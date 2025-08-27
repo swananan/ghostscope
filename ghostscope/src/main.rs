@@ -46,19 +46,10 @@ async fn main() {
         }
     };
 
-    // Set default file paths for debug mode
-    let llvm_ir_file = parsed_args.llvm_ir_file.as_ref()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| "ghostscope_ir.ll".to_string());
-    
-    let ebpf_file = parsed_args.ebpf_file.as_ref()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| "ghostscope_ebpf.o".to_string());
-
     // Display parsed arguments and session info
     info!("Debug session created");
-    info!("LLVM IR will be saved to: {}", llvm_ir_file);
-    info!("eBPF bytecode will be saved to: {}", ebpf_file);
+    info!("Save LLVM IR files: {}", parsed_args.should_save_llvm_ir);
+    info!("Save eBPF bytecode files: {}", parsed_args.should_save_ebpf);
     
     if let Some(ref binary) = session.target_binary {
         info!("Target binary: {}", binary);
@@ -130,27 +121,10 @@ async fn main() {
     info!("Starting GhostScope with script");
     info!("Script content:\n{}", script_content);
 
-    // First compile to LLVM IR to see the intermediate representation
-    match ghostscope_compiler::compile_to_llvm_ir(&script_content) {
-        Ok(llvm_ir) => {
-            info!("\n=== Generated LLVM IR ===");
-            println!("{}", llvm_ir);
-            info!("=== End LLVM IR ===\n");
-            
-            // Save LLVM IR to file for inspection
-            if let Err(e) = std::fs::write(&llvm_ir_file, &llvm_ir) {
-                warn!("Failed to save LLVM IR to '{}': {}", llvm_ir_file, e);
-            } else {
-                info!("LLVM IR saved to '{}'", llvm_ir_file);
-            }
-        }
-        Err(e) => {
-            error!("LLVM IR compilation failed: {:?}", e);
-            return;
-        }
-    }
+    // Note: LLVM IR generation is now unified with eBPF compilation
+    // Each trace pattern will save its IR file during eBPF compilation
 
-    // Now compile to eBPF uprobe configurations  
+    // Compile to eBPF uprobe configurations (now includes LLVM IR generation)
     let binary_path_string = if let Some(ref analyzer) = session.binary_analyzer {
         Some(analyzer.debug_info().binary_path.to_string_lossy().to_string())
     } else {
@@ -158,16 +132,29 @@ async fn main() {
     };
     let binary_path_for_naming = binary_path_string.as_deref();
     
-    match ghostscope_compiler::compile_to_uprobe_configs(&script_content, session.target_pid, binary_path_for_naming) {
+    match ghostscope_compiler::compile_to_uprobe_configs(&script_content, session.target_pid, binary_path_for_naming, parsed_args.should_save_llvm_ir) {
         Ok(mut uprobe_configs) => {
             info!("eBPF compilation successful, generated {} uprobe configurations", uprobe_configs.len());
+            if parsed_args.should_save_llvm_ir || parsed_args.should_save_ebpf {
+                info!("Files saved with consistent naming: gs_{{pid}}_{{exec}}_{{func}}_{{index}}");
+            }
             
-            // Save first config's bytecode to file for debugging (backward compatibility)
-            if !uprobe_configs.is_empty() {
-                if let Err(e) = std::fs::write(&ebpf_file, &uprobe_configs[0].ebpf_bytecode) {
-                    warn!("Failed to save eBPF bytecode to '{}': {}", ebpf_file, e);
-                } else {
-                    info!("eBPF bytecode saved to '{}'", ebpf_file);
+            // Save each config's bytecode to individual files with consistent naming (if enabled)
+            if parsed_args.should_save_ebpf {
+                for (index, config) in uprobe_configs.iter().enumerate() {
+                    let file_base_name = ghostscope_compiler::generate_file_name(
+                        &config.trace_pattern, 
+                        index, 
+                        session.target_pid, 
+                        binary_path_for_naming
+                    );
+                    let ebpf_filename = format!("{}.o", file_base_name);
+                    
+                    if let Err(e) = std::fs::write(&ebpf_filename, &config.ebpf_bytecode) {
+                        warn!("Failed to save eBPF bytecode to '{}': {}", ebpf_filename, e);
+                    } else {
+                        info!("eBPF bytecode saved to '{}'", ebpf_filename);
+                    }
                 }
             }
 

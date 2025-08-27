@@ -127,7 +127,7 @@ impl<'ctx> CodeGen<'ctx> {
         }
     }
 
-    pub fn compile_with_function_name(&mut self, program: &Program, function_name: &str, trace_statements: &[Statement]) -> Result<&Module<'ctx>> {
+    pub fn compile_with_function_name(&mut self, program: &Program, function_name: &str, trace_statements: &[Statement], target_pid: Option<u32>, save_ir_path: Option<&str>) -> Result<&Module<'ctx>> {
         // Declare all external functions
         self.declare_external_functions();
 
@@ -187,6 +187,11 @@ impl<'ctx> CodeGen<'ctx> {
         );
         self.builder.set_current_debug_location(debug_loc);
 
+        // Add PID filtering if target_pid is specified
+        if let Some(target_pid) = target_pid {
+            self.add_pid_filter(target_pid)?;
+        }
+
         // Create required maps
         // Use 8 pages (32KB) for ringbuf map
         self.map_manager
@@ -211,6 +216,14 @@ impl<'ctx> CodeGen<'ctx> {
         // Finalize debug information for BTF generation
         self.di_builder.finalize();
 
+        // Save IR to file if path is provided
+        if let Some(ir_path) = save_ir_path {
+            info!("Saving LLVM IR to: {}", ir_path);
+            self.module.print_to_file(ir_path).map_err(|e| {
+                CodeGenError::Builder(format!("Failed to save IR to file: {}", e))
+            })?;
+        }
+
         // Ensure module verification passes
         if let Err(e) = self.module.verify() {
             return Err(CodeGenError::Builder(format!("Module verification failed: {}", e)));
@@ -222,7 +235,7 @@ impl<'ctx> CodeGen<'ctx> {
     // Keep original compile method for backward compatibility
     pub fn compile(&mut self, program: &Program) -> Result<&Module<'ctx>> {
         // For backward compatibility, use "main" as function name and compile all statements
-        self.compile_with_function_name(program, "main", &program.statements)
+        self.compile_with_function_name(program, "main", &program.statements, None, None)
     }
 
     fn declare_external_functions(&mut self) {
@@ -244,6 +257,11 @@ impl<'ctx> CodeGen<'ctx> {
         let pseudo_fn_type = i64_type.fn_type(&[i64_type.into(), i64_type.into()], false);
         let pseudo_fn = self.module.add_function("llvm.bpf.pseudo", pseudo_fn_type, None);
         pseudo_fn.set_linkage(inkwell::module::Linkage::External);
+
+        // Declare bpf_get_current_pid_tgid helper function
+        let pid_tgid_fn_type = i64_type.fn_type(&[], false);
+        let pid_tgid_fn = self.module.add_function("bpf_get_current_pid_tgid", pid_tgid_fn_type, None);
+        pid_tgid_fn.set_linkage(inkwell::module::Linkage::External);
     }
 
     fn get_seq_printf_fn(&self) -> FunctionValue<'ctx> {
@@ -846,6 +864,85 @@ impl<'ctx> CodeGen<'ctx> {
         license_global.set_metadata(license_di_global.as_metadata_value(self.context), 0);
         
         info!("Created GPL license section");
+        Ok(())
+    }
+
+    /// Add PID filtering logic to the current function
+    fn add_pid_filter(&mut self, target_pid: u32) -> Result<()> {
+        info!("Adding PID filter for target PID: {}", target_pid);
+
+        // Get current function and entry block
+        let current_fn = self.builder
+            .get_insert_block()
+            .unwrap()
+            .get_parent()
+            .unwrap();
+
+        // Create basic blocks for control flow
+        let continue_block = self.context.append_basic_block(current_fn, "continue_execution");
+        let early_return_block = self.context.append_basic_block(current_fn, "pid_mismatch_return");
+
+        // Call bpf_get_current_pid_tgid() using direct function ID
+        // BPF helper function ID for bpf_get_current_pid_tgid is 14
+        let func_id_val = self.context.i64_type().const_int(14, false);
+        let i64_type = self.context.i64_type();
+        let fn_type = i64_type.fn_type(&[], false);
+        let fn_ptr_type = self.context.ptr_type(AddressSpace::default());
+        
+        let func_ptr = self.builder.build_int_to_ptr(
+            func_id_val,
+            fn_ptr_type,
+            "pid_tgid_fn_ptr"
+        ).map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        
+        let pid_tgid_result = self.builder.build_indirect_call(
+            fn_type,
+            func_ptr,
+            &[],
+            "pid_tgid"
+        ).map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        let pid_tgid_value = pid_tgid_result
+            .try_as_basic_value()
+            .left()
+            .ok_or_else(|| CodeGenError::Builder("Failed to get pid_tgid return value".to_string()))?;
+
+        // Extract TGID (high 32 bits) by right shifting 32 bits
+        let shift_amount = self.context.i64_type().const_int(32, false);
+        let current_tgid = if let BasicValueEnum::IntValue(pid_tgid_int) = pid_tgid_value {
+            self.builder
+                .build_right_shift(pid_tgid_int, shift_amount, false, "current_tgid")
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?
+        } else {
+            return Err(CodeGenError::Builder("Expected integer value from pid_tgid".to_string()));
+        };
+
+        // Convert target_pid to i64 and compare
+        let target_pid_value = self.context.i64_type().const_int(target_pid as u64, false);
+        let pid_matches = self.builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                current_tgid,
+                target_pid_value,
+                "pid_matches"
+            )
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        // Conditional branch: if pid matches, continue; else early return
+        self.builder
+            .build_conditional_branch(pid_matches, continue_block, early_return_block)
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        // Early return block - just return 0
+        self.builder.position_at_end(early_return_block);
+        self.builder
+            .build_return(Some(&self.context.i32_type().const_int(0, false)))
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        // Position at continue block for the rest of the function
+        self.builder.position_at_end(continue_block);
+
+        info!("PID filter added successfully for target PID: {}", target_pid);
         Ok(())
     }
 }

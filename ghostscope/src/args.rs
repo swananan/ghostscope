@@ -40,13 +40,21 @@ pub struct Args {
     #[arg(long, short = 'p', value_name = "PID")]
     pub pid: Option<u32>,
     
-    /// LLVM IR output file path (default: ghostscope_ir.ll)
-    #[arg(long, value_name = "PATH")]
-    pub llvm_ir_file: Option<PathBuf>,
+    /// Save LLVM IR files for each trace pattern (debug: true, release: false)
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub save_llvm_ir: bool,
     
-    /// eBPF bytecode output file path (default: ghostscope_ebpf.o)
-    #[arg(long, value_name = "PATH")]
-    pub ebpf_file: Option<PathBuf>,
+    /// Disable saving LLVM IR files (overrides default behavior)
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub no_save_llvm_ir: bool,
+    
+    /// Save eBPF bytecode files for each trace pattern (debug: true, release: false)  
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub save_ebpf: bool,
+    
+    /// Disable saving eBPF bytecode files (overrides default behavior)
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub no_save_ebpf: bool,
     
     /// Remaining arguments (when using --args)
     pub remaining: Vec<String>,
@@ -61,8 +69,8 @@ pub struct ParsedArgs {
     pub script: Option<String>,
     pub script_file: Option<PathBuf>,
     pub pid: Option<u32>,
-    pub llvm_ir_file: Option<PathBuf>,
-    pub ebpf_file: Option<PathBuf>,
+    pub should_save_llvm_ir: bool,
+    pub should_save_ebpf: bool,
 }
 
 impl Args {
@@ -90,6 +98,9 @@ impl Args {
                 (None, Vec::new())
             };
             
+            let should_save_llvm_ir = Self::should_save_llvm_ir(&parsed);
+            let should_save_ebpf = Self::should_save_ebpf(&parsed);
+            
             ParsedArgs {
                 binary_path,
                 binary_args,
@@ -98,12 +109,15 @@ impl Args {
                 script: parsed.script,
                 script_file: parsed.script_file,
                 pid: parsed.pid,
-                llvm_ir_file: parsed.llvm_ir_file,
-                ebpf_file: parsed.ebpf_file,
+                should_save_llvm_ir,
+                should_save_ebpf,
             }
         } else {
             // Normal parsing without --args
             let parsed = Args::parse();
+            
+            let should_save_llvm_ir = Self::should_save_llvm_ir(&parsed);
+            let should_save_ebpf = Self::should_save_ebpf(&parsed);
             
             ParsedArgs {
                 binary_path: parsed.binary,
@@ -113,9 +127,33 @@ impl Args {
                 script: parsed.script,
                 script_file: parsed.script_file,
                 pid: parsed.pid,
-                llvm_ir_file: parsed.llvm_ir_file,
-                ebpf_file: parsed.ebpf_file,
+                should_save_llvm_ir,
+                should_save_ebpf,
             }
+        }
+    }
+
+    /// Determine whether to save LLVM IR files based on arguments and build type
+    fn should_save_llvm_ir(parsed: &Args) -> bool {
+        if parsed.no_save_llvm_ir {
+            false
+        } else if parsed.save_llvm_ir {
+            true
+        } else {
+            // Default behavior: debug = true, release = false
+            cfg!(debug_assertions)
+        }
+    }
+
+    /// Determine whether to save eBPF files based on arguments and build type
+    fn should_save_ebpf(parsed: &Args) -> bool {
+        if parsed.no_save_ebpf {
+            false
+        } else if parsed.save_ebpf {
+            true
+        } else {
+            // Default behavior: debug = true, release = false
+            cfg!(debug_assertions)
         }
     }
 }

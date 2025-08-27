@@ -120,9 +120,59 @@ pub fn extract_trace_patterns(program: &Program) -> Vec<TracePoint> {
     trace_points
 }
 
+/// Generate filename for IR and eBPF files based on trace pattern
+/// Format: gs_{pid}_{target_exec}_{function_name}_index
+/// Binary name and function name are NOT truncated for file naming
+pub fn generate_file_name(pattern: &TracePattern, index: usize, pid: Option<u32>, binary_path: Option<&str>) -> String {
+    let pid_str = pid.map(|p| p.to_string()).unwrap_or_else(|| "0".to_string());
+    
+    let exec_name = if let Some(path) = binary_path {
+        // Extract just the filename from the path
+        let filename = std::path::Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("unknown");
+        
+        // Sanitize but don't truncate for file naming
+        filename
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '_' })
+            .collect::<String>()
+    } else {
+        "unknown".to_string()
+    };
+    
+    match pattern {
+        TracePattern::FunctionName(name) => {
+            // Sanitize but don't truncate function name for file naming
+            let func_name = name
+                .chars()
+                .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                .collect::<String>();
+            format!("gs_{}_{}_{}_{}",  pid_str, exec_name, func_name, index)
+        }
+        TracePattern::Wildcard(pattern) => {
+            // Sanitize but don't truncate wildcard pattern for file naming
+            let pattern_name = pattern
+                .chars()
+                .map(|c| match c {
+                    '*' => 's', // star -> s  
+                    '?' => 'q', // question -> q
+                    c if c.is_alphanumeric() => c,
+                    _ => '_',
+                })
+                .collect::<String>();
+            format!("gs_{}_{}_{}_{}",  pid_str, exec_name, pattern_name, index)
+        }
+        TracePattern::Address(addr) => {
+            format!("gs_{}_{}_0x{:x}_{}",  pid_str, exec_name, addr, index)
+        }
+    }
+}
+
 /// Generate a unique eBPF function name based on trace pattern
 /// Generate eBPF function name in format: gs_{pid}_{target_exec}_{function_name}_index
-/// Binary name and function name are truncated to 8 bytes if too long
+/// Binary name and function name are NOT truncated for eBPF function naming
 pub fn generate_ebpf_function_name(pattern: &TracePattern, index: usize, pid: Option<u32>, binary_path: Option<&str>) -> String {
     let pid_str = pid.map(|p| p.to_string()).unwrap_or_else(|| "0".to_string());
     
@@ -133,10 +183,9 @@ pub fn generate_ebpf_function_name(pattern: &TracePattern, index: usize, pid: Op
             .and_then(|name| name.to_str())
             .unwrap_or("unknown");
         
-        // Truncate and sanitize to 8 characters max
+        // Sanitize but don't truncate for eBPF function naming
         filename
             .chars()
-            .take(8)
             .map(|c| if c.is_alphanumeric() { c } else { '_' })
             .collect::<String>()
     } else {
@@ -145,19 +194,17 @@ pub fn generate_ebpf_function_name(pattern: &TracePattern, index: usize, pid: Op
     
     match pattern {
         TracePattern::FunctionName(name) => {
-            // Truncate and sanitize function name to 8 characters max
+            // Sanitize but don't truncate function name for eBPF function naming
             let func_name = name
                 .chars()
-                .take(8)
                 .map(|c| if c.is_alphanumeric() { c } else { '_' })
                 .collect::<String>();
             format!("gs_{}_{}_{}_{}",  pid_str, exec_name, func_name, index)
         }
         TracePattern::Wildcard(pattern) => {
-            // Truncate and sanitize wildcard pattern to 8 characters max
+            // Sanitize but don't truncate wildcard pattern for eBPF function naming
             let pattern_name = pattern
                 .chars()
-                .take(8)
                 .map(|c| match c {
                     '*' => 's', // star -> s  
                     '?' => 'q', // question -> q
@@ -225,7 +272,7 @@ pub fn compile_to_llvm_ir(source: &str) -> Result<String> {
 
 /// Compile source code to eBPF bytecode for multiple trace patterns
 /// Returns UProbeConfig for each trace pattern with individual eBPF bytecode
-pub fn compile_to_uprobe_configs(source: &str, pid: Option<u32>, binary_path: Option<&str>) -> Result<Vec<UProbeConfig>> {
+pub fn compile_to_uprobe_configs(source: &str, pid: Option<u32>, binary_path: Option<&str>, save_ir: bool) -> Result<Vec<UProbeConfig>> {
     info!("Starting eBPF compilation for multiple trace patterns...");
 
     // Parse the source code
@@ -264,8 +311,16 @@ pub fn compile_to_uprobe_configs(source: &str, pid: Option<u32>, binary_path: Op
         let context = Context::create();
         let mut codegen = codegen::CodeGen::new(&context, &format!("bpf_output_{}", index));
         
-        // Compile this specific trace pattern
-        let module = match codegen.compile_with_function_name(&program, &ebpf_function_name, statements) {
+        // Generate file base name using consistent naming
+        let file_base_name = generate_file_name(&pattern, index, pid, binary_path);
+        
+        // Compile this specific trace pattern with PID filtering and optionally save IR
+        let ir_file_path = if save_ir {
+            Some(format!("{}.ll", file_base_name))
+        } else {
+            None
+        };
+        let module = match codegen.compile_with_function_name(&program, &ebpf_function_name, statements, pid, ir_file_path.as_deref()) {
             Ok(module) => module,
             Err(e) => {
                 error!("CodeGen error for pattern {:?}: {:?}", pattern, e);
@@ -329,7 +384,7 @@ pub fn compile_to_uprobe_configs(source: &str, pid: Option<u32>, binary_path: Op
             },
             function_address: None, // Will be resolved later
             uprobe_offset: None,    // Will be calculated later
-            target_pid: None,       // Will be set later if needed
+            target_pid: pid,        // Set from function parameter
             ebpf_bytecode: object_code.as_slice().to_vec(),
             ebpf_function_name,
         };
@@ -347,7 +402,7 @@ pub fn compile_to_uprobe_configs(source: &str, pid: Option<u32>, binary_path: Op
 pub fn compile_to_ebpf_with_trace_points(source: &str) -> Result<(Vec<u8>, Vec<TracePoint>)> {
     // Use the new function and return first config's bytecode for backward compatibility
     // Use default values for pid and binary path since this is legacy function
-    let uprobe_configs = compile_to_uprobe_configs(source, None, None)?;
+    let uprobe_configs = compile_to_uprobe_configs(source, None, None, false)?;
     if uprobe_configs.is_empty() {
         return Err(CompileError::LLVM("No uprobe configurations generated".to_string()));
     }
