@@ -1,0 +1,54 @@
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+COMMENT = _{ "//" ~ (!"\n" ~ ANY)* ~ "\n" | "/*" ~ (!"*/" ~ ANY)* ~ "*/" }
+
+program = _{ SOI ~ statement* ~ EOI }
+
+statement = {
+    trace_stmt |
+    print_stmt |
+    backtrace_stmt |
+    expr_stmt |
+    var_decl_stmt
+}
+
+trace_stmt = { "trace" ~ trace_pattern ~ "{" ~ statement* ~ "}" }
+trace_pattern = { 
+    hex_address |
+    wildcard_pattern |
+    function_name
+}
+
+hex_address = @{ "0x" ~ ASCII_HEX_DIGIT+ }
+wildcard_pattern = @{ identifier ~ "*" }
+function_name = { identifier }
+
+print_stmt = { "print" ~ expr ~ ";" }
+backtrace_stmt = { ("backtrace" | "bt") ~ ";" }
+expr_stmt = { expr ~ ";" }
+var_decl_stmt = { "let" ~ identifier ~ "=" ~ expr ~ ";" }
+
+expr = { term ~ (add_op ~ term)* }
+term = { factor ~ (mul_op ~ factor)* }
+factor = {
+    string |
+    float |
+    int |
+    special_var |
+    identifier |
+    member_access |
+    pointer_deref |
+    "(" ~ expr ~ ")"
+}
+
+special_var = @{ "$" ~ (ASCII_ALPHANUMERIC | "_")+ }
+
+member_access = { identifier ~ ("." ~ identifier)+ }
+pointer_deref = { "*" ~ identifier }
+
+add_op = { "+" | "-" }
+mul_op = { "*" | "/" }
+
+identifier = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
+int = @{ ASCII_DIGIT+ }
+float = @{ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
+string = @{ "\"" ~ (!"\"" ~ ANY)* ~ "\"" } 

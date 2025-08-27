@@ -1,0 +1,29 @@
+[workspace]
+members = [
+    "ghostscope-compiler",
+    "ghostscope-frontend",
+    "ghostscope-loader",
+    "ghostscope-ui",
+    "ghostscope-binary",
+    "ghostscope",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["swananan <jt26wzz@gmail.com>"]
+license = "MIT"
+# repository = "https://github.com/swananan/feather-quic"
+keywords = ["ebpf", "gdb", "debugger"]
+#categories = ["network-programming", "protocols"]
+
+[workspace.dependencies]
+log = "0.4.22"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+anyhow = "1.0.93"
+tracing = "0.1.41"
+tracing-log = "0.2.0"
+thiserror = "2.0.12"
+# eBPF相关依赖（供子crates引用）- 使用本地调试版本
+aya = { path = "../aya/aya" }
+tokio = { version = "1.0", features = ["full"] }

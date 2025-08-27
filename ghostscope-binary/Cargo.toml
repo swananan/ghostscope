@@ -1,0 +1,18 @@
+[package]
+name = "ghostscope-binary"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# ELF and DWARF parsing
+object = "0.36"
+gimli = "0.31"
+addr2line = "0.24"
+
+# Error handling and logging
+thiserror = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+
+# Path and file operations
+memmap2 = "0.9"

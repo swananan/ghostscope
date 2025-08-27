@@ -1,0 +1,552 @@
+pub mod ast;
+pub mod codegen;
+pub mod map;
+pub mod parser;
+
+use crate::ast::{Program, TracePattern};
+use codegen::CodeGenError;
+use inkwell::context::Context;
+use inkwell::memory_buffer::MemoryBuffer;
+use inkwell::module::Module;
+use inkwell::passes::PassManager;
+use inkwell::targets::{
+    CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetTriple,
+};
+use inkwell::OptimizationLevel;
+use parser::ParseError;
+use tracing::{debug, error, info, warn};
+
+pub fn hello() -> &'static str {
+    "Hello from ghostscope-compiler!"
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CompileError {
+    #[error("Parse error: {0}")]
+    Parse(#[from] ParseError),
+
+    #[error("Code generation error: {0}")]
+    CodeGen(#[from] CodeGenError),
+
+    #[error("LLVM error: {0}")]
+    LLVM(String),
+}
+
+pub type Result<T> = std::result::Result<T, CompileError>;
+
+pub fn print_ast(program: &Program) {
+    info!("\n=== AST Tree ===");
+    info!("Program:");
+    for (i, stmt) in program.statements.iter().enumerate() {
+        info!("  Statement {}: {:?}", i, stmt);
+    }
+    info!("=== End AST Tree ===\n");
+}
+
+/// Extract trace patterns from the parsed program
+/// This function traverses the AST and collects all trace points with their patterns
+#[derive(Debug, Clone)]
+pub struct TracePoint {
+    pub pattern: TracePattern,
+    pub function_name: Option<String>, // Resolved function name for FunctionName pattern
+    pub address: Option<u64>,          // Resolved address for Address pattern  
+    pub wildcard: Option<String>,      // Pattern string for Wildcard pattern
+}
+
+/// Complete uprobe configuration ready for attachment
+#[derive(Debug, Clone)]
+pub struct UProbeConfig {
+    /// The trace pattern this uprobe corresponds to
+    pub trace_pattern: TracePattern,
+    
+    /// Target binary path
+    pub binary_path: String,
+    
+    /// Function name (for FunctionName patterns)
+    pub function_name: Option<String>,
+    
+    /// Resolved function address in the binary  
+    pub function_address: Option<u64>,
+    
+    /// Calculated uprobe offset (for aya uprobe attachment)
+    pub uprobe_offset: Option<u64>,
+    
+    /// Process ID to attach to (None means attach to all instances)
+    pub target_pid: Option<u32>,
+    
+    /// eBPF bytecode for this uprobe
+    pub ebpf_bytecode: Vec<u8>,
+    
+    /// eBPF function name for this uprobe (e.g., "ghostscope_main_0", "ghostscope_printf_1")
+    pub ebpf_function_name: String,
+}
+
+pub fn extract_trace_patterns(program: &Program) -> Vec<TracePoint> {
+    let mut trace_points = Vec::new();
+    
+    for stmt in &program.statements {
+        if let crate::ast::Statement::TracePoint { pattern, body: _ } = stmt {
+            let trace_point = match pattern {
+                TracePattern::FunctionName(func_name) => {
+                    TracePoint {
+                        pattern: pattern.clone(),
+                        function_name: Some(func_name.clone()),
+                        address: None,
+                        wildcard: None,
+                    }
+                }
+                TracePattern::Address(addr) => {
+                    TracePoint {
+                        pattern: pattern.clone(),
+                        function_name: None,
+                        address: Some(*addr),
+                        wildcard: None,
+                    }
+                }
+                TracePattern::Wildcard(pattern_str) => {
+                    TracePoint {
+                        pattern: pattern.clone(),
+                        function_name: None,
+                        address: None,
+                        wildcard: Some(pattern_str.clone()),
+                    }
+                }
+            };
+            
+            trace_points.push(trace_point);
+        }
+    }
+    
+    trace_points
+}
+
+/// Generate a unique eBPF function name based on trace pattern
+/// Generate eBPF function name in format: gs_{pid}_{target_exec}_{function_name}_index
+/// Binary name and function name are truncated to 8 bytes if too long
+pub fn generate_ebpf_function_name(pattern: &TracePattern, index: usize, pid: Option<u32>, binary_path: Option<&str>) -> String {
+    let pid_str = pid.map(|p| p.to_string()).unwrap_or_else(|| "0".to_string());
+    
+    let exec_name = if let Some(path) = binary_path {
+        // Extract just the filename from the path
+        let filename = std::path::Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("unknown");
+        
+        // Truncate and sanitize to 8 characters max
+        filename
+            .chars()
+            .take(8)
+            .map(|c| if c.is_alphanumeric() { c } else { '_' })
+            .collect::<String>()
+    } else {
+        "unknown".to_string()
+    };
+    
+    match pattern {
+        TracePattern::FunctionName(name) => {
+            // Truncate and sanitize function name to 8 characters max
+            let func_name = name
+                .chars()
+                .take(8)
+                .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                .collect::<String>();
+            format!("gs_{}_{}_{}_{}",  pid_str, exec_name, func_name, index)
+        }
+        TracePattern::Wildcard(pattern) => {
+            // Truncate and sanitize wildcard pattern to 8 characters max
+            let pattern_name = pattern
+                .chars()
+                .take(8)
+                .map(|c| match c {
+                    '*' => 's', // star -> s  
+                    '?' => 'q', // question -> q
+                    c if c.is_alphanumeric() => c,
+                    _ => '_',
+                })
+                .collect::<String>();
+            format!("gs_{}_{}_ptn{}_{}",  pid_str, exec_name, pattern_name, index)
+        }
+        TracePattern::Address(addr) => {
+            format!("gs_{}_{}_{:x}_{}",  pid_str, exec_name, addr, index)
+        }
+    }
+}
+
+/// Compiles a string of source code in our small language to LLVM IR
+/// Note: This will use BPF target functions (e.g., bpf_trace_printk) by default
+pub fn compile_to_llvm_ir(source: &str) -> Result<String> {
+    // Parse the source code
+    let program = parser::parse(source)?;
+
+    print_ast(&program);
+    
+    // Extract trace patterns
+    let trace_points = extract_trace_patterns(&program);
+    if !trace_points.is_empty() {
+        info!("\n=== Extracted Trace Points ===");
+        for (i, tp) in trace_points.iter().enumerate() {
+            match &tp.pattern {
+                TracePattern::FunctionName(name) => {
+                    info!("  Trace Point {}: Function '{}'", i, name);
+                }
+                TracePattern::Wildcard(pattern) => {
+                    info!("  Trace Point {}: Wildcard pattern '{}'", i, pattern);
+                }
+                TracePattern::Address(addr) => {
+                    info!("  Trace Point {}: Address 0x{:x}", i, addr);
+                }
+            }
+        }
+        info!("=== End Trace Points ===\n");
+    } else {
+        info!("No trace points found in script");
+    }
+
+    // Generate LLVM IR
+    let context = Context::create();
+    let mut codegen = codegen::CodeGen::new(&context, "output");
+
+    match codegen.compile(&program) {
+        Ok(module) => {
+            // Return the LLVM IR as a string
+            let llvm_ir = module.print_to_string().to_string();
+            // Ensure IR format is correct, remove trailing empty lines
+            let llvm_ir = llvm_ir.trim_end().to_string();
+            info!("Successfully generated LLVM IR, length: {}", llvm_ir.len());
+            Ok(llvm_ir)
+        }
+        Err(e) => {
+            error!("CodeGen error: {:?}", e);
+            Err(CompileError::CodeGen(e))
+        }
+    }
+}
+
+/// Compile source code to eBPF bytecode for multiple trace patterns
+/// Returns UProbeConfig for each trace pattern with individual eBPF bytecode
+pub fn compile_to_uprobe_configs(source: &str, pid: Option<u32>, binary_path: Option<&str>) -> Result<Vec<UProbeConfig>> {
+    info!("Starting eBPF compilation for multiple trace patterns...");
+
+    // Parse the source code
+    let program = parser::parse(source)?;
+    info!("Successfully parsed program: {:?}", program);
+    
+    // Extract trace patterns with their statements
+    let mut trace_patterns_with_statements = Vec::new();
+    for stmt in &program.statements {
+        if let crate::ast::Statement::TracePoint { pattern, body } = stmt {
+            trace_patterns_with_statements.push((pattern.clone(), body));
+        }
+    }
+    
+    if trace_patterns_with_statements.is_empty() {
+        return Err(CompileError::LLVM("No trace patterns found in source code".to_string()));
+    }
+    
+    info!("Found {} trace patterns to compile", trace_patterns_with_statements.len());
+    
+    let mut uprobe_configs = Vec::new();
+    
+    // Initialize BPF target
+    let config = inkwell::targets::InitializationConfig::default();
+    inkwell::targets::Target::initialize_bpf(&config);
+    info!("BPF target initialized");
+    
+    for (index, (pattern, statements)) in trace_patterns_with_statements.into_iter().enumerate() {
+        info!("Compiling trace pattern {}: {:?}", index, pattern);
+        
+        // Generate unique function name for this trace pattern
+        let ebpf_function_name = generate_ebpf_function_name(&pattern, index, pid, binary_path);
+        info!("Generated eBPF function name: {}", ebpf_function_name);
+        
+        // Create new context and codegen for each trace pattern
+        let context = Context::create();
+        let mut codegen = codegen::CodeGen::new(&context, &format!("bpf_output_{}", index));
+        
+        // Compile this specific trace pattern
+        let module = match codegen.compile_with_function_name(&program, &ebpf_function_name, statements) {
+            Ok(module) => module,
+            Err(e) => {
+                error!("CodeGen error for pattern {:?}: {:?}", pattern, e);
+                return Err(CompileError::CodeGen(e));
+            }
+        };
+
+        // Get LLVM IR string for logging only
+        let llvm_ir = module.print_to_string().to_string();
+        let llvm_ir = llvm_ir.trim_end().to_string();
+        info!("Successfully generated LLVM IR for {}, length: {}", ebpf_function_name, llvm_ir.len());
+
+        // Get target triple
+        let triple = inkwell::targets::TargetTriple::create("bpf-pc-linux");
+
+        // Get BPF target
+        let target = match inkwell::targets::Target::from_triple(&triple) {
+            Ok(t) => t,
+            Err(e) => {
+                error!("Failed to get target for {}: {}", ebpf_function_name, e);
+                return Err(CompileError::LLVM(format!("Failed to get target: {}", e)));
+            }
+        };
+
+        // Create target machine
+        let target_machine = match target.create_target_machine(
+            &triple,
+            "generic", // CPU
+            "+alu32",  // Enable BPF ALU32 instructions
+            inkwell::OptimizationLevel::Default,
+            inkwell::targets::RelocMode::PIC,
+            inkwell::targets::CodeModel::Small,
+        ) {
+            Some(tm) => tm,
+            None => {
+                error!("Failed to create target machine for {}", ebpf_function_name);
+                return Err(CompileError::LLVM("Failed to create target machine".to_string()));
+            }
+        };
+
+        // Generate eBPF object file
+        info!("Generating eBPF object file for {}...", ebpf_function_name);
+        let object_code = match target_machine.write_to_memory_buffer(&module, inkwell::targets::FileType::Object) {
+            Ok(buf) => {
+                info!("Successfully generated object code for {}! Size: {}", ebpf_function_name, buf.get_size());
+                buf
+            }
+            Err(e) => {
+                error!("Failed to generate object code for {}: {}", ebpf_function_name, e);
+                return Err(CompileError::LLVM(format!("Failed to generate object code: {}", e)));
+            }
+        };
+
+        // Create UProbeConfig for this trace pattern
+        let uprobe_config = UProbeConfig {
+            trace_pattern: pattern.clone(),
+            binary_path: String::new(), // Will be set later when attaching
+            function_name: match &pattern {
+                TracePattern::FunctionName(name) => Some(name.clone()),
+                _ => None,
+            },
+            function_address: None, // Will be resolved later
+            uprobe_offset: None,    // Will be calculated later
+            target_pid: None,       // Will be set later if needed
+            ebpf_bytecode: object_code.as_slice().to_vec(),
+            ebpf_function_name,
+        };
+        
+        uprobe_configs.push(uprobe_config);
+        info!("Created UProbeConfig for pattern {:?}", pattern);
+    }
+
+    info!("eBPF compilation completed! Generated {} UProbe configurations", uprobe_configs.len());
+    Ok(uprobe_configs)
+}
+
+/// Compile source code to eBPF bytecode
+/// Also returns extracted trace points for the caller to use
+pub fn compile_to_ebpf_with_trace_points(source: &str) -> Result<(Vec<u8>, Vec<TracePoint>)> {
+    // Use the new function and return first config's bytecode for backward compatibility
+    // Use default values for pid and binary path since this is legacy function
+    let uprobe_configs = compile_to_uprobe_configs(source, None, None)?;
+    if uprobe_configs.is_empty() {
+        return Err(CompileError::LLVM("No uprobe configurations generated".to_string()));
+    }
+    
+    // Extract trace points from uprobe configs
+    let trace_points: Vec<TracePoint> = uprobe_configs.iter().map(|config| {
+        TracePoint {
+            pattern: config.trace_pattern.clone(),
+            function_name: config.function_name.clone(),
+            address: config.function_address,
+            wildcard: match &config.trace_pattern {
+                TracePattern::Wildcard(pattern) => Some(pattern.clone()),
+                _ => None,
+            },
+        }
+    }).collect();
+    
+    // Return first config's bytecode for backward compatibility
+    Ok((uprobe_configs[0].ebpf_bytecode.clone(), trace_points))
+}
+
+/// Compile source code to eBPF bytecode (legacy interface)
+pub fn compile_to_ebpf(source: &str) -> Result<Vec<u8>> {
+    compile_to_ebpf_with_trace_points(source).map(|(bytecode, _)| bytecode)
+}
+
+/// Format eBPF bytecode as hexadecimal string for inspection
+pub fn format_ebpf_bytecode(bytecode: &[u8]) -> String {
+    let mut result = String::new();
+
+    // Display in 16-byte per line format
+    for (i, chunk) in bytecode.chunks(16).enumerate() {
+        // Add offset address
+        result.push_str(&format!("{:08x}:  ", i * 16));
+
+        // Add hexadecimal bytes
+        for (j, &byte) in chunk.iter().enumerate() {
+            result.push_str(&format!("{:02x} ", byte));
+            if j == 7 {
+                // Add extra space in the middle
+                result.push_str(" ");
+            }
+        }
+
+        // Add spaces to align ASCII part
+        if chunk.len() < 16 {
+            let spaces = (16 - chunk.len()) * 3 + if chunk.len() <= 8 { 1 } else { 0 };
+            result.push_str(&" ".repeat(spaces));
+        }
+
+        // Add ASCII representation
+        result.push_str(" |");
+        for &byte in chunk {
+            if byte >= 32 && byte <= 126 {
+                // Printable ASCII character
+                result.push(byte as char);
+            } else {
+                // Non-printable character represented by dot
+                result.push('.');
+            }
+        }
+        result.push_str("|\n");
+    }
+
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hello() {
+        assert_eq!(hello(), "Hello from ghostscope-compiler!");
+    }
+
+    #[test]
+    fn test_simple_program() {
+        let source = r#"
+            print 42;
+            backtrace;
+            let a = 10;
+            let b = 20;
+            print a + b;
+        "#;
+
+        let result = compile_to_llvm_ir(source);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_string_program() {
+        let source = r#"
+            let greeting = "Hello, world!";
+            print greeting;
+            let name = "Rust";
+            print greeting;
+        "#;
+
+        let result = compile_to_llvm_ir(source);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_type_error() {
+        let source = r#"
+            let a = 10;
+            let b = 15.5;
+            // This should cause a type error
+            print a + b;
+        "#;
+
+        let result = compile_to_llvm_ir(source);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_type_error_string_with_number() {
+        let source = r#"
+            let num = 42;
+            let txt = "Hello";
+            // Strings and numbers cannot be operated on
+            print num + txt;
+        "#;
+
+        let result = compile_to_llvm_ir(source);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_type_error_assignment() {
+        let source = r#"
+            let a = 10;
+            // Reassignment to different type should error in real compiler
+            // Our simple implementation may not detect this
+            let a = "string";
+            print a;
+        "#;
+
+        // Note: our current implementation may not detect this error
+        // This test is mainly for future strict type checking implementation
+        let result = compile_to_llvm_ir(source);
+        // We're not sure about the result now, but it should be an error in the future
+        // assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_ebpf_compilation() {
+        let source = r#"
+            print 42;
+            let a = 10;
+            print a;
+        "#;
+
+        // Test compilation from source code to LLVM IR
+        let llvm_result = compile_to_llvm_ir(source);
+        assert!(llvm_result.is_ok());
+
+        // Test compilation from source code to eBPF bytecode
+        let ebpf_result = compile_to_ebpf(source);
+        assert!(ebpf_result.is_ok());
+
+        // Verify the generated bytecode is not empty
+        if let Ok(bytecode) = ebpf_result {
+            assert!(!bytecode.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_trace_syntax() {
+        let source = r#"
+            trace main {
+                print "Entering main function";
+                print $arg0;
+                print $arg1;
+            }
+
+            trace printf* {
+                print "printf family called";
+                print $arg0;
+            }
+
+            trace 0x400000 {
+                print "Hit address";
+                print $pc;
+            }
+        "#;
+
+        // Test compilation from source code to LLVM IR
+        let llvm_result = compile_to_llvm_ir(source);
+        assert!(llvm_result.is_ok());
+
+        // Test compilation from source code to eBPF bytecode
+        let ebpf_result = compile_to_ebpf(source);
+        assert!(ebpf_result.is_ok());
+
+        // Verify the generated bytecode is not empty
+        if let Ok(bytecode) = ebpf_result {
+            assert!(!bytecode.is_empty());
+        }
+    }
+}

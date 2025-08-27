@@ -1,0 +1,20 @@
+[package]
+name = "ghostscope"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ghostscope-compiler = { path = "../ghostscope-compiler" }
+ghostscope-frontend = { path = "../ghostscope-frontend" }
+ghostscope-loader = { path = "../ghostscope-loader" }
+ghostscope-ui = { path = "../ghostscope-ui" }
+ghostscope-binary = { path = "../ghostscope-binary" }
+dirs = "5.0"
+libc = "0.2"
+clap = { version = "4.0", features = ["derive"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-log = { workspace = true }
+thiserror = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
