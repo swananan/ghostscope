@@ -9,36 +9,68 @@ use session::DebugSession;
 use tracing::{error, info, warn};
 
 #[tokio::main]
-async fn main() {
-    // Parse command line arguments
+async fn main() -> Result<()> {
+    // Step 1: Parse and validate command line arguments
     let parsed_args = args::Args::parse_args();
 
-    // Initialize logging with optional custom log file path
+    // Initialize logging first so we can use it for validation
     let log_file_path = parsed_args.log_file.as_ref().and_then(|p| p.to_str());
     if let Err(e) = logging::initialize_logging(log_file_path) {
         eprintln!("Failed to initialize logging: {}", e);
-        return;
+        return Err(anyhow::anyhow!("Failed to initialize logging: {}", e));
     }
 
-    // Display startup information
-    info!("{}", ghostscope_compiler::hello());
-    info!("{}", ghostscope_frontend::hello());
-    info!("{}", ghostscope_loader::hello());
-    info!("{}", ghostscope_ui::hello());
+    // Step 1.1: Validate arguments immediately
+    validate_arguments(&parsed_args)?;
+
+    // Step 2: Validate PID existence if specified
+    if let Some(pid) = parsed_args.pid {
+        if !is_pid_running(pid) {
+            return Err(anyhow::anyhow!(
+                "Process with PID {} is not running. Use 'ps -p {}' to verify the process exists",
+                pid,
+                pid
+            ));
+        }
+        info!("✓ Target PID {} is running", pid);
+    }
+
+    // Step 3: Parse and validate script syntax early
+    let script_content = get_script_content(&parsed_args)?;
+    let parsed_script = parse_and_validate_script(&script_content)?;
+
+    let trace_count = parsed_script
+        .statements
+        .iter()
+        .filter(|stmt| matches!(stmt, ghostscope_compiler::ast::Statement::TracePoint { .. }))
+        .count();
+    info!(
+        "✓ Script parsing successful, found {} trace patterns",
+        trace_count
+    );
+
+    // Step 4: Initialize and prepare DWARF information for efficient queries
+    // This creates the debug session with optimized DWARF processing
+    info!("Initializing debug session and DWARF information processing...");
 
     // Create debug session
-    let mut session = match DebugSession::new(&parsed_args) {
-        Ok(session) => session,
-        Err(e) => {
-            error!("Failed to create debug session: {}", e);
-            return;
-        }
-    };
+    let mut session = DebugSession::new(&parsed_args)
+        .map_err(|e| anyhow::anyhow!("Failed to create debug session: {}", e))?;
+
+    // Save AST to file if requested (after session creation so we have target info)
+    if parsed_args.should_save_ast {
+        save_ast_to_file(
+            &parsed_script,
+            session.target_pid,
+            binary_path_for_session(&session).as_deref(),
+        )?;
+    }
 
     // Display parsed arguments and session info
     info!("Debug session created");
     info!("Save LLVM IR files: {}", parsed_args.should_save_llvm_ir);
     info!("Save eBPF bytecode files: {}", parsed_args.should_save_ebpf);
+    info!("Save AST files: {}", parsed_args.should_save_ast);
 
     if let Some(ref binary) = session.target_binary {
         info!("Target binary: {}", binary);
@@ -71,27 +103,20 @@ async fn main() {
                 }
             }
             None => {
-                error!("✗ Binary analysis failed!");
-                error!("Cannot proceed without binary information for PID or binary path.");
-                error!("Possible solutions:");
-                error!(
-                    "1. Check that PID {} exists: ps -p {}",
+                return Err(anyhow::anyhow!(
+                    "Binary analysis failed! Cannot proceed without binary information for PID or binary path. \
+                    Possible solutions: 1. Check that PID {} exists: ps -p {}, \
+                    2. Check binary path permissions, 3. Run with sudo if needed for process access",
                     parsed_args.pid.unwrap_or(0),
                     parsed_args.pid.unwrap_or(0)
-                );
-                error!("2. Check binary path permissions");
-                error!("3. Run with sudo if needed for process access");
-                return;
+                ));
             }
         }
     } else {
         info!("No target binary or PID specified - running in standalone mode");
     }
 
-    // Check for script parameter
-    if parsed_args.script.is_some() || parsed_args.script_file.is_some() {
-        info!("Script provided via command line arguments");
-    }
+    // Script has been validated and parsed successfully in Step 3
 
     // Show available functions if we have binary analysis and no target function specified
     if let Some(_debug_info) = session.get_debug_info() {
@@ -109,41 +134,8 @@ async fn main() {
         }
     }
 
-    // Get script content from arguments or default
-    let script_content = match (&parsed_args.script, &parsed_args.script_file) {
-        (Some(script), _) => {
-            info!("Using inline script from command line");
-            script.clone()
-        }
-        (None, Some(script_file)) => {
-            info!("Loading script from file: {}", script_file.display());
-            match std::fs::read_to_string(script_file) {
-                Ok(content) => content,
-                Err(e) => {
-                    error!(
-                        "Failed to read script file '{}': {}",
-                        script_file.display(),
-                        e
-                    );
-                    return;
-                }
-            }
-        }
-        (None, None) => {
-            warn!("No script provided, using default trace example");
-            r#"
-                trace main {
-                    print "Entering main function";
-                    print $arg0;
-                    print $arg1;
-                }
-            "#
-            .to_string()
-        }
-    };
-
-    info!("Starting GhostScope with script");
-    info!("Script content:\n{}", script_content);
+    // Script content and parsed AST are already available from Step 3
+    info!("Starting GhostScope with validated script");
 
     // Note: LLVM IR generation is now unified with eBPF compilation
     // Each trace pattern will save its IR file during eBPF compilation
@@ -162,8 +154,16 @@ async fn main() {
     };
     let binary_path_for_naming = binary_path_string.as_deref();
 
-    match ghostscope_compiler::compile_to_uprobe_configs(
-        &script_content,
+    // Step 5: Generate LLVM IR using pre-parsed AST with optimized DWARF queries
+    // Now we use the already validated parsed_script instead of re-parsing
+    info!("Generating LLVM IR with optimized DWARF information access...");
+    info!(
+        "Using pre-validated AST with {} statements",
+        parsed_script.statements.len()
+    );
+
+    match ghostscope_compiler::compile_ast_to_uprobe_configs(
+        &parsed_script, // Use pre-parsed AST instead of re-parsing
         session.target_pid,
         binary_path_for_naming,
         parsed_args.should_save_llvm_ir,
@@ -212,8 +212,9 @@ async fn main() {
                 } else if let Some(ref binary_path) = session.target_binary {
                     binary_path.clone()
                 } else {
-                    error!("No target binary available for address resolution");
-                    return;
+                    return Err(anyhow::anyhow!(
+                        "No target binary available for address resolution"
+                    ));
                 };
 
                 for (i, config) in uprobe_configs.iter_mut().enumerate() {
@@ -418,18 +419,20 @@ async fn main() {
                             );
                         }
                         Err(e) => {
-                            error!("Failed to attach uprobes: {}", e);
-                            info!("Possible reasons:");
-                            info!("1. Need root permissions (run with sudo)");
-                            info!("2. Target binary doesn't exist or lacks debug info");
-                            info!("3. Process not running or PID invalid");
-                            info!("4. Function addresses not accessible");
-                            return;
+                            return Err(anyhow::anyhow!(
+                                "Failed to attach uprobes: {}. Possible reasons: \
+                                1. Need root permissions (run with sudo), \
+                                2. Target binary doesn't exist or lacks debug info, \
+                                3. Process not running or PID invalid, \
+                                4. Function addresses not accessible",
+                                e
+                            ));
                         }
                     }
                 } else {
-                    warn!("No uprobe configurations created - nothing to attach");
-                    return;
+                    return Err(anyhow::anyhow!(
+                        "No uprobe configurations created - nothing to attach"
+                    ));
                 }
             } else {
                 info!("No trace points found in script - using legacy behavior");
@@ -450,12 +453,236 @@ async fn main() {
             // trace pattern extraction and multiple uprobe support
 
             // Start event monitoring loop
-            if let Err(e) = session.start_monitoring().await {
-                error!("Event monitoring failed: {}", e);
-            }
+            session
+                .start_monitoring()
+                .await
+                .map_err(|e| anyhow::anyhow!("Event monitoring failed: {}", e))?;
+
+            Ok(())
         }
-        Err(e) => {
-            error!("eBPF compilation failed: {:?}", e);
+        Err(e) => Err(anyhow::anyhow!("eBPF compilation failed: {:?}", e)),
+    }
+}
+
+/// Validate command line arguments for consistency and completeness
+fn validate_arguments(args: &ParsedArgs) -> Result<()> {
+    // Must have either PID or binary path for meaningful operation
+    if args.pid.is_none() && args.binary_path.is_none() {
+        warn!("No target PID or binary path specified - running in standalone mode");
+    }
+
+    // Cannot specify both PID and binary simultaneously
+    if args.pid.is_some() && args.binary_path.is_some() {
+        return Err(anyhow::anyhow!(
+            "Cannot specify both PID (-p) and binary path simultaneously. Choose one target method."
+        ));
+    }
+
+    // Script file must exist if specified
+    if let Some(script_file) = &args.script_file {
+        if !script_file.exists() {
+            return Err(anyhow::anyhow!(
+                "Script file does not exist: {}",
+                script_file.display()
+            ));
+        }
+        if !script_file.is_file() {
+            return Err(anyhow::anyhow!(
+                "Script path is not a file: {}",
+                script_file.display()
+            ));
         }
     }
+
+    // Debug file must exist if specified
+    if let Some(debug_file) = &args.debug_file {
+        if !debug_file.exists() {
+            return Err(anyhow::anyhow!(
+                "Debug file does not exist: {}",
+                debug_file.display()
+            ));
+        }
+    }
+
+    info!("✓ Command line arguments validated successfully");
+    Ok(())
+}
+
+/// Check if a process with given PID is currently running
+fn is_pid_running(pid: u32) -> bool {
+    use std::path::Path;
+
+    // On Linux, check if /proc/PID exists and is a directory
+    let proc_path = format!("/proc/{}", pid);
+    Path::new(&proc_path).is_dir()
+}
+
+/// Get script content from arguments or provide default
+fn get_script_content(args: &ParsedArgs) -> Result<String> {
+    match (&args.script, &args.script_file) {
+        (Some(script), _) => {
+            info!("Using inline script from command line");
+            Ok(script.clone())
+        }
+        (None, Some(script_file)) => {
+            info!("Loading script from file: {}", script_file.display());
+            std::fs::read_to_string(script_file).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to read script file '{}': {}",
+                    script_file.display(),
+                    e
+                )
+            })
+        }
+        (None, None) => {
+            warn!("No script provided, using default trace example");
+            Ok(r#"
+                trace main {
+                    print "Entering main function";
+                    print $arg0;
+                    print $arg1;
+                }
+            "#
+            .to_string())
+        }
+    }
+}
+
+/// Parse and validate script syntax, return AST
+fn parse_and_validate_script(script_content: &str) -> Result<ghostscope_compiler::ast::Program> {
+    info!("Parsing script content:\n{}", script_content);
+
+    // Use ghostscope_compiler directly to parse the script
+    match ghostscope_compiler::parser::parse(script_content) {
+        Ok(ast) => {
+            // Additional validation
+            if ast.statements.is_empty() {
+                return Err(anyhow::anyhow!("Script contains no statements"));
+            }
+
+            // Count trace patterns
+            let trace_count = ast
+                .statements
+                .iter()
+                .filter(|stmt| {
+                    matches!(stmt, ghostscope_compiler::ast::Statement::TracePoint { .. })
+                })
+                .count();
+
+            if trace_count == 0 {
+                return Err(anyhow::anyhow!("Script contains no trace patterns"));
+            }
+
+            // Validate each statement
+            for (i, stmt) in ast.statements.iter().enumerate() {
+                validate_statement(i, stmt)?;
+            }
+
+            Ok(ast)
+        }
+        Err(e) => Err(anyhow::anyhow!("Script parsing error: {}", e)),
+    }
+}
+
+/// Validate individual statement for semantic correctness
+fn validate_statement(index: usize, stmt: &ghostscope_compiler::ast::Statement) -> Result<()> {
+    match stmt {
+        ghostscope_compiler::ast::Statement::TracePoint { pattern, body } => {
+            // Validate trace pattern
+            match pattern {
+                ghostscope_compiler::ast::TracePattern::FunctionName(name) => {
+                    if name.is_empty() {
+                        return Err(anyhow::anyhow!(
+                            "Statement {}: function name cannot be empty",
+                            index
+                        ));
+                    }
+                    if name.contains(' ') {
+                        return Err(anyhow::anyhow!(
+                            "Statement {}: function name '{}' contains spaces",
+                            index,
+                            name
+                        ));
+                    }
+                }
+                ghostscope_compiler::ast::TracePattern::Wildcard(pattern) => {
+                    if pattern.is_empty() {
+                        return Err(anyhow::anyhow!(
+                            "Statement {}: wildcard pattern cannot be empty",
+                            index
+                        ));
+                    }
+                }
+                ghostscope_compiler::ast::TracePattern::Address(addr) => {
+                    if *addr == 0 {
+                        return Err(anyhow::anyhow!(
+                            "Statement {}: address cannot be zero",
+                            index
+                        ));
+                    }
+                }
+                ghostscope_compiler::ast::TracePattern::SourceLine {
+                    file_path,
+                    line_number,
+                } => {
+                    if file_path.is_empty() {
+                        return Err(anyhow::anyhow!(
+                            "Statement {}: source file path cannot be empty",
+                            index
+                        ));
+                    }
+                    if *line_number == 0 {
+                        return Err(anyhow::anyhow!(
+                            "Statement {}: line number cannot be zero",
+                            index
+                        ));
+                    }
+                }
+            }
+
+            // Validate statements
+            if body.is_empty() {
+                warn!("Statement {}: no statements defined in trace block", index);
+            }
+        }
+        _ => {
+            // Other statement types are generally valid
+        }
+    }
+
+    Ok(())
+}
+
+/// Get binary path for file naming from session
+fn binary_path_for_session(session: &DebugSession) -> Option<String> {
+    if let Some(ref analyzer) = session.binary_analyzer {
+        Some(
+            analyzer
+                .debug_info()
+                .binary_path
+                .to_string_lossy()
+                .to_string(),
+        )
+    } else {
+        session.target_binary.clone()
+    }
+}
+
+/// Save AST to file with consistent naming
+fn save_ast_to_file(
+    ast: &ghostscope_compiler::ast::Program,
+    pid: Option<u32>,
+    binary_path: Option<&str>,
+) -> Result<()> {
+    let file_base_name = ghostscope_compiler::generate_file_name_for_ast(pid, binary_path);
+    let ast_filename = format!("{}.ast", file_base_name);
+
+    // Format AST as pretty-printed JSON or debug format
+    let ast_content = format!("{:#?}", ast);
+
+    std::fs::write(&ast_filename, ast_content)
+        .map_err(|e| anyhow::anyhow!("Failed to save AST to '{}': {}", ast_filename, e))?;
+
+    info!("AST saved to '{}'", ast_filename);
+    Ok(())
 }

@@ -338,20 +338,20 @@ pub fn compile_to_llvm_ir(source: &str) -> Result<String> {
     }
 }
 
-/// Compile source code to eBPF bytecode for multiple trace patterns
+/// Compile pre-parsed AST to eBPF bytecode for multiple trace patterns
 /// Returns UProbeConfig for each trace pattern with individual eBPF bytecode
-pub fn compile_to_uprobe_configs(
-    source: &str,
+pub fn compile_ast_to_uprobe_configs(
+    program: &Program,
     pid: Option<u32>,
     binary_path: Option<&str>,
     save_ir: bool,
     binary_analyzer: Option<&ghostscope_binary::BinaryAnalyzer>,
 ) -> Result<Vec<UProbeConfig>> {
-    info!("Starting eBPF compilation for multiple trace patterns...");
-
-    // Parse the source code
-    let program = parser::parse(source)?;
-    info!("Successfully parsed program: {:?}", program);
+    info!("Starting eBPF compilation from pre-parsed AST for multiple trace patterns...");
+    info!(
+        "Using pre-validated AST with {} statements",
+        program.statements.len()
+    );
 
     // Extract trace patterns with their statements
     let mut trace_patterns_with_statements = Vec::new();
@@ -624,6 +624,25 @@ pub fn compile_to_uprobe_configs(
     Ok(uprobe_configs)
 }
 
+/// Compile source code to eBPF bytecode for multiple trace patterns (legacy interface)
+/// Returns UProbeConfig for each trace pattern with individual eBPF bytecode
+/// This function parses the source and then calls compile_ast_to_uprobe_configs
+pub fn compile_to_uprobe_configs(
+    source: &str,
+    pid: Option<u32>,
+    binary_path: Option<&str>,
+    save_ir: bool,
+    binary_analyzer: Option<&ghostscope_binary::BinaryAnalyzer>,
+) -> Result<Vec<UProbeConfig>> {
+    info!("Starting eBPF compilation for multiple trace patterns (legacy interface)...");
+
+    // Parse the source code
+    let program = parser::parse(source)?;
+
+    // Call the new function with pre-parsed AST
+    compile_ast_to_uprobe_configs(&program, pid, binary_path, save_ir, binary_analyzer)
+}
+
 /// Compile source code to eBPF bytecode
 /// Also returns extracted trace points for the caller to use
 pub fn compile_to_ebpf_with_trace_points(source: &str) -> Result<(Vec<u8>, Vec<TracePoint>)> {
@@ -698,6 +717,19 @@ pub fn format_ebpf_bytecode(bytecode: &[u8]) -> String {
     }
 
     result
+}
+
+/// Generate file name for AST files
+pub fn generate_file_name_for_ast(pid: Option<u32>, binary_path: Option<&str>) -> String {
+    let pid_part = pid
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let exec_part = binary_path
+        .and_then(|path| std::path::Path::new(path).file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or("unknown");
+
+    format!("gs_{}_{}_{}", pid_part, exec_part, "ast")
 }
 
 #[cfg(test)]

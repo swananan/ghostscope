@@ -58,6 +58,14 @@ pub struct Args {
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub no_save_ebpf: bool,
 
+    /// Save AST files for each trace pattern (debug: true, release: false)
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub save_ast: bool,
+
+    /// Disable saving AST files (overrides default behavior)
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub no_save_ast: bool,
+
     /// Remaining arguments (when using --args)
     pub remaining: Vec<String>,
 }
@@ -73,6 +81,7 @@ pub struct ParsedArgs {
     pub pid: Option<u32>,
     pub should_save_llvm_ir: bool,
     pub should_save_ebpf: bool,
+    pub should_save_ast: bool,
 }
 
 impl Args {
@@ -101,6 +110,7 @@ impl Args {
 
             let should_save_llvm_ir = Self::should_save_llvm_ir(&parsed);
             let should_save_ebpf = Self::should_save_ebpf(&parsed);
+            let should_save_ast = Self::should_save_ast(&parsed);
 
             ParsedArgs {
                 binary_path,
@@ -112,6 +122,7 @@ impl Args {
                 pid: parsed.pid,
                 should_save_llvm_ir,
                 should_save_ebpf,
+                should_save_ast,
             }
         } else {
             // Normal parsing without --args
@@ -119,6 +130,7 @@ impl Args {
 
             let should_save_llvm_ir = Self::should_save_llvm_ir(&parsed);
             let should_save_ebpf = Self::should_save_ebpf(&parsed);
+            let should_save_ast = Self::should_save_ast(&parsed);
 
             ParsedArgs {
                 binary_path: parsed.binary,
@@ -130,6 +142,7 @@ impl Args {
                 pid: parsed.pid,
                 should_save_llvm_ir,
                 should_save_ebpf,
+                should_save_ast,
             }
         }
     }
@@ -151,6 +164,18 @@ impl Args {
         if parsed.no_save_ebpf {
             false
         } else if parsed.save_ebpf {
+            true
+        } else {
+            // Default behavior: debug = true, release = false
+            cfg!(debug_assertions)
+        }
+    }
+
+    /// Determine whether to save AST files based on arguments and build type
+    fn should_save_ast(parsed: &Args) -> bool {
+        if parsed.no_save_ast {
+            false
+        } else if parsed.save_ast {
             true
         } else {
             // Default behavior: debug = true, release = false
