@@ -3,7 +3,9 @@ use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(name = "ghostscope")]
-#[command(about = "A gdb-like eBPF debugger with TUI interface")]
+#[command(
+    about = "A DWARF-friendly eBPF userspace probe with gdb-like TUI, built in 100% safe Rust"
+)]
 #[command(version = "0.1.0")]
 pub struct Args {
     /// Binary file to debug (path or name)

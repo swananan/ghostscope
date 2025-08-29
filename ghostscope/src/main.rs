@@ -10,17 +10,6 @@ use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() {
-    // Root check disabled for debugging
-    // if !is_root() {
-    //     eprintln!("Error: GhostScope requires root privileges to load eBPF programs.");
-    //     eprintln!("Please run with sudo:");
-    //     eprintln!("  sudo ./target/debug/ghostscope [OPTIONS] <target_binary> [binary_args...]");
-    //     eprintln!("Example:");
-    //     eprintln!("  sudo ./target/debug/ghostscope --function main /bin/ls -la");
-    //     eprintln!("  sudo ./target/debug/ghostscope --args /bin/cat file.txt");
-    //     std::process::exit(1);
-    // }
-
     // Parse command line arguments
     let parsed_args = args::Args::parse_args();
 
@@ -469,9 +458,4 @@ async fn main() {
             error!("eBPF compilation failed: {:?}", e);
         }
     }
-}
-
-/// Check if the program is running with root privileges
-fn is_root() -> bool {
-    unsafe { libc::geteuid() == 0 }
 }
