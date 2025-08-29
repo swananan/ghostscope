@@ -1,5 +1,6 @@
 pub mod ast;
 pub mod codegen;
+pub mod debug_logger;
 pub mod map;
 pub mod parser;
 

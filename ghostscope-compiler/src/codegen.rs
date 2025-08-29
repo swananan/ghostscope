@@ -17,11 +17,12 @@ use std::collections::HashMap;
 use tracing::{debug, error, info, warn};
 
 use crate::ast::{BinaryOp, Expr, Program, Statement, VarType, VariableContext};
+use crate::debug_logger::DebugLogger;
 use crate::map::{MapError, MapManager};
 use ghostscope_binary::dwarf::{
     DwarfEncoding, DwarfType, EnhancedVariableLocation, LocationExpression,
 };
-use ghostscope_protocol::{consts, log_levels, MessageType};
+use ghostscope_protocol::{consts, MessageType, TypeEncoding};
 
 pub struct CodeGen<'ctx> {
     context: &'ctx Context,
@@ -31,9 +32,11 @@ pub struct CodeGen<'ctx> {
     compile_unit: inkwell::debug_info::DICompileUnit<'ctx>,
     variables: HashMap<String, PointerValue<'ctx>>,
     var_types: HashMap<String, VarType>, // Track variable types
+    optimized_out_vars: HashMap<String, bool>, // Track which variables are optimized out
     map_manager: MapManager<'ctx>,
     variable_context: Option<VariableContext>, // Variable scope context for validation
     pending_dwarf_variables: Option<Vec<ghostscope_binary::EnhancedVariableLocation>>, // DWARF variables awaiting population
+    debug_logger: DebugLogger<'ctx>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -130,9 +133,11 @@ impl<'ctx> CodeGen<'ctx> {
             compile_unit,
             variables: HashMap::new(),
             var_types: HashMap::new(),
+            optimized_out_vars: HashMap::new(),
             map_manager,
             variable_context: None, // Will be set later when trace point context is available
             pending_dwarf_variables: None, // Will be set when DWARF variables are prepared
+            debug_logger: DebugLogger::new(context),
         }
     }
 
@@ -252,6 +257,8 @@ impl<'ctx> CodeGen<'ctx> {
                         "Variable '{}' was optimized out, creating placeholder",
                         var.name
                     );
+                    // Mark this variable as optimized out
+                    self.optimized_out_vars.insert(var.name.clone(), true);
                     self.create_optimized_out_placeholder(&var.name)?
                 }
                 LocationExpression::DwarfExpression { bytecode: _ } => {
@@ -569,9 +576,6 @@ impl<'ctx> CodeGen<'ctx> {
         }
         .map_err(|e| CodeGenError::Builder(e.to_string()))?;
 
-        // Debug: Output variable address in hex format
-        self.generate_debug_hex_output(var_name, user_var_addr)?;
-
         // Convert to pointer for user memory address
         let user_ptr = self
             .builder
@@ -630,9 +634,6 @@ impl<'ctx> CodeGen<'ctx> {
         if let Either::Left(BasicValueEnum::IntValue(result_int)) =
             probe_read_result.try_as_basic_value()
         {
-            // Debug: Output bpf_probe_read_user return value
-            self.generate_debug_probe_read_result(var_name, result_int)?;
-
             // Check if bpf_probe_read_user failed (non-zero return value)
             let zero_value = i64_type.const_int(0, false);
             let is_error = self
@@ -718,15 +719,16 @@ impl<'ctx> CodeGen<'ctx> {
             var_name, offset
         );
 
-        // Frame base is typically RBP (register 6)
-        // This is similar to stack access but uses RBP instead of RSP
+        // Frame base calculation for DW_OP_fbreg
+        // TODO: Replace with full CFI parsing - this is a simplified assumption
+        // In standard x86_64 calling convention after prologue: frame_base = RBP + 16
+        // (RBP points to saved RBP, return address is at RBP+8, so locals start at RBP+16)
         let i64_type = self.context.i64_type();
         let i32_type = self.context.i32_type();
         let ptr_type = self.context.ptr_type(AddressSpace::default());
 
-        // Get RBP from pt_regs - RBP is at offset 6 in the pt_regs array (not bytes, but register slots)
+        // Get RBP from pt_regs - RBP is at offset 4 in the pt_regs array
         // pt_regs structure: [r15, r14, r13, r12, rbp, rbx, r11, r10, r9, r8, rax, rcx, rdx, rsi, rdi, orig_rax, rip, cs, eflags, rsp, ss]
-        // RBP is at index 4 (0-indexed), so offset = 4 * 8 = 32 bytes
         let rbp_index = self.context.i64_type().const_int(4, false); // RBP is 4th register in pt_regs
         let rbp_ptr = unsafe {
             self.builder
@@ -740,22 +742,26 @@ impl<'ctx> CodeGen<'ctx> {
             .map_err(|e| CodeGenError::Builder(e.to_string()))?
             .into_int_value();
 
-        // Calculate variable address (RBP + offset)
-        let var_offset_const = self.context.i64_type().const_int(offset as u64, offset < 0);
+        // Debug: Generate eBPF bpf_trace_printk for RBP value
+        self.generate_rbp_trace_printk(var_name, rbp_value)?;
+
+        // EXPERIMENTAL: Try different frame base interpretations
+        // Problem: DW_OP_fbreg might be relative to RBP directly, not RBP+16
+        // Let's try both approaches and see which gives non-zero addresses
+
+        // Approach 1: Direct RBP + offset (traditional interpretation)
+        let var_offset_const = self
+            .context
+            .i64_type()
+            .const_int(offset.unsigned_abs(), offset < 0);
         let user_var_addr = if offset >= 0 {
             self.builder
                 .build_int_add(rbp_value, var_offset_const, &format!("{}_addr", var_name))
         } else {
-            self.builder.build_int_sub(
-                rbp_value,
-                var_offset_const.const_neg(),
-                &format!("{}_addr", var_name),
-            )
+            self.builder
+                .build_int_sub(rbp_value, var_offset_const, &format!("{}_addr", var_name))
         }
         .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-        // Debug: Output variable address in hex format
-        self.generate_debug_hex_output(var_name, user_var_addr)?;
 
         // Convert to pointer for user memory address
         let user_ptr = self
@@ -815,9 +821,6 @@ impl<'ctx> CodeGen<'ctx> {
         if let Either::Left(BasicValueEnum::IntValue(result_int)) =
             probe_read_result.try_as_basic_value()
         {
-            // Debug: Output bpf_probe_read_user return value
-            self.generate_debug_probe_read_result(var_name, result_int)?;
-
             // Check if bpf_probe_read_user failed (non-zero return value)
             let zero_value = i64_type.const_int(0, false);
             let is_error = self
@@ -909,9 +912,6 @@ impl<'ctx> CodeGen<'ctx> {
         // Convert address to pointer for user memory
         let addr_const = self.context.i64_type().const_int(address, false);
 
-        // Debug: Output variable address in hex format
-        self.generate_debug_hex_output(var_name, addr_const)?;
-
         let user_ptr = self
             .builder
             .build_int_to_ptr(addr_const, ptr_type, &format!("{}_user_ptr", var_name))
@@ -965,9 +965,6 @@ impl<'ctx> CodeGen<'ctx> {
         if let Either::Left(BasicValueEnum::IntValue(result_int)) =
             probe_read_result.try_as_basic_value()
         {
-            // Debug: Output bpf_probe_read_user return value
-            self.generate_debug_probe_read_result(var_name, result_int)?;
-
             // Check if bpf_probe_read_user failed (non-zero return value)
             let zero_value = i64_type.const_int(0, false);
             let is_error = self
@@ -1845,8 +1842,17 @@ impl<'ctx> CodeGen<'ctx> {
 
         info!("Sending variable data: {} (type: {:?})", var_name, var_type);
 
-        // Build protocol message
-        self.build_and_send_protocol_message(var_name, &var_type, var_ptr)
+        // Check if variable is optimized out and handle separately
+        if *self.optimized_out_vars.get(var_name).unwrap_or(&false) {
+            info!(
+                "Variable '{}' is optimized out, sending OptimizedOut protocol message",
+                var_name
+            );
+            self.build_and_send_optimized_out_message(var_name, &var_type)
+        } else {
+            // Build protocol message for normal variables
+            self.build_and_send_protocol_message(var_name, &var_type, var_ptr)
+        }
     }
 
     /// Build and send protocol format message
@@ -1867,6 +1873,34 @@ impl<'ctx> CodeGen<'ctx> {
 
         // Build variable entry (VariableEntry + variable name + data)
         self.build_variable_entry(msg_storage, var_name, var_type, var_ptr)?;
+
+        // Calculate actual message length and update header
+        let total_len = self.calculate_message_length(var_name, var_type);
+        self.update_message_length(msg_storage, total_len)?;
+
+        // Send to ringbuf
+        self.create_ringbuf_output(msg_storage, total_len as u64)?;
+
+        Ok(())
+    }
+
+    /// Build and send optimized-out variable message (no bpf_probe_read_user calls)
+    fn build_and_send_optimized_out_message(
+        &mut self,
+        var_name: &str,
+        var_type: &VarType,
+    ) -> Result<()> {
+        // Create protocol message storage area
+        let msg_storage = self.create_protocol_message_storage();
+
+        // Build message header (MessageHeader: 8 bytes)
+        self.build_message_header(msg_storage)?;
+
+        // Build variable data message body (VariableDataMessage: 28 bytes)
+        self.build_variable_data_header(msg_storage)?;
+
+        // Build variable entry for optimized-out variable (no memory read)
+        self.build_optimized_out_variable_entry(msg_storage, var_name, var_type)?;
 
         // Calculate actual message length and update header
         let total_len = self.calculate_message_length(var_name, var_type);
@@ -2117,8 +2151,13 @@ impl<'ctx> CodeGen<'ctx> {
 
         // VariableEntry: [name_len:u8, type_encoding:u8, data_len:u16]
         let name_len = i8_type.const_int(var_name.len() as u64, false);
-        let type_encoding = i8_type.const_int(self.get_type_encoding(var_type), false);
-        let data_len = i16_type.const_int(8, false); // Assume all are 8-byte data
+        let type_encoding = i8_type.const_int(self.get_type_encoding(var_name, var_type), false);
+        // Set data length based on whether variable is optimized out
+        let data_len = if *self.optimized_out_vars.get(var_name).unwrap_or(&false) {
+            i16_type.const_int(0, false) // Optimized out variables have no data
+        } else {
+            i16_type.const_int(8, false) // Normal variables are 8-byte data
+        };
 
         // Write name_len
         let name_len_ptr = unsafe {
@@ -2205,33 +2244,142 @@ impl<'ctx> CodeGen<'ctx> {
         }
 
         // Write variable data (read from DWARF storage location)
-        let data_offset: usize = name_offset + var_name.len();
-        let var_value = self
-            .builder
-            .build_load(i64_type, var_ptr, "var_value")
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        // Skip data writing for optimized-out variables
+        if !*self.optimized_out_vars.get(var_name).unwrap_or(&false) {
+            let data_offset: usize = name_offset + var_name.len();
+            let var_value = self
+                .builder
+                .build_load(i64_type, var_ptr, "var_value")
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
 
-        let data_ptr = unsafe {
+            let data_ptr = unsafe {
+                self.builder
+                    .build_gep(
+                        i8_type,
+                        buffer,
+                        &[self.context.i32_type().const_int(data_offset as u64, false)],
+                        "data_ptr",
+                    )
+                    .map_err(|e| CodeGenError::Builder(e.to_string()))?
+            };
+            let data_cast = self
+                .builder
+                .build_pointer_cast(
+                    data_ptr,
+                    self.context.ptr_type(AddressSpace::default()),
+                    "data_cast",
+                )
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            self.builder
+                .build_store(data_cast, var_value)
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        }
+
+        Ok(())
+    }
+
+    /// Build variable entry for optimized-out variables (no memory access)
+    fn build_optimized_out_variable_entry(
+        &mut self,
+        buffer: PointerValue<'ctx>,
+        var_name: &str,
+        _var_type: &VarType,
+    ) -> Result<()> {
+        let i8_type = self.context.i8_type();
+        let i16_type = self.context.i16_type();
+
+        let entry_offset: usize = 36; // MessageHeader(8) + VariableDataMessage(28)
+
+        // VariableEntry: [name_len:u8, type_encoding:u8, data_len:u16]
+        let name_len = i8_type.const_int(var_name.len() as u64, false);
+        let type_encoding = i8_type.const_int(TypeEncoding::OptimizedOut as u64, false);
+        let data_len = i16_type.const_int(0, false); // Optimized out variables have no data
+
+        // Write name_len
+        let name_len_ptr = unsafe {
             self.builder
                 .build_gep(
                     i8_type,
                     buffer,
-                    &[self.context.i32_type().const_int(data_offset as u64, false)],
-                    "data_ptr",
+                    &[self
+                        .context
+                        .i32_type()
+                        .const_int(entry_offset as u64, false)],
+                    "name_len_ptr",
                 )
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?
         };
-        let data_cast = self
+        self.builder
+            .build_store(name_len_ptr, name_len)
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        // Write type_encoding
+        let type_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    i8_type,
+                    buffer,
+                    &[self
+                        .context
+                        .i32_type()
+                        .const_int((entry_offset + 1) as u64, false)],
+                    "type_ptr",
+                )
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?
+        };
+        self.builder
+            .build_store(type_ptr, type_encoding)
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        // Write data_len
+        let data_len_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    i8_type,
+                    buffer,
+                    &[self
+                        .context
+                        .i32_type()
+                        .const_int((entry_offset + 2) as u64, false)],
+                    "data_len_ptr",
+                )
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?
+        };
+        let data_len_cast = self
             .builder
             .build_pointer_cast(
-                data_ptr,
+                data_len_ptr,
                 self.context.ptr_type(AddressSpace::default()),
-                "data_cast",
+                "data_len_cast",
             )
             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
         self.builder
-            .build_store(data_cast, var_value)
+            .build_store(data_len_cast, data_len)
             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        // Write variable name
+        let name_offset: usize = entry_offset + 4;
+        for (i, byte) in var_name.as_bytes().iter().enumerate() {
+            let char_ptr = unsafe {
+                self.builder
+                    .build_gep(
+                        i8_type,
+                        buffer,
+                        &[self
+                            .context
+                            .i32_type()
+                            .const_int((name_offset + i) as u64, false)],
+                        &format!("name_char_{}", i),
+                    )
+                    .map_err(|e| CodeGenError::Builder(e.to_string()))?
+            };
+            let char_val = i8_type.const_int(*byte as u64, false);
+            self.builder
+                .build_store(char_ptr, char_val)
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        }
+
+        // No data section for optimized-out variables
 
         Ok(())
     }
@@ -2242,7 +2390,12 @@ impl<'ctx> CodeGen<'ctx> {
         let msg_body_len: usize = 28; // VariableDataMessage
         let entry_len: usize = 4; // VariableEntry
         let name_len: usize = var_name.len(); // Variable name
-        let data_len: usize = 8; // Data length (assume 8 bytes)
+                                              // Optimized-out variables have 0 data length, normal variables have 8 bytes
+        let data_len: usize = if *self.optimized_out_vars.get(var_name).unwrap_or(&false) {
+            0
+        } else {
+            8
+        };
 
         (header_len + msg_body_len + entry_len + name_len + data_len) as u32
     }
@@ -2279,11 +2432,16 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     /// Get type encoding
-    fn get_type_encoding(&self, var_type: &VarType) -> u64 {
+    fn get_type_encoding(&self, var_name: &str, var_type: &VarType) -> u64 {
+        // Check if this variable is optimized out
+        if *self.optimized_out_vars.get(var_name).unwrap_or(&false) {
+            return TypeEncoding::OptimizedOut as u64;
+        }
+
         match var_type {
-            VarType::Int => 0x08,    // I64
-            VarType::Float => 0x0A,  // F64
-            VarType::String => 0x51, // String
+            VarType::Int => TypeEncoding::I64 as u64,
+            VarType::Float => TypeEncoding::F64 as u64,
+            VarType::String => TypeEncoding::String as u64,
         }
     }
 
@@ -2594,186 +2752,6 @@ impl<'ctx> CodeGen<'ctx> {
                 "Expected integer value from timestamp".to_string(),
             ))
         }
-    }
-
-    /// Generate debug output using new log system to print variable address in hex
-    fn generate_debug_hex_output(&mut self, var_name: &str, address: IntValue<'ctx>) -> Result<()> {
-        debug!(
-            "Generating hex debug output for variable '{}' address",
-            var_name
-        );
-
-        // Use new log message system instead of bpf_trace_printk
-        let addr_val = address.get_zero_extended_constant().unwrap_or(0);
-        let debug_msg = format!("var:{} addr:0x{:x}", var_name, addr_val);
-        self.send_log_message(0, &debug_msg)?; // Debug level
-        return Ok(());
-
-        // Fallback to old bpf_trace_printk if needed
-        // Use a simple fixed format that works with eBPF verifier
-        // Format: "addr: 0x%llx\n" - simple and compatible, null-terminated
-        let format_str = "addr: 0x%llx\n\0";
-        let format_bytes = format_str.as_bytes();
-
-        let i8_type = self.context.i8_type();
-        let i64_type = self.context.i64_type();
-        let i32_type = self.context.i32_type();
-        let ptr_type = self.context.ptr_type(AddressSpace::default());
-
-        // Create a global format string (eBPF verifier actually allows this for trace_printk)
-        let array_type = i8_type.array_type(format_bytes.len() as u32);
-        let format_global_name = format!("debug_fmt_{}", var_name);
-
-        // Check if format string already exists to avoid duplicates
-        let format_global = match self.module.get_global(&format_global_name) {
-            Some(existing) => existing,
-            None => {
-                let global = self
-                    .module
-                    .add_global(array_type, None, &format_global_name);
-                global.set_initializer(&self.context.const_string(format_bytes, false));
-                global.set_constant(true);
-                global
-            }
-        };
-
-        // BPF helper function ID for bpf_trace_printk is 6
-        let helper_id = self.context.i64_type().const_int(6, false);
-
-        let helper_fn_type = i64_type.fn_type(
-            &[
-                ptr_type.into(), // fmt
-                i32_type.into(), // fmt_size
-                i64_type.into(), // arg1 (address)
-            ],
-            false,
-        );
-        let fn_ptr_type = self.context.ptr_type(AddressSpace::default());
-
-        let helper_ptr = self
-            .builder
-            .build_int_to_ptr(helper_id, fn_ptr_type, "trace_printk_fn_ptr")
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-        // Cast global format string to ptr
-        let format_ptr = self
-            .builder
-            .build_pointer_cast(format_global.as_pointer_value(), ptr_type, "format_ptr")
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-        let format_size = i32_type.const_int(format_bytes.len() as u64, false);
-
-        // Call bpf_trace_printk(fmt, fmt_size, address)
-        let _ = self
-            .builder
-            .build_indirect_call(
-                helper_fn_type,
-                helper_ptr,
-                &[format_ptr.into(), format_size.into(), address.into()],
-                "debug_print_result",
-            )
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-        Ok(())
-    }
-
-    /// Generate debug output for bpf_probe_read_user return value
-    fn generate_debug_probe_read_result(
-        &mut self,
-        var_name: &str,
-        result_value: IntValue<'ctx>,
-    ) -> Result<()> {
-        debug!(
-            "Generating probe read result debug output for variable '{}'",
-            var_name
-        );
-
-        // Use new log message system instead of bpf_trace_printk
-        let result_val = result_value.get_sign_extended_constant().unwrap_or(-1);
-        let debug_msg = format!("var:{} probe_read_result:{}", var_name, result_val);
-        self.send_log_message(0, &debug_msg)?; // Debug level
-        return Ok(());
-
-        // Fallback to old bpf_trace_printk if needed
-        // Use a simple fixed format that works with eBPF verifier
-        // Format: "probe_read result: %lld\n" - simple and compatible, null-terminated
-        let format_str = "probe_read result: %lld\n\0";
-        let format_bytes = format_str.as_bytes();
-
-        let i8_type = self.context.i8_type();
-        let i64_type = self.context.i64_type();
-        let i32_type = self.context.i32_type();
-        let ptr_type = self.context.ptr_type(AddressSpace::default());
-
-        // Create a global format string (eBPF verifier actually allows this for trace_printk)
-        let array_type = i8_type.array_type(format_bytes.len() as u32);
-        let format_global_name = format!("debug_probe_fmt_{}", var_name);
-
-        // Check if format string already exists to avoid duplicates
-        let format_global = match self.module.get_global(&format_global_name) {
-            Some(existing) => existing,
-            None => {
-                let global = self
-                    .module
-                    .add_global(array_type, None, &format_global_name);
-                global.set_initializer(&self.context.const_string(format_bytes, false));
-                global.set_constant(true);
-                global
-            }
-        };
-
-        // BPF helper function ID for bpf_trace_printk is 6
-        let helper_id = self.context.i64_type().const_int(6, false);
-
-        let helper_fn_type = i64_type.fn_type(
-            &[
-                ptr_type.into(), // fmt
-                i32_type.into(), // fmt_size
-                i64_type.into(), // arg1 (result_value)
-            ],
-            false,
-        );
-        let fn_ptr_type = self.context.ptr_type(AddressSpace::default());
-
-        let helper_ptr = self
-            .builder
-            .build_int_to_ptr(helper_id, fn_ptr_type, "trace_printk_fn_ptr")
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-        // Cast global format string to ptr
-        let format_ptr = self
-            .builder
-            .build_pointer_cast(format_global.as_pointer_value(), ptr_type, "format_ptr")
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-        let format_size = i32_type.const_int(format_bytes.len() as u64, false);
-
-        // Call bpf_trace_printk(fmt, fmt_size, result_value)
-        let _ = self
-            .builder
-            .build_indirect_call(
-                helper_fn_type,
-                helper_ptr,
-                &[format_ptr.into(), format_size.into(), result_value.into()],
-                "debug_probe_result",
-            )
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-        Ok(())
-    }
-
-    /// Send log message using new protocol format (replaces bpf_trace_printk)
-    fn send_log_message(&mut self, log_level: u8, message: &str) -> Result<()> {
-        let msg_storage = self.create_log_message_storage();
-        self.build_log_message_header(msg_storage, log_level, message.len() as u16)?;
-        self.write_message_string(
-            msg_storage,
-            message,
-            consts::MESSAGE_HEADER_SIZE + consts::LOG_MESSAGE_SIZE,
-        )?; // After MessageHeader + LogMessage
-        let total_len = consts::MESSAGE_HEADER_SIZE + consts::LOG_MESSAGE_SIZE + message.len(); // Header + LogMessage + message
-        self.create_ringbuf_output(msg_storage, total_len as u64)?;
-        Ok(())
     }
 
     /// Send execution failure message
@@ -3227,6 +3205,83 @@ impl<'ctx> CodeGen<'ctx> {
             "PID filter added successfully for target PID: {}",
             target_pid
         );
+        Ok(())
+    }
+
+    /// Generate eBPF bpf_trace_printk instruction for RBP debugging
+    /// This directly generates eBPF bytecode without complex borrowing
+    fn generate_rbp_trace_printk(
+        &mut self,
+        var_name: &str,
+        rbp_value: IntValue<'ctx>,
+    ) -> Result<()> {
+        debug!("Generating RBP trace_printk for variable: {}", var_name);
+
+        let i64_type = self.context.i64_type();
+        let i32_type = self.context.i32_type();
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+
+        // Create simplified format string for RBP debug output
+        let format_str = "RBP_DEBUG rbp:0x%llx\n\0";
+        let format_bytes = format_str.as_bytes();
+
+        // Create global format string with unique name
+        let array_type = self.context.i8_type().array_type(format_bytes.len() as u32);
+        let format_global_name = format!("rbp_debug_fmt_{}", var_name.replace(".", "_"));
+
+        debug!("Creating global format string: {}", format_global_name);
+
+        let format_global = self
+            .module
+            .add_global(array_type, None, &format_global_name);
+        format_global.set_initializer(&self.context.const_string(format_bytes, false));
+        format_global.set_constant(true);
+
+        // Create function type for bpf_trace_printk
+        let trace_printk_fn_type = i64_type.fn_type(
+            &[
+                ptr_type.into(), // fmt
+                i32_type.into(), // fmt_size
+                i64_type.into(), // rbp_value
+            ],
+            false,
+        );
+
+        // Create function pointer type
+        let fn_ptr_type = trace_printk_fn_type.ptr_type(AddressSpace::default());
+
+        // Convert BPF helper function ID to function pointer (bpf_trace_printk = 6)
+        let func_id_val = i64_type.const_int(6u64, false);
+        let func_ptr = self
+            .builder
+            .build_int_to_ptr(func_id_val, fn_ptr_type, "trace_printk_fn_ptr")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        // Cast format string to pointer
+        let format_ptr = self
+            .builder
+            .build_pointer_cast(format_global.as_pointer_value(), ptr_type, "rbp_format_ptr")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        let format_size = i32_type.const_int(format_bytes.len() as u64, false);
+
+        debug!(
+            "Calling bpf_trace_printk (helper ID 6) with format_size: {}",
+            format_bytes.len()
+        );
+
+        // Use build_indirect_call like other BPF helper functions
+        let _result = self
+            .builder
+            .build_indirect_call(
+                trace_printk_fn_type,
+                func_ptr,
+                &[format_ptr.into(), format_size.into(), rbp_value.into()],
+                "rbp_debug_call",
+            )
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        debug!("RBP trace_printk call generated successfully");
         Ok(())
     }
 }
