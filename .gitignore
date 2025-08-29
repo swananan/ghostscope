@@ -37,4 +37,6 @@ ghostscope_*
 # Test programs and binaries (not part of Rust project)
 test_program
 test_program.c
+*.c
+CLA*
 kernel.dwarf

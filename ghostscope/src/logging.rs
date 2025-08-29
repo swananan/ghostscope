@@ -8,13 +8,13 @@ const DEFAULT_LOG_FILE: &str = "ghostscope.log";
 
 pub fn initialize_logging(log_file_path: Option<&str>) -> Result<()> {
     eprintln!("Starting logging initialization...");
-    
+
     // Initialize log to tracing adapter to capture aya's log:: output
     match tracing_log::LogTracer::init() {
         Ok(()) => eprintln!("LogTracer initialized successfully"),
         Err(e) => eprintln!("Warning: Failed to initialize log tracer: {}", e),
     }
-    
+
     // Set up the log level for detailed debugging - include aya debug logs
     let rust_log = "debug,ghostscope=debug,ghostscope_compiler=debug,ghostscope_loader=debug,aya=debug,aya_obj=debug";
     std::env::set_var("RUST_LOG", rust_log);
@@ -36,7 +36,7 @@ pub fn initialize_logging(log_file_path: Option<&str>) -> Result<()> {
     match maybe_log_file {
         Ok(log_file) => {
             eprintln!("Successfully created log file: {}", log_path.display());
-            
+
             // Configure dual output: file and stdout
             let file_subscriber = tracing_subscriber::fmt::layer()
                 .with_file(true)
@@ -49,7 +49,8 @@ pub fn initialize_logging(log_file_path: Option<&str>) -> Result<()> {
             match tracing_subscriber::registry()
                 .with(file_subscriber)
                 .with(tracing_subscriber::fmt::layer().with_writer(std::io::stdout))
-                .try_init() {
+                .try_init()
+            {
                 Ok(()) => eprintln!("Tracing subscriber initialized successfully with file output"),
                 Err(e) => eprintln!("Warning: Failed to initialize tracing subscriber: {}", e),
             }
@@ -63,7 +64,8 @@ pub fn initialize_logging(log_file_path: Option<&str>) -> Result<()> {
                 .with_line_number(true)
                 .with_target(true)
                 .with_env_filter(tracing_subscriber::filter::EnvFilter::from_default_env())
-                .try_init() {
+                .try_init()
+            {
                 Ok(()) => eprintln!("Tracing subscriber initialized successfully (stdout only)"),
                 Err(e) => eprintln!("Warning: Failed to initialize tracing subscriber: {}", e),
             }

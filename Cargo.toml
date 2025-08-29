@@ -5,6 +5,7 @@ members = [
     "ghostscope-loader",
     "ghostscope-ui",
     "ghostscope-binary",
+    "ghostscope-protocol",
     "ghostscope",
 ]
 

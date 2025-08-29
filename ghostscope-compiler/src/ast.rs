@@ -34,15 +34,61 @@ pub enum Statement {
     Print(Expr),
     Backtrace,
     Expr(Expr),
-    VarDeclaration { name: String, value: Expr },
-    TracePoint { pattern: TracePattern, body: Vec<Statement> },
+    VarDeclaration {
+        name: String,
+        value: Expr,
+    },
+    TracePoint {
+        pattern: TracePattern,
+        body: Vec<Statement>,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub enum TracePattern {
-    FunctionName(String),      // trace main { ... }
-    Wildcard(String),         // trace printf* { ... }
-    Address(u64),             // trace 0x400000 { ... }
+    FunctionName(String), // trace main { ... }
+    Wildcard(String),     // trace printf* { ... }
+    Address(u64),         // trace 0x400000 { ... }
+    SourceLine {
+        // trace file.c:123 { ... }
+        file_path: String,
+        line_number: u32,
+    },
+}
+
+/// Variable validation context
+#[derive(Debug, Clone)]
+pub struct VariableContext {
+    pub current_address: Option<u64>,
+    pub available_vars: Vec<String>, // Variables available at current context
+}
+
+impl VariableContext {
+    pub fn new() -> Self {
+        Self {
+            current_address: None,
+            available_vars: vec![
+                // Always available special variables
+                "$arg0".to_string(),
+                "$arg1".to_string(),
+                "$arg2".to_string(),
+                "$arg3".to_string(),
+                "$retval".to_string(),
+                "$pc".to_string(),
+                "$sp".to_string(),
+            ],
+        }
+    }
+
+    pub fn is_variable_available(&self, var_name: &str) -> bool {
+        self.available_vars.contains(&var_name.to_string())
+    }
+
+    pub fn add_variable(&mut self, var_name: String) {
+        if !self.available_vars.contains(&var_name) {
+            self.available_vars.push(var_name);
+        }
+    }
 }
 
 #[derive(Debug)]

@@ -18,15 +18,15 @@ pub struct ElfInfo {
 pub fn parse_elf<P: AsRef<Path>>(path: P) -> Result<ElfInfo> {
     let path = path.as_ref();
     info!("Parsing ELF file: {}", path.display());
-    
+
     let file_data = std::fs::read(path)?;
     let object_file = object::File::parse(&*file_data)?;
-    
+
     let entry_point = object_file.entry();
     let architecture = format!("{:?}", object_file.architecture());
     let is_64bit = object_file.is_64();
     let is_executable = matches!(object_file.kind(), object::ObjectKind::Executable);
-    
+
     // Calculate base address
     let base_address = if is_executable {
         // For executables, base address is typically the lowest loadable segment address
@@ -34,10 +34,10 @@ pub fn parse_elf<P: AsRef<Path>>(path: P) -> Result<ElfInfo> {
     } else {
         0 // For shared libraries, we'll handle relocation later
     };
-    
+
     // Check for debug sections
     let has_debug_sections = has_debug_information(&object_file);
-    
+
     let elf_info = ElfInfo {
         entry_point,
         base_address,
@@ -46,7 +46,7 @@ pub fn parse_elf<P: AsRef<Path>>(path: P) -> Result<ElfInfo> {
         is_executable,
         has_debug_sections,
     };
-    
+
     debug!("ELF info: {:?}", elf_info);
     Ok(elf_info)
 }
@@ -55,14 +55,14 @@ pub fn parse_elf<P: AsRef<Path>>(path: P) -> Result<ElfInfo> {
 fn calculate_base_address(object_file: &object::File) -> u64 {
     // Find the lowest virtual address of loadable segments
     let mut min_addr = u64::MAX;
-    
+
     for segment in object_file.segments() {
         let addr = segment.address();
         if addr > 0 && addr < min_addr {
             min_addr = addr;
         }
     }
-    
+
     if min_addr == u64::MAX {
         0
     } else {
@@ -88,7 +88,7 @@ pub fn get_section_data<P: AsRef<Path>>(path: P, section_name: &str) -> Result<O
     let path = path.as_ref();
     let file_data = std::fs::read(path)?;
     let object_file = object::File::parse(&*file_data)?;
-    
+
     for section in object_file.sections() {
         if let Ok(name) = section.name() {
             if name == section_name {
@@ -105,7 +105,7 @@ pub fn get_section_data<P: AsRef<Path>>(path: P, section_name: &str) -> Result<O
             }
         }
     }
-    
+
     debug!("Section '{}' not found", section_name);
     Ok(None)
 }
@@ -115,15 +115,15 @@ pub fn list_sections<P: AsRef<Path>>(path: P) -> Result<Vec<String>> {
     let path = path.as_ref();
     let file_data = std::fs::read(path)?;
     let object_file = object::File::parse(&*file_data)?;
-    
+
     let mut sections = Vec::new();
-    
+
     for section in object_file.sections() {
         if let Ok(name) = section.name() {
             sections.push(name.to_string());
         }
     }
-    
+
     debug!("Found {} sections in ELF file", sections.len());
     Ok(sections)
 }
@@ -133,7 +133,7 @@ pub fn has_section<P: AsRef<Path>>(path: P, section_name: &str) -> Result<bool> 
     let path = path.as_ref();
     let file_data = std::fs::read(path)?;
     let object_file = object::File::parse(&*file_data)?;
-    
+
     for section in object_file.sections() {
         if let Ok(name) = section.name() {
             if name == section_name {
@@ -141,6 +141,6 @@ pub fn has_section<P: AsRef<Path>>(path: P, section_name: &str) -> Result<bool> 
             }
         }
     }
-    
+
     Ok(false)
 }

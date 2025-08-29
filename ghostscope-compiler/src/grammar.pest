@@ -15,12 +15,17 @@ trace_stmt = { "trace" ~ trace_pattern ~ "{" ~ statement* ~ "}" }
 trace_pattern = { 
     hex_address |
     wildcard_pattern |
+    source_line |
     function_name
 }
 
 hex_address = @{ "0x" ~ ASCII_HEX_DIGIT+ }
 wildcard_pattern = @{ identifier ~ "*" }
+source_line = { file_path ~ ":" ~ line_number }
 function_name = { identifier }
+
+file_path = @{ (ASCII_ALPHANUMERIC | "_" | "/" | "." | "-")+ }
+line_number = @{ ASCII_DIGIT+ }
 
 print_stmt = { "print" ~ expr ~ ";" }
 backtrace_stmt = { ("backtrace" | "bt") ~ ";" }

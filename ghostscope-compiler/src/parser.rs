@@ -71,7 +71,7 @@ fn parse_statement(pair: Pair<Rule>) -> Result<Statement> {
             let mut inner_pairs = inner.into_inner();
             let pattern_pair = inner_pairs.next().unwrap();
             let pattern = parse_trace_pattern(pattern_pair)?;
-            
+
             let mut body = Vec::new();
             for stmt_pair in inner_pairs {
                 let stmt = parse_statement(stmt_pair)?;
@@ -261,14 +261,14 @@ fn parse_factor(pair: Pair<Rule>) -> Result<Expr> {
 
 fn parse_trace_pattern(pair: Pair<Rule>) -> Result<TracePattern> {
     let inner = pair.into_inner().next().unwrap();
-    
+
     match inner.as_rule() {
         Rule::hex_address => {
             let addr_str = inner.as_str();
             // Remove "0x" prefix and parse as hex
             let addr_hex = &addr_str[2..];
-            let addr = u64::from_str_radix(addr_hex, 16)
-                .map_err(|_| ParseError::InvalidExpression)?;
+            let addr =
+                u64::from_str_radix(addr_hex, 16).map_err(|_| ParseError::InvalidExpression)?;
             Ok(TracePattern::Address(addr))
         }
         Rule::wildcard_pattern => {
@@ -278,6 +278,20 @@ fn parse_trace_pattern(pair: Pair<Rule>) -> Result<TracePattern> {
         Rule::function_name => {
             let func_name = inner.into_inner().next().unwrap().as_str().to_string();
             Ok(TracePattern::FunctionName(func_name))
+        }
+        Rule::source_line => {
+            let mut parts = inner.into_inner();
+            let file_path = parts.next().unwrap().as_str().to_string();
+            let line_number = parts
+                .next()
+                .unwrap()
+                .as_str()
+                .parse::<u32>()
+                .map_err(|_| ParseError::InvalidExpression)?;
+            Ok(TracePattern::SourceLine {
+                file_path,
+                line_number,
+            })
         }
         _ => Err(ParseError::UnexpectedToken(inner.as_rule())),
     }

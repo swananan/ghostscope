@@ -30,6 +30,9 @@ pub enum CompileError {
 
     #[error("LLVM error: {0}")]
     LLVM(String),
+
+    #[error("Error: {0}")]
+    Other(String),
 }
 
 pub type Result<T> = std::result::Result<T, CompileError>;
@@ -49,7 +52,7 @@ pub fn print_ast(program: &Program) {
 pub struct TracePoint {
     pub pattern: TracePattern,
     pub function_name: Option<String>, // Resolved function name for FunctionName pattern
-    pub address: Option<u64>,          // Resolved address for Address pattern  
+    pub address: Option<u64>,          // Resolved address for Address pattern
     pub wildcard: Option<String>,      // Pattern string for Wildcard pattern
 }
 
@@ -58,81 +61,93 @@ pub struct TracePoint {
 pub struct UProbeConfig {
     /// The trace pattern this uprobe corresponds to
     pub trace_pattern: TracePattern,
-    
+
     /// Target binary path
     pub binary_path: String,
-    
+
     /// Function name (for FunctionName patterns)
     pub function_name: Option<String>,
-    
+
     /// Resolved function address in the binary  
     pub function_address: Option<u64>,
-    
+
     /// Calculated uprobe offset (for aya uprobe attachment)
     pub uprobe_offset: Option<u64>,
-    
+
     /// Process ID to attach to (None means attach to all instances)
     pub target_pid: Option<u32>,
-    
+
     /// eBPF bytecode for this uprobe
     pub ebpf_bytecode: Vec<u8>,
-    
+
     /// eBPF function name for this uprobe (e.g., "ghostscope_main_0", "ghostscope_printf_1")
     pub ebpf_function_name: String,
 }
 
 pub fn extract_trace_patterns(program: &Program) -> Vec<TracePoint> {
     let mut trace_points = Vec::new();
-    
+
     for stmt in &program.statements {
         if let crate::ast::Statement::TracePoint { pattern, body: _ } = stmt {
             let trace_point = match pattern {
-                TracePattern::FunctionName(func_name) => {
-                    TracePoint {
-                        pattern: pattern.clone(),
-                        function_name: Some(func_name.clone()),
-                        address: None,
-                        wildcard: None,
-                    }
-                }
-                TracePattern::Address(addr) => {
+                TracePattern::FunctionName(func_name) => TracePoint {
+                    pattern: pattern.clone(),
+                    function_name: Some(func_name.clone()),
+                    address: None,
+                    wildcard: None,
+                },
+                TracePattern::Address(addr) => TracePoint {
+                    pattern: pattern.clone(),
+                    function_name: None,
+                    address: Some(*addr),
+                    wildcard: None,
+                },
+                TracePattern::SourceLine {
+                    file_path,
+                    line_number,
+                } => {
                     TracePoint {
                         pattern: pattern.clone(),
                         function_name: None,
-                        address: Some(*addr),
-                        wildcard: None,
+                        address: None, // Will be resolved from DWARF info
+                        wildcard: Some(format!("{}:{}", file_path, line_number)),
                     }
                 }
-                TracePattern::Wildcard(pattern_str) => {
-                    TracePoint {
-                        pattern: pattern.clone(),
-                        function_name: None,
-                        address: None,
-                        wildcard: Some(pattern_str.clone()),
-                    }
-                }
+                TracePattern::Wildcard(pattern_str) => TracePoint {
+                    pattern: pattern.clone(),
+                    function_name: None,
+                    address: None,
+                    wildcard: Some(pattern_str.clone()),
+                },
             };
-            
+
             trace_points.push(trace_point);
         }
     }
-    
+
     trace_points
 }
 
 /// Generate filename for IR and eBPF files based on trace pattern
 /// Format: gs_{pid}_{target_exec}_{function_name}_index
 /// Binary name and function name are NOT truncated for file naming
-pub fn generate_file_name(pattern: &TracePattern, index: usize, pid: Option<u32>, binary_path: Option<&str>) -> String {
-    let pid_str = pid.map(|p| p.to_string()).unwrap_or_else(|| "0".to_string());
-    
+pub fn generate_file_name(
+    pattern: &TracePattern,
+    index: usize,
+    pid: Option<u32>,
+    binary_path: Option<&str>,
+) -> String {
+    let pid_str = pid
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "0".to_string());
+
     let exec_name = if let Some(path) = binary_path {
         // Extract just the filename from the path
         let filename = std::path::Path::new(path)
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("unknown");
-        
+
         // Sanitize but don't truncate for file naming
         filename
             .chars()
@@ -141,7 +156,7 @@ pub fn generate_file_name(pattern: &TracePattern, index: usize, pid: Option<u32>
     } else {
         "unknown".to_string()
     };
-    
+
     match pattern {
         TracePattern::FunctionName(name) => {
             // Sanitize but don't truncate function name for file naming
@@ -149,23 +164,41 @@ pub fn generate_file_name(pattern: &TracePattern, index: usize, pid: Option<u32>
                 .chars()
                 .map(|c| if c.is_alphanumeric() { c } else { '_' })
                 .collect::<String>();
-            format!("gs_{}_{}_{}_{}",  pid_str, exec_name, func_name, index)
+            format!("gs_{}_{}_{}_{}", pid_str, exec_name, func_name, index)
         }
         TracePattern::Wildcard(pattern) => {
             // Sanitize but don't truncate wildcard pattern for file naming
             let pattern_name = pattern
                 .chars()
                 .map(|c| match c {
-                    '*' => 's', // star -> s  
+                    '*' => 's', // star -> s
                     '?' => 'q', // question -> q
                     c if c.is_alphanumeric() => c,
                     _ => '_',
                 })
                 .collect::<String>();
-            format!("gs_{}_{}_{}_{}",  pid_str, exec_name, pattern_name, index)
+            format!("gs_{}_{}_{}_{}", pid_str, exec_name, pattern_name, index)
         }
         TracePattern::Address(addr) => {
-            format!("gs_{}_{}_0x{:x}_{}",  pid_str, exec_name, addr, index)
+            format!("gs_{}_{}_0x{:x}_{}", pid_str, exec_name, addr, index)
+        }
+        TracePattern::SourceLine {
+            file_path,
+            line_number,
+        } => {
+            // Extract filename from path for naming
+            let filename = std::path::Path::new(file_path)
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or("unknown");
+            let sanitized_filename = filename
+                .chars()
+                .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                .collect::<String>();
+            format!(
+                "gs_{}_{}_{}_L{}_{}",
+                pid_str, exec_name, sanitized_filename, line_number, index
+            )
         }
     }
 }
@@ -173,16 +206,23 @@ pub fn generate_file_name(pattern: &TracePattern, index: usize, pid: Option<u32>
 /// Generate a unique eBPF function name based on trace pattern
 /// Generate eBPF function name in format: gs_{pid}_{target_exec}_{function_name}_index
 /// Binary name and function name are NOT truncated for eBPF function naming
-pub fn generate_ebpf_function_name(pattern: &TracePattern, index: usize, pid: Option<u32>, binary_path: Option<&str>) -> String {
-    let pid_str = pid.map(|p| p.to_string()).unwrap_or_else(|| "0".to_string());
-    
+pub fn generate_ebpf_function_name(
+    pattern: &TracePattern,
+    index: usize,
+    pid: Option<u32>,
+    binary_path: Option<&str>,
+) -> String {
+    let pid_str = pid
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "0".to_string());
+
     let exec_name = if let Some(path) = binary_path {
         // Extract just the filename from the path
         let filename = std::path::Path::new(path)
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("unknown");
-        
+
         // Sanitize but don't truncate for eBPF function naming
         filename
             .chars()
@@ -191,7 +231,7 @@ pub fn generate_ebpf_function_name(pattern: &TracePattern, index: usize, pid: Op
     } else {
         "unknown".to_string()
     };
-    
+
     match pattern {
         TracePattern::FunctionName(name) => {
             // Sanitize but don't truncate function name for eBPF function naming
@@ -199,23 +239,41 @@ pub fn generate_ebpf_function_name(pattern: &TracePattern, index: usize, pid: Op
                 .chars()
                 .map(|c| if c.is_alphanumeric() { c } else { '_' })
                 .collect::<String>();
-            format!("gs_{}_{}_{}_{}",  pid_str, exec_name, func_name, index)
+            format!("gs_{}_{}_{}_{}", pid_str, exec_name, func_name, index)
         }
         TracePattern::Wildcard(pattern) => {
             // Sanitize but don't truncate wildcard pattern for eBPF function naming
             let pattern_name = pattern
                 .chars()
                 .map(|c| match c {
-                    '*' => 's', // star -> s  
+                    '*' => 's', // star -> s
                     '?' => 'q', // question -> q
                     c if c.is_alphanumeric() => c,
                     _ => '_',
                 })
                 .collect::<String>();
-            format!("gs_{}_{}_ptn{}_{}",  pid_str, exec_name, pattern_name, index)
+            format!("gs_{}_{}_ptn{}_{}", pid_str, exec_name, pattern_name, index)
         }
         TracePattern::Address(addr) => {
-            format!("gs_{}_{}_{:x}_{}",  pid_str, exec_name, addr, index)
+            format!("gs_{}_{}_{:x}_{}", pid_str, exec_name, addr, index)
+        }
+        TracePattern::SourceLine {
+            file_path,
+            line_number,
+        } => {
+            // Extract filename from path for eBPF function naming
+            let filename = std::path::Path::new(file_path)
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or("unknown");
+            let sanitized_filename = filename
+                .chars()
+                .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                .collect::<String>();
+            format!(
+                "gs_{}_{}_{}_L{}_{}",
+                pid_str, exec_name, sanitized_filename, line_number, index
+            )
         }
     }
 }
@@ -227,7 +285,7 @@ pub fn compile_to_llvm_ir(source: &str) -> Result<String> {
     let program = parser::parse(source)?;
 
     print_ast(&program);
-    
+
     // Extract trace patterns
     let trace_points = extract_trace_patterns(&program);
     if !trace_points.is_empty() {
@@ -242,6 +300,15 @@ pub fn compile_to_llvm_ir(source: &str) -> Result<String> {
                 }
                 TracePattern::Address(addr) => {
                     info!("  Trace Point {}: Address 0x{:x}", i, addr);
+                }
+                TracePattern::SourceLine {
+                    file_path,
+                    line_number,
+                } => {
+                    info!(
+                        "  Trace Point {}: Source Line '{}:{}'",
+                        i, file_path, line_number
+                    );
                 }
             }
         }
@@ -272,13 +339,19 @@ pub fn compile_to_llvm_ir(source: &str) -> Result<String> {
 
 /// Compile source code to eBPF bytecode for multiple trace patterns
 /// Returns UProbeConfig for each trace pattern with individual eBPF bytecode
-pub fn compile_to_uprobe_configs(source: &str, pid: Option<u32>, binary_path: Option<&str>, save_ir: bool) -> Result<Vec<UProbeConfig>> {
+pub fn compile_to_uprobe_configs(
+    source: &str,
+    pid: Option<u32>,
+    binary_path: Option<&str>,
+    save_ir: bool,
+    binary_analyzer: Option<&ghostscope_binary::BinaryAnalyzer>,
+) -> Result<Vec<UProbeConfig>> {
     info!("Starting eBPF compilation for multiple trace patterns...");
 
     // Parse the source code
     let program = parser::parse(source)?;
     info!("Successfully parsed program: {:?}", program);
-    
+
     // Extract trace patterns with their statements
     let mut trace_patterns_with_statements = Vec::new();
     for stmt in &program.statements {
@@ -286,41 +359,173 @@ pub fn compile_to_uprobe_configs(source: &str, pid: Option<u32>, binary_path: Op
             trace_patterns_with_statements.push((pattern.clone(), body));
         }
     }
-    
+
     if trace_patterns_with_statements.is_empty() {
-        return Err(CompileError::LLVM("No trace patterns found in source code".to_string()));
+        return Err(CompileError::LLVM(
+            "No trace patterns found in source code".to_string(),
+        ));
     }
-    
-    info!("Found {} trace patterns to compile", trace_patterns_with_statements.len());
-    
+
+    info!(
+        "Found {} trace patterns to compile",
+        trace_patterns_with_statements.len()
+    );
+
     let mut uprobe_configs = Vec::new();
-    
+
     // Initialize BPF target
     let config = inkwell::targets::InitializationConfig::default();
     inkwell::targets::Target::initialize_bpf(&config);
     info!("BPF target initialized");
-    
+
     for (index, (pattern, statements)) in trace_patterns_with_statements.into_iter().enumerate() {
         info!("Compiling trace pattern {}: {:?}", index, pattern);
-        
+
         // Generate unique function name for this trace pattern
         let ebpf_function_name = generate_ebpf_function_name(&pattern, index, pid, binary_path);
         info!("Generated eBPF function name: {}", ebpf_function_name);
-        
+
         // Create new context and codegen for each trace pattern
         let context = Context::create();
         let mut codegen = codegen::CodeGen::new(&context, &format!("bpf_output_{}", index));
-        
+
+        // Create variable context for scope validation
+        let mut var_context = ast::VariableContext::new();
+
+        // For source line patterns, extract variable scope from DWARF if available
+        if let ast::TracePattern::SourceLine {
+            file_path,
+            line_number,
+        } = &pattern
+        {
+            info!(
+                "Setting up variable context for source line {}:{}",
+                file_path, line_number
+            );
+
+            if let Some(analyzer) = binary_analyzer {
+                if let Some(dwarf_context) = analyzer.dwarf_context() {
+                    // Get all addresses for this source line first
+                    let line_mappings =
+                        dwarf_context.get_addresses_for_line(file_path, *line_number);
+
+                    if !line_mappings.is_empty() {
+                        // Use the first address to find variables in scope
+                        let target_addr = line_mappings[0].address;
+                        let variables = dwarf_context.get_variables_at_address(target_addr);
+
+                        info!(
+                            "Found {} variables in scope at {}:{} (address 0x{:x})",
+                            variables.len(),
+                            file_path,
+                            line_number,
+                            target_addr
+                        );
+
+                        // Add all found variables to the context
+                        for var in variables {
+                            info!(
+                                "  Adding variable '{}' of type '{}' to scope",
+                                var.name, var.type_name
+                            );
+                            var_context.add_variable(var.name);
+                        }
+                    } else {
+                        error!(
+                            "No addresses found for source line '{}:{}'",
+                            file_path, line_number
+                        );
+                        error!("This usually means:");
+                        error!("  1. The line number doesn't exist in the source file");
+                        error!("  2. The line contains no executable code (comments, empty lines, etc.)");
+                        error!("  3. The binary was compiled without debug information (-g flag)");
+                        error!("  4. The file name doesn't match the compiled source");
+                        return Err(CompileError::Other(
+                            format!("Source line '{}:{}' not found in debug information. Cannot attach probe to non-existent line.", 
+                                   file_path, line_number)
+                        ));
+                    }
+                } else {
+                    warn!("No DWARF context available for variable analysis");
+                    warn!("Source line variable validation requires debug information");
+                }
+            } else {
+                error!("Binary analyzer required for source line variable validation");
+                error!(
+                    "Cannot validate variables in 'trace {}:{}' without binary analysis",
+                    file_path, line_number
+                );
+                return Err(CompileError::Other(
+                    "Source line tracing requires binary analyzer".to_string(),
+                ));
+            }
+        }
+
+        // For function patterns, we could also extract function parameter info
+        if let ast::TracePattern::FunctionName(func_name) = &pattern {
+            info!("Setting up variable context for function '{}'", func_name);
+            // TODO: Extract function parameters from DWARF and add to context
+        }
+
+        // Set the variable context for validation during compilation
+        codegen.set_variable_context(var_context);
+
+        // For source line patterns, populate DWARF variables into code generation context
+        if let ast::TracePattern::SourceLine {
+            file_path,
+            line_number,
+        } = &pattern
+        {
+            if let Some(analyzer) = binary_analyzer {
+                if let Some(dwarf_context) = analyzer.dwarf_context() {
+                    // Get all addresses for this source line
+                    let line_mappings =
+                        dwarf_context.get_addresses_for_line(file_path, *line_number);
+
+                    if !line_mappings.is_empty() {
+                        // Use the first address to get enhanced variable location information
+                        let target_addr = line_mappings[0].address;
+                        let enhanced_variables =
+                            dwarf_context.get_enhanced_variable_locations(target_addr);
+
+                        if !enhanced_variables.is_empty() {
+                            info!(
+                                "Integrating {} DWARF variables into LLVM code generation",
+                                enhanced_variables.len()
+                            );
+
+                            // We need to get the ctx parameter from the function being compiled
+                            // For now, we'll do this during the compile process where we have access to the parameter
+                            // Store the enhanced variables for later use
+                            if let Err(e) = codegen.prepare_dwarf_variables(&enhanced_variables) {
+                                error!(
+                                    "Failed to prepare DWARF variables for code generation: {}",
+                                    e
+                                );
+                                return Err(CompileError::CodeGen(e));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Generate file base name using consistent naming
         let file_base_name = generate_file_name(&pattern, index, pid, binary_path);
-        
+
         // Compile this specific trace pattern with PID filtering and optionally save IR
         let ir_file_path = if save_ir {
             Some(format!("{}.ll", file_base_name))
         } else {
             None
         };
-        let module = match codegen.compile_with_function_name(&program, &ebpf_function_name, statements, pid, ir_file_path.as_deref()) {
+        let module = match codegen.compile_with_function_name(
+            &program,
+            &ebpf_function_name,
+            statements,
+            pid,
+            ir_file_path.as_deref(),
+        ) {
             Ok(module) => module,
             Err(e) => {
                 error!("CodeGen error for pattern {:?}: {:?}", pattern, e);
@@ -331,7 +536,11 @@ pub fn compile_to_uprobe_configs(source: &str, pid: Option<u32>, binary_path: Op
         // Get LLVM IR string for logging only
         let llvm_ir = module.print_to_string().to_string();
         let llvm_ir = llvm_ir.trim_end().to_string();
-        info!("Successfully generated LLVM IR for {}, length: {}", ebpf_function_name, llvm_ir.len());
+        info!(
+            "Successfully generated LLVM IR for {}, length: {}",
+            ebpf_function_name,
+            llvm_ir.len()
+        );
 
         // Get target triple
         let triple = inkwell::targets::TargetTriple::create("bpf-pc-linux");
@@ -357,20 +566,34 @@ pub fn compile_to_uprobe_configs(source: &str, pid: Option<u32>, binary_path: Op
             Some(tm) => tm,
             None => {
                 error!("Failed to create target machine for {}", ebpf_function_name);
-                return Err(CompileError::LLVM("Failed to create target machine".to_string()));
+                return Err(CompileError::LLVM(
+                    "Failed to create target machine".to_string(),
+                ));
             }
         };
 
         // Generate eBPF object file
         info!("Generating eBPF object file for {}...", ebpf_function_name);
-        let object_code = match target_machine.write_to_memory_buffer(&module, inkwell::targets::FileType::Object) {
+        let object_code = match target_machine
+            .write_to_memory_buffer(&module, inkwell::targets::FileType::Object)
+        {
             Ok(buf) => {
-                info!("Successfully generated object code for {}! Size: {}", ebpf_function_name, buf.get_size());
+                info!(
+                    "Successfully generated object code for {}! Size: {}",
+                    ebpf_function_name,
+                    buf.get_size()
+                );
                 buf
             }
             Err(e) => {
-                error!("Failed to generate object code for {}: {}", ebpf_function_name, e);
-                return Err(CompileError::LLVM(format!("Failed to generate object code: {}", e)));
+                error!(
+                    "Failed to generate object code for {}: {}",
+                    ebpf_function_name, e
+                );
+                return Err(CompileError::LLVM(format!(
+                    "Failed to generate object code: {}",
+                    e
+                )));
             }
         };
 
@@ -388,12 +611,15 @@ pub fn compile_to_uprobe_configs(source: &str, pid: Option<u32>, binary_path: Op
             ebpf_bytecode: object_code.as_slice().to_vec(),
             ebpf_function_name,
         };
-        
+
         uprobe_configs.push(uprobe_config);
         info!("Created UProbeConfig for pattern {:?}", pattern);
     }
 
-    info!("eBPF compilation completed! Generated {} UProbe configurations", uprobe_configs.len());
+    info!(
+        "eBPF compilation completed! Generated {} UProbe configurations",
+        uprobe_configs.len()
+    );
     Ok(uprobe_configs)
 }
 
@@ -402,14 +628,17 @@ pub fn compile_to_uprobe_configs(source: &str, pid: Option<u32>, binary_path: Op
 pub fn compile_to_ebpf_with_trace_points(source: &str) -> Result<(Vec<u8>, Vec<TracePoint>)> {
     // Use the new function and return first config's bytecode for backward compatibility
     // Use default values for pid and binary path since this is legacy function
-    let uprobe_configs = compile_to_uprobe_configs(source, None, None, false)?;
+    let uprobe_configs = compile_to_uprobe_configs(source, None, None, false, None)?;
     if uprobe_configs.is_empty() {
-        return Err(CompileError::LLVM("No uprobe configurations generated".to_string()));
+        return Err(CompileError::LLVM(
+            "No uprobe configurations generated".to_string(),
+        ));
     }
-    
+
     // Extract trace points from uprobe configs
-    let trace_points: Vec<TracePoint> = uprobe_configs.iter().map(|config| {
-        TracePoint {
+    let trace_points: Vec<TracePoint> = uprobe_configs
+        .iter()
+        .map(|config| TracePoint {
             pattern: config.trace_pattern.clone(),
             function_name: config.function_name.clone(),
             address: config.function_address,
@@ -417,9 +646,9 @@ pub fn compile_to_ebpf_with_trace_points(source: &str) -> Result<(Vec<u8>, Vec<T
                 TracePattern::Wildcard(pattern) => Some(pattern.clone()),
                 _ => None,
             },
-        }
-    }).collect();
-    
+        })
+        .collect();
+
     // Return first config's bytecode for backward compatibility
     Ok((uprobe_configs[0].ebpf_bytecode.clone(), trace_points))
 }

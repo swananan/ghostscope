@@ -1,5 +1,5 @@
 use inkwell::context::Context;
-use inkwell::debug_info::{DebugInfoBuilder, DIType, AsDIScope};
+use inkwell::debug_info::{AsDIScope, DIType, DebugInfoBuilder};
 use inkwell::module::Linkage;
 use inkwell::module::Module;
 use inkwell::types::{BasicTypeEnum, StructType};
@@ -50,7 +50,7 @@ pub enum MapError {
 
     #[error("Builder error: {0}")]
     Builder(String),
-    
+
     #[error("Debug info error: {0}")]
     DebugInfo(String),
 }
@@ -95,7 +95,7 @@ impl<'ctx> MapManager<'ctx> {
         // Create BPF map definition structure that aya expects
         // This should match the structure that aya-obj looks for
         let i32_type = self.context.i32_type();
-        
+
         // Map type ID (BPF_MAP_TYPE_RINGBUF = 27, BPF_MAP_TYPE_ARRAY = 2)
         let map_type_id = match map_type {
             BpfMapType::Ringbuf => 27u32,
@@ -105,16 +105,24 @@ impl<'ctx> MapManager<'ctx> {
         };
 
         // Calculate key and value sizes in bytes (converting from bits)
-        let key_size = if key_type.is_none { 0 } else { (key_type.size / 8) as u32 };
-        let value_size = if value_type.is_none { 0 } else { (value_type.size / 8) as u32 };
+        let key_size = if key_type.is_none {
+            0
+        } else {
+            (key_type.size / 8) as u32
+        };
+        let value_size = if value_type.is_none {
+            0
+        } else {
+            (value_type.size / 8) as u32
+        };
 
         // Create a simple struct with basic map definition layout
         // Use the standard 4-field layout that most eBPF maps use
         let elements = vec![
-            i32_type.into(),    // type (map type)
-            i32_type.into(),    // key_size  
-            i32_type.into(),    // value_size
-            i32_type.into(),    // max_entries
+            i32_type.into(), // type (map type)
+            i32_type.into(), // key_size
+            i32_type.into(), // value_size
+            i32_type.into(), // max_entries
         ];
         let (struct_elements, initializer) = {
             let struct_type = self.context.struct_type(&elements, false);
@@ -127,7 +135,15 @@ impl<'ctx> MapManager<'ctx> {
 
         // Create BTF type information for the map
         // This is critical for aya to understand the map structure
-        let map_di_type = self.create_map_btf_info(di_builder, compile_unit, &var_name, map_type, max_entries, key_type, value_type)?;
+        let map_di_type = self.create_map_btf_info(
+            di_builder,
+            compile_unit,
+            &var_name,
+            map_type,
+            max_entries,
+            key_type,
+            value_type,
+        )?;
 
         // Create the global variable
         let map_var = module.add_global(struct_type, None, &var_name);
@@ -147,15 +163,15 @@ impl<'ctx> MapManager<'ctx> {
         let file = compile_unit.get_file();
         let di_global_variable = di_builder.create_global_variable_expression(
             compile_unit.as_debug_info_scope(), // scope
-            &var_name,      // name
-            &var_name,      // linkage_name
-            file,           // file
-            1,              // line_no
-            map_di_type,    // ty
-            false,          // is_local_to_unit
-            None,           // expr
-            None,           // decl
-            map_var.get_alignment(), // align_in_bits
+            &var_name,                          // name
+            &var_name,                          // linkage_name
+            file,                               // file
+            1,                                  // line_no
+            map_di_type,                        // ty
+            false,                              // is_local_to_unit
+            None,                               // expr
+            None,                               // decl
+            map_var.get_alignment(),            // align_in_bits
         );
 
         // Attach the debug info to the global variable using proper metadata API
@@ -253,11 +269,14 @@ impl<'ctx> MapManager<'ctx> {
         key_type: SizedType,
         value_type: SizedType,
     ) -> Result<inkwell::debug_info::DIType<'ctx>> {
-        info!("Creating BTF info for map: {} (type: {:?})", map_name, map_type);
+        info!(
+            "Creating BTF info for map: {} (type: {:?})",
+            map_name, map_type
+        );
 
         // Create basic types needed for the map structure
         let i32_type = di_builder.create_basic_type("int", 32, 0x05, 0)?; // DW_ATE_signed = 0x05
-        
+
         let file = compile_unit.get_file();
         let scope = compile_unit.as_debug_info_scope();
 
@@ -269,23 +288,23 @@ impl<'ctx> MapManager<'ctx> {
             BpfMapType::Hash => 1u32,
             BpfMapType::PerfEventArray => 4u32,
         };
-        
+
         // Create array type with nr_elems = map_type_id (this is how aya encodes map types)
         // Use Range<i64> directly to encode the map type
         let array_type = di_builder.create_array_type(
-            i32_type.as_type(),  // element_type
-            64,                  // size_in_bits  
-            32,                  // align_in_bits
+            i32_type.as_type(),       // element_type
+            64,                       // size_in_bits
+            32,                       // align_in_bits
             &[0..map_type_id as i64], // Range with map_type_id as count
         );
-        
+
         // Create pointer to this array for the 'type' field
         let type_ptr_type = di_builder.create_pointer_type(
             "type",
             array_type.as_type(),
-            64,  // size_in_bits (pointer size)
-            64,  // align_in_bits
-            AddressSpace::default()
+            64, // size_in_bits (pointer size)
+            64, // align_in_bits
+            AddressSpace::default(),
         );
 
         let members = match map_type {
@@ -293,7 +312,7 @@ impl<'ctx> MapManager<'ctx> {
                 // Ringbuf maps in clang BTF have only type and max_entries fields
                 // This matches the reference program structure
                 info!("Creating ringbuf BTF with 2 fields (type, max_entries)");
-                
+
                 // Create max_entries array type with proper range
                 let max_entries_array = di_builder.create_array_type(
                     i32_type.as_type(),
@@ -306,40 +325,44 @@ impl<'ctx> MapManager<'ctx> {
                     max_entries_array.as_type(),
                     64,
                     64,
-                    AddressSpace::default()
+                    AddressSpace::default(),
                 );
-                
+
                 vec![
                     di_builder.create_member_type(
                         scope,
                         "type",
                         file,
-                        0,    // line_no
-                        64,   // size_in_bits (pointer size)
-                        64,   // align_in_bits 
-                        0,    // offset_in_bits
-                        0,    // flags
+                        0,  // line_no
+                        64, // size_in_bits (pointer size)
+                        64, // align_in_bits
+                        0,  // offset_in_bits
+                        0,  // flags
                         type_ptr_type.as_type(),
                     ),
                     di_builder.create_member_type(
                         scope,
-                        "max_entries", 
+                        "max_entries",
                         file,
-                        0,    // line_no
-                        64,   // size_in_bits (pointer size)
-                        64,   // align_in_bits 
-                        64,   // offset_in_bits
-                        0,    // flags
+                        0,  // line_no
+                        64, // size_in_bits (pointer size)
+                        64, // align_in_bits
+                        64, // offset_in_bits
+                        0,  // flags
                         max_entries_ptr.as_type(),
                     ),
                 ]
-            },
+            }
             _ => {
                 // Other maps have all fields as pointers to arrays with encoded values
                 info!("Creating array/hash BTF with pointer-to-array fields for aya compatibility");
-                
+
                 // Create key_size array
-                let key_size_value = if key_type.is_none { 0 } else { (key_type.size / 8) as i64 };
+                let key_size_value = if key_type.is_none {
+                    0
+                } else {
+                    (key_type.size / 8) as i64
+                };
                 let key_size_array = di_builder.create_array_type(
                     i32_type.as_type(),
                     64,
@@ -351,11 +374,15 @@ impl<'ctx> MapManager<'ctx> {
                     key_size_array.as_type(),
                     64,
                     64,
-                    AddressSpace::default()
+                    AddressSpace::default(),
                 );
 
                 // Create value_size array
-                let value_size_value = if value_type.is_none { 0 } else { (value_type.size / 8) as i64 };
+                let value_size_value = if value_type.is_none {
+                    0
+                } else {
+                    (value_type.size / 8) as i64
+                };
                 let value_size_array = di_builder.create_array_type(
                     i32_type.as_type(),
                     64,
@@ -367,7 +394,7 @@ impl<'ctx> MapManager<'ctx> {
                     value_size_array.as_type(),
                     64,
                     64,
-                    AddressSpace::default()
+                    AddressSpace::default(),
                 );
 
                 // Create max_entries array
@@ -382,7 +409,7 @@ impl<'ctx> MapManager<'ctx> {
                     max_entries_array.as_type(),
                     64,
                     64,
-                    AddressSpace::default()
+                    AddressSpace::default(),
                 );
 
                 vec![
@@ -390,44 +417,44 @@ impl<'ctx> MapManager<'ctx> {
                         scope,
                         "type",
                         file,
-                        0,    // line_no
-                        64,   // size_in_bits (pointer size)
-                        64,   // align_in_bits 
-                        0,    // offset_in_bits
-                        0,    // flags
+                        0,  // line_no
+                        64, // size_in_bits (pointer size)
+                        64, // align_in_bits
+                        0,  // offset_in_bits
+                        0,  // flags
                         type_ptr_type.as_type(),
                     ),
                     di_builder.create_member_type(
                         scope,
                         "key_size",
                         file,
-                        0,    // line_no
-                        64,   // size_in_bits (pointer size)
-                        64,   // align_in_bits 
-                        64,   // offset_in_bits
-                        0,    // flags
+                        0,  // line_no
+                        64, // size_in_bits (pointer size)
+                        64, // align_in_bits
+                        64, // offset_in_bits
+                        0,  // flags
                         key_size_ptr.as_type(),
                     ),
                     di_builder.create_member_type(
                         scope,
                         "value_size",
                         file,
-                        0,    // line_no
-                        64,   // size_in_bits (pointer size)
-                        64,   // align_in_bits 
-                        128,  // offset_in_bits
-                        0,    // flags
+                        0,   // line_no
+                        64,  // size_in_bits (pointer size)
+                        64,  // align_in_bits
+                        128, // offset_in_bits
+                        0,   // flags
                         value_size_ptr.as_type(),
                     ),
                     di_builder.create_member_type(
                         scope,
                         "max_entries",
                         file,
-                        0,    // line_no
-                        64,   // size_in_bits (pointer size)
-                        64,   // align_in_bits 
-                        192,  // offset_in_bits
-                        0,    // flags
+                        0,   // line_no
+                        64,  // size_in_bits (pointer size)
+                        64,  // align_in_bits
+                        192, // offset_in_bits
+                        0,   // flags
                         max_entries_ptr.as_type(),
                     ),
                 ]
@@ -439,28 +466,30 @@ impl<'ctx> MapManager<'ctx> {
 
         // Calculate total structure size based on number of fields (all pointers now)
         let (total_size_bits, field_count) = match map_type {
-            BpfMapType::Ringbuf => (128, 2),  // 2 * 64 bits (pointers)
-            _ => (256, 4),   // 4 * 64 bits (pointers)
+            BpfMapType::Ringbuf => (128, 2), // 2 * 64 bits (pointers)
+            _ => (256, 4),                   // 4 * 64 bits (pointers)
         };
 
         // Create the map structure type (anonymous like reference)
         let map_struct_type = di_builder.create_struct_type(
-            scope,                   // scope
-            "",                      // name - empty for anonymous struct
-            file,                    // file
-            0,                       // line_number
-            total_size_bits,         // size_in_bits
-            32,                      // align_in_bits
-            0,                       // flags
-            None,                    // derived_from
-            &member_types,           // elements
-            0,                       // runtime_lang
-            None,                    // vtable_holder
-            "",                      // unique_id
+            scope,           // scope
+            "",              // name - empty for anonymous struct
+            file,            // file
+            0,               // line_number
+            total_size_bits, // size_in_bits
+            32,              // align_in_bits
+            0,               // flags
+            None,            // derived_from
+            &member_types,   // elements
+            0,               // runtime_lang
+            None,            // vtable_holder
+            "",              // unique_id
         );
 
-        info!("Created BTF struct type for map: {} with {} fields, {} total bits", 
-               map_name, field_count, total_size_bits);
+        info!(
+            "Created BTF struct type for map: {} with {} fields, {} total bits",
+            map_name, field_count, total_size_bits
+        );
         Ok(map_struct_type.as_type())
     }
 }

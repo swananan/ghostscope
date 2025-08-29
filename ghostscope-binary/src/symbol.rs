@@ -54,13 +54,13 @@ impl SymbolTable {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
         info!("Loading symbol table from: {}", path.display());
-        
+
         let file_data = std::fs::read(path)?;
         let object_file = object::File::parse(&*file_data)?;
-        
+
         let mut symbols = Vec::new();
         let mut name_index = HashMap::new();
-        
+
         // Parse dynamic symbols first
         for symbol in object_file.dynamic_symbols() {
             if let Some(sym) = parse_symbol(symbol, &object_file) {
@@ -68,7 +68,7 @@ impl SymbolTable {
                 symbols.push(sym);
             }
         }
-        
+
         // Then parse regular symbols
         for symbol in object_file.symbols() {
             if let Some(sym) = parse_symbol(symbol, &object_file) {
@@ -79,62 +79,73 @@ impl SymbolTable {
                 }
             }
         }
-        
+
         // Create address-sorted index
         let mut address_sorted: Vec<usize> = (0..symbols.len()).collect();
         address_sorted.sort_by(|&a, &b| symbols[a].address.cmp(&symbols[b].address));
-        
+
         info!("Loaded {} symbols", symbols.len());
-        debug!("Symbol types: functions: {}, objects: {}, others: {}", 
-            symbols.iter().filter(|s| s.kind == SymbolType::Function).count(),
-            symbols.iter().filter(|s| s.kind == SymbolType::Object).count(),
-            symbols.iter().filter(|s| !matches!(s.kind, SymbolType::Function | SymbolType::Object)).count());
-        
+        debug!(
+            "Symbol types: functions: {}, objects: {}, others: {}",
+            symbols
+                .iter()
+                .filter(|s| s.kind == SymbolType::Function)
+                .count(),
+            symbols
+                .iter()
+                .filter(|s| s.kind == SymbolType::Object)
+                .count(),
+            symbols
+                .iter()
+                .filter(|s| !matches!(s.kind, SymbolType::Function | SymbolType::Object))
+                .count()
+        );
+
         Ok(SymbolTable {
             symbols,
             name_index,
             address_sorted,
         })
     }
-    
+
     /// Find symbol by name
     pub fn find_by_name(&self, name: &str) -> Option<&Symbol> {
         self.name_index.get(name).map(|&idx| &self.symbols[idx])
     }
-    
+
     /// Find symbol by exact address
     pub fn find_by_address(&self, addr: u64) -> Option<&Symbol> {
         self.symbols.iter().find(|sym| sym.address == addr)
     }
-    
+
     /// Find the closest symbol at or before the given address
     pub fn find_closest_symbol(&self, addr: u64) -> Option<&Symbol> {
         if self.address_sorted.is_empty() {
             return None;
         }
-        
+
         // Binary search for the largest address <= addr
         let mut left = 0;
         let mut right = self.address_sorted.len();
-        
+
         while left < right {
             let mid = (left + right) / 2;
             let sym_addr = self.symbols[self.address_sorted[mid]].address;
-            
+
             if sym_addr <= addr {
                 left = mid + 1;
             } else {
                 right = mid;
             }
         }
-        
+
         if left > 0 {
             Some(&self.symbols[self.address_sorted[left - 1]])
         } else {
             None
         }
     }
-    
+
     /// Find all symbols matching a pattern
     pub fn find_matching(&self, pattern: &str) -> Vec<&Symbol> {
         let pattern_lower = pattern.to_lowercase();
@@ -143,7 +154,7 @@ impl SymbolTable {
             .filter(|sym| sym.name.to_lowercase().contains(&pattern_lower))
             .collect()
     }
-    
+
     /// Get all function symbols
     pub fn get_functions(&self) -> Vec<&Symbol> {
         self.symbols
@@ -151,17 +162,43 @@ impl SymbolTable {
             .filter(|sym| sym.kind == SymbolType::Function)
             .collect()
     }
-    
+
     /// Get all symbols
     pub fn get_all_symbols(&self) -> &[Symbol] {
         &self.symbols
     }
-    
+
+    /// Find symbol that contains the given address (within symbol bounds)
+    pub fn find_containing_symbol(&self, addr: u64) -> Option<&Symbol> {
+        // First find the closest symbol at or before this address
+        let closest = self.find_closest_symbol(addr)?;
+
+        // Check if the address falls within this symbol's range
+        // For functions, we can check if addr is within [symbol_addr, symbol_addr + size]
+        // If size is 0 or unknown, we'll be more permissive and just return the closest symbol
+        if closest.address <= addr {
+            if closest.size > 0 {
+                // Check if address is within the symbol's size bounds
+                if addr < closest.address + closest.size {
+                    Some(closest)
+                } else {
+                    None
+                }
+            } else {
+                // If size is unknown, assume this symbol contains the address
+                // This is a reasonable assumption for uprobe offset calculation
+                Some(closest)
+            }
+        } else {
+            None
+        }
+    }
+
     /// Get symbol count
     pub fn len(&self) -> usize {
         self.symbols.len()
     }
-    
+
     pub fn is_empty(&self) -> bool {
         self.symbols.is_empty()
     }
@@ -170,20 +207,20 @@ impl SymbolTable {
 /// Parse a symbol from object file
 fn parse_symbol<'data, 'file>(
     symbol: object::Symbol<'data, 'file>,
-    object_file: &object::File<'data>
+    object_file: &object::File<'data>,
 ) -> Option<Symbol> {
     let name = symbol.name().ok()?.to_string();
-    
+
     // Skip empty names and some special symbols
     if name.is_empty() || name.starts_with('$') {
         return None;
     }
-    
+
     let address = symbol.address();
     let size = symbol.size();
     let kind = SymbolType::from(symbol.kind());
     let is_global = symbol.is_global();
-    
+
     // Get section information if available
     let (section_name, section_viraddr, section_file_offset) = match symbol.section() {
         object::SymbolSection::Section(section_index) => {
@@ -198,7 +235,7 @@ fn parse_symbol<'data, 'file>(
         }
         _ => (None, None, None),
     };
-    
+
     Some(Symbol {
         name,
         address,
@@ -221,14 +258,18 @@ impl Symbol {
                 if self.address >= viraddr {
                     Some(self.address - viraddr + file_offset)
                 } else {
-                    debug!("Symbol address 0x{:x} is less than section virtual address 0x{:x}", 
-                           self.address, viraddr);
+                    debug!(
+                        "Symbol address 0x{:x} is less than section virtual address 0x{:x}",
+                        self.address, viraddr
+                    );
                     None
                 }
             }
             _ => {
-                debug!("Missing section information for symbol '{}': viraddr={:?}, file_offset={:?}", 
-                       self.name, self.section_viraddr, self.section_file_offset);
+                debug!(
+                    "Missing section information for symbol '{}': viraddr={:?}, file_offset={:?}",
+                    self.name, self.section_viraddr, self.section_file_offset
+                );
                 None
             }
         }

@@ -8,15 +8,15 @@ use std::path::PathBuf;
 pub struct Args {
     /// Binary file to debug (path or name)
     pub binary: Option<String>,
-    
+
     /// Arguments to pass to the binary (use --args before binary and its arguments)
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub args: bool,
-    
+
     /// Log file path (default: ./ghostscope.log)
     #[arg(long, value_name = "PATH")]
     pub log_file: Option<PathBuf>,
-    
+
     /// Debug information file path (overrides auto-detection)
     /// Auto-detection searches:
     /// 1. Binary itself (.debug_info sections)
@@ -27,35 +27,35 @@ pub struct Args {
     /// 6. Common patterns: binary.debug, binary.dbg
     #[arg(long, short = 'd', value_name = "PATH")]
     pub debug_file: Option<PathBuf>,
-    
+
     /// Script to execute (inline script or file path)
     #[arg(long, short = 's', value_name = "SCRIPT")]
     pub script: Option<String>,
-    
+
     /// Script file path (alternative to inline script)
     #[arg(long, value_name = "PATH")]
     pub script_file: Option<PathBuf>,
-    
+
     /// Process ID to attach to
     #[arg(long, short = 'p', value_name = "PID")]
     pub pid: Option<u32>,
-    
+
     /// Save LLVM IR files for each trace pattern (debug: true, release: false)
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub save_llvm_ir: bool,
-    
+
     /// Disable saving LLVM IR files (overrides default behavior)
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub no_save_llvm_ir: bool,
-    
+
     /// Save eBPF bytecode files for each trace pattern (debug: true, release: false)  
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub save_ebpf: bool,
-    
+
     /// Disable saving eBPF bytecode files (overrides default behavior)
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub no_save_ebpf: bool,
-    
+
     /// Remaining arguments (when using --args)
     pub remaining: Vec<String>,
 }
@@ -77,19 +77,18 @@ impl Args {
     /// Parse command line arguments with special handling for --args
     pub fn parse_args() -> ParsedArgs {
         let args: Vec<String> = std::env::args().collect();
-        
+
         // Look for --args flag
         if let Some(args_pos) = args.iter().position(|arg| arg == "--args") {
             // Everything after --args is for the target binary
             let (before_args, after_args) = args.split_at(args_pos);
-            
+
             // Parse options before --args
             let mut modified_args = before_args.to_vec();
             modified_args.push("--args".to_string()); // Keep the flag for clap
-            
-            let parsed = Args::try_parse_from(&modified_args)
-                .unwrap_or_else(|e| e.exit());
-            
+
+            let parsed = Args::try_parse_from(&modified_args).unwrap_or_else(|e| e.exit());
+
             // Extract binary and its arguments from after --args
             let after_args = &after_args[1..]; // Skip the --args flag itself
             let (binary_path, binary_args) = if !after_args.is_empty() {
@@ -97,10 +96,10 @@ impl Args {
             } else {
                 (None, Vec::new())
             };
-            
+
             let should_save_llvm_ir = Self::should_save_llvm_ir(&parsed);
             let should_save_ebpf = Self::should_save_ebpf(&parsed);
-            
+
             ParsedArgs {
                 binary_path,
                 binary_args,
@@ -115,10 +114,10 @@ impl Args {
         } else {
             // Normal parsing without --args
             let parsed = Args::parse();
-            
+
             let should_save_llvm_ir = Self::should_save_llvm_ir(&parsed);
             let should_save_ebpf = Self::should_save_ebpf(&parsed);
-            
+
             ParsedArgs {
                 binary_path: parsed.binary,
                 binary_args: Vec::new(),
