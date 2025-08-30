@@ -41,3 +41,4 @@ test_*
 CLA*
 IMPL*
 kernel.dwarf
+*.bt

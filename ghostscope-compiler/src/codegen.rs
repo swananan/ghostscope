@@ -767,6 +767,9 @@ impl<'ctx> CodeGen<'ctx> {
             let success_block = self
                 .context
                 .append_basic_block(current_fn, "probe_read_success");
+            let continue_block = self
+                .context
+                .append_basic_block(current_fn, "probe_read_continue");
 
             self.builder
                 .build_conditional_branch(is_error, error_block, success_block)
@@ -781,18 +784,24 @@ impl<'ctx> CodeGen<'ctx> {
                 self.send_execution_failure(1, error_code_int, &error_msg)?;
             }
 
-            // Return error - set storage to zero and continue
+            // Return error - set storage to zero and jump to continue block
             let zero_storage = storage_global.as_pointer_value();
             self.builder
                 .build_store(zero_storage, i64_type.const_int(0, false))
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?;
 
             self.builder
-                .build_unconditional_branch(success_block)
+                .build_unconditional_branch(continue_block)
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?;
 
-            // Success block - continue with normal execution
+            // Success block - no special processing needed, just continue
             self.builder.position_at_end(success_block);
+            self.builder
+                .build_unconditional_branch(continue_block)
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+            // Continue block - continue with normal execution
+            self.builder.position_at_end(continue_block);
         }
 
         debug!(
@@ -982,6 +991,9 @@ impl<'ctx> CodeGen<'ctx> {
             let success_block = self
                 .context
                 .append_basic_block(current_fn, "probe_read_success_frame");
+            let continue_block = self
+                .context
+                .append_basic_block(current_fn, "probe_read_continue_frame");
 
             self.builder
                 .build_conditional_branch(is_error, error_block, success_block)
@@ -999,18 +1011,24 @@ impl<'ctx> CodeGen<'ctx> {
                 self.send_execution_failure(2, error_code_int, &error_msg)?;
             }
 
-            // Return error - set storage to zero and continue
+            // Return error - set storage to zero and jump to continue block
             let zero_storage = storage_global.as_pointer_value();
             self.builder
                 .build_store(zero_storage, i64_type.const_int(0, false))
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?;
 
             self.builder
-                .build_unconditional_branch(success_block)
+                .build_unconditional_branch(continue_block)
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?;
 
-            // Success block - continue with normal execution
+            // Success block - no special processing needed, just continue
             self.builder.position_at_end(success_block);
+            self.builder
+                .build_unconditional_branch(continue_block)
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+            // Continue block - continue with normal execution
+            self.builder.position_at_end(continue_block);
         }
 
         debug!(
@@ -1128,6 +1146,9 @@ impl<'ctx> CodeGen<'ctx> {
             let success_block = self
                 .context
                 .append_basic_block(current_fn, "probe_read_success_abs");
+            let continue_block = self
+                .context
+                .append_basic_block(current_fn, "probe_read_continue_abs");
 
             self.builder
                 .build_conditional_branch(is_error, error_block, success_block)
@@ -1144,18 +1165,24 @@ impl<'ctx> CodeGen<'ctx> {
                 self.send_execution_failure(3, error_code_int, &error_msg)?;
             }
 
-            // Return error - set storage to zero and continue
+            // Return error - set storage to zero and jump to continue block
             let zero_storage = storage_global.as_pointer_value();
             self.builder
                 .build_store(zero_storage, i64_type.const_int(0, false))
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?;
 
             self.builder
-                .build_unconditional_branch(success_block)
+                .build_unconditional_branch(continue_block)
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?;
 
-            // Success block - continue with normal execution
+            // Success block - no special processing needed, just continue
             self.builder.position_at_end(success_block);
+            self.builder
+                .build_unconditional_branch(continue_block)
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+            // Continue block - continue with normal execution
+            self.builder.position_at_end(continue_block);
         }
 
         debug!(
