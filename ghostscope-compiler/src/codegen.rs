@@ -1,6 +1,6 @@
 use aya_ebpf_bindings::bindings::bpf_func_id::{
-    BPF_FUNC_get_current_pid_tgid, BPF_FUNC_ktime_get_ns, BPF_FUNC_probe_read_user, 
-    BPF_FUNC_ringbuf_output, BPF_FUNC_trace_printk
+    BPF_FUNC_get_current_pid_tgid, BPF_FUNC_ktime_get_ns, BPF_FUNC_probe_read_user,
+    BPF_FUNC_ringbuf_output, BPF_FUNC_trace_printk,
 };
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
@@ -26,6 +26,47 @@ use ghostscope_binary::dwarf::{
     DwarfEncoding, DwarfType, EnhancedVariableLocation, LocationExpression,
 };
 use ghostscope_protocol::{consts, MessageType, TypeEncoding};
+
+/// Register indices for pt_regs array access in eBPF
+/// Dynamically calculated from aya's pt_regs structure layout using offset_of! macro
+///
+/// Note: In eBPF, pt_regs is typically accessed as an array of u64 values,
+/// where each register is at a specific index. This is the standard approach
+/// used in eBPF programs for accessing register values.
+///
+/// The indices are calculated by dividing the field offset by the size of u64,
+/// which gives us the array index for accessing pt_regs as a u64 array.
+mod pt_regs_indices {
+    use aya_ebpf_bindings::bindings::pt_regs;
+
+    // Size of u64 in bytes for array index calculation
+    const U64_SIZE: usize = core::mem::size_of::<u64>();
+
+    // Core registers - calculated from pt_regs structure layout
+    pub const R15: usize = core::mem::offset_of!(pt_regs, r15) / U64_SIZE;
+    pub const R14: usize = core::mem::offset_of!(pt_regs, r14) / U64_SIZE;
+    pub const R13: usize = core::mem::offset_of!(pt_regs, r13) / U64_SIZE;
+    pub const R12: usize = core::mem::offset_of!(pt_regs, r12) / U64_SIZE;
+    pub const RBP: usize = core::mem::offset_of!(pt_regs, rbp) / U64_SIZE; // Frame pointer
+    pub const RBX: usize = core::mem::offset_of!(pt_regs, rbx) / U64_SIZE;
+    pub const R11: usize = core::mem::offset_of!(pt_regs, r11) / U64_SIZE;
+    pub const R10: usize = core::mem::offset_of!(pt_regs, r10) / U64_SIZE;
+    pub const R9: usize = core::mem::offset_of!(pt_regs, r9) / U64_SIZE;
+    pub const R8: usize = core::mem::offset_of!(pt_regs, r8) / U64_SIZE;
+    pub const RAX: usize = core::mem::offset_of!(pt_regs, rax) / U64_SIZE; // Return value
+    pub const RCX: usize = core::mem::offset_of!(pt_regs, rcx) / U64_SIZE; // 4th argument
+    pub const RDX: usize = core::mem::offset_of!(pt_regs, rdx) / U64_SIZE; // 3rd argument
+    pub const RSI: usize = core::mem::offset_of!(pt_regs, rsi) / U64_SIZE; // 2nd argument
+    pub const RDI: usize = core::mem::offset_of!(pt_regs, rdi) / U64_SIZE; // 1st argument
+
+    // Special registers
+    pub const ORIG_RAX: usize = core::mem::offset_of!(pt_regs, orig_rax) / U64_SIZE; // Original syscall number
+    pub const RIP: usize = core::mem::offset_of!(pt_regs, rip) / U64_SIZE; // Instruction pointer
+    pub const CS: usize = core::mem::offset_of!(pt_regs, cs) / U64_SIZE; // Code segment
+    pub const EFLAGS: usize = core::mem::offset_of!(pt_regs, eflags) / U64_SIZE; // Flags register
+    pub const RSP: usize = core::mem::offset_of!(pt_regs, rsp) / U64_SIZE; // Stack pointer
+    pub const SS: usize = core::mem::offset_of!(pt_regs, ss) / U64_SIZE; // Stack segment
+}
 
 pub struct CodeGen<'ctx> {
     context: &'ctx Context,
@@ -602,9 +643,11 @@ impl<'ctx> CodeGen<'ctx> {
         let i32_type = self.context.i32_type();
         let ptr_type = self.context.ptr_type(AddressSpace::default());
 
-        // Get the stack pointer from pt_regs - RSP is at index 19 in pt_regs array
-        // pt_regs structure: [r15, r14, r13, r12, rbp, rbx, r11, r10, r9, r8, rax, rcx, rdx, rsi, rdi, orig_rax, rip, cs, eflags, rsp, ss]
-        let rsp_index = self.context.i64_type().const_int(19, false); // RSP is 19th register in pt_regs
+        // Get the stack pointer from pt_regs using aya's pt_regs structure
+        let rsp_index = self
+            .context
+            .i64_type()
+            .const_int(pt_regs_indices::RSP as u64, false);
         let rsp_ptr = unsafe {
             self.builder
                 .build_gep(i64_type, ctx_param, &[rsp_index], "rsp_ptr")
@@ -779,9 +822,11 @@ impl<'ctx> CodeGen<'ctx> {
         let i32_type = self.context.i32_type();
         let ptr_type = self.context.ptr_type(AddressSpace::default());
 
-        // Get RBP from pt_regs - RBP is at offset 4 in the pt_regs array
-        // pt_regs structure: [r15, r14, r13, r12, rbp, rbx, r11, r10, r9, r8, rax, rcx, rdx, rsi, rdi, orig_rax, rip, cs, eflags, rsp, ss]
-        let rbp_index = self.context.i64_type().const_int(4, false); // RBP is 4th register in pt_regs
+        // Get RBP from pt_regs using aya's pt_regs structure
+        let rbp_index = self
+            .context
+            .i64_type()
+            .const_int(pt_regs_indices::RBP as u64, false);
         let rbp_ptr = unsafe {
             self.builder
                 .build_gep(i64_type, ctx_param, &[rbp_index], "rbp_ptr")
@@ -1239,8 +1284,8 @@ impl<'ctx> CodeGen<'ctx> {
                     if !requires_frame_base {
                         warn!("Fbreg operation without frame base requirement");
                     }
-                    // For now, treat frame base as RBP (register 6 on x86_64)
-                    let rbp_value = self.get_register_value(ctx_param, 6)?;
+                    // For now, treat frame base as RBP (DWARF register 5 on x86_64)
+                    let rbp_value = self.get_register_value(ctx_param, 5)?;
                     let offset_value = i64_type.const_int(*offset as u64, true);
                     let result = self
                         .builder
@@ -1472,30 +1517,30 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     /// Convert DWARF register number to pt_regs array index
-    /// pt_regs structure: [r15, r14, r13, r12, rbp, rbx, r11, r10, r9, r8, rax, rcx, rdx, rsi, rdi, orig_rax, rip, cs, eflags, rsp, ss]
+    /// Using aya's pt_regs structure indices
     fn convert_dwarf_reg_to_pt_regs_index(&self, dwarf_reg: u16) -> usize {
         match dwarf_reg {
             // x86_64 DWARF register mappings to pt_regs indices
-            0 => 10,  // RAX -> pt_regs[10]
-            1 => 11,  // RCX -> pt_regs[11]
-            2 => 12,  // RDX -> pt_regs[12]
-            3 => 5,   // RBX -> pt_regs[5]
-            4 => 19,  // RSP -> pt_regs[19]
-            5 => 4,   // RBP -> pt_regs[4]
-            6 => 13,  // RSI -> pt_regs[13]
-            7 => 14,  // RDI -> pt_regs[14]
-            8 => 9,   // R8 -> pt_regs[9]
-            9 => 8,   // R9 -> pt_regs[8]
-            10 => 7,  // R10 -> pt_regs[7]
-            11 => 6,  // R11 -> pt_regs[6]
-            12 => 3,  // R12 -> pt_regs[3]
-            13 => 2,  // R13 -> pt_regs[2]
-            14 => 1,  // R14 -> pt_regs[1]
-            15 => 0,  // R15 -> pt_regs[0]
-            16 => 16, // RIP -> pt_regs[16]
+            0 => pt_regs_indices::RAX,  // RAX -> pt_regs[RAX]
+            1 => pt_regs_indices::RCX,  // RCX -> pt_regs[RCX]
+            2 => pt_regs_indices::RDX,  // RDX -> pt_regs[RDX]
+            3 => pt_regs_indices::RBX,  // RBX -> pt_regs[RBX]
+            4 => pt_regs_indices::RSP,  // RSP -> pt_regs[RSP]
+            5 => pt_regs_indices::RBP,  // RBP -> pt_regs[RBP]
+            6 => pt_regs_indices::RSI,  // RSI -> pt_regs[RSI]
+            7 => pt_regs_indices::RDI,  // RDI -> pt_regs[RDI]
+            8 => pt_regs_indices::R8,   // R8 -> pt_regs[R8]
+            9 => pt_regs_indices::R9,   // R9 -> pt_regs[R9]
+            10 => pt_regs_indices::R10, // R10 -> pt_regs[R10]
+            11 => pt_regs_indices::R11, // R11 -> pt_regs[R11]
+            12 => pt_regs_indices::R12, // R12 -> pt_regs[R12]
+            13 => pt_regs_indices::R13, // R13 -> pt_regs[R13]
+            14 => pt_regs_indices::R14, // R14 -> pt_regs[R14]
+            15 => pt_regs_indices::R15, // R15 -> pt_regs[R15]
+            16 => pt_regs_indices::RIP, // RIP -> pt_regs[RIP]
             _ => {
                 warn!("Unknown DWARF register {}, defaulting to RAX", dwarf_reg);
-                10 // Default to RAX
+                pt_regs_indices::RAX // Default to RAX
             }
         }
     }
@@ -3094,7 +3139,10 @@ impl<'ctx> CodeGen<'ctx> {
     /// Get current PID/TID using bpf_get_current_pid_tgid helper
     fn get_current_pid_tgid(&mut self) -> Result<IntValue<'ctx>> {
         // Use aya binding for bpf_get_current_pid_tgid helper function ID
-        let func_id_val = self.context.i64_type().const_int(BPF_FUNC_get_current_pid_tgid as u64, false);
+        let func_id_val = self
+            .context
+            .i64_type()
+            .const_int(BPF_FUNC_get_current_pid_tgid as u64, false);
         let i64_type = self.context.i64_type();
         let fn_type = i64_type.fn_type(&[], false);
         let fn_ptr_type = self.context.ptr_type(AddressSpace::default());
@@ -3125,7 +3173,10 @@ impl<'ctx> CodeGen<'ctx> {
     /// Get current timestamp using bpf_ktime_get_ns helper
     fn get_current_timestamp(&mut self) -> Result<IntValue<'ctx>> {
         // Use aya binding for bpf_ktime_get_ns helper function ID
-        let func_id_val = self.context.i64_type().const_int(BPF_FUNC_ktime_get_ns as u64, false);
+        let func_id_val = self
+            .context
+            .i64_type()
+            .const_int(BPF_FUNC_ktime_get_ns as u64, false);
         let i64_type = self.context.i64_type();
         let fn_type = i64_type.fn_type(&[], false);
         let fn_ptr_type = self.context.ptr_type(AddressSpace::default());

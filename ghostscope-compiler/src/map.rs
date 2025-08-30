@@ -1,3 +1,4 @@
+use aya_ebpf_bindings::bindings::bpf_map_type;
 use inkwell::context::Context;
 use inkwell::debug_info::{AsDIScope, DIType, DebugInfoBuilder};
 use inkwell::module::Linkage;
@@ -7,7 +8,6 @@ use inkwell::values::{GlobalValue, PointerValue};
 use inkwell::AddressSpace;
 use std::collections::HashMap;
 use tracing::{debug, error, info, warn};
-use aya_ebpf_bindings::bindings::bpf_map_type;
 
 #[derive(Debug, Clone, Copy)]
 pub enum BpfMapType {
