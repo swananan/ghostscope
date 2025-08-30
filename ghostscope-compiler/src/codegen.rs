@@ -57,7 +57,10 @@ pub enum CodeGenError {
     TypeError(String),
 
     #[error("Map error: {0}")]
-    Map(#[from] MapError),
+    MapError(String),
+
+    #[error("DWARF expression error: {0}")]
+    DwarfError(String),
 
     #[error("Debug info error: {0}")]
     DebugInfo(String),
@@ -260,6 +263,30 @@ impl<'ctx> CodeGen<'ctx> {
                     // Mark this variable as optimized out
                     self.optimized_out_vars.insert(var.name.clone(), true);
                     self.create_optimized_out_placeholder(&var.name)?
+                }
+                LocationExpression::RegisterOffset { reg, offset } => {
+                    debug!(
+                        "Variable '{}' is at register {} + offset {}",
+                        var.name, reg, offset
+                    );
+                    self.create_register_offset_access(ctx_param, *reg, *offset, &var.name)?
+                }
+                LocationExpression::ComputedExpression {
+                    operations,
+                    requires_frame_base,
+                    requires_registers,
+                } => {
+                    debug!(
+                        "Variable '{}' has computed expression with {} operations (frame_base: {}, registers: {:?})",
+                        var.name, operations.len(), requires_frame_base, requires_registers
+                    );
+                    self.create_computed_expression_access(
+                        ctx_param,
+                        operations,
+                        *requires_frame_base,
+                        requires_registers,
+                        &var.name,
+                    )?
                 }
                 LocationExpression::DwarfExpression { bytecode: _ } => {
                     warn!(
@@ -1072,6 +1099,253 @@ impl<'ctx> CodeGen<'ctx> {
         self.create_optimized_out_placeholder(var_name)
     }
 
+    /// Create LLVM pointer for variable at register + offset location
+    fn create_register_offset_access(
+        &mut self,
+        ctx_param: PointerValue<'ctx>,
+        register: u16,
+        offset: i64,
+        var_name: &str,
+    ) -> Result<PointerValue<'ctx>> {
+        debug!(
+            "Creating register offset access for variable '{}': reg {} + offset {}",
+            var_name, register, offset
+        );
+
+        // Get register value first
+        let reg_value = self.get_register_value(ctx_param, register)?;
+
+        // Add offset to register value
+        let offset_value = self.context.i64_type().const_int(offset as u64, true);
+        let address = self
+            .builder
+            .build_int_add(reg_value, offset_value, &format!("{}_addr", var_name))
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        // Convert to pointer
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let address_ptr = self
+            .builder
+            .build_int_to_ptr(address, ptr_type, &format!("{}_ptr", var_name))
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        Ok(address_ptr)
+    }
+
+    /// Create LLVM pointer for variable with computed DWARF expression
+    fn create_computed_expression_access(
+        &mut self,
+        ctx_param: PointerValue<'ctx>,
+        operations: &[ghostscope_binary::dwarf::DwarfOp],
+        requires_frame_base: bool,
+        requires_registers: &[u16],
+        var_name: &str,
+    ) -> Result<PointerValue<'ctx>> {
+        use ghostscope_binary::dwarf::DwarfOp;
+
+        debug!(
+            "Creating computed expression access for variable '{}' with {} operations",
+            var_name,
+            operations.len()
+        );
+
+        // Initialize a simple stack for expression evaluation
+        let mut stack: Vec<IntValue<'ctx>> = Vec::new();
+        let i64_type = self.context.i64_type();
+
+        // Process each operation
+        for (i, op) in operations.iter().enumerate() {
+            debug!("  Operation {}: {:?}", i, op);
+
+            match op {
+                DwarfOp::Const(value) => {
+                    let const_val = i64_type.const_int(*value as u64, true);
+                    stack.push(const_val);
+                }
+                DwarfOp::Reg(reg) => {
+                    let reg_value = self.get_register_value(ctx_param, *reg)?;
+                    stack.push(reg_value);
+                }
+                DwarfOp::Breg(reg, offset) => {
+                    let reg_value = self.get_register_value(ctx_param, *reg)?;
+                    let offset_value = i64_type.const_int(*offset as u64, true);
+                    let result = self
+                        .builder
+                        .build_int_add(
+                            reg_value,
+                            offset_value,
+                            &format!("{}_breg_result", var_name),
+                        )
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                    stack.push(result);
+                }
+                DwarfOp::Fbreg(offset) => {
+                    if !requires_frame_base {
+                        warn!("Fbreg operation without frame base requirement");
+                    }
+                    // For now, treat frame base as RBP (register 6 on x86_64)
+                    let rbp_value = self.get_register_value(ctx_param, 6)?;
+                    let offset_value = i64_type.const_int(*offset as u64, true);
+                    let result = self
+                        .builder
+                        .build_int_add(
+                            rbp_value,
+                            offset_value,
+                            &format!("{}_fbreg_result", var_name),
+                        )
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                    stack.push(result);
+                }
+                DwarfOp::Plus => {
+                    if stack.len() < 2 {
+                        return Err(CodeGenError::DwarfError(
+                            "Stack underflow in DWARF Plus operation".to_string(),
+                        ));
+                    }
+                    let b = stack.pop().unwrap();
+                    let a = stack.pop().unwrap();
+                    let result = self
+                        .builder
+                        .build_int_add(a, b, &format!("{}_plus_result", var_name))
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                    stack.push(result);
+                }
+                DwarfOp::PlusUconst(value) => {
+                    if stack.is_empty() {
+                        return Err(CodeGenError::DwarfError(
+                            "Stack underflow in DWARF PlusUconst operation".to_string(),
+                        ));
+                    }
+                    let a = stack.pop().unwrap();
+                    let const_val = i64_type.const_int(*value, false);
+                    let result = self
+                        .builder
+                        .build_int_add(a, const_val, &format!("{}_plus_const_result", var_name))
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                    stack.push(result);
+                }
+                DwarfOp::Deref => {
+                    if stack.is_empty() {
+                        return Err(CodeGenError::DwarfError(
+                            "Stack underflow in DWARF Deref operation".to_string(),
+                        ));
+                    }
+                    let address = stack.pop().unwrap();
+
+                    // Convert to pointer and dereference
+                    let ptr_type = self.context.ptr_type(AddressSpace::default());
+                    let address_ptr = self
+                        .builder
+                        .build_int_to_ptr(address, ptr_type, &format!("{}_deref_ptr", var_name))
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+                    // For now, just return the pointer - actual dereferencing happens later
+                    // when the variable is accessed
+                    return Ok(address_ptr);
+                }
+                DwarfOp::StackValue => {
+                    // The value is already on the stack, convert to address
+                    if stack.is_empty() {
+                        return Err(CodeGenError::DwarfError(
+                            "Stack underflow in DWARF StackValue operation".to_string(),
+                        ));
+                    }
+                    let value = stack.pop().unwrap();
+                    let ptr_type = self.context.ptr_type(AddressSpace::default());
+                    let result_ptr = self
+                        .builder
+                        .build_int_to_ptr(value, ptr_type, &format!("{}_stack_value_ptr", var_name))
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                    return Ok(result_ptr);
+                }
+                _ => {
+                    warn!(
+                        "Unsupported DWARF operation in computed expression: {:?}",
+                        op
+                    );
+                    return self.create_optimized_out_placeholder(var_name);
+                }
+            }
+        }
+
+        // After processing all operations, the final result should be on the stack
+        if stack.is_empty() {
+            return Err(CodeGenError::DwarfError(
+                "Empty stack after DWARF expression evaluation".to_string(),
+            ));
+        }
+
+        let final_address = stack.pop().unwrap();
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let result_ptr = self
+            .builder
+            .build_int_to_ptr(
+                final_address,
+                ptr_type,
+                &format!("{}_computed_ptr", var_name),
+            )
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        Ok(result_ptr)
+    }
+
+    /// Get register value from eBPF context
+    fn get_register_value(
+        &mut self,
+        ctx_param: PointerValue<'ctx>,
+        register: u16,
+    ) -> Result<IntValue<'ctx>> {
+        debug!("Getting value for register {}", register);
+
+        // For x86_64 register mapping in eBPF context
+        // This is a simplified mapping - real implementation would need complete register context
+        let reg_offset = match register {
+            0 => 0,                           // RAX
+            1 => 8,                           // RDX
+            2 => 16,                          // RCX
+            3 => 24,                          // RBX
+            4 => 32,                          // RSI
+            5 => 40,                          // RDI
+            6 => 48,                          // RBP
+            7 => 56,                          // RSP
+            8..=15 => (register - 8 + 8) * 8, // R8-R15
+            _ => {
+                warn!("Unknown register {}, using offset 0", register);
+                0
+            }
+        };
+
+        let i64_type = self.context.i64_type();
+        let offset_value = i64_type.const_int(reg_offset.into(), false);
+
+        // Get pointer to register in context
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let reg_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    i64_type,
+                    ctx_param,
+                    &[offset_value],
+                    &format!("reg_{}_ptr", register),
+                )
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?
+        };
+
+        // Load register value
+        let reg_value = self
+            .builder
+            .build_load(i64_type, reg_ptr, &format!("reg_{}_value", register))
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        if let BasicValueEnum::IntValue(int_val) = reg_value {
+            Ok(int_val)
+        } else {
+            Err(CodeGenError::Builder(
+                "Expected integer value from register load".to_string(),
+            ))
+        }
+    }
+
     /// Extract variable names used in the trace statements
     fn extract_used_variables(
         &self,
@@ -1304,25 +1578,29 @@ impl<'ctx> CodeGen<'ctx> {
 
             // Create required maps BEFORE processing variables since they might need logging
             // Use 8 pages (32KB) for ringbuf map
-            self.map_manager.create_ringbuf_map(
-                &self.module,
-                &self.di_builder,
-                &self.compile_unit,
-                "ringbuf",
-                8,
-            )?;
+            self.map_manager
+                .create_ringbuf_map(
+                    &self.module,
+                    &self.di_builder,
+                    &self.compile_unit,
+                    "ringbuf",
+                    8,
+                )
+                .map_err(|e| CodeGenError::MapError(e.to_string()))?;
 
             self.populate_variables_from_dwarf(&dwarf_variables, ctx_param, &used_variables)?;
         } else {
             // Create required maps even if no DWARF variables
             // Use 8 pages (32KB) for ringbuf map
-            self.map_manager.create_ringbuf_map(
-                &self.module,
-                &self.di_builder,
-                &self.compile_unit,
-                "ringbuf",
-                8,
-            )?;
+            self.map_manager
+                .create_ringbuf_map(
+                    &self.module,
+                    &self.di_builder,
+                    &self.compile_unit,
+                    "ringbuf",
+                    8,
+                )
+                .map_err(|e| CodeGenError::MapError(e.to_string()))?;
         }
         // Temporarily disable event_loss_counter for POC testing
         // self.map_manager
@@ -2496,7 +2774,10 @@ impl<'ctx> CodeGen<'ctx> {
 
     fn create_ringbuf_output(&mut self, data: PointerValue<'ctx>, size: u64) -> Result<()> {
         // Get ringbuf map
-        let map_ptr = self.map_manager.get_map(&self.module, "ringbuf")?;
+        let map_ptr = self
+            .map_manager
+            .get_map(&self.module, "ringbuf")
+            .map_err(|e| CodeGenError::MapError(e.to_string()))?;
 
         // Create parameters
         let size_val = self.context.i64_type().const_int(size, false);

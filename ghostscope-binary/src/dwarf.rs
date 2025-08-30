@@ -60,10 +60,45 @@ pub enum LocationExpression {
     Address { addr: u64 },
     /// Variable is at stack pointer + offset  
     StackOffset { offset: i64 },
-    /// Complex DWARF expression (to be implemented)
+    /// Variable is at register + offset (more precise than StackOffset)
+    RegisterOffset { reg: u16, offset: i64 },
+    /// Complex DWARF expression that requires evaluation
+    ComputedExpression {
+        operations: Vec<DwarfOp>,
+        requires_frame_base: bool,
+        requires_registers: Vec<u16>,
+    },
+    /// Legacy: Complex DWARF expression (to be implemented)
     DwarfExpression { bytecode: Vec<u8> },
     /// Variable was optimized away
     OptimizedOut,
+}
+
+/// Simplified DWARF operations for common expression evaluation
+#[derive(Debug, Clone)]
+pub enum DwarfOp {
+    /// Push a constant value onto the stack
+    Const(i64),
+    /// Push register value onto the stack
+    Reg(u16),
+    /// Push frame base + offset onto the stack  
+    Fbreg(i64),
+    /// Push register + offset onto the stack
+    Breg(u16, i64),
+    /// Dereference the top stack value
+    Deref,
+    /// Add two values on stack
+    Plus,
+    /// Add constant to top of stack
+    PlusUconst(u64),
+    /// Duplicate top stack value
+    Dup,
+    /// Pop top stack value
+    Drop,
+    /// Swap top two stack values  
+    Swap,
+    /// Stack has the address, not the value (DW_OP_stack_value)
+    StackValue,
 }
 
 /// Address range for variable visibility
@@ -1489,78 +1524,225 @@ impl DwarfContext {
         }
     }
 
-    /// Parse DWARF expression bytecode
+    /// Parse DWARF expression bytecode with enhanced support for common operations
     fn parse_expression_bytecode(
         &self,
         bytecode: &[u8],
         unit: &gimli::Unit<gimli::EndianSlice<gimli::LittleEndian>>,
     ) -> Option<LocationExpression> {
         if bytecode.is_empty() {
+            debug!("Empty DWARF expression bytecode");
             return Some(LocationExpression::OptimizedOut);
         }
 
-        // Parse the first operation to determine location type
         let mut reader = gimli::EndianSlice::new(bytecode, gimli::LittleEndian);
-
-        // Use the actual encoding from the unit instead of hardcoded values
         let encoding = unit.encoding();
 
-        match gimli::Operation::parse(&mut reader, encoding) {
-            Ok(op) => {
-                debug!("Parsed DWARF operation: {:?}", op);
-                match op {
-                    // Register operations
-                    gimli::Operation::Register { register } => {
-                        debug!("Variable stored in register {}", register.0);
-                        Some(LocationExpression::Register { reg: register.0 })
-                    }
-                    gimli::Operation::RegisterOffset {
-                        register, offset, ..
-                    } => {
-                        debug!("Variable at register {} + offset {}", register.0, offset);
-                        // For now, treat register offset as stack offset if it's likely stack-related
-                        if register.0 == 6 || register.0 == 7 {
-                            // RBP or RSP on x86_64
-                            Some(LocationExpression::StackOffset { offset })
-                        } else {
-                            Some(LocationExpression::Register { reg: register.0 })
+        // Try to parse as a sequence of operations
+        let mut operations = Vec::new();
+        let mut requires_frame_base = false;
+        let mut requires_registers = Vec::new();
+
+        debug!("Parsing DWARF expression of {} bytes", bytecode.len());
+
+        // Parse all operations in the expression
+        while !reader.is_empty() {
+            match gimli::Operation::parse(&mut reader, encoding) {
+                Ok(op) => {
+                    debug!("  Parsed DWARF operation: {:?}", op);
+
+                    match self.convert_dwarf_operation(
+                        op,
+                        &mut requires_frame_base,
+                        &mut requires_registers,
+                    ) {
+                        Some(dwarf_op) => operations.push(dwarf_op),
+                        None => {
+                            // Unsupported operation, fall back to storing bytecode
+                            debug!("  Unsupported operation, falling back to bytecode storage");
+                            return Some(LocationExpression::DwarfExpression {
+                                bytecode: bytecode.to_vec(),
+                            });
                         }
                     }
-                    // Frame base relative
-                    gimli::Operation::FrameOffset { offset } => {
-                        debug!("Variable at frame base + offset {}", offset);
-                        Some(LocationExpression::FrameBaseOffset { offset })
-                    }
-                    // Direct address
-                    gimli::Operation::Address { address } => {
-                        debug!("Variable at absolute address 0x{:x}", address);
-                        Some(LocationExpression::Address { addr: address })
-                    }
-                    // Stack operations
-                    gimli::Operation::StackValue => {
-                        debug!("Variable is a stack value (computed)");
-                        Some(LocationExpression::OptimizedOut) // Treat as optimized for now
-                    }
-                    // Arithmetic operations that might indicate stack offsets
-                    gimli::Operation::PlusConstant { value } => {
-                        debug!("Plus constant operation: {}", value);
-                        Some(LocationExpression::StackOffset {
-                            offset: value as i64,
-                        })
-                    }
-                    // Complex expressions - store bytecode for later processing
-                    _ => {
-                        debug!("Complex DWARF expression, storing bytecode");
-                        Some(LocationExpression::DwarfExpression {
-                            bytecode: bytecode.to_vec(),
-                        })
-                    }
+                }
+                Err(e) => {
+                    debug!("Failed to parse DWARF operation: {}", e);
+                    return Some(LocationExpression::OptimizedOut);
                 }
             }
-            Err(e) => {
-                debug!("Failed to parse DWARF expression: {}", e);
-                Some(LocationExpression::OptimizedOut)
+        }
+
+        // Handle simple common cases directly
+        if operations.len() == 1 {
+            return self.handle_simple_operation(&operations[0]);
+        }
+
+        // Handle two-operation patterns that are very common
+        if operations.len() == 2 {
+            if let Some(simple) = self.handle_two_op_pattern(&operations) {
+                return Some(simple);
             }
+        }
+
+        // For complex expressions, use ComputedExpression
+        if !operations.is_empty() {
+            debug!(
+                "Creating ComputedExpression with {} operations",
+                operations.len()
+            );
+            debug!("  Requires frame base: {}", requires_frame_base);
+            debug!("  Requires registers: {:?}", requires_registers);
+
+            Some(LocationExpression::ComputedExpression {
+                operations,
+                requires_frame_base,
+                requires_registers,
+            })
+        } else {
+            // Fallback to legacy behavior
+            debug!("No operations parsed, falling back to bytecode storage");
+            Some(LocationExpression::DwarfExpression {
+                bytecode: bytecode.to_vec(),
+            })
+        }
+    }
+
+    /// Convert gimli DWARF operation to our simplified DwarfOp
+    fn convert_dwarf_operation(
+        &self,
+        op: gimli::Operation<gimli::EndianSlice<gimli::LittleEndian>>,
+        requires_frame_base: &mut bool,
+        requires_registers: &mut Vec<u16>,
+    ) -> Option<DwarfOp> {
+        match op {
+            // Constants
+            gimli::Operation::UnsignedConstant { value } => Some(DwarfOp::Const(value as i64)),
+            gimli::Operation::SignedConstant { value } => Some(DwarfOp::Const(value)),
+
+            // Register operations
+            gimli::Operation::Register { register } => {
+                if !requires_registers.contains(&register.0) {
+                    requires_registers.push(register.0);
+                }
+                Some(DwarfOp::Reg(register.0))
+            }
+            gimli::Operation::RegisterOffset {
+                register, offset, ..
+            } => {
+                if !requires_registers.contains(&register.0) {
+                    requires_registers.push(register.0);
+                }
+                Some(DwarfOp::Breg(register.0, offset))
+            }
+
+            // Frame base operations
+            gimli::Operation::FrameOffset { offset } => {
+                *requires_frame_base = true;
+                Some(DwarfOp::Fbreg(offset))
+            }
+
+            // Arithmetic operations
+            gimli::Operation::Plus => Some(DwarfOp::Plus),
+            gimli::Operation::PlusConstant { value } => Some(DwarfOp::PlusUconst(value)),
+
+            // Memory operations
+            gimli::Operation::Deref { .. } => Some(DwarfOp::Deref),
+
+            // Stack operations (note: gimli may not have these exact operations)
+            // gimli::Operation::Dup => Some(DwarfOp::Dup),
+            // gimli::Operation::Drop => Some(DwarfOp::Drop),
+            // gimli::Operation::Swap => Some(DwarfOp::Swap),
+            gimli::Operation::StackValue => Some(DwarfOp::StackValue),
+
+            // Direct address (convert to constant + deref pattern later if needed)
+            gimli::Operation::Address { address } => Some(DwarfOp::Const(address as i64)),
+
+            // Unsupported operations
+            _ => {
+                debug!("Unsupported DWARF operation: {:?}", op);
+                None
+            }
+        }
+    }
+
+    /// Handle simple single-operation expressions
+    fn handle_simple_operation(&self, op: &DwarfOp) -> Option<LocationExpression> {
+        match op {
+            DwarfOp::Reg(reg) => {
+                debug!("Simple register expression: reg {}", reg);
+                Some(LocationExpression::Register { reg: *reg })
+            }
+            DwarfOp::Fbreg(offset) => {
+                debug!("Simple frame base expression: fbreg + {}", offset);
+                Some(LocationExpression::FrameBaseOffset { offset: *offset })
+            }
+            DwarfOp::Breg(reg, offset) => {
+                debug!(
+                    "Simple register offset expression: reg {} + {}",
+                    reg, offset
+                );
+                Some(LocationExpression::RegisterOffset {
+                    reg: *reg,
+                    offset: *offset,
+                })
+            }
+            DwarfOp::Const(addr) => {
+                debug!("Simple address expression: 0x{:x}", addr);
+                Some(LocationExpression::Address { addr: *addr as u64 })
+            }
+            _ => None,
+        }
+    }
+
+    /// Handle common two-operation patterns
+    fn handle_two_op_pattern(&self, ops: &[DwarfOp]) -> Option<LocationExpression> {
+        if ops.len() != 2 {
+            return None;
+        }
+
+        match (&ops[0], &ops[1]) {
+            // fbreg + constant = frame base + (offset + constant)
+            (DwarfOp::Fbreg(base_offset), DwarfOp::PlusUconst(add_offset)) => {
+                let total_offset = *base_offset + (*add_offset as i64);
+                debug!(
+                    "Frame base pattern: fbreg {} + {} = {}",
+                    base_offset, add_offset, total_offset
+                );
+                Some(LocationExpression::FrameBaseOffset {
+                    offset: total_offset,
+                })
+            }
+
+            // breg + constant = register + (offset + constant)
+            (DwarfOp::Breg(reg, base_offset), DwarfOp::PlusUconst(add_offset)) => {
+                let total_offset = *base_offset + (*add_offset as i64);
+                debug!(
+                    "Register offset pattern: breg {} {} + {} = {}",
+                    reg, base_offset, add_offset, total_offset
+                );
+                Some(LocationExpression::RegisterOffset {
+                    reg: *reg,
+                    offset: total_offset,
+                })
+            }
+
+            // reg + constant = register + offset
+            (DwarfOp::Reg(reg), DwarfOp::PlusUconst(offset)) => {
+                debug!("Register plus constant pattern: reg {} + {}", reg, offset);
+                Some(LocationExpression::RegisterOffset {
+                    reg: *reg,
+                    offset: *offset as i64,
+                })
+            }
+
+            // const + deref = address dereference
+            (DwarfOp::Const(addr), DwarfOp::Deref) => {
+                debug!("Address dereference pattern: *0x{:x}", addr);
+                Some(LocationExpression::Address { addr: *addr as u64 })
+            }
+
+            _ => None,
         }
     }
 

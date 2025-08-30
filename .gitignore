@@ -30,13 +30,14 @@ Thumbs.db
 *.ll
 *.dwarf
 *.bpf
+gs_*
 output.*
 ghostscope.log
 ghostscope_*
 
 # Test programs and binaries (not part of Rust project)
-test_program
-test_program.c
+test_*
 *.c
 CLA*
+IMPL*
 kernel.dwarf
