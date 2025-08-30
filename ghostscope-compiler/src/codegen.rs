@@ -37,6 +37,7 @@ pub struct CodeGen<'ctx> {
     variable_context: Option<VariableContext>, // Variable scope context for validation
     pending_dwarf_variables: Option<Vec<ghostscope_binary::EnhancedVariableLocation>>, // DWARF variables awaiting population
     debug_logger: DebugLogger<'ctx>,
+    binary_analyzer: Option<*const ghostscope_binary::BinaryAnalyzer>, // CFI and DWARF information access
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -70,6 +71,14 @@ pub type Result<T> = std::result::Result<T, CodeGenError>;
 
 impl<'ctx> CodeGen<'ctx> {
     pub fn new(context: &'ctx Context, module_name: &str) -> Self {
+        Self::new_with_binary_analyzer(context, module_name, None)
+    }
+
+    pub fn new_with_binary_analyzer(
+        context: &'ctx Context,
+        module_name: &str,
+        binary_analyzer: Option<&ghostscope_binary::BinaryAnalyzer>,
+    ) -> Self {
         let module = context.create_module(module_name);
         let builder = context.create_builder();
         let map_manager = MapManager::new(context);
@@ -141,6 +150,7 @@ impl<'ctx> CodeGen<'ctx> {
             variable_context: None, // Will be set later when trace point context is available
             pending_dwarf_variables: None, // Will be set when DWARF variables are prepared
             debug_logger: DebugLogger::new(context),
+            binary_analyzer: binary_analyzer.map(|ba| ba as *const _),
         }
     }
 
@@ -243,10 +253,15 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 LocationExpression::FrameBaseOffset { offset } => {
                     debug!(
-                        "Variable '{}' is at frame base + offset {}",
-                        var.name, offset
+                        "Variable '{}' is at frame base + offset {} at PC 0x{:x}",
+                        var.name, offset, enhanced_var.address
                     );
-                    self.create_frame_base_offset_access(ctx_param, *offset, &var.name)?
+                    self.create_frame_base_offset_access(
+                        ctx_param,
+                        *offset,
+                        &var.name,
+                        enhanced_var.address,
+                    )?
                 }
                 LocationExpression::Address { addr } => {
                     debug!(
@@ -740,16 +755,15 @@ impl<'ctx> CodeGen<'ctx> {
         ctx_param: PointerValue<'ctx>,
         offset: i64,
         var_name: &str,
+        pc_address: u64,
     ) -> Result<PointerValue<'ctx>> {
         debug!(
             "Creating frame base access for variable '{}' at offset {}",
             var_name, offset
         );
 
-        // Frame base calculation for DW_OP_fbreg
-        // TODO: Replace with full CFI parsing - this is a simplified assumption
-        // In standard x86_64 calling convention after prologue: frame_base = RBP + 16
-        // (RBP points to saved RBP, return address is at RBP+8, so locals start at RBP+16)
+        // Frame base calculation for DW_OP_fbreg using CFI information
+        // We now use CFI to determine the precise frame base location
         let i64_type = self.context.i64_type();
         let i32_type = self.context.i32_type();
         let ptr_type = self.context.ptr_type(AddressSpace::default());
@@ -772,23 +786,52 @@ impl<'ctx> CodeGen<'ctx> {
         // Debug: Generate eBPF bpf_trace_printk for RBP value
         self.generate_rbp_trace_printk(var_name, rbp_value)?;
 
-        // EXPERIMENTAL: Try different frame base interpretations
-        // Problem: DW_OP_fbreg might be relative to RBP directly, not RBP+16
-        // Let's try both approaches and see which gives non-zero addresses
+        // CFI-based frame base calculation using PC-specific rules
+        // Query CFI information based on the actual PC address
+        let cfi_offset_value = self.get_cfi_offset_for_pc(pc_address);
 
-        // Approach 1: Direct RBP + offset (traditional interpretation)
+        debug!(
+            "Using CFI-enhanced frame base calculation for PC 0x{:x}: frame_base = RBP + {}, variable_addr = (RBP + {}) + {}",
+            pc_address, cfi_offset_value, cfi_offset_value, offset
+        );
+
+        // Calculate: frame_base = RBP + cfi_offset
+        let cfi_offset = self
+            .context
+            .i64_type()
+            .const_int(cfi_offset_value as u64, false);
+        let frame_base = self
+            .builder
+            .build_int_add(rbp_value, cfi_offset, "frame_base_cfi")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        // Calculate: variable_addr = frame_base + variable_offset
         let var_offset_const = self
             .context
             .i64_type()
             .const_int(offset.unsigned_abs(), offset < 0);
         let user_var_addr = if offset >= 0 {
-            self.builder
-                .build_int_add(rbp_value, var_offset_const, &format!("{}_addr", var_name))
+            self.builder.build_int_add(
+                frame_base,
+                var_offset_const,
+                &format!("{}_addr_cfi", var_name),
+            )
         } else {
-            self.builder
-                .build_int_sub(rbp_value, var_offset_const, &format!("{}_addr", var_name))
+            self.builder.build_int_sub(
+                frame_base,
+                var_offset_const,
+                &format!("{}_addr_cfi", var_name),
+            )
         }
         .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        debug!(
+            "CFI calculation for '{}': RBP + {} + ({}) = final_addr (should be RBP + {})",
+            var_name,
+            cfi_offset_value,
+            offset,
+            cfi_offset_value + offset
+        );
 
         // Convert to pointer for user memory address
         let user_ptr = self
@@ -3491,6 +3534,33 @@ impl<'ctx> CodeGen<'ctx> {
 
     /// Generate eBPF bpf_trace_printk instruction for RBP debugging
     /// This directly generates eBPF bytecode without complex borrowing
+    /// Get CFI offset for a specific PC address by querying the binary analyzer
+    /// This delegates all DWARF/CFI logic to the binary crate
+    fn get_cfi_offset_for_pc(&self, pc_address: u64) -> i64 {
+        // Query the binary analyzer for frame base offset
+        if let Some(analyzer_ptr) = self.binary_analyzer {
+            unsafe {
+                let analyzer = &*analyzer_ptr;
+                if let Some(offset) = analyzer.get_frame_base_offset(pc_address) {
+                    debug!(
+                        "Binary analyzer returned frame base offset {} for PC 0x{:x}",
+                        offset, pc_address
+                    );
+                    offset
+                } else {
+                    debug!(
+                        "Binary analyzer found no CFI info for PC 0x{:x}: using default RBP + 16",
+                        pc_address
+                    );
+                    16 // Default fallback
+                }
+            }
+        } else {
+            debug!("No binary analyzer available: using default RBP + 16");
+            16 // Default fallback
+        }
+    }
+
     fn generate_rbp_trace_printk(
         &mut self,
         var_name: &str,

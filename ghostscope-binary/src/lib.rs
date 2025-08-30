@@ -149,6 +149,13 @@ impl BinaryAnalyzer {
         self.dwarf_context.as_ref()
     }
 
+    /// Get frame base offset for a specific PC address
+    /// This is the main interface for codegen to query CFI information
+    /// Returns the offset to add to the base register (usually RBP) to get frame base
+    pub fn get_frame_base_offset(&self, pc: u64) -> Option<i64> {
+        self.dwarf_context.as_ref()?.get_frame_base_offset_at_pc(pc)
+    }
+
     /// Calculate uprobe offset from a virtual address
     /// This converts a virtual address (e.g. from DWARF line info) to a file offset suitable for uprobe attachment
     pub fn calculate_uprobe_offset_from_address(&self, virtual_addr: u64) -> Option<u64> {

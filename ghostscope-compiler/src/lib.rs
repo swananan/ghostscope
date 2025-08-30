@@ -388,7 +388,11 @@ pub fn compile_ast_to_uprobe_configs(
 
         // Create new context and codegen for each trace pattern
         let context = Context::create();
-        let mut codegen = codegen::CodeGen::new(&context, &format!("bpf_output_{}", index));
+        let mut codegen = codegen::CodeGen::new_with_binary_analyzer(
+            &context,
+            &format!("bpf_output_{}", index),
+            binary_analyzer,
+        );
 
         // Create variable context for scope validation
         let mut var_context = ast::VariableContext::new();
