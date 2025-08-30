@@ -7,6 +7,7 @@ use inkwell::values::{GlobalValue, PointerValue};
 use inkwell::AddressSpace;
 use std::collections::HashMap;
 use tracing::{debug, error, info, warn};
+use aya_ebpf_bindings::bindings::bpf_map_type;
 
 #[derive(Debug, Clone, Copy)]
 pub enum BpfMapType {
@@ -14,6 +15,17 @@ pub enum BpfMapType {
     Array,
     Hash,
     PerfEventArray,
+}
+
+impl BpfMapType {
+    fn to_aya_map_type(&self) -> u32 {
+        match self {
+            BpfMapType::Ringbuf => bpf_map_type::BPF_MAP_TYPE_RINGBUF,
+            BpfMapType::Array => bpf_map_type::BPF_MAP_TYPE_ARRAY,
+            BpfMapType::Hash => bpf_map_type::BPF_MAP_TYPE_HASH,
+            BpfMapType::PerfEventArray => bpf_map_type::BPF_MAP_TYPE_PERF_EVENT_ARRAY,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -96,13 +108,8 @@ impl<'ctx> MapManager<'ctx> {
         // This should match the structure that aya-obj looks for
         let i32_type = self.context.i32_type();
 
-        // Map type ID (BPF_MAP_TYPE_RINGBUF = 27, BPF_MAP_TYPE_ARRAY = 2)
-        let map_type_id = match map_type {
-            BpfMapType::Ringbuf => 27u32,
-            BpfMapType::Array => 2u32,
-            BpfMapType::Hash => 1u32,
-            BpfMapType::PerfEventArray => 4u32,
-        };
+        // Use aya binding for map type ID
+        let map_type_id = map_type.to_aya_map_type();
 
         // Calculate key and value sizes in bytes (converting from bits)
         let key_size = if key_type.is_none {
@@ -282,12 +289,7 @@ impl<'ctx> MapManager<'ctx> {
 
         // Create the map structure based on map type, matching clang's BTF format
         // aya expects 'type' field to be a pointer to array where array.len contains the map type
-        let map_type_id = match map_type {
-            BpfMapType::Ringbuf => 27u32,
-            BpfMapType::Array => 2u32,
-            BpfMapType::Hash => 1u32,
-            BpfMapType::PerfEventArray => 4u32,
-        };
+        let map_type_id = map_type.to_aya_map_type();
 
         // Create array type with nr_elems = map_type_id (this is how aya encodes map types)
         // Use Range<i64> directly to encode the map type

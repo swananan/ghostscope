@@ -1,4 +1,7 @@
-use aya_ebpf_bindings::bindings::bpf_func_id::BPF_FUNC_ringbuf_output;
+use aya_ebpf_bindings::bindings::bpf_func_id::{
+    BPF_FUNC_get_current_pid_tgid, BPF_FUNC_ktime_get_ns, BPF_FUNC_probe_read_user, 
+    BPF_FUNC_ringbuf_output, BPF_FUNC_trace_printk
+};
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
@@ -656,8 +659,10 @@ impl<'ctx> CodeGen<'ctx> {
         storage_global.set_initializer(&zero_value);
 
         // Use bpf_probe_read_user() to safely copy data from user memory to eBPF storage
-        // bpf_probe_read_user(dst, size, unsafe_ptr) - helper function ID 113 (BPF_FUNC_probe_read_user)
-        let helper_id = self.context.i64_type().const_int(113, false);
+        let helper_id = self
+            .context
+            .i64_type()
+            .const_int(BPF_FUNC_probe_read_user as u64, false);
         let helper_fn_type = i64_type.fn_type(
             &[
                 ptr_type.into(), // dst
@@ -867,8 +872,10 @@ impl<'ctx> CodeGen<'ctx> {
         storage_global.set_initializer(&zero_value);
 
         // Use bpf_probe_read_user() to safely copy data from user memory to eBPF storage
-        // bpf_probe_read_user(dst, size, unsafe_ptr) - helper function ID 113 (BPF_FUNC_probe_read_user)
-        let helper_id = self.context.i64_type().const_int(113, false);
+        let helper_id = self
+            .context
+            .i64_type()
+            .const_int(BPF_FUNC_probe_read_user as u64, false);
         let helper_fn_type = i64_type.fn_type(
             &[
                 ptr_type.into(), // dst
@@ -1011,8 +1018,10 @@ impl<'ctx> CodeGen<'ctx> {
         storage_global.set_initializer(&zero_value);
 
         // Use bpf_probe_read_user() to safely copy data from user memory to eBPF storage
-        // bpf_probe_read_user(dst, size, unsafe_ptr) - helper function ID 113 (BPF_FUNC_probe_read_user)
-        let helper_id = self.context.i64_type().const_int(113, false);
+        let helper_id = self
+            .context
+            .i64_type()
+            .const_int(BPF_FUNC_probe_read_user as u64, false);
         let helper_fn_type = i64_type.fn_type(
             &[
                 ptr_type.into(), // dst
@@ -3084,8 +3093,8 @@ impl<'ctx> CodeGen<'ctx> {
     /// Add PID filtering logic to the current function
     /// Get current PID/TID using bpf_get_current_pid_tgid helper
     fn get_current_pid_tgid(&mut self) -> Result<IntValue<'ctx>> {
-        // BPF helper function ID for bpf_get_current_pid_tgid is 14
-        let func_id_val = self.context.i64_type().const_int(14, false);
+        // Use aya binding for bpf_get_current_pid_tgid helper function ID
+        let func_id_val = self.context.i64_type().const_int(BPF_FUNC_get_current_pid_tgid as u64, false);
         let i64_type = self.context.i64_type();
         let fn_type = i64_type.fn_type(&[], false);
         let fn_ptr_type = self.context.ptr_type(AddressSpace::default());
@@ -3115,8 +3124,8 @@ impl<'ctx> CodeGen<'ctx> {
 
     /// Get current timestamp using bpf_ktime_get_ns helper
     fn get_current_timestamp(&mut self) -> Result<IntValue<'ctx>> {
-        // BPF helper function ID for bpf_ktime_get_ns is 5
-        let func_id_val = self.context.i64_type().const_int(5, false);
+        // Use aya binding for bpf_ktime_get_ns helper function ID
+        let func_id_val = self.context.i64_type().const_int(BPF_FUNC_ktime_get_ns as u64, false);
         let i64_type = self.context.i64_type();
         let fn_type = i64_type.fn_type(&[], false);
         let fn_ptr_type = self.context.ptr_type(AddressSpace::default());
@@ -3712,8 +3721,8 @@ impl<'ctx> CodeGen<'ctx> {
         // Create function pointer type
         let fn_ptr_type = trace_printk_fn_type.ptr_type(AddressSpace::default());
 
-        // Convert BPF helper function ID to function pointer (bpf_trace_printk = 6)
-        let func_id_val = i64_type.const_int(6u64, false);
+        // Use aya binding for bpf_trace_printk helper function ID
+        let func_id_val = i64_type.const_int(BPF_FUNC_trace_printk as u64, false);
         let func_ptr = self
             .builder
             .build_int_to_ptr(func_id_val, fn_ptr_type, "trace_printk_fn_ptr")
