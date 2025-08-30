@@ -149,6 +149,20 @@ impl BinaryAnalyzer {
         self.dwarf_context.as_ref()
     }
 
+    /// Get variable size at specific address by variable name
+    /// Returns the size in bytes for bpf_probe_read_user, or None if variable not found
+    pub fn get_variable_size(&self, pc: u64, var_name: &str) -> Option<u64> {
+        if let Some(dwarf_ctx) = &self.dwarf_context {
+            let enhanced_vars = dwarf_ctx.get_enhanced_variable_locations(pc);
+            for var_info in enhanced_vars {
+                if var_info.variable.name == var_name {
+                    return var_info.size;
+                }
+            }
+        }
+        None
+    }
+
     /// Get frame base offset for a specific PC address
     /// This is the main interface for codegen to query CFI information
     /// Returns the offset to add to the base register (usually RBP) to get frame base

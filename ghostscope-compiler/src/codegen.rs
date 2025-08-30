@@ -33,6 +33,7 @@ pub struct CodeGen<'ctx> {
     variables: HashMap<String, PointerValue<'ctx>>,
     var_types: HashMap<String, VarType>, // Track variable types
     optimized_out_vars: HashMap<String, bool>, // Track which variables are optimized out
+    var_pc_addresses: HashMap<String, u64>, // Track PC addresses for variables (for size calculation)
     map_manager: MapManager<'ctx>,
     variable_context: Option<VariableContext>, // Variable scope context for validation
     pending_dwarf_variables: Option<Vec<ghostscope_binary::EnhancedVariableLocation>>, // DWARF variables awaiting population
@@ -146,6 +147,7 @@ impl<'ctx> CodeGen<'ctx> {
             variables: HashMap::new(),
             var_types: HashMap::new(),
             optimized_out_vars: HashMap::new(),
+            var_pc_addresses: HashMap::new(),
             map_manager,
             variable_context: None, // Will be set later when trace point context is available
             pending_dwarf_variables: None, // Will be set when DWARF variables are prepared
@@ -249,7 +251,12 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 LocationExpression::StackOffset { offset } => {
                     debug!("Variable '{}' is at stack offset {}", var.name, offset);
-                    self.create_stack_offset_access(ctx_param, *offset, &var.name)?
+                    self.create_stack_offset_access(
+                        ctx_param,
+                        *offset,
+                        &var.name,
+                        enhanced_var.address,
+                    )?
                 }
                 LocationExpression::FrameBaseOffset { offset } => {
                     debug!(
@@ -268,7 +275,7 @@ impl<'ctx> CodeGen<'ctx> {
                         "Variable '{}' is at absolute address 0x{:x}",
                         var.name, addr
                     );
-                    self.create_absolute_address_access(*addr, &var.name)?
+                    self.create_absolute_address_access(*addr, &var.name, enhanced_var.address)?
                 }
                 LocationExpression::OptimizedOut => {
                     warn!(
@@ -318,6 +325,8 @@ impl<'ctx> CodeGen<'ctx> {
             // Add to code generation HashMaps
             self.variables.insert(var.name.clone(), variable_ptr);
             self.var_types.insert(var.name.clone(), var_type);
+            self.var_pc_addresses
+                .insert(var.name.clone(), enhanced_var.address);
 
             info!(
                 "Successfully added used DWARF variable '{}' to code generation context",
@@ -579,6 +588,7 @@ impl<'ctx> CodeGen<'ctx> {
         ctx_param: PointerValue<'ctx>,
         offset: i64,
         var_name: &str,
+        pc_address: u64,
     ) -> Result<PointerValue<'ctx>> {
         debug!(
             "Creating stack access for variable '{}' at stack offset {}",
@@ -631,10 +641,19 @@ impl<'ctx> CodeGen<'ctx> {
             var_name,
             user_var_addr.get_name().to_string_lossy().len()
         );
+        // Get variable size and create appropriate type
+        let var_size = self.get_variable_size(pc_address, var_name);
+        let storage_type = self.get_llvm_type_for_size(var_size);
         let storage_global =
             self.module
-                .add_global(i64_type, Some(AddressSpace::default()), &unique_name);
-        storage_global.set_initializer(&i64_type.const_zero());
+                .add_global(storage_type, Some(AddressSpace::default()), &unique_name);
+
+        // Initialize with zero value of correct type
+        let zero_value: inkwell::values::BasicValueEnum = match storage_type {
+            inkwell::types::BasicTypeEnum::IntType(int_type) => int_type.const_zero().into(),
+            _ => self.context.i64_type().const_zero().into(), // Fallback
+        };
+        storage_global.set_initializer(&zero_value);
 
         // Use bpf_probe_read_user() to safely copy data from user memory to eBPF storage
         // bpf_probe_read_user(dst, size, unsafe_ptr) - helper function ID 113 (BPF_FUNC_probe_read_user)
@@ -656,8 +675,7 @@ impl<'ctx> CodeGen<'ctx> {
             )
             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
 
-        // Call bpf_probe_read_user to read from user memory
-        let size = i32_type.const_int(8, false); // Read 8 bytes (i64)
+        let size = i32_type.const_int(var_size, false);
         let probe_read_result = self
             .builder
             .build_indirect_call(
@@ -708,23 +726,11 @@ impl<'ctx> CodeGen<'ctx> {
 
             // Error block - send execution failure message
             self.builder.position_at_end(error_block);
-            let error_code = self
-                .builder
-                .build_int_truncate(result_int, i32_type, "error_code_i32")
-                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-            if let BasicValueEnum::IntValue(error_code_int) = error_code.as_basic_value_enum() {
-                let signed_error_code = self
-                    .builder
-                    .build_int_s_extend(error_code_int, self.context.i32_type(), "signed_error")
-                    .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-                // Convert signed error to actual error value
-                let error_val = signed_error_code.get_sign_extended_constant().unwrap_or(-1) as i32;
-                let error_msg = format!(
-                    "bpf_probe_read_user failed for variable '{}': error {}",
-                    var_name, error_val
-                );
-                self.send_execution_failure(1, error_val, &error_msg)?;
+            // Use the full i64 return value directly, no truncation needed
+            if let BasicValueEnum::IntValue(error_code_int) = result_int.as_basic_value_enum() {
+                let error_msg = format!("bpf_probe_read_user failed for variable '{}'", var_name);
+                // Pass the runtime LLVM value instead of constant
+                self.send_execution_failure(1, error_code_int, &error_msg)?;
             }
 
             // Return error - set storage to zero and continue
@@ -846,10 +852,19 @@ impl<'ctx> CodeGen<'ctx> {
             var_name,
             user_var_addr.get_name().to_string_lossy().len()
         );
+        // Get variable size and create appropriate type
+        let var_size = self.get_variable_size(pc_address, var_name);
+        let storage_type = self.get_llvm_type_for_size(var_size);
         let storage_global =
             self.module
-                .add_global(i64_type, Some(AddressSpace::default()), &unique_name);
-        storage_global.set_initializer(&i64_type.const_zero());
+                .add_global(storage_type, Some(AddressSpace::default()), &unique_name);
+
+        // Initialize with zero value of correct type
+        let zero_value: inkwell::values::BasicValueEnum = match storage_type {
+            inkwell::types::BasicTypeEnum::IntType(int_type) => int_type.const_zero().into(),
+            _ => self.context.i64_type().const_zero().into(), // Fallback
+        };
+        storage_global.set_initializer(&zero_value);
 
         // Use bpf_probe_read_user() to safely copy data from user memory to eBPF storage
         // bpf_probe_read_user(dst, size, unsafe_ptr) - helper function ID 113 (BPF_FUNC_probe_read_user)
@@ -871,8 +886,7 @@ impl<'ctx> CodeGen<'ctx> {
             )
             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
 
-        // Call bpf_probe_read_user to read from user memory
-        let size = i32_type.const_int(8, false); // Read 8 bytes (i64)
+        let size = i32_type.const_int(var_size, false);
         let probe_read_result = self
             .builder
             .build_indirect_call(
@@ -923,23 +937,14 @@ impl<'ctx> CodeGen<'ctx> {
 
             // Error block - send execution failure message
             self.builder.position_at_end(error_block);
-            let error_code = self
-                .builder
-                .build_int_truncate(result_int, i32_type, "error_code_i32")
-                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-            if let BasicValueEnum::IntValue(error_code_int) = error_code.as_basic_value_enum() {
-                let signed_error_code = self
-                    .builder
-                    .build_int_s_extend(error_code_int, self.context.i32_type(), "signed_error")
-                    .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-                // Convert signed error to actual error value
-                let error_val = signed_error_code.get_sign_extended_constant().unwrap_or(-1) as i32;
+            // Use the full i64 return value directly, no truncation needed
+            if let BasicValueEnum::IntValue(error_code_int) = result_int.as_basic_value_enum() {
                 let error_msg = format!(
-                    "bpf_probe_read_user failed for frame variable '{}': error {}",
-                    var_name, error_val
+                    "bpf_probe_read_user failed for frame variable '{}'",
+                    var_name
                 );
-                self.send_execution_failure(2, error_val, &error_msg)?;
+                // Pass the runtime LLVM value instead of constant
+                self.send_execution_failure(2, error_code_int, &error_msg)?;
             }
 
             // Return error - set storage to zero and continue
@@ -969,6 +974,7 @@ impl<'ctx> CodeGen<'ctx> {
         &mut self,
         address: u64,
         var_name: &str,
+        pc_address: u64,
     ) -> Result<PointerValue<'ctx>> {
         debug!(
             "Creating absolute address access for variable '{}' at 0x{:x}",
@@ -990,10 +996,19 @@ impl<'ctx> CodeGen<'ctx> {
         // Create global storage for the variable data (eBPF kernel memory)
         // Use unique name based on variable name and address to avoid duplicates
         let unique_name = format!("_abs_var_{}_{:x}", var_name, address);
+        // Get variable size and create appropriate type
+        let var_size = self.get_variable_size(pc_address, var_name);
+        let storage_type = self.get_llvm_type_for_size(var_size);
         let storage_global =
             self.module
-                .add_global(i64_type, Some(AddressSpace::default()), &unique_name);
-        storage_global.set_initializer(&i64_type.const_zero());
+                .add_global(storage_type, Some(AddressSpace::default()), &unique_name);
+
+        // Initialize with zero value of correct type
+        let zero_value: inkwell::values::BasicValueEnum = match storage_type {
+            inkwell::types::BasicTypeEnum::IntType(int_type) => int_type.const_zero().into(),
+            _ => self.context.i64_type().const_zero().into(), // Fallback
+        };
+        storage_global.set_initializer(&zero_value);
 
         // Use bpf_probe_read_user() to safely copy data from user memory to eBPF storage
         // bpf_probe_read_user(dst, size, unsafe_ptr) - helper function ID 113 (BPF_FUNC_probe_read_user)
@@ -1015,8 +1030,7 @@ impl<'ctx> CodeGen<'ctx> {
             )
             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
 
-        // Call bpf_probe_read_user to read from user memory
-        let size = i32_type.const_int(8, false); // Read 8 bytes (i64)
+        let size = i32_type.const_int(var_size, false);
         let probe_read_result = self
             .builder
             .build_indirect_call(
@@ -1067,23 +1081,13 @@ impl<'ctx> CodeGen<'ctx> {
 
             // Error block - send execution failure message
             self.builder.position_at_end(error_block);
-            let error_code = self
-                .builder
-                .build_int_truncate(result_int, i32_type, "error_code_i32")
-                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-            if let BasicValueEnum::IntValue(error_code_int) = error_code.as_basic_value_enum() {
-                let signed_error_code = self
-                    .builder
-                    .build_int_s_extend(error_code_int, self.context.i32_type(), "signed_error")
-                    .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-                // Convert signed error to actual error value
-                let error_val = signed_error_code.get_sign_extended_constant().unwrap_or(-1) as i32;
+            // Use the full i64 return value directly, no truncation needed
+            if let BasicValueEnum::IntValue(error_code_int) = result_int.as_basic_value_enum() {
                 let error_msg = format!(
-                    "bpf_probe_read_user failed for absolute address variable '{}': error {}",
-                    var_name, error_val
+                    "bpf_probe_read_user failed for absolute address variable '{}'",
+                    var_name
                 );
-                self.send_execution_failure(3, error_val, &error_msg)?;
+                self.send_execution_failure(3, error_code_int, &error_msg)?;
             }
 
             // Return error - set storage to zero and continue
@@ -2169,10 +2173,14 @@ impl<'ctx> CodeGen<'ctx> {
                 "Variable '{}' is optimized out, sending OptimizedOut protocol message",
                 var_name
             );
-            self.build_and_send_optimized_out_message(var_name, &var_type)
+            // Get PC address for the variable (needed for size calculation)
+            let pc_address = self.var_pc_addresses.get(var_name).copied().unwrap_or(0);
+            self.build_and_send_optimized_out_message(var_name, &var_type, pc_address)
         } else {
             // Build protocol message for normal variables
-            self.build_and_send_protocol_message(var_name, &var_type, var_ptr)
+            // Get PC address for the variable to calculate correct size
+            let pc_address = self.var_pc_addresses.get(var_name).copied().unwrap_or(0);
+            self.build_and_send_protocol_message(var_name, &var_type, var_ptr, pc_address)
         }
     }
 
@@ -2182,6 +2190,7 @@ impl<'ctx> CodeGen<'ctx> {
         var_name: &str,
         var_type: &VarType,
         var_ptr: PointerValue<'ctx>,
+        pc_address: u64,
     ) -> Result<()> {
         // Create protocol message storage area
         let msg_storage = self.create_protocol_message_storage();
@@ -2193,10 +2202,10 @@ impl<'ctx> CodeGen<'ctx> {
         self.build_variable_data_header(msg_storage)?;
 
         // Build variable entry (VariableEntry + variable name + data)
-        self.build_variable_entry(msg_storage, var_name, var_type, var_ptr)?;
+        self.build_variable_entry(msg_storage, var_name, var_type, var_ptr, pc_address)?;
 
         // Calculate actual message length and update header
-        let total_len = self.calculate_message_length(var_name, var_type);
+        let total_len = self.calculate_message_length(var_name, var_type, pc_address);
         self.update_message_length(msg_storage, total_len)?;
 
         // Send to ringbuf
@@ -2210,6 +2219,7 @@ impl<'ctx> CodeGen<'ctx> {
         &mut self,
         var_name: &str,
         var_type: &VarType,
+        pc_address: u64,
     ) -> Result<()> {
         // Create protocol message storage area
         let msg_storage = self.create_protocol_message_storage();
@@ -2224,7 +2234,7 @@ impl<'ctx> CodeGen<'ctx> {
         self.build_optimized_out_variable_entry(msg_storage, var_name, var_type)?;
 
         // Calculate actual message length and update header
-        let total_len = self.calculate_message_length(var_name, var_type);
+        let total_len = self.calculate_message_length(var_name, var_type, pc_address);
         self.update_message_length(msg_storage, total_len)?;
 
         // Send to ringbuf
@@ -2463,6 +2473,7 @@ impl<'ctx> CodeGen<'ctx> {
         var_name: &str,
         var_type: &VarType,
         var_ptr: PointerValue<'ctx>,
+        pc_address: u64,
     ) -> Result<()> {
         let i8_type = self.context.i8_type();
         let i16_type = self.context.i16_type();
@@ -2472,12 +2483,17 @@ impl<'ctx> CodeGen<'ctx> {
 
         // VariableEntry: [name_len:u8, type_encoding:u8, data_len:u16]
         let name_len = i8_type.const_int(var_name.len() as u64, false);
-        let type_encoding = i8_type.const_int(self.get_type_encoding(var_name, var_type), false);
+        let type_encoding = i8_type.const_int(
+            self.get_type_encoding(var_name, var_type, pc_address),
+            false,
+        );
         // Set data length based on whether variable is optimized out
         let data_len = if *self.optimized_out_vars.get(var_name).unwrap_or(&false) {
             i16_type.const_int(0, false) // Optimized out variables have no data
         } else {
-            i16_type.const_int(8, false) // Normal variables are 8-byte data
+            // Use actual variable size from DWARF information
+            let var_size = self.get_variable_size(pc_address, var_name);
+            i16_type.const_int(var_size, false)
         };
 
         // Write name_len
@@ -2568,9 +2584,25 @@ impl<'ctx> CodeGen<'ctx> {
         // Skip data writing for optimized-out variables
         if !*self.optimized_out_vars.get(var_name).unwrap_or(&false) {
             let data_offset: usize = name_offset + var_name.len();
+            // Use actual variable size to determine load type
+            let var_size = self.get_variable_size(pc_address, var_name);
+            let load_type: inkwell::types::BasicTypeEnum = match var_size {
+                1 => self.context.i8_type().into(),
+                2 => self.context.i16_type().into(),
+                4 => self.context.i32_type().into(),
+                8 => self.context.i64_type().into(),
+                _ => {
+                    debug!(
+                        "Unusual variable size {} for '{}', using i64",
+                        var_size, var_name
+                    );
+                    self.context.i64_type().into()
+                }
+            };
+
             let var_value = self
                 .builder
-                .build_load(i64_type, var_ptr, "var_value")
+                .build_load(load_type, var_ptr, "var_value")
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?;
 
             let data_ptr = unsafe {
@@ -2706,16 +2738,21 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     /// Calculate total message length
-    fn calculate_message_length(&self, var_name: &str, _var_type: &VarType) -> u32 {
+    fn calculate_message_length(
+        &self,
+        var_name: &str,
+        _var_type: &VarType,
+        pc_address: u64,
+    ) -> u32 {
         let header_len: usize = 8; // MessageHeader
         let msg_body_len: usize = 28; // VariableDataMessage
         let entry_len: usize = 4; // VariableEntry
         let name_len: usize = var_name.len(); // Variable name
-                                              // Optimized-out variables have 0 data length, normal variables have 8 bytes
+                                              // Optimized-out variables have 0 data length, normal variables use actual size
         let data_len: usize = if *self.optimized_out_vars.get(var_name).unwrap_or(&false) {
             0
         } else {
-            8
+            self.get_variable_size(pc_address, var_name) as usize
         };
 
         (header_len + msg_body_len + entry_len + name_len + data_len) as u32
@@ -2752,16 +2789,46 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
-    /// Get type encoding
-    fn get_type_encoding(&self, var_name: &str, var_type: &VarType) -> u64 {
+    /// Get type encoding based on variable size
+    fn get_type_encoding(&self, var_name: &str, var_type: &VarType, pc_address: u64) -> u64 {
         // Check if this variable is optimized out
         if *self.optimized_out_vars.get(var_name).unwrap_or(&false) {
             return TypeEncoding::OptimizedOut as u64;
         }
 
         match var_type {
-            VarType::Int => TypeEncoding::I64 as u64,
-            VarType::Float => TypeEncoding::F64 as u64,
+            VarType::Int => {
+                // Use actual variable size to determine encoding
+                let var_size = self.get_variable_size(pc_address, var_name);
+                match var_size {
+                    1 => TypeEncoding::I8 as u64,
+                    2 => TypeEncoding::I16 as u64,
+                    4 => TypeEncoding::I32 as u64,
+                    8 => TypeEncoding::I64 as u64,
+                    _ => {
+                        debug!(
+                            "Unusual integer size {} for variable '{}', using I64",
+                            var_size, var_name
+                        );
+                        TypeEncoding::I64 as u64
+                    }
+                }
+            }
+            VarType::Float => {
+                // Use actual variable size for float types too
+                let var_size = self.get_variable_size(pc_address, var_name);
+                match var_size {
+                    4 => TypeEncoding::F32 as u64,
+                    8 => TypeEncoding::F64 as u64,
+                    _ => {
+                        debug!(
+                            "Unusual float size {} for variable '{}', using F64",
+                            var_size, var_name
+                        );
+                        TypeEncoding::F64 as u64
+                    }
+                }
+            }
             VarType::String => TypeEncoding::String as u64,
         }
     }
@@ -2791,6 +2858,7 @@ impl<'ctx> CodeGen<'ctx> {
             "<anonymous>",
             &VarType::Int,
             temp_storage.as_pointer_value(),
+            0, // Anonymous variables don't have PC address
         )
     }
 
@@ -2812,6 +2880,7 @@ impl<'ctx> CodeGen<'ctx> {
             "<anonymous>",
             &VarType::Float,
             temp_storage.as_pointer_value(),
+            0, // Anonymous variables don't have PC address
         )
     }
 
@@ -3082,14 +3151,14 @@ impl<'ctx> CodeGen<'ctx> {
     fn send_execution_failure(
         &mut self,
         function_id: u32,
-        error_code: i32,
+        error_code_value: IntValue<'ctx>, // Changed to accept runtime LLVM value
         message: &str,
     ) -> Result<()> {
         let msg_storage = self.create_execution_failure_message_storage();
         self.build_execution_failure_header(
             msg_storage,
             function_id,
-            error_code,
+            error_code_value,
             message.len() as u16,
         )?;
         self.write_message_string(
@@ -3198,7 +3267,7 @@ impl<'ctx> CodeGen<'ctx> {
         &mut self,
         buffer: PointerValue<'ctx>,
         function_id: u32,
-        error_code: i32,
+        error_code_value: IntValue<'ctx>, // Changed to accept runtime LLVM value
         message_len: u16,
     ) -> Result<()> {
         let i16_type = self.context.i16_type();
@@ -3250,14 +3319,13 @@ impl<'ctx> CodeGen<'ctx> {
             i32_type.const_int(function_id as u64, false),
         )?;
 
-        // error_code (4 bytes)
-        let error_code_val = i32_type.const_int(error_code as u64, true); // signed integer
-        self.write_u32_at_offset(buffer, failure_msg_offset + 28, error_code_val)?;
+        // error_code (8 bytes) - use runtime value
+        self.write_u64_at_offset(buffer, failure_msg_offset + 28, error_code_value)?;
 
         // message_len (2 bytes) + reserved (2 bytes)
         self.write_u16_at_offset(
             buffer,
-            failure_msg_offset + 32,
+            failure_msg_offset + 36,
             i16_type.const_int(message_len as u64, false),
         )?;
 
@@ -3558,6 +3626,49 @@ impl<'ctx> CodeGen<'ctx> {
         } else {
             debug!("No binary analyzer available: using default RBP + 16");
             16 // Default fallback
+        }
+    }
+
+    /// Get variable size from binary analyzer
+    /// Returns size in bytes for bpf_probe_read_user, defaults to 8 bytes if not found
+    fn get_variable_size(&self, pc_address: u64, var_name: &str) -> u64 {
+        if let Some(analyzer_ptr) = self.binary_analyzer {
+            unsafe {
+                let analyzer = &*analyzer_ptr;
+                if let Some(size) = analyzer.get_variable_size(pc_address, var_name) {
+                    debug!(
+                        "Binary analyzer returned size {} bytes for variable '{}' at PC 0x{:x}",
+                        size, var_name, pc_address
+                    );
+                    size
+                } else {
+                    debug!(
+                        "Binary analyzer found no size info for variable '{}' at PC 0x{:x}: using default 8 bytes",
+                        var_name, pc_address
+                    );
+                    8 // Default fallback
+                }
+            }
+        } else {
+            debug!(
+                "No binary analyzer available: using default 8 bytes for variable '{}'",
+                var_name
+            );
+            8 // Default fallback
+        }
+    }
+
+    /// Get LLVM type based on variable size
+    fn get_llvm_type_for_size(&self, size: u64) -> inkwell::types::BasicTypeEnum<'ctx> {
+        match size {
+            1 => self.context.i8_type().into(),
+            2 => self.context.i16_type().into(),
+            4 => self.context.i32_type().into(),
+            8 => self.context.i64_type().into(),
+            _ => {
+                debug!("Unusual variable size {}, using i64", size);
+                self.context.i64_type().into()
+            }
         }
     }
 

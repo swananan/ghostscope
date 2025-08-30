@@ -109,7 +109,7 @@ pub struct ExecutionFailureMessage {
     pub pid: u32,
     pub tid: u32,
     pub function_id: u32,
-    pub error_code: i32,
+    pub error_code: i64,
     pub message_len: u16,
     pub reserved: u16,
 }
@@ -300,7 +300,7 @@ impl MessageBuilder {
         pid: u32,
         tid: u32,
         function_id: u32,
-        error_code: i32,
+        error_code: i64,
         message: &str,
     ) -> Result<Vec<u8>, String> {
         self.buffer.clear();
