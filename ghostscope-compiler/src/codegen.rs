@@ -361,6 +361,15 @@ impl<'ctx> CodeGen<'ctx> {
                     );
                     self.create_complex_expression_fallback(&var.name)?
                 }
+                LocationExpression::LocationList { entries: _ } => {
+                    // This should never happen because resolve_at_pc() should have been called
+                    // in get_enhanced_variable_locations to resolve the location list
+                    warn!(
+                        "Variable '{}' has unresolved location list, this should not happen",
+                        var.name
+                    );
+                    self.create_optimized_out_placeholder(&var.name)?
+                }
             };
 
             // Determine variable type from DWARF information

@@ -75,8 +75,43 @@ pub enum LocationExpression {
     },
     /// Legacy: Complex DWARF expression (to be implemented)
     DwarfExpression { bytecode: Vec<u8> },
+    /// Variable has different locations at different PC ranges (location lists)
+    LocationList { entries: Vec<LocationListEntry> },
     /// Variable was optimized away
     OptimizedOut,
+}
+
+/// Location list entry representing a variable location at a specific PC range
+#[derive(Debug, Clone)]
+pub struct LocationListEntry {
+    /// Start PC address (inclusive)
+    pub start_pc: u64,
+    /// End PC address (exclusive)  
+    pub end_pc: u64,
+    /// Location expression for this PC range
+    pub location_expr: LocationExpression,
+}
+
+impl LocationExpression {
+    /// Get the location expression for a specific PC address
+    /// For location lists, this finds the correct entry for the given PC
+    pub fn resolve_at_pc(&self, pc: u64) -> &LocationExpression {
+        match self {
+            LocationExpression::LocationList { entries } => {
+                for entry in entries {
+                    if pc >= entry.start_pc && pc < entry.end_pc {
+                        debug!("Found location at PC 0x{:x} in range 0x{:x}-0x{:x}", 
+                               pc, entry.start_pc, entry.end_pc);
+                        return entry.location_expr.resolve_at_pc(pc);
+                    }
+                }
+                debug!("No location found for PC 0x{:x} in location list", pc);
+                &LocationExpression::OptimizedOut
+            }
+            // For non-location-list expressions, return self
+            _ => self,
+        }
+    }
 }
 
 /// Simplified DWARF operations for common expression evaluation
@@ -558,17 +593,21 @@ impl DwarfContext {
         let mut enhanced_locations = Vec::new();
 
         for var in variables {
-            let location_expr = var
+            let base_location_expr = var
                 .location_expr
                 .clone()
                 .unwrap_or(LocationExpression::OptimizedOut);
 
+            // Resolve location expression for the specific PC address
+            // This handles location lists by finding the correct entry for this PC
+            let resolved_location_expr = base_location_expr.resolve_at_pc(addr).clone();
+
             let size = self.get_variable_size(&var);
-            let is_optimized_out = matches!(location_expr, LocationExpression::OptimizedOut);
+            let is_optimized_out = matches!(resolved_location_expr, LocationExpression::OptimizedOut);
 
             enhanced_locations.push(EnhancedVariableLocation {
                 variable: var,
-                location_at_address: location_expr,
+                location_at_address: resolved_location_expr,
                 address: addr,
                 size,
                 is_optimized_out,
@@ -1579,15 +1618,62 @@ impl DwarfContext {
                 );
                 self.parse_expression_bytecode(&expression.0, unit)
             }
-            AttributeValue::LocationListsRef(_) => {
-                // TODO: Handle location lists (variables with different locations at different PC ranges)
-                debug!("Location lists not yet implemented");
-                Some(LocationExpression::OptimizedOut)
+            AttributeValue::LocationListsRef(offset) => {
+                debug!("Parsing location lists at offset 0x{:x}", offset.0);
+                self.parse_location_lists(unit, offset)
             }
             _ => {
                 debug!("Unsupported location attribute type");
                 None
             }
+        }
+    }
+
+    /// Parse location lists from .debug_loclists or .debug_loc section
+    fn parse_location_lists(
+        &self,
+        unit: &gimli::Unit<gimli::EndianSlice<gimli::LittleEndian>>,
+        offset: gimli::LocationListsOffset<usize>,
+    ) -> Option<LocationExpression> {
+        debug!("Parsing location lists at offset 0x{:x}", offset.0);
+
+        // Try to get location lists from DWARF context
+        let mut locations = match self.dwarf.locations(unit, offset) {
+            Ok(locations) => locations,
+            Err(e) => {
+                debug!("Failed to get location lists: {:?}", e);
+                return Some(LocationExpression::OptimizedOut);
+            }
+        };
+
+        let mut entries = Vec::new();
+        
+        // Parse each location list entry
+        while let Ok(Some(location_list_entry)) = locations.next() {
+            let start_pc = location_list_entry.range.begin;
+            let end_pc = location_list_entry.range.end;
+            
+            debug!("Location list entry: PC 0x{:x}-0x{:x}", start_pc, end_pc);
+            
+            // Parse the expression data for this PC range
+            let location_expr = self.parse_expression_bytecode(
+                location_list_entry.data.0.slice(),
+                unit,
+            ).unwrap_or(LocationExpression::OptimizedOut);
+            
+            entries.push(LocationListEntry {
+                start_pc,
+                end_pc,
+                location_expr,
+            });
+        }
+
+        if entries.is_empty() {
+            debug!("No valid location list entries found");
+            Some(LocationExpression::OptimizedOut)
+        } else {
+            debug!("Parsed {} location list entries", entries.len());
+            Some(LocationExpression::LocationList { entries })
         }
     }
 
