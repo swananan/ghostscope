@@ -8,11 +8,10 @@ use ratatui::{
 };
 use std::collections::VecDeque;
 
-use crate::events::{RuntimeStatus, TraceEvent};
-use ghostscope_protocol::MessageType;
+use crate::events::TraceEvent;
+
 
 pub struct EbpfInfoPanel {
-    pub status_messages: VecDeque<RuntimeStatus>,
     pub trace_events: VecDeque<TraceEvent>,
     pub scroll_offset: usize,
     pub max_messages: usize,
@@ -22,19 +21,10 @@ pub struct EbpfInfoPanel {
 impl EbpfInfoPanel {
     pub fn new() -> Self {
         Self {
-            status_messages: VecDeque::new(),
             trace_events: VecDeque::new(),
             scroll_offset: 0,
-            max_messages: 1000,
+            max_messages: 2000, // TODO: Make this configurable in the future
             auto_scroll: true,
-        }
-    }
-
-    pub fn add_status_message(&mut self, status: RuntimeStatus) {
-        self.status_messages.push_back(status);
-        if self.status_messages.len() > 100 {
-            // Keep fewer status messages
-            self.status_messages.pop_front();
         }
     }
 
@@ -57,7 +47,7 @@ impl EbpfInfoPanel {
     }
 
     pub fn scroll_down(&mut self) {
-        let total_lines = self.status_messages.len() + self.trace_events.len();
+        let total_lines = self.trace_events.len();
         if self.scroll_offset + 1 < total_lines {
             self.scroll_offset += 1;
         } else {
@@ -66,171 +56,75 @@ impl EbpfInfoPanel {
     }
 
     pub fn scroll_to_bottom(&mut self) {
-        let total_lines = self.status_messages.len() + self.trace_events.len();
-        self.scroll_offset = total_lines.saturating_sub(1);
+        // For now, just set scroll offset to 0 to show all messages
+        self.scroll_offset = 0;
         self.auto_scroll = true;
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect, is_focused: bool) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, is_focused: bool) {
         let mut all_items = Vec::new();
 
-        // Calculate content width for text wrapping (subtract borders and prefix)
-        let content_width = area.width.saturating_sub(4); // 2 for borders + 2 for padding
+        // Calculate content width for text wrapping (subtract borders and padding)
+        let content_width = area.width.saturating_sub(6); // 2 for borders + 4 for padding
 
-        // Add status messages first (in chronological order)
-        for status in &self.status_messages {
-            let (style, text) = match status {
-                RuntimeStatus::DwarfLoadingStarted => (
-                    Style::default().fg(Color::Yellow),
-                    "Loading DWARF information...".to_string(),
-                ),
-                RuntimeStatus::DwarfLoadingCompleted { symbols_count } => (
-                    Style::default().fg(Color::Green),
-                    format!("DWARF loaded successfully ({} symbols)", symbols_count),
-                ),
-                RuntimeStatus::DwarfLoadingFailed(err) => (
-                    Style::default().fg(Color::Red),
-                    format!("DWARF loading failed: {}", err),
-                ),
-                RuntimeStatus::ScriptCompilationStarted => (
-                    Style::default().fg(Color::Yellow),
-                    "Compiling script...".to_string(),
-                ),
-                RuntimeStatus::ScriptCompilationCompleted => (
-                    Style::default().fg(Color::Green),
-                    "Script compiled successfully".to_string(),
-                ),
-                RuntimeStatus::ScriptCompilationFailed(err) => (
-                    Style::default().fg(Color::Red),
-                    format!("Script compilation failed: {}", err),
-                ),
-                RuntimeStatus::UprobeAttached { function, address } => (
-                    Style::default().fg(Color::Green),
-                    format!("Uprobe attached: {} @ 0x{:x}", function, address),
-                ),
-                RuntimeStatus::UprobeDetached { function } => (
-                    Style::default().fg(Color::Yellow),
-                    format!("Uprobe detached: {}", function),
-                ),
-                RuntimeStatus::ProcessAttached(pid) => (
-                    Style::default().fg(Color::Green),
-                    format!("Attached to process {}", pid),
-                ),
-                RuntimeStatus::ProcessDetached => (
-                    Style::default().fg(Color::Yellow),
-                    "Detached from process".to_string(),
-                ),
-                RuntimeStatus::SourceCodeLoaded(source_info) => (
-                    Style::default().fg(Color::Green),
-                    format!("Source code loaded: {}", source_info.file_path),
-                ),
-                RuntimeStatus::SourceCodeLoadFailed(err) => (
-                    Style::default().fg(Color::Red),
-                    format!("Source code load failed: {}", err),
-                ),
-                RuntimeStatus::Error(err) => {
-                    (Style::default().fg(Color::Red), format!("Error: {}", err))
-                }
+
+
+        // Add trace events with clean, simple formatting
+        let total_traces = self.trace_events.len();
+        for (trace_index, trace) in self.trace_events.iter().enumerate() {
+            let is_latest = trace_index == total_traces - 1;
+            
+            // Format timestamp
+            let formatted_time = self.format_timestamp(trace.timestamp);
+            
+            // Create the main message line
+            let message_line = format!(
+                "[{}] [{:^5}] TraceID:{} PID:{} - {}",
+                formatted_time,
+                format!("{:?}", trace.trace_type),
+                trace.trace_id,
+                trace.pid,
+                trace.message
+            );
+            
+            // Wrap the message if needed
+            let wrapped_lines = self.wrap_text(&message_line, content_width as usize);
+            
+            // Apply highlighting for latest message, use white for non-latest messages
+            let final_style = if is_latest {
+                Style::default().fg(Color::Green).add_modifier(ratatui::style::Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
             };
-
-            // Wrap long messages
-            let status_prefix = "[STATUS] ";
-            let full_text = format!("{}{}", status_prefix, text);
-            let wrapped_lines = self.wrap_text(&full_text, content_width as usize);
-
-            for (i, line) in wrapped_lines.iter().enumerate() {
-                if i == 0 {
-                    // First line includes the [STATUS] prefix
+            
+            // Add each line
+            for (line_index, line) in wrapped_lines.iter().enumerate() {
+                if line_index == 0 {
+                    // First line - use the full styled message
                     all_items.push(ListItem::new(Line::from(vec![Span::styled(
                         line.clone(),
-                        style,
+                        final_style,
                     )])));
                 } else {
-                    // Continuation lines are indented to align with content after prefix
-                    let indent = " ".repeat(status_prefix.len());
+                    // Continuation lines - indent and use same style
+                    let indent = " ".repeat(4); // Simple 4-space indent
                     all_items.push(ListItem::new(Line::from(vec![Span::styled(
                         format!("{}{}", indent, line),
-                        style,
+                        final_style,
                     )])));
                 }
             }
         }
 
-        // Add trace events (from ringbuf processing)
-        for trace in &self.trace_events {
-            // Format timestamp as HH:MM:SS.mmm
-            let formatted_time = self.format_timestamp(trace.timestamp);
-            let timestamp_text = format!("[{}] ", formatted_time);
-
-            let level_style = match trace.trace_type {
-                MessageType::Error => Style::default().fg(Color::Red),
-                MessageType::ExecutionFailure => Style::default().fg(Color::Red),
-                MessageType::Log => Style::default().fg(Color::Green),
-                MessageType::VariableData => Style::default().fg(Color::Cyan),
-                MessageType::Heartbeat => Style::default().fg(Color::DarkGray),
-                MessageType::BatchVariables => Style::default().fg(Color::Blue),
-                MessageType::Reserved => Style::default().fg(Color::White),
-            };
-
-            let level_text = format!("[{:^5}] ", format!("{:?}", trace.trace_type));
-            let trace_info = format!("TraceID:{} PID:{} - ", trace.trace_id, trace.pid);
-            let full_line = format!(
-                "{}{}{}{}",
-                timestamp_text, level_text, trace_info, trace.message
-            );
-
-            let wrapped_lines = self.wrap_text(&full_line, content_width as usize);
-            for (i, line) in wrapped_lines.iter().enumerate() {
-                if i == 0 {
-                    // First line with proper coloring
-                    let timestamp_len = timestamp_text.len();
-                    let level_len = level_text.len();
-                    let trace_info_len = trace_info.len();
-                    let total_prefix_len = timestamp_len + level_len + trace_info_len;
-
-                    let timestamp_part = &line[..timestamp_len.min(line.len())];
-                    let level_part = if line.len() > timestamp_len {
-                        &line[timestamp_len..(timestamp_len + level_len).min(line.len())]
-                    } else {
-                        ""
-                    };
-                    let trace_info_part = if line.len() > timestamp_len + level_len {
-                        &line[(timestamp_len + level_len)
-                            ..(timestamp_len + level_len + trace_info_len).min(line.len())]
-                    } else {
-                        ""
-                    };
-                    let content_part = if line.len() > total_prefix_len {
-                        &line[total_prefix_len..]
-                    } else {
-                        ""
-                    };
-
-                    all_items.push(ListItem::new(Line::from(vec![
-                        Span::styled(
-                            timestamp_part.to_string(),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                        Span::styled(level_part.to_string(), level_style),
-                        Span::styled(
-                            trace_info_part.to_string(),
-                            Style::default().fg(Color::Blue),
-                        ),
-                        Span::styled(content_part.to_string(), Style::default()),
-                    ])));
-                } else {
-                    // Continuation lines - indent to align with content after prefixes
-                    let indent =
-                        " ".repeat(timestamp_text.len() + level_text.len() + trace_info.len());
-                    all_items.push(ListItem::new(Line::from(vec![Span::styled(
-                        format!("{}{}", indent, line),
-                        Style::default(),
-                    )])));
-                }
-            }
+        // Apply scrolling with auto-scroll to latest events when area is full
+        let available_height = area.height.saturating_sub(2); // Subtract borders
+        
+        // If auto-scroll is enabled and we have more items than can fit, 
+        // adjust scroll offset to show the latest events
+        if self.auto_scroll && all_items.len() > available_height as usize {
+            self.scroll_offset = all_items.len().saturating_sub(available_height as usize);
         }
-
-        // Apply scrolling
+        
         let visible_items: Vec<_> = all_items.into_iter().skip(self.scroll_offset).collect();
 
         let border_style = if is_focused {
@@ -288,66 +182,27 @@ impl EbpfInfoPanel {
     }
 
     /// Wrap text to fit within the specified width
-    /// This improved version handles long words and special characters better
+    /// Simple character-based wrapping to avoid word breaking issues
     fn wrap_text(&self, text: &str, width: usize) -> Vec<String> {
-        if width == 0 {
+        if width == 0 || text.is_empty() {
             return vec![text.to_string()];
         }
 
         let mut lines = Vec::new();
         let mut current_line = String::new();
 
-        for word in text.split_whitespace() {
-            // If the word itself is longer than the width, we need to break it
-            if word.len() > width {
-                // If we have content on the current line, push it first
-                if !current_line.is_empty() {
-                    lines.push(current_line);
-                    current_line = String::new();
-                }
-
-                // For long words (like file paths), try to break at more sensible points
-                if word.contains('/') {
-                    // Try to break at path separators for file paths
-                    let mut remaining = word;
-                    while !remaining.is_empty() {
-                        let mut chunk_size = (width - 3).min(remaining.len());
-
-                        // If we're not at the end, try to find a good break point
-                        if chunk_size < remaining.len() {
-                            // Look for a path separator near the end of the chunk
-                            let chunk = &remaining[..chunk_size];
-                            if let Some(last_slash) = chunk.rfind('/') {
-                                // Break after the last slash in the chunk
-                                chunk_size = last_slash + 1;
-                            }
-                        }
-
-                        let chunk = &remaining[..chunk_size];
-                        lines.push(chunk.to_string());
-                        remaining = &remaining[chunk_size..];
-                    }
-                } else {
-                    // For other long words, break at character boundaries
-                    let mut remaining = word;
-                    while !remaining.is_empty() {
-                        let chunk_size = (width - 3).min(remaining.len());
-                        let chunk = &remaining[..chunk_size];
-                        lines.push(chunk.to_string());
-                        remaining = &remaining[chunk_size..];
-                    }
-                }
-            } else if current_line.is_empty() {
-                // First word on the line
-                current_line = word.to_string();
-            } else if current_line.len() + 1 + word.len() <= width {
-                // Word fits on current line
-                current_line.push(' ');
-                current_line.push_str(word);
-            } else {
-                // Word doesn't fit, start new line
+        for ch in text.chars() {
+            if ch == '\n' {
+                // Handle explicit line breaks
                 lines.push(current_line);
-                current_line = word.to_string();
+                current_line = String::new();
+            } else if current_line.len() >= width {
+                // Line is full, start a new one
+                lines.push(current_line);
+                current_line = ch.to_string();
+            } else {
+                // Add character to current line
+                current_line.push(ch);
             }
         }
 
@@ -356,7 +211,7 @@ impl EbpfInfoPanel {
             lines.push(current_line);
         }
 
-        // If no lines were created, return the original text
+        // Ensure we always return at least one line
         if lines.is_empty() {
             vec![text.to_string()]
         } else {

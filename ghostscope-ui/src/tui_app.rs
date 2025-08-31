@@ -588,7 +588,13 @@ impl TuiApp {
             _ => {}
         }
 
-        self.ebpf_info_panel.add_status_message(status);
+        // TODO: Consider moving status messages to the interactive command panel
+        // for better separation of concerns. The eBPF output panel should focus
+        // on actual eBPF events, while status messages could be shown in a
+        // dedicated status/log area in the command panel.
+        
+        // Currently not showing any status messages in eBPF output panel
+        // to keep it focused on actual eBPF trace events only
     }
 
     async fn handle_trace_event(&mut self, trace_event: TraceEvent) {
