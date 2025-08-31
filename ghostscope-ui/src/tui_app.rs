@@ -20,7 +20,9 @@ use crate::{
     events::{
         EventRegistry, RingbufEvent, RuntimeCommand, RuntimeStatus, SourceCodeInfo, TuiEvent,
     },
-    panels::{EbpfInfoPanel, InteractiveCommandPanel, SourceCodePanel, CommandAction, ResponseType},
+    panels::{
+        CommandAction, EbpfInfoPanel, InteractiveCommandPanel, ResponseType, SourceCodePanel,
+    },
 };
 
 pub struct TuiApp {
@@ -42,15 +44,15 @@ pub struct TuiApp {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum FocusedPanel {
-    Source,
-    Output,
-    Input,
+    Source,             // Source Code Panel
+    EbpfInfo,           // eBPF Information Display Panel
+    InteractiveCommand, // Command Interactive Window Panel
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LayoutMode {
-    Horizontal, // 水平布局 (4:3:3)
-    Vertical,   // 垂直布局 (上中下)
+    Horizontal,
+    Vertical,
 }
 
 impl TuiApp {
@@ -61,7 +63,7 @@ impl TuiApp {
             ebpf_info_panel: EbpfInfoPanel::new(),
             interactive_command_panel: InteractiveCommandPanel::new(),
             layout_mode,
-            focused_panel: FocusedPanel::Input,
+            focused_panel: FocusedPanel::InteractiveCommand,
             expecting_window_nav: false,
             event_registry,
         })
@@ -163,7 +165,7 @@ impl TuiApp {
         if self.expecting_window_nav {
             match key.code {
                 KeyCode::Char('j') => {
-                    // 垂直布局: j 向下移动焦点
+                    // Vertical layout: j moves focus down
                     if self.layout_mode == LayoutMode::Vertical {
                         self.move_focus("down");
                     }
@@ -172,7 +174,7 @@ impl TuiApp {
                     return Ok(false);
                 }
                 KeyCode::Char('k') => {
-                    // 垂直布局: k 向上移动焦点
+                    // Vertical layout: k moves focus up
                     if self.layout_mode == LayoutMode::Vertical {
                         self.move_focus("up");
                     }
@@ -181,7 +183,7 @@ impl TuiApp {
                     return Ok(false);
                 }
                 KeyCode::Char('h') => {
-                    // 水平布局: h 向左移动焦点
+                    // Horizontal layout: h moves focus left
                     if self.layout_mode == LayoutMode::Horizontal {
                         self.move_focus("left");
                     }
@@ -190,7 +192,7 @@ impl TuiApp {
                     return Ok(false);
                 }
                 KeyCode::Char('l') => {
-                    // 水平布局: l 向右移动焦点
+                    // Horizontal layout: l moves focus right
                     if self.layout_mode == LayoutMode::Horizontal {
                         self.move_focus("right");
                     }
@@ -199,7 +201,7 @@ impl TuiApp {
                     return Ok(false);
                 }
                 KeyCode::Char('v') => {
-                    // 切换布局模式
+                    // Switch layout mode
                     self.switch_layout();
                     debug!("Switched layout to {:?}", self.layout_mode);
                     self.expecting_window_nav = false;
@@ -236,13 +238,10 @@ impl TuiApp {
                 debug!("Expecting window navigation key (j/k)");
             }
             KeyCode::Esc => {
-                if self.focused_panel == FocusedPanel::Input {
-                    info!("Quit requested via ESC");
-                    let _ = self
-                        .event_registry
-                        .command_sender
-                        .send(RuntimeCommand::Shutdown);
-                    return Ok(true);
+                if self.focused_panel == FocusedPanel::InteractiveCommand {
+                    // Enter command mode instead of quitting
+                    self.interactive_command_panel.enter_command_mode();
+                    debug!("Entered command mode via ESC");
                 }
             }
             KeyCode::Tab => {
@@ -257,24 +256,62 @@ impl TuiApp {
 
     async fn handle_panel_input(&mut self, key: crossterm::event::KeyEvent) -> Result<()> {
         match self.focused_panel {
-            FocusedPanel::Input => match key.code {
+            FocusedPanel::InteractiveCommand => match key.code {
                 KeyCode::Char(c) => {
-                    self.interactive_command_panel.insert_char(c);
+                    if self.interactive_command_panel.mode
+                        == crate::panels::InteractionMode::Command
+                    {
+                        // Handle command navigation keys
+                        let key_str = c.to_string();
+                        self.interactive_command_panel
+                            .handle_vim_navigation(&key_str);
+                    } else {
+                        // In input mode, all characters are inserted as input
+                        self.interactive_command_panel.insert_char(c);
+                    }
                 }
                 KeyCode::Backspace => {
-                    self.interactive_command_panel.delete_char();
+                    if self.interactive_command_panel.mode == crate::panels::InteractionMode::Input
+                    {
+                        self.interactive_command_panel.delete_char();
+                    }
+                    // Ignore backspace in command mode
                 }
                 KeyCode::Left => {
-                    self.interactive_command_panel.move_cursor_left();
+                    if self.interactive_command_panel.mode
+                        == crate::panels::InteractionMode::Command
+                    {
+                        self.interactive_command_panel.handle_vim_navigation("h");
+                    } else {
+                        self.interactive_command_panel.move_cursor_left();
+                    }
                 }
                 KeyCode::Right => {
-                    self.interactive_command_panel.move_cursor_right();
+                    if self.interactive_command_panel.mode
+                        == crate::panels::InteractionMode::Command
+                    {
+                        self.interactive_command_panel.handle_vim_navigation("l");
+                    } else {
+                        self.interactive_command_panel.move_cursor_right();
+                    }
                 }
                 KeyCode::Up => {
-                    self.interactive_command_panel.history_up();
+                    if self.interactive_command_panel.mode
+                        == crate::panels::InteractionMode::Command
+                    {
+                        self.interactive_command_panel.handle_vim_navigation("k");
+                    } else {
+                        self.interactive_command_panel.history_up();
+                    }
                 }
                 KeyCode::Down => {
-                    self.interactive_command_panel.history_down();
+                    if self.interactive_command_panel.mode
+                        == crate::panels::InteractionMode::Command
+                    {
+                        self.interactive_command_panel.handle_vim_navigation("j");
+                    } else {
+                        self.interactive_command_panel.history_down();
+                    }
                 }
                 KeyCode::Enter => {
                     if let Some(action) = self.interactive_command_panel.submit_command() {
@@ -282,13 +319,27 @@ impl TuiApp {
                     }
                 }
                 KeyCode::Esc => {
-                    if self.interactive_command_panel.cancel_script() {
-                        info!("Script input cancelled");
+                    match self.interactive_command_panel.mode {
+                        crate::panels::InteractionMode::Input => {
+                            // Input mode: Enter command mode
+                            self.interactive_command_panel.enter_command_mode();
+                            debug!("Entered command mode via ESC from input mode");
+                        }
+                        crate::panels::InteractionMode::Script => {
+                            // Script mode: Cancel script and return to input mode
+                            if self.interactive_command_panel.cancel_script() {
+                                info!("Script input cancelled");
+                            }
+                        }
+                        crate::panels::InteractionMode::Command => {
+                            // Command mode: Do nothing (already in command mode)
+                            debug!("ESC ignored in command mode");
+                        }
                     }
                 }
                 _ => {}
             },
-            FocusedPanel::Output => match key.code {
+            FocusedPanel::EbpfInfo => match key.code {
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.ebpf_info_panel.scroll_up();
                 }
@@ -358,11 +409,11 @@ impl TuiApp {
             }
             CommandAction::AddScriptLine(line) => {
                 info!("Added script line: {}", line);
-                // 脚本行已添加到面板中，这里可以添加额外的处理逻辑
+                // Script line added to panel, additional processing logic can be added here
             }
             CommandAction::SubmitScript(script) => {
                 info!("Submitting script: {}", script);
-                // 发送脚本到主程序处理
+                // Send script to main program for processing
                 if let Err(e) = self.event_registry.script_sender.send(script.clone()) {
                     error!("Failed to send script: {}", e);
                     self.interactive_command_panel.add_response(
@@ -401,10 +452,8 @@ impl TuiApp {
                     ResponseType::Error,
                 );
             } else {
-                self.interactive_command_panel.add_response(
-                    "✓ Trace command sent".to_string(),
-                    ResponseType::Success,
-                );
+                self.interactive_command_panel
+                    .add_response("✓ Trace command sent".to_string(), ResponseType::Success);
             }
         } else if trimmed.starts_with("attach ") {
             // Parse PID from "attach <pid>"
@@ -419,10 +468,8 @@ impl TuiApp {
                         ResponseType::Progress,
                     );
                 } else {
-                    self.interactive_command_panel.add_response(
-                        format!("✗ Invalid PID: {}", pid_str),
-                        ResponseType::Error,
-                    );
+                    self.interactive_command_panel
+                        .add_response(format!("✗ Invalid PID: {}", pid_str), ResponseType::Error);
                 }
             }
         } else if trimmed == "detach" {
@@ -430,10 +477,8 @@ impl TuiApp {
                 .event_registry
                 .command_sender
                 .send(RuntimeCommand::DetachFromProcess);
-            self.interactive_command_panel.add_response(
-                "✓ Detached from process".to_string(),
-                ResponseType::Success,
-            );
+            self.interactive_command_panel
+                .add_response("✓ Detached from process".to_string(), ResponseType::Success);
         } else if trimmed == "quit" || trimmed == "exit" {
             let _ = self
                 .event_registry
@@ -461,19 +506,17 @@ impl TuiApp {
   detach   - Detach from current process
   quit     - Exit ghostscope
   exit     - Exit ghostscope"#;
-        
-        self.interactive_command_panel.add_response(
-            help_text.to_string(),
-            ResponseType::Info,
-        );
+
+        self.interactive_command_panel
+            .add_response(help_text.to_string(), ResponseType::Info);
     }
 
     fn cycle_focus(&mut self) {
         // Tab navigation follows same order as visual layout: Source -> Output -> Input
         self.focused_panel = match self.focused_panel {
-            FocusedPanel::Source => FocusedPanel::Output,
-            FocusedPanel::Output => FocusedPanel::Input,
-            FocusedPanel::Input => FocusedPanel::Source,
+            FocusedPanel::Source => FocusedPanel::EbpfInfo,
+            FocusedPanel::EbpfInfo => FocusedPanel::InteractiveCommand,
+            FocusedPanel::InteractiveCommand => FocusedPanel::Source,
         };
     }
 
@@ -487,20 +530,20 @@ impl TuiApp {
     fn move_focus(&mut self, direction: &str) {
         match self.layout_mode {
             LayoutMode::Horizontal => {
-                // 水平布局: h/l 切换
+                // Horizontal layout: h/l switching
                 match direction {
                     "left" => {
                         self.focused_panel = match self.focused_panel {
-                            FocusedPanel::Source => FocusedPanel::Input, // 循环到最右边
-                            FocusedPanel::Output => FocusedPanel::Source,
-                            FocusedPanel::Input => FocusedPanel::Output,
+                            FocusedPanel::Source => FocusedPanel::InteractiveCommand, // Cycle to rightmost
+                            FocusedPanel::EbpfInfo => FocusedPanel::Source,
+                            FocusedPanel::InteractiveCommand => FocusedPanel::EbpfInfo,
                         };
                     }
                     "right" => {
                         self.focused_panel = match self.focused_panel {
-                            FocusedPanel::Source => FocusedPanel::Output,
-                            FocusedPanel::Output => FocusedPanel::Input,
-                            FocusedPanel::Input => FocusedPanel::Source, // 循环到最左边
+                            FocusedPanel::Source => FocusedPanel::EbpfInfo,
+                            FocusedPanel::EbpfInfo => FocusedPanel::InteractiveCommand,
+                            FocusedPanel::InteractiveCommand => FocusedPanel::Source, // Cycle to leftmost
                         };
                     }
                     _ => {}
@@ -511,16 +554,16 @@ impl TuiApp {
                 match direction {
                     "up" => {
                         self.focused_panel = match self.focused_panel {
-                            FocusedPanel::Source => FocusedPanel::Input, // 循环到最下面
-                            FocusedPanel::Output => FocusedPanel::Source,
-                            FocusedPanel::Input => FocusedPanel::Output,
+                            FocusedPanel::Source => FocusedPanel::InteractiveCommand, // 循环到最下面
+                            FocusedPanel::EbpfInfo => FocusedPanel::Source,
+                            FocusedPanel::InteractiveCommand => FocusedPanel::EbpfInfo,
                         };
                     }
                     "down" => {
                         self.focused_panel = match self.focused_panel {
-                            FocusedPanel::Source => FocusedPanel::Output,
-                            FocusedPanel::Output => FocusedPanel::Input,
-                            FocusedPanel::Input => FocusedPanel::Source, // 循环到最上面
+                            FocusedPanel::Source => FocusedPanel::EbpfInfo,
+                            FocusedPanel::EbpfInfo => FocusedPanel::InteractiveCommand,
+                            FocusedPanel::InteractiveCommand => FocusedPanel::Source, // 循环到最上面
                         };
                     }
                     _ => {}
@@ -592,12 +635,15 @@ impl TuiApp {
         // Render panels with focus indication
         self.source_panel
             .render(frame, chunks[0], self.focused_panel == FocusedPanel::Source);
-        self.ebpf_info_panel
-            .render(frame, chunks[1], self.focused_panel == FocusedPanel::Output);
+        self.ebpf_info_panel.render(
+            frame,
+            chunks[1],
+            self.focused_panel == FocusedPanel::EbpfInfo,
+        );
         self.interactive_command_panel.render(
             frame,
             chunks[2],
-            self.focused_panel == FocusedPanel::Input,
+            self.focused_panel == FocusedPanel::InteractiveCommand,
         );
     }
 }

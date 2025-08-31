@@ -239,7 +239,7 @@ impl EbpfInfoPanel {
                     // Try to break at path separators for file paths
                     let mut remaining = word;
                     while !remaining.is_empty() {
-                        let mut chunk_size = (width - 3).min(remaining.len()); // 更保守的边距
+                        let mut chunk_size = (width - 3).min(remaining.len());
 
                         // If we're not at the end, try to find a good break point
                         if chunk_size < remaining.len() {
@@ -259,7 +259,7 @@ impl EbpfInfoPanel {
                     // For other long words, break at character boundaries
                     let mut remaining = word;
                     while !remaining.is_empty() {
-                        let chunk_size = (width - 3).min(remaining.len()); // 更保守的边距
+                        let chunk_size = (width - 3).min(remaining.len());
                         let chunk = &remaining[..chunk_size];
                         lines.push(chunk.to_string());
                         remaining = &remaining[chunk_size..];
