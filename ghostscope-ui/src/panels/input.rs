@@ -108,6 +108,7 @@ impl InputPanel {
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(if is_focused { BorderType::Thick } else { BorderType::Plain })
+                .title("Interactive Commands")
                 .border_style(border_style),
         );
 

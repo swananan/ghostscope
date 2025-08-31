@@ -32,7 +32,7 @@ pub struct TuiApp {
     input_panel: InputPanel,
 
     // Layout state
-    split_ratio: f32,
+    layout_mode: LayoutMode,
     focused_panel: FocusedPanel,
     expecting_window_nav: bool,
 
@@ -47,14 +47,20 @@ enum FocusedPanel {
     Input,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LayoutMode {
+    Horizontal, // 水平布局 (4:3:3)
+    Vertical,   // 垂直布局 (上中下)
+}
+
 impl TuiApp {
-    pub async fn new(event_registry: EventRegistry) -> Result<Self> {
+    pub async fn new(event_registry: EventRegistry, layout_mode: LayoutMode) -> Result<Self> {
         Ok(Self {
             should_quit: false,
             source_panel: SourceCodePanel::new(),
             output_panel: OutputPanel::new(),
             input_panel: InputPanel::new(),
-            split_ratio: 0.6, // 60% for source code, 40% for output
+            layout_mode,
             focused_panel: FocusedPanel::Input,
             expecting_window_nav: false,
             event_registry,
@@ -157,24 +163,45 @@ impl TuiApp {
         if self.expecting_window_nav {
             match key.code {
                 KeyCode::Char('j') => {
-                    // Move focus down: Source -> Output -> Input -> Source (top to bottom)
-                    self.focused_panel = match self.focused_panel {
-                        FocusedPanel::Source => FocusedPanel::Output,
-                        FocusedPanel::Output => FocusedPanel::Input,
-                        FocusedPanel::Input => FocusedPanel::Source,
-                    };
-                    debug!("Window nav: moved focus to {:?}", self.focused_panel);
+                    // 垂直布局: j 向下移动焦点
+                    if self.layout_mode == LayoutMode::Vertical {
+                        self.move_focus("down");
+                    }
+                    debug!("Window nav: moved focus down to {:?}", self.focused_panel);
                     self.expecting_window_nav = false;
                     return Ok(false);
                 }
                 KeyCode::Char('k') => {
-                    // Move focus up: Source -> Input -> Output -> Source (bottom to top)
-                    self.focused_panel = match self.focused_panel {
-                        FocusedPanel::Source => FocusedPanel::Input,
-                        FocusedPanel::Input => FocusedPanel::Output,
-                        FocusedPanel::Output => FocusedPanel::Source,
-                    };
-                    debug!("Window nav: moved focus to {:?}", self.focused_panel);
+                    // 垂直布局: k 向上移动焦点
+                    if self.layout_mode == LayoutMode::Vertical {
+                        self.move_focus("up");
+                    }
+                    debug!("Window nav: moved focus up to {:?}", self.focused_panel);
+                    self.expecting_window_nav = false;
+                    return Ok(false);
+                }
+                KeyCode::Char('h') => {
+                    // 水平布局: h 向左移动焦点
+                    if self.layout_mode == LayoutMode::Horizontal {
+                        self.move_focus("left");
+                    }
+                    debug!("Window nav: moved focus left to {:?}", self.focused_panel);
+                    self.expecting_window_nav = false;
+                    return Ok(false);
+                }
+                KeyCode::Char('l') => {
+                    // 水平布局: l 向右移动焦点
+                    if self.layout_mode == LayoutMode::Horizontal {
+                        self.move_focus("right");
+                    }
+                    debug!("Window nav: moved focus right to {:?}", self.focused_panel);
+                    self.expecting_window_nav = false;
+                    return Ok(false);
+                }
+                KeyCode::Char('v') => {
+                    // 切换布局模式
+                    self.switch_layout();
+                    debug!("Switched layout to {:?}", self.layout_mode);
                     self.expecting_window_nav = false;
                     return Ok(false);
                 }
@@ -371,6 +398,58 @@ impl TuiApp {
         };
     }
 
+    fn switch_layout(&mut self) {
+        self.layout_mode = match self.layout_mode {
+            LayoutMode::Horizontal => LayoutMode::Vertical,
+            LayoutMode::Vertical => LayoutMode::Horizontal,
+        };
+    }
+
+    fn move_focus(&mut self, direction: &str) {
+        match self.layout_mode {
+            LayoutMode::Horizontal => {
+                // 水平布局: h/l 切换
+                match direction {
+                    "left" => {
+                        self.focused_panel = match self.focused_panel {
+                            FocusedPanel::Source => FocusedPanel::Input, // 循环到最右边
+                            FocusedPanel::Output => FocusedPanel::Source,
+                            FocusedPanel::Input => FocusedPanel::Output,
+                        };
+                    }
+                    "right" => {
+                        self.focused_panel = match self.focused_panel {
+                            FocusedPanel::Source => FocusedPanel::Output,
+                            FocusedPanel::Output => FocusedPanel::Input,
+                            FocusedPanel::Input => FocusedPanel::Source, // 循环到最左边
+                        };
+                    }
+                    _ => {}
+                }
+            }
+            LayoutMode::Vertical => {
+                // 垂直布局: j/k 切换
+                match direction {
+                    "up" => {
+                        self.focused_panel = match self.focused_panel {
+                            FocusedPanel::Source => FocusedPanel::Input, // 循环到最下面
+                            FocusedPanel::Output => FocusedPanel::Source,
+                            FocusedPanel::Input => FocusedPanel::Output,
+                        };
+                    }
+                    "down" => {
+                        self.focused_panel = match self.focused_panel {
+                            FocusedPanel::Source => FocusedPanel::Output,
+                            FocusedPanel::Output => FocusedPanel::Input,
+                            FocusedPanel::Input => FocusedPanel::Source, // 循环到最上面
+                        };
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     async fn handle_runtime_status(&mut self, status: RuntimeStatus) {
         debug!("Runtime status: {:?}", status);
 
@@ -406,38 +485,45 @@ impl TuiApp {
     fn render(&mut self, frame: &mut ratatui::Frame) {
         let size = frame.area();
 
-        // Create main layout: source code area and bottom area
-        let main_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage((self.split_ratio * 100.0) as u16),
-                Constraint::Min(1),
-            ])
-            .split(size);
-
-        // Split bottom area into output and input
-        let bottom_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(5),    // Output area (resizable)
-                Constraint::Length(3), // Input area (fixed height)
-            ])
-            .split(main_chunks[1]);
+        let chunks = match self.layout_mode {
+            LayoutMode::Horizontal => {
+                // 水平布局: 4:3:3 比例
+                Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Ratio(4, 10), // Source code panel - 40%
+                        Constraint::Ratio(3, 10), // eBPF output panel - 30%
+                        Constraint::Ratio(3, 10), // Interactive command panel - 30%
+                    ])
+                    .split(size)
+            }
+            LayoutMode::Vertical => {
+                // 垂直布局: 上中下
+                Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Ratio(4, 10), // Source code panel - 40%
+                        Constraint::Ratio(3, 10), // eBPF output panel - 30%
+                        Constraint::Ratio(3, 10), // Interactive command panel - 30%
+                    ])
+                    .split(size)
+            }
+        };
 
         // Render panels with focus indication
         self.source_panel.render(
             frame,
-            main_chunks[0],
+            chunks[0],
             self.focused_panel == FocusedPanel::Source,
         );
         self.output_panel.render(
             frame,
-            bottom_chunks[0],
+            chunks[1],
             self.focused_panel == FocusedPanel::Output,
         );
         self.input_panel.render(
             frame,
-            bottom_chunks[1],
+            chunks[2],
             self.focused_panel == FocusedPanel::Input,
         );
     }

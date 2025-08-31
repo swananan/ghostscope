@@ -1,5 +1,13 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
+
+#[derive(Debug, Clone, Copy, PartialEq, ValueEnum)]
+pub enum LayoutMode {
+    /// Horizontal layout: panels arranged side by side (4:3:3 ratio)
+    Horizontal,
+    /// Vertical layout: panels arranged top to bottom (4:3:3 ratio)
+    Vertical,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "ghostscope")]
@@ -70,6 +78,12 @@ pub struct Args {
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub no_save_ast: bool,
 
+    /// TUI layout mode: horizontal (h) or vertical (v)
+    /// horizontal: panels arranged side by side (4:3:3 ratio)
+    /// vertical: panels arranged top to bottom (4:3:3 ratio)
+    #[arg(long, value_name = "MODE", value_enum, default_value = "horizontal")]
+    pub layout: LayoutMode,
+
     /// Remaining arguments (when using --args)
     pub remaining: Vec<String>,
 }
@@ -87,6 +101,7 @@ pub struct ParsedArgs {
     pub should_save_llvm_ir: bool,
     pub should_save_ebpf: bool,
     pub should_save_ast: bool,
+    pub layout_mode: LayoutMode,
 }
 
 impl Args {
@@ -130,6 +145,7 @@ impl Args {
                 should_save_llvm_ir,
                 should_save_ebpf,
                 should_save_ast,
+                layout_mode: parsed.layout,
             }
         } else {
             // Normal parsing without --args
@@ -152,6 +168,7 @@ impl Args {
                 should_save_llvm_ir,
                 should_save_ebpf,
                 should_save_ast,
+                layout_mode: parsed.layout,
             }
         }
     }

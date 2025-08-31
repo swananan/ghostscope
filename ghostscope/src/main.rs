@@ -4,7 +4,7 @@ mod session;
 
 use anyhow::Result;
 use args::ParsedArgs;
-use ghostscope_ui::{run_tui_mode, EventRegistry};
+use ghostscope_ui::{run_tui_mode, EventRegistry, LayoutMode};
 use session::DebugSession;
 use std::path::{Path, PathBuf};
 use tracing::{error, info, warn};
@@ -735,9 +735,15 @@ async fn run_tui_runtime(parsed_args: ParsedArgs) -> Result<()> {
         }
     });
 
+    // Convert layout mode to UI layout mode
+    let ui_layout_mode = match parsed_args.layout_mode {
+        args::LayoutMode::Horizontal => ghostscope_ui::LayoutMode::Horizontal,
+        args::LayoutMode::Vertical => ghostscope_ui::LayoutMode::Vertical,
+    };
+
     // Wait for tasks to complete or handle shutdown
     let result = tokio::select! {
-        tui_result = run_tui_mode(event_registry) => {
+        tui_result = run_tui_mode(event_registry, ui_layout_mode) => {
             info!("TUI exited");
             tui_result
         }
