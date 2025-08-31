@@ -18,7 +18,8 @@ use tracing::{debug, error, info};
 
 use crate::{
     events::{
-        EventRegistry, RingbufEvent, RuntimeCommand, RuntimeStatus, SourceCodeInfo, TuiEvent,
+        EventRegistry, RingbufEvent, RuntimeCommand, RuntimeStatus, SourceCodeInfo, TraceEvent,
+        TuiEvent,
     },
     panels::{
         CommandAction, EbpfInfoPanel, InteractiveCommandPanel, ResponseType, SourceCodePanel,
@@ -129,6 +130,12 @@ impl TuiApp {
                 // Handle ringbuf events
                 Some(event) = self.event_registry.ringbuf_receiver.recv() => {
                     self.handle_ringbuf_event(event).await;
+                    needs_render = true;
+                }
+
+                // Handle trace events from ringbuf processing
+                Some(trace_event) = self.event_registry.trace_receiver.recv() => {
+                    self.handle_trace_event(trace_event).await;
                     needs_render = true;
                 }
             }
@@ -596,6 +603,11 @@ impl TuiApp {
     async fn handle_ringbuf_event(&mut self, event: RingbufEvent) {
         debug!("Ringbuf event: {:?}", event);
         self.ebpf_info_panel.add_ringbuf_event(event);
+    }
+
+    async fn handle_trace_event(&mut self, trace_event: TraceEvent) {
+        debug!("Trace event: {:?}", trace_event);
+        self.ebpf_info_panel.add_trace_event(trace_event);
     }
 
     fn render(&mut self, frame: &mut ratatui::Frame) {

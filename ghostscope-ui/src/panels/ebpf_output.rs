@@ -7,11 +7,12 @@ use ratatui::{
 };
 use std::collections::VecDeque;
 
-use crate::events::{RingbufEvent, RuntimeStatus};
+use crate::events::{RingbufEvent, RuntimeStatus, TraceEvent, TraceLevel};
 
 pub struct EbpfInfoPanel {
     pub messages: VecDeque<RingbufEvent>,
     pub status_messages: VecDeque<RuntimeStatus>,
+    pub trace_events: VecDeque<TraceEvent>,
     pub scroll_offset: usize,
     pub max_messages: usize,
     pub auto_scroll: bool,
@@ -22,6 +23,7 @@ impl EbpfInfoPanel {
         Self {
             messages: VecDeque::new(),
             status_messages: VecDeque::new(),
+            trace_events: VecDeque::new(),
             scroll_offset: 0,
             max_messages: 1000,
             auto_scroll: true,
@@ -47,6 +49,17 @@ impl EbpfInfoPanel {
         }
     }
 
+    pub fn add_trace_event(&mut self, trace_event: TraceEvent) {
+        self.trace_events.push_back(trace_event);
+        if self.trace_events.len() > self.max_messages {
+            self.trace_events.pop_front();
+        }
+
+        if self.auto_scroll {
+            self.scroll_to_bottom();
+        }
+    }
+
     pub fn scroll_up(&mut self) {
         if self.scroll_offset > 0 {
             self.scroll_offset -= 1;
@@ -55,7 +68,8 @@ impl EbpfInfoPanel {
     }
 
     pub fn scroll_down(&mut self) {
-        let total_lines = self.messages.len() + self.status_messages.len();
+        let total_lines =
+            self.messages.len() + self.status_messages.len() + self.trace_events.len();
         if self.scroll_offset + 1 < total_lines {
             self.scroll_offset += 1;
         } else {
@@ -64,7 +78,8 @@ impl EbpfInfoPanel {
     }
 
     pub fn scroll_to_bottom(&mut self) {
-        let total_lines = self.messages.len() + self.status_messages.len();
+        let total_lines =
+            self.messages.len() + self.status_messages.len() + self.trace_events.len();
         self.scroll_offset = total_lines.saturating_sub(1);
         self.auto_scroll = true;
     }
@@ -154,6 +169,58 @@ impl EbpfInfoPanel {
             }
         }
 
+        // Add trace events (from ringbuf processing)
+        for trace in &self.trace_events {
+            let timestamp_text = format!("[{:>12}] ", trace.timestamp);
+            let level_style = match trace.level {
+                TraceLevel::Info => Style::default().fg(Color::Green),
+                TraceLevel::Warn => Style::default().fg(Color::Yellow),
+                TraceLevel::Error => Style::default().fg(Color::Red),
+                TraceLevel::Trace => Style::default().fg(Color::Cyan),
+            };
+
+            let level_text = format!("[{:?}] ", trace.level);
+            let full_line = format!("{}{}{}", timestamp_text, level_text, trace.message);
+
+            let wrapped_lines = self.wrap_text(&full_line, content_width as usize);
+            for (i, line) in wrapped_lines.iter().enumerate() {
+                if i == 0 {
+                    // First line with proper coloring
+                    let timestamp_len = timestamp_text.len();
+                    let level_len = level_text.len();
+                    let total_prefix_len = timestamp_len + level_len;
+
+                    let timestamp_part = &line[..timestamp_len.min(line.len())];
+                    let level_part = if line.len() > timestamp_len {
+                        &line[timestamp_len..(timestamp_len + level_len).min(line.len())]
+                    } else {
+                        ""
+                    };
+                    let content_part = if line.len() > total_prefix_len {
+                        &line[total_prefix_len..]
+                    } else {
+                        ""
+                    };
+
+                    all_items.push(ListItem::new(Line::from(vec![
+                        Span::styled(
+                            timestamp_part.to_string(),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                        Span::styled(level_part.to_string(), level_style),
+                        Span::styled(content_part.to_string(), Style::default()),
+                    ])));
+                } else {
+                    // Continuation lines - indent to align with content after prefixes
+                    let indent = " ".repeat(timestamp_text.len() + level_text.len());
+                    all_items.push(ListItem::new(Line::from(vec![Span::styled(
+                        format!("{}{}", indent, line),
+                        Style::default(),
+                    )])));
+                }
+            }
+        }
+
         // Add ringbuf messages
         for event in &self.messages {
             let timestamp_text = format!("[{:>12}] ", event.timestamp);
@@ -206,7 +273,8 @@ impl EbpfInfoPanel {
                     BorderType::Plain
                 })
                 .title(format!(
-                    "eBPF Information ({} messages)",
+                    "eBPF Information ({} traces, {} messages)",
+                    self.trace_events.len(),
                     self.messages.len()
                 ))
                 .border_style(border_style),

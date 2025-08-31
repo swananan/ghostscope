@@ -865,15 +865,23 @@ async fn run_runtime_coordinator(
     mut runtime_channels: ghostscope_ui::RuntimeChannels,
     mut session: Option<DebugSession>,
 ) -> Result<()> {
-    use ghostscope_ui::{RingbufEvent, RuntimeCommand, RuntimeStatus};
+    use ghostscope_ui::events::{RingbufEvent, TraceEvent, TraceLevel};
+    use ghostscope_ui::{RuntimeCommand, RuntimeStatus};
 
     info!("Runtime coordinator started");
 
-    // TODO: Implement eBPF session management
-    // For now, just handle basic commands
+    // Create trace sender for event polling task
+    let trace_sender = runtime_channels.create_trace_sender();
 
     loop {
         tokio::select! {
+            // Poll ringbuf events from all active loaders
+            _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
+                if let Some(ref mut session) = session {
+                    poll_ringbuf_events(session, &trace_sender);
+                }
+            }
+
             // Handle script compilation requests
             Some(script) = runtime_channels.script_receiver.recv() => {
                 info!("Received script for compilation: {}", script);
@@ -1168,11 +1176,11 @@ fn compile_and_load_script(
                     "Resolving source line '{}:{}' to addresses",
                     file_path, line_number
                 );
-                
+
                 if let Some(ref analyzer) = session.binary_analyzer {
                     if let Some(dwarf_context) = analyzer.dwarf_context() {
-                        let line_mappings = dwarf_context
-                            .get_addresses_for_line(file_path, *line_number);
+                        let line_mappings =
+                            dwarf_context.get_addresses_for_line(file_path, *line_number);
 
                         if !line_mappings.is_empty() {
                             info!(
@@ -1192,8 +1200,8 @@ fn compile_and_load_script(
                             );
 
                             // Calculate proper uprobe offset from the resolved address
-                            if let Some(uprobe_offset) = analyzer
-                                .calculate_uprobe_offset_from_address(resolved_address)
+                            if let Some(uprobe_offset) =
+                                analyzer.calculate_uprobe_offset_from_address(resolved_address)
                             {
                                 info!(
                                     "Calculated uprobe offset: 0x{:x} for address 0x{:x}",
@@ -1289,19 +1297,13 @@ fn compile_and_load_script(
                 Some(&config.ebpf_function_name),
             ) {
                 Ok(_) => {
-                    info!(
-                        "Successfully attached uprobe for '{}'",
-                        attachment_name
-                    );
+                    info!("Successfully attached uprobe for '{}'", attachment_name);
 
                     // Store the loader in session for event polling
                     session.loaders.push(loader);
                 }
                 Err(e) => {
-                    error!(
-                        "Failed to attach uprobe for '{}': {}",
-                        attachment_name, e
-                    );
+                    error!("Failed to attach uprobe for '{}': {}", attachment_name, e);
                     continue;
                 }
             }
@@ -1312,4 +1314,65 @@ fn compile_and_load_script(
     }
 
     Ok(())
+}
+
+/// Poll ringbuf events from all active loaders and send formatted events to TUI
+fn poll_ringbuf_events(
+    session: &mut DebugSession,
+    trace_sender: &tokio::sync::mpsc::UnboundedSender<ghostscope_ui::events::TraceEvent>,
+) {
+    use ghostscope_ui::events::{TraceEvent, TraceLevel};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // Get current timestamp for events
+    let current_timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+
+    // Poll events from all loaders
+    for (loader_index, loader) in session.loaders.iter_mut().enumerate() {
+        match loader.poll_events() {
+            Ok(Some(events)) => {
+                for event in events {
+                    // Format the event message with relevant information
+                    let message = format!(
+                        "[Loader {}] Trace ID: {}, PID: {}, TID: {} - Variables: [{}]",
+                        loader_index,
+                        event.trace_id,
+                        event.pid,
+                        event.tid,
+                        event
+                            .variables
+                            .iter()
+                            .map(|var| format!("{}: {}", var.name, var.formatted_value))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+
+                    let trace_event = TraceEvent {
+                        timestamp: event.timestamp,
+                        level: TraceLevel::Trace,
+                        message,
+                    };
+
+                    // Send to TUI (ignore errors if channel is closed)
+                    let _ = trace_sender.send(trace_event);
+                }
+            }
+            Ok(None) => {
+                // No events available, continue
+            }
+            Err(e) => {
+                // Log error and send error event to TUI
+                error!("Error polling events from loader {}: {}", loader_index, e);
+                let error_event = TraceEvent {
+                    timestamp: current_timestamp,
+                    level: TraceLevel::Error,
+                    message: format!("Error polling events from loader {}: {}", loader_index, e),
+                };
+                let _ = trace_sender.send(error_event);
+            }
+        }
+    }
 }
