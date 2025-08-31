@@ -15,6 +15,7 @@ pub struct SourceCodePanel {
     pub current_column: usize, // Add horizontal cursor position
     pub scroll_offset: usize,
     pub file_path: Option<String>,
+    pub area_height: u16, // Store the current area height for scroll calculations
 }
 
 impl SourceCodePanel {
@@ -25,6 +26,7 @@ impl SourceCodePanel {
             current_column: 0,
             scroll_offset: 0,
             file_path: None,
+            area_height: 10, // Default height
         }
     }
 
@@ -37,14 +39,25 @@ impl SourceCodePanel {
         self.file_path = Some(file_path);
         self.content = content;
 
-        // Auto-scroll to highlighted line
+        // Smart initial cursor positioning
         if let Some(line) = highlight_line {
             if line > 0 && line <= self.content.len() {
+                // If DWARF provides a specific line (e.g., main function), go there
                 self.current_line = line - 1; // Convert to 0-based
-                                              // Center the highlighted line in the view
-                self.scroll_offset = line.saturating_sub(10);
+                self.current_column = 0; // Start at beginning of line
+            } else {
+                // Invalid line number, start at top
+                self.current_line = 0;
+                self.current_column = 0;
             }
+        } else {
+            // No specific line provided, start at top
+            self.current_line = 0;
+            self.current_column = 0;
         }
+        
+        // Reset scroll offset - let ensure_cursor_visible handle positioning
+        self.scroll_offset = 0;
     }
 
     pub fn clear_source(&mut self) {
@@ -113,19 +126,47 @@ impl SourceCodePanel {
             return;
         }
 
-        let visible_lines = 10; // Approximate visible lines
-        let current_visible_line = self.current_line.saturating_sub(self.scroll_offset);
+        // Calculate actual visible lines (subtract borders and title)
+        let visible_lines = (self.area_height.saturating_sub(2)) as usize; // 2 for top and bottom borders
+        
+        // If content fits entirely in the visible area, don't scroll
+        if self.content.len() <= visible_lines {
+            self.scroll_offset = 0;
+            return;
+        }
 
-        if current_visible_line >= visible_lines {
-            // Cursor is below visible area, scroll down
-            self.scroll_offset = self.current_line.saturating_sub(visible_lines / 2);
-        } else if self.current_line < self.scroll_offset {
-            // Cursor is above visible area, scroll up
-            self.scroll_offset = self.current_line.saturating_sub(visible_lines / 2);
+        // Vim-style scrolloff behavior
+        let scrolloff = visible_lines / 3; // Keep cursor roughly in the middle third
+        
+        // Calculate the ideal scroll position to keep cursor in the middle
+        let ideal_scroll = if self.current_line >= scrolloff {
+            self.current_line.saturating_sub(scrolloff)
+        } else {
+            0
+        };
+
+        // Check if we're near the end of the file
+        let max_scroll = self.content.len().saturating_sub(visible_lines);
+        let near_end = self.current_line >= max_scroll.saturating_add(scrolloff);
+        
+        if near_end {
+            // Near the end: lock the end at the bottom
+            self.scroll_offset = max_scroll;
+        } else {
+            // Normal scrolling: keep cursor in the middle area
+            self.scroll_offset = ideal_scroll.min(max_scroll);
         }
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect, is_focused: bool) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, is_focused: bool) {
+        // Update area height for scroll calculations
+        self.area_height = area.height;
+        
+        // When focus is gained, ensure cursor is visible immediately
+        if is_focused {
+            self.ensure_cursor_visible();
+        }
+        
         let items: Vec<ListItem> = self
             .content
             .iter()
@@ -578,3 +619,4 @@ impl InputPanel {
         }
     }
 }
+
