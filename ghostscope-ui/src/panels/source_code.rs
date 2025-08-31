@@ -5,6 +5,7 @@ use ratatui::{
     widgets::{Block, Borders, BorderType, List, ListItem},
     Frame,
 };
+use crate::syntax_highlight::{SyntaxHighlighter, Token, TokenType};
 
 pub struct SourceCodePanel {
     pub content: Vec<String>,
@@ -13,6 +14,8 @@ pub struct SourceCodePanel {
     pub scroll_offset: usize,
     pub file_path: Option<String>,
     pub area_height: u16, // Store the current area height for scroll calculations
+    pub language: String, // Programming language for syntax highlighting
+    pub syntax_highlighter: SyntaxHighlighter,
 }
 
 impl SourceCodePanel {
@@ -25,6 +28,8 @@ impl SourceCodePanel {
             scroll_offset: 0,
             file_path: None,
             area_height: 10, // Default height
+            language: "c".to_string(), // Default to C
+            syntax_highlighter: SyntaxHighlighter::new(),
         }
     }
 
@@ -34,13 +39,61 @@ impl SourceCodePanel {
         content: Vec<String>,
         _highlight_line: Option<usize>, // Ignore highlight_line parameter
     ) {
-        self.file_path = Some(file_path);
+        self.file_path = Some(file_path.clone());
         self.content = content;
+        
+        // Detect language based on file extension
+        self.language = self.detect_language(&file_path);
 
         // Always start at the top of the file
         self.current_line = 0;
         self.current_column = 0;
         self.scroll_offset = 0;
+    }
+
+    fn detect_language(&self, file_path: &str) -> String {
+        if let Some(extension) = file_path.split('.').last() {
+            match extension.to_lowercase().as_str() {
+                "c" => "c".to_string(),
+                "cpp" | "cc" | "cxx" | "hpp" | "hxx" => "cpp".to_string(),
+                "rs" => "rust".to_string(),
+                _ => "c".to_string(), // Default to C
+            }
+        } else {
+            "c".to_string() // Default to C
+        }
+    }
+
+    fn highlight_line(&self, line: &str) -> Vec<Span> {
+        let tokens = self.syntax_highlighter.highlight_line(line, &self.language);
+        let mut spans = Vec::new();
+        let mut current_pos = 0;
+        
+        for token in tokens {
+            // Add any characters that come before this token
+            if token.start > current_pos {
+                let normal_text = &line[current_pos..token.start];
+                if !normal_text.is_empty() {
+                    spans.push(Span::styled(normal_text.to_string(), Style::default()));
+                }
+            }
+            
+            // Add the token with its style
+            let style = self.syntax_highlighter.get_token_style(&token.token_type);
+            spans.push(Span::styled(token.text.clone(), style));
+            
+            current_pos = token.end;
+        }
+        
+        // Add any remaining characters after the last token
+        if current_pos < line.len() {
+            let remaining_text = &line[current_pos..];
+            if !remaining_text.is_empty() {
+                spans.push(Span::styled(remaining_text.to_string(), Style::default()));
+            }
+        }
+        
+        spans
     }
 
     pub fn clear_source(&mut self) {
@@ -186,15 +239,18 @@ impl SourceCodePanel {
                     Style::default().fg(Color::DarkGray)
                 };
 
-                let style = Style::default();
+                // Apply syntax highlighting
+                let highlighted_spans = self.highlight_line(line);
 
-                ListItem::new(Line::from(vec![
+                let mut spans = vec![
                     Span::styled(
                         format!("{:4} ", line_num),
                         line_number_style,
                     ),
-                    Span::styled(line.clone(), style),
-                ]))
+                ];
+                spans.extend(highlighted_spans);
+
+                ListItem::new(Line::from(spans))
             })
             .collect();
 

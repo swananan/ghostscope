@@ -1,5 +1,6 @@
 pub mod events;
 mod panels;
+mod syntax_highlight;
 mod tui_app;
 
 pub use events::{
