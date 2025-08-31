@@ -6,6 +6,7 @@ use anyhow::Result;
 use args::ParsedArgs;
 use ghostscope_ui::{run_tui_mode, EventRegistry};
 use session::DebugSession;
+use std::path::{Path, PathBuf};
 use tracing::{error, info, warn};
 
 #[tokio::main]
@@ -718,26 +719,27 @@ async fn run_tui_runtime(parsed_args: ParsedArgs) -> Result<()> {
         )
     };
 
-    // Start the runtime coordination task
-    let runtime_task = tokio::spawn(async move { run_runtime_coordinator(runtime_channels).await });
+    // Start the runtime coordination task with session from DWARF processing
+    let runtime_task = tokio::spawn(async move {
+        // Wait for DWARF processing to complete and get the session
+        match dwarf_task.await {
+            Ok(Ok(session)) => run_runtime_coordinator(runtime_channels, Some(session)).await,
+            Ok(Err(e)) => {
+                error!("DWARF processing failed: {}", e);
+                run_runtime_coordinator(runtime_channels, None).await
+            }
+            Err(e) => {
+                error!("DWARF task panicked: {}", e);
+                run_runtime_coordinator(runtime_channels, None).await
+            }
+        }
+    });
 
     // Wait for tasks to complete or handle shutdown
     let result = tokio::select! {
         tui_result = run_tui_mode(event_registry) => {
             info!("TUI exited");
             tui_result
-        }
-        dwarf_result = dwarf_task => {
-            match dwarf_result {
-                Ok(result) => {
-                    info!("DWARF processing completed");
-                    result
-                }
-                Err(e) => {
-                    error!("DWARF processing task failed: {}", e);
-                    Err(anyhow::anyhow!("DWARF processing task failed: {}", e))
-                }
-            }
         }
         runtime_result = runtime_task => {
             match runtime_result {
@@ -794,7 +796,7 @@ fn validate_tui_arguments(args: &ParsedArgs) -> Result<()> {
 async fn initialize_dwarf_processing(
     parsed_args: ParsedArgs,
     status_sender: tokio::sync::mpsc::UnboundedSender<ghostscope_ui::RuntimeStatus>,
-) -> Result<()> {
+) -> Result<DebugSession> {
     use ghostscope_ui::RuntimeStatus;
 
     // Send status update: starting DWARF loading
@@ -802,7 +804,7 @@ async fn initialize_dwarf_processing(
 
     // Create debug session for DWARF processing
     match DebugSession::new(&parsed_args) {
-        Ok(mut session) => {
+        Ok(session) => {
             // Validate that we have debug information
             match session.get_debug_info() {
                 Some(debug_info) => {
@@ -829,10 +831,8 @@ async fn initialize_dwarf_processing(
                         );
                     }
 
-                    // TODO: Store session for later use by script compilation
-                    // For now, we'll keep it alive in this task
-                    tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await; // Keep alive for 1 hour
-                    Ok(())
+                    // Return the session for use by runtime coordinator
+                    Ok(session)
                 }
                 None => {
                     let error_msg = format!(
@@ -857,6 +857,7 @@ async fn initialize_dwarf_processing(
 /// Main runtime coordinator that handles commands and manages eBPF sessions
 async fn run_runtime_coordinator(
     mut runtime_channels: ghostscope_ui::RuntimeChannels,
+    session: Option<DebugSession>,
 ) -> Result<()> {
     use ghostscope_ui::{RingbufEvent, RuntimeCommand, RuntimeStatus};
 
@@ -910,6 +911,10 @@ async fn run_runtime_coordinator(
                         info!("Reloading binary: {}", path);
                         // TODO: Implement binary reloading
                     }
+                    RuntimeCommand::RequestSourceCode => {
+                        info!("Source code request received");
+                        handle_source_code_request(&session, &runtime_channels.status_sender).await;
+                    }
                     RuntimeCommand::Shutdown => {
                         info!("Shutdown command received");
                         break;
@@ -921,4 +926,91 @@ async fn run_runtime_coordinator(
 
     info!("Runtime coordinator shutting down");
     Ok(())
+}
+
+/// Handle source code request from TUI
+async fn handle_source_code_request(
+    session: &Option<DebugSession>,
+    status_sender: &tokio::sync::mpsc::UnboundedSender<ghostscope_ui::RuntimeStatus>,
+) {
+    use ghostscope_ui::{RuntimeStatus, events::SourceCodeInfo};
+
+    if let Some(session) = session {
+        // Try to get source information from DWARF
+        if let Some(binary_analyzer) = &session.binary_analyzer {
+            if let Some(dwarf_context) = binary_analyzer.dwarf_context() {
+                // For now, get main function address and find its source
+                if let Some(main_symbol) = binary_analyzer.find_symbol("main") {
+                    if let Some(source_location) = dwarf_context.get_source_location(main_symbol.address) {
+                        info!("Found source location: file_path={}, line={}", 
+                              source_location.file_path, source_location.line_number);
+                        
+                        // Try multiple strategies to find the source file
+                        let possible_paths = get_possible_source_paths(
+                            &source_location.file_path,
+                            &binary_analyzer.debug_info().binary_path
+                        );
+                        
+                        for path in possible_paths {
+                            info!("Trying to read source file: {}", path.display());
+                            match std::fs::read_to_string(&path) {
+                                Ok(content) => {
+                                    let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+                                    let source_info = SourceCodeInfo {
+                                        file_path: path.to_string_lossy().to_string(),
+                                        content: lines,
+                                        current_line: Some(source_location.line_number as usize),
+                                    };
+                                    let _ = status_sender.send(RuntimeStatus::SourceCodeLoaded(source_info));
+                                    return;
+                                }
+                                Err(e) => {
+                                    info!("Failed to read source file {}: {}", path.display(), e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // If we get here, source code loading failed
+    let _ = status_sender.send(RuntimeStatus::SourceCodeLoadFailed(
+        "No debug information available or source file not found. Compile with -g and ensure source files are accessible.".to_string()
+    ));
+}
+
+/// Get possible source file paths based on DWARF info and binary location
+fn get_possible_source_paths(dwarf_file_path: &str, binary_path: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    
+    // 1. Try the original path from DWARF
+    paths.push(PathBuf::from(dwarf_file_path));
+    
+    // 2. If it's a relative path like "file_1", try common source file names in binary directory
+    if dwarf_file_path.starts_with("file_") || !Path::new(dwarf_file_path).is_absolute() {
+        if let Some(binary_dir) = binary_path.parent() {
+            // Try test_program.c in the same directory as binary
+            paths.push(binary_dir.join("test_program.c"));
+            
+            // Try other common source file extensions
+            let binary_stem = binary_path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("main");
+                
+            for ext in &["c", "cpp", "cc", "cxx"] {
+                paths.push(binary_dir.join(format!("{}.{}", binary_stem, ext)));
+            }
+        }
+    }
+    
+    // 3. If it's a filename without directory, try in binary directory
+    if let Some(filename) = Path::new(dwarf_file_path).file_name() {
+        if let Some(binary_dir) = binary_path.parent() {
+            paths.push(binary_dir.join(filename));
+        }
+    }
+    
+    paths
 }

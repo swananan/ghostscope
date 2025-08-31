@@ -31,6 +31,14 @@ pub struct EventRegistry {
     pub status_receiver: mpsc::UnboundedReceiver<RuntimeStatus>,
 }
 
+/// Source code information for display in TUI
+#[derive(Debug, Clone)]
+pub struct SourceCodeInfo {
+    pub file_path: String,
+    pub content: Vec<String>,
+    pub current_line: Option<usize>,
+}
+
 /// Commands that TUI can send to runtime
 #[derive(Debug, Clone)]
 pub enum RuntimeCommand {
@@ -38,6 +46,7 @@ pub enum RuntimeCommand {
     AttachToProcess(u32),
     DetachFromProcess,
     ReloadBinary(String),
+    RequestSourceCode, // Request source code for current function/address
     Shutdown,
 }
 
@@ -54,6 +63,8 @@ pub enum RuntimeStatus {
     UprobeDetached { function: String },
     ProcessAttached(u32),
     ProcessDetached,
+    SourceCodeLoaded(SourceCodeInfo),
+    SourceCodeLoadFailed(String),
     Error(String),
 }
 

@@ -7,12 +7,14 @@ use ratatui::{
 };
 use std::collections::VecDeque;
 
-use crate::events::{RingbufEvent, RuntimeStatus};
+use crate::events::{RingbufEvent, RuntimeStatus, SourceCodeInfo};
 
 pub struct SourceCodePanel {
     pub content: Vec<String>,
     pub current_line: usize,
     pub scroll_offset: usize,
+    pub file_path: Option<String>,
+    pub highlighted_line: Option<usize>,
 }
 
 impl SourceCodePanel {
@@ -21,7 +23,32 @@ impl SourceCodePanel {
             content: vec!["// No source code loaded".to_string()],
             current_line: 0,
             scroll_offset: 0,
+            file_path: None,
+            highlighted_line: None,
         }
+    }
+
+    pub fn load_source(&mut self, file_path: String, content: Vec<String>, highlight_line: Option<usize>) {
+        self.file_path = Some(file_path);
+        self.content = content;
+        self.highlighted_line = highlight_line;
+        
+        // Auto-scroll to highlighted line
+        if let Some(line) = highlight_line {
+            if line > 0 && line <= self.content.len() {
+                self.current_line = line - 1; // Convert to 0-based
+                // Center the highlighted line in the view
+                self.scroll_offset = line.saturating_sub(10);
+            }
+        }
+    }
+
+    pub fn clear_source(&mut self) {
+        self.content = vec!["// No source code loaded".to_string()];
+        self.file_path = None;
+        self.highlighted_line = None;
+        self.current_line = 0;
+        self.scroll_offset = 0;
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect, is_focused: bool) {
@@ -32,8 +59,13 @@ impl SourceCodePanel {
             .skip(self.scroll_offset)
             .map(|(i, line)| {
                 let line_num = i + 1;
+                
                 let style = if i == self.current_line {
+                    // Current line (cursor position)
                     Style::default().bg(Color::Blue).fg(Color::White)
+                } else if Some(line_num) == self.highlighted_line {
+                    // Highlighted line from DWARF (e.g., main function)
+                    Style::default().bg(Color::Green).fg(Color::Black)
                 } else {
                     Style::default()
                 };
@@ -54,10 +86,16 @@ impl SourceCodePanel {
             Style::default()
         };
 
+        // Include file path in title if available
+        let title = match &self.file_path {
+            Some(path) => format!("Source Code - {}", path),
+            None => "Source Code".to_string(),
+        };
+
         let list = List::new(items).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Source Code")
+                .title(title)
                 .border_style(border_style),
         );
 
@@ -170,6 +208,14 @@ impl OutputPanel {
                 RuntimeStatus::ProcessDetached => (
                     Style::default().fg(Color::Yellow),
                     "Detached from process".to_string(),
+                ),
+                RuntimeStatus::SourceCodeLoaded(source_info) => (
+                    Style::default().fg(Color::Green),
+                    format!("Source code loaded: {}", source_info.file_path),
+                ),
+                RuntimeStatus::SourceCodeLoadFailed(err) => (
+                    Style::default().fg(Color::Red),
+                    format!("Source code load failed: {}", err),
                 ),
                 RuntimeStatus::Error(err) => {
                     (Style::default().fg(Color::Red), format!("Error: {}", err))
