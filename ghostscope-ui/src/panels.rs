@@ -19,6 +19,7 @@ pub struct SourceCodePanel {
 }
 
 impl SourceCodePanel {
+
     pub fn new() -> Self {
         Self {
             content: vec!["// No source code loaded".to_string()],
@@ -39,24 +40,19 @@ impl SourceCodePanel {
         self.file_path = Some(file_path);
         self.content = content;
 
-        // Smart initial cursor positioning
         if let Some(line) = highlight_line {
             if line > 0 && line <= self.content.len() {
-                // If DWARF provides a specific line (e.g., main function), go there
-                self.current_line = line - 1; // Convert to 0-based
-                self.current_column = 0; // Start at beginning of line
+                self.current_line = line - 1;
+                self.current_column = 0;
             } else {
-                // Invalid line number, start at top
                 self.current_line = 0;
                 self.current_column = 0;
             }
         } else {
-            // No specific line provided, start at top
             self.current_line = 0;
             self.current_column = 0;
         }
         
-        // Reset scroll offset - let ensure_cursor_visible handle positioning
         self.scroll_offset = 0;
     }
 
@@ -68,17 +64,21 @@ impl SourceCodePanel {
         self.scroll_offset = 0;
     }
 
-    // Vim-style navigation methods
+
     pub fn move_up(&mut self) {
         if self.current_line > 0 {
+            let old_column = self.current_column;
             self.current_line -= 1;
+            self.adjust_column_for_new_line(old_column);
             self.ensure_cursor_visible();
         }
     }
 
     pub fn move_down(&mut self) {
         if self.current_line + 1 < self.content.len() {
+            let old_column = self.current_column;
             self.current_line += 1;
+            self.adjust_column_for_new_line(old_column);
             self.ensure_cursor_visible();
         }
     }
@@ -86,38 +86,68 @@ impl SourceCodePanel {
     pub fn move_up_fast(&mut self) {
         let new_line = self.current_line.saturating_sub(10);
         self.current_line = new_line;
+        self.ensure_column_bounds();
         self.ensure_cursor_visible();
     }
 
     pub fn move_down_fast(&mut self) {
         let new_line = (self.current_line + 10).min(self.content.len().saturating_sub(1));
         self.current_line = new_line;
+        self.ensure_column_bounds();
         self.ensure_cursor_visible();
     }
 
     pub fn move_to_top(&mut self) {
         self.current_line = 0;
+        self.current_column = 0;
         self.scroll_offset = 0;
     }
 
     pub fn move_to_bottom(&mut self) {
         if !self.content.is_empty() {
             self.current_line = self.content.len() - 1;
+            self.current_column = 0;
             self.ensure_cursor_visible();
         }
     }
 
-    pub fn move_left(&mut self) {
-        if self.current_column > 0 {
-            self.current_column -= 1;
-        }
-    }
+
 
     pub fn move_right(&mut self) {
         if let Some(current_line_content) = self.content.get(self.current_line) {
             if self.current_column < current_line_content.len() {
                 self.current_column += 1;
+            } else if self.current_line + 1 < self.content.len() {
+                self.current_line += 1;
+                self.current_column = 0;
+                self.ensure_cursor_visible();
             }
+        }
+        self.ensure_column_bounds();
+    }
+
+    pub fn move_left(&mut self) {
+        if self.current_column > 0 {
+            self.current_column -= 1;
+        } else if self.current_line > 0 {
+            self.current_line -= 1;
+            if let Some(prev_line_content) = self.content.get(self.current_line) {
+                self.current_column = prev_line_content.len();
+            }
+            self.ensure_cursor_visible();
+        }
+        self.ensure_column_bounds();
+    }
+
+    fn adjust_column_for_new_line(&mut self, old_column: usize) {
+        if let Some(current_line_content) = self.content.get(self.current_line) {
+            self.current_column = old_column.min(current_line_content.len());
+        }
+    }
+
+    fn ensure_column_bounds(&mut self) {
+        if let Some(current_line_content) = self.content.get(self.current_line) {
+            self.current_column = self.current_column.min(current_line_content.len());
         }
     }
 
@@ -126,43 +156,30 @@ impl SourceCodePanel {
             return;
         }
 
-        // Calculate actual visible lines (subtract borders and title)
-        let visible_lines = (self.area_height.saturating_sub(2)) as usize; // 2 for top and bottom borders
+        let visible_lines = (self.area_height.saturating_sub(2)) as usize;
         
-        // If content fits entirely in the visible area, don't scroll
         if self.content.len() <= visible_lines {
             self.scroll_offset = 0;
             return;
         }
 
-        // Vim-style scrolloff behavior
-        let scrolloff = visible_lines / 3; // Keep cursor roughly in the middle third
+        let scrolloff = visible_lines / 3;
         
-        // Calculate the ideal scroll position to keep cursor in the middle
-        let ideal_scroll = if self.current_line >= scrolloff {
-            self.current_line.saturating_sub(scrolloff)
-        } else {
-            0
-        };
+        let ideal_scroll = self.current_line.saturating_sub(scrolloff);
 
-        // Check if we're near the end of the file
         let max_scroll = self.content.len().saturating_sub(visible_lines);
         let near_end = self.current_line >= max_scroll.saturating_add(scrolloff);
         
         if near_end {
-            // Near the end: lock the end at the bottom
             self.scroll_offset = max_scroll;
         } else {
-            // Normal scrolling: keep cursor in the middle area
             self.scroll_offset = ideal_scroll.min(max_scroll);
         }
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, is_focused: bool) {
-        // Update area height for scroll calculations
         self.area_height = area.height;
         
-        // When focus is gained, ensure cursor is visible immediately
         if is_focused {
             self.ensure_cursor_visible();
         }
@@ -193,7 +210,6 @@ impl SourceCodePanel {
             Style::default()
         };
 
-        // Include file path in title if available
         let title = match &self.file_path {
             Some(path) => format!("Source Code - {}", path),
             None => "Source Code".to_string(),
@@ -209,10 +225,12 @@ impl SourceCodePanel {
 
         frame.render_widget(list, area);
 
-        // Render cursor when focused
         if is_focused && !self.content.is_empty() {
+            self.ensure_column_bounds();
+            
             let cursor_y = area.y + 1 + (self.current_line.saturating_sub(self.scroll_offset)) as u16;
-            let cursor_x = area.x + 5 + self.current_column as u16; // Position after line number + column offset
+            let line_number_width = 5u16;
+            let cursor_x = area.x + 1 + line_number_width + self.current_column as u16;
 
             if cursor_y < area.y + area.height - 1 && cursor_x < area.x + area.width - 1 {
                 frame.render_widget(
@@ -619,4 +637,5 @@ impl InputPanel {
         }
     }
 }
+
 
