@@ -2,7 +2,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, BorderType, List, ListItem, Paragraph},
     Frame,
 };
 use std::collections::VecDeque;
@@ -86,7 +86,7 @@ impl SourceCodePanel {
             .collect();
 
         let border_style = if is_focused {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(Color::Cyan)
         } else {
             Style::default()
         };
@@ -100,6 +100,7 @@ impl SourceCodePanel {
         let list = List::new(items).block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(if is_focused { BorderType::Thick } else { BorderType::Plain })
                 .title(title)
                 .border_style(border_style),
         );
@@ -289,7 +290,7 @@ impl OutputPanel {
         let visible_items: Vec<_> = all_items.into_iter().skip(self.scroll_offset).collect();
 
         let border_style = if is_focused {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(Color::Cyan)
         } else {
             Style::default()
         };
@@ -297,6 +298,7 @@ impl OutputPanel {
         let list = List::new(visible_items).block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(if is_focused { BorderType::Thick } else { BorderType::Plain })
                 .title(format!("Output ({} messages)", self.messages.len()))
                 .border_style(border_style),
         );
@@ -476,7 +478,7 @@ impl InputPanel {
         let input_line = format!("{}{}", self.prompt, self.input_text);
 
         let border_style = if is_focused {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(Color::Cyan)
         } else {
             Style::default()
         };
@@ -484,6 +486,7 @@ impl InputPanel {
         let paragraph = Paragraph::new(input_line).block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(if is_focused { BorderType::Thick } else { BorderType::Plain })
                 .border_style(border_style),
         );
 
