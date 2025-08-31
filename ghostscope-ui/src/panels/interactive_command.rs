@@ -269,8 +269,9 @@ impl InteractiveCommandPanel {
 
     pub fn exit_command_mode(&mut self) {
         self.mode = InteractionMode::Input;
-        self.input_text.clear();
-        self.cursor_position = 0;
+        // Don't clear input_text - preserve what user was typing
+        // Reset cursor position to end of current input
+        self.cursor_position = self.input_text.len();
     }
 
     pub fn handle_vim_navigation(&mut self, key: &str) -> bool {
