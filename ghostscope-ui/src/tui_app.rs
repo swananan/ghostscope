@@ -529,46 +529,40 @@ impl TuiApp {
 
     fn move_focus(&mut self, direction: &str) {
         match self.layout_mode {
-            LayoutMode::Horizontal => {
-                // Horizontal layout: h/l switching
-                match direction {
-                    "left" => {
-                        self.focused_panel = match self.focused_panel {
-                            FocusedPanel::Source => FocusedPanel::InteractiveCommand, // Cycle to rightmost
-                            FocusedPanel::EbpfInfo => FocusedPanel::Source,
-                            FocusedPanel::InteractiveCommand => FocusedPanel::EbpfInfo,
-                        };
-                    }
-                    "right" => {
-                        self.focused_panel = match self.focused_panel {
-                            FocusedPanel::Source => FocusedPanel::EbpfInfo,
-                            FocusedPanel::EbpfInfo => FocusedPanel::InteractiveCommand,
-                            FocusedPanel::InteractiveCommand => FocusedPanel::Source, // Cycle to leftmost
-                        };
-                    }
-                    _ => {}
+            LayoutMode::Horizontal => match direction {
+                "left" => {
+                    self.focused_panel = match self.focused_panel {
+                        FocusedPanel::Source => FocusedPanel::InteractiveCommand,
+                        FocusedPanel::EbpfInfo => FocusedPanel::Source,
+                        FocusedPanel::InteractiveCommand => FocusedPanel::EbpfInfo,
+                    };
                 }
-            }
-            LayoutMode::Vertical => {
-                // 垂直布局: j/k 切换
-                match direction {
-                    "up" => {
-                        self.focused_panel = match self.focused_panel {
-                            FocusedPanel::Source => FocusedPanel::InteractiveCommand, // 循环到最下面
-                            FocusedPanel::EbpfInfo => FocusedPanel::Source,
-                            FocusedPanel::InteractiveCommand => FocusedPanel::EbpfInfo,
-                        };
-                    }
-                    "down" => {
-                        self.focused_panel = match self.focused_panel {
-                            FocusedPanel::Source => FocusedPanel::EbpfInfo,
-                            FocusedPanel::EbpfInfo => FocusedPanel::InteractiveCommand,
-                            FocusedPanel::InteractiveCommand => FocusedPanel::Source, // 循环到最上面
-                        };
-                    }
-                    _ => {}
+                "right" => {
+                    self.focused_panel = match self.focused_panel {
+                        FocusedPanel::Source => FocusedPanel::EbpfInfo,
+                        FocusedPanel::EbpfInfo => FocusedPanel::InteractiveCommand,
+                        FocusedPanel::InteractiveCommand => FocusedPanel::Source,
+                    };
                 }
-            }
+                _ => {}
+            },
+            LayoutMode::Vertical => match direction {
+                "up" => {
+                    self.focused_panel = match self.focused_panel {
+                        FocusedPanel::Source => FocusedPanel::InteractiveCommand,
+                        FocusedPanel::EbpfInfo => FocusedPanel::Source,
+                        FocusedPanel::InteractiveCommand => FocusedPanel::EbpfInfo,
+                    };
+                }
+                "down" => {
+                    self.focused_panel = match self.focused_panel {
+                        FocusedPanel::Source => FocusedPanel::EbpfInfo,
+                        FocusedPanel::EbpfInfo => FocusedPanel::InteractiveCommand,
+                        FocusedPanel::InteractiveCommand => FocusedPanel::Source,
+                    };
+                }
+                _ => {}
+            },
         }
     }
 
@@ -609,7 +603,6 @@ impl TuiApp {
 
         let chunks = match self.layout_mode {
             LayoutMode::Horizontal => {
-                // 水平布局: 4:3:3 比例
                 Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([
@@ -620,7 +613,6 @@ impl TuiApp {
                     .split(size)
             }
             LayoutMode::Vertical => {
-                // 垂直布局: 上中下
                 Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([

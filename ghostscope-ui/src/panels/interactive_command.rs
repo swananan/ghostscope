@@ -209,11 +209,9 @@ impl InteractiveCommandPanel {
         let command = self.input_text.clone();
         let action = match self.mode {
             InteractionMode::Input => {
-                if command.starts_with("trace ") {
-                    self.mode = InteractionMode::Script;
-                    self.script_lines.clear();
-                    self.current_script_line = 0;
-                    CommandAction::EnterScriptMode(command.clone())
+                if command.trim().starts_with("trace ") {
+                    // Treat trace command as complete script and send directly to compiler
+                    CommandAction::SubmitScript(command.clone())
                 } else {
                     CommandAction::ExecuteCommand(command.clone())
                 }

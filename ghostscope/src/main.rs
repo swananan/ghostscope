@@ -863,7 +863,7 @@ async fn initialize_dwarf_processing(
 /// Main runtime coordinator that handles commands and manages eBPF sessions
 async fn run_runtime_coordinator(
     mut runtime_channels: ghostscope_ui::RuntimeChannels,
-    session: Option<DebugSession>,
+    mut session: Option<DebugSession>,
 ) -> Result<()> {
     use ghostscope_ui::{RingbufEvent, RuntimeCommand, RuntimeStatus};
 
@@ -879,19 +879,22 @@ async fn run_runtime_coordinator(
                 info!("Received script for compilation: {}", script);
                 let _ = runtime_channels.status_sender.send(RuntimeStatus::ScriptCompilationStarted);
 
-                // TODO: Implement actual script compilation
-                // For now, simulate compilation
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                let _ = runtime_channels.status_sender.send(RuntimeStatus::ScriptCompilationCompleted);
-
-                // TODO: Attach uprobes and start monitoring
-                // For now, simulate uprobe attachment
-                let _ = runtime_channels.status_sender.send(
-                    RuntimeStatus::UprobeAttached {
-                        function: "main".to_string(),
-                        address: 0x401000,
+                // Use actual script compilation and loading
+                if let Some(ref mut session) = session {
+                    match compile_and_load_script(&script, session, &runtime_channels.status_sender) {
+                        Ok(_) => {
+                            info!("Script compilation and loading completed successfully");
+                            let _ = runtime_channels.status_sender.send(RuntimeStatus::ScriptCompilationCompleted);
+                        }
+                        Err(e) => {
+                            error!("Script compilation failed: {}", e);
+                            let _ = runtime_channels.status_sender.send(RuntimeStatus::ScriptCompilationCompleted);
+                        }
                     }
-                );
+                } else {
+                    warn!("No debug session available for script compilation");
+                    let _ = runtime_channels.status_sender.send(RuntimeStatus::ScriptCompilationCompleted);
+                }
             }
 
             // Handle runtime commands
@@ -1060,4 +1063,253 @@ fn get_possible_source_paths(dwarf_file_path: &str, binary_path: &Path) -> Vec<P
     }
 
     paths
+}
+
+/// Compile and load a script in TUI mode using existing logic from CLI mode
+fn compile_and_load_script(
+    script: &str,
+    session: &mut DebugSession,
+    status_sender: &tokio::sync::mpsc::UnboundedSender<ghostscope_ui::RuntimeStatus>,
+) -> Result<()> {
+    use ghostscope_ui::RuntimeStatus;
+
+    // Step 1: Parse and validate script
+    let parsed_script = parse_and_validate_script(script)?;
+    let trace_count = parsed_script
+        .statements
+        .iter()
+        .filter(|stmt| matches!(stmt, ghostscope_compiler::ast::Statement::TracePoint { .. }))
+        .count();
+
+    info!("Parsed script with {} trace points", trace_count);
+
+    if trace_count == 0 {
+        return Err(anyhow::anyhow!("Script contains no valid trace points"));
+    }
+
+    // Step 2: Compile to eBPF using existing compiler
+    let binary_path = if let Some(ref analyzer) = session.binary_analyzer {
+        analyzer
+            .debug_info()
+            .binary_path
+            .to_string_lossy()
+            .to_string()
+    } else if let Some(ref binary_path) = session.target_binary {
+        binary_path.clone()
+    } else {
+        return Err(anyhow::anyhow!(
+            "No target binary available for compilation"
+        ));
+    };
+
+    let binary_path_for_naming = Path::new(&binary_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown");
+
+    let mut uprobe_configs = match ghostscope_compiler::compile_ast_to_uprobe_configs(
+        &parsed_script,
+        session.target_pid,
+        Some(binary_path_for_naming),
+        false, // don't save LLVM IR in TUI mode
+        session.binary_analyzer.as_ref(),
+    ) {
+        Ok(configs) => configs,
+        Err(e) => {
+            return Err(anyhow::anyhow!("eBPF compilation failed: {}", e));
+        }
+    };
+
+    info!(
+        "eBPF compilation successful, generated {} uprobe configurations",
+        uprobe_configs.len()
+    );
+
+    // Step 3: Resolve addresses and attach uprobes (simplified version)
+    for (i, config) in uprobe_configs.iter_mut().enumerate() {
+        config.binary_path = binary_path.clone();
+        config.target_pid = session.target_pid;
+
+        match &config.trace_pattern {
+            ghostscope_compiler::ast::TracePattern::FunctionName(function_name) => {
+                if let Some(ref analyzer) = session.binary_analyzer {
+                    if let Some(symbol) = analyzer.find_symbol(function_name) {
+                        config.function_address = Some(symbol.address);
+                        if let Some(uprobe_offset) = symbol.uprobe_offset() {
+                            config.uprobe_offset = Some(uprobe_offset);
+                        } else {
+                            config.uprobe_offset = Some(symbol.address);
+                        }
+
+                        info!(
+                            "Resolved function '{}' to address 0x{:x}",
+                            function_name, symbol.address
+                        );
+
+                        // Send uprobe attached status
+                        let _ = status_sender.send(RuntimeStatus::UprobeAttached {
+                            function: function_name.clone(),
+                            address: symbol.address,
+                        });
+                    } else {
+                        warn!("Function '{}' not found in binary", function_name);
+                        continue;
+                    }
+                } else {
+                    warn!("No binary analyzer available for address resolution");
+                    continue;
+                }
+            }
+            ghostscope_compiler::ast::TracePattern::SourceLine {
+                file_path,
+                line_number,
+            } => {
+                info!(
+                    "Resolving source line '{}:{}' to addresses",
+                    file_path, line_number
+                );
+                
+                if let Some(ref analyzer) = session.binary_analyzer {
+                    if let Some(dwarf_context) = analyzer.dwarf_context() {
+                        let line_mappings = dwarf_context
+                            .get_addresses_for_line(file_path, *line_number);
+
+                        if !line_mappings.is_empty() {
+                            info!(
+                                "Found {} addresses for line {}:{}",
+                                line_mappings.len(),
+                                file_path,
+                                line_number
+                            );
+
+                            // Use the first mapping for uprobe attachment
+                            let first_mapping = &line_mappings[0];
+                            let resolved_address = first_mapping.address;
+
+                            info!(
+                                "Resolved {}:{} to address 0x{:x}",
+                                file_path, line_number, resolved_address
+                            );
+
+                            // Calculate proper uprobe offset from the resolved address
+                            if let Some(uprobe_offset) = analyzer
+                                .calculate_uprobe_offset_from_address(resolved_address)
+                            {
+                                info!(
+                                    "Calculated uprobe offset: 0x{:x} for address 0x{:x}",
+                                    uprobe_offset, resolved_address
+                                );
+
+                                // Update config with resolved address information
+                                config.function_name = None; // Source line tracing doesn't use function names
+                                config.function_address = Some(resolved_address);
+                                config.uprobe_offset = Some(uprobe_offset);
+
+                                // Send uprobe attached status for source line
+                                let _ = status_sender.send(RuntimeStatus::UprobeAttached {
+                                    function: format!("{}:{}", file_path, line_number),
+                                    address: resolved_address,
+                                });
+                            } else {
+                                warn!(
+                                    "Failed to calculate uprobe offset for address 0x{:x}",
+                                    resolved_address
+                                );
+                                continue;
+                            }
+                        } else {
+                            warn!(
+                                "No addresses found for source line {}:{}",
+                                file_path, line_number
+                            );
+                            continue;
+                        }
+                    } else {
+                        warn!("No DWARF context available for line number resolution");
+                        continue;
+                    }
+                } else {
+                    warn!("No binary analyzer available for source line resolution");
+                    continue;
+                }
+            }
+            _ => {
+                // Handle other trace patterns if needed
+                warn!(
+                    "Trace pattern not yet supported in TUI mode: {:?}",
+                    config.trace_pattern
+                );
+                continue;
+            }
+        }
+
+        // Step 4: Actually load and attach the eBPF program
+        info!(
+            "Loading eBPF program for config {} ({} bytes)",
+            i,
+            config.ebpf_bytecode.len()
+        );
+
+        let mut loader = match ghostscope_loader::GhostScopeLoader::new(&config.ebpf_bytecode) {
+            Ok(loader) => loader,
+            Err(e) => {
+                error!("Failed to create eBPF loader for config {}: {}", i, e);
+                continue;
+            }
+        };
+
+        // Attach uprobe based on resolved address
+        if let Some(uprobe_offset) = config.uprobe_offset {
+            // Handle both function name and source line based tracing
+            let attachment_name = if let Some(ref function_name) = config.function_name {
+                // Function-based tracing
+                info!(
+                    "Attaching uprobe to function '{}' at offset 0x{:x} in {}",
+                    function_name, uprobe_offset, config.binary_path
+                );
+                function_name.clone()
+            } else if let Some(function_address) = config.function_address {
+                // Source line based tracing - use address as identifier
+                let address_name = format!("0x{:x}", function_address);
+                info!(
+                    "Attaching uprobe to address {} (offset 0x{:x}) in {}",
+                    address_name, uprobe_offset, config.binary_path
+                );
+                address_name
+            } else {
+                warn!("No function name or address available for uprobe attachment");
+                continue;
+            };
+
+            match loader.attach_uprobe_with_program_name(
+                &config.binary_path,
+                &attachment_name,
+                Some(uprobe_offset),
+                session.target_pid.map(|p| p as i32),
+                Some(&config.ebpf_function_name),
+            ) {
+                Ok(_) => {
+                    info!(
+                        "Successfully attached uprobe for '{}'",
+                        attachment_name
+                    );
+
+                    // Store the loader in session for event polling
+                    session.loaders.push(loader);
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to attach uprobe for '{}': {}",
+                        attachment_name, e
+                    );
+                    continue;
+                }
+            }
+        } else {
+            warn!("No uprobe offset available for config {}", i);
+            continue;
+        }
+    }
+
+    Ok(())
 }
