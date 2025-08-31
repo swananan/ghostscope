@@ -20,7 +20,7 @@ use crate::{
     events::{
         EventRegistry, RingbufEvent, RuntimeCommand, RuntimeStatus, SourceCodeInfo, TuiEvent,
     },
-    panels::{EbpfInfoPanel, InteractiveCommandPanel, SourceCodePanel},
+    panels::{EbpfInfoPanel, InteractiveCommandPanel, SourceCodePanel, CommandAction, ResponseType},
 };
 
 pub struct TuiApp {
@@ -277,9 +277,13 @@ impl TuiApp {
                     self.interactive_command_panel.history_down();
                 }
                 KeyCode::Enter => {
-                    if let Some(command) = self.interactive_command_panel.submit_command() {
-                        info!("User command: {}", command);
-                        self.execute_user_command(command).await?;
+                    if let Some(action) = self.interactive_command_panel.submit_command() {
+                        self.handle_command_action(action).await?;
+                    }
+                }
+                KeyCode::Esc => {
+                    if self.interactive_command_panel.cancel_script() {
+                        info!("Script input cancelled");
                     }
                 }
                 _ => {}
@@ -340,13 +344,67 @@ impl TuiApp {
         Ok(())
     }
 
+    async fn handle_command_action(&mut self, action: CommandAction) -> Result<()> {
+        match action {
+            CommandAction::ExecuteCommand(command) => {
+                self.execute_user_command(command).await?;
+            }
+            CommandAction::EnterScriptMode(command) => {
+                info!("Entering script mode for: {}", command);
+                self.interactive_command_panel.add_response(
+                    "Entering script mode. Type 'end' or '}' to finish.".to_string(),
+                    ResponseType::Info,
+                );
+            }
+            CommandAction::AddScriptLine(line) => {
+                info!("Added script line: {}", line);
+                // 脚本行已添加到面板中，这里可以添加额外的处理逻辑
+            }
+            CommandAction::SubmitScript(script) => {
+                info!("Submitting script: {}", script);
+                // 发送脚本到主程序处理
+                if let Err(e) = self.event_registry.script_sender.send(script.clone()) {
+                    error!("Failed to send script: {}", e);
+                    self.interactive_command_panel.add_response(
+                        format!("✗ Failed to send script: {}", e),
+                        ResponseType::Error,
+                    );
+                } else {
+                    self.interactive_command_panel.add_response(
+                        "✓ Script submitted successfully".to_string(),
+                        ResponseType::Success,
+                    );
+                }
+            }
+            CommandAction::CancelScript => {
+                info!("Script cancelled");
+                self.interactive_command_panel.add_response(
+                    "⚠ Script input cancelled".to_string(),
+                    ResponseType::Warning,
+                );
+            }
+        }
+        Ok(())
+    }
+
     async fn execute_user_command(&mut self, command: String) -> Result<()> {
         let trimmed = command.trim();
 
-        if trimmed.starts_with("trace ") {
+        if trimmed == "help" {
+            self.show_help();
+        } else if trimmed.starts_with("trace ") {
             // This is a trace command, send it for compilation
             if let Err(e) = self.event_registry.script_sender.send(command.clone()) {
                 error!("Failed to send script command: {}", e);
+                self.interactive_command_panel.add_response(
+                    format!("✗ Failed to send trace command: {}", e),
+                    ResponseType::Error,
+                );
+            } else {
+                self.interactive_command_panel.add_response(
+                    "✓ Trace command sent".to_string(),
+                    ResponseType::Success,
+                );
             }
         } else if trimmed.starts_with("attach ") {
             // Parse PID from "attach <pid>"
@@ -356,12 +414,15 @@ impl TuiApp {
                         .event_registry
                         .command_sender
                         .send(RuntimeCommand::AttachToProcess(pid));
+                    self.interactive_command_panel.add_response(
+                        format!("⏳ Attaching to process {}", pid),
+                        ResponseType::Progress,
+                    );
                 } else {
-                    self.ebpf_info_panel
-                        .add_status_message(RuntimeStatus::Error(format!(
-                            "Invalid PID: {}",
-                            pid_str
-                        )));
+                    self.interactive_command_panel.add_response(
+                        format!("✗ Invalid PID: {}", pid_str),
+                        ResponseType::Error,
+                    );
                 }
             }
         } else if trimmed == "detach" {
@@ -369,6 +430,10 @@ impl TuiApp {
                 .event_registry
                 .command_sender
                 .send(RuntimeCommand::DetachFromProcess);
+            self.interactive_command_panel.add_response(
+                "✓ Detached from process".to_string(),
+                ResponseType::Success,
+            );
         } else if trimmed == "quit" || trimmed == "exit" {
             let _ = self
                 .event_registry
@@ -379,14 +444,28 @@ impl TuiApp {
             // Ignore empty commands
         } else {
             // Unknown command
-            self.ebpf_info_panel
-                .add_status_message(RuntimeStatus::Error(format!(
-                    "Unknown command: {}",
-                    trimmed
-                )));
+            self.interactive_command_panel.add_response(
+                format!("✗ Unknown command: {}", trimmed),
+                ResponseType::Error,
+            );
         }
 
         Ok(())
+    }
+
+    fn show_help(&mut self) {
+        let help_text = r#"Available commands:
+  help     - Show this help message
+  trace    - Start tracing a function (enters script mode)
+  attach   - Attach to a process by PID
+  detach   - Detach from current process
+  quit     - Exit ghostscope
+  exit     - Exit ghostscope"#;
+        
+        self.interactive_command_panel.add_response(
+            help_text.to_string(),
+            ResponseType::Info,
+        );
     }
 
     fn cycle_focus(&mut self) {
