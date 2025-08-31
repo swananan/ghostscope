@@ -514,7 +514,7 @@ impl InteractiveCommandPanel {
         let current_line = format!("{}{}", current_prompt, self.input_text);
         let input_line_style = if self.mode == InteractionMode::Input {
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Yellow)
                 .add_modifier(ratatui::style::Modifier::BOLD)
         } else {
             Style::default().fg(Color::White)
