@@ -32,6 +32,7 @@ pub struct TuiApp {
     // Layout state
     split_ratio: f32,
     focused_panel: FocusedPanel,
+    expecting_window_nav: bool,
 
     // Event communication
     event_registry: EventRegistry,
@@ -53,6 +54,7 @@ impl TuiApp {
             input_panel: InputPanel::new(),
             split_ratio: 0.6, // 60% for source code, 40% for output
             focused_panel: FocusedPanel::Input,
+            expecting_window_nav: false,
             event_registry,
         })
     }
@@ -149,6 +151,39 @@ impl TuiApp {
     }
 
     async fn handle_key_event(&mut self, key: crossterm::event::KeyEvent) -> Result<bool> {
+        // Handle window navigation keys if expecting them
+        if self.expecting_window_nav {
+            match key.code {
+                KeyCode::Char('j') => {
+                    // Move focus down: Input -> Output -> Source -> Input
+                    self.focused_panel = match self.focused_panel {
+                        FocusedPanel::Input => FocusedPanel::Output,
+                        FocusedPanel::Output => FocusedPanel::Source,
+                        FocusedPanel::Source => FocusedPanel::Input,
+                    };
+                    debug!("Window nav: moved focus to {:?}", self.focused_panel);
+                    self.expecting_window_nav = false;
+                    return Ok(false);
+                }
+                KeyCode::Char('k') => {
+                    // Move focus up: Input -> Source -> Output -> Input
+                    self.focused_panel = match self.focused_panel {
+                        FocusedPanel::Input => FocusedPanel::Source,
+                        FocusedPanel::Source => FocusedPanel::Output,
+                        FocusedPanel::Output => FocusedPanel::Input,
+                    };
+                    debug!("Window nav: moved focus to {:?}", self.focused_panel);
+                    self.expecting_window_nav = false;
+                    return Ok(false);
+                }
+                _ => {
+                    // Any other key cancels window navigation expectation
+                    self.expecting_window_nav = false;
+                    // Fall through to normal key handling
+                }
+            }
+        }
+
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 info!("Quit requested via Ctrl+C");
@@ -165,6 +200,11 @@ impl TuiApp {
                     .command_sender
                     .send(RuntimeCommand::Shutdown);
                 return Ok(true);
+            }
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Set expectation for next j/k key
+                self.expecting_window_nav = true;
+                debug!("Expecting window navigation key (j/k)");
             }
             KeyCode::Esc => {
                 if self.focused_panel == FocusedPanel::Input {
@@ -250,6 +290,7 @@ impl TuiApp {
         }
         Ok(())
     }
+
 
     async fn execute_user_command(&mut self, command: String) -> Result<()> {
         let trimmed = command.trim();
@@ -339,9 +380,9 @@ impl TuiApp {
             ])
             .split(main_chunks[1]);
 
-        // Render panels
-        self.source_panel.render(frame, main_chunks[0]);
-        self.output_panel.render(frame, bottom_chunks[0]);
-        self.input_panel.render(frame, bottom_chunks[1]);
+        // Render panels with focus indication
+        self.source_panel.render(frame, main_chunks[0], self.focused_panel == FocusedPanel::Source);
+        self.output_panel.render(frame, bottom_chunks[0], self.focused_panel == FocusedPanel::Output);
+        self.input_panel.render(frame, bottom_chunks[1], self.focused_panel == FocusedPanel::Input);
     }
 }

@@ -24,7 +24,7 @@ impl SourceCodePanel {
         }
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect) {
+    pub fn render(&self, frame: &mut Frame, area: Rect, is_focused: bool) {
         let items: Vec<ListItem> = self
             .content
             .iter()
@@ -48,8 +48,18 @@ impl SourceCodePanel {
             })
             .collect();
 
-        let list =
-            List::new(items).block(Block::default().borders(Borders::ALL).title("Source Code"));
+        let border_style = if is_focused {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        };
+
+        let list = List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Source Code")
+                .border_style(border_style),
+        );
 
         frame.render_widget(list, area);
     }
@@ -115,7 +125,7 @@ impl OutputPanel {
         self.auto_scroll = true;
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect) {
+    pub fn render(&self, frame: &mut Frame, area: Rect, is_focused: bool) {
         let mut all_items = Vec::new();
 
         // Add status messages first (in chronological order)
@@ -187,10 +197,17 @@ impl OutputPanel {
         // Apply scrolling
         let visible_items: Vec<_> = all_items.into_iter().skip(self.scroll_offset).collect();
 
+        let border_style = if is_focused {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        };
+
         let list = List::new(visible_items).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!("Output ({} messages)", self.messages.len())),
+                .title(format!("Output ({} messages)", self.messages.len()))
+                .border_style(border_style),
         );
 
         frame.render_widget(list, area);
@@ -287,9 +304,20 @@ impl InputPanel {
         }
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect) {
+    pub fn render(&self, frame: &mut Frame, area: Rect, is_focused: bool) {
         let input_line = format!("{}{}", self.prompt, self.input_text);
-        let paragraph = Paragraph::new(input_line).block(Block::default().borders(Borders::ALL));
+        
+        let border_style = if is_focused {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        };
+        
+        let paragraph = Paragraph::new(input_line).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(border_style)
+        );
 
         frame.render_widget(paragraph, area);
 
