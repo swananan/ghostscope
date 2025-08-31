@@ -100,8 +100,10 @@ impl LocationExpression {
             LocationExpression::LocationList { entries } => {
                 for entry in entries {
                     if pc >= entry.start_pc && pc < entry.end_pc {
-                        debug!("Found location at PC 0x{:x} in range 0x{:x}-0x{:x}", 
-                               pc, entry.start_pc, entry.end_pc);
+                        debug!(
+                            "Found location at PC 0x{:x} in range 0x{:x}-0x{:x}",
+                            pc, entry.start_pc, entry.end_pc
+                        );
                         return entry.location_expr.resolve_at_pc(pc);
                     }
                 }
@@ -603,7 +605,8 @@ impl DwarfContext {
             let resolved_location_expr = base_location_expr.resolve_at_pc(addr).clone();
 
             let size = self.get_variable_size(&var);
-            let is_optimized_out = matches!(resolved_location_expr, LocationExpression::OptimizedOut);
+            let is_optimized_out =
+                matches!(resolved_location_expr, LocationExpression::OptimizedOut);
 
             enhanced_locations.push(EnhancedVariableLocation {
                 variable: var,
@@ -1647,20 +1650,19 @@ impl DwarfContext {
         };
 
         let mut entries = Vec::new();
-        
+
         // Parse each location list entry
         while let Ok(Some(location_list_entry)) = locations.next() {
             let start_pc = location_list_entry.range.begin;
             let end_pc = location_list_entry.range.end;
-            
+
             debug!("Location list entry: PC 0x{:x}-0x{:x}", start_pc, end_pc);
-            
+
             // Parse the expression data for this PC range
-            let location_expr = self.parse_expression_bytecode(
-                location_list_entry.data.0.slice(),
-                unit,
-            ).unwrap_or(LocationExpression::OptimizedOut);
-            
+            let location_expr = self
+                .parse_expression_bytecode(location_list_entry.data.0.slice(), unit)
+                .unwrap_or(LocationExpression::OptimizedOut);
+
             entries.push(LocationListEntry {
                 start_pc,
                 end_pc,

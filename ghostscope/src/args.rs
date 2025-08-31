@@ -30,13 +30,17 @@ pub struct Args {
     #[arg(long, short = 'd', value_name = "PATH")]
     pub debug_file: Option<PathBuf>,
 
-    /// Script to execute (inline script or file path)
+    /// Script to execute (inline script - optional for TUI mode)
     #[arg(long, short = 's', value_name = "SCRIPT")]
     pub script: Option<String>,
 
-    /// Script file path (alternative to inline script)
+    /// Script file path (optional for debugging - TUI mode accepts user input)
     #[arg(long, value_name = "PATH")]
     pub script_file: Option<PathBuf>,
+
+    /// Start in TUI mode (default behavior when no script provided)
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub tui: bool,
 
     /// Process ID to attach to
     #[arg(long, short = 'p', value_name = "PID")]
@@ -70,7 +74,7 @@ pub struct Args {
     pub remaining: Vec<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ParsedArgs {
     pub binary_path: Option<String>,
     pub binary_args: Vec<String>,
@@ -79,6 +83,7 @@ pub struct ParsedArgs {
     pub script: Option<String>,
     pub script_file: Option<PathBuf>,
     pub pid: Option<u32>,
+    pub tui_mode: bool,
     pub should_save_llvm_ir: bool,
     pub should_save_ebpf: bool,
     pub should_save_ast: bool,
@@ -111,6 +116,7 @@ impl Args {
             let should_save_llvm_ir = Self::should_save_llvm_ir(&parsed);
             let should_save_ebpf = Self::should_save_ebpf(&parsed);
             let should_save_ast = Self::should_save_ast(&parsed);
+            let tui_mode = Self::determine_tui_mode(&parsed);
 
             ParsedArgs {
                 binary_path,
@@ -120,6 +126,7 @@ impl Args {
                 script: parsed.script,
                 script_file: parsed.script_file,
                 pid: parsed.pid,
+                tui_mode,
                 should_save_llvm_ir,
                 should_save_ebpf,
                 should_save_ast,
@@ -131,6 +138,7 @@ impl Args {
             let should_save_llvm_ir = Self::should_save_llvm_ir(&parsed);
             let should_save_ebpf = Self::should_save_ebpf(&parsed);
             let should_save_ast = Self::should_save_ast(&parsed);
+            let tui_mode = Self::determine_tui_mode(&parsed);
 
             ParsedArgs {
                 binary_path: parsed.binary,
@@ -140,6 +148,7 @@ impl Args {
                 script: parsed.script,
                 script_file: parsed.script_file,
                 pid: parsed.pid,
+                tui_mode,
                 should_save_llvm_ir,
                 should_save_ebpf,
                 should_save_ast,
@@ -181,5 +190,16 @@ impl Args {
             // Default behavior: debug = true, release = false
             cfg!(debug_assertions)
         }
+    }
+
+    /// Determine whether to start in TUI mode
+    fn determine_tui_mode(parsed: &Args) -> bool {
+        // Explicit --tui flag takes precedence
+        if parsed.tui {
+            return true;
+        }
+
+        // If no script or script file provided, default to TUI mode
+        parsed.script.is_none() && parsed.script_file.is_none()
     }
 }

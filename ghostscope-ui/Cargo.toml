@@ -4,4 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-ghostscope-frontend = { path = "../ghostscope-frontend" } 
+ghostscope-frontend = { path = "../ghostscope-frontend" }
+ghostscope-protocol = { path = "../ghostscope-protocol" }
+ratatui = "0.28"
+crossterm = { version = "0.28", features = ["event-stream"] }
+futures-util = "0.3"
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true } 

@@ -4,7 +4,7 @@ mod session;
 
 use anyhow::Result;
 use args::ParsedArgs;
-use ghostscope_loader::GhostScopeLoader;
+use ghostscope_ui::{run_tui_mode, EventRegistry};
 use session::DebugSession;
 use tracing::{error, info, warn};
 
@@ -12,6 +12,11 @@ use tracing::{error, info, warn};
 async fn main() -> Result<()> {
     // Step 1: Parse and validate command line arguments
     let parsed_args = args::Args::parse_args();
+
+    // Check if we should start in TUI mode
+    if parsed_args.tui_mode {
+        return run_tui_runtime(parsed_args).await;
+    }
 
     // Initialize logging first so we can use it for validation
     let log_file_path = parsed_args.log_file.as_ref().and_then(|p| p.to_str());
@@ -684,5 +689,236 @@ fn save_ast_to_file(
         .map_err(|e| anyhow::anyhow!("Failed to save AST to '{}': {}", ast_filename, e))?;
 
     info!("AST saved to '{}'", ast_filename);
+    Ok(())
+}
+
+/// Run GhostScope in TUI mode with tokio runtime coordination
+async fn run_tui_runtime(parsed_args: ParsedArgs) -> Result<()> {
+    // Initialize logging first
+    let log_file_path = parsed_args.log_file.as_ref().and_then(|p| p.to_str());
+    if let Err(e) = logging::initialize_logging(log_file_path) {
+        eprintln!("Failed to initialize logging: {}", e);
+        return Err(anyhow::anyhow!("Failed to initialize logging: {}", e));
+    }
+
+    info!("Starting GhostScope in TUI mode");
+
+    // Validate basic arguments
+    validate_tui_arguments(&parsed_args)?;
+
+    // Create event communication channels
+    let (event_registry, runtime_channels) = EventRegistry::new();
+
+    // Initialize DWARF information processing in background
+    let dwarf_task = {
+        let parsed_args_clone = parsed_args.clone();
+        let status_sender = runtime_channels.create_status_sender();
+        tokio::spawn(
+            async move { initialize_dwarf_processing(parsed_args_clone, status_sender).await },
+        )
+    };
+
+    // Start the runtime coordination task
+    let runtime_task = tokio::spawn(async move { run_runtime_coordinator(runtime_channels).await });
+
+    // Wait for tasks to complete or handle shutdown
+    let result = tokio::select! {
+        tui_result = run_tui_mode(event_registry) => {
+            info!("TUI exited");
+            tui_result
+        }
+        dwarf_result = dwarf_task => {
+            match dwarf_result {
+                Ok(result) => {
+                    info!("DWARF processing completed");
+                    result
+                }
+                Err(e) => {
+                    error!("DWARF processing task failed: {}", e);
+                    Err(anyhow::anyhow!("DWARF processing task failed: {}", e))
+                }
+            }
+        }
+        runtime_result = runtime_task => {
+            match runtime_result {
+                Ok(result) => {
+                    info!("Runtime coordinator completed");
+                    result
+                }
+                Err(e) => {
+                    error!("Runtime coordinator task failed: {}", e);
+                    Err(anyhow::anyhow!("Runtime coordinator task failed: {}", e))
+                }
+            }
+        }
+    };
+
+    result
+}
+
+/// Validate arguments specific to TUI mode
+fn validate_tui_arguments(args: &ParsedArgs) -> Result<()> {
+    // In TUI mode, we need at least a PID or binary path for DWARF processing
+    if args.pid.is_none() && args.binary_path.is_none() {
+        return Err(anyhow::anyhow!(
+            "TUI mode requires either a PID (-p) or binary path. Example:\n  \
+            ghostscope -p $(pidof test_program)\n  \
+            ghostscope /path/to/binary"
+        ));
+    }
+
+    // Cannot specify both PID and binary simultaneously
+    if args.pid.is_some() && args.binary_path.is_some() {
+        return Err(anyhow::anyhow!(
+            "Cannot specify both PID (-p) and binary path simultaneously in TUI mode"
+        ));
+    }
+
+    // Check PID exists if specified
+    if let Some(pid) = args.pid {
+        if !is_pid_running(pid) {
+            return Err(anyhow::anyhow!(
+                "Process with PID {} is not running. Use 'ps -p {}' to verify",
+                pid,
+                pid
+            ));
+        }
+        info!("✓ Target PID {} is running", pid);
+    }
+
+    info!("✓ TUI mode arguments validated successfully");
+    Ok(())
+}
+
+/// Initialize DWARF processing in background
+async fn initialize_dwarf_processing(
+    parsed_args: ParsedArgs,
+    status_sender: tokio::sync::mpsc::UnboundedSender<ghostscope_ui::RuntimeStatus>,
+) -> Result<()> {
+    use ghostscope_ui::RuntimeStatus;
+
+    // Send status update: starting DWARF loading
+    let _ = status_sender.send(RuntimeStatus::DwarfLoadingStarted);
+
+    // Create debug session for DWARF processing
+    match DebugSession::new(&parsed_args) {
+        Ok(mut session) => {
+            // Validate that we have debug information
+            match session.get_debug_info() {
+                Some(debug_info) => {
+                    info!("✓ Binary analysis successful in TUI mode");
+                    info!("  Path: {}", debug_info.binary_path.display());
+                    info!("  Debug info: {:?}", debug_info.debug_path);
+                    info!("  Has symbols: {}", debug_info.has_symbols);
+                    info!("  Has debug info: {}", debug_info.has_debug_info);
+                    info!("  Base address: 0x{:x}", debug_info.base_address);
+
+                    // Count available symbols for status update
+                    let functions = session.list_functions();
+                    let symbols_count = functions.len();
+
+                    // Send success status
+                    let _ =
+                        status_sender.send(RuntimeStatus::DwarfLoadingCompleted { symbols_count });
+
+                    if !debug_info.has_debug_info {
+                        let _ = status_sender.send(
+                            RuntimeStatus::Error(
+                                "No debug information available. Compile with -g for full functionality".to_string()
+                            )
+                        );
+                    }
+
+                    // TODO: Store session for later use by script compilation
+                    // For now, we'll keep it alive in this task
+                    tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await; // Keep alive for 1 hour
+                    Ok(())
+                }
+                None => {
+                    let error_msg = format!(
+                        "Binary analysis failed! Cannot load DWARF information for PID {} or binary path {:?}",
+                        parsed_args.pid.unwrap_or(0),
+                        parsed_args.binary_path
+                    );
+                    let _ =
+                        status_sender.send(RuntimeStatus::DwarfLoadingFailed(error_msg.clone()));
+                    Err(anyhow::anyhow!(error_msg))
+                }
+            }
+        }
+        Err(e) => {
+            let error_msg = format!("Failed to create debug session: {}", e);
+            let _ = status_sender.send(RuntimeStatus::DwarfLoadingFailed(error_msg.clone()));
+            Err(anyhow::anyhow!(error_msg))
+        }
+    }
+}
+
+/// Main runtime coordinator that handles commands and manages eBPF sessions
+async fn run_runtime_coordinator(
+    mut runtime_channels: ghostscope_ui::RuntimeChannels,
+) -> Result<()> {
+    use ghostscope_ui::{RingbufEvent, RuntimeCommand, RuntimeStatus};
+
+    info!("Runtime coordinator started");
+
+    // TODO: Implement eBPF session management
+    // For now, just handle basic commands
+
+    loop {
+        tokio::select! {
+            // Handle script compilation requests
+            Some(script) = runtime_channels.script_receiver.recv() => {
+                info!("Received script for compilation: {}", script);
+                let _ = runtime_channels.status_sender.send(RuntimeStatus::ScriptCompilationStarted);
+
+                // TODO: Implement actual script compilation
+                // For now, simulate compilation
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                let _ = runtime_channels.status_sender.send(RuntimeStatus::ScriptCompilationCompleted);
+
+                // TODO: Attach uprobes and start monitoring
+                // For now, simulate uprobe attachment
+                let _ = runtime_channels.status_sender.send(
+                    RuntimeStatus::UprobeAttached {
+                        function: "main".to_string(),
+                        address: 0x401000,
+                    }
+                );
+            }
+
+            // Handle runtime commands
+            Some(command) = runtime_channels.command_receiver.recv() => {
+                match command {
+                    RuntimeCommand::ExecuteScript(script) => {
+                        info!("Executing script: {}", script);
+                        // Same as script_receiver handling
+                        let _ = runtime_channels.status_sender.send(RuntimeStatus::ScriptCompilationStarted);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                        let _ = runtime_channels.status_sender.send(RuntimeStatus::ScriptCompilationCompleted);
+                    }
+                    RuntimeCommand::AttachToProcess(pid) => {
+                        info!("Attaching to process: {}", pid);
+                        // TODO: Implement process attachment
+                        let _ = runtime_channels.status_sender.send(RuntimeStatus::ProcessAttached(pid));
+                    }
+                    RuntimeCommand::DetachFromProcess => {
+                        info!("Detaching from process");
+                        let _ = runtime_channels.status_sender.send(RuntimeStatus::ProcessDetached);
+                    }
+                    RuntimeCommand::ReloadBinary(path) => {
+                        info!("Reloading binary: {}", path);
+                        // TODO: Implement binary reloading
+                    }
+                    RuntimeCommand::Shutdown => {
+                        info!("Shutdown command received");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    info!("Runtime coordinator shutting down");
     Ok(())
 }

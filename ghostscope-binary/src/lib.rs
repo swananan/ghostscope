@@ -112,6 +112,11 @@ impl BinaryAnalyzer {
             dwarf::DwarfContext::load_from_binary(&binary_path).ok()
         };
 
+        // Update debug_info with actual loading results
+        let mut debug_info = debug_info;
+        debug_info.has_symbols = !symbol_table.is_empty();
+        debug_info.has_debug_info = dwarf_context.is_some();
+
         Ok(Self {
             debug_info,
             symbol_table,
