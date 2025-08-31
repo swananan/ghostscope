@@ -191,13 +191,20 @@ impl SourceCodePanel {
             .skip(self.scroll_offset)
             .map(|(i, line)| {
                 let line_num = i + 1;
+                let is_current_line = i == self.current_line;
+
+                let line_number_style = if is_current_line {
+                    Style::default().fg(Color::LightYellow).bg(Color::DarkGray)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
 
                 let style = Style::default();
 
                 ListItem::new(Line::from(vec![
                     Span::styled(
                         format!("{:4} ", line_num),
-                        Style::default().fg(Color::DarkGray),
+                        line_number_style,
                     ),
                     Span::styled(line.clone(), style),
                 ]))
