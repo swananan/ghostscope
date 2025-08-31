@@ -274,19 +274,39 @@ impl TuiApp {
                 _ => {}
             },
             FocusedPanel::Source => {
-                // TODO: Implement source code navigation
                 match key.code {
                     KeyCode::Up | KeyCode::Char('k') => {
-                        if self.source_panel.current_line > 0 {
-                            self.source_panel.current_line -= 1;
-                        }
+                        self.source_panel.move_up();
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        if self.source_panel.current_line + 1 < self.source_panel.content.len() {
-                            self.source_panel.current_line += 1;
-                        }
+                        self.source_panel.move_down();
+                    }
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        self.source_panel.move_left();
+                    }
+                    KeyCode::Right | KeyCode::Char('l') => {
+                        self.source_panel.move_right();
+                    }
+                    KeyCode::Char('g') => {
+                        self.source_panel.move_to_top();
+                    }
+                    KeyCode::Char('G') => {
+                        self.source_panel.move_to_bottom();
                     }
                     _ => {}
+                }
+
+                // Handle Ctrl+key combinations
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    match key.code {
+                        KeyCode::Char('d') => {
+                            self.source_panel.move_down_fast();
+                        }
+                        KeyCode::Char('u') => {
+                            self.source_panel.move_up_fast();
+                        }
+                        _ => {}
+                    }
                 }
             }
         }

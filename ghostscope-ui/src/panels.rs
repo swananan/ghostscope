@@ -12,9 +12,9 @@ use crate::events::{RingbufEvent, RuntimeStatus};
 pub struct SourceCodePanel {
     pub content: Vec<String>,
     pub current_line: usize,
+    pub current_column: usize, // Add horizontal cursor position
     pub scroll_offset: usize,
     pub file_path: Option<String>,
-    pub highlighted_line: Option<usize>,
 }
 
 impl SourceCodePanel {
@@ -22,9 +22,9 @@ impl SourceCodePanel {
         Self {
             content: vec!["// No source code loaded".to_string()],
             current_line: 0,
+            current_column: 0,
             scroll_offset: 0,
             file_path: None,
-            highlighted_line: None,
         }
     }
 
@@ -36,7 +36,6 @@ impl SourceCodePanel {
     ) {
         self.file_path = Some(file_path);
         self.content = content;
-        self.highlighted_line = highlight_line;
 
         // Auto-scroll to highlighted line
         if let Some(line) = highlight_line {
@@ -51,9 +50,79 @@ impl SourceCodePanel {
     pub fn clear_source(&mut self) {
         self.content = vec!["// No source code loaded".to_string()];
         self.file_path = None;
-        self.highlighted_line = None;
+        self.current_line = 0;
+        self.current_column = 0;
+        self.scroll_offset = 0;
+    }
+
+    // Vim-style navigation methods
+    pub fn move_up(&mut self) {
+        if self.current_line > 0 {
+            self.current_line -= 1;
+            self.ensure_cursor_visible();
+        }
+    }
+
+    pub fn move_down(&mut self) {
+        if self.current_line + 1 < self.content.len() {
+            self.current_line += 1;
+            self.ensure_cursor_visible();
+        }
+    }
+
+    pub fn move_up_fast(&mut self) {
+        let new_line = self.current_line.saturating_sub(10);
+        self.current_line = new_line;
+        self.ensure_cursor_visible();
+    }
+
+    pub fn move_down_fast(&mut self) {
+        let new_line = (self.current_line + 10).min(self.content.len().saturating_sub(1));
+        self.current_line = new_line;
+        self.ensure_cursor_visible();
+    }
+
+    pub fn move_to_top(&mut self) {
         self.current_line = 0;
         self.scroll_offset = 0;
+    }
+
+    pub fn move_to_bottom(&mut self) {
+        if !self.content.is_empty() {
+            self.current_line = self.content.len() - 1;
+            self.ensure_cursor_visible();
+        }
+    }
+
+    pub fn move_left(&mut self) {
+        if self.current_column > 0 {
+            self.current_column -= 1;
+        }
+    }
+
+    pub fn move_right(&mut self) {
+        if let Some(current_line_content) = self.content.get(self.current_line) {
+            if self.current_column < current_line_content.len() {
+                self.current_column += 1;
+            }
+        }
+    }
+
+    fn ensure_cursor_visible(&mut self) {
+        if self.content.is_empty() {
+            return;
+        }
+
+        let visible_lines = 10; // Approximate visible lines
+        let current_visible_line = self.current_line.saturating_sub(self.scroll_offset);
+
+        if current_visible_line >= visible_lines {
+            // Cursor is below visible area, scroll down
+            self.scroll_offset = self.current_line.saturating_sub(visible_lines / 2);
+        } else if self.current_line < self.scroll_offset {
+            // Cursor is above visible area, scroll up
+            self.scroll_offset = self.current_line.saturating_sub(visible_lines / 2);
+        }
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect, is_focused: bool) {
@@ -65,15 +134,7 @@ impl SourceCodePanel {
             .map(|(i, line)| {
                 let line_num = i + 1;
 
-                let style = if i == self.current_line {
-                    // Current line (cursor position)
-                    Style::default().bg(Color::Blue).fg(Color::White)
-                } else if Some(line_num) == self.highlighted_line {
-                    // Highlighted line from DWARF (e.g., main function)
-                    Style::default().bg(Color::Green).fg(Color::Black)
-                } else {
-                    Style::default()
-                };
+                let style = Style::default();
 
                 ListItem::new(Line::from(vec![
                     Span::styled(
@@ -106,6 +167,19 @@ impl SourceCodePanel {
         );
 
         frame.render_widget(list, area);
+
+        // Render cursor when focused
+        if is_focused && !self.content.is_empty() {
+            let cursor_y = area.y + 1 + (self.current_line.saturating_sub(self.scroll_offset)) as u16;
+            let cursor_x = area.x + 5 + self.current_column as u16; // Position after line number + column offset
+
+            if cursor_y < area.y + area.height - 1 && cursor_x < area.x + area.width - 1 {
+                frame.render_widget(
+                    Block::default().style(Style::default().bg(Color::Cyan)),
+                    Rect::new(cursor_x, cursor_y, 1, 1),
+                );
+            }
+        }
     }
 }
 
