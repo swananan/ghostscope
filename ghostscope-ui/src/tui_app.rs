@@ -155,22 +155,22 @@ impl TuiApp {
         if self.expecting_window_nav {
             match key.code {
                 KeyCode::Char('j') => {
-                    // Move focus down: Input -> Output -> Source -> Input
+                    // Move focus down: Source -> Output -> Input -> Source (top to bottom)
                     self.focused_panel = match self.focused_panel {
-                        FocusedPanel::Input => FocusedPanel::Output,
-                        FocusedPanel::Output => FocusedPanel::Source,
-                        FocusedPanel::Source => FocusedPanel::Input,
+                        FocusedPanel::Source => FocusedPanel::Output,
+                        FocusedPanel::Output => FocusedPanel::Input,
+                        FocusedPanel::Input => FocusedPanel::Source,
                     };
                     debug!("Window nav: moved focus to {:?}", self.focused_panel);
                     self.expecting_window_nav = false;
                     return Ok(false);
                 }
                 KeyCode::Char('k') => {
-                    // Move focus up: Input -> Source -> Output -> Input
+                    // Move focus up: Source -> Input -> Output -> Source (bottom to top)
                     self.focused_panel = match self.focused_panel {
-                        FocusedPanel::Input => FocusedPanel::Source,
-                        FocusedPanel::Source => FocusedPanel::Output,
-                        FocusedPanel::Output => FocusedPanel::Input,
+                        FocusedPanel::Source => FocusedPanel::Input,
+                        FocusedPanel::Input => FocusedPanel::Output,
+                        FocusedPanel::Output => FocusedPanel::Source,
                     };
                     debug!("Window nav: moved focus to {:?}", self.focused_panel);
                     self.expecting_window_nav = false;
@@ -291,7 +291,6 @@ impl TuiApp {
         Ok(())
     }
 
-
     async fn execute_user_command(&mut self, command: String) -> Result<()> {
         let trimmed = command.trim();
 
@@ -342,10 +341,11 @@ impl TuiApp {
     }
 
     fn cycle_focus(&mut self) {
+        // Tab navigation follows same order as visual layout: Source -> Output -> Input
         self.focused_panel = match self.focused_panel {
-            FocusedPanel::Input => FocusedPanel::Output,
-            FocusedPanel::Output => FocusedPanel::Source,
-            FocusedPanel::Source => FocusedPanel::Input,
+            FocusedPanel::Source => FocusedPanel::Output,
+            FocusedPanel::Output => FocusedPanel::Input,
+            FocusedPanel::Input => FocusedPanel::Source,
         };
     }
 
@@ -381,8 +381,20 @@ impl TuiApp {
             .split(main_chunks[1]);
 
         // Render panels with focus indication
-        self.source_panel.render(frame, main_chunks[0], self.focused_panel == FocusedPanel::Source);
-        self.output_panel.render(frame, bottom_chunks[0], self.focused_panel == FocusedPanel::Output);
-        self.input_panel.render(frame, bottom_chunks[1], self.focused_panel == FocusedPanel::Input);
+        self.source_panel.render(
+            frame,
+            main_chunks[0],
+            self.focused_panel == FocusedPanel::Source,
+        );
+        self.output_panel.render(
+            frame,
+            bottom_chunks[0],
+            self.focused_panel == FocusedPanel::Output,
+        );
+        self.input_panel.render(
+            frame,
+            bottom_chunks[1],
+            self.focused_panel == FocusedPanel::Input,
+        );
     }
 }

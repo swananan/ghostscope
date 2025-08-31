@@ -306,17 +306,17 @@ impl InputPanel {
 
     pub fn render(&self, frame: &mut Frame, area: Rect, is_focused: bool) {
         let input_line = format!("{}{}", self.prompt, self.input_text);
-        
+
         let border_style = if is_focused {
             Style::default().fg(Color::Yellow)
         } else {
             Style::default()
         };
-        
+
         let paragraph = Paragraph::new(input_line).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(border_style)
+                .border_style(border_style),
         );
 
         frame.render_widget(paragraph, area);

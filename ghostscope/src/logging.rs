@@ -52,7 +52,9 @@ pub fn initialize_logging(log_file_path: Option<&str>, tui_mode: bool) -> Result
                     .with(file_subscriber)
                     .try_init()
                 {
-                    Ok(()) => eprintln!("Tracing subscriber initialized successfully (file-only for TUI mode)"),
+                    Ok(()) => eprintln!(
+                        "Tracing subscriber initialized successfully (file-only for TUI mode)"
+                    ),
                     Err(e) => eprintln!("Warning: Failed to initialize tracing subscriber: {}", e),
                 }
             } else {
@@ -62,7 +64,9 @@ pub fn initialize_logging(log_file_path: Option<&str>, tui_mode: bool) -> Result
                     .with(tracing_subscriber::fmt::layer().with_writer(std::io::stdout))
                     .try_init()
                 {
-                    Ok(()) => eprintln!("Tracing subscriber initialized successfully with file and stdout output"),
+                    Ok(()) => eprintln!(
+                        "Tracing subscriber initialized successfully with file and stdout output"
+                    ),
                     Err(e) => eprintln!("Warning: Failed to initialize tracing subscriber: {}", e),
                 }
             }
