@@ -3,9 +3,7 @@ mod panels;
 mod syntax_highlight;
 mod tui_app;
 
-pub use events::{
-    EventRegistry, RingbufEvent, RuntimeChannels, RuntimeCommand, RuntimeStatus, TuiEvent,
-};
+pub use events::{EventRegistry, RuntimeChannels, RuntimeCommand, RuntimeStatus, TuiEvent};
 pub use tui_app::{LayoutMode, TuiApp};
 
 use anyhow::Result;

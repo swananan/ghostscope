@@ -1,3 +1,4 @@
+use chrono::{DateTime, Local, TimeZone, Timelike, Utc};
 use ratatui::{
     layout::Rect,
     style::{Color, Style},
@@ -7,10 +8,10 @@ use ratatui::{
 };
 use std::collections::VecDeque;
 
-use crate::events::{RingbufEvent, RuntimeStatus, TraceEvent, TraceLevel};
+use crate::events::{RuntimeStatus, TraceEvent};
+use ghostscope_protocol::MessageType;
 
 pub struct EbpfInfoPanel {
-    pub messages: VecDeque<RingbufEvent>,
     pub status_messages: VecDeque<RuntimeStatus>,
     pub trace_events: VecDeque<TraceEvent>,
     pub scroll_offset: usize,
@@ -21,23 +22,11 @@ pub struct EbpfInfoPanel {
 impl EbpfInfoPanel {
     pub fn new() -> Self {
         Self {
-            messages: VecDeque::new(),
             status_messages: VecDeque::new(),
             trace_events: VecDeque::new(),
             scroll_offset: 0,
             max_messages: 1000,
             auto_scroll: true,
-        }
-    }
-
-    pub fn add_ringbuf_event(&mut self, event: RingbufEvent) {
-        self.messages.push_back(event);
-        if self.messages.len() > self.max_messages {
-            self.messages.pop_front();
-        }
-
-        if self.auto_scroll {
-            self.scroll_to_bottom();
         }
     }
 
@@ -68,8 +57,7 @@ impl EbpfInfoPanel {
     }
 
     pub fn scroll_down(&mut self) {
-        let total_lines =
-            self.messages.len() + self.status_messages.len() + self.trace_events.len();
+        let total_lines = self.status_messages.len() + self.trace_events.len();
         if self.scroll_offset + 1 < total_lines {
             self.scroll_offset += 1;
         } else {
@@ -78,8 +66,7 @@ impl EbpfInfoPanel {
     }
 
     pub fn scroll_to_bottom(&mut self) {
-        let total_lines =
-            self.messages.len() + self.status_messages.len() + self.trace_events.len();
+        let total_lines = self.status_messages.len() + self.trace_events.len();
         self.scroll_offset = total_lines.saturating_sub(1);
         self.auto_scroll = true;
     }
@@ -171,16 +158,26 @@ impl EbpfInfoPanel {
 
         // Add trace events (from ringbuf processing)
         for trace in &self.trace_events {
-            let timestamp_text = format!("[{:>12}] ", trace.timestamp);
-            let level_style = match trace.level {
-                TraceLevel::Info => Style::default().fg(Color::Green),
-                TraceLevel::Warn => Style::default().fg(Color::Yellow),
-                TraceLevel::Error => Style::default().fg(Color::Red),
-                TraceLevel::Trace => Style::default().fg(Color::Cyan),
+            // Format timestamp as HH:MM:SS.mmm
+            let formatted_time = self.format_timestamp(trace.timestamp);
+            let timestamp_text = format!("[{}] ", formatted_time);
+
+            let level_style = match trace.trace_type {
+                MessageType::Error => Style::default().fg(Color::Red),
+                MessageType::ExecutionFailure => Style::default().fg(Color::Red),
+                MessageType::Log => Style::default().fg(Color::Green),
+                MessageType::VariableData => Style::default().fg(Color::Cyan),
+                MessageType::Heartbeat => Style::default().fg(Color::DarkGray),
+                MessageType::BatchVariables => Style::default().fg(Color::Blue),
+                MessageType::Reserved => Style::default().fg(Color::White),
             };
 
-            let level_text = format!("[{:?}] ", trace.level);
-            let full_line = format!("{}{}{}", timestamp_text, level_text, trace.message);
+            let level_text = format!("[{:^5}] ", format!("{:?}", trace.trace_type));
+            let trace_info = format!("TraceID:{} PID:{} - ", trace.trace_id, trace.pid);
+            let full_line = format!(
+                "{}{}{}{}",
+                timestamp_text, level_text, trace_info, trace.message
+            );
 
             let wrapped_lines = self.wrap_text(&full_line, content_width as usize);
             for (i, line) in wrapped_lines.iter().enumerate() {
@@ -188,11 +185,18 @@ impl EbpfInfoPanel {
                     // First line with proper coloring
                     let timestamp_len = timestamp_text.len();
                     let level_len = level_text.len();
-                    let total_prefix_len = timestamp_len + level_len;
+                    let trace_info_len = trace_info.len();
+                    let total_prefix_len = timestamp_len + level_len + trace_info_len;
 
                     let timestamp_part = &line[..timestamp_len.min(line.len())];
                     let level_part = if line.len() > timestamp_len {
                         &line[timestamp_len..(timestamp_len + level_len).min(line.len())]
+                    } else {
+                        ""
+                    };
+                    let trace_info_part = if line.len() > timestamp_len + level_len {
+                        &line[(timestamp_len + level_len)
+                            ..(timestamp_len + level_len + trace_info_len).min(line.len())]
                     } else {
                         ""
                     };
@@ -208,45 +212,16 @@ impl EbpfInfoPanel {
                             Style::default().fg(Color::DarkGray),
                         ),
                         Span::styled(level_part.to_string(), level_style),
+                        Span::styled(
+                            trace_info_part.to_string(),
+                            Style::default().fg(Color::Blue),
+                        ),
                         Span::styled(content_part.to_string(), Style::default()),
                     ])));
                 } else {
                     // Continuation lines - indent to align with content after prefixes
-                    let indent = " ".repeat(timestamp_text.len() + level_text.len());
-                    all_items.push(ListItem::new(Line::from(vec![Span::styled(
-                        format!("{}{}", indent, line),
-                        Style::default(),
-                    )])));
-                }
-            }
-        }
-
-        // Add ringbuf messages
-        for event in &self.messages {
-            let timestamp_text = format!("[{:>12}] ", event.timestamp);
-            let message_text =
-                format!("Type: {:?}, {} bytes", event.message_type, event.data.len());
-            let full_line = format!("{}{}", timestamp_text, message_text);
-
-            let wrapped_lines = self.wrap_text(&full_line, content_width as usize);
-            for (i, line) in wrapped_lines.iter().enumerate() {
-                if i == 0 {
-                    // First line with proper coloring
-                    let prefix_len = timestamp_text.len();
-                    let prefix = &line[..prefix_len.min(line.len())];
-                    let content = if line.len() > prefix_len {
-                        &line[prefix_len..]
-                    } else {
-                        ""
-                    };
-
-                    all_items.push(ListItem::new(Line::from(vec![
-                        Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
-                        Span::styled(content.to_string(), Style::default()),
-                    ])));
-                } else {
-                    // Continuation lines - indent to align with content after timestamp
-                    let indent = " ".repeat(timestamp_text.len());
+                    let indent =
+                        " ".repeat(timestamp_text.len() + level_text.len() + trace_info.len());
                     all_items.push(ListItem::new(Line::from(vec![Span::styled(
                         format!("{}{}", indent, line),
                         Style::default(),
@@ -273,14 +248,43 @@ impl EbpfInfoPanel {
                     BorderType::Plain
                 })
                 .title(format!(
-                    "eBPF Information ({} traces, {} messages)",
-                    self.trace_events.len(),
-                    self.messages.len()
+                    "eBPF Trace Output ({} events)",
+                    self.trace_events.len()
                 ))
                 .border_style(border_style),
         );
 
         frame.render_widget(list, area);
+    }
+
+    /// Format nanosecond timestamp to HH:MM:SS.mmm format using chrono with local timezone
+    fn format_timestamp(&self, timestamp_ns: u64) -> String {
+        // Convert nanoseconds to seconds and nanoseconds
+        let secs = timestamp_ns / 1_000_000_000;
+        let nsecs = (timestamp_ns % 1_000_000_000) as u32;
+
+        // Create UTC DateTime from timestamp
+        let utc_dt: DateTime<Utc> = match Utc.timestamp_opt(secs as i64, nsecs) {
+            chrono::LocalResult::Single(dt) => dt,
+            chrono::LocalResult::None => {
+                // Fallback to current time if timestamp is invalid
+                Utc::now()
+            }
+            chrono::LocalResult::Ambiguous(dt, _) => dt, // Use first occurrence in case of ambiguity
+        };
+
+        // Convert to local timezone
+        let local_dt: DateTime<Local> = DateTime::from(utc_dt);
+
+        // Format as HH:MM:SS.mmm
+        let millis = local_dt.nanosecond() / 1_000_000;
+        format!(
+            "{:02}:{:02}:{:02}.{:03}",
+            local_dt.hour(),
+            local_dt.minute(),
+            local_dt.second(),
+            millis
+        )
     }
 
     /// Wrap text to fit within the specified width

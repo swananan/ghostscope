@@ -11,29 +11,14 @@ pub enum TuiEvent {
     Quit,
 }
 
-/// Events from the eBPF monitoring system
-#[derive(Debug, Clone)]
-pub struct RingbufEvent {
-    pub timestamp: u64,
-    pub message_type: MessageType,
-    pub data: Vec<u8>,
-}
-
-/// Simple trace event for TUI display
+/// Structured trace event for TUI display
 #[derive(Debug, Clone)]
 pub struct TraceEvent {
-    pub timestamp: u64,
-    pub level: TraceLevel,
-    pub message: String,
-}
-
-/// Trace event level for coloring and filtering
-#[derive(Debug, Clone, PartialEq)]
-pub enum TraceLevel {
-    Info,
-    Warn,
-    Error,
-    Trace,
+    pub timestamp: u64, // Raw timestamp in nanoseconds, TUI will format for display
+    pub trace_id: u64,
+    pub pid: u32,
+    pub message: String,         // Main trace message content
+    pub trace_type: MessageType, // Use MessageType directly for trace categorization
 }
 
 /// Registry for event communication between TUI and runtime
@@ -44,7 +29,6 @@ pub struct EventRegistry {
     pub command_sender: mpsc::UnboundedSender<RuntimeCommand>,
 
     // Runtime -> TUI communication
-    pub ringbuf_receiver: mpsc::UnboundedReceiver<RingbufEvent>,
     pub trace_receiver: mpsc::UnboundedReceiver<TraceEvent>,
     pub status_receiver: mpsc::UnboundedReceiver<RuntimeStatus>,
 }
@@ -90,14 +74,12 @@ impl EventRegistry {
     pub fn new() -> (Self, RuntimeChannels) {
         let (script_tx, script_rx) = mpsc::unbounded_channel();
         let (command_tx, command_rx) = mpsc::unbounded_channel();
-        let (ringbuf_tx, ringbuf_rx) = mpsc::unbounded_channel();
         let (trace_tx, trace_rx) = mpsc::unbounded_channel();
         let (status_tx, status_rx) = mpsc::unbounded_channel();
 
         let registry = EventRegistry {
             script_sender: script_tx,
             command_sender: command_tx,
-            ringbuf_receiver: ringbuf_rx,
             trace_receiver: trace_rx,
             status_receiver: status_rx,
         };
@@ -105,7 +87,6 @@ impl EventRegistry {
         let channels = RuntimeChannels {
             script_receiver: script_rx,
             command_receiver: command_rx,
-            ringbuf_sender: ringbuf_tx.clone(),
             trace_sender: trace_tx.clone(),
             status_sender: status_tx.clone(),
         };
@@ -119,7 +100,6 @@ impl EventRegistry {
 pub struct RuntimeChannels {
     pub script_receiver: mpsc::UnboundedReceiver<String>,
     pub command_receiver: mpsc::UnboundedReceiver<RuntimeCommand>,
-    pub ringbuf_sender: mpsc::UnboundedSender<RingbufEvent>,
     pub trace_sender: mpsc::UnboundedSender<TraceEvent>,
     pub status_sender: mpsc::UnboundedSender<RuntimeStatus>,
 }
@@ -128,11 +108,6 @@ impl RuntimeChannels {
     /// Create a status sender that can be shared with other tasks
     pub fn create_status_sender(&self) -> mpsc::UnboundedSender<RuntimeStatus> {
         self.status_sender.clone()
-    }
-
-    /// Create a ringbuf sender that can be shared with other tasks
-    pub fn create_ringbuf_sender(&self) -> mpsc::UnboundedSender<RingbufEvent> {
-        self.ringbuf_sender.clone()
     }
 
     /// Create a trace sender that can be shared with other tasks

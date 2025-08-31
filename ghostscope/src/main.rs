@@ -865,7 +865,8 @@ async fn run_runtime_coordinator(
     mut runtime_channels: ghostscope_ui::RuntimeChannels,
     mut session: Option<DebugSession>,
 ) -> Result<()> {
-    use ghostscope_ui::events::{RingbufEvent, TraceEvent, TraceLevel};
+    use ghostscope_protocol::MessageType;
+    use ghostscope_ui::events::TraceEvent;
     use ghostscope_ui::{RuntimeCommand, RuntimeStatus};
 
     info!("Runtime coordinator started");
@@ -1321,7 +1322,8 @@ fn poll_ringbuf_events(
     session: &mut DebugSession,
     trace_sender: &tokio::sync::mpsc::UnboundedSender<ghostscope_ui::events::TraceEvent>,
 ) {
-    use ghostscope_ui::events::{TraceEvent, TraceLevel};
+    use ghostscope_protocol::MessageType;
+    use ghostscope_ui::events::TraceEvent;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     // Get current timestamp for events
@@ -1335,25 +1337,26 @@ fn poll_ringbuf_events(
         match loader.poll_events() {
             Ok(Some(events)) => {
                 for event in events {
-                    // Format the event message with relevant information
-                    let message = format!(
-                        "[Loader {}] Trace ID: {}, PID: {}, TID: {} - Variables: [{}]",
-                        loader_index,
-                        event.trace_id,
-                        event.pid,
-                        event.tid,
-                        event
-                            .variables
-                            .iter()
-                            .map(|var| format!("{}: {}", var.name, var.formatted_value))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    );
+                    // Format the main message content
+                    let variables_text = event
+                        .variables
+                        .iter()
+                        .map(|var| format!("{}: {}", var.name, var.formatted_value))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+
+                    let message = if variables_text.is_empty() {
+                        format!("[Loader {}] Function trace", loader_index)
+                    } else {
+                        format!("[Loader {}] Variables: [{}]", loader_index, variables_text)
+                    };
 
                     let trace_event = TraceEvent {
                         timestamp: event.timestamp,
-                        level: TraceLevel::Trace,
+                        trace_id: event.trace_id,
+                        pid: event.pid,
                         message,
+                        trace_type: MessageType::VariableData,
                     };
 
                     // Send to TUI (ignore errors if channel is closed)
@@ -1368,8 +1371,10 @@ fn poll_ringbuf_events(
                 error!("Error polling events from loader {}: {}", loader_index, e);
                 let error_event = TraceEvent {
                     timestamp: current_timestamp,
-                    level: TraceLevel::Error,
+                    trace_id: 0, // No trace ID for error events
+                    pid: 0,      // No specific PID for error events
                     message: format!("Error polling events from loader {}: {}", loader_index, e),
+                    trace_type: MessageType::Error,
                 };
                 let _ = trace_sender.send(error_event);
             }

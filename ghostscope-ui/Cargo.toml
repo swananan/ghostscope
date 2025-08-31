@@ -11,4 +11,5 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 futures-util = "0.3"
 tokio = { workspace = true }
 anyhow = { workspace = true }
-tracing = { workspace = true } 
+tracing = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] } 
