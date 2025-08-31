@@ -32,24 +32,14 @@ impl SourceCodePanel {
         &mut self,
         file_path: String,
         content: Vec<String>,
-        highlight_line: Option<usize>,
+        _highlight_line: Option<usize>, // Ignore highlight_line parameter
     ) {
         self.file_path = Some(file_path);
         self.content = content;
 
-        if let Some(line) = highlight_line {
-            if line > 0 && line <= self.content.len() {
-                self.current_line = line - 1;
-                self.current_column = 0;
-            } else {
-                self.current_line = 0;
-                self.current_column = 0;
-            }
-        } else {
-            self.current_line = 0;
-            self.current_column = 0;
-        }
-        
+        // Always start at the top of the file
+        self.current_line = 0;
+        self.current_column = 0;
         self.scroll_offset = 0;
     }
 
