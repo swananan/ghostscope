@@ -40,5 +40,6 @@ test_*
 *.c
 CLA*
 IMPL*
+TUI_IN*
 kernel.dwarf
 *.bt
