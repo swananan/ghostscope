@@ -933,7 +933,7 @@ async fn handle_source_code_request(
     session: &Option<DebugSession>,
     status_sender: &tokio::sync::mpsc::UnboundedSender<ghostscope_ui::RuntimeStatus>,
 ) {
-    use ghostscope_ui::{RuntimeStatus, events::SourceCodeInfo};
+    use ghostscope_ui::{events::SourceCodeInfo, RuntimeStatus};
 
     if let Some(session) = session {
         // Try to get source information from DWARF
@@ -941,27 +941,33 @@ async fn handle_source_code_request(
             if let Some(dwarf_context) = binary_analyzer.dwarf_context() {
                 // For now, get main function address and find its source
                 if let Some(main_symbol) = binary_analyzer.find_symbol("main") {
-                    if let Some(source_location) = dwarf_context.get_source_location(main_symbol.address) {
-                        info!("Found source location: file_path={}, line={}", 
-                              source_location.file_path, source_location.line_number);
-                        
+                    if let Some(source_location) =
+                        dwarf_context.get_source_location(main_symbol.address)
+                    {
+                        info!(
+                            "Found source location: file_path={}, line={}",
+                            source_location.file_path, source_location.line_number
+                        );
+
                         // Try multiple strategies to find the source file
                         let possible_paths = get_possible_source_paths(
                             &source_location.file_path,
-                            &binary_analyzer.debug_info().binary_path
+                            &binary_analyzer.debug_info().binary_path,
                         );
-                        
+
                         for path in possible_paths {
                             info!("Trying to read source file: {}", path.display());
                             match std::fs::read_to_string(&path) {
                                 Ok(content) => {
-                                    let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+                                    let lines: Vec<String> =
+                                        content.lines().map(|s| s.to_string()).collect();
                                     let source_info = SourceCodeInfo {
                                         file_path: path.to_string_lossy().to_string(),
                                         content: lines,
                                         current_line: Some(source_location.line_number as usize),
                                     };
-                                    let _ = status_sender.send(RuntimeStatus::SourceCodeLoaded(source_info));
+                                    let _ = status_sender
+                                        .send(RuntimeStatus::SourceCodeLoaded(source_info));
                                     return;
                                 }
                                 Err(e) => {
@@ -975,42 +981,77 @@ async fn handle_source_code_request(
         }
     }
 
-    // If we get here, source code loading failed
+    // If we get here, source code loading failed - provide detailed error info
+    if let Some(session) = session {
+        if let Some(binary_analyzer) = &session.binary_analyzer {
+            if let Some(dwarf_context) = binary_analyzer.dwarf_context() {
+                if let Some(main_symbol) = binary_analyzer.find_symbol("main") {
+                    if let Some(source_location) =
+                        dwarf_context.get_source_location(main_symbol.address)
+                    {
+                        // We found DWARF info but couldn't find source files
+                        let possible_paths = get_possible_source_paths(
+                            &source_location.file_path,
+                            &binary_analyzer.debug_info().binary_path,
+                        );
+
+                        let path_list: Vec<String> = possible_paths
+                            .iter()
+                            .map(|p| p.to_string_lossy().to_string())
+                            .collect();
+
+                        let error_msg = format!(
+                            "Source file not found. DWARF reports: '{}' (line {}). Searched paths: {}",
+                            source_location.file_path,
+                            source_location.line_number,
+                            path_list.join(", ")
+                        );
+
+                        let _ = status_sender.send(RuntimeStatus::SourceCodeLoadFailed(error_msg));
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback error message
     let _ = status_sender.send(RuntimeStatus::SourceCodeLoadFailed(
-        "No debug information available or source file not found. Compile with -g and ensure source files are accessible.".to_string()
+        "No debug information available. Compile with -g for source code display.".to_string(),
     ));
 }
 
 /// Get possible source file paths based on DWARF info and binary location
 fn get_possible_source_paths(dwarf_file_path: &str, binary_path: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    
+
     // 1. Try the original path from DWARF
     paths.push(PathBuf::from(dwarf_file_path));
-    
+
     // 2. If it's a relative path like "file_1", try common source file names in binary directory
     if dwarf_file_path.starts_with("file_") || !Path::new(dwarf_file_path).is_absolute() {
         if let Some(binary_dir) = binary_path.parent() {
             // Try test_program.c in the same directory as binary
             paths.push(binary_dir.join("test_program.c"));
-            
+
             // Try other common source file extensions
-            let binary_stem = binary_path.file_stem()
+            let binary_stem = binary_path
+                .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("main");
-                
+
             for ext in &["c", "cpp", "cc", "cxx"] {
                 paths.push(binary_dir.join(format!("{}.{}", binary_stem, ext)));
             }
         }
     }
-    
+
     // 3. If it's a filename without directory, try in binary directory
     if let Some(filename) = Path::new(dwarf_file_path).file_name() {
         if let Some(binary_dir) = binary_path.parent() {
             paths.push(binary_dir.join(filename));
         }
     }
-    
+
     paths
 }

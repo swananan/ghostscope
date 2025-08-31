@@ -17,7 +17,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
 use crate::{
-    events::{EventRegistry, RingbufEvent, RuntimeCommand, RuntimeStatus, SourceCodeInfo, TuiEvent},
+    events::{
+        EventRegistry, RingbufEvent, RuntimeCommand, RuntimeStatus, SourceCodeInfo, TuiEvent,
+    },
     panels::{InputPanel, OutputPanel, SourceCodePanel},
 };
 
@@ -351,7 +353,7 @@ impl TuiApp {
 
     async fn handle_runtime_status(&mut self, status: RuntimeStatus) {
         debug!("Runtime status: {:?}", status);
-        
+
         match &status {
             RuntimeStatus::SourceCodeLoaded(source_info) => {
                 self.source_panel.load_source(
@@ -365,11 +367,14 @@ impl TuiApp {
             }
             RuntimeStatus::DwarfLoadingCompleted { .. } => {
                 // Auto-request source code when DWARF loading completes
-                let _ = self.event_registry.command_sender.send(RuntimeCommand::RequestSourceCode);
+                let _ = self
+                    .event_registry
+                    .command_sender
+                    .send(RuntimeCommand::RequestSourceCode);
             }
             _ => {}
         }
-        
+
         self.output_panel.add_status_message(status);
     }
 

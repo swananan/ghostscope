@@ -1,13 +1,13 @@
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    layout::Rect,
+    style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
+    widgets::{Block, Borders, List, ListItem, Paragraph},
     Frame,
 };
 use std::collections::VecDeque;
 
-use crate::events::{RingbufEvent, RuntimeStatus, SourceCodeInfo};
+use crate::events::{RingbufEvent, RuntimeStatus};
 
 pub struct SourceCodePanel {
     pub content: Vec<String>,
@@ -28,16 +28,21 @@ impl SourceCodePanel {
         }
     }
 
-    pub fn load_source(&mut self, file_path: String, content: Vec<String>, highlight_line: Option<usize>) {
+    pub fn load_source(
+        &mut self,
+        file_path: String,
+        content: Vec<String>,
+        highlight_line: Option<usize>,
+    ) {
         self.file_path = Some(file_path);
         self.content = content;
         self.highlighted_line = highlight_line;
-        
+
         // Auto-scroll to highlighted line
         if let Some(line) = highlight_line {
             if line > 0 && line <= self.content.len() {
                 self.current_line = line - 1; // Convert to 0-based
-                // Center the highlighted line in the view
+                                              // Center the highlighted line in the view
                 self.scroll_offset = line.saturating_sub(10);
             }
         }
@@ -59,7 +64,7 @@ impl SourceCodePanel {
             .skip(self.scroll_offset)
             .map(|(i, line)| {
                 let line_num = i + 1;
-                
+
                 let style = if i == self.current_line {
                     // Current line (cursor position)
                     Style::default().bg(Color::Blue).fg(Color::White)
@@ -166,6 +171,9 @@ impl OutputPanel {
     pub fn render(&self, frame: &mut Frame, area: Rect, is_focused: bool) {
         let mut all_items = Vec::new();
 
+        // Calculate content width for text wrapping (subtract borders and prefix)
+        let content_width = area.width.saturating_sub(4); // 2 for borders + 2 for padding
+
         // Add status messages first (in chronological order)
         for status in &self.status_messages {
             let (style, text) = match status {
@@ -222,10 +230,26 @@ impl OutputPanel {
                 }
             };
 
-            all_items.push(ListItem::new(Line::from(vec![
-                Span::styled("[STATUS] ", Style::default().fg(Color::Cyan)),
-                Span::styled(text, style),
-            ])));
+            // Wrap long messages
+            let status_prefix = "[STATUS] ";
+            let full_text = format!("{}{}", status_prefix, text);
+            let wrapped_lines = self.wrap_text(&full_text, content_width as usize);
+            
+            for (i, line) in wrapped_lines.iter().enumerate() {
+                if i == 0 {
+                    // First line includes the [STATUS] prefix
+                    all_items.push(ListItem::new(Line::from(vec![Span::styled(
+                        line.clone(),
+                        style,
+                    )])));
+                } else {
+                    // Continuation lines are indented to align with content after prefix
+                    let indent = " ".repeat(status_prefix.len());
+                    all_items.push(ListItem::new(Line::from(vec![
+                        Span::styled(format!("{}{}", indent, line), style),
+                    ])));
+                }
+            }
         }
 
         // Add ringbuf messages
@@ -233,11 +257,32 @@ impl OutputPanel {
             let timestamp_text = format!("[{:>12}] ", event.timestamp);
             let message_text =
                 format!("Type: {:?}, {} bytes", event.message_type, event.data.len());
+            let full_line = format!("{}{}", timestamp_text, message_text);
 
-            all_items.push(ListItem::new(Line::from(vec![
-                Span::styled(timestamp_text, Style::default().fg(Color::DarkGray)),
-                Span::styled(message_text, Style::default()),
-            ])));
+            let wrapped_lines = self.wrap_text(&full_line, content_width as usize);
+            for (i, line) in wrapped_lines.iter().enumerate() {
+                if i == 0 {
+                    // First line with proper coloring
+                    let prefix_len = timestamp_text.len();
+                    let prefix = &line[..prefix_len.min(line.len())];
+                    let content = if line.len() > prefix_len {
+                        &line[prefix_len..]
+                    } else {
+                        ""
+                    };
+
+                    all_items.push(ListItem::new(Line::from(vec![
+                        Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
+                        Span::styled(content.to_string(), Style::default()),
+                    ])));
+                } else {
+                    // Continuation lines - indent to align with content after timestamp
+                    let indent = " ".repeat(timestamp_text.len());
+                    all_items.push(ListItem::new(Line::from(vec![
+                        Span::styled(format!("{}{}", indent, line), Style::default()),
+                    ])));
+                }
+            }
         }
 
         // Apply scrolling
@@ -257,6 +302,83 @@ impl OutputPanel {
         );
 
         frame.render_widget(list, area);
+    }
+
+    /// Wrap text to fit within the specified width
+    /// This improved version handles long words and special characters better
+    fn wrap_text(&self, text: &str, width: usize) -> Vec<String> {
+        if width == 0 {
+            return vec![text.to_string()];
+        }
+
+        let mut lines = Vec::new();
+        let mut current_line = String::new();
+
+        for word in text.split_whitespace() {
+            // If the word itself is longer than the width, we need to break it
+            if word.len() > width {
+                // If we have content on the current line, push it first
+                if !current_line.is_empty() {
+                    lines.push(current_line);
+                    current_line = String::new();
+                }
+                
+                // For long words (like file paths), try to break at more sensible points
+                if word.contains('/') {
+                    // Try to break at path separators for file paths
+                    let mut remaining = word;
+                    while !remaining.is_empty() {
+                        let mut chunk_size = (width - 3).min(remaining.len()); // 更保守的边距
+                        
+                        // If we're not at the end, try to find a good break point
+                        if chunk_size < remaining.len() {
+                            // Look for a path separator near the end of the chunk
+                            let chunk = &remaining[..chunk_size];
+                            if let Some(last_slash) = chunk.rfind('/') {
+                                // Break after the last slash in the chunk
+                                chunk_size = last_slash + 1;
+                            }
+                        }
+                        
+                        let chunk = &remaining[..chunk_size];
+                        lines.push(chunk.to_string());
+                        remaining = &remaining[chunk_size..];
+                    }
+                } else {
+                    // For other long words, break at character boundaries
+                    let mut remaining = word;
+                    while !remaining.is_empty() {
+                        let chunk_size = (width - 3).min(remaining.len()); // 更保守的边距
+                        let chunk = &remaining[..chunk_size];
+                        lines.push(chunk.to_string());
+                        remaining = &remaining[chunk_size..];
+                    }
+                }
+            } else if current_line.is_empty() {
+                // First word on the line
+                current_line = word.to_string();
+            } else if current_line.len() + 1 + word.len() <= width {
+                // Word fits on current line
+                current_line.push(' ');
+                current_line.push_str(word);
+            } else {
+                // Word doesn't fit, start new line
+                lines.push(current_line);
+                current_line = word.to_string();
+            }
+        }
+
+        // Add the last line if it's not empty
+        if !current_line.is_empty() {
+            lines.push(current_line);
+        }
+
+        // If no lines were created, return the original text
+        if lines.is_empty() {
+            vec![text.to_string()]
+        } else {
+            lines
+        }
     }
 }
 
