@@ -6,7 +6,7 @@ use tracing_subscriber::Layer;
 
 const DEFAULT_LOG_FILE: &str = "ghostscope.log";
 
-pub fn initialize_logging(log_file_path: Option<&str>) -> Result<()> {
+pub fn initialize_logging(log_file_path: Option<&str>, tui_mode: bool) -> Result<()> {
     eprintln!("Starting logging initialization...");
 
     // Initialize log to tracing adapter to capture aya's log:: output
@@ -37,7 +37,7 @@ pub fn initialize_logging(log_file_path: Option<&str>) -> Result<()> {
         Ok(log_file) => {
             eprintln!("Successfully created log file: {}", log_path.display());
 
-            // Configure dual output: file and stdout
+            // Configure file output
             let file_subscriber = tracing_subscriber::fmt::layer()
                 .with_file(true)
                 .with_line_number(true)
@@ -46,13 +46,25 @@ pub fn initialize_logging(log_file_path: Option<&str>) -> Result<()> {
                 .with_ansi(false)
                 .with_filter(tracing_subscriber::filter::EnvFilter::from_default_env());
 
-            match tracing_subscriber::registry()
-                .with(file_subscriber)
-                .with(tracing_subscriber::fmt::layer().with_writer(std::io::stdout))
-                .try_init()
-            {
-                Ok(()) => eprintln!("Tracing subscriber initialized successfully with file output"),
-                Err(e) => eprintln!("Warning: Failed to initialize tracing subscriber: {}", e),
+            if tui_mode {
+                // TUI mode: only log to file
+                match tracing_subscriber::registry()
+                    .with(file_subscriber)
+                    .try_init()
+                {
+                    Ok(()) => eprintln!("Tracing subscriber initialized successfully (file-only for TUI mode)"),
+                    Err(e) => eprintln!("Warning: Failed to initialize tracing subscriber: {}", e),
+                }
+            } else {
+                // Non-TUI mode: dual output to file and stdout
+                match tracing_subscriber::registry()
+                    .with(file_subscriber)
+                    .with(tracing_subscriber::fmt::layer().with_writer(std::io::stdout))
+                    .try_init()
+                {
+                    Ok(()) => eprintln!("Tracing subscriber initialized successfully with file and stdout output"),
+                    Err(e) => eprintln!("Warning: Failed to initialize tracing subscriber: {}", e),
+                }
             }
 
             eprintln!("Tracing subscriber initialized successfully");

@@ -20,7 +20,7 @@ async fn main() -> Result<()> {
 
     // Initialize logging first so we can use it for validation
     let log_file_path = parsed_args.log_file.as_ref().and_then(|p| p.to_str());
-    if let Err(e) = logging::initialize_logging(log_file_path) {
+    if let Err(e) = logging::initialize_logging(log_file_path, false) {
         eprintln!("Failed to initialize logging: {}", e);
         return Err(anyhow::anyhow!("Failed to initialize logging: {}", e));
     }
@@ -696,7 +696,7 @@ fn save_ast_to_file(
 async fn run_tui_runtime(parsed_args: ParsedArgs) -> Result<()> {
     // Initialize logging first
     let log_file_path = parsed_args.log_file.as_ref().and_then(|p| p.to_str());
-    if let Err(e) = logging::initialize_logging(log_file_path) {
+    if let Err(e) = logging::initialize_logging(log_file_path, true) {
         eprintln!("Failed to initialize logging: {}", e);
         return Err(anyhow::anyhow!("Failed to initialize logging: {}", e));
     }
