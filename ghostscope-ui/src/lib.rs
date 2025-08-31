@@ -6,7 +6,7 @@ mod tui_app;
 pub use events::{
     EventRegistry, RingbufEvent, RuntimeChannels, RuntimeCommand, RuntimeStatus, TuiEvent,
 };
-pub use tui_app::{TuiApp, LayoutMode};
+pub use tui_app::{LayoutMode, TuiApp};
 
 use anyhow::Result;
 use tokio::sync::mpsc;

@@ -1,11 +1,11 @@
+use crate::syntax_highlight::{SyntaxHighlighter, Token, TokenType};
 use ratatui::{
     layout::Rect,
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, BorderType, List, ListItem},
+    widgets::{Block, BorderType, Borders, List, ListItem},
     Frame,
 };
-use crate::syntax_highlight::{SyntaxHighlighter, Token, TokenType};
 
 pub struct SourceCodePanel {
     pub content: Vec<String>,
@@ -19,7 +19,6 @@ pub struct SourceCodePanel {
 }
 
 impl SourceCodePanel {
-
     pub fn new() -> Self {
         Self {
             content: vec!["// No source code loaded".to_string()],
@@ -27,7 +26,7 @@ impl SourceCodePanel {
             current_column: 0,
             scroll_offset: 0,
             file_path: None,
-            area_height: 10, // Default height
+            area_height: 10,           // Default height
             language: "c".to_string(), // Default to C
             syntax_highlighter: SyntaxHighlighter::new(),
         }
@@ -41,7 +40,7 @@ impl SourceCodePanel {
     ) {
         self.file_path = Some(file_path.clone());
         self.content = content;
-        
+
         // Detect language based on file extension
         self.language = self.detect_language(&file_path);
 
@@ -68,7 +67,7 @@ impl SourceCodePanel {
         let tokens = self.syntax_highlighter.highlight_line(line, &self.language);
         let mut spans = Vec::new();
         let mut current_pos = 0;
-        
+
         for token in tokens {
             // Add any characters that come before this token
             if token.start > current_pos {
@@ -77,14 +76,14 @@ impl SourceCodePanel {
                     spans.push(Span::styled(normal_text.to_string(), Style::default()));
                 }
             }
-            
+
             // Add the token with its style
             let style = self.syntax_highlighter.get_token_style(&token.token_type);
             spans.push(Span::styled(token.text.clone(), style));
-            
+
             current_pos = token.end;
         }
-        
+
         // Add any remaining characters after the last token
         if current_pos < line.len() {
             let remaining_text = &line[current_pos..];
@@ -92,7 +91,7 @@ impl SourceCodePanel {
                 spans.push(Span::styled(remaining_text.to_string(), Style::default()));
             }
         }
-        
+
         spans
     }
 
@@ -103,7 +102,6 @@ impl SourceCodePanel {
         self.current_column = 0;
         self.scroll_offset = 0;
     }
-
 
     pub fn move_up(&mut self) {
         if self.current_line > 0 {
@@ -151,8 +149,6 @@ impl SourceCodePanel {
         }
     }
 
-
-
     pub fn move_right(&mut self) {
         if let Some(current_line_content) = self.content.get(self.current_line) {
             if self.current_column < current_line_content.len() {
@@ -197,19 +193,19 @@ impl SourceCodePanel {
         }
 
         let visible_lines = (self.area_height.saturating_sub(2)) as usize;
-        
+
         if self.content.len() <= visible_lines {
             self.scroll_offset = 0;
             return;
         }
 
         let scrolloff = visible_lines / 3;
-        
+
         let ideal_scroll = self.current_line.saturating_sub(scrolloff);
 
         let max_scroll = self.content.len().saturating_sub(visible_lines);
         let near_end = self.current_line >= max_scroll.saturating_add(scrolloff);
-        
+
         if near_end {
             self.scroll_offset = max_scroll;
         } else {
@@ -219,11 +215,11 @@ impl SourceCodePanel {
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, is_focused: bool) {
         self.area_height = area.height;
-        
+
         if is_focused {
             self.ensure_cursor_visible();
         }
-        
+
         let items: Vec<ListItem> = self
             .content
             .iter()
@@ -242,12 +238,7 @@ impl SourceCodePanel {
                 // Apply syntax highlighting
                 let highlighted_spans = self.highlight_line(line);
 
-                let mut spans = vec![
-                    Span::styled(
-                        format!("{:4} ", line_num),
-                        line_number_style,
-                    ),
-                ];
+                let mut spans = vec![Span::styled(format!("{:4} ", line_num), line_number_style)];
                 spans.extend(highlighted_spans);
 
                 ListItem::new(Line::from(spans))
@@ -268,7 +259,11 @@ impl SourceCodePanel {
         let list = List::new(items).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(if is_focused { BorderType::Thick } else { BorderType::Plain })
+                .border_type(if is_focused {
+                    BorderType::Thick
+                } else {
+                    BorderType::Plain
+                })
                 .title(title)
                 .border_style(border_style),
         );
@@ -277,8 +272,9 @@ impl SourceCodePanel {
 
         if is_focused && !self.content.is_empty() {
             self.ensure_column_bounds();
-            
-            let cursor_y = area.y + 1 + (self.current_line.saturating_sub(self.scroll_offset)) as u16;
+
+            let cursor_y =
+                area.y + 1 + (self.current_line.saturating_sub(self.scroll_offset)) as u16;
             let line_number_width = 5u16;
             let cursor_x = area.x + 1 + line_number_width + self.current_column as u16;
 

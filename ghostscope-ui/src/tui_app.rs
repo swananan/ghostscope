@@ -20,7 +20,7 @@ use crate::{
     events::{
         EventRegistry, RingbufEvent, RuntimeCommand, RuntimeStatus, SourceCodeInfo, TuiEvent,
     },
-    panels::{InputPanel, OutputPanel, SourceCodePanel},
+    panels::{EbpfInfoPanel, InteractiveCommandPanel, SourceCodePanel},
 };
 
 pub struct TuiApp {
@@ -28,8 +28,8 @@ pub struct TuiApp {
 
     // UI panels
     source_panel: SourceCodePanel,
-    output_panel: OutputPanel,
-    input_panel: InputPanel,
+    ebpf_info_panel: EbpfInfoPanel,
+    interactive_command_panel: InteractiveCommandPanel,
 
     // Layout state
     layout_mode: LayoutMode,
@@ -58,8 +58,8 @@ impl TuiApp {
         Ok(Self {
             should_quit: false,
             source_panel: SourceCodePanel::new(),
-            output_panel: OutputPanel::new(),
-            input_panel: InputPanel::new(),
+            ebpf_info_panel: EbpfInfoPanel::new(),
+            interactive_command_panel: InteractiveCommandPanel::new(),
             layout_mode,
             focused_panel: FocusedPanel::Input,
             expecting_window_nav: false,
@@ -259,25 +259,25 @@ impl TuiApp {
         match self.focused_panel {
             FocusedPanel::Input => match key.code {
                 KeyCode::Char(c) => {
-                    self.input_panel.insert_char(c);
+                    self.interactive_command_panel.insert_char(c);
                 }
                 KeyCode::Backspace => {
-                    self.input_panel.delete_char();
+                    self.interactive_command_panel.delete_char();
                 }
                 KeyCode::Left => {
-                    self.input_panel.move_cursor_left();
+                    self.interactive_command_panel.move_cursor_left();
                 }
                 KeyCode::Right => {
-                    self.input_panel.move_cursor_right();
+                    self.interactive_command_panel.move_cursor_right();
                 }
                 KeyCode::Up => {
-                    self.input_panel.history_up();
+                    self.interactive_command_panel.history_up();
                 }
                 KeyCode::Down => {
-                    self.input_panel.history_down();
+                    self.interactive_command_panel.history_down();
                 }
                 KeyCode::Enter => {
-                    if let Some(command) = self.input_panel.submit_command() {
+                    if let Some(command) = self.interactive_command_panel.submit_command() {
                         info!("User command: {}", command);
                         self.execute_user_command(command).await?;
                     }
@@ -286,17 +286,17 @@ impl TuiApp {
             },
             FocusedPanel::Output => match key.code {
                 KeyCode::Up | KeyCode::Char('k') => {
-                    self.output_panel.scroll_up();
+                    self.ebpf_info_panel.scroll_up();
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    self.output_panel.scroll_down();
+                    self.ebpf_info_panel.scroll_down();
                 }
                 KeyCode::Home | KeyCode::Char('g') => {
-                    self.output_panel.scroll_offset = 0;
-                    self.output_panel.auto_scroll = false;
+                    self.ebpf_info_panel.scroll_offset = 0;
+                    self.ebpf_info_panel.auto_scroll = false;
                 }
                 KeyCode::End | KeyCode::Char('G') => {
-                    self.output_panel.scroll_to_bottom();
+                    self.ebpf_info_panel.scroll_to_bottom();
                 }
                 _ => {}
             },
@@ -357,7 +357,7 @@ impl TuiApp {
                         .command_sender
                         .send(RuntimeCommand::AttachToProcess(pid));
                 } else {
-                    self.output_panel
+                    self.ebpf_info_panel
                         .add_status_message(RuntimeStatus::Error(format!(
                             "Invalid PID: {}",
                             pid_str
@@ -379,7 +379,7 @@ impl TuiApp {
             // Ignore empty commands
         } else {
             // Unknown command
-            self.output_panel
+            self.ebpf_info_panel
                 .add_status_message(RuntimeStatus::Error(format!(
                     "Unknown command: {}",
                     trimmed
@@ -474,12 +474,12 @@ impl TuiApp {
             _ => {}
         }
 
-        self.output_panel.add_status_message(status);
+        self.ebpf_info_panel.add_status_message(status);
     }
 
     async fn handle_ringbuf_event(&mut self, event: RingbufEvent) {
         debug!("Ringbuf event: {:?}", event);
-        self.output_panel.add_ringbuf_event(event);
+        self.ebpf_info_panel.add_ringbuf_event(event);
     }
 
     fn render(&mut self, frame: &mut ratatui::Frame) {
@@ -511,17 +511,11 @@ impl TuiApp {
         };
 
         // Render panels with focus indication
-        self.source_panel.render(
-            frame,
-            chunks[0],
-            self.focused_panel == FocusedPanel::Source,
-        );
-        self.output_panel.render(
-            frame,
-            chunks[1],
-            self.focused_panel == FocusedPanel::Output,
-        );
-        self.input_panel.render(
+        self.source_panel
+            .render(frame, chunks[0], self.focused_panel == FocusedPanel::Source);
+        self.ebpf_info_panel
+            .render(frame, chunks[1], self.focused_panel == FocusedPanel::Output);
+        self.interactive_command_panel.render(
             frame,
             chunks[2],
             self.focused_panel == FocusedPanel::Input,

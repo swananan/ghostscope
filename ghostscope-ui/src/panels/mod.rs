@@ -1,7 +1,7 @@
+mod ebpf_output;
+mod interactive_command;
 mod source_code;
-mod output;
-mod input;
 
+pub use ebpf_output::EbpfInfoPanel;
+pub use interactive_command::InteractiveCommandPanel;
 pub use source_code::SourceCodePanel;
-pub use output::OutputPanel;
-pub use input::InputPanel;

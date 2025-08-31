@@ -33,57 +33,106 @@ impl SyntaxHighlighter {
             cpp_keywords: HashMap::new(),
             rust_keywords: HashMap::new(),
         };
-        
+
         highlighter.init_c_keywords();
         highlighter.init_cpp_keywords();
         highlighter.init_rust_keywords();
-        
+
         highlighter
     }
 
     fn init_c_keywords(&mut self) {
         let keywords = vec![
-            "auto", "break", "case", "char", "const", "continue", "default", "do",
-            "double", "else", "enum", "extern", "float", "for", "goto", "if",
-            "int", "long", "register", "return", "short", "signed", "sizeof", "static",
-            "struct", "switch", "typedef", "union", "unsigned", "void", "volatile", "while",
+            "auto", "break", "case", "char", "const", "continue", "default", "do", "double",
+            "else", "enum", "extern", "float", "for", "goto", "if", "int", "long", "register",
+            "return", "short", "signed", "sizeof", "static", "struct", "switch", "typedef",
+            "union", "unsigned", "void", "volatile", "while",
         ];
-        
+
         for keyword in keywords {
-            self.c_keywords.insert(keyword.to_string(), TokenType::Keyword);
+            self.c_keywords
+                .insert(keyword.to_string(), TokenType::Keyword);
         }
     }
 
     fn init_cpp_keywords(&mut self) {
         // C++ specific keywords (in addition to C keywords)
         let cpp_keywords = vec![
-            "class", "namespace", "template", "typename", "public", "private", "protected",
-            "virtual", "override", "final", "explicit", "friend", "inline", "mutable",
-            "new", "delete", "this", "operator", "throw", "try", "catch", "const_cast",
-            "dynamic_cast", "reinterpret_cast", "static_cast", "typeid", "using",
-            "bool", "true", "false", "nullptr", "decltype", "auto", "constexpr",
-            "noexcept", "override", "final", "alignas", "alignof", "char16_t", "char32_t",
-            "concept", "consteval", "constinit", "co_await", "co_return", "co_yield",
-            "requires", "std", "vector", "string", "map", "set", "unordered_map",
+            "class",
+            "namespace",
+            "template",
+            "typename",
+            "public",
+            "private",
+            "protected",
+            "virtual",
+            "override",
+            "final",
+            "explicit",
+            "friend",
+            "inline",
+            "mutable",
+            "new",
+            "delete",
+            "this",
+            "operator",
+            "throw",
+            "try",
+            "catch",
+            "const_cast",
+            "dynamic_cast",
+            "reinterpret_cast",
+            "static_cast",
+            "typeid",
+            "using",
+            "bool",
+            "true",
+            "false",
+            "nullptr",
+            "decltype",
+            "auto",
+            "constexpr",
+            "noexcept",
+            "override",
+            "final",
+            "alignas",
+            "alignof",
+            "char16_t",
+            "char32_t",
+            "concept",
+            "consteval",
+            "constinit",
+            "co_await",
+            "co_return",
+            "co_yield",
+            "requires",
+            "std",
+            "vector",
+            "string",
+            "map",
+            "set",
+            "unordered_map",
         ];
-        
+
         for keyword in cpp_keywords {
-            self.cpp_keywords.insert(keyword.to_string(), TokenType::Keyword);
+            self.cpp_keywords
+                .insert(keyword.to_string(), TokenType::Keyword);
         }
     }
 
     fn init_rust_keywords(&mut self) {
         let rust_keywords = vec![
-            "as", "break", "const", "continue", "crate", "else", "enum", "extern",
-            "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod",
-            "move", "mut", "pub", "ref", "return", "self", "Self", "static", "struct",
-            "super", "trait", "true", "type", "unsafe", "use", "where", "while",
-            "async", "await", "dyn", "abstract", "become", "box", "do", "final",
-            "macro", "override", "priv", "try", "typeof", "unsized", "virtual", "yield",
+            "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn",
+            "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref",
+            "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
+            "unsafe", "use", "where", "while", "async", "await", "dyn", "abstract", "become",
+            "box", "do", "final", "macro", "override", "priv", "try", "typeof", "unsized",
+            "virtual", "yield",
         ];
-        
+
         for keyword in rust_keywords {
-            self.rust_keywords.insert(keyword.to_string(), TokenType::Keyword);
+            self.rust_keywords
+                .insert(keyword.to_string(), TokenType::Keyword);
         }
     }
 
@@ -95,13 +144,13 @@ impl SyntaxHighlighter {
         let mut comment_start = 0;
         let mut string_start = 0;
         let mut string_char = '\0';
-        
+
         let chars: Vec<char> = line.chars().collect();
         let mut i = 0;
-        
+
         while i < chars.len() {
             let ch = chars[i];
-            
+
             // Handle comments
             if !in_string && !in_comment {
                 if ch == '/' && i + 1 < chars.len() {
@@ -123,7 +172,7 @@ impl SyntaxHighlighter {
                     }
                 }
             }
-            
+
             // Handle multi-line comment end
             if in_comment && ch == '*' && i + 1 < chars.len() && chars[i + 1] == '/' {
                 tokens.push(Token {
@@ -137,7 +186,7 @@ impl SyntaxHighlighter {
                 current_pos += 2;
                 continue;
             }
-            
+
             // Handle strings
             if !in_comment && (ch == '"' || ch == '\'') {
                 if !in_string {
@@ -155,20 +204,20 @@ impl SyntaxHighlighter {
                     in_string = false;
                 }
             }
-            
+
             // Handle keywords and identifiers
             if !in_string && !in_comment && (ch.is_alphabetic() || ch == '_') {
                 let start = current_pos;
                 let mut end = current_pos;
                 let mut word = String::new();
-                
+
                 while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
                     word.push(chars[i]);
                     end = current_pos + 1;
                     i += 1;
                     current_pos += 1;
                 }
-                
+
                 let token_type = self.get_keyword_type(&word, language);
                 tokens.push(Token {
                     token_type,
@@ -178,18 +227,23 @@ impl SyntaxHighlighter {
                 });
                 continue;
             }
-            
+
             // Handle numbers
             if !in_string && !in_comment && ch.is_numeric() {
                 let start = current_pos;
                 let mut end = current_pos;
-                
-                while i < chars.len() && (chars[i].is_numeric() || chars[i] == '.' || chars[i] == 'x' || chars[i] == 'X') {
+
+                while i < chars.len()
+                    && (chars[i].is_numeric()
+                        || chars[i] == '.'
+                        || chars[i] == 'x'
+                        || chars[i] == 'X')
+                {
                     end = current_pos + 1;
                     i += 1;
                     current_pos += 1;
                 }
-                
+
                 tokens.push(Token {
                     token_type: TokenType::Number,
                     start,
@@ -198,18 +252,18 @@ impl SyntaxHighlighter {
                 });
                 continue;
             }
-            
+
             // Handle preprocessor directives
             if !in_string && !in_comment && ch == '#' && current_pos == 0 {
                 let start = current_pos;
                 let mut end = current_pos;
-                
+
                 while i < chars.len() && chars[i] != '\n' {
                     end = current_pos + 1;
                     i += 1;
                     current_pos += 1;
                 }
-                
+
                 tokens.push(Token {
                     token_type: TokenType::Preprocessor,
                     start,
@@ -218,11 +272,11 @@ impl SyntaxHighlighter {
                 });
                 continue;
             }
-            
+
             i += 1;
             current_pos += 1;
         }
-        
+
         // Handle remaining comment or string
         if in_comment {
             tokens.push(Token {
@@ -239,7 +293,7 @@ impl SyntaxHighlighter {
                 text: line[string_start..].to_string(),
             });
         }
-        
+
         tokens
     }
 
@@ -292,15 +346,16 @@ mod tests {
         let highlighter = SyntaxHighlighter::new();
         let line = "int main() { return 0; }";
         let tokens = highlighter.highlight_line(line, "c");
-        
+
         // Should have tokens for "int", "main", "(", ")", "{", "return", "0", ";", "}"
         assert!(!tokens.is_empty());
-        
+
         // Check that "int" and "return" are keywords
-        let keyword_tokens: Vec<_> = tokens.iter()
+        let keyword_tokens: Vec<_> = tokens
+            .iter()
             .filter(|t| t.token_type == TokenType::Keyword)
             .collect();
-        
+
         assert!(keyword_tokens.iter().any(|t| t.text == "int"));
         assert!(keyword_tokens.iter().any(|t| t.text == "return"));
     }
@@ -310,12 +365,13 @@ mod tests {
         let highlighter = SyntaxHighlighter::new();
         let line = r#"printf("Hello, World!");"#;
         let tokens = highlighter.highlight_line(line, "c");
-        
+
         // Should have a string token
-        let string_tokens: Vec<_> = tokens.iter()
+        let string_tokens: Vec<_> = tokens
+            .iter()
             .filter(|t| t.token_type == TokenType::String)
             .collect();
-        
+
         assert!(!string_tokens.is_empty());
         assert!(string_tokens.iter().any(|t| t.text == r#""Hello, World!""#));
     }
@@ -325,14 +381,17 @@ mod tests {
         let highlighter = SyntaxHighlighter::new();
         let line = "int x = 5; // This is a comment";
         let tokens = highlighter.highlight_line(line, "c");
-        
+
         // Should have a comment token
-        let comment_tokens: Vec<_> = tokens.iter()
+        let comment_tokens: Vec<_> = tokens
+            .iter()
             .filter(|t| t.token_type == TokenType::Comment)
             .collect();
-        
+
         assert!(!comment_tokens.is_empty());
-        assert!(comment_tokens.iter().any(|t| t.text.contains("// This is a comment")));
+        assert!(comment_tokens
+            .iter()
+            .any(|t| t.text.contains("// This is a comment")));
     }
 
     #[test]
@@ -340,12 +399,13 @@ mod tests {
         let highlighter = SyntaxHighlighter::new();
         let line = "int x = 42; double y = 3.14;";
         let tokens = highlighter.highlight_line(line, "c");
-        
+
         // Should have number tokens
-        let number_tokens: Vec<_> = tokens.iter()
+        let number_tokens: Vec<_> = tokens
+            .iter()
             .filter(|t| t.token_type == TokenType::Number)
             .collect();
-        
+
         assert!(!number_tokens.is_empty());
         assert!(number_tokens.iter().any(|t| t.text == "42"));
         assert!(number_tokens.iter().any(|t| t.text == "3.14"));

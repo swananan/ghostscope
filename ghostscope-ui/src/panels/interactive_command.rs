@@ -1,11 +1,11 @@
 use ratatui::{
     layout::Rect,
     style::{Color, Style},
-    widgets::{Block, Borders, BorderType, Paragraph},
+    widgets::{Block, BorderType, Borders, Paragraph},
     Frame,
 };
 
-pub struct InputPanel {
+pub struct InteractiveCommandPanel {
     pub input_text: String,
     pub cursor_position: usize,
     pub command_history: Vec<String>,
@@ -13,7 +13,7 @@ pub struct InputPanel {
     pub prompt: String,
 }
 
-impl InputPanel {
+impl InteractiveCommandPanel {
     pub fn new() -> Self {
         Self {
             input_text: String::new(),
@@ -107,8 +107,12 @@ impl InputPanel {
         let paragraph = Paragraph::new(input_line).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(if is_focused { BorderType::Thick } else { BorderType::Plain })
-                .title("Interactive Commands")
+                .border_type(if is_focused {
+                    BorderType::Thick
+                } else {
+                    BorderType::Plain
+                })
+                .title("Command Interactive Window")
                 .border_style(border_style),
         );
 
