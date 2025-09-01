@@ -2,7 +2,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, List, ListItem, Paragraph},
+    widgets::{Block, BorderType, Borders, List, ListItem},
     Frame,
 };
 
@@ -29,6 +29,20 @@ pub enum ResponseType {
     Progress,
 }
 
+#[derive(Debug, Clone)]
+pub struct StaticTextLine {
+    pub content: String,
+    pub line_type: LineType,
+    pub history_index: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LineType {
+    Command,
+    Response,
+    CurrentInput,
+}
+
 pub struct InteractiveCommandPanel {
     pub input_text: String,
     pub cursor_position: usize,
@@ -37,15 +51,17 @@ pub struct InteractiveCommandPanel {
     pub mode: InteractionMode,
     pub script_lines: Vec<String>,
     pub current_script_line: usize,
-    pub scroll_offset: usize,
     pub max_history_items: usize,
-    pub vim_cursor_line: usize, // Cursor position in vim mode (line in history)
-    pub vim_cursor_column: usize, // Cursor column position in vim mode
+    
+    pub command_cursor_line: usize,
+    pub command_cursor_column: usize,
+    
+    pub static_lines: Vec<StaticTextLine>,
 }
 
 impl InteractiveCommandPanel {
     pub fn new() -> Self {
-        Self {
+        let mut panel = Self {
             input_text: String::new(),
             cursor_position: 0,
             command_history: Vec::new(),
@@ -53,11 +69,13 @@ impl InteractiveCommandPanel {
             mode: InteractionMode::Input,
             script_lines: Vec::new(),
             current_script_line: 0,
-            scroll_offset: 0,
-            max_history_items: 1000, // TODO: Make this configurable via command line arguments or config file
-            vim_cursor_line: 0,
-            vim_cursor_column: 0,
-        }
+            max_history_items: 1000,
+            command_cursor_line: 0,
+            command_cursor_column: 0,
+            static_lines: Vec::new(),
+        };
+        panel.update_static_lines();
+        panel
     }
 
     pub fn get_prompt(&self) -> String {
@@ -71,19 +89,21 @@ impl InteractiveCommandPanel {
     pub fn insert_char(&mut self, c: char) {
         self.input_text.insert(self.cursor_position, c);
         self.cursor_position += 1;
+        self.update_static_lines();
     }
 
     pub fn delete_char(&mut self) {
         if self.cursor_position > 0 {
             self.input_text.remove(self.cursor_position - 1);
             self.cursor_position -= 1;
+            self.update_static_lines();
         }
     }
 
     pub fn move_cursor_left(&mut self) {
         if self.mode == InteractionMode::Command {
-            if self.vim_cursor_column > 0 {
-                self.vim_cursor_column -= 1;
+            if self.command_cursor_column > 0 {
+                self.command_cursor_column -= 1;
             }
         } else {
             if self.cursor_position > 0 {
@@ -94,9 +114,10 @@ impl InteractiveCommandPanel {
 
     pub fn move_cursor_right(&mut self) {
         if self.mode == InteractionMode::Command {
-            let current_line_content = self.get_current_history_line_content();
-            if self.vim_cursor_column < current_line_content.len() {
-                self.vim_cursor_column += 1;
+            if let Some(line) = self.static_lines.get(self.command_cursor_line) {
+                if self.command_cursor_column < line.content.len() {
+                    self.command_cursor_column += 1;
+                }
             }
         } else {
             if self.cursor_position < self.input_text.len() {
@@ -140,64 +161,40 @@ impl InteractiveCommandPanel {
     }
 
     pub fn move_to_next_word_in_history(&mut self) {
-        let current_line_content = self.get_current_history_line_content();
-        let prompt = self.get_prompt();
-
-        // Get the command part only (excluding the prompt)
-        if current_line_content.len() > prompt.len() {
-            let command_text = &current_line_content[prompt.len()..];
-            let mut pos = self.vim_cursor_column.saturating_sub(prompt.len());
+        if let Some(line) = self.static_lines.get(self.command_cursor_line) {
+            let content = &line.content;
+            let mut pos = self.command_cursor_column;
 
             // Skip current word if we're in the middle of one
-            while pos < command_text.len()
-                && !command_text.chars().nth(pos).unwrap_or(' ').is_whitespace()
-            {
+            while pos < content.len() && !content.chars().nth(pos).unwrap_or(' ').is_whitespace() {
                 pos += 1;
             }
 
             // Skip whitespace
-            while pos < command_text.len()
-                && command_text.chars().nth(pos).unwrap_or(' ').is_whitespace()
-            {
+            while pos < content.len() && content.chars().nth(pos).unwrap_or(' ').is_whitespace() {
                 pos += 1;
             }
 
-            self.vim_cursor_column = prompt.len() + pos;
+            self.command_cursor_column = pos;
         }
     }
 
     pub fn move_to_previous_word_in_history(&mut self) {
-        let current_line_content = self.get_current_history_line_content();
-        let prompt = self.get_prompt();
-
-        // Get the command part only (excluding the prompt)
-        if current_line_content.len() > prompt.len() && self.vim_cursor_column > prompt.len() {
-            let command_text = &current_line_content[prompt.len()..];
-            let mut pos = self.vim_cursor_column.saturating_sub(prompt.len());
+        if let Some(line) = self.static_lines.get(self.command_cursor_line) {
+            let content = &line.content;
+            let mut pos = self.command_cursor_column;
 
             // Skip whitespace backwards
-            while pos > 0
-                && command_text
-                    .chars()
-                    .nth(pos - 1)
-                    .unwrap_or(' ')
-                    .is_whitespace()
-            {
+            while pos > 0 && content.chars().nth(pos - 1).unwrap_or(' ').is_whitespace() {
                 pos -= 1;
             }
 
             // Skip current word backwards
-            while pos > 0
-                && !command_text
-                    .chars()
-                    .nth(pos - 1)
-                    .unwrap_or(' ')
-                    .is_whitespace()
-            {
+            while pos > 0 && !content.chars().nth(pos - 1).unwrap_or(' ').is_whitespace() {
                 pos -= 1;
             }
 
-            self.vim_cursor_column = prompt.len() + pos;
+            self.command_cursor_column = pos;
         }
     }
 
@@ -236,6 +233,7 @@ impl InteractiveCommandPanel {
         };
 
         self.add_to_history(command, None);
+        self.update_static_lines();
 
         self.input_text.clear();
         self.cursor_position = 0;
@@ -259,17 +257,24 @@ impl InteractiveCommandPanel {
 
     pub fn enter_command_mode(&mut self) {
         self.mode = InteractionMode::Command;
-        // Start from current input line (at the end of all content)
-        self.vim_cursor_line = self.command_history.len(); // Point to current input line
-        let prompt = self.get_prompt();
-        self.vim_cursor_column = prompt.len() + self.cursor_position;
+        self.update_static_lines();
+        // Position cursor at the last line (current input line)
+        self.command_cursor_line = self.static_lines.len().saturating_sub(1);
+        self.command_cursor_column = self.get_prompt().len() + self.cursor_position;
     }
 
     pub fn exit_command_mode(&mut self) {
         self.mode = InteractionMode::Input;
-        // Don't clear input_text - preserve what user was typing
-        // Reset cursor position to end of current input
-        self.cursor_position = self.input_text.len();
+        if let Some(line) = self.static_lines.get(self.command_cursor_line) {
+            if line.line_type == LineType::CurrentInput {
+                let prompt_len = self.get_prompt().len();
+                if self.command_cursor_column >= prompt_len {
+                    self.cursor_position = self.command_cursor_column - prompt_len;
+                } else {
+                    self.cursor_position = 0;
+                }
+            }
+        }
     }
 
     pub fn handle_vim_navigation(&mut self, key: &str) -> bool {
@@ -301,26 +306,28 @@ impl InteractiveCommandPanel {
             }
             "g" => {
                 // Go to top of history (vim style)
-                self.vim_cursor_line = 0;
-                self.vim_cursor_column = 0;
+                self.command_cursor_line = 0;
+                self.command_cursor_column = 0;
                 true
             }
             "G" => {
                 // Go to current input line (bottom of all content)
-                self.vim_cursor_line = self.command_history.len();
-                let current_line_content = self.get_current_history_line_content();
-                self.vim_cursor_column = current_line_content.len().min(self.vim_cursor_column);
+                self.command_cursor_line = self.static_lines.len().saturating_sub(1);
+                if let Some(line) = self.static_lines.get(self.command_cursor_line) {
+                    self.command_cursor_column = line.content.len();
+                }
                 true
             }
             "0" => {
                 // Go to beginning of current line
-                self.vim_cursor_column = 0;
+                self.command_cursor_column = 0;
                 true
             }
             "$" => {
                 // Go to end of current line
-                let current_line_content = self.get_current_history_line_content();
-                self.vim_cursor_column = current_line_content.len();
+                if let Some(line) = self.static_lines.get(self.command_cursor_line) {
+                    self.command_cursor_column = line.content.len();
+                }
                 true
             }
             "w" => {
@@ -338,21 +345,60 @@ impl InteractiveCommandPanel {
     }
 
     fn move_cursor_up(&mut self) {
-        if self.vim_cursor_line > 0 {
-            self.vim_cursor_line -= 1;
-            // Adjust column to stay within line bounds
-            let current_line_content = self.get_current_history_line_content();
-            self.vim_cursor_column = self.vim_cursor_column.min(current_line_content.len());
+        if self.command_cursor_line > 0 {
+            self.command_cursor_line -= 1;
+            // Adjust column position to stay within line bounds
+            if let Some(line) = self.static_lines.get(self.command_cursor_line) {
+                self.command_cursor_column = self.command_cursor_column.min(line.content.len());
+            }
         }
     }
 
     fn move_cursor_down(&mut self) {
-        // Can move down to current input line (command_history.len())
-        if self.vim_cursor_line < self.command_history.len() {
-            self.vim_cursor_line += 1;
-            // Adjust column to stay within line bounds
-            let current_line_content = self.get_current_history_line_content();
-            self.vim_cursor_column = self.vim_cursor_column.min(current_line_content.len());
+        if self.command_cursor_line < self.static_lines.len().saturating_sub(1) {
+            self.command_cursor_line += 1;
+            // Adjust column position to stay within line bounds
+            if let Some(line) = self.static_lines.get(self.command_cursor_line) {
+                self.command_cursor_column = self.command_cursor_column.min(line.content.len());
+            }
+        }
+    }
+
+    fn move_to_next_word_in_current_line(&mut self) {
+        if let Some(line) = self.static_lines.get(self.command_cursor_line) {
+            let content = &line.content;
+            let mut pos = self.command_cursor_column;
+
+            // Skip current word if we're in the middle of one
+            while pos < content.len() && !content.chars().nth(pos).unwrap_or(' ').is_whitespace() {
+                pos += 1;
+            }
+
+            // Skip whitespace
+            while pos < content.len() && content.chars().nth(pos).unwrap_or(' ').is_whitespace() {
+                pos += 1;
+            }
+
+            self.command_cursor_column = pos;
+        }
+    }
+
+    fn move_to_previous_word_in_current_line(&mut self) {
+        if let Some(line) = self.static_lines.get(self.command_cursor_line) {
+            let content = &line.content;
+            let mut pos = self.command_cursor_column;
+
+            // Skip whitespace backwards
+            while pos > 0 && content.chars().nth(pos - 1).unwrap_or(' ').is_whitespace() {
+                pos -= 1;
+            }
+
+            // Skip current word backwards
+            while pos > 0 && !content.chars().nth(pos - 1).unwrap_or(' ').is_whitespace() {
+                pos -= 1;
+            }
+
+            self.command_cursor_column = pos;
         }
     }
 
@@ -360,6 +406,7 @@ impl InteractiveCommandPanel {
         if let Some(last_item) = self.command_history.last_mut() {
             last_item.response = Some(response);
         }
+        self.update_static_lines();
     }
 
     fn add_to_history(&mut self, command: String, response: Option<String>) {
@@ -391,6 +438,7 @@ impl InteractiveCommandPanel {
         let item = &self.command_history[new_index];
         self.input_text = item.command.clone();
         self.cursor_position = self.input_text.len();
+        self.update_static_lines();
     }
 
     pub fn history_down(&mut self) {
@@ -409,49 +457,41 @@ impl InteractiveCommandPanel {
                 self.cursor_position = 0;
             }
         }
+        self.update_static_lines();
     }
 
-    pub fn scroll_up(&mut self) {
-        if self.scroll_offset > 0 {
-            self.scroll_offset -= 1;
-        }
-    }
+    // Update static text lines list
+    fn update_static_lines(&mut self) {
+        self.static_lines.clear();
+        
+        // Add history records
+        for (history_idx, item) in self.command_history.iter().enumerate() {
+            let prompt = self.get_prompt();
+            let command_line = format!("{}{}", prompt, item.command);
+            
+            self.static_lines.push(StaticTextLine {
+                content: command_line,
+                line_type: LineType::Command,
+                history_index: Some(history_idx),
+            });
 
-    pub fn scroll_down(&mut self) {
-        let max_scroll = self.command_history.len().saturating_sub(1);
-        if self.scroll_offset < max_scroll {
-            self.scroll_offset += 1;
-        }
-    }
-
-    pub fn clear_screen(&mut self) {
-        self.command_history.clear();
-        self.scroll_offset = 0;
-    }
-
-    fn calculate_history_lines(&self) -> usize {
-        let mut lines = 0;
-        for item in &self.command_history {
-            lines += 1; // Command line
-            if item.response.is_some() {
-                lines += 1; // Response line
+            if let Some(ref response) = item.response {
+                self.static_lines.push(StaticTextLine {
+                    content: response.clone(),
+                    line_type: LineType::Response,
+                    history_index: Some(history_idx),
+                });
             }
         }
-        lines
-    }
 
-    fn get_current_history_line_content(&self) -> String {
-        if self.vim_cursor_line < self.command_history.len() {
-            let item = &self.command_history[self.vim_cursor_line];
-            let prompt = self.get_prompt();
-            format!("{}{}", prompt, item.command)
-        } else if self.vim_cursor_line == self.command_history.len() {
-            // This is the current input line
-            let prompt = self.get_prompt();
-            format!("{}{}", prompt, self.input_text)
-        } else {
-            String::new()
-        }
+        // Add current input line
+        let prompt = self.get_prompt();
+        let current_line = format!("{}{}", prompt, self.input_text);
+        self.static_lines.push(StaticTextLine {
+            content: current_line,
+            line_type: LineType::CurrentInput,
+            history_index: None,
+        });
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect, is_focused: bool) {
@@ -469,8 +509,8 @@ impl InteractiveCommandPanel {
             available_height as u16,
         );
 
-        // Render all content (history + current input) as a continuous flow like GDB
-        self.render_gdb_style_content(frame, content_area, is_focused);
+        // Render static text content
+        self.render_static_content(frame, content_area, is_focused);
 
         // Render border
         let block = Block::default()
@@ -493,56 +533,21 @@ impl InteractiveCommandPanel {
         frame.render_widget(block, area);
     }
 
-    fn render_gdb_style_content(&self, frame: &mut Frame, area: Rect, is_focused: bool) {
-        let mut all_lines = Vec::new();
+    fn render_static_content(&self, frame: &mut Frame, area: Rect, is_focused: bool) {
         let max_lines = area.height as usize;
-
-        // Add all history items with dimmed color
-        for item in &self.command_history {
-            let prompt = self.get_prompt();
-            let command_line = format!("{}{}", prompt, item.command);
-            all_lines.push((command_line, Style::default().fg(Color::DarkGray), false));
-
-            if let Some(ref response) = item.response {
-                let response_style = self.get_response_style(response);
-                all_lines.push((response.clone(), response_style, false));
-            }
-        }
-
-        // Add current input line with highlighted color in input mode
-        let current_prompt = self.get_prompt();
-        let current_line = format!("{}{}", current_prompt, self.input_text);
-        let input_line_style = if self.mode == InteractionMode::Input {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(ratatui::style::Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        all_lines.push((current_line, input_line_style, true)); // Mark as current input
+        let content_width = area.width.saturating_sub(2) as usize;
 
         // Calculate which lines to show
-        let total_lines = all_lines.len();
+        let total_lines = self.static_lines.len();
         let start_idx = if self.mode == InteractionMode::Command {
-            // In command mode, show content based on cursor position
-            if self.vim_cursor_line < self.command_history.len() {
-                // Show around the selected history item
-                let history_line_idx = self.vim_cursor_line * 2; // Each history item takes ~2 lines
-                if history_line_idx >= max_lines {
-                    history_line_idx + 1 - max_lines
-                } else {
-                    0
-                }
+            // In command mode, ensure cursor line is visible
+            if self.command_cursor_line >= max_lines {
+                self.command_cursor_line + 1 - max_lines
             } else {
-                // If somehow beyond history, show recent content
-                if total_lines > max_lines {
-                    total_lines - max_lines
-                } else {
-                    0
-                }
+                0
             }
         } else {
-            // In input mode, always show the most recent content (like GDB)
+            // In input mode, show latest content
             if total_lines > max_lines {
                 total_lines - max_lines
             } else {
@@ -555,11 +560,30 @@ impl InteractiveCommandPanel {
         // Render visible lines
         let mut items = Vec::new();
         for i in start_idx..end_idx {
-            let (line_content, style, _) = &all_lines[i];
-            items.push(ListItem::new(Line::from(vec![Span::styled(
-                line_content.clone(),
-                *style,
-            )])));
+            if let Some(line) = self.static_lines.get(i) {
+                let style = match line.line_type {
+                    LineType::Command => Style::default().fg(Color::White),
+                    LineType::Response => self.get_response_style(&line.content),
+                    LineType::CurrentInput => {
+                        if self.mode == InteractionMode::Input {
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(ratatui::style::Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::White)
+                        }
+                    }
+                };
+
+                // Handle text wrapping
+                let wrapped_lines = self.wrap_text(&line.content, content_width);
+                for wrapped_line in wrapped_lines {
+                    items.push(ListItem::new(Line::from(vec![Span::styled(
+                        wrapped_line,
+                        style,
+                    )])));
+                }
+            }
         }
 
         let list = List::new(items);
@@ -567,249 +591,166 @@ impl InteractiveCommandPanel {
 
         // Render cursor
         if is_focused {
-            self.render_gdb_cursor(frame, area, start_idx, &all_lines);
+            self.render_cursor(frame, area, start_idx);
         }
     }
 
-    fn render_gdb_cursor(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        start_idx: usize,
-        all_lines: &[(String, Style, bool)],
-    ) {
+    fn render_cursor(&self, frame: &mut Frame, area: Rect, start_idx: usize) {
         if self.mode == InteractionMode::Input {
-            // In input mode, cursor is on the current input line
-            let current_input_line_idx = all_lines.len() - 1;
-            if current_input_line_idx >= start_idx
-                && current_input_line_idx < start_idx + area.height as usize
-            {
-                let relative_line = current_input_line_idx - start_idx;
-                let prompt = self.get_prompt();
-                let cursor_x = area.x + prompt.len() as u16 + self.cursor_position as u16;
-                let cursor_y = area.y + relative_line as u16;
-
-                if cursor_x < area.x + area.width && cursor_y < area.y + area.height {
-                    frame.render_widget(
-                        Block::default().style(Style::default().bg(Color::White).fg(Color::Black)),
-                        Rect::new(cursor_x, cursor_y, 1, 1),
-                    );
+            // Input mode: render cursor on current input line, considering text wrapping
+            let content_width = area.width.saturating_sub(2) as usize;
+            let prompt = self.get_prompt();
+            let prompt_len = prompt.len();
+            let full_text = format!("{}{}", prompt, self.input_text);
+            
+            // Calculate cursor position in wrapped text
+            let mut remaining_cursor_pos = self.cursor_position;
+            let mut cursor_line_offset = 0;
+            
+            // Calculate which line the cursor should be on
+            let wrapped_lines = self.wrap_text(&full_text, content_width);
+            for (line_idx, line) in wrapped_lines.iter().enumerate() {
+                let line_content_len = if line_idx == 0 {
+                    // First line includes prompt
+                    line.len().saturating_sub(prompt_len)
+                } else {
+                    line.len()
+                };
+                
+                if remaining_cursor_pos <= line_content_len {
+                    // Cursor is on this line
+                    cursor_line_offset = line_idx;
+                    break;
+                } else {
+                    remaining_cursor_pos -= line_content_len;
+                }
+            }
+            
+            // Find the current input line's position in the rendered display
+            let mut current_line_rendered_pos = 0;
+            let mut found_current_input = false;
+            
+            // Count rendered lines up to the current input line
+            for i in start_idx..self.static_lines.len() {
+                if let Some(line) = self.static_lines.get(i) {
+                    if line.line_type == LineType::CurrentInput {
+                        found_current_input = true;
+                        break;
+                    }
+                    let wrapped_lines = self.wrap_text(&line.content, content_width);
+                    current_line_rendered_pos += wrapped_lines.len();
+                }
+            }
+            
+            if found_current_input {
+                // Add the wrapped lines of the current input up to the cursor line
+                current_line_rendered_pos += cursor_line_offset;
+                
+                let relative_line = current_line_rendered_pos.saturating_sub(start_idx);
+                if relative_line < area.height as usize {
+                    let cursor_x = if cursor_line_offset == 0 {
+                        area.x + prompt_len as u16 + remaining_cursor_pos as u16
+                    } else {
+                        area.x + remaining_cursor_pos as u16
+                    };
+                    let cursor_y = area.y + relative_line as u16;
+                    
+                    if cursor_x < area.x + area.width && cursor_y < area.y + area.height {
+                        frame.render_widget(
+                            Block::default().style(Style::default().bg(Color::White).fg(Color::Black)),
+                            Rect::new(cursor_x, cursor_y, 1, 1),
+                        );
+                    }
                 }
             }
         } else if self.mode == InteractionMode::Command {
-            // In command mode, cursor can be on history lines or current input line
-            if self.vim_cursor_line < self.command_history.len() {
-                // Cursor is on a history line
-                let history_line_idx = self.vim_cursor_line * 2; // History items are at even indices
-                if history_line_idx >= start_idx
-                    && history_line_idx < start_idx + area.height as usize
-                {
-                    let relative_line = history_line_idx - start_idx;
-                    let cursor_x = area.x + self.vim_cursor_column as u16;
-                    let cursor_y = area.y + relative_line as u16;
-
-                    if cursor_x < area.x + area.width && cursor_y < area.y + area.height {
-                        frame.render_widget(
-                            Block::default()
-                                .style(Style::default().bg(Color::White).fg(Color::Black)),
-                            Rect::new(cursor_x, cursor_y, 1, 1),
-                        );
+            // Command mode: render cursor on selected line, considering text wrapping
+            if self.command_cursor_line < self.static_lines.len() {
+                let content_width = area.width.saturating_sub(2) as usize;
+                
+                // Calculate the actual rendered position of the selected line
+                let mut rendered_line_pos = 0;
+                for i in start_idx..self.static_lines.len() {
+                    if i == self.command_cursor_line {
+                        break;
+                    }
+                    if let Some(line) = self.static_lines.get(i) {
+                        let wrapped_lines = self.wrap_text(&line.content, content_width);
+                        rendered_line_pos += wrapped_lines.len();
                     }
                 }
-            } else if self.vim_cursor_line == self.command_history.len() {
-                // Cursor is on the current input line (last line in all_lines)
-                let current_input_line_idx = all_lines.len() - 1;
-                if current_input_line_idx >= start_idx
-                    && current_input_line_idx < start_idx + area.height as usize
-                {
-                    let relative_line = current_input_line_idx - start_idx;
-                    let cursor_x = area.x + self.vim_cursor_column as u16;
-                    let cursor_y = area.y + relative_line as u16;
-
-                    if cursor_x < area.x + area.width && cursor_y < area.y + area.height {
-                        frame.render_widget(
-                            Block::default()
-                                .style(Style::default().bg(Color::White).fg(Color::Black)),
-                            Rect::new(cursor_x, cursor_y, 1, 1),
-                        );
+                
+                // Add the wrapped lines of the selected line up to the cursor position
+                if let Some(selected_line) = self.static_lines.get(self.command_cursor_line) {
+                    let wrapped_lines = self.wrap_text(&selected_line.content, content_width);
+                    
+                    // Find which wrapped line the cursor is on
+                    let mut remaining_cursor_pos = self.command_cursor_column;
+                    let mut cursor_line_offset = 0;
+                    
+                    for (line_idx, line) in wrapped_lines.iter().enumerate() {
+                        if remaining_cursor_pos <= line.len() {
+                            cursor_line_offset = line_idx;
+                            break;
+                        } else {
+                            remaining_cursor_pos -= line.len();
+                        }
+                    }
+                    
+                    rendered_line_pos += cursor_line_offset;
+                    let relative_line = rendered_line_pos.saturating_sub(start_idx);
+                    
+                    if relative_line < area.height as usize {
+                        let cursor_x = area.x + remaining_cursor_pos as u16;
+                        let cursor_y = area.y + relative_line as u16;
+                        
+                        if cursor_x < area.x + area.width && cursor_y < area.y + area.height {
+                            frame.render_widget(
+                                Block::default().style(Style::default().bg(Color::White).fg(Color::Black)),
+                                Rect::new(cursor_x, cursor_y, 1, 1),
+                            );
+                        }
                     }
                 }
             }
         }
     }
 
-    fn render_history_with_scroll(&self, frame: &mut Frame, area: Rect) {
-        let mut items = Vec::new();
-        let max_items = area.height as usize;
-        let total_items = self.command_history.len();
-
-        if total_items == 0 {
-            return;
+    /// Wrap text to fit within the specified width
+    /// Simple character-based wrapping to avoid word breaking issues
+    fn wrap_text(&self, text: &str, width: usize) -> Vec<String> {
+        if width == 0 || text.is_empty() {
+            return vec![text.to_string()];
         }
 
-        let start_idx = if self.mode == InteractionMode::Command {
-            // In command mode, scroll to show the cursor position
-            let cursor_line = self.vim_cursor_line;
-            if cursor_line >= max_items {
-                cursor_line + 1 - max_items
+        let mut lines = Vec::new();
+        let mut current_line = String::new();
+
+        for ch in text.chars() {
+            if ch == '\n' {
+                // Handle explicit line breaks
+                lines.push(current_line);
+                current_line = String::new();
+            } else if current_line.len() >= width {
+                // Line is full, start a new one
+                lines.push(current_line);
+                current_line = ch.to_string();
             } else {
-                0
+                // Add character to current line
+                current_line.push(ch);
             }
+        }
+
+        // Add the last line if it's not empty
+        if !current_line.is_empty() {
+            lines.push(current_line);
+        }
+
+        // Ensure we always return at least one line
+        if lines.is_empty() {
+            vec![text.to_string()]
         } else {
-            // In input mode, always show the most recent items
-            if total_items > max_items {
-                total_items - max_items
-            } else {
-                0
-            }
-        };
-
-        let end_idx = (start_idx + max_items).min(total_items);
-
-        // Show selected range of history items
-        for i in start_idx..end_idx {
-            let item = &self.command_history[i];
-            let prompt = self.get_prompt();
-            let command_line = format!("{}{}", prompt, item.command);
-
-            let style = Style::default().fg(Color::White);
-
-            items.push(ListItem::new(Line::from(vec![Span::styled(
-                command_line,
-                style,
-            )])));
-
-            if let Some(ref response) = item.response {
-                let response_style = self.get_response_style(response);
-
-                items.push(ListItem::new(Line::from(vec![Span::styled(
-                    response.clone(),
-                    response_style,
-                )])));
-            }
-        }
-
-        let list = List::new(items);
-        frame.render_widget(list, area);
-
-        // Render cursor in command mode
-        if self.mode == InteractionMode::Command {
-            self.render_cursor_in_history_scroll(frame, area, start_idx);
-        }
-    }
-
-    fn render_history(&self, frame: &mut Frame, area: Rect) {
-        let mut items = Vec::new();
-
-        // Calculate how many items we can show
-        let max_items = area.height as usize;
-        let total_items = self.command_history.len();
-
-        // Determine which items to show
-        let start_idx = if total_items > max_items {
-            total_items - max_items
-        } else {
-            0
-        };
-
-        // Show history items
-        for i in start_idx..total_items {
-            let item = &self.command_history[i];
-            let prompt = self.get_prompt();
-            let command_line = format!("{}{}", prompt, item.command);
-
-            // In command mode, show cursor instead of highlighting
-            let style = Style::default().fg(Color::White);
-
-            items.push(ListItem::new(Line::from(vec![Span::styled(
-                command_line,
-                style,
-            )])));
-
-            if let Some(ref response) = item.response {
-                let response_style = self.get_response_style(response);
-
-                items.push(ListItem::new(Line::from(vec![Span::styled(
-                    response.clone(),
-                    response_style,
-                )])));
-            }
-        }
-
-        let list = List::new(items);
-        frame.render_widget(list, area);
-
-        // Render cursor in command mode
-        if self.mode == InteractionMode::Command {
-            self.render_cursor_in_history(frame, area, start_idx);
-        }
-    }
-
-    fn render_cursor_in_history(&self, frame: &mut Frame, area: Rect, start_idx: usize) {
-        if self.vim_cursor_line < self.command_history.len() {
-            let prompt = self.get_prompt();
-
-            // Calculate cursor position within the visible area
-            if self.vim_cursor_line >= start_idx {
-                let relative_line = self.vim_cursor_line - start_idx;
-
-                // Each history item takes 2 lines (command + response, if exists)
-                let cursor_x = area.x + prompt.len() as u16 + self.vim_cursor_column as u16;
-                let cursor_y = area.y + relative_line as u16 * 2; // Command line, not response line
-
-                // Ensure cursor is within the visible area
-                if cursor_x < area.x + area.width
-                    && cursor_y < area.y + area.height
-                    && cursor_x >= area.x
-                {
-                    frame.render_widget(
-                        Block::default().style(Style::default().bg(Color::White).fg(Color::Black)),
-                        Rect::new(cursor_x, cursor_y, 1, 1),
-                    );
-                }
-            }
-        }
-    }
-
-    fn render_cursor_in_history_scroll(&self, frame: &mut Frame, area: Rect, start_idx: usize) {
-        if self.vim_cursor_line < self.command_history.len() && self.vim_cursor_line >= start_idx {
-            let prompt = self.get_prompt();
-            let relative_line = self.vim_cursor_line - start_idx;
-
-            // Each history item takes 2 lines (command + response, if exists)
-            let cursor_x = area.x + prompt.len() as u16 + self.vim_cursor_column as u16;
-            let cursor_y = area.y + relative_line as u16 * 2; // Command line, not response line
-
-            // Ensure cursor is within the visible area
-            if cursor_x < area.x + area.width
-                && cursor_y < area.y + area.height
-                && cursor_x >= area.x
-            {
-                frame.render_widget(
-                    Block::default().style(Style::default().bg(Color::White).fg(Color::Black)),
-                    Rect::new(cursor_x, cursor_y, 1, 1),
-                );
-            }
-        }
-    }
-
-    fn render_input(&self, frame: &mut Frame, area: Rect, is_focused: bool) {
-        let prompt = self.get_prompt();
-        let input_line = format!("{}{}", prompt, self.input_text);
-
-        let paragraph = Paragraph::new(input_line);
-        frame.render_widget(paragraph, area);
-
-        if is_focused {
-            let cursor_x = area.x + prompt.len() as u16 + self.cursor_position as u16;
-            let cursor_y = area.y;
-
-            if cursor_x < area.x + area.width && cursor_y < area.y + area.height {
-                frame.render_widget(
-                    Block::default().style(Style::default().bg(Color::White)),
-                    Rect::new(cursor_x, cursor_y, 1, 1),
-                );
-            }
+            lines
         }
     }
 
