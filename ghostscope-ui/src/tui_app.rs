@@ -256,64 +256,104 @@ impl TuiApp {
         match self.focused_panel {
             FocusedPanel::InteractiveCommand => match key.code {
                 KeyCode::Char(c) => {
-                    if self.interactive_command_panel.mode
-                        == crate::panels::InteractionMode::Command
-                    {
-                        // Handle command navigation keys
-                        let key_str = c.to_string();
-                        self.interactive_command_panel
-                            .handle_vim_navigation(&key_str);
-                    } else {
-                        // In input mode, all characters are inserted as input
-                        self.interactive_command_panel.insert_char(c);
+                    match self.interactive_command_panel.mode {
+                        crate::panels::InteractionMode::Command => {
+                            // Handle command navigation keys
+                            let key_str = c.to_string();
+                            self.interactive_command_panel
+                                .handle_vim_navigation(&key_str);
+                        }
+                        crate::panels::InteractionMode::ScriptEditor => {
+                            // Insert character in script
+                            self.interactive_command_panel.insert_char_in_script(c);
+                        }
+                        crate::panels::InteractionMode::Input => {
+                            // In input mode, all characters are inserted as input
+                            self.interactive_command_panel.insert_char(c);
+                        }
                     }
                 }
                 KeyCode::Backspace => {
-                    if self.interactive_command_panel.mode == crate::panels::InteractionMode::Input
-                    {
-                        self.interactive_command_panel.delete_char();
+                    match self.interactive_command_panel.mode {
+                        crate::panels::InteractionMode::Input => {
+                            self.interactive_command_panel.delete_char();
+                        }
+                        crate::panels::InteractionMode::ScriptEditor => {
+                            self.interactive_command_panel.delete_char_in_script();
+                        }
+                        crate::panels::InteractionMode::Command => {
+                            // Ignore backspace in command mode
+                        }
                     }
-                    // Ignore backspace in command mode
                 }
-                KeyCode::Left => {
-                    if self.interactive_command_panel.mode
-                        == crate::panels::InteractionMode::Command
-                    {
+                KeyCode::Left => match self.interactive_command_panel.mode {
+                    crate::panels::InteractionMode::Command => {
                         self.interactive_command_panel.handle_vim_navigation("h");
-                    } else {
+                    }
+                    crate::panels::InteractionMode::ScriptEditor => {
+                        self.interactive_command_panel.move_cursor_left_in_script();
+                    }
+                    crate::panels::InteractionMode::Input => {
                         self.interactive_command_panel.move_cursor_left();
                     }
-                }
-                KeyCode::Right => {
-                    if self.interactive_command_panel.mode
-                        == crate::panels::InteractionMode::Command
-                    {
+                },
+                KeyCode::Right => match self.interactive_command_panel.mode {
+                    crate::panels::InteractionMode::Command => {
                         self.interactive_command_panel.handle_vim_navigation("l");
-                    } else {
+                    }
+                    crate::panels::InteractionMode::ScriptEditor => {
+                        self.interactive_command_panel.move_cursor_right_in_script();
+                    }
+                    crate::panels::InteractionMode::Input => {
                         self.interactive_command_panel.move_cursor_right();
                     }
-                }
-                KeyCode::Up => {
-                    if self.interactive_command_panel.mode
-                        == crate::panels::InteractionMode::Command
-                    {
+                },
+                KeyCode::Up => match self.interactive_command_panel.mode {
+                    crate::panels::InteractionMode::Command => {
                         self.interactive_command_panel.handle_vim_navigation("k");
-                    } else {
+                    }
+                    crate::panels::InteractionMode::ScriptEditor => {
+                        self.interactive_command_panel.move_cursor_up_in_script();
+                    }
+                    crate::panels::InteractionMode::Input => {
                         self.interactive_command_panel.history_up();
                     }
-                }
-                KeyCode::Down => {
-                    if self.interactive_command_panel.mode
-                        == crate::panels::InteractionMode::Command
-                    {
+                },
+                KeyCode::Down => match self.interactive_command_panel.mode {
+                    crate::panels::InteractionMode::Command => {
                         self.interactive_command_panel.handle_vim_navigation("j");
-                    } else {
+                    }
+                    crate::panels::InteractionMode::ScriptEditor => {
+                        self.interactive_command_panel.move_cursor_down_in_script();
+                    }
+                    crate::panels::InteractionMode::Input => {
                         self.interactive_command_panel.history_down();
                     }
-                }
+                },
                 KeyCode::Enter => {
-                    if let Some(action) = self.interactive_command_panel.submit_command() {
-                        self.handle_command_action(action).await?;
+                    match self.interactive_command_panel.mode {
+                        crate::panels::InteractionMode::ScriptEditor => {
+                            // Check for Ctrl+Enter to submit script
+                            if key
+                                .modifiers
+                                .contains(crossterm::event::KeyModifiers::CONTROL)
+                            {
+                                if let Some(action) = self.interactive_command_panel.submit_script()
+                                {
+                                    self.handle_command_action(action).await?;
+                                }
+                            } else {
+                                // Normal Enter creates a new line
+                                self.interactive_command_panel.insert_newline_in_script();
+                            }
+                        }
+                        crate::panels::InteractionMode::Input
+                        | crate::panels::InteractionMode::Command => {
+                            // In other modes, Enter submits the command
+                            if let Some(action) = self.interactive_command_panel.submit_command() {
+                                self.handle_command_action(action).await?;
+                            }
+                        }
                     }
                 }
                 KeyCode::Esc => {
@@ -323,16 +363,29 @@ impl TuiApp {
                             self.interactive_command_panel.enter_command_mode();
                             debug!("Entered command mode via ESC from input mode");
                         }
-                        crate::panels::InteractionMode::Script => {
-                            // Script mode: Cancel script and return to input mode
-                            if self.interactive_command_panel.cancel_script() {
-                                info!("Script input cancelled");
-                            }
+                        crate::panels::InteractionMode::ScriptEditor => {
+                            // Script editor mode: Cancel script editing and return to input mode
+                            self.interactive_command_panel.cancel_script_editor();
+                            info!("Script editing cancelled");
                         }
                         crate::panels::InteractionMode::Command => {
                             // Command mode: Do nothing (already in command mode)
                             debug!("ESC ignored in command mode");
                         }
+                    }
+                }
+                KeyCode::F(2) => {
+                    // F2: Re-enter script editing mode if script is submitted
+                    if self.interactive_command_panel.can_edit_script() {
+                        self.interactive_command_panel.edit_script_again();
+                    }
+                }
+                KeyCode::F(3) => {
+                    // F3: Clear current script
+                    if self.interactive_command_panel.mode
+                        == crate::panels::InteractionMode::ScriptEditor
+                    {
+                        self.interactive_command_panel.clear_current_script();
                     }
                 }
                 _ => {}
@@ -393,17 +446,51 @@ impl TuiApp {
         Ok(())
     }
 
+    fn parse_trace_script<'a>(&self, script: &'a str) -> Option<(&'a str, &'a str)> {
+        // Expected format: "trace <target> <script_content>"
+        if let Some(rest) = script.strip_prefix("trace ") {
+            if let Some(space_pos) = rest.find(' ') {
+                let target = &rest[..space_pos];
+                let script_content = &rest[space_pos + 1..];
+                Some((target, script_content))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    fn add_script_display(&mut self, target: &str, script_content: &str) {
+        // Format the script display similar to script editor mode
+        let mut script_lines = Vec::new();
+
+        // Add header with target info
+        script_lines.push(format!("Script for target: {}", target));
+        script_lines.push("─".repeat(50));
+
+        // Add script content with line numbers (similar to script editor)
+        for (line_idx, line) in script_content.lines().enumerate() {
+            script_lines.push(format!("{:3} │ {}", line_idx + 1, line));
+        }
+
+        script_lines.push("─".repeat(50));
+
+        // Add the formatted script display as a response
+        let script_display = script_lines.join("\n");
+        self.interactive_command_panel
+            .add_response(script_display, ResponseType::Info);
+    }
+
     async fn handle_command_action(&mut self, action: CommandAction) -> Result<()> {
         match action {
             CommandAction::ExecuteCommand(command) => {
                 self.execute_user_command(command).await?;
             }
-            CommandAction::EnterScriptMode(command) => {
-                info!("Entering script mode for: {}", command);
-                self.interactive_command_panel.add_response(
-                    "Entering script mode. Type 'end' or '}' to finish.".to_string(),
-                    ResponseType::Info,
-                );
+            CommandAction::EnterScriptMode(message) => {
+                info!("Entering script mode: {}", message);
+                self.interactive_command_panel
+                    .add_response(message, ResponseType::Success);
             }
             CommandAction::AddScriptLine(line) => {
                 info!("Added script line: {}", line);
@@ -411,18 +498,33 @@ impl TuiApp {
             }
             CommandAction::SubmitScript(script) => {
                 info!("Submitting script: {}", script);
-                // Send script to main program for processing
-                if let Err(e) = self.event_registry.script_sender.send(script.clone()) {
-                    error!("Failed to send script: {}", e);
-                    self.interactive_command_panel.add_response(
-                        format!("✗ Failed to send script: {}", e),
-                        ResponseType::Error,
-                    );
+
+                // Parse the script to extract target and content
+                let parsed_script = self.parse_trace_script(&script);
+                if let Some((target, script_content)) = parsed_script {
+                    // Copy the strings to avoid borrowing issues
+                    let target_owned = target.to_string();
+                    let script_content_owned = script_content.to_string();
+
+                    // Add the script content to display with formatting
+                    self.add_script_display(&target_owned, &script_content_owned);
+
+                    // Send script to main program for processing
+                    if let Err(e) = self.event_registry.script_sender.send(script.clone()) {
+                        error!("Failed to send script: {}", e);
+                        self.interactive_command_panel.add_response(
+                            format!("✗ Failed to send script: {}", e),
+                            ResponseType::Error,
+                        );
+                    } else {
+                        self.interactive_command_panel.add_response(
+                            "⏳ Compiling and executing script...".to_string(),
+                            ResponseType::Progress,
+                        );
+                    }
                 } else {
-                    self.interactive_command_panel.add_response(
-                        "✓ Script submitted successfully".to_string(),
-                        ResponseType::Success,
-                    );
+                    self.interactive_command_panel
+                        .add_response("✗ Invalid script format".to_string(), ResponseType::Error);
                 }
             }
             CommandAction::CancelScript => {
@@ -592,7 +694,7 @@ impl TuiApp {
         // for better separation of concerns. The eBPF output panel should focus
         // on actual eBPF events, while status messages could be shown in a
         // dedicated status/log area in the command panel.
-        
+
         // Currently not showing any status messages in eBPF output panel
         // to keep it focused on actual eBPF trace events only
     }

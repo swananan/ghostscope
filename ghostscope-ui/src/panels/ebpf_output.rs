@@ -10,7 +10,6 @@ use std::collections::VecDeque;
 
 use crate::events::TraceEvent;
 
-
 pub struct EbpfInfoPanel {
     pub trace_events: VecDeque<TraceEvent>,
     pub scroll_offset: usize,
@@ -67,16 +66,14 @@ impl EbpfInfoPanel {
         // Calculate content width for text wrapping (subtract borders and padding)
         let content_width = area.width.saturating_sub(6); // 2 for borders + 4 for padding
 
-
-
         // Add trace events with clean, simple formatting
         let total_traces = self.trace_events.len();
         for (trace_index, trace) in self.trace_events.iter().enumerate() {
             let is_latest = trace_index == total_traces - 1;
-            
+
             // Format timestamp
             let formatted_time = self.format_timestamp(trace.timestamp);
-            
+
             // Create the main message line
             let message_line = format!(
                 "[{}] [{:^5}] TraceID:{} PID:{} - {}",
@@ -86,17 +83,19 @@ impl EbpfInfoPanel {
                 trace.pid,
                 trace.message
             );
-            
+
             // Wrap the message if needed
             let wrapped_lines = self.wrap_text(&message_line, content_width as usize);
-            
+
             // Apply highlighting for latest message, use white for non-latest messages
             let final_style = if is_latest {
-                Style::default().fg(Color::Green).add_modifier(ratatui::style::Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(ratatui::style::Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };
-            
+
             // Add each line
             for (line_index, line) in wrapped_lines.iter().enumerate() {
                 if line_index == 0 {
@@ -118,13 +117,13 @@ impl EbpfInfoPanel {
 
         // Apply scrolling with auto-scroll to latest events when area is full
         let available_height = area.height.saturating_sub(2); // Subtract borders
-        
-        // If auto-scroll is enabled and we have more items than can fit, 
+
+        // If auto-scroll is enabled and we have more items than can fit,
         // adjust scroll offset to show the latest events
         if self.auto_scroll && all_items.len() > available_height as usize {
             self.scroll_offset = all_items.len().saturating_sub(available_height as usize);
         }
-        
+
         let visible_items: Vec<_> = all_items.into_iter().skip(self.scroll_offset).collect();
 
         let border_style = if is_focused {
