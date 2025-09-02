@@ -551,8 +551,20 @@ impl InteractiveCommandPanel {
     /// Cancel script editing and return to input mode
     pub fn cancel_script_editor(&mut self) {
         if self.mode == InteractionMode::ScriptEditor {
+            // Add termination message before switching modes
+            self.add_response(
+                "⚠️ Script editing cancelled".to_string(),
+                ResponseType::Warning,
+            );
+
             self.mode = InteractionMode::Input; // ESC should go to input mode
                                                 // Keep script_cache for potential restoration
+
+            // Ensure input state is ready to show prompt
+            self.input_state = InputState::Ready;
+
+            // Update static lines to show the input prompt again
+            self.update_static_lines();
         }
     }
 

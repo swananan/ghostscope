@@ -235,12 +235,6 @@ impl TuiApp {
                 self.expecting_window_nav = true;
                 debug!("Expecting window navigation key (j/k)");
             }
-            KeyCode::Esc => {
-                if self.focused_panel == FocusedPanel::InteractiveCommand {
-                    self.interactive_command_panel.enter_input_mode();
-                    debug!("Entered command mode via ESC");
-                }
-            }
             KeyCode::Tab => {
                 self.cycle_focus();
             }
