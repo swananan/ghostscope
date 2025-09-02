@@ -237,8 +237,7 @@ impl TuiApp {
             }
             KeyCode::Esc => {
                 if self.focused_panel == FocusedPanel::InteractiveCommand {
-                    // Enter command mode instead of quitting
-                    self.interactive_command_panel.enter_command_mode();
+                    self.interactive_command_panel.enter_input_mode();
                     debug!("Entered command mode via ESC");
                 }
             }

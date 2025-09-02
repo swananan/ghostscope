@@ -708,6 +708,10 @@ impl InteractiveCommandPanel {
         self.command_cursor_column = self.get_prompt().len() + self.cursor_position;
     }
 
+    pub fn enter_input_mode(&mut self) {
+        self.mode = InteractionMode::Input;
+    }
+
     pub fn exit_command_mode(&mut self) {
         self.mode = InteractionMode::Input;
         if let Some(line) = self.static_lines.get(self.command_cursor_line) {
@@ -1240,12 +1244,8 @@ impl InteractiveCommandPanel {
                 0
             }
         } else {
-            // In input mode, show latest content
-            if total_lines > max_lines {
-                total_lines - max_lines
-            } else {
-                0
-            }
+            // In input mode, ensure current input line is always visible
+            self.calculate_scroll_to_show_current_input(max_lines, content_width)
         };
 
         let end_idx = (start_idx + max_lines).min(total_lines);
@@ -1352,26 +1352,39 @@ impl InteractiveCommandPanel {
             }
 
             // Find the current input line's position in the rendered display
-            let mut current_line_rendered_pos = 0;
+            let mut total_rendered_lines_before_scroll = 0;
+            let mut current_input_rendered_start = 0;
             let mut found_current_input = false;
 
-            // Count rendered lines up to the current input line
-            for i in start_idx..self.static_lines.len() {
-                if let Some(line) = self.static_lines.get(i) {
-                    if line.line_type == LineType::CurrentInput {
-                        found_current_input = true;
-                        break;
-                    }
-                    let wrapped_lines = self.wrap_text(&line.content, content_width);
-                    current_line_rendered_pos += wrapped_lines.len();
+            // First, calculate total rendered lines from beginning to current input line
+            for (static_idx, line) in self.static_lines.iter().enumerate() {
+                if line.line_type == LineType::CurrentInput {
+                    current_input_rendered_start = total_rendered_lines_before_scroll;
+                    found_current_input = true;
+                    break;
                 }
+                let wrapped_lines = self.wrap_text(&line.content, content_width);
+                total_rendered_lines_before_scroll += wrapped_lines.len();
             }
 
             if found_current_input {
-                // Add the wrapped lines of the current input up to the cursor line
-                current_line_rendered_pos += cursor_line_offset;
+                // Calculate cursor's absolute rendered position
+                let cursor_absolute_rendered_pos =
+                    current_input_rendered_start + cursor_line_offset;
 
-                let relative_line = current_line_rendered_pos.saturating_sub(start_idx);
+                // Convert start_idx (static line index) to rendered line offset
+                let mut rendered_lines_before_start_idx = 0;
+                for static_idx in 0..start_idx {
+                    if let Some(line) = self.static_lines.get(static_idx) {
+                        let wrapped_lines = self.wrap_text(&line.content, content_width);
+                        rendered_lines_before_start_idx += wrapped_lines.len();
+                    }
+                }
+
+                // Calculate relative position in the visible area
+                let relative_line =
+                    cursor_absolute_rendered_pos.saturating_sub(rendered_lines_before_start_idx);
+
                 if relative_line < area.height as usize {
                     let cursor_x = if cursor_line_offset == 0 {
                         area.x + prompt_len as u16 + remaining_cursor_pos as u16
@@ -1715,6 +1728,86 @@ impl InteractiveCommandPanel {
         }
 
         spans
+    }
+
+    /// Calculate scroll position to ensure current input line is visible
+    fn calculate_scroll_to_show_current_input(
+        &self,
+        max_lines: usize,
+        content_width: usize,
+    ) -> usize {
+        // Find current input line and calculate all rendered line positions
+        let mut current_input_static_idx = None;
+        let mut rendered_positions = Vec::new();
+        let mut total_rendered_lines = 0;
+
+        for (static_idx, line) in self.static_lines.iter().enumerate() {
+            let wrapped_lines = self.wrap_text(&line.content, content_width);
+            let line_rendered_count = wrapped_lines.len();
+
+            rendered_positions.push((total_rendered_lines, line_rendered_count));
+
+            if line.line_type == LineType::CurrentInput {
+                current_input_static_idx = Some(static_idx);
+            }
+
+            total_rendered_lines += line_rendered_count;
+        }
+
+        let Some(current_input_idx) = current_input_static_idx else {
+            // No current input line, use original logic
+            return if self.static_lines.len() > max_lines {
+                self.static_lines.len() - max_lines
+            } else {
+                0
+            };
+        };
+
+        let (current_input_start, current_input_count) = rendered_positions[current_input_idx];
+        let current_input_end = current_input_start + current_input_count;
+
+        // Strategy: Ensure the ENTIRE current input line is visible at the bottom of the screen
+        if current_input_end <= max_lines {
+            // Everything fits, show from the beginning
+            return 0;
+        }
+
+        // Calculate how much we need to scroll to show the current input line at the bottom
+        let target_scroll_start = current_input_end.saturating_sub(max_lines);
+
+        // Find the static line index that corresponds to this rendered position
+        // We want to be conservative and ensure we don't cut off the current input line
+        let mut best_static_idx = 0;
+        let mut best_rendered_start = 0;
+
+        for (static_idx, &(rendered_start, rendered_count)) in rendered_positions.iter().enumerate()
+        {
+            // We want the rendered_start to be <= target_scroll_start
+            // but also want to get as close as possible without exceeding
+            if rendered_start <= target_scroll_start {
+                best_static_idx = static_idx;
+                best_rendered_start = rendered_start;
+            } else {
+                break;
+            }
+        }
+
+        // Double-check: ensure current input line will be fully visible
+        let visible_start = best_rendered_start;
+        let visible_end = visible_start + max_lines;
+
+        if current_input_end > visible_end {
+            // Current input line would be cut off, need to scroll more
+            // Find a static line that ensures current input is fully visible
+            for (static_idx, &(rendered_start, _)) in rendered_positions.iter().enumerate() {
+                let test_visible_end = rendered_start + max_lines;
+                if current_input_end <= test_visible_end {
+                    return static_idx;
+                }
+            }
+        }
+
+        best_static_idx
     }
 
     /// Helper function to check if a keyword matches at a specific position
