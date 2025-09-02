@@ -689,6 +689,30 @@ impl TuiApp {
                     .command_sender
                     .send(RuntimeCommand::RequestSourceCode);
             }
+            RuntimeStatus::ScriptCompilationStarted => {
+                // Update UI to show compilation is starting
+                info!("Script compilation started");
+            }
+            RuntimeStatus::ScriptCompilationCompleted => {
+                // Add success message to existing script display, then reset for new input
+                self.interactive_command_panel
+                    .add_script_completion_response(
+                        "✅ Script compiled and loaded successfully!".to_string(),
+                        crate::panels::ResponseType::Success,
+                    );
+                self.interactive_command_panel.reset_for_new_input();
+                info!("✅ Script compilation completed successfully");
+            }
+            RuntimeStatus::ScriptCompilationFailed(error) => {
+                // Add error message to existing script display, then reset for new input
+                self.interactive_command_panel
+                    .add_script_completion_response(
+                        format!("💔 {}", error),
+                        crate::panels::ResponseType::Error,
+                    );
+                self.interactive_command_panel.reset_for_new_input();
+                error!("💔 Script compilation failed: {}", error);
+            }
             _ => {}
         }
 

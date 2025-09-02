@@ -897,12 +897,12 @@ async fn run_runtime_coordinator(
                         }
                         Err(e) => {
                             error!("Script compilation failed: {}", e);
-                            let _ = runtime_channels.status_sender.send(RuntimeStatus::ScriptCompilationCompleted);
+                            let _ = runtime_channels.status_sender.send(RuntimeStatus::ScriptCompilationFailed(e.to_string()));
                         }
                     }
                 } else {
                     warn!("No debug session available for script compilation");
-                    let _ = runtime_channels.status_sender.send(RuntimeStatus::ScriptCompilationCompleted);
+                    let _ = runtime_channels.status_sender.send(RuntimeStatus::ScriptCompilationFailed("No debug session available".to_string()));
                 }
             }
 

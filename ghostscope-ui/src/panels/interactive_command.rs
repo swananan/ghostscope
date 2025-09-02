@@ -36,11 +36,12 @@ pub enum ScriptStatus {
 
 #[derive(Debug, Clone)]
 pub struct ScriptCache {
-    pub target: String,       // Trace target (function name or file:line)
-    pub lines: Vec<String>,   // Script lines
-    pub cursor_line: usize,   // Current cursor line (0-based)
-    pub cursor_col: usize,    // Current cursor column (0-based)
-    pub status: ScriptStatus, // Current script status
+    pub target: String,           // Trace target (function name or file:line)
+    pub original_command: String, // Original trace command (e.g., "trace main")
+    pub lines: Vec<String>,       // Script lines
+    pub cursor_line: usize,       // Current cursor line (0-based)
+    pub cursor_col: usize,        // Current cursor column (0-based)
+    pub status: ScriptStatus,     // Current script status
     pub saved_scripts: HashMap<String, String>, // target -> complete script cache
 }
 
@@ -192,6 +193,29 @@ impl InteractiveCommandPanel {
         false
     }
 
+    /// Reset panel state for accepting new input after script completion
+    pub fn reset_for_new_input(&mut self) {
+        // Clear any waiting response state
+        self.input_state = InputState::Ready;
+
+        // Ensure we're in the right mode for new input
+        if self.mode != InteractionMode::Input {
+            self.mode = InteractionMode::Input;
+        }
+
+        // Clear input buffer and reset cursor
+        self.input_text.clear();
+        self.cursor_position = 0;
+
+        // Update display to show ready prompt
+        self.update_static_lines();
+
+        debug!(
+            "Panel reset for new input, state: {:?}, mode: {:?}",
+            self.input_state, self.mode
+        );
+    }
+
     pub fn insert_char(&mut self, c: char) {
         // Don't accept input when waiting for response
         if !self.should_show_input_prompt() {
@@ -339,7 +363,9 @@ impl InteractiveCommandPanel {
             }
         };
 
+        // Always add command to history for immediate user feedback
         self.add_to_history(command, None);
+
         self.update_static_lines();
 
         self.input_text.clear();
@@ -373,6 +399,7 @@ impl InteractiveCommandPanel {
         // Create new script cache
         self.script_cache = Some(ScriptCache {
             target: target.to_string(),
+            original_command: command.to_string(),
             lines,
             cursor_line: 0, // Start at first line
             cursor_col: 0,
@@ -430,9 +457,21 @@ impl InteractiveCommandPanel {
             );
 
             // Extract data first to avoid borrow conflicts
-            let script_content = cache.lines.join("\n");
+            let script_lines = cache.lines.join("\n");
             let target = cache.target.clone();
+            let original_command = cache.original_command.clone();
             let lines = cache.lines.clone();
+
+            // Wrap script content with function body braces
+            let script_content =
+                if script_lines.trim().starts_with('{') && script_lines.trim().ends_with('}') {
+                    // Already has braces, use as-is
+                    script_lines
+                } else {
+                    // Add braces to create a complete function body
+                    format!("{{\n{}\n}}", script_lines)
+                };
+
             let command = format!("trace {} {}", target, script_content);
 
             debug!("Generated command: {}", command);
@@ -463,8 +502,23 @@ impl InteractiveCommandPanel {
                 }
             }
 
-            // 4. Add the complete script display as a single history item
-            self.add_to_history("".to_string(), Some(script_display.join("\n")));
+            // 4. Find the last history item (should be the trace command) and replace its response with script display
+            if let Some(last_item) = self.command_history.last_mut() {
+                // Check if this is the trace command we just entered
+                if last_item.command == original_command {
+                    // Replace any existing response with the script display
+                    last_item.response = Some(script_display.join("\n"));
+                    debug!("Replaced existing response with script display for trace command");
+                } else {
+                    // Fallback: create new history item (shouldn't happen in normal flow)
+                    debug!("Creating new history item for script display (fallback)");
+                    self.add_to_history(original_command.clone(), Some(script_display.join("\n")));
+                }
+            } else {
+                // Fallback: create new history item (shouldn't happen in normal flow)
+                debug!("No existing history items, creating new one for script display");
+                self.add_to_history(original_command.clone(), Some(script_display.join("\n")));
+            }
 
             // Set response type for syntax highlighting detection
             if let Some(last_item) = self.command_history.last_mut() {
@@ -810,6 +864,34 @@ impl InteractiveCommandPanel {
         self.update_static_lines();
     }
 
+    /// Add a response specifically for script completion - appends to existing script display
+    pub fn add_script_completion_response(
+        &mut self,
+        response: String,
+        response_type: ResponseType,
+    ) {
+        if let Some(last_item) = self.command_history.last_mut() {
+            debug!("Last history item {:?}", last_item);
+            // Append to the existing script display response
+            if last_item.response_type == Some(ResponseType::ScriptDisplay) {
+                if let Some(existing_response) = &last_item.response {
+                    last_item.response = Some(format!("{}\n\n{}", existing_response, response));
+                } else {
+                    last_item.response = Some(response);
+                }
+                debug!(
+                    "Appended script completion response {:?} to existing script display",
+                    last_item.response
+                );
+            } else {
+                // Fallback to normal response handling
+                last_item.response = Some(response);
+                last_item.response_type = Some(response_type);
+            }
+        }
+        self.update_static_lines();
+    }
+
     fn add_to_history(&mut self, command: String, response: Option<String>) {
         let prompt = self.get_history_prompt();
         let item = CommandHistoryItem {
@@ -864,7 +946,6 @@ impl InteractiveCommandPanel {
         self.update_static_lines();
     }
 
-    // Update static text lines list
     fn update_static_lines(&mut self) {
         self.static_lines.clear();
         debug!(
@@ -881,12 +962,13 @@ impl InteractiveCommandPanel {
                 item.response_type
             );
 
-            // Skip creating command line for ScriptDisplay items and empty Progress items
-            if item.response_type != Some(ResponseType::ScriptDisplay)
-                && !(item.command.trim().is_empty()
-                    && item.response_type == Some(ResponseType::Progress))
-            {
+            if !item.command.trim().is_empty() {
                 let command_line = format!("{}{}", item.prompt, item.command);
+                debug!(
+                    "Adding new response to static lines: response_type={:?}, command_line='{}'",
+                    item.response_type,
+                    command_line.chars().take(50).collect::<String>()
+                );
                 self.static_lines.push(StaticTextLine {
                     content: command_line,
                     line_type: LineType::Command,
