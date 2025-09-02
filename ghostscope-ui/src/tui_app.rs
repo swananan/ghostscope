@@ -256,20 +256,32 @@ impl TuiApp {
         match self.focused_panel {
             FocusedPanel::InteractiveCommand => match key.code {
                 KeyCode::Char(c) => {
-                    match self.interactive_command_panel.mode {
-                        crate::panels::InteractionMode::Command => {
-                            // Handle command navigation keys
-                            let key_str = c.to_string();
-                            self.interactive_command_panel
-                                .handle_vim_navigation(&key_str);
+                    // Check for Ctrl+S in ScriptEditor mode
+                    if key.modifiers.contains(KeyModifiers::CONTROL) && c == 's' {
+                        if self.interactive_command_panel.mode
+                            == crate::panels::InteractionMode::ScriptEditor
+                        {
+                            // Submit script with Ctrl+S
+                            if let Some(action) = self.interactive_command_panel.submit_script() {
+                                self.handle_command_action(action).await?;
+                            }
                         }
-                        crate::panels::InteractionMode::ScriptEditor => {
-                            // Insert character in script
-                            self.interactive_command_panel.insert_char_in_script(c);
-                        }
-                        crate::panels::InteractionMode::Input => {
-                            // In input mode, all characters are inserted as input
-                            self.interactive_command_panel.insert_char(c);
+                    } else {
+                        match self.interactive_command_panel.mode {
+                            crate::panels::InteractionMode::Command => {
+                                // Handle command navigation keys
+                                let key_str = c.to_string();
+                                self.interactive_command_panel
+                                    .handle_vim_navigation(&key_str);
+                            }
+                            crate::panels::InteractionMode::ScriptEditor => {
+                                // Insert character in script
+                                self.interactive_command_panel.insert_char_in_script(c);
+                            }
+                            crate::panels::InteractionMode::Input => {
+                                // In input mode, all characters are inserted as input
+                                self.interactive_command_panel.insert_char(c);
+                            }
                         }
                     }
                 }
@@ -333,19 +345,8 @@ impl TuiApp {
                 KeyCode::Enter => {
                     match self.interactive_command_panel.mode {
                         crate::panels::InteractionMode::ScriptEditor => {
-                            // Check for Ctrl+Enter to submit script
-                            if key
-                                .modifiers
-                                .contains(crossterm::event::KeyModifiers::CONTROL)
-                            {
-                                if let Some(action) = self.interactive_command_panel.submit_script()
-                                {
-                                    self.handle_command_action(action).await?;
-                                }
-                            } else {
-                                // Normal Enter creates a new line
-                                self.interactive_command_panel.insert_newline_in_script();
-                            }
+                            // Normal Enter creates a new line
+                            self.interactive_command_panel.insert_newline_in_script();
                         }
                         crate::panels::InteractionMode::Input
                         | crate::panels::InteractionMode::Command => {
@@ -388,6 +389,7 @@ impl TuiApp {
                         self.interactive_command_panel.clear_current_script();
                     }
                 }
+
                 _ => {}
             },
             FocusedPanel::EbpfInfo => match key.code {
@@ -518,7 +520,7 @@ impl TuiApp {
                         );
                     } else {
                         self.interactive_command_panel.add_response(
-                            "⏳ Compiling and executing script...".to_string(),
+                            "⏳ Compiling and loading script...".to_string(),
                             ResponseType::Progress,
                         );
                     }

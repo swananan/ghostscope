@@ -6,12 +6,25 @@ use ratatui::{
     Frame,
 };
 use std::collections::HashMap;
+use std::time::Instant;
+use tracing::debug;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum InteractionMode {
     Input,        // Normal input mode
     Command,      // Command mode (previously VimCommand)
     ScriptEditor, // Multi-line script editing mode
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum InputState {
+    Ready, // Normal input state, shows (ghostscope)
+    WaitingResponse {
+        // Waiting for response, completely hide input
+        command: String,
+        sent_time: Instant,
+    },
+    ScriptEditor, // Script editing mode
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -36,6 +49,8 @@ pub struct CommandHistoryItem {
     pub command: String,
     pub response: Option<String>,
     pub timestamp: std::time::Instant,
+    pub prompt: String,
+    pub response_type: Option<ResponseType>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -45,6 +60,7 @@ pub enum ResponseType {
     Warning,
     Info,
     Progress,
+    ScriptDisplay, // Specifically for script content display
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +68,7 @@ pub struct StaticTextLine {
     pub content: String,
     pub line_type: LineType,
     pub history_index: Option<usize>,
+    pub response_type: Option<ResponseType>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -67,6 +84,7 @@ pub struct InteractiveCommandPanel {
     pub command_history: Vec<CommandHistoryItem>,
     pub history_index: Option<usize>,
     pub mode: InteractionMode,
+    pub input_state: InputState, // Input state management
     pub max_history_items: usize,
 
     // Script editing state
@@ -90,6 +108,7 @@ impl InteractiveCommandPanel {
             command_history: Vec::new(),
             history_index: None,
             mode: InteractionMode::Input,
+            input_state: InputState::Ready, // Initialize to ready state
             max_history_items: 1000,
             script_cache: None,
             command_cursor_line: 0,
@@ -102,26 +121,94 @@ impl InteractiveCommandPanel {
     }
 
     pub fn get_prompt(&self) -> String {
+        // Don't show prompt when waiting for response
+        if !self.should_show_input_prompt() {
+            return "".to_string();
+        }
+
+        self.get_history_prompt()
+    }
+
+    /// Get prompt for history display (always shows, regardless of input state)
+    fn get_history_prompt(&self) -> String {
         match self.mode {
             InteractionMode::Input => "(ghostscope) ".to_string(),
             InteractionMode::Command => "(ghostscope) ".to_string(),
-            InteractionMode::ScriptEditor => {
-                if let Some(ref cache) = self.script_cache {
-                    format!("script:{} > ", cache.target)
-                } else {
-                    "script > ".to_string()
-                }
-            }
+            InteractionMode::ScriptEditor => "(ghostscope) ".to_string(),
         }
     }
 
+    /// Check if input prompt should be displayed
+    pub fn should_show_input_prompt(&self) -> bool {
+        let should_show = matches!(self.input_state, InputState::Ready);
+        debug!(
+            "should_show_input_prompt: {:?} -> {}",
+            self.input_state, should_show
+        );
+        should_show
+    }
+
+    /// Get panel title based on state
+    pub fn get_panel_title(&self) -> String {
+        match &self.input_state {
+            InputState::Ready => match self.mode {
+                InteractionMode::Input => "Interactive Command (input mode)".to_string(),
+                InteractionMode::Command => "Interactive Command (command mode)".to_string(),
+                InteractionMode::ScriptEditor => "Interactive Command (script mode)".to_string(),
+            },
+            InputState::WaitingResponse { .. } => {
+                "Interactive Command (waiting for response...)".to_string()
+            }
+            InputState::ScriptEditor => "Interactive Command (script mode)".to_string(),
+        }
+    }
+
+    /// Handle response from main thread and return to ready state
+    pub fn handle_command_response(&mut self, response: String, is_success: bool) {
+        // Add the response to display
+        let response_type = if is_success {
+            ResponseType::Success
+        } else {
+            ResponseType::Error
+        };
+        self.add_response(response, response_type);
+
+        // Return to ready state
+        self.input_state = InputState::Ready;
+    }
+
+    /// Check if command has timed out (optional timeout handling)
+    pub fn check_timeout(&mut self, timeout_secs: u64) -> bool {
+        if let InputState::WaitingResponse { sent_time, .. } = &self.input_state {
+            if sent_time.elapsed().as_secs() > timeout_secs {
+                self.add_response(
+                    "⚠️ Command timeout - returning to input mode".to_string(),
+                    ResponseType::Error,
+                );
+                self.input_state = InputState::Ready;
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn insert_char(&mut self, c: char) {
+        // Don't accept input when waiting for response
+        if !self.should_show_input_prompt() {
+            return;
+        }
+
         self.input_text.insert(self.cursor_position, c);
         self.cursor_position += 1;
         self.update_static_lines();
     }
 
     pub fn delete_char(&mut self) {
+        // Don't accept input when waiting for response
+        if !self.should_show_input_prompt() {
+            return;
+        }
+
         if self.cursor_position > 0 {
             self.input_text.remove(self.cursor_position - 1);
             self.cursor_position -= 1;
@@ -277,29 +364,17 @@ impl InteractiveCommandPanel {
             if let Some(cached_script) = cache.saved_scripts.get(target) {
                 (cached_script.lines().map(String::from).collect(), true)
             } else {
-                (
-                    vec![
-                        "// Trace script for target: ".to_string() + target,
-                        String::new(),
-                    ],
-                    false,
-                )
+                (vec![String::new()], false)
             }
         } else {
-            (
-                vec![
-                    "// Trace script for target: ".to_string() + target,
-                    String::new(),
-                ],
-                false,
-            )
+            (vec![String::new()], false)
         };
 
         // Create new script cache
         self.script_cache = Some(ScriptCache {
             target: target.to_string(),
             lines,
-            cursor_line: if restored_from_cache { 0 } else { 1 }, // Position after comment
+            cursor_line: 0, // Start at first line
             cursor_col: 0,
             status: ScriptStatus::Draft,
             saved_scripts: self
@@ -327,32 +402,103 @@ impl InteractiveCommandPanel {
 
     /// Submit the current script but keep editor displayed
     pub fn submit_script(&mut self) -> Option<CommandAction> {
-        if let Some(ref mut cache) = self.script_cache {
+        // Add debug logging
+        debug!(
+            "submit_script called, script_cache: {:?}",
+            self.script_cache.is_some()
+        );
+
+        if let Some(ref cache) = self.script_cache {
+            debug!(
+                "Script cache has {} lines: {:?}",
+                cache.lines.len(),
+                cache.lines
+            );
+        }
+        debug!("Current mode: {:?}", self.mode);
+        debug!("Current input_state: {:?}", self.input_state);
+
+        if let Some(cache) = &self.script_cache {
+            debug!(
+                "Found script cache, target: {}, lines: {:?}",
+                cache.target, cache.lines
+            );
+            debug!("Script cache status: {:?}", cache.status);
+            debug!(
+                "Script cache cursor: line={}, col={}",
+                cache.cursor_line, cache.cursor_col
+            );
+
+            // Extract data first to avoid borrow conflicts
             let script_content = cache.lines.join("\n");
+            let target = cache.target.clone();
+            let lines = cache.lines.clone();
+            let command = format!("trace {} {}", target, script_content);
 
-            // Save to cache
-            cache
-                .saved_scripts
-                .insert(cache.target.clone(), script_content.clone());
-            cache.status = ScriptStatus::Submitted;
+            debug!("Generated command: {}", command);
 
-            // Return to Input mode for command input, but keep script cache
+            // 1. Save script to history (before clearing cache)
+            if let Some(ref mut cache) = self.script_cache {
+                cache
+                    .saved_scripts
+                    .insert(target.clone(), script_content.clone());
+                cache.status = ScriptStatus::Submitted;
+            }
+
+            // 2. Switch to Input mode and clear script cache
             self.mode = InteractionMode::Input;
+            self.script_cache = None; // Clear the script cache
+            debug!("Cleared script_cache, now using history approach");
 
-            Some(CommandAction::SubmitScript(format!(
-                "trace {} {}",
-                cache.target, script_content
-            )))
+            // 3. Create formatted script display for history
+            let mut script_display = Vec::new();
+            script_display.push("📝 Script content:".to_string());
+
+            // Add script lines with line numbers (skip empty lines and default comments)
+            for (line_idx, line) in lines.iter().enumerate() {
+                if !line.trim().is_empty() {
+                    let formatted_line = format!("  {} │ {}", line_idx + 1, line);
+                    script_display.push(formatted_line);
+                    debug!("Added script line {}: {}", line_idx + 1, line);
+                }
+            }
+
+            // 4. Add the complete script display as a single history item
+            self.add_to_history("".to_string(), Some(script_display.join("\n")));
+
+            // Set response type for syntax highlighting detection
+            if let Some(last_item) = self.command_history.last_mut() {
+                last_item.response_type = Some(ResponseType::ScriptDisplay);
+            }
+
+            // 5. Update display
+            self.update_static_lines();
+
+            // 6. Set waiting state - this hides input box but stays in Input mode
+            self.input_state = InputState::WaitingResponse {
+                command: command.clone(),
+                sent_time: Instant::now(),
+            };
+            debug!("Set input_state to WaitingResponse");
+
+            debug!(
+                "Before final check, script_cache exists = {}",
+                self.script_cache.is_some()
+            );
+            debug!("Returning CommandAction::SubmitScript");
+            Some(CommandAction::SubmitScript(command))
         } else {
+            debug!("No script cache found, returning None");
+            debug!("script_cache is None, this might be the issue!");
             None
         }
     }
 
-    /// Cancel script editing and return to command mode
+    /// Cancel script editing and return to input mode
     pub fn cancel_script_editor(&mut self) {
         if self.mode == InteractionMode::ScriptEditor {
-            self.mode = InteractionMode::Input;
-            // Keep script_cache for potential restoration
+            self.mode = InteractionMode::Input; // ESC should go to input mode
+                                                // Keep script_cache for potential restoration
         }
     }
 
@@ -467,11 +613,8 @@ impl InteractiveCommandPanel {
     /// Clear current script (F3 key)  
     pub fn clear_current_script(&mut self) {
         if let Some(ref mut cache) = self.script_cache {
-            cache.lines = vec![
-                format!("// Trace script for target: {}", cache.target),
-                String::new(),
-            ];
-            cache.cursor_line = 1;
+            cache.lines = vec![String::new()];
+            cache.cursor_line = 0;
             cache.cursor_col = 0;
             cache.status = ScriptStatus::Draft;
         }
@@ -624,18 +767,31 @@ impl InteractiveCommandPanel {
         }
     }
 
-    pub fn add_response(&mut self, response: String, _response_type: ResponseType) {
+    pub fn add_response(&mut self, response: String, response_type: ResponseType) {
         if let Some(last_item) = self.command_history.last_mut() {
-            last_item.response = Some(response);
+            // If the last item is ScriptDisplay, create a new history item for the response
+            if last_item.response_type == Some(ResponseType::ScriptDisplay) {
+                debug!("Last item is ScriptDisplay, creating new history item for response");
+                self.add_to_history("".to_string(), Some(response));
+                if let Some(new_item) = self.command_history.last_mut() {
+                    new_item.response_type = Some(response_type);
+                }
+            } else {
+                last_item.response = Some(response);
+                last_item.response_type = Some(response_type);
+            }
         }
         self.update_static_lines();
     }
 
     fn add_to_history(&mut self, command: String, response: Option<String>) {
+        let prompt = self.get_history_prompt();
         let item = CommandHistoryItem {
             command,
             response,
             timestamp: std::time::Instant::now(),
+            prompt,
+            response_type: None,
         };
 
         self.command_history.push(item);
@@ -685,35 +841,60 @@ impl InteractiveCommandPanel {
     // Update static text lines list
     fn update_static_lines(&mut self) {
         self.static_lines.clear();
+        debug!(
+            "update_static_lines: Processing {} history items",
+            self.command_history.len()
+        );
 
         // Add history records
         for (history_idx, item) in self.command_history.iter().enumerate() {
-            let prompt = self.get_prompt();
-            let command_line = format!("{}{}", prompt, item.command);
+            debug!(
+                "Processing history item {}: command='{}', response_type={:?}",
+                history_idx,
+                item.command.chars().take(30).collect::<String>(),
+                item.response_type
+            );
 
-            self.static_lines.push(StaticTextLine {
-                content: command_line,
-                line_type: LineType::Command,
-                history_index: Some(history_idx),
-            });
+            // Skip creating command line for ScriptDisplay items and empty Progress items
+            if item.response_type != Some(ResponseType::ScriptDisplay)
+                && !(item.command.trim().is_empty()
+                    && item.response_type == Some(ResponseType::Progress))
+            {
+                let command_line = format!("{}{}", item.prompt, item.command);
+                self.static_lines.push(StaticTextLine {
+                    content: command_line,
+                    line_type: LineType::Command,
+                    history_index: Some(history_idx),
+                    response_type: None, // Commands don't have response type
+                });
+            }
 
             if let Some(ref response) = item.response {
+                debug!(
+                    "Adding response to static lines: response_type={:?}, content_preview='{}'",
+                    item.response_type,
+                    response.chars().take(50).collect::<String>()
+                );
                 self.static_lines.push(StaticTextLine {
                     content: response.clone(),
                     line_type: LineType::Response,
                     history_index: Some(history_idx),
+                    response_type: item.response_type, // Use saved response type
                 });
             }
         }
 
-        // Add current input line
-        let prompt = self.get_prompt();
-        let current_line = format!("{}{}", prompt, self.input_text);
-        self.static_lines.push(StaticTextLine {
-            content: current_line,
-            line_type: LineType::CurrentInput,
-            history_index: None,
-        });
+        // Only add current input line when not waiting for response and not in script editor mode
+        if self.should_show_input_prompt() && self.mode != InteractionMode::ScriptEditor {
+            let prompt = self.get_prompt();
+            let current_line = format!("{}{}", prompt, self.input_text);
+            self.static_lines.push(StaticTextLine {
+                content: current_line,
+                line_type: LineType::CurrentInput,
+                history_index: None,
+                response_type: None, // Current input doesn't have response type
+            });
+        }
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect, is_focused: bool) {
@@ -731,7 +912,10 @@ impl InteractiveCommandPanel {
     }
 
     fn render_original_layout(&self, frame: &mut Frame, area: Rect, is_focused: bool) {
-        let border_style = if is_focused {
+        let border_style = if matches!(self.input_state, InputState::WaitingResponse { .. }) {
+            // Show yellow border when waiting for response
+            Style::default().fg(Color::Yellow)
+        } else if is_focused {
             Style::default().fg(Color::Cyan)
         } else {
             Style::default()
@@ -760,14 +944,6 @@ impl InteractiveCommandPanel {
             .border_style(border_style);
 
         frame.render_widget(block, area);
-    }
-
-    fn get_panel_title(&self) -> String {
-        match self.mode {
-            InteractionMode::Input => "Interactive Command (input mode)".to_string(),
-            InteractionMode::Command => "Interactive Command (command mode)".to_string(),
-            InteractionMode::ScriptEditor => "Interactive Command (script mode)".to_string(),
-        }
     }
 
     fn render_script_integrated_layout(&self, frame: &mut Frame, area: Rect, is_focused: bool) {
@@ -845,7 +1021,7 @@ impl InteractiveCommandPanel {
             )])));
 
             // Add script editor prompt with line wrapping support
-            let script_prompt = "Script Editor (Ctrl+Enter to submit, Esc to cancel):";
+            let script_prompt = "Script Editor (Ctrl+s to submit, Esc to cancel):";
             let prompt_wrapped = self.wrap_text(script_prompt, available_width.saturating_sub(2));
             for prompt_line in prompt_wrapped {
                 rendered_lines.push(ListItem::new(Line::from(vec![Span::styled(
@@ -969,29 +1145,56 @@ impl InteractiveCommandPanel {
 
         // Render visible lines
         let mut items = Vec::new();
+        debug!(
+            "Rendering {} static lines (showing {}-{})",
+            self.static_lines.len(),
+            start_idx,
+            end_idx
+        );
         for i in start_idx..end_idx {
             if let Some(line) = self.static_lines.get(i) {
-                let style = match line.line_type {
-                    LineType::Command => Style::default().fg(Color::Gray),
-                    LineType::Response => self.get_response_style(&line.content),
-                    LineType::CurrentInput => {
-                        if self.mode == InteractionMode::Input {
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(Color::White)
-                        }
-                    }
-                };
+                {
+                    debug!(
+                        "Regular line: line_type={:?}, response_type={:?}",
+                        line.line_type, line.response_type
+                    );
+                    // Handle text wrapping and styling for other content
+                    let wrapped_lines = self.wrap_text(&line.content, content_width);
 
-                // Handle text wrapping
-                let wrapped_lines = self.wrap_text(&line.content, content_width);
-                for wrapped_line in wrapped_lines {
-                    items.push(ListItem::new(Line::from(vec![Span::styled(
-                        wrapped_line,
-                        style,
-                    )])));
+                    for wrapped_line in wrapped_lines {
+                        let spans = {
+                            match line.line_type {
+                                LineType::Command => {
+                                    vec![Span::styled(
+                                        wrapped_line,
+                                        Style::default().fg(Color::Gray),
+                                    )]
+                                }
+                                LineType::Response => {
+                                    // Special handling for ScriptDisplay in history
+                                    if line.response_type == Some(ResponseType::ScriptDisplay) {
+                                        self.format_script_display_line(&wrapped_line)
+                                    } else {
+                                        // Regular response styling
+                                        let style = self.get_response_style(&line.content);
+                                        vec![Span::styled(wrapped_line, style)]
+                                    }
+                                }
+                                LineType::CurrentInput => {
+                                    let style = if self.mode == InteractionMode::Input {
+                                        Style::default()
+                                            .fg(Color::Yellow)
+                                            .add_modifier(Modifier::BOLD)
+                                    } else {
+                                        Style::default().fg(Color::White)
+                                    };
+                                    vec![Span::styled(wrapped_line, style)]
+                                }
+                            }
+                        };
+
+                        items.push(ListItem::new(Line::from(spans)));
+                    }
                 }
             }
         }
@@ -1006,6 +1209,11 @@ impl InteractiveCommandPanel {
     }
 
     fn render_cursor(&self, frame: &mut Frame, area: Rect, start_idx: usize) {
+        // Don't render cursor when waiting for response
+        if !self.should_show_input_prompt() {
+            return;
+        }
+
         if self.mode == InteractionMode::Input {
             // Input mode: render cursor on current input line, considering text wrapping
             let content_width = area.width.saturating_sub(2) as usize;
@@ -1177,16 +1385,97 @@ impl InteractiveCommandPanel {
             Style::default().fg(Color::Blue)
         } else if response.starts_with("🔨") {
             Style::default().fg(Color::Cyan)
+        } else if response.starts_with("📝") {
+            // Script display - use script highlighting style
+            Style::default().fg(Color::Magenta)
         } else {
             Style::default()
         }
     }
 
+    /// Format a script display line from history with proper syntax highlighting
+    fn format_script_display_line(&self, line: &str) -> Vec<Span> {
+        debug!("Formatting script display line: '{}'", line);
+
+        // Handle different types of lines in script display
+        if line.starts_with("📝") {
+            // Header line - green and bold
+            vec![Span::styled(
+                line.to_string(),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(ratatui::style::Modifier::BOLD),
+            )]
+        } else if line.chars().all(|c| c == '─' || c.is_whitespace()) {
+            // Separator line - dark gray
+            vec![Span::styled(
+                line.to_string(),
+                Style::default().fg(Color::DarkGray),
+            )]
+        } else if line.starts_with("⏳") {
+            // Status message - blue
+            vec![Span::styled(
+                line.to_string(),
+                Style::default().fg(Color::Blue),
+            )]
+        } else if line.contains(" │ ") {
+            // Script line with line number - apply syntax highlighting
+            if let Some(separator_pos) = line.find(" │ ") {
+                let separator_str = " │ ";
+                let end_byte_pos = separator_pos + separator_str.len();
+
+                if end_byte_pos <= line.len() {
+                    let line_number_part = &line[..end_byte_pos];
+                    let code_part = if end_byte_pos < line.len() {
+                        &line[end_byte_pos..]
+                    } else {
+                        ""
+                    };
+
+                    let mut spans = vec![Span::styled(
+                        line_number_part.to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    )];
+
+                    // Apply syntax highlighting to code part
+                    spans.extend(self.syntax_highlight_line(code_part));
+                    spans
+                } else {
+                    // Fallback
+                    vec![Span::styled(
+                        line.to_string(),
+                        Style::default().fg(Color::White),
+                    )]
+                }
+            } else {
+                // Fallback
+                vec![Span::styled(
+                    line.to_string(),
+                    Style::default().fg(Color::White),
+                )]
+            }
+        } else {
+            // Other lines - default styling
+            vec![Span::styled(
+                line.to_string(),
+                Style::default().fg(Color::White),
+            )]
+        }
+    }
+
     /// Syntax highlighting for script lines
     fn syntax_highlight_line(&self, line: &str) -> Vec<Span> {
+        debug!("Starting syntax_highlight_line for: '{}'", line);
         let mut spans = Vec::new();
         let mut current_pos = 0;
         let line_chars: Vec<char> = line.chars().collect();
+
+        debug!("Line chars length: {}", line_chars.len());
+
+        if line_chars.is_empty() {
+            debug!("Empty line, returning empty spans");
+            return spans;
+        }
 
         // Define keywords and their styles
         let keywords = &[
@@ -1217,11 +1506,18 @@ impl InteractiveCommandPanel {
         ];
 
         while current_pos < line_chars.len() {
+            debug!(
+                "Processing position {} of {}",
+                current_pos,
+                line_chars.len()
+            );
+
             // Check for comments (// style)
             if current_pos + 1 < line_chars.len()
                 && line_chars[current_pos] == '/'
                 && line_chars[current_pos + 1] == '/'
             {
+                debug!("Found comment at position {}", current_pos);
                 // Rest of line is comment
                 let comment_text: String = line_chars[current_pos..].iter().collect();
                 spans.push(Span::styled(
@@ -1234,7 +1530,8 @@ impl InteractiveCommandPanel {
             }
 
             // Check for string literals
-            if line_chars[current_pos] == '"' {
+            if current_pos < line_chars.len() && line_chars[current_pos] == '"' {
+                debug!("Found string literal at position {}", current_pos);
                 let mut end_pos = current_pos + 1;
                 while end_pos < line_chars.len() && line_chars[end_pos] != '"' {
                     if line_chars[end_pos] == '\\' && end_pos + 1 < line_chars.len() {
@@ -1269,7 +1566,8 @@ impl InteractiveCommandPanel {
             }
 
             // Check for numbers
-            if line_chars[current_pos].is_ascii_digit() {
+            if current_pos < line_chars.len() && line_chars[current_pos].is_ascii_digit() {
+                debug!("Found number at position {}", current_pos);
                 let mut end_pos = current_pos;
                 while end_pos < line_chars.len()
                     && (line_chars[end_pos].is_ascii_digit() || line_chars[end_pos] == '.')
@@ -1289,11 +1587,24 @@ impl InteractiveCommandPanel {
             }
 
             // Default: regular text
-            spans.push(Span::styled(
-                line_chars[current_pos].to_string(),
-                Style::default().fg(Color::Cyan),
-            ));
-            current_pos += 1;
+            if current_pos < line_chars.len() {
+                debug!(
+                    "Adding regular char '{}' at position {}",
+                    line_chars[current_pos], current_pos
+                );
+                spans.push(Span::styled(
+                    line_chars[current_pos].to_string(),
+                    Style::default().fg(Color::Cyan),
+                ));
+                current_pos += 1;
+            } else {
+                debug!(
+                    "Position {} is beyond line length {}, breaking",
+                    current_pos,
+                    line_chars.len()
+                );
+                break;
+            }
         }
 
         spans
@@ -1506,7 +1817,7 @@ impl InteractiveCommandPanel {
         total_visual_lines += 1;
 
         // 3. Count prompt lines (with wrapping)
-        let script_prompt = "Script Editor (Ctrl+Enter to submit, Esc to cancel):";
+        let script_prompt = "Script Editor (Ctrl+s to submit, Esc to cancel):";
         let prompt_wrapped = self.wrap_text(script_prompt, available_width.saturating_sub(2));
         total_visual_lines += prompt_wrapped.len();
 
