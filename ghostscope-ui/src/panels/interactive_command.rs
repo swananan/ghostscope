@@ -519,6 +519,13 @@ impl InteractiveCommandPanel {
                 cache.lines[cache.cursor_line].insert(cache.cursor_col, c);
                 cache.cursor_col += 1;
                 cache.status = ScriptStatus::Draft;
+            } else if cache.cursor_line == cache.lines.len() {
+                // Cursor is after last line, create a new line
+                let mut new_line = String::new();
+                new_line.insert(0, c);
+                cache.lines.push(new_line);
+                cache.cursor_col = 1;
+                cache.status = ScriptStatus::Draft;
             }
         }
     }
@@ -526,8 +533,16 @@ impl InteractiveCommandPanel {
     pub fn delete_char_in_script(&mut self) {
         if let Some(ref mut cache) = self.script_cache {
             if cache.cursor_line < cache.lines.len() && cache.cursor_col > 0 {
+                // Delete character within current line
                 cache.lines[cache.cursor_line].remove(cache.cursor_col - 1);
                 cache.cursor_col -= 1;
+                cache.status = ScriptStatus::Draft;
+            } else if cache.cursor_col == 0 && cache.cursor_line > 0 {
+                // Delete at beginning of line - merge with previous line
+                let current_line = cache.lines.remove(cache.cursor_line);
+                cache.cursor_line -= 1;
+                cache.cursor_col = cache.lines[cache.cursor_line].len();
+                cache.lines[cache.cursor_line].push_str(&current_line);
                 cache.status = ScriptStatus::Draft;
             }
         }
@@ -536,12 +551,19 @@ impl InteractiveCommandPanel {
     pub fn insert_newline_in_script(&mut self) {
         if let Some(ref mut cache) = self.script_cache {
             if cache.cursor_line < cache.lines.len() {
+                // Split current line at cursor position
                 let current_line = cache.lines[cache.cursor_line].clone();
                 let (left, right) = current_line.split_at(cache.cursor_col);
 
                 cache.lines[cache.cursor_line] = left.to_string();
                 cache.lines.insert(cache.cursor_line + 1, right.to_string());
 
+                cache.cursor_line += 1;
+                cache.cursor_col = 0;
+                cache.status = ScriptStatus::Draft;
+            } else if cache.cursor_line == cache.lines.len() {
+                // Cursor is after last line, add a new empty line
+                cache.lines.push(String::new());
                 cache.cursor_line += 1;
                 cache.cursor_col = 0;
                 cache.status = ScriptStatus::Draft;
@@ -569,6 +591,10 @@ impl InteractiveCommandPanel {
                 if cache.cursor_col > cache.lines[cache.cursor_line].len() {
                     cache.cursor_col = cache.lines[cache.cursor_line].len();
                 }
+            } else if cache.cursor_line + 1 == cache.lines.len() {
+                // Allow moving to position after last line for new input
+                cache.cursor_line += 1;
+                cache.cursor_col = 0;
             }
         }
     }
@@ -1072,9 +1098,8 @@ impl InteractiveCommandPanel {
                         let prefix = if is_first_line {
                             line_prefix.clone()
                         } else {
-                            // Continuation line - just indent, no pipe symbol
-                            format!("{}   ", " ".repeat(cursor_indicator.len() + 4))
-                            // Simple indent
+                            // Continuation line - use spaces to match the first line's prefix length
+                            " ".repeat(line_prefix.chars().count())
                         };
 
                         let mut line_spans =
@@ -1824,10 +1849,10 @@ impl InteractiveCommandPanel {
         // 4. Count script lines up to cursor line
         for line_idx in 0..cache.cursor_line {
             if let Some(script_line) = cache.lines.get(line_idx) {
-                let cursor_indicator_len = 1; // "▶" or " "
-                let line_prefix_len = 5; // " 1 │ "
-                let content_width =
-                    available_width.saturating_sub(cursor_indicator_len + line_prefix_len + 2);
+                let cursor_indicator = " "; // Non-cursor lines use space
+                let line_prefix = format!("{}{:2} │ ", cursor_indicator, line_idx + 1);
+                let prefix_width = line_prefix.chars().count();
+                let content_width = available_width.saturating_sub(prefix_width + 2);
 
                 if script_line.chars().count() <= content_width {
                     total_visual_lines += 1; // Single line
@@ -1842,10 +1867,10 @@ impl InteractiveCommandPanel {
 
         // 5. Calculate cursor position within current line
         if let Some(_current_line) = cache.lines.get(cache.cursor_line) {
-            let cursor_indicator_len = 1; // "▶"
-            let line_prefix_len = 5; // " 1 │ "
-            let prefix_total = cursor_indicator_len + line_prefix_len;
-            let content_width = available_width.saturating_sub(prefix_total + 2);
+            let cursor_indicator = "▶";
+            let line_prefix = format!("{}{:2} │ ", cursor_indicator, cache.cursor_line + 1);
+            let prefix_width = line_prefix.chars().count();
+            let content_width = available_width.saturating_sub(prefix_width + 2);
 
             // Find which visual line the cursor is on for this logical line
             let cursor_visual_offset = if content_width > 0 {
@@ -1861,7 +1886,7 @@ impl InteractiveCommandPanel {
             } else {
                 0
             };
-            let cursor_x = area.x + prefix_total as u16 + cursor_col_in_visual_line as u16;
+            let cursor_x = area.x + prefix_width as u16 + cursor_col_in_visual_line as u16;
             let cursor_y = area.y + (total_visual_lines.saturating_sub(scroll_offset)) as u16;
 
             // Only draw cursor if it's within the visible area
@@ -1870,11 +1895,11 @@ impl InteractiveCommandPanel {
             }
         } else if cache.cursor_line == cache.lines.len() {
             // Cursor is on empty line at the end
-            let cursor_indicator_len = 1; // "▶"
-            let line_prefix_len = 5; // " 1 │ "
-            let prefix_total = cursor_indicator_len + line_prefix_len;
+            let cursor_indicator = "▶";
+            let line_prefix = format!("{}{:2} │ ", cursor_indicator, cache.lines.len() + 1);
+            let prefix_width = line_prefix.chars().count();
 
-            let cursor_x = area.x + prefix_total as u16;
+            let cursor_x = area.x + prefix_width as u16;
             let cursor_y = area.y + (total_visual_lines.saturating_sub(scroll_offset)) as u16;
 
             // Only draw cursor if it's within the visible area
