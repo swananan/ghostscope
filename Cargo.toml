@@ -1,7 +1,6 @@
 [workspace]
 members = [
     "ghostscope-compiler",
-    "ghostscope-frontend",
     "ghostscope-loader",
     "ghostscope-ui",
     "ghostscope-binary",

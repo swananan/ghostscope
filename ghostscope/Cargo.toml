@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 ghostscope-compiler = { path = "../ghostscope-compiler" }
-ghostscope-frontend = { path = "../ghostscope-frontend" }
 ghostscope-loader = { path = "../ghostscope-loader" }
 ghostscope-ui = { path = "../ghostscope-ui" }
 ghostscope-binary = { path = "../ghostscope-binary" }
