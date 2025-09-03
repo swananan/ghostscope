@@ -5,13 +5,14 @@ use ghostscope_binary::{BinaryAnalyzer, DebugInfo};
 use ghostscope_loader::GhostScopeLoader;
 use tracing::{error, info, warn};
 
-/// Debug session state - focuses on binary analysis and process management
+/// Ghost session state - manages binary analysis, process tracking, and trace instances
 #[derive(Debug)]
-pub struct DebugSession {
+pub struct GhostSession {
     pub binary_analyzer: Option<BinaryAnalyzer>,
     pub target_binary: Option<String>,
     pub target_args: Vec<String>,
     pub target_pid: Option<u32>,
+    pub debug_file: Option<String>,  // Optional debug file path
     pub trace_manager: TraceManager, // Manages all trace instances with their loaders
 
     // Legacy fields for backward compatibility
@@ -20,80 +21,53 @@ pub struct DebugSession {
     pub is_attached: bool,
 }
 
-impl DebugSession {
-    /// Create a new debug session from parsed arguments
-    pub fn new(args: &ParsedArgs) -> Result<Self> {
-        info!("Creating debug session");
+impl GhostSession {
+    /// Create a new ghost session (without binary analysis - call load_binary separately)
+    pub fn new(args: &ParsedArgs) -> Self {
+        info!("Creating ghost session");
 
-        let binary_analyzer = if let Some(pid) = args.pid {
-            info!("Loading binary from PID: {}", pid);
-
-            // Create binary analyzer from PID
-            let debug_path = args.debug_file.as_ref().map(|p| p.to_str().unwrap());
-            match BinaryAnalyzer::from_pid(pid, debug_path) {
-                Ok(analyzer) => {
-                    let debug_info = analyzer.debug_info();
-                    info!("Binary analysis complete:");
-                    info!("  Path: {}", debug_info.binary_path.display());
-                    info!("  Debug info: {:?}", debug_info.debug_path);
-                    info!("  Has symbols: {}", debug_info.has_symbols);
-                    info!("  Has debug info: {}", debug_info.has_debug_info);
-                    info!("  Entry point: {:?}", debug_info.entry_point);
-                    info!("  Base address: 0x{:x}", debug_info.base_address);
-
-                    Some(analyzer)
-                }
-                Err(e) => {
-                    return Err(anyhow::anyhow!(
-                        "Failed to analyze binary for PID {}: {}",
-                        pid,
-                        e
-                    ));
-                }
-            }
-        } else if let Some(ref binary_path) = args.binary_path {
-            info!("Loading binary: {}", binary_path);
-
-            // Create binary analyzer
-            let debug_path = args.debug_file.as_ref().map(|p| p.to_str().unwrap());
-            match BinaryAnalyzer::new(binary_path, debug_path) {
-                Ok(analyzer) => {
-                    let debug_info = analyzer.debug_info();
-                    info!("Binary analysis complete:");
-                    info!("  Path: {}", debug_info.binary_path.display());
-                    info!("  Debug info: {:?}", debug_info.debug_path);
-                    info!("  Has symbols: {}", debug_info.has_symbols);
-                    info!("  Has debug info: {}", debug_info.has_debug_info);
-                    info!("  Entry point: {:?}", debug_info.entry_point);
-                    info!("  Base address: 0x{:x}", debug_info.base_address);
-
-                    Some(analyzer)
-                }
-                Err(e) => {
-                    return Err(anyhow::anyhow!(
-                        "Failed to analyze binary '{}': {}",
-                        binary_path,
-                        e
-                    ));
-                }
-            }
-        } else {
-            info!("No target binary specified");
-            None
-        };
-
-        Ok(Self {
-            binary_analyzer,
+        Self {
+            binary_analyzer: None,
             target_binary: args.binary_path.clone(),
             target_args: args.binary_args.clone(),
             target_pid: args.pid,
+            debug_file: args
+                .debug_file
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
             trace_manager: TraceManager::new(),
-
-            // Legacy fields
             loader: None,
             loaders: Vec::new(),
             is_attached: false,
-        })
+        }
+    }
+
+    /// Load binary and perform DWARF analysis (separated from new)
+    pub async fn load_binary(&mut self) -> Result<()> {
+        info!("Loading binary and performing DWARF analysis");
+
+        let debug_file_path = self.debug_file.as_deref();
+
+        let binary_analyzer = if let Some(pid) = self.target_pid {
+            info!("Loading binary from PID: {}", pid);
+            Some(BinaryAnalyzer::from_pid(pid, debug_file_path)?)
+        } else if let Some(ref binary_path) = self.target_binary {
+            info!("Loading binary from path: {}", binary_path);
+            Some(BinaryAnalyzer::new(binary_path, debug_file_path)?)
+        } else {
+            warn!("No PID or binary path specified - running without binary analysis");
+            None
+        };
+
+        self.binary_analyzer = binary_analyzer;
+        Ok(())
+    }
+
+    /// Create ghost session and load binary in one step (for command line mode)
+    pub async fn new_with_binary(args: &ParsedArgs) -> Result<Self> {
+        let mut session = Self::new(args);
+        session.load_binary().await?;
+        Ok(session)
     }
 
     /// Initialize eBPF loader with compiled program

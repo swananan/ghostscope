@@ -7,7 +7,7 @@ mod trace_manager;
 use anyhow::Result;
 use args::ParsedArgs;
 use ghostscope_ui::{run_tui_mode, EventRegistry, LayoutMode};
-use session::DebugSession;
+use session::GhostSession;
 use std::path::{Path, PathBuf};
 use tracing::{error, info, warn};
 
@@ -27,10 +27,9 @@ fn extract_target_from_script(script: &str) -> Option<String> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Step 1: Parse and validate command line arguments
     let parsed_args = args::Args::parse_args();
 
-    // Initialize logging first so we can use it for validation
+    // Initialize logging
     let log_file_path = parsed_args.log_file.as_ref().and_then(|p| p.to_str());
     if let Err(e) = logging::initialize_logging(
         log_file_path,
@@ -40,46 +39,32 @@ async fn main() -> Result<()> {
         return Err(anyhow::anyhow!("Failed to initialize logging: {}", e));
     }
 
-    // Step 1.1: Validate arguments immediately
+    // Validate arguments
     validate_arguments(&parsed_args)?;
 
-    // Check if we should start in TUI mode
+    // Route to appropriate runtime mode
     if parsed_args.tui_mode {
-        return run_tui_runtime(parsed_args).await;
+        run_tui_runtime(parsed_args).await
+    } else {
+        run_command_line_runtime(parsed_args).await
     }
+}
 
-    // Step 3: Parse and validate script syntax early
+/// Run GhostScope in command line mode with direct script execution
+async fn run_command_line_runtime(parsed_args: ParsedArgs) -> Result<()> {
+    info!("Starting GhostScope in command line mode");
+
+    // Step 1: Get script content
     let script_content = get_script_content(&parsed_args)?;
-    let parsed_script = parse_and_validate_script(&script_content)?;
 
-    let trace_count = parsed_script
-        .statements
-        .iter()
-        .filter(|stmt| matches!(stmt, ghostscope_compiler::ast::Statement::TracePoint { .. }))
-        .count();
-    info!(
-        "✓ Script parsing successful, found {} trace patterns",
-        trace_count
-    );
-
-    // Step 4: Initialize and prepare DWARF information for efficient queries
-    // This creates the debug session with optimized DWARF processing
+    // Step 2: Initialize debug session and DWARF information processing
     info!("Initializing debug session and DWARF information processing...");
 
-    // Create debug session
-    let mut session = DebugSession::new(&parsed_args)
+    let mut session = GhostSession::new_with_binary(&parsed_args)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to create debug session: {}", e))?;
 
-    // Save AST to file if requested (after session creation so we have target info)
-    if parsed_args.should_save_ast {
-        save_ast_to_file(
-            &parsed_script,
-            session.target_pid,
-            binary_path_for_session(&session).as_deref(),
-        )?;
-    }
-
-    // Display parsed arguments and session info
+    // Step 3: Display session information
     info!("Debug session created");
     info!("Save LLVM IR files: {}", parsed_args.should_save_llvm_ir);
     info!("Save eBPF bytecode files: {}", parsed_args.should_save_ebpf);
@@ -95,9 +80,7 @@ async fn main() -> Result<()> {
         info!("Target PID: {}", pid);
     }
 
-    // ====== CRITICAL: Validate binary analysis before proceeding ======
-    // If we have a target PID or binary, we MUST have valid binary analysis
-    // This prevents proceeding with incomplete information
+    // Step 4: Validate binary analysis
     if parsed_args.pid.is_some() || parsed_args.binary_path.is_some() {
         match session.get_debug_info() {
             Some(debug_info) => {
@@ -129,13 +112,10 @@ async fn main() -> Result<()> {
         info!("No target binary or PID specified - running in standalone mode");
     }
 
-    // Script has been validated and parsed successfully in Step 3
-
-    // Show available functions if we have binary analysis
+    // Step 5: Show available functions for user reference
     if let Some(_debug_info) = session.get_debug_info() {
-        // Always show available functions for user reference
         let functions = session.list_functions();
-        if functions.len() > 0 {
+        if !functions.is_empty() {
             info!("Available functions (showing first 10):");
             for func in functions.iter().take(10) {
                 info!("  {}", func);
@@ -146,278 +126,103 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Script content and parsed AST are already available from Step 3
-    info!("Starting GhostScope with validated script");
+    // Step 6: Compile script using unified interface
+    info!("Starting unified script compilation with DWARF integration...");
 
-    // Note: LLVM IR generation is now unified with eBPF compilation
-    // Each trace pattern will save its IR file during eBPF compilation
+    let binary_analyzer = session
+        .binary_analyzer
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Binary analyzer is required for script compilation"))?;
 
-    // Compile to eBPF uprobe configurations (now includes LLVM IR generation)
-    let binary_path_string = if let Some(ref analyzer) = session.binary_analyzer {
-        Some(
-            analyzer
-                .debug_info()
-                .binary_path
-                .to_string_lossy()
-                .to_string(),
-        )
-    } else {
-        session.target_binary.clone()
+    let binary_path_string = binary_analyzer
+        .debug_info()
+        .binary_path
+        .to_string_lossy()
+        .to_string();
+
+    let save_options = ghostscope_compiler::SaveOptions {
+        save_llvm_ir: parsed_args.should_save_llvm_ir,
+        save_ast: parsed_args.should_save_ast,
+        save_ebpf: parsed_args.should_save_ebpf,
+        binary_path_hint: Some(binary_path_string.clone()),
     };
-    let binary_path_for_naming = binary_path_string.as_deref();
 
-    // Step 5: Generate LLVM IR using pre-parsed AST with optimized DWARF queries
-    // Now we use the already validated parsed_script instead of re-parsing
-    info!("Generating LLVM IR with optimized DWARF information access...");
-    info!(
-        "Using pre-validated AST with {} statements",
-        parsed_script.statements.len()
-    );
-
-    match ghostscope_compiler::compile_ast_to_uprobe_configs(
-        &parsed_script, // Use pre-parsed AST instead of re-parsing
+    let compilation_result = ghostscope_compiler::compile_script_to_uprobe_configs(
+        &script_content,
+        binary_analyzer,
         session.target_pid,
-        binary_path_for_naming,
-        parsed_args.should_save_llvm_ir,
-        session.binary_analyzer.as_ref(), // Pass binary analyzer for variable validation
-    ) {
-        Ok(mut uprobe_configs) => {
-            info!(
-                "eBPF compilation successful, generated {} uprobe configurations",
-                uprobe_configs.len()
-            );
-            if parsed_args.should_save_llvm_ir || parsed_args.should_save_ebpf {
-                info!("Files saved with consistent naming: gs_{{pid}}_{{exec}}_{{func}}_{{index}}");
-            }
+        &save_options,
+    )?;
 
-            // Save each config's bytecode to individual files with consistent naming (if enabled)
-            if parsed_args.should_save_ebpf {
-                for (index, config) in uprobe_configs.iter().enumerate() {
-                    let file_base_name = ghostscope_compiler::generate_file_name(
-                        &config.trace_pattern,
-                        index,
-                        session.target_pid,
-                        binary_path_for_naming,
-                    );
-                    let ebpf_filename = format!("{}.o", file_base_name);
+    info!(
+        "✓ Script compilation successful: {} trace points found, {} uprobe configs generated",
+        compilation_result.trace_count,
+        compilation_result.uprobe_configs.len()
+    );
+    info!("Target info: {}", compilation_result.target_info);
 
-                    if let Err(e) = std::fs::write(&ebpf_filename, &config.ebpf_bytecode) {
-                        warn!("Failed to save eBPF bytecode to '{}': {}", ebpf_filename, e);
-                    } else {
-                        info!("eBPF bytecode saved to '{}'", ebpf_filename);
-                    }
-                }
-            }
-
-            // Resolve addresses for each uprobe configuration
-            if !uprobe_configs.is_empty() {
-                info!(
-                    "Processing {} uprobe configurations from script:",
-                    uprobe_configs.len()
-                );
-                let binary_path = if let Some(ref analyzer) = session.binary_analyzer {
-                    analyzer
-                        .debug_info()
-                        .binary_path
-                        .to_string_lossy()
-                        .to_string()
-                } else if let Some(ref binary_path) = session.target_binary {
-                    binary_path.clone()
-                } else {
-                    return Err(anyhow::anyhow!(
-                        "No target binary available for address resolution"
-                    ));
-                };
-
-                // Use unified address resolution interfaces to simplify code
-                for (i, config) in uprobe_configs.iter_mut().enumerate() {
-                    // Update binary path and target PID for each config
-                    config.binary_path = binary_path.clone();
-                    config.target_pid = session.target_pid;
-
-                    if let Some(ref analyzer) = session.binary_analyzer {
-                        match &config.trace_pattern {
-                            ghostscope_compiler::ast::TracePattern::FunctionName(function_name) => {
-                                info!("  {}: Function '{}' - resolving address", i, function_name);
-
-                                match (
-                                    analyzer.resolve_function_address(function_name),
-                                    analyzer.resolve_function_uprobe_offset(function_name),
-                                ) {
-                                    (Some(address), Some(uprobe_offset)) => {
-                                        config.function_name = Some(function_name.clone());
-                                        config.function_address = Some(address);
-                                        config.uprobe_offset = Some(uprobe_offset);
-
-                                        info!("    ✓ Resolved to address 0x{:x}, uprobe offset 0x{:x}", 
-                                              address, uprobe_offset);
-                                    }
-                                    (Some(address), None) => {
-                                        warn!("    ✗ Found address 0x{:x} but failed to calculate uprobe offset", address);
-
-                                        // Show similar function names for debugging
-                                        let similar =
-                                            analyzer.symbol_table.find_matching(function_name);
-                                        if !similar.is_empty() {
-                                            info!("    Similar functions found:");
-                                            for sym in similar.iter().take(5) {
-                                                info!("      {}", sym.name);
-                                            }
-                                        }
-                                    }
-                                    (None, _) => {
-                                        warn!(
-                                            "    ✗ Function '{}' not found in symbol table",
-                                            function_name
-                                        );
-
-                                        // Show similar function names for debugging
-                                        let similar =
-                                            analyzer.symbol_table.find_matching(function_name);
-                                        if !similar.is_empty() {
-                                            info!("    Similar functions found:");
-                                            for sym in similar.iter().take(5) {
-                                                info!("      {}", sym.name);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            ghostscope_compiler::ast::TracePattern::SourceLine {
-                                file_path,
-                                line_number,
-                            } => {
-                                info!(
-                                    "  {}: Source line '{}:{}' - resolving from DWARF info",
-                                    i, file_path, line_number
-                                );
-
-                                match (
-                                    analyzer.resolve_source_line_address(file_path, *line_number),
-                                    analyzer
-                                        .resolve_source_line_uprobe_offset(file_path, *line_number),
-                                ) {
-                                    (Some(address), Some(uprobe_offset)) => {
-                                        config.function_name = None;
-                                        config.function_address = Some(address);
-                                        config.uprobe_offset = Some(uprobe_offset);
-
-                                        info!("    ✓ Resolved to address 0x{:x}, uprobe offset 0x{:x}", 
-                                              address, uprobe_offset);
-
-                                        // Show additional info about multiple addresses if available
-                                        if let Some(dwarf_context) = analyzer.dwarf_context() {
-                                            let line_mappings = dwarf_context
-                                                .get_addresses_for_line(file_path, *line_number);
-                                            if line_mappings.len() > 1 {
-                                                info!("    Note: {} total addresses available for this line", line_mappings.len());
-                                            }
-                                        }
-                                    }
-                                    (Some(address), None) => {
-                                        warn!("    ✗ Found address 0x{:x} but failed to calculate uprobe offset", address);
-                                    }
-                                    (None, _) => {
-                                        warn!(
-                                            "    ✗ No addresses found for source line {}:{}",
-                                            file_path, line_number
-                                        );
-                                        warn!("    Possible reasons: file path mismatch, line not found in debug info, or code optimized away");
-                                    }
-                                }
-                            }
-                            ghostscope_compiler::ast::TracePattern::Address(addr) => {
-                                info!("  {}: Direct address 0x{:x}", i, addr);
-
-                                // For direct addresses, use the address as both virtual address and uprobe offset
-                                config.function_name = None;
-                                config.function_address = Some(*addr);
-                                config.uprobe_offset = Some(*addr);
-
-                                info!("    ✓ Using direct address 0x{:x}", addr);
-                            }
-                            ghostscope_compiler::ast::TracePattern::Wildcard(pattern) => {
-                                info!(
-                                    "  {}: Wildcard '{}' - pattern matching not yet implemented",
-                                    i, pattern
-                                );
-                            }
-                        }
-                    } else {
-                        warn!(
-                            "  {}: No binary analyzer available for address resolution",
-                            i
-                        );
-                    }
-                }
-
-                info!("Updated {} uprobe configurations", uprobe_configs.len());
-
-                // Attach each uprobe configuration
-                if !uprobe_configs.is_empty() {
-                    info!("Attaching uprobes using the configurations");
-                    for (i, config) in uprobe_configs.iter().enumerate() {
-                        info!(
-                            "  Config {}: {:?} -> 0x{:x}",
-                            i,
-                            config.function_name.as_ref().unwrap_or(&format!(
-                                "0x{:x}",
-                                config.function_address.unwrap_or(0)
-                            )),
-                            config.uprobe_offset.unwrap_or(0)
-                        );
-                    }
-
-                    match session.attach_uprobes(&uprobe_configs).await {
-                        Ok(()) => {
-                            info!(
-                                "All uprobes attached successfully! Starting event monitoring..."
-                            );
-                        }
-                        Err(e) => {
-                            return Err(anyhow::anyhow!(
-                                "Failed to attach uprobes: {}. Possible reasons: \
-                                1. Need root permissions (run with sudo), \
-                                2. Target binary doesn't exist or lacks debug info, \
-                                3. Process not running or PID invalid, \
-                                4. Function addresses not accessible",
-                                e
-                            ));
-                        }
-                    }
-                } else {
-                    return Err(anyhow::anyhow!(
-                        "No uprobe configurations created - nothing to attach"
-                    ));
-                }
-            } else {
-                info!("No trace points found in script - using legacy behavior");
-            }
-
-            info!("\nNew usage with trace scripts:");
-            info!("  sudo ./ghostscope --script 'trace main {{ print \"Hello\"; }}'");
-            info!("  sudo ./ghostscope --script-file my_trace.gs");
-            info!("  sudo ./ghostscope -s 'trace printf* {{ print $arg0; }}'");
-            info!("\nTrace script syntax:");
-            info!("  trace <function_name> {{ statements... }}");
-            info!("  trace <pattern*> {{ statements... }}");
-            info!("  trace 0x<address> {{ statements... }}");
-            info!("  trace file.c:123 {{ statements... }}");
-            info!("  Special variables: $arg0, $arg1, $retval, $pc, $sp");
-
-            // For now, skip uprobe attachment since we need to implement
-            // trace pattern extraction and multiple uprobe support
-
-            // Start event monitoring loop
-            session
-                .start_monitoring()
-                .await
-                .map_err(|e| anyhow::anyhow!("Event monitoring failed: {}", e))?;
-
-            Ok(())
-        }
-        Err(e) => Err(anyhow::anyhow!("eBPF compilation failed: {:?}", e)),
+    if save_options.save_llvm_ir || save_options.save_ebpf || save_options.save_ast {
+        info!("Files saved with consistent naming: gs_{{pid}}_{{exec}}_{{func}}_{{index}}");
     }
+
+    // Step 7: Prepare and attach uprobe configurations
+    let mut uprobe_configs = compilation_result.uprobe_configs;
+
+    for config in uprobe_configs.iter_mut() {
+        config.binary_path = binary_path_string.clone();
+    }
+
+    if !uprobe_configs.is_empty() {
+        info!("Attaching {} uprobe configurations", uprobe_configs.len());
+        for (i, config) in uprobe_configs.iter().enumerate() {
+            info!(
+                "  Config {}: {:?} -> 0x{:x}",
+                i,
+                config
+                    .function_name
+                    .as_ref()
+                    .unwrap_or(&format!("0x{:x}", config.function_address.unwrap_or(0))),
+                config.uprobe_offset.unwrap_or(0)
+            );
+        }
+
+        session.attach_uprobes(&uprobe_configs).await.map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to attach uprobes: {}. Possible reasons: \
+                1. Need root permissions (run with sudo), \
+                2. Target binary doesn't exist or lacks debug info, \
+                3. Process not running or PID invalid, \
+                4. Function addresses not accessible",
+                e
+            )
+        })?;
+
+        info!("All uprobes attached successfully! Starting event monitoring...");
+    } else {
+        return Err(anyhow::anyhow!(
+            "No uprobe configurations created - nothing to attach"
+        ));
+    }
+
+    // Step 8: Display usage information
+    info!("\nUsage examples:");
+    info!("  sudo ./ghostscope --script 'trace main {{ print \"Hello\"; }}'");
+    info!("  sudo ./ghostscope --script-file my_trace.gs");
+    info!("  sudo ./ghostscope -s 'trace printf* {{ print $arg0; }}'");
+    info!("\nTrace script syntax:");
+    info!("  trace <function_name> {{ statements... }}");
+    info!("  trace <pattern*> {{ statements... }}");
+    info!("  trace 0x<address> {{ statements... }}");
+    info!("  trace file.c:123 {{ statements... }}");
+    info!("  Special variables: $arg0, $arg1, $retval, $pc, $sp");
+
+    // Step 9: Start event monitoring loop
+    session
+        .start_monitoring()
+        .await
+        .map_err(|e| anyhow::anyhow!("Event monitoring failed: {}", e))?;
+
+    Ok(())
 }
 
 /// Validate command line arguments for consistency and completeness
@@ -622,7 +427,7 @@ fn validate_statement(index: usize, stmt: &ghostscope_compiler::ast::Statement) 
 }
 
 /// Get binary path for file naming from session
-fn binary_path_for_session(session: &DebugSession) -> Option<String> {
+fn binary_path_for_session(session: &GhostSession) -> Option<String> {
     if let Some(ref analyzer) = session.binary_analyzer {
         Some(
             analyzer
@@ -658,9 +463,6 @@ fn save_ast_to_file(
 /// Run GhostScope in TUI mode with tokio runtime coordination
 async fn run_tui_runtime(parsed_args: ParsedArgs) -> Result<()> {
     info!("Starting GhostScope in TUI mode");
-
-    // Validate basic arguments
-    validate_tui_arguments(&parsed_args)?;
 
     // Create event communication channels
     let (event_registry, runtime_channels) = EventRegistry::new();
@@ -719,52 +521,18 @@ async fn run_tui_runtime(parsed_args: ParsedArgs) -> Result<()> {
     result
 }
 
-/// Validate arguments specific to TUI mode
-fn validate_tui_arguments(args: &ParsedArgs) -> Result<()> {
-    // In TUI mode, we need at least a PID or binary path for DWARF processing
-    if args.pid.is_none() && args.binary_path.is_none() {
-        return Err(anyhow::anyhow!(
-            "TUI mode requires either a PID (-p) or binary path. Example:\n  \
-            ghostscope -p $(pidof test_program)\n  \
-            ghostscope /path/to/binary"
-        ));
-    }
-
-    // Cannot specify both PID and binary simultaneously
-    if args.pid.is_some() && args.binary_path.is_some() {
-        return Err(anyhow::anyhow!(
-            "Cannot specify both PID (-p) and binary path simultaneously in TUI mode"
-        ));
-    }
-
-    // Check PID exists if specified
-    if let Some(pid) = args.pid {
-        if !is_pid_running(pid) {
-            return Err(anyhow::anyhow!(
-                "Process with PID {} is not running. Use 'ps -p {}' to verify",
-                pid,
-                pid
-            ));
-        }
-        info!("✓ Target PID {} is running", pid);
-    }
-
-    info!("✓ TUI mode arguments validated successfully");
-    Ok(())
-}
-
 /// Initialize DWARF processing in background
 async fn initialize_dwarf_processing(
     parsed_args: ParsedArgs,
     status_sender: tokio::sync::mpsc::UnboundedSender<ghostscope_ui::RuntimeStatus>,
-) -> Result<DebugSession> {
+) -> Result<GhostSession> {
     use ghostscope_ui::RuntimeStatus;
 
     // Send status update: starting DWARF loading
     let _ = status_sender.send(RuntimeStatus::DwarfLoadingStarted);
 
     // Create debug session for DWARF processing
-    match DebugSession::new(&parsed_args) {
+    match GhostSession::new_with_binary(&parsed_args).await {
         Ok(session) => {
             // Validate that we have debug information
             match session.get_debug_info() {
@@ -818,7 +586,7 @@ async fn initialize_dwarf_processing(
 /// Main runtime coordinator that handles commands and manages eBPF sessions
 async fn run_runtime_coordinator(
     mut runtime_channels: ghostscope_ui::RuntimeChannels,
-    mut session: Option<DebugSession>,
+    mut session: Option<GhostSession>,
 ) -> Result<()> {
     use ghostscope_protocol::MessageType;
     use ghostscope_ui::events::TraceEvent;
@@ -1027,7 +795,7 @@ async fn run_runtime_coordinator(
 
 /// Handle source code request from TUI
 async fn handle_source_code_request(
-    session: &Option<DebugSession>,
+    session: &Option<GhostSession>,
     status_sender: &tokio::sync::mpsc::UnboundedSender<ghostscope_ui::RuntimeStatus>,
 ) {
     use ghostscope_ui::{events::SourceCodeInfo, RuntimeStatus};
@@ -1156,7 +924,7 @@ fn get_possible_source_paths(dwarf_file_path: &str, binary_path: &Path) -> Vec<P
 /// Compile and load a script in TUI mode using existing logic from CLI mode
 fn compile_and_load_script(
     script: &str,
-    session: &mut DebugSession,
+    session: &mut GhostSession,
     status_sender: &tokio::sync::mpsc::UnboundedSender<ghostscope_ui::RuntimeStatus>,
 ) -> Result<()> {
     use ghostscope_ui::RuntimeStatus;
@@ -1398,7 +1166,7 @@ fn compile_and_load_script(
 
 /// Poll ringbuf events from all active trace instances and send formatted events to TUI
 fn poll_ringbuf_events(
-    session: &mut DebugSession,
+    session: &mut GhostSession,
     trace_sender: &tokio::sync::mpsc::UnboundedSender<ghostscope_ui::events::TraceEvent>,
 ) {
     use ghostscope_protocol::MessageType;

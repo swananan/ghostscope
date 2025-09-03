@@ -15,17 +15,3 @@ pub async fn run_tui_mode(event_registry: EventRegistry, layout_mode: LayoutMode
     let mut tui_app = TuiApp::new(event_registry, layout_mode).await?;
     tui_app.run().await
 }
-
-pub fn hello() -> String {
-    format!("UI: {}", ghostscope_frontend::hello())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_hello() {
-        assert_eq!(hello(), "UI: Frontend: Hello from ghostscope-compiler!");
-    }
-}

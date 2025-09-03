@@ -1,4 +1,4 @@
-use crate::session::DebugSession;
+use crate::session::GhostSession;
 use anyhow::Result;
 use ghostscope_loader::GhostScopeLoader;
 use std::path::Path;
@@ -8,68 +8,49 @@ use tracing::{error, info, warn};
 pub async fn compile_and_load_script_with_trace_id(
     script: &str,
     trace_id: u32,
-    session: &mut DebugSession,
+    session: &mut GhostSession,
     status_sender: &tokio::sync::mpsc::UnboundedSender<ghostscope_ui::RuntimeStatus>,
 ) -> Result<()> {
     use ghostscope_ui::RuntimeStatus;
 
-    let target = extract_target_from_script(script);
-
-    // Step 1: Parse and validate script
-    let parsed_script = parse_and_validate_script(script)?;
-    let trace_count = parsed_script
-        .statements
-        .iter()
-        .filter(|stmt| matches!(stmt, ghostscope_compiler::ast::Statement::TracePoint { .. }))
-        .count();
-
-    info!(
-        "Parsed script with {} trace points for target: {}",
-        trace_count, target
-    );
-
-    if trace_count == 0 {
-        let error = "Script contains no valid trace points".to_string();
-        let _ = status_sender.send(RuntimeStatus::ScriptCompilationFailed {
-            error: error.clone(),
-            trace_id,
-        });
-        return Err(anyhow::anyhow!(error));
-    }
-
-    // Step 2: Compile to eBPF using existing compiler
-    let binary_path = if let Some(ref analyzer) = session.binary_analyzer {
-        analyzer
-            .debug_info()
-            .binary_path
-            .to_string_lossy()
-            .to_string()
-    } else if let Some(ref binary_path) = session.target_binary {
-        binary_path.clone()
-    } else {
-        let error = "No target binary available for compilation".to_string();
-        let _ = status_sender.send(RuntimeStatus::ScriptCompilationFailed {
-            error: error.clone(),
-            trace_id,
-        });
-        return Err(anyhow::anyhow!(error));
+    // Step 1: Validate binary analyzer availability
+    let binary_analyzer = match session.binary_analyzer.as_ref() {
+        Some(analyzer) => analyzer,
+        None => {
+            let error = "Binary analyzer is required for script compilation".to_string();
+            let _ = status_sender.send(RuntimeStatus::ScriptCompilationFailed {
+                error: error.clone(),
+                trace_id,
+            });
+            return Err(anyhow::anyhow!(error));
+        }
     };
 
-    let binary_path_for_naming = Path::new(&binary_path)
+    // Step 2: Configure save options (no file saving in TUI mode)
+    let binary_path_hint = binary_analyzer
+        .debug_info()
+        .binary_path
         .file_stem()
         .and_then(|s| s.to_str())
-        .unwrap_or("unknown");
+        .map(|s| s.to_string());
 
-    let mut uprobe_configs = match ghostscope_compiler::compile_ast_to_uprobe_configs(
-        &parsed_script,
+    let save_options = ghostscope_compiler::SaveOptions {
+        save_llvm_ir: false,
+        save_ast: false,
+        save_ebpf: false,
+        binary_path_hint,
+    };
+
+    // Step 3: Use unified compilation interface
+    let compilation_result = match ghostscope_compiler::compile_script_to_uprobe_configs(
+        script,
+        binary_analyzer,
         session.target_pid,
-        Some(binary_path_for_naming),
-        false, // don't save LLVM IR in TUI mode
-        session.binary_analyzer.as_ref(),
+        &save_options,
     ) {
-        Ok(configs) => configs,
+        Ok(result) => result,
         Err(e) => {
-            let error = format!("eBPF compilation failed: {}", e);
+            let error = format!("Script compilation failed: {}", e);
             let _ = status_sender.send(RuntimeStatus::ScriptCompilationFailed {
                 error: error.clone(),
                 trace_id,
@@ -79,18 +60,34 @@ pub async fn compile_and_load_script_with_trace_id(
     };
 
     info!(
-        "eBPF compilation successful, generated {} uprobe configurations for target: {}",
-        uprobe_configs.len(),
-        target
+        "Script compilation successful: {} trace points found, {} uprobe configs generated, target: {}",
+        compilation_result.trace_count,
+        compilation_result.uprobe_configs.len(),
+        compilation_result.target_info
     );
 
-    // Step 3: Process each uprobe configuration and create trace instances
-    for (i, config) in uprobe_configs.iter_mut().enumerate() {
+    if compilation_result.uprobe_configs.is_empty() {
+        let error = "No valid uprobe configurations generated from script".to_string();
+        let _ = status_sender.send(RuntimeStatus::ScriptCompilationFailed {
+            error: error.clone(),
+            trace_id,
+        });
+        return Err(anyhow::anyhow!(error));
+    }
+
+    // Step 4: Get binary path for trace instances
+    let binary_path = binary_analyzer
+        .debug_info()
+        .binary_path
+        .to_string_lossy()
+        .to_string();
+
+    // Step 5: Process each uprobe configuration and create trace instances
+    for (i, mut config) in compilation_result.uprobe_configs.into_iter().enumerate() {
         config.binary_path = binary_path.clone();
-        config.target_pid = session.target_pid;
 
         let (function_name, uprobe_offset) =
-            match resolve_uprobe_config(config, session, status_sender).await {
+            match resolve_uprobe_config(&mut config, session, status_sender).await {
                 Ok((name, offset)) => (name, offset),
                 Err(e) => {
                     warn!("Failed to resolve uprobe config {}: {}", i, e);
@@ -98,7 +95,7 @@ pub async fn compile_and_load_script_with_trace_id(
                 }
             };
 
-        // Create eBPF loader
+        // Step 6: Create GhostScopeLoader with compiled eBPF bytecode
         let loader = match GhostScopeLoader::new(&config.ebpf_bytecode) {
             Ok(loader) => loader,
             Err(e) => {
@@ -107,9 +104,9 @@ pub async fn compile_and_load_script_with_trace_id(
             }
         };
 
-        // Add trace instance to TraceManager
+        // Step 7: Add trace instance to TraceManager
         let actual_trace_id = session.trace_manager.add_trace(
-            target.clone(),
+            compilation_result.target_info.clone(),
             script.to_string(),
             loader,
             binary_path.clone(),
@@ -123,7 +120,7 @@ pub async fn compile_and_load_script_with_trace_id(
             actual_trace_id, function_name, i
         );
 
-        // Activate the trace instance (attach uprobe)
+        // Step 8: Activate the trace instance (attach uprobe)
         if let Err(e) = session.trace_manager.activate_trace(actual_trace_id).await {
             error!("Failed to activate trace {}: {}", actual_trace_id, e);
             // Remove failed trace
@@ -137,11 +134,11 @@ pub async fn compile_and_load_script_with_trace_id(
         );
     }
 
-    // Check if any traces were successfully created
+    // Step 9: Check if any traces were successfully created
     if session.trace_manager.active_trace_count() > 0 {
         let _ = status_sender.send(RuntimeStatus::ScriptCompilationCompleted { trace_id });
         info!(
-            "Script compilation and loading completed successfully with {} active traces",
+            "Script compilation and loading completed successfully using unified interface with {} active traces",
             session.trace_manager.active_trace_count()
         );
         Ok(())
@@ -174,7 +171,7 @@ pub fn extract_target_from_script(script: &str) -> String {
 /// Uses unified DWARF query interfaces for cleaner code
 async fn resolve_uprobe_config(
     config: &mut ghostscope_compiler::UProbeConfig,
-    session: &DebugSession,
+    session: &GhostSession,
     status_sender: &tokio::sync::mpsc::UnboundedSender<ghostscope_ui::RuntimeStatus>,
 ) -> Result<(String, Option<u64>)> {
     use ghostscope_ui::RuntimeStatus;

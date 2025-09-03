@@ -279,6 +279,248 @@ pub fn generate_ebpf_function_name(
     }
 }
 
+/// Unified script compilation interface - from script source to ready-to-use uprobe configs
+/// This is the main interface that both command line and TUI should use
+///
+/// # Arguments
+/// * `script_source` - The script source code to compile
+/// * `binary_analyzer` - Binary analyzer for address resolution (immutable reference)
+/// * `pid` - Optional target PID for filtering
+/// * `save_options` - Options for saving intermediate files (IR, AST, etc.)
+///
+/// # Returns
+/// * `CompilationResult` - Contains uprobe configs ready for attachment and metadata
+#[derive(Debug)]
+pub struct SaveOptions {
+    pub save_llvm_ir: bool,
+    pub save_ast: bool,
+    pub save_ebpf: bool,
+    pub binary_path_hint: Option<String>, // For file naming
+}
+
+#[derive(Debug)]
+pub struct CompilationResult {
+    pub uprobe_configs: Vec<UProbeConfig>,
+    pub trace_count: usize,
+    pub target_info: String, // Extracted target information
+    pub compilation_metadata: CompilationMetadata,
+}
+
+#[derive(Debug)]
+pub struct CompilationMetadata {
+    pub parsed_successfully: bool,
+    pub trace_patterns_found: usize,
+    pub compilation_warnings: Vec<String>,
+}
+
+/// Main unified compilation interface
+pub fn compile_script_to_uprobe_configs(
+    script_source: &str,
+    binary_analyzer: &ghostscope_binary::BinaryAnalyzer,
+    pid: Option<u32>,
+    save_options: &SaveOptions,
+) -> Result<CompilationResult> {
+    info!("Starting unified script compilation...");
+
+    // Step 1: Parse and validate script
+    let program = parser::parse(script_source)?;
+
+    // Step 2: Extract target information and trace count
+    let target_info = extract_target_from_script(script_source);
+    let trace_count = program
+        .statements
+        .iter()
+        .filter(|stmt| matches!(stmt, crate::ast::Statement::TracePoint { .. }))
+        .count();
+
+    info!(
+        "Parsed script with {} trace points, target: {}",
+        trace_count, target_info
+    );
+
+    // Step 3: Save AST if requested
+    if save_options.save_ast {
+        let ast_filename =
+            generate_file_name_for_ast(pid, save_options.binary_path_hint.as_deref());
+        save_ast_to_file(&program, &ast_filename)?;
+        info!("AST saved to '{}'", ast_filename);
+    }
+
+    // Step 4: Compile AST to uprobe configs with address resolution
+    let mut uprobe_configs = compile_ast_to_uprobe_configs(
+        &program,
+        pid,
+        save_options.binary_path_hint.as_deref(),
+        save_options.save_llvm_ir,
+        Some(binary_analyzer),
+    )?;
+
+    // Step 5: Resolve addresses for all configs using unified interfaces
+    resolve_addresses_for_configs(&mut uprobe_configs, binary_analyzer)?;
+
+    // Step 6: Save eBPF bytecode if requested
+    if save_options.save_ebpf {
+        save_ebpf_bytecode_files(&uprobe_configs, save_options.binary_path_hint.as_deref())?;
+    }
+
+    let result = CompilationResult {
+        uprobe_configs,
+        trace_count,
+        target_info,
+        compilation_metadata: CompilationMetadata {
+            parsed_successfully: true,
+            trace_patterns_found: trace_count,
+            compilation_warnings: vec![], // TODO: collect warnings during compilation
+        },
+    };
+
+    info!("Script compilation completed successfully");
+    Ok(result)
+}
+
+/// Extract target from script source (e.g., "trace main { ... }" -> "main")
+fn extract_target_from_script(script_source: &str) -> String {
+    if let Some(trace_start) = script_source.find("trace ") {
+        let after_trace = &script_source[trace_start + 6..]; // "trace ".len() = 6
+        if let Some(first_space_or_brace) =
+            after_trace.find(|c: char| c.is_whitespace() || c == '{')
+        {
+            return after_trace[..first_space_or_brace].trim().to_string();
+        } else {
+            return after_trace.trim().to_string();
+        }
+    }
+    "unknown".to_string()
+}
+
+/// Resolve addresses for all uprobe configs using unified DWARF interfaces
+fn resolve_addresses_for_configs(
+    configs: &mut [UProbeConfig],
+    binary_analyzer: &ghostscope_binary::BinaryAnalyzer,
+) -> Result<()> {
+    info!(
+        "Resolving addresses for {} uprobe configurations",
+        configs.len()
+    );
+
+    for (i, config) in configs.iter_mut().enumerate() {
+        match &config.trace_pattern {
+            crate::ast::TracePattern::FunctionName(function_name) => {
+                info!("  {}: Resolving function '{}'", i, function_name);
+
+                match (
+                    binary_analyzer.resolve_function_address(function_name),
+                    binary_analyzer.resolve_function_uprobe_offset(function_name),
+                ) {
+                    (Some(address), Some(uprobe_offset)) => {
+                        config.function_address = Some(address);
+                        config.uprobe_offset = Some(uprobe_offset);
+                        info!(
+                            "    ✓ Resolved to address 0x{:x}, uprobe offset 0x{:x}",
+                            address, uprobe_offset
+                        );
+                    }
+                    (Some(address), None) => {
+                        return Err(CompileError::Other(format!(
+                            "Function '{}' found at address 0x{:x} but uprobe offset calculation failed",
+                            function_name, address
+                        )));
+                    }
+                    (None, _) => {
+                        return Err(CompileError::Other(format!(
+                            "Function '{}' not found in symbol table",
+                            function_name
+                        )));
+                    }
+                }
+            }
+            crate::ast::TracePattern::SourceLine {
+                file_path,
+                line_number,
+            } => {
+                info!(
+                    "  {}: Resolving source line '{}:{}'",
+                    i, file_path, line_number
+                );
+
+                match (
+                    binary_analyzer.resolve_source_line_address(file_path, *line_number),
+                    binary_analyzer.resolve_source_line_uprobe_offset(file_path, *line_number),
+                ) {
+                    (Some(address), Some(uprobe_offset)) => {
+                        config.function_address = Some(address);
+                        config.uprobe_offset = Some(uprobe_offset);
+                        info!(
+                            "    ✓ Resolved to address 0x{:x}, uprobe offset 0x{:x}",
+                            address, uprobe_offset
+                        );
+                    }
+                    (Some(address), None) => {
+                        return Err(CompileError::Other(format!(
+                            "Source line '{}:{}' found at address 0x{:x} but uprobe offset calculation failed",
+                            file_path, line_number, address
+                        )));
+                    }
+                    (None, _) => {
+                        return Err(CompileError::Other(format!(
+                            "No addresses found for source line '{}:{}'",
+                            file_path, line_number
+                        )));
+                    }
+                }
+            }
+            crate::ast::TracePattern::Address(addr) => {
+                info!("  {}: Using direct address 0x{:x}", i, addr);
+                config.function_address = Some(*addr);
+                config.uprobe_offset = Some(*addr);
+            }
+            crate::ast::TracePattern::Wildcard(pattern) => {
+                return Err(CompileError::Other(format!(
+                    "Wildcard pattern '{}' not yet implemented",
+                    pattern
+                )));
+            }
+        }
+    }
+
+    info!("Address resolution completed for all configs");
+    Ok(())
+}
+
+/// Save AST to file
+fn save_ast_to_file(program: &Program, filename: &str) -> Result<()> {
+    let ast_content = format!("{:#?}", program);
+    std::fs::write(filename, ast_content)
+        .map_err(|e| CompileError::Other(format!("Failed to save AST to '{}': {}", filename, e)))?;
+    Ok(())
+}
+
+/// Save eBPF bytecode files for all configs
+fn save_ebpf_bytecode_files(
+    configs: &[UProbeConfig],
+    binary_path_hint: Option<&str>,
+) -> Result<()> {
+    for (index, config) in configs.iter().enumerate() {
+        let file_base_name = generate_file_name(
+            &config.trace_pattern,
+            index,
+            config.target_pid,
+            binary_path_hint,
+        );
+        let ebpf_filename = format!("{}.o", file_base_name);
+
+        std::fs::write(&ebpf_filename, &config.ebpf_bytecode).map_err(|e| {
+            CompileError::Other(format!(
+                "Failed to save eBPF bytecode to '{}': {}",
+                ebpf_filename, e
+            ))
+        })?;
+
+        info!("eBPF bytecode saved to '{}'", ebpf_filename);
+    }
+    Ok(())
+}
+
 /// Compiles a string of source code in our small language to LLVM IR
 /// Note: This will use BPF target functions (e.g., bpf_trace_printk) by default
 pub fn compile_to_llvm_ir(source: &str) -> Result<String> {
