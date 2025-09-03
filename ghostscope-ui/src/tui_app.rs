@@ -818,11 +818,8 @@ impl TuiApp {
                 );
             }
             RuntimeStatus::TraceEnabled { trace_id } => {
-                self.interactive_command_panel.add_response(
-                    format!("✅ Trace {} enabled successfully", trace_id),
-                    ResponseType::Success,
-                );
-                // Update trace status to Active
+                // Handle sync response for enable command and update trace status
+                self.interactive_command_panel.handle_command_completed();
                 self.interactive_command_panel.update_trace_status(
                     crate::trace::TraceStatus::Active,
                     *trace_id,
@@ -831,11 +828,8 @@ impl TuiApp {
                 info!("Trace {} enabled successfully", trace_id);
             }
             RuntimeStatus::TraceDisabled { trace_id } => {
-                self.interactive_command_panel.add_response(
-                    format!("✅ Trace {} disabled successfully", trace_id),
-                    ResponseType::Success,
-                );
-                // Update trace status to Disabled
+                // Handle sync response for disable command and update trace status
+                self.interactive_command_panel.handle_command_completed();
                 self.interactive_command_panel.update_trace_status(
                     crate::trace::TraceStatus::Disabled,
                     *trace_id,
@@ -844,39 +838,28 @@ impl TuiApp {
                 info!("Trace {} disabled successfully", trace_id);
             }
             RuntimeStatus::AllTracesEnabled { count } => {
-                self.interactive_command_panel.add_response(
-                    format!("✅ All traces enabled successfully ({} traces)", count),
-                    ResponseType::Success,
-                );
+                // Handle sync response for enable all command
+                self.interactive_command_panel.handle_command_completed();
                 info!("All traces enabled successfully ({} traces)", count);
             }
             RuntimeStatus::AllTracesDisabled { count } => {
-                self.interactive_command_panel.add_response(
-                    format!("✅ All traces disabled successfully ({} traces)", count),
-                    ResponseType::Success,
-                );
+                // Handle sync response for disable all command
+                self.interactive_command_panel.handle_command_completed();
                 info!("All traces disabled successfully ({} traces)", count);
             }
             RuntimeStatus::TraceEnableFailed { trace_id, error } => {
-                self.interactive_command_panel.add_response(
-                    format!("✗ Failed to enable trace {}: {}", trace_id, error),
-                    ResponseType::Error,
-                );
+                // Handle sync failure for enable command
+                self.interactive_command_panel.handle_command_failed(error);
                 error!("Failed to enable trace {}: {}", trace_id, error);
             }
             RuntimeStatus::TraceDisableFailed { trace_id, error } => {
-                self.interactive_command_panel.add_response(
-                    format!("✗ Failed to disable trace {}: {}", trace_id, error),
-                    ResponseType::Error,
-                );
+                // Handle sync failure for disable command
+                self.interactive_command_panel.handle_command_failed(error);
                 error!("Failed to disable trace {}: {}", trace_id, error);
             }
             RuntimeStatus::TraceDeleted { trace_id } => {
-                self.interactive_command_panel.add_response(
-                    format!("✅ Trace {} deleted successfully", trace_id),
-                    ResponseType::Success,
-                );
-                // Remove trace from UI trace manager
+                // Handle sync response for delete command and remove trace from UI
+                self.interactive_command_panel.handle_command_completed();
                 self.interactive_command_panel
                     .trace_manager
                     .remove_trace(*trace_id);
@@ -886,22 +869,23 @@ impl TuiApp {
                 );
             }
             RuntimeStatus::AllTracesDeleted { count } => {
-                self.interactive_command_panel.add_response(
-                    format!("✅ All traces deleted successfully ({} traces)", count),
-                    ResponseType::Success,
-                );
-                // Clear all traces from UI trace manager
+                // Handle sync response for delete all command and clear all traces
+                self.interactive_command_panel.handle_command_completed();
                 self.interactive_command_panel
                     .trace_manager
                     .clear_all_traces();
                 info!("All traces deleted successfully ({} traces)", count);
             }
             RuntimeStatus::TraceDeleteFailed { trace_id, error } => {
-                self.interactive_command_panel.add_response(
-                    format!("✗ Failed to delete trace {}: {}", trace_id, error),
-                    ResponseType::Error,
-                );
+                // Handle sync failure for delete command
+                self.interactive_command_panel.handle_command_failed(error);
                 error!("Failed to delete trace {}: {}", trace_id, error);
+            }
+
+            RuntimeStatus::Error(error) => {
+                // Handle sync failure for batch operations that send generic errors
+                self.interactive_command_panel.handle_command_failed(error);
+                error!("Runtime error: {}", error);
             }
             _ => {}
         }

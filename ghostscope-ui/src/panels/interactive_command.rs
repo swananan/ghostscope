@@ -24,8 +24,20 @@ pub enum InputState {
         // Waiting for response, completely hide input
         command: String,
         sent_time: Instant,
+        command_type: CommandType,
     },
     ScriptEditor, // Script editing mode
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CommandType {
+    Script { trace_id: u32 },
+    Enable { trace_id: u32 },
+    Disable { trace_id: u32 },
+    Delete { trace_id: u32 },
+    EnableAll,
+    DisableAll,
+    DeleteAll,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -367,14 +379,26 @@ impl InteractiveCommandPanel {
     }
 
     /// Parse disable/enable/delete commands and return appropriate CommandAction
-    fn parse_enable_disable_command(&self, command: &str) -> Option<CommandAction> {
+    fn parse_enable_disable_command_sync(&mut self, command: &str) -> Option<CommandAction> {
         let cmd = command.trim();
 
         if cmd.starts_with("disable ") {
             let args = cmd.strip_prefix("disable ").unwrap().trim();
             if args == "all" {
+                // Set waiting state for disable all
+                self.input_state = InputState::WaitingResponse {
+                    command: command.to_string(),
+                    sent_time: Instant::now(),
+                    command_type: CommandType::DisableAll,
+                };
                 Some(CommandAction::DisableAllTraces)
             } else if let Ok(trace_id) = args.parse::<u32>() {
+                // Set waiting state for specific trace disable
+                self.input_state = InputState::WaitingResponse {
+                    command: command.to_string(),
+                    sent_time: Instant::now(),
+                    command_type: CommandType::Disable { trace_id },
+                };
                 Some(CommandAction::DisableTrace(trace_id))
             } else {
                 None // Invalid trace ID
@@ -382,8 +406,20 @@ impl InteractiveCommandPanel {
         } else if cmd.starts_with("enable ") {
             let args = cmd.strip_prefix("enable ").unwrap().trim();
             if args == "all" {
+                // Set waiting state for enable all
+                self.input_state = InputState::WaitingResponse {
+                    command: command.to_string(),
+                    sent_time: Instant::now(),
+                    command_type: CommandType::EnableAll,
+                };
                 Some(CommandAction::EnableAllTraces)
             } else if let Ok(trace_id) = args.parse::<u32>() {
+                // Set waiting state for specific trace enable
+                self.input_state = InputState::WaitingResponse {
+                    command: command.to_string(),
+                    sent_time: Instant::now(),
+                    command_type: CommandType::Enable { trace_id },
+                };
                 Some(CommandAction::EnableTrace(trace_id))
             } else {
                 None // Invalid trace ID
@@ -391,8 +427,20 @@ impl InteractiveCommandPanel {
         } else if cmd.starts_with("delete ") {
             let args = cmd.strip_prefix("delete ").unwrap().trim();
             if args == "all" {
+                // Set waiting state for delete all
+                self.input_state = InputState::WaitingResponse {
+                    command: command.to_string(),
+                    sent_time: Instant::now(),
+                    command_type: CommandType::DeleteAll,
+                };
                 Some(CommandAction::DeleteAllTraces)
             } else if let Ok(trace_id) = args.parse::<u32>() {
+                // Set waiting state for specific trace delete
+                self.input_state = InputState::WaitingResponse {
+                    command: command.to_string(),
+                    sent_time: Instant::now(),
+                    command_type: CommandType::Delete { trace_id },
+                };
                 Some(CommandAction::DeleteTrace(trace_id))
             } else {
                 None // Invalid trace ID
@@ -447,8 +495,9 @@ impl InteractiveCommandPanel {
                     // Update static lines after clearing input
                     self.update_static_lines();
                     return None; // No external action needed
-                } else if let Some(action) = self.parse_enable_disable_command(&command) {
-                    // Handle disable/enable commands
+                } else if let Some(action) = self.parse_enable_disable_command_sync(&command) {
+                    // Handle disable/enable/delete commands in sync mode
+                    self.update_static_lines();
                     action
                 } else if command.trim().starts_with("trace ") {
                     // Two-step trace interaction: parse target and enter script editor
@@ -645,6 +694,7 @@ impl InteractiveCommandPanel {
             self.input_state = InputState::WaitingResponse {
                 command: command.clone(),
                 sent_time: Instant::now(),
+                command_type: CommandType::Script { trace_id },
             };
             debug!("Set input_state to WaitingResponse");
 
@@ -682,39 +732,63 @@ impl InteractiveCommandPanel {
         self.trace_manager
             .update_trace_status(trace_id, status.clone(), error_message.clone());
 
-        // Update UI based on status change
-        match status {
-            TraceStatus::Failed => {
-                if let Some(error) = &error_message {
-                    // Add error response if we're waiting for a response
-                    if let InputState::WaitingResponse { .. } = &self.input_state {
-                        self.add_error_response_and_clear_waiting(error);
+        // Update UI based on status change - only handle script-related status here
+        // Other command types are handled by handle_command_completed/failed
+        if let InputState::WaitingResponse { command_type, .. } = &self.input_state {
+            match command_type {
+                CommandType::Script { .. } => {
+                    // Only handle script compilation status changes
+                    match status {
+                        TraceStatus::Failed => {
+                            if let Some(error) = &error_message {
+                                self.add_error_response_and_clear_waiting(error);
+                            }
+                        }
+                        TraceStatus::Active => {
+                            self.add_success_response_and_clear_waiting();
+                        }
+                        _ => {
+                            // For other status changes, do nothing
+                        }
                     }
                 }
-            }
-            TraceStatus::Active => {
-                // Script compilation succeeded
-                if let InputState::WaitingResponse { .. } = &self.input_state {
-                    self.add_success_response_and_clear_waiting();
+                _ => {
+                    // Non-script commands are handled by specific command completion handlers
+                    // Don't process trace status changes for these
                 }
-            }
-            _ => {
-                // For other status changes, do nothing
             }
         }
     }
 
     /// Add error response and clear waiting state
     fn add_error_response_and_clear_waiting(&mut self, error: &str) {
-        if let Some(last_item) = self.command_history.last_mut() {
-            let error_response = format!("❌ Script compilation failed: {}", error);
-            // If there's already a script display, append error message
-            if let Some(existing_response) = &last_item.response {
-                last_item.response = Some(format!("{}\n\n{}", existing_response, error_response));
-            } else {
-                last_item.response = Some(error_response);
+        if let InputState::WaitingResponse { command_type, .. } = &self.input_state {
+            let error_message = match command_type {
+                CommandType::Script { .. } => format!("❌ Script compilation failed: {}", error),
+                CommandType::Enable { trace_id } => {
+                    format!("❌ Failed to enable trace {}: {}", trace_id, error)
+                }
+                CommandType::Disable { trace_id } => {
+                    format!("❌ Failed to disable trace {}: {}", trace_id, error)
+                }
+                CommandType::Delete { trace_id } => {
+                    format!("❌ Failed to delete trace {}: {}", trace_id, error)
+                }
+                CommandType::EnableAll => format!("❌ Failed to enable all traces: {}", error),
+                CommandType::DisableAll => format!("❌ Failed to disable all traces: {}", error),
+                CommandType::DeleteAll => format!("❌ Failed to delete all traces: {}", error),
+            };
+
+            if let Some(last_item) = self.command_history.last_mut() {
+                // If there's already a script display, append error message
+                if let Some(existing_response) = &last_item.response {
+                    last_item.response =
+                        Some(format!("{}\n\n{}", existing_response, error_message));
+                } else {
+                    last_item.response = Some(error_message);
+                }
+                last_item.response_type = Some(ResponseType::Error);
             }
-            last_item.response_type = Some(ResponseType::Error);
         }
 
         // Clear waiting state
@@ -725,21 +799,71 @@ impl InteractiveCommandPanel {
 
     /// Add success response and clear waiting state
     fn add_success_response_and_clear_waiting(&mut self) {
-        if let Some(last_item) = self.command_history.last_mut() {
-            let success_response = format!("✅ Script compiled and loaded successfully");
-            // If there's already a script display, append success message
-            if let Some(existing_response) = &last_item.response {
-                last_item.response = Some(format!("{}\n\n{}", existing_response, success_response));
-            } else {
-                last_item.response = Some(success_response);
+        if let InputState::WaitingResponse { command_type, .. } = &self.input_state {
+            let success_message = match command_type {
+                CommandType::Script { .. } => {
+                    "✅ Script compiled and loaded successfully".to_string()
+                }
+                CommandType::Enable { trace_id } => {
+                    format!("✅ Trace {} enabled successfully", trace_id)
+                }
+                CommandType::Disable { trace_id } => {
+                    format!("✅ Trace {} disabled successfully", trace_id)
+                }
+                CommandType::Delete { trace_id } => {
+                    format!("✅ Trace {} deleted successfully", trace_id)
+                }
+                CommandType::EnableAll => "✅ All traces enabled successfully".to_string(),
+                CommandType::DisableAll => "✅ All traces disabled successfully".to_string(),
+                CommandType::DeleteAll => "✅ All traces deleted successfully".to_string(),
+            };
+
+            if let Some(last_item) = self.command_history.last_mut() {
+                // If there's already a script display, append success message
+                if let Some(existing_response) = &last_item.response {
+                    last_item.response =
+                        Some(format!("{}\n\n{}", existing_response, success_message));
+                } else {
+                    last_item.response = Some(success_message);
+                }
+                last_item.response_type = Some(ResponseType::Success);
             }
-            last_item.response_type = Some(ResponseType::Success);
         }
 
         // Clear waiting state
         self.input_state = InputState::Ready;
         self.update_static_lines();
         debug!("Added success response and cleared waiting state");
+    }
+
+    /// Handle command completion (for non-script commands like enable/disable/delete)
+    pub fn handle_command_completed(&mut self) {
+        if let InputState::WaitingResponse { command_type, .. } = &self.input_state {
+            match command_type {
+                CommandType::Script { .. } => {
+                    // Script completion is handled by update_trace_status
+                }
+                _ => {
+                    // Handle other command completions
+                    self.add_success_response_and_clear_waiting();
+                }
+            }
+        }
+    }
+
+    /// Handle command failure (for non-script commands like enable/disable/delete)  
+    pub fn handle_command_failed(&mut self, error: &str) {
+        if let InputState::WaitingResponse { command_type, .. } = &self.input_state {
+            match command_type {
+                CommandType::Script { .. } => {
+                    // Script failures are handled by update_trace_status
+                }
+                _ => {
+                    // Handle other command failures
+                    self.add_error_response_and_clear_waiting(error);
+                }
+            }
+        }
     }
 
     /// Cancel script editing and return to input mode
