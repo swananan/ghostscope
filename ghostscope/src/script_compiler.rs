@@ -171,6 +171,7 @@ pub fn extract_target_from_script(script: &str) -> String {
 }
 
 /// Resolve uprobe configuration to function name and offset
+/// Uses unified DWARF query interfaces for cleaner code
 async fn resolve_uprobe_config(
     config: &mut ghostscope_compiler::UProbeConfig,
     session: &DebugSession,
@@ -178,112 +179,79 @@ async fn resolve_uprobe_config(
 ) -> Result<(String, Option<u64>)> {
     use ghostscope_ui::RuntimeStatus;
 
+    let analyzer = session
+        .binary_analyzer
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("No binary analyzer available for address resolution"))?;
+
     match &config.trace_pattern {
         ghostscope_compiler::ast::TracePattern::FunctionName(function_name) => {
-            if let Some(ref analyzer) = session.binary_analyzer {
-                if let Some(symbol) = analyzer.find_symbol(function_name) {
-                    config.function_address = Some(symbol.address);
-                    let uprobe_offset = if let Some(uprobe_offset) = symbol.uprobe_offset() {
-                        config.uprobe_offset = Some(uprobe_offset);
-                        Some(uprobe_offset)
-                    } else {
-                        config.uprobe_offset = Some(symbol.address);
-                        Some(symbol.address)
-                    };
+            // Use unified function address resolution
+            let address = analyzer
+                .resolve_function_address(function_name)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Function '{}' not found in binary", function_name)
+                })?;
 
-                    info!(
-                        "Resolved function '{}' to address 0x{:x}",
-                        function_name, symbol.address
-                    );
+            let uprobe_offset = analyzer
+                .resolve_function_uprobe_offset(function_name)
+                .unwrap_or(address); // Fallback to address if uprobe offset calculation fails
 
-                    // Send uprobe attached status
-                    let _ = status_sender.send(RuntimeStatus::UprobeAttached {
-                        function: function_name.clone(),
-                        address: symbol.address,
-                    });
+            // Update config
+            config.function_address = Some(address);
+            config.uprobe_offset = Some(uprobe_offset);
 
-                    Ok((function_name.clone(), uprobe_offset))
-                } else {
-                    Err(anyhow::anyhow!(
-                        "Function '{}' not found in binary",
-                        function_name
-                    ))
-                }
-            } else {
-                Err(anyhow::anyhow!(
-                    "No binary analyzer available for address resolution"
-                ))
-            }
+            info!(
+                "Resolved function '{}' to address 0x{:x}",
+                function_name, address
+            );
+
+            // Send uprobe attached status
+            let _ = status_sender.send(RuntimeStatus::UprobeAttached {
+                function: function_name.clone(),
+                address,
+            });
+
+            Ok((function_name.clone(), Some(uprobe_offset)))
         }
         ghostscope_compiler::ast::TracePattern::SourceLine {
             file_path,
             line_number,
         } => {
-            if let Some(ref analyzer) = session.binary_analyzer {
-                if let Some(dwarf_context) = analyzer.dwarf_context() {
-                    let line_mappings =
-                        dwarf_context.get_addresses_for_line(file_path, *line_number);
+            // Use unified source line address resolution
+            let address = analyzer
+                .resolve_source_line_address(file_path, *line_number)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "No addresses found for source line {}:{}",
+                        file_path,
+                        line_number
+                    )
+                })?;
 
-                    if !line_mappings.is_empty() {
-                        // Use the first resolved address
-                        let line_mapping = &line_mappings[0];
-                        let resolved_address = line_mapping.address;
+            let uprobe_offset = analyzer
+                .resolve_source_line_uprobe_offset(file_path, *line_number)
+                .unwrap_or(address); // Fallback to address if uprobe offset calculation fails
 
-                        if let Some(symbol) = analyzer.find_symbol_by_address(resolved_address) {
-                            // Found exact symbol match, use symbol's uprobe offset
-                            if let Some(uprobe_offset) = symbol.uprobe_offset() {
-                                config.function_name = None;
-                                config.function_address = Some(resolved_address);
-                                config.uprobe_offset = Some(uprobe_offset);
+            // Update config
+            config.function_name = None;
+            config.function_address = Some(address);
+            config.uprobe_offset = Some(uprobe_offset);
 
-                                let function_name = format!("{}:{}", file_path, line_number);
+            let function_name = format!("{}:{}", file_path, line_number);
 
-                                // Send uprobe attached status for source line
-                                let _ = status_sender.send(RuntimeStatus::UprobeAttached {
-                                    function: function_name.clone(),
-                                    address: resolved_address,
-                                });
+            info!(
+                "Resolved source line '{}:{}' to address 0x{:x}",
+                file_path, line_number, address
+            );
 
-                                Ok((function_name, Some(uprobe_offset)))
-                            } else {
-                                Err(anyhow::anyhow!(
-                                    "Failed to calculate uprobe offset for symbol at address 0x{:x}",
-                                    resolved_address
-                                ))
-                            }
-                        } else {
-                            // No symbol found, but we have precise DWARF address - use it directly
-                            config.function_name = None;
-                            config.function_address = Some(resolved_address);
-                            config.uprobe_offset = Some(resolved_address); // Use the DWARF address directly
+            // Send uprobe attached status for source line
+            let _ = status_sender.send(RuntimeStatus::UprobeAttached {
+                function: function_name.clone(),
+                address,
+            });
 
-                            let function_name = format!("{}:{}", file_path, line_number);
-
-                            // Send uprobe attached status for source line
-                            let _ = status_sender.send(RuntimeStatus::UprobeAttached {
-                                function: function_name.clone(),
-                                address: resolved_address,
-                            });
-
-                            Ok((function_name, Some(resolved_address)))
-                        }
-                    } else {
-                        Err(anyhow::anyhow!(
-                            "No addresses found for source line {}:{}",
-                            file_path,
-                            line_number
-                        ))
-                    }
-                } else {
-                    Err(anyhow::anyhow!(
-                        "No DWARF context available for line number resolution"
-                    ))
-                }
-            } else {
-                Err(anyhow::anyhow!(
-                    "No binary analyzer available for source line resolution"
-                ))
-            }
+            Ok((function_name, Some(uprobe_offset)))
         }
         _ => Err(anyhow::anyhow!(
             "Trace pattern not yet supported: {:?}",

@@ -30,14 +30,12 @@ async fn main() -> Result<()> {
     // Step 1: Parse and validate command line arguments
     let parsed_args = args::Args::parse_args();
 
-    // Check if we should start in TUI mode
-    if parsed_args.tui_mode {
-        return run_tui_runtime(parsed_args).await;
-    }
-
     // Initialize logging first so we can use it for validation
     let log_file_path = parsed_args.log_file.as_ref().and_then(|p| p.to_str());
-    if let Err(e) = logging::initialize_logging(log_file_path, false) {
+    if let Err(e) = logging::initialize_logging(
+        log_file_path,
+        if parsed_args.tui_mode { true } else { false },
+    ) {
         eprintln!("Failed to initialize logging: {}", e);
         return Err(anyhow::anyhow!("Failed to initialize logging: {}", e));
     }
@@ -45,16 +43,9 @@ async fn main() -> Result<()> {
     // Step 1.1: Validate arguments immediately
     validate_arguments(&parsed_args)?;
 
-    // Step 2: Validate PID existence if specified
-    if let Some(pid) = parsed_args.pid {
-        if !is_pid_running(pid) {
-            return Err(anyhow::anyhow!(
-                "Process with PID {} is not running. Use 'ps -p {}' to verify the process exists",
-                pid,
-                pid
-            ));
-        }
-        info!("✓ Target PID {} is running", pid);
+    // Check if we should start in TUI mode
+    if parsed_args.tui_mode {
+        return run_tui_runtime(parsed_args).await;
     }
 
     // Step 3: Parse and validate script syntax early
@@ -238,47 +229,43 @@ async fn main() -> Result<()> {
                     ));
                 };
 
+                // Use unified address resolution interfaces to simplify code
                 for (i, config) in uprobe_configs.iter_mut().enumerate() {
                     // Update binary path and target PID for each config
                     config.binary_path = binary_path.clone();
                     config.target_pid = session.target_pid;
 
-                    match &config.trace_pattern {
-                        ghostscope_compiler::ast::TracePattern::FunctionName(function_name) => {
-                            info!(
-                                "  {}: Function '{}' - looking up in symbol table",
-                                i, function_name
-                            );
+                    if let Some(ref analyzer) = session.binary_analyzer {
+                        match &config.trace_pattern {
+                            ghostscope_compiler::ast::TracePattern::FunctionName(function_name) => {
+                                info!("  {}: Function '{}' - resolving address", i, function_name);
 
-                            if let Some(ref analyzer) = session.binary_analyzer {
-                                match analyzer.find_symbol(function_name) {
-                                    Some(symbol) => {
-                                        info!(
-                                            "    Found function '{}' at address 0x{:x}",
-                                            function_name, symbol.address
-                                        );
+                                match (
+                                    analyzer.resolve_function_address(function_name),
+                                    analyzer.resolve_function_uprobe_offset(function_name),
+                                ) {
+                                    (Some(address), Some(uprobe_offset)) => {
+                                        config.function_name = Some(function_name.clone());
+                                        config.function_address = Some(address);
+                                        config.uprobe_offset = Some(uprobe_offset);
 
-                                        // Calculate uprobe offset
-                                        if let Some(uprobe_offset) = symbol.uprobe_offset() {
-                                            info!(
-                                                "    Calculated uprobe offset: 0x{:x}",
-                                                uprobe_offset
-                                            );
+                                        info!("    ✓ Resolved to address 0x{:x}, uprobe offset 0x{:x}", 
+                                              address, uprobe_offset);
+                                    }
+                                    (Some(address), None) => {
+                                        warn!("    ✗ Found address 0x{:x} but failed to calculate uprobe offset", address);
 
-                                            // Update config with resolved addresses
-                                            config.function_name = Some(function_name.clone());
-                                            config.function_address = Some(symbol.address);
-                                            config.uprobe_offset = Some(uprobe_offset);
-
-                                            info!(
-                                                "    ✓ UProbe config updated for function '{}'",
-                                                function_name
-                                            );
-                                        } else {
-                                            warn!("    ✗ Unable to calculate uprobe offset for function '{}'", function_name);
+                                        // Show similar function names for debugging
+                                        let similar =
+                                            analyzer.symbol_table.find_matching(function_name);
+                                        if !similar.is_empty() {
+                                            info!("    Similar functions found:");
+                                            for sym in similar.iter().take(5) {
+                                                info!("      {}", sym.name);
+                                            }
                                         }
                                     }
-                                    None => {
+                                    (None, _) => {
                                         warn!(
                                             "    ✗ Function '{}' not found in symbol table",
                                             function_name
@@ -295,124 +282,72 @@ async fn main() -> Result<()> {
                                         }
                                     }
                                 }
-                            } else {
-                                warn!("    ✗ No binary analyzer available for symbol lookup");
                             }
-                        }
-                        ghostscope_compiler::ast::TracePattern::Wildcard(pattern) => {
-                            info!(
-                                "  {}: Wildcard '{}' - pattern matching not yet implemented",
-                                i, pattern
-                            );
-                        }
-                        ghostscope_compiler::ast::TracePattern::Address(addr) => {
-                            info!("  {}: Address 0x{:x} - direct attachment", i, addr);
-
-                            // Update config with address information
-                            config.function_name = None;
-                            config.function_address = Some(*addr);
-                            config.uprobe_offset = Some(*addr); // For direct address, offset equals address
-
-                            info!("    ✓ UProbe config updated for address 0x{:x}", addr);
-                        }
-                        ghostscope_compiler::ast::TracePattern::SourceLine {
-                            file_path,
-                            line_number,
-                        } => {
-                            info!(
-                                "  {}: Source line '{}:{}' - resolving from DWARF info",
-                                i, file_path, line_number
-                            );
-
-                            if let Some(ref analyzer) = session.binary_analyzer {
+                            ghostscope_compiler::ast::TracePattern::SourceLine {
+                                file_path,
+                                line_number,
+                            } => {
                                 info!(
-                                    "    Resolving line {}:{} to machine code addresses...",
-                                    file_path, line_number
+                                    "  {}: Source line '{}:{}' - resolving from DWARF info",
+                                    i, file_path, line_number
                                 );
 
-                                // Use DWARF context to resolve line to addresses
-                                if let Some(dwarf_context) = analyzer.dwarf_context() {
-                                    let line_mappings = dwarf_context
-                                        .get_addresses_for_line(file_path, *line_number);
+                                match (
+                                    analyzer.resolve_source_line_address(file_path, *line_number),
+                                    analyzer
+                                        .resolve_source_line_uprobe_offset(file_path, *line_number),
+                                ) {
+                                    (Some(address), Some(uprobe_offset)) => {
+                                        config.function_name = None;
+                                        config.function_address = Some(address);
+                                        config.uprobe_offset = Some(uprobe_offset);
 
-                                    if !line_mappings.is_empty() {
-                                        info!(
-                                            "    Found {} addresses for line {}:{}",
-                                            line_mappings.len(),
-                                            file_path,
-                                            line_number
-                                        );
+                                        info!("    ✓ Resolved to address 0x{:x}, uprobe offset 0x{:x}", 
+                                              address, uprobe_offset);
 
-                                        // Use the first mapping for uprobe attachment
-                                        // In a more sophisticated implementation, we might want to handle multiple addresses
-                                        let first_mapping = &line_mappings[0];
-                                        let resolved_address = first_mapping.address;
-
-                                        info!("    ✓ Resolved {}:{} to address 0x{:x} (file: {}, line: {})", 
-                                            file_path, line_number, resolved_address, first_mapping.file_path, first_mapping.line_number);
-
-                                        // Calculate proper uprobe offset from the resolved address
-                                        // We need to convert the virtual address to a file offset for uprobe attachment
-                                        let uprobe_offset = analyzer
-                                            .calculate_uprobe_offset_from_address(resolved_address);
-
-                                        match uprobe_offset {
-                                            Some(offset) => {
-                                                info!("    ✓ Calculated uprobe offset: 0x{:x} (from virtual address: 0x{:x})", offset, resolved_address);
-
-                                                // Update config with resolved address information
-                                                config.function_name = None; // Source line tracing doesn't use function names
-                                                config.function_address = Some(resolved_address);
-                                                config.uprobe_offset = Some(offset);
-                                            }
-                                            None => {
-                                                warn!("    ✗ Failed to calculate uprobe offset for address 0x{:x}", resolved_address);
-                                                warn!("    This may happen if the address is not in a loadable section");
-                                                continue; // Skip this configuration
+                                        // Show additional info about multiple addresses if available
+                                        if let Some(dwarf_context) = analyzer.dwarf_context() {
+                                            let line_mappings = dwarf_context
+                                                .get_addresses_for_line(file_path, *line_number);
+                                            if line_mappings.len() > 1 {
+                                                info!("    Note: {} total addresses available for this line", line_mappings.len());
                                             }
                                         }
-
-                                        info!(
-                                            "    ✓ UProbe config updated for source line '{}:{}'",
-                                            file_path, line_number
-                                        );
-
-                                        // Show additional mappings if available
-                                        if line_mappings.len() > 1 {
-                                            info!("    Note: {} additional addresses available for this line:", line_mappings.len() - 1);
-                                            for (idx, mapping) in
-                                                line_mappings.iter().skip(1).take(3).enumerate()
-                                            {
-                                                info!(
-                                                    "      [{}] 0x{:x}",
-                                                    idx + 2,
-                                                    mapping.address
-                                                );
-                                            }
-                                            if line_mappings.len() > 4 {
-                                                info!(
-                                                    "      ... and {} more",
-                                                    line_mappings.len() - 4
-                                                );
-                                            }
-                                        }
-                                    } else {
-                                        warn!(
-                                            "    ✗ No addresses found for source line '{}:{}'",
-                                            file_path, line_number
-                                        );
-                                        warn!("    Possible reasons:");
-                                        warn!("      - Source file path doesn't match debug info");
-                                        warn!("      - Line number not found in debug info");
-                                        warn!("      - Code may have been optimized away");
                                     }
-                                } else {
-                                    warn!("    ✗ No DWARF debug context available");
+                                    (Some(address), None) => {
+                                        warn!("    ✗ Found address 0x{:x} but failed to calculate uprobe offset", address);
+                                    }
+                                    (None, _) => {
+                                        warn!(
+                                            "    ✗ No addresses found for source line {}:{}",
+                                            file_path, line_number
+                                        );
+                                        warn!("    Possible reasons: file path mismatch, line not found in debug info, or code optimized away");
+                                    }
                                 }
-                            } else {
-                                warn!("    ✗ No binary analyzer available for DWARF info");
+                            }
+                            ghostscope_compiler::ast::TracePattern::Address(addr) => {
+                                info!("  {}: Direct address 0x{:x}", i, addr);
+
+                                // For direct addresses, use the address as both virtual address and uprobe offset
+                                config.function_name = None;
+                                config.function_address = Some(*addr);
+                                config.uprobe_offset = Some(*addr);
+
+                                info!("    ✓ Using direct address 0x{:x}", addr);
+                            }
+                            ghostscope_compiler::ast::TracePattern::Wildcard(pattern) => {
+                                info!(
+                                    "  {}: Wildcard '{}' - pattern matching not yet implemented",
+                                    i, pattern
+                                );
                             }
                         }
+                    } else {
+                        warn!(
+                            "  {}: No binary analyzer available for address resolution",
+                            i
+                        );
                     }
                 }
 
@@ -494,9 +429,21 @@ fn validate_arguments(args: &ParsedArgs) -> Result<()> {
 
     // Cannot specify both PID and binary simultaneously
     if args.pid.is_some() && args.binary_path.is_some() {
+        // TODO: actually we can
         return Err(anyhow::anyhow!(
             "Cannot specify both PID (-p) and binary path simultaneously. Choose one target method."
         ));
+    }
+
+    if let Some(pid) = args.pid {
+        if !is_pid_running(pid) {
+            return Err(anyhow::anyhow!(
+                "Process with PID {} is not running. Use 'ps -p {}' to verify the process exists",
+                pid,
+                pid
+            ));
+        }
+        info!("✓ Target PID {} is running", pid);
     }
 
     // Script file must exist if specified
@@ -710,13 +657,6 @@ fn save_ast_to_file(
 
 /// Run GhostScope in TUI mode with tokio runtime coordination
 async fn run_tui_runtime(parsed_args: ParsedArgs) -> Result<()> {
-    // Initialize logging first
-    let log_file_path = parsed_args.log_file.as_ref().and_then(|p| p.to_str());
-    if let Err(e) = logging::initialize_logging(log_file_path, true) {
-        eprintln!("Failed to initialize logging: {}", e);
-        return Err(anyhow::anyhow!("Failed to initialize logging: {}", e));
-    }
-
     info!("Starting GhostScope in TUI mode");
 
     // Validate basic arguments

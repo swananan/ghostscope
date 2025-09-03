@@ -154,6 +154,64 @@ impl BinaryAnalyzer {
         self.dwarf_context.as_ref()
     }
 
+    /// Resolve function name to virtual address
+    /// This is a unified interface that handles the complete function name to address resolution
+    pub fn resolve_function_address(&self, func_name: &str) -> Option<u64> {
+        if let Some(symbol) = self.find_symbol(func_name) {
+            Some(symbol.address)
+        } else {
+            None
+        }
+    }
+
+    /// Resolve source line to virtual address  
+    /// This is a unified interface that handles the complete source line to address resolution
+    /// Returns the first address found for the given source line
+    pub fn resolve_source_line_address(&self, file_path: &str, line_number: u32) -> Option<u64> {
+        if let Some(dwarf_context) = &self.dwarf_context {
+            let line_mappings = dwarf_context.get_addresses_for_line(file_path, line_number);
+            if !line_mappings.is_empty() {
+                Some(line_mappings[0].address)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Calculate uprobe offset for function name
+    /// This combines function name resolution and uprobe offset calculation
+    pub fn resolve_function_uprobe_offset(&self, func_name: &str) -> Option<u64> {
+        if let Some(symbol) = self.find_symbol(func_name) {
+            symbol.uprobe_offset()
+        } else {
+            None
+        }
+    }
+
+    /// Calculate uprobe offset for source line
+    /// This combines source line resolution and uprobe offset calculation
+    pub fn resolve_source_line_uprobe_offset(
+        &self,
+        file_path: &str,
+        line_number: u32,
+    ) -> Option<u64> {
+        if let Some(virtual_addr) = self.resolve_source_line_address(file_path, line_number) {
+            // For source line, we can use the virtual address directly as uprobe offset
+            // or try to find containing symbol for better offset calculation
+            if let Some(symbol) = self.find_symbol_by_address(virtual_addr) {
+                // Found exact symbol match, use symbol's uprobe offset
+                symbol.uprobe_offset()
+            } else {
+                // Use the virtual address directly (fallback)
+                self.calculate_uprobe_offset_from_address(virtual_addr)
+            }
+        } else {
+            None
+        }
+    }
+
     /// Get variable size at specific address by variable name
     /// Returns the size in bytes for bpf_probe_read_user, or None if variable not found
     pub fn get_variable_size(&self, pc: u64, var_name: &str) -> Option<u64> {
