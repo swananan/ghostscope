@@ -1,6 +1,8 @@
 mod args;
 mod logging;
+mod script_compiler;
 mod session;
+mod trace_manager;
 
 use anyhow::Result;
 use args::ParsedArgs;
@@ -8,6 +10,20 @@ use ghostscope_ui::{run_tui_mode, EventRegistry, LayoutMode};
 use session::DebugSession;
 use std::path::{Path, PathBuf};
 use tracing::{error, info, warn};
+
+// Helper function to extract target from script command
+fn extract_target_from_script(script: &str) -> Option<String> {
+    // Parse "trace <target> <script_content>" format
+    if let Some(trace_prefix) = script.strip_prefix("trace ") {
+        if let Some(first_space) = trace_prefix.find(' ') {
+            return Some(trace_prefix[..first_space].to_string());
+        } else {
+            // Only target, no script content
+            return Some(trace_prefix.trim().to_string());
+        }
+    }
+    None
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -124,18 +140,17 @@ async fn main() -> Result<()> {
 
     // Script has been validated and parsed successfully in Step 3
 
-    // Show available functions if we have binary analysis and no target function specified
+    // Show available functions if we have binary analysis
     if let Some(_debug_info) = session.get_debug_info() {
-        if session.target_function.is_none() {
-            let functions = session.list_functions();
-            if functions.len() > 0 {
-                info!("Available functions (showing first 10):");
-                for func in functions.iter().take(10) {
-                    info!("  {}", func);
-                }
-                if functions.len() > 10 {
-                    info!("  ... and {} more", functions.len() - 10);
-                }
+        // Always show available functions for user reference
+        let functions = session.list_functions();
+        if functions.len() > 0 {
+            info!("Available functions (showing first 10):");
+            for func in functions.iter().take(10) {
+                info!("  {}", func);
+            }
+            if functions.len() > 10 {
+                info!("  ... and {} more", functions.len() - 10);
             }
         }
     }
@@ -883,38 +898,40 @@ async fn run_runtime_coordinator(
                 }
             }
 
-            // Handle script compilation requests
-            Some(script) = runtime_channels.script_receiver.recv() => {
-                info!("Received script for compilation: {}", script);
-                let _ = runtime_channels.status_sender.send(RuntimeStatus::ScriptCompilationStarted);
-
-                // Use actual script compilation and loading
-                if let Some(ref mut session) = session {
-                    match compile_and_load_script(&script, session, &runtime_channels.status_sender) {
-                        Ok(_) => {
-                            info!("Script compilation and loading completed successfully");
-                            let _ = runtime_channels.status_sender.send(RuntimeStatus::ScriptCompilationCompleted);
-                        }
-                        Err(e) => {
-                            error!("Script compilation failed: {}", e);
-                            let _ = runtime_channels.status_sender.send(RuntimeStatus::ScriptCompilationFailed(e.to_string()));
-                        }
-                    }
-                } else {
-                    warn!("No debug session available for script compilation");
-                    let _ = runtime_channels.status_sender.send(RuntimeStatus::ScriptCompilationFailed("No debug session available".to_string()));
-                }
-            }
-
             // Handle runtime commands
             Some(command) = runtime_channels.command_receiver.recv() => {
                 match command {
-                    RuntimeCommand::ExecuteScript(script) => {
-                        info!("Executing script: {}", script);
-                        // Same as script_receiver handling
-                        let _ = runtime_channels.status_sender.send(RuntimeStatus::ScriptCompilationStarted);
-                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                        let _ = runtime_channels.status_sender.send(RuntimeStatus::ScriptCompilationCompleted);
+                    RuntimeCommand::ExecuteScript { command: script, trace_id } => {
+                        info!("Executing script with trace_id {:?}: {}", trace_id, script);
+
+                        if let Some(ref mut session) = session {
+                            // Use the new trace-aware compilation and loading
+                            match script_compiler::compile_and_load_script_with_trace_id(
+                                &script,
+                                trace_id,
+                                session,
+                                &runtime_channels.status_sender
+                            ).await {
+                                Ok(_) => {
+                                    info!("Script with trace_id {} compiled and loaded successfully", trace_id);
+                                }
+                                Err(e) => {
+                                    let target = script_compiler::extract_target_from_script(&script);
+                                    error!("Script compilation failed for trace_id {}: {}", trace_id, e);
+                                    let _ = runtime_channels.status_sender.send(RuntimeStatus::ScriptCompilationFailed {
+                                        error: e.to_string(),
+                                        trace_id,
+                                    });
+                                }
+                            }
+                        } else {
+                            let target = script_compiler::extract_target_from_script(&script);
+                            warn!("No debug session available for script compilation");
+                            let _ = runtime_channels.status_sender.send(RuntimeStatus::ScriptCompilationFailed {
+                                error: "No debug session available".to_string(),
+                                trace_id,
+                            });
+                        }
                     }
                     RuntimeCommand::AttachToProcess(pid) => {
                         info!("Attaching to process: {}", pid);
@@ -1317,7 +1334,7 @@ fn compile_and_load_script(
     Ok(())
 }
 
-/// Poll ringbuf events from all active loaders and send formatted events to TUI
+/// Poll ringbuf events from all active trace instances and send formatted events to TUI
 fn poll_ringbuf_events(
     session: &mut DebugSession,
     trace_sender: &tokio::sync::mpsc::UnboundedSender<ghostscope_ui::events::TraceEvent>,
@@ -1332,7 +1349,29 @@ fn poll_ringbuf_events(
         .unwrap_or_default()
         .as_nanos() as u64;
 
-    // Poll events from all loaders
+    // Poll events from the new trace manager
+    let events_with_ids = session.trace_manager.poll_all_events();
+    for (trace_id, event_string) in events_with_ids {
+        // Parse the event string format: "[Trace X] event_content"
+        let message = if event_string.starts_with(&format!("[Trace {}]", trace_id)) {
+            event_string
+        } else {
+            format!("[Trace {}] {}", trace_id, event_string)
+        };
+
+        let trace_event = TraceEvent {
+            timestamp: current_timestamp,
+            trace_id: trace_id as u64, // Convert to u64 for protocol compatibility
+            pid: session.target_pid.unwrap_or(0),
+            message,
+            trace_type: MessageType::VariableData,
+        };
+
+        // Send to TUI (ignore errors if channel is closed)
+        let _ = trace_sender.send(trace_event);
+    }
+
+    // Legacy support: also poll from old loaders for backward compatibility
     for (loader_index, loader) in session.loaders.iter_mut().enumerate() {
         match loader.poll_events() {
             Ok(Some(events)) => {
@@ -1346,9 +1385,12 @@ fn poll_ringbuf_events(
                         .join(", ");
 
                     let message = if variables_text.is_empty() {
-                        format!("[Loader {}] Function trace", loader_index)
+                        format!("[Legacy Loader {}] Function trace", loader_index)
                     } else {
-                        format!("[Loader {}] Variables: [{}]", loader_index, variables_text)
+                        format!(
+                            "[Legacy Loader {}] Variables: [{}]",
+                            loader_index, variables_text
+                        )
                     };
 
                     let trace_event = TraceEvent {
@@ -1368,12 +1410,18 @@ fn poll_ringbuf_events(
             }
             Err(e) => {
                 // Log error and send error event to TUI
-                error!("Error polling events from loader {}: {}", loader_index, e);
+                error!(
+                    "Error polling events from legacy loader {}: {}",
+                    loader_index, e
+                );
                 let error_event = TraceEvent {
                     timestamp: current_timestamp,
                     trace_id: 0, // No trace ID for error events
                     pid: 0,      // No specific PID for error events
-                    message: format!("Error polling events from loader {}: {}", loader_index, e),
+                    message: format!(
+                        "Error polling events from legacy loader {}: {}",
+                        loader_index, e
+                    ),
                     trace_type: MessageType::Error,
                 };
                 let _ = trace_sender.send(error_event);

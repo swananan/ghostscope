@@ -1,19 +1,22 @@
 use crate::args::ParsedArgs;
+use crate::trace_manager::TraceManager;
 use anyhow::{Context, Result};
 use ghostscope_binary::{BinaryAnalyzer, DebugInfo};
 use ghostscope_loader::GhostScopeLoader;
 use tracing::{error, info, warn};
 
-/// Debug session state
+/// Debug session state - focuses on binary analysis and process management
 #[derive(Debug)]
 pub struct DebugSession {
     pub binary_analyzer: Option<BinaryAnalyzer>,
-    pub loader: Option<GhostScopeLoader>, // Keep for backward compatibility
-    pub loaders: Vec<GhostScopeLoader>,   // Multiple loaders for multiple uprobes
     pub target_binary: Option<String>,
     pub target_args: Vec<String>,
-    pub target_function: Option<String>,
     pub target_pid: Option<u32>,
+    pub trace_manager: TraceManager, // Manages all trace instances with their loaders
+
+    // Legacy fields for backward compatibility
+    pub loader: Option<GhostScopeLoader>, // Keep for backward compatibility
+    pub loaders: Vec<GhostScopeLoader>,   // Multiple loaders for multiple uprobes
     pub is_attached: bool,
 }
 
@@ -81,12 +84,14 @@ impl DebugSession {
 
         Ok(Self {
             binary_analyzer,
-            loader: None,
-            loaders: Vec::new(),
             target_binary: args.binary_path.clone(),
             target_args: args.binary_args.clone(),
-            target_function: None, // Functions will be determined from trace script
             target_pid: args.pid,
+            trace_manager: TraceManager::new(),
+
+            // Legacy fields
+            loader: None,
+            loaders: Vec::new(),
             is_attached: false,
         })
     }
@@ -189,14 +194,15 @@ impl DebugSession {
     }
 
     /// Legacy single uprobe attachment (kept for compatibility)
-    pub async fn attach_uprobe(&mut self) -> Result<()> {
+    pub async fn legacy_attach_uprobe(&mut self) -> Result<()> {
         let loader = self
             .loader
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("eBPF loader not initialized"))?;
 
-        let function_name = self.target_function.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Target function extraction from trace script not yet implemented. Use legacy --function parameter temporarily."))?;
+        // TODO: do not use hardcoded function_name
+        let function_name = "main"; // Default function for legacy compatibility
+        warn!("Using legacy attach_uprobe with hardcoded 'main' function. Consider migrating to new trace-based approach.");
 
         // Determine binary path - prefer from binary analyzer if available
         let binary_path = if let Some(ref analyzer) = self.binary_analyzer {

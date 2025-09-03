@@ -491,8 +491,8 @@ impl TuiApp {
                 info!("Added script line: {}", line);
                 // Script line added to panel, additional processing logic can be added here
             }
-            CommandAction::SubmitScript(script) => {
-                info!("Submitting script: {}", script);
+            CommandAction::SubmitScript { script, trace_id } => {
+                info!("Submitting script id {}: {}", trace_id, script);
 
                 // Parse the script to extract target and content
                 let parsed_script = self.parse_trace_script(&script);
@@ -504,8 +504,15 @@ impl TuiApp {
                     // Add the script content to display with formatting
                     self.add_script_display(&target_owned, &script_content_owned);
 
-                    // Send script to main program for processing
-                    if let Err(e) = self.event_registry.script_sender.send(script.clone()) {
+                    // Send script to main program for processing (legacy mode without trace_id)
+                    if let Err(e) =
+                        self.event_registry
+                            .command_sender
+                            .send(RuntimeCommand::ExecuteScript {
+                                command: script.clone(),
+                                trace_id,
+                            })
+                    {
                         error!("Failed to send script: {}", e);
                         self.interactive_command_panel.add_response(
                             format!("✗ Failed to send script: {}", e),
@@ -538,18 +545,6 @@ impl TuiApp {
 
         if trimmed == "help" {
             self.show_help();
-        } else if trimmed.starts_with("trace ") {
-            // This is a trace command, send it for compilation
-            if let Err(e) = self.event_registry.script_sender.send(command.clone()) {
-                error!("Failed to send script command: {}", e);
-                self.interactive_command_panel.add_response(
-                    format!("✗ Failed to send trace command: {}", e),
-                    ResponseType::Error,
-                );
-            } else {
-                self.interactive_command_panel
-                    .add_response("✓ Trace command sent".to_string(), ResponseType::Success);
-            }
         } else if trimmed.starts_with("attach ") {
             // Parse PID from "attach <pid>"
             if let Some(pid_str) = trimmed.strip_prefix("attach ") {
@@ -682,29 +677,31 @@ impl TuiApp {
                     .command_sender
                     .send(RuntimeCommand::RequestSourceCode);
             }
-            RuntimeStatus::ScriptCompilationStarted => {
-                // Update UI to show compilation is starting
-                info!("Script compilation started");
+            RuntimeStatus::ScriptCompilationCompleted { trace_id } => {
+                // Update trace status in the interactive panel
+                self.interactive_command_panel.update_trace_status(
+                    crate::trace::TraceStatus::Active,
+                    *trace_id,
+                    None,
+                );
+
+                info!(
+                    "✅ Script compilation completed successfully for trace_id: {:?}",
+                    trace_id
+                );
             }
-            RuntimeStatus::ScriptCompilationCompleted => {
-                // Add success message to existing script display, then reset for new input
-                self.interactive_command_panel
-                    .add_script_completion_response(
-                        "✅ Script compiled and loaded successfully!".to_string(),
-                        crate::panels::ResponseType::Success,
-                    );
-                self.interactive_command_panel.reset_for_new_input();
-                info!("✅ Script compilation completed successfully");
-            }
-            RuntimeStatus::ScriptCompilationFailed(error) => {
-                // Add error message to existing script display, then reset for new input
-                self.interactive_command_panel
-                    .add_script_completion_response(
-                        format!("💔 {}", error),
-                        crate::panels::ResponseType::Error,
-                    );
-                self.interactive_command_panel.reset_for_new_input();
-                error!("💔 Script compilation failed: {}", error);
+            RuntimeStatus::ScriptCompilationFailed { error, trace_id } => {
+                // Update trace status in the interactive panel
+                self.interactive_command_panel.update_trace_status(
+                    crate::trace::TraceStatus::Failed,
+                    *trace_id,
+                    Some(error.clone()),
+                );
+
+                error!(
+                    "💔 Script compilation failed for trace_id: {:?}, error: {}",
+                    trace_id, error
+                );
             }
             _ => {}
         }

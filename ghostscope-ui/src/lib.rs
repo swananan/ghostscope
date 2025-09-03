@@ -1,6 +1,7 @@
 pub mod events;
 mod panels;
 mod syntax_highlight;
+pub mod trace;
 mod tui_app;
 
 pub use events::{EventRegistry, RuntimeChannels, RuntimeCommand, RuntimeStatus, TuiEvent};

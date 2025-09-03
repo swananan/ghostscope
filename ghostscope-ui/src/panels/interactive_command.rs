@@ -1,3 +1,4 @@
+use crate::trace::{TraceManager, TraceStatus};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
@@ -99,6 +100,9 @@ pub struct InteractiveCommandPanel {
 
     // UI state
     pub scroll_offset: usize,
+
+    // Trace management
+    pub trace_manager: TraceManager,
 }
 
 impl InteractiveCommandPanel {
@@ -116,6 +120,7 @@ impl InteractiveCommandPanel {
             command_cursor_column: 0,
             static_lines: Vec::new(),
             scroll_offset: 0,
+            trace_manager: TraceManager::new(),
         };
         panel.update_static_lines();
         panel
@@ -338,6 +343,48 @@ impl InteractiveCommandPanel {
         }
     }
 
+    /// Handle built-in commands and return response if handled
+    fn handle_builtin_command(&self, command: &str) -> Option<String> {
+        let cmd = command.trim();
+
+        if cmd == "info" {
+            // Show general info help
+            Some(self.format_info_help())
+        } else if cmd == "info trace" {
+            // Show trace status information
+            Some(self.format_trace_info())
+        } else {
+            // Not a built-in command
+            None
+        }
+    }
+
+    /// Format general info help message
+    fn format_info_help(&self) -> String {
+        "Available info commands:\n  info trace - Show current trace status".to_string()
+    }
+
+    /// Format trace information using TraceManager
+    fn format_trace_info(&self) -> String {
+        let summary = self.trace_manager.get_summary();
+        let mut output = format!("Trace Status: {}\n", summary.format());
+
+        if summary.total > 0 {
+            output.push_str("\nTrace Details:\n");
+            let traces = self.trace_manager.get_all_traces();
+            for trace in traces {
+                output.push_str(&format!(
+                    "  {}\n",
+                    self.trace_manager.format_trace_info(trace)
+                ));
+            }
+        } else {
+            output.push_str("No traces currently loaded.");
+        }
+
+        output
+    }
+
     pub fn submit_command(&mut self) -> Option<CommandAction> {
         if self.input_text.trim().is_empty() {
             return None;
@@ -346,7 +393,18 @@ impl InteractiveCommandPanel {
         let command = self.input_text.clone();
         let action = match self.mode {
             InteractionMode::Input => {
-                if command.trim().starts_with("trace ") {
+                // Handle built-in commands first
+                if let Some(response) = self.handle_builtin_command(&command) {
+                    // Built-in command was handled, add response to history
+                    self.add_to_history(command.clone(), Some(response));
+                    // Clear input state completely
+                    self.input_text.clear();
+                    self.cursor_position = 0;
+                    self.history_index = None;
+                    // Update static lines after clearing input
+                    self.update_static_lines();
+                    return None; // No external action needed
+                } else if command.trim().starts_with("trace ") {
                     // Two-step trace interaction: parse target and enter script editor
                     self.enter_script_editor_for_trace(&command)
                 } else {
@@ -528,6 +586,15 @@ impl InteractiveCommandPanel {
             // 5. Update display
             self.update_static_lines();
 
+            // 5.5. Create trace record when script is submitted (only for successful submissions)
+            let trace_id = self
+                .trace_manager
+                .add_trace(target.clone(), script_content.clone());
+            debug!(
+                "Created trace record with ID: {} for target: {}",
+                trace_id, target
+            );
+
             // 6. Set waiting state - this hides input box but stays in Input mode
             self.input_state = InputState::WaitingResponse {
                 command: command.clone(),
@@ -539,8 +606,14 @@ impl InteractiveCommandPanel {
                 "Before final check, script_cache exists = {}",
                 self.script_cache.is_some()
             );
-            debug!("Returning CommandAction::SubmitScript");
-            Some(CommandAction::SubmitScript(command))
+            debug!(
+                "Returning CommandAction::SubmitScript with trace_id: {}",
+                trace_id
+            );
+            Some(CommandAction::SubmitScript {
+                script: command,
+                trace_id,
+            })
         } else {
             debug!("No script cache found, returning None");
             debug!("script_cache is None, this might be the issue!");
@@ -548,9 +621,86 @@ impl InteractiveCommandPanel {
         }
     }
 
+    /// Update trace status when runtime provides feedback
+    pub fn update_trace_status(
+        &mut self,
+        status: TraceStatus,
+        trace_id: u32,
+        error_message: Option<String>,
+    ) {
+        debug!(
+            "update_trace_status called with status: {:?}, trace_id {}, error: {:?}",
+            status, trace_id, error_message
+        );
+
+        self.trace_manager
+            .update_trace_status(trace_id, status.clone(), error_message.clone());
+
+        // Update UI based on status change
+        match status {
+            TraceStatus::Failed => {
+                if let Some(error) = &error_message {
+                    // Add error response if we're waiting for a response
+                    if let InputState::WaitingResponse { .. } = &self.input_state {
+                        self.add_error_response_and_clear_waiting(error);
+                    }
+                }
+            }
+            TraceStatus::Active => {
+                // Script compilation succeeded
+                if let InputState::WaitingResponse { .. } = &self.input_state {
+                    self.add_success_response_and_clear_waiting();
+                }
+            }
+            _ => {
+                // For other status changes, do nothing
+            }
+        }
+    }
+
+    /// Add error response and clear waiting state
+    fn add_error_response_and_clear_waiting(&mut self, error: &str) {
+        if let Some(last_item) = self.command_history.last_mut() {
+            let error_response = format!("❌ Script compilation failed: {}", error);
+            // If there's already a script display, append error message
+            if let Some(existing_response) = &last_item.response {
+                last_item.response = Some(format!("{}\n\n{}", existing_response, error_response));
+            } else {
+                last_item.response = Some(error_response);
+            }
+            last_item.response_type = Some(ResponseType::Error);
+        }
+
+        // Clear waiting state
+        self.input_state = InputState::Ready;
+        self.update_static_lines();
+        debug!("Added error response and cleared waiting state");
+    }
+
+    /// Add success response and clear waiting state
+    fn add_success_response_and_clear_waiting(&mut self) {
+        if let Some(last_item) = self.command_history.last_mut() {
+            let success_response = format!("✅ Script compiled and loaded successfully");
+            // If there's already a script display, append success message
+            if let Some(existing_response) = &last_item.response {
+                last_item.response = Some(format!("{}\n\n{}", existing_response, success_response));
+            } else {
+                last_item.response = Some(success_response);
+            }
+            last_item.response_type = Some(ResponseType::Success);
+        }
+
+        // Clear waiting state
+        self.input_state = InputState::Ready;
+        self.update_static_lines();
+        debug!("Added success response and cleared waiting state");
+    }
+
     /// Cancel script editing and return to input mode
     pub fn cancel_script_editor(&mut self) {
         if self.mode == InteractionMode::ScriptEditor {
+            self.trace_manager.remove_latest_trace();
+
             // Add termination message before switching modes
             self.add_response(
                 "⚠️ Script editing cancelled".to_string(),
@@ -558,7 +708,6 @@ impl InteractiveCommandPanel {
             );
 
             self.mode = InteractionMode::Input; // ESC should go to input mode
-                                                // Keep script_cache for potential restoration
 
             // Ensure input state is ready to show prompt
             self.input_state = InputState::Ready;
@@ -2102,6 +2251,6 @@ pub enum CommandAction {
     ExecuteCommand(String),
     EnterScriptMode(String),
     AddScriptLine(String),
-    SubmitScript(String),
+    SubmitScript { script: String, trace_id: u32 },
     CancelScript,
 }

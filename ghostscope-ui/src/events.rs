@@ -25,7 +25,6 @@ pub struct TraceEvent {
 #[derive(Debug)]
 pub struct EventRegistry {
     // TUI -> Runtime communication
-    pub script_sender: mpsc::UnboundedSender<String>,
     pub command_sender: mpsc::UnboundedSender<RuntimeCommand>,
 
     // Runtime -> TUI communication
@@ -44,7 +43,7 @@ pub struct SourceCodeInfo {
 /// Commands that TUI can send to runtime
 #[derive(Debug, Clone)]
 pub enum RuntimeCommand {
-    ExecuteScript(String),
+    ExecuteScript { command: String, trace_id: u32 },
     AttachToProcess(u32),
     DetachFromProcess,
     ReloadBinary(String),
@@ -58,9 +57,8 @@ pub enum RuntimeStatus {
     DwarfLoadingStarted,
     DwarfLoadingCompleted { symbols_count: usize },
     DwarfLoadingFailed(String),
-    ScriptCompilationStarted,
-    ScriptCompilationCompleted,
-    ScriptCompilationFailed(String),
+    ScriptCompilationCompleted { trace_id: u32 },
+    ScriptCompilationFailed { error: String, trace_id: u32 },
     UprobeAttached { function: String, address: u64 },
     UprobeDetached { function: String },
     ProcessAttached(u32),
@@ -72,20 +70,17 @@ pub enum RuntimeStatus {
 
 impl EventRegistry {
     pub fn new() -> (Self, RuntimeChannels) {
-        let (script_tx, script_rx) = mpsc::unbounded_channel();
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (trace_tx, trace_rx) = mpsc::unbounded_channel();
         let (status_tx, status_rx) = mpsc::unbounded_channel();
 
         let registry = EventRegistry {
-            script_sender: script_tx,
             command_sender: command_tx,
             trace_receiver: trace_rx,
             status_receiver: status_rx,
         };
 
         let channels = RuntimeChannels {
-            script_receiver: script_rx,
             command_receiver: command_rx,
             trace_sender: trace_tx.clone(),
             status_sender: status_tx.clone(),
@@ -98,7 +93,6 @@ impl EventRegistry {
 /// Channels used by the runtime to receive commands and send events
 #[derive(Debug)]
 pub struct RuntimeChannels {
-    pub script_receiver: mpsc::UnboundedReceiver<String>,
     pub command_receiver: mpsc::UnboundedReceiver<RuntimeCommand>,
     pub trace_sender: mpsc::UnboundedSender<TraceEvent>,
     pub status_sender: mpsc::UnboundedSender<RuntimeStatus>,
