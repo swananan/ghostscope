@@ -14,7 +14,7 @@ pub struct TraceInstance {
     pub function_name: String,      // Specific function being traced
     pub uprobe_offset: Option<u64>, // Uprobe offset if calculated
     pub target_pid: Option<u32>,    // Target PID if specified
-    pub is_active: bool,            // Whether the trace is currently active
+    pub is_enabled: bool,           // Whether the uprobe is currently enabled
 }
 
 impl TraceInstance {
@@ -37,43 +37,73 @@ impl TraceInstance {
             function_name,
             uprobe_offset,
             target_pid,
-            is_active: false,
+            is_enabled: false,
         }
     }
 
-    /// Activate this trace instance (attach uprobe)
-    pub async fn activate(&mut self) -> Result<()> {
+    /// Enable this trace instance (attach uprobe)
+    pub async fn enable(&mut self) -> Result<()> {
+        if self.is_enabled {
+            info!("Trace {} is already enabled", self.trace_id);
+            return Ok(());
+        }
+
         info!(
-            "Activating trace {} for function '{}' in binary '{}'",
+            "Enabling trace {} for function '{}' in binary '{}'",
             self.trace_id, self.function_name, self.binary_path
         );
 
-        self.loader.attach_uprobe(
-            &self.binary_path,
-            &self.function_name,
-            self.uprobe_offset,
-            self.target_pid.map(|pid| pid as i32),
-        )?;
+        // If the loader already has attachment parameters stored (from previous attach),
+        // use reattach_uprobe instead of attach_uprobe to avoid reloading the program
+        if self.loader.is_uprobe_attached() {
+            // This should not happen since we checked is_enabled above
+            warn!("Uprobe is already attached for trace {}", self.trace_id);
+            return Ok(());
+        } else if self.loader.get_attachment_info().is_some() {
+            // Attachment parameters exist, this means the program was loaded before
+            // Use reattach_uprobe to avoid reloading the program
+            info!(
+                "Using reattach_uprobe for trace {} (program already loaded)",
+                self.trace_id
+            );
+            self.loader.reattach_uprobe()?;
+        } else {
+            // First time attachment, use attach_uprobe
+            info!(
+                "Using attach_uprobe for trace {} (first time)",
+                self.trace_id
+            );
+            self.loader.attach_uprobe(
+                &self.binary_path,
+                &self.function_name,
+                self.uprobe_offset,
+                self.target_pid.map(|pid| pid as i32),
+            )?;
+        }
 
-        self.is_active = true;
-        info!("Trace {} activated successfully", self.trace_id);
+        self.is_enabled = true;
+        info!("Trace {} enabled successfully", self.trace_id);
         Ok(())
     }
 
-    /// Deactivate this trace instance
-    pub async fn deactivate(&mut self) -> Result<()> {
-        if self.is_active {
-            info!("Deactivating trace {}", self.trace_id);
-            // Note: GhostScopeLoader doesn't have explicit detach yet,
-            // so we just mark as inactive for now
-            self.is_active = false;
+    /// Disable this trace instance (detach uprobe but keep eBPF resources)
+    pub async fn disable(&mut self) -> Result<()> {
+        if !self.is_enabled {
+            info!("Trace {} is already disabled", self.trace_id);
+            return Ok(());
         }
+
+        info!("Disabling trace {}", self.trace_id);
+        // Detach the uprobe while keeping eBPF resources
+        self.loader.detach_uprobe()?;
+        self.is_enabled = false;
+        info!("Trace {} disabled successfully", self.trace_id);
         Ok(())
     }
 
     /// Poll events from this trace instance
     pub fn poll_events(&mut self) -> Result<Option<Vec<String>>> {
-        if !self.is_active {
+        if !self.is_enabled {
             return Ok(None);
         }
 
@@ -131,8 +161,8 @@ impl TraceManager {
             if let Some(mut old_trace) = self.traces.remove(&old_trace_id) {
                 // Deactivate the old trace
                 tokio::spawn(async move {
-                    if let Err(e) = old_trace.deactivate().await {
-                        warn!("Failed to deactivate old trace {}: {}", old_trace_id, e);
+                    if let Err(e) = old_trace.disable().await {
+                        warn!("Failed to disable old trace {}: {}", old_trace_id, e);
                     }
                 });
             }
@@ -156,38 +186,65 @@ impl TraceManager {
         trace_id
     }
 
-    /// Activate a trace by ID
+    /// Enable a trace by ID (duplicate of enable_trace method - keeping for compatibility)
     pub async fn activate_trace(&mut self, trace_id: u32) -> Result<()> {
-        if let Some(trace) = self.traces.get_mut(&trace_id) {
-            trace.activate().await
-        } else {
-            Err(anyhow::anyhow!("Trace {} not found", trace_id))
-        }
+        self.enable_trace(trace_id).await
     }
 
-    /// Deactivate a trace by ID
+    /// Disable a trace by ID (duplicate of disable_trace method - keeping for compatibility)
     pub async fn deactivate_trace(&mut self, trace_id: u32) -> Result<()> {
-        if let Some(trace) = self.traces.get_mut(&trace_id) {
-            trace.deactivate().await
-        } else {
-            Err(anyhow::anyhow!("Trace {} not found", trace_id))
-        }
+        self.disable_trace(trace_id).await
     }
 
-    /// Remove a trace by ID
+    /// Remove a trace by ID (legacy method, use delete_trace for complete cleanup)
     pub async fn remove_trace(&mut self, trace_id: u32) -> Result<()> {
         if let Some(mut trace) = self.traces.remove(&trace_id) {
             // Remove from target mapping
             self.target_to_trace_id.remove(&trace.target);
 
-            // Deactivate if still active
-            trace.deactivate().await?;
+            // Disable if still active
+            trace.disable().await?;
 
             debug!("Removed trace {} from manager", trace_id);
             Ok(())
         } else {
             Err(anyhow::anyhow!("Trace {} not found", trace_id))
         }
+    }
+
+    /// Completely delete a trace by ID, destroying all associated resources
+    pub async fn delete_trace(&mut self, trace_id: u32) -> Result<()> {
+        if let Some(mut trace) = self.traces.remove(&trace_id) {
+            // Remove from target mapping
+            self.target_to_trace_id.remove(&trace.target);
+
+            info!("Deleting trace {} and all associated resources", trace_id);
+
+            // Completely destroy the loader and all eBPF resources
+            trace.loader.destroy()?;
+
+            info!("Trace {} deleted successfully", trace_id);
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Trace {} not found", trace_id))
+        }
+    }
+
+    /// Delete all traces, destroying all associated resources
+    pub async fn delete_all_traces(&mut self) -> Result<usize> {
+        let trace_ids: Vec<u32> = self.traces.keys().cloned().collect();
+        let count = trace_ids.len();
+
+        info!("Deleting all {} traces and their resources", count);
+
+        for trace_id in trace_ids {
+            if let Err(e) = self.delete_trace(trace_id).await {
+                warn!("Failed to delete trace {}: {}", trace_id, e);
+            }
+        }
+
+        info!("Deleted all traces successfully");
+        Ok(count)
     }
 
     /// Get trace by ID
@@ -211,7 +268,7 @@ impl TraceManager {
     pub fn get_active_trace_ids(&self) -> Vec<u32> {
         self.traces
             .iter()
-            .filter_map(|(&id, trace)| if trace.is_active { Some(id) } else { None })
+            .filter_map(|(&id, trace)| if trace.is_enabled { Some(id) } else { None })
             .collect()
     }
 
@@ -225,7 +282,7 @@ impl TraceManager {
         let mut all_events = Vec::new();
 
         for (&trace_id, trace) in self.traces.iter_mut() {
-            if trace.is_active {
+            if trace.is_enabled {
                 match trace.poll_events() {
                     Ok(Some(events)) => {
                         for event in events {
@@ -252,7 +309,47 @@ impl TraceManager {
 
     /// Get active trace count
     pub fn active_trace_count(&self) -> usize {
-        self.traces.values().filter(|t| t.is_active).count()
+        self.traces.values().filter(|t| t.is_enabled).count()
+    }
+
+    /// Enable a specific trace by ID
+    pub async fn enable_trace(&mut self, trace_id: u32) -> Result<()> {
+        if let Some(trace) = self.traces.get_mut(&trace_id) {
+            trace.enable().await
+        } else {
+            Err(anyhow::anyhow!("Trace {} not found", trace_id))
+        }
+    }
+
+    /// Disable a specific trace by ID
+    pub async fn disable_trace(&mut self, trace_id: u32) -> Result<()> {
+        if let Some(trace) = self.traces.get_mut(&trace_id) {
+            trace.disable().await
+        } else {
+            Err(anyhow::anyhow!("Trace {} not found", trace_id))
+        }
+    }
+
+    /// Enable all traces
+    pub async fn enable_all_traces(&mut self) -> Result<()> {
+        let trace_ids: Vec<u32> = self.traces.keys().cloned().collect();
+        for trace_id in trace_ids {
+            if let Err(e) = self.enable_trace(trace_id).await {
+                warn!("Failed to enable trace {}: {}", trace_id, e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Disable all traces  
+    pub async fn disable_all_traces(&mut self) -> Result<()> {
+        let trace_ids: Vec<u32> = self.traces.keys().cloned().collect();
+        for trace_id in trace_ids {
+            if let Err(e) = self.disable_trace(trace_id).await {
+                warn!("Failed to disable trace {}: {}", trace_id, e);
+            }
+        }
+        Ok(())
     }
 }
 

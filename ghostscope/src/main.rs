@@ -950,6 +950,128 @@ async fn run_runtime_coordinator(
                         info!("Source code request received");
                         handle_source_code_request(&session, &runtime_channels.status_sender).await;
                     }
+                    RuntimeCommand::DisableTrace(trace_id) => {
+                        info!("Disabling trace: {}", trace_id);
+                        if let Some(ref mut session) = session {
+                            match session.trace_manager.disable_trace(trace_id).await {
+                                Ok(_) => {
+                                    info!("Trace {} disabled successfully", trace_id);
+                                    let _ = runtime_channels.status_sender.send(RuntimeStatus::TraceDisabled { trace_id });
+                                }
+                                Err(e) => {
+                                    error!("Failed to disable trace {}: {}", trace_id, e);
+                                    let _ = runtime_channels.status_sender.send(RuntimeStatus::TraceDisableFailed {
+                                        trace_id,
+                                        error: e.to_string()
+                                    });
+                                }
+                            }
+                        } else {
+                            let _ = runtime_channels.status_sender.send(RuntimeStatus::TraceDisableFailed {
+                                trace_id,
+                                error: "No debug session available".to_string()
+                            });
+                        }
+                    }
+                    RuntimeCommand::EnableTrace(trace_id) => {
+                        info!("Enabling trace: {}", trace_id);
+                        if let Some(ref mut session) = session {
+                            match session.trace_manager.enable_trace(trace_id).await {
+                                Ok(_) => {
+                                    info!("Trace {} enabled successfully", trace_id);
+                                    let _ = runtime_channels.status_sender.send(RuntimeStatus::TraceEnabled { trace_id });
+                                }
+                                Err(e) => {
+                                    error!("Failed to enable trace {}: {}", trace_id, e);
+                                    let _ = runtime_channels.status_sender.send(RuntimeStatus::TraceEnableFailed {
+                                        trace_id,
+                                        error: e.to_string()
+                                    });
+                                }
+                            }
+                        } else {
+                            let _ = runtime_channels.status_sender.send(RuntimeStatus::TraceEnableFailed {
+                                trace_id,
+                                error: "No debug session available".to_string()
+                            });
+                        }
+                    }
+                    RuntimeCommand::DisableAllTraces => {
+                        info!("Disabling all traces");
+                        if let Some(ref mut session) = session {
+                            let trace_count = session.trace_manager.active_trace_count();
+                            match session.trace_manager.disable_all_traces().await {
+                                Ok(_) => {
+                                    info!("All {} traces disabled successfully", trace_count);
+                                    let _ = runtime_channels.status_sender.send(RuntimeStatus::AllTracesDisabled { count: trace_count });
+                                }
+                                Err(e) => {
+                                    error!("Failed to disable all traces: {}", e);
+                                    let _ = runtime_channels.status_sender.send(RuntimeStatus::Error(format!("Failed to disable all traces: {}", e)));
+                                }
+                            }
+                        } else {
+                            let _ = runtime_channels.status_sender.send(RuntimeStatus::Error("No debug session available".to_string()));
+                        }
+                    }
+                    RuntimeCommand::EnableAllTraces => {
+                        info!("Enabling all traces");
+                        if let Some(ref mut session) = session {
+                            let trace_count = session.trace_manager.trace_count();
+                            match session.trace_manager.enable_all_traces().await {
+                                Ok(_) => {
+                                    info!("All {} traces enabled successfully", trace_count);
+                                    let _ = runtime_channels.status_sender.send(RuntimeStatus::AllTracesEnabled { count: trace_count });
+                                }
+                                Err(e) => {
+                                    error!("Failed to enable all traces: {}", e);
+                                    let _ = runtime_channels.status_sender.send(RuntimeStatus::Error(format!("Failed to enable all traces: {}", e)));
+                                }
+                            }
+                        } else {
+                            let _ = runtime_channels.status_sender.send(RuntimeStatus::Error("No debug session available".to_string()));
+                        }
+                    }
+                    RuntimeCommand::DeleteTrace(trace_id) => {
+                        info!("Deleting trace: {}", trace_id);
+                        if let Some(ref mut session) = session {
+                            match session.trace_manager.delete_trace(trace_id).await {
+                                Ok(_) => {
+                                    info!("Trace {} deleted successfully", trace_id);
+                                    let _ = runtime_channels.status_sender.send(RuntimeStatus::TraceDeleted { trace_id });
+                                }
+                                Err(e) => {
+                                    error!("Failed to delete trace {}: {}", trace_id, e);
+                                    let _ = runtime_channels.status_sender.send(RuntimeStatus::TraceDeleteFailed {
+                                        trace_id,
+                                        error: e.to_string()
+                                    });
+                                }
+                            }
+                        } else {
+                            let _ = runtime_channels.status_sender.send(RuntimeStatus::TraceDeleteFailed {
+                                trace_id,
+                                error: "No debug session available".to_string()
+                            });
+                        }
+                    }
+                    RuntimeCommand::DeleteAllTraces => {
+                        info!("Deleting all traces");
+                        if let Some(ref mut session) = session {
+                            match session.trace_manager.delete_all_traces().await {
+                                Ok(count) => {
+                                    info!("All {} traces deleted successfully", count);
+                                    let _ = runtime_channels.status_sender.send(RuntimeStatus::AllTracesDeleted { count });
+                                }
+                                Err(e) => {
+                                    error!("Failed to delete all traces: {}", e);
+                                    let _ = runtime_channels.status_sender.send(RuntimeStatus::Error(format!("Failed to delete all traces: {}", e)));
+                                }
+                            }
+                        } else {
+                            let _ = runtime_channels.status_sender.send(RuntimeStatus::Error("No debug session available".to_string()));
+                        }
+                    }
                     RuntimeCommand::Shutdown => {
                         info!("Shutdown command received");
                         break;

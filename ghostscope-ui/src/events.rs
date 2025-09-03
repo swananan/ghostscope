@@ -48,6 +48,12 @@ pub enum RuntimeCommand {
     DetachFromProcess,
     ReloadBinary(String),
     RequestSourceCode, // Request source code for current function/address
+    DisableTrace(u32), // Disable specific trace by ID
+    EnableTrace(u32),  // Enable specific trace by ID
+    DisableAllTraces,  // Disable all traces
+    EnableAllTraces,   // Enable all traces
+    DeleteTrace(u32),  // Completely delete specific trace and all resources
+    DeleteAllTraces,   // Delete all traces and resources
     Shutdown,
 }
 
@@ -65,6 +71,15 @@ pub enum RuntimeStatus {
     ProcessDetached,
     SourceCodeLoaded(SourceCodeInfo),
     SourceCodeLoadFailed(String),
+    TraceEnabled { trace_id: u32 },
+    TraceDisabled { trace_id: u32 },
+    AllTracesEnabled { count: usize },
+    AllTracesDisabled { count: usize },
+    TraceEnableFailed { trace_id: u32, error: String },
+    TraceDisableFailed { trace_id: u32, error: String },
+    TraceDeleted { trace_id: u32 },
+    AllTracesDeleted { count: usize },
+    TraceDeleteFailed { trace_id: u32, error: String },
     Error(String),
 }
 

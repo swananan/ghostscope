@@ -344,6 +344,7 @@ impl InteractiveCommandPanel {
     }
 
     /// Handle built-in commands and return response if handled
+    /// Returns Some(response) for locally handled commands, None for commands that need external processing
     fn handle_builtin_command(&self, command: &str) -> Option<String> {
         let cmd = command.trim();
 
@@ -353,15 +354,57 @@ impl InteractiveCommandPanel {
         } else if cmd == "info trace" {
             // Show trace status information
             Some(self.format_trace_info())
+        } else if cmd.starts_with("disable ")
+            || cmd.starts_with("enable ")
+            || cmd.starts_with("delete ")
+        {
+            // These commands need to be sent to runtime, not handled locally
+            None
         } else {
             // Not a built-in command
             None
         }
     }
 
+    /// Parse disable/enable/delete commands and return appropriate CommandAction
+    fn parse_enable_disable_command(&self, command: &str) -> Option<CommandAction> {
+        let cmd = command.trim();
+
+        if cmd.starts_with("disable ") {
+            let args = cmd.strip_prefix("disable ").unwrap().trim();
+            if args == "all" {
+                Some(CommandAction::DisableAllTraces)
+            } else if let Ok(trace_id) = args.parse::<u32>() {
+                Some(CommandAction::DisableTrace(trace_id))
+            } else {
+                None // Invalid trace ID
+            }
+        } else if cmd.starts_with("enable ") {
+            let args = cmd.strip_prefix("enable ").unwrap().trim();
+            if args == "all" {
+                Some(CommandAction::EnableAllTraces)
+            } else if let Ok(trace_id) = args.parse::<u32>() {
+                Some(CommandAction::EnableTrace(trace_id))
+            } else {
+                None // Invalid trace ID
+            }
+        } else if cmd.starts_with("delete ") {
+            let args = cmd.strip_prefix("delete ").unwrap().trim();
+            if args == "all" {
+                Some(CommandAction::DeleteAllTraces)
+            } else if let Ok(trace_id) = args.parse::<u32>() {
+                Some(CommandAction::DeleteTrace(trace_id))
+            } else {
+                None // Invalid trace ID
+            }
+        } else {
+            None
+        }
+    }
+
     /// Format general info help message
     fn format_info_help(&self) -> String {
-        "Available info commands:\n  info trace - Show current trace status".to_string()
+        "Available commands:\n  info trace - Show current trace status\n  disable <id|all> - Disable trace(s)\n  enable <id|all> - Enable trace(s)\n  delete <id|all> - Delete trace(s) and all resources\n  trace <target> - Create new trace".to_string()
     }
 
     /// Format trace information using TraceManager
@@ -404,6 +447,9 @@ impl InteractiveCommandPanel {
                     // Update static lines after clearing input
                     self.update_static_lines();
                     return None; // No external action needed
+                } else if let Some(action) = self.parse_enable_disable_command(&command) {
+                    // Handle disable/enable commands
+                    action
                 } else if command.trim().starts_with("trace ") {
                     // Two-step trace interaction: parse target and enter script editor
                     self.enter_script_editor_for_trace(&command)
@@ -2253,4 +2299,10 @@ pub enum CommandAction {
     AddScriptLine(String),
     SubmitScript { script: String, trace_id: u32 },
     CancelScript,
+    DisableTrace(u32),
+    EnableTrace(u32),
+    DisableAllTraces,
+    EnableAllTraces,
+    DeleteTrace(u32),
+    DeleteAllTraces,
 }

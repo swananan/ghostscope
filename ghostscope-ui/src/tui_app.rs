@@ -536,6 +536,120 @@ impl TuiApp {
                     ResponseType::Warning,
                 );
             }
+            CommandAction::DisableTrace(trace_id) => {
+                info!("Disabling trace {}", trace_id);
+                if let Err(e) = self
+                    .event_registry
+                    .command_sender
+                    .send(RuntimeCommand::DisableTrace(trace_id))
+                {
+                    error!("Failed to send disable trace command: {}", e);
+                    self.interactive_command_panel.add_response(
+                        format!("✗ Failed to disable trace {}: {}", trace_id, e),
+                        ResponseType::Error,
+                    );
+                } else {
+                    self.interactive_command_panel.add_response(
+                        format!("⏳ Disabling trace {}...", trace_id),
+                        ResponseType::Progress,
+                    );
+                }
+            }
+            CommandAction::EnableTrace(trace_id) => {
+                info!("Enabling trace {}", trace_id);
+                if let Err(e) = self
+                    .event_registry
+                    .command_sender
+                    .send(RuntimeCommand::EnableTrace(trace_id))
+                {
+                    error!("Failed to send enable trace command: {}", e);
+                    self.interactive_command_panel.add_response(
+                        format!("✗ Failed to enable trace {}: {}", trace_id, e),
+                        ResponseType::Error,
+                    );
+                } else {
+                    self.interactive_command_panel.add_response(
+                        format!("⏳ Enabling trace {}...", trace_id),
+                        ResponseType::Progress,
+                    );
+                }
+            }
+            CommandAction::DisableAllTraces => {
+                info!("Disabling all traces");
+                if let Err(e) = self
+                    .event_registry
+                    .command_sender
+                    .send(RuntimeCommand::DisableAllTraces)
+                {
+                    error!("Failed to send disable all traces command: {}", e);
+                    self.interactive_command_panel.add_response(
+                        format!("✗ Failed to disable all traces: {}", e),
+                        ResponseType::Error,
+                    );
+                } else {
+                    self.interactive_command_panel.add_response(
+                        "⏳ Disabling all traces...".to_string(),
+                        ResponseType::Progress,
+                    );
+                }
+            }
+            CommandAction::EnableAllTraces => {
+                info!("Enabling all traces");
+                if let Err(e) = self
+                    .event_registry
+                    .command_sender
+                    .send(RuntimeCommand::EnableAllTraces)
+                {
+                    error!("Failed to send enable all traces command: {}", e);
+                    self.interactive_command_panel.add_response(
+                        format!("✗ Failed to enable all traces: {}", e),
+                        ResponseType::Error,
+                    );
+                } else {
+                    self.interactive_command_panel.add_response(
+                        "⏳ Enabling all traces...".to_string(),
+                        ResponseType::Progress,
+                    );
+                }
+            }
+            CommandAction::DeleteTrace(trace_id) => {
+                info!("Deleting trace {}", trace_id);
+                if let Err(e) = self
+                    .event_registry
+                    .command_sender
+                    .send(RuntimeCommand::DeleteTrace(trace_id))
+                {
+                    error!("Failed to send delete trace command: {}", e);
+                    self.interactive_command_panel.add_response(
+                        format!("✗ Failed to delete trace {}: {}", trace_id, e),
+                        ResponseType::Error,
+                    );
+                } else {
+                    self.interactive_command_panel.add_response(
+                        format!("⏳ Deleting trace {}...", trace_id),
+                        ResponseType::Progress,
+                    );
+                }
+            }
+            CommandAction::DeleteAllTraces => {
+                info!("Deleting all traces");
+                if let Err(e) = self
+                    .event_registry
+                    .command_sender
+                    .send(RuntimeCommand::DeleteAllTraces)
+                {
+                    error!("Failed to send delete all traces command: {}", e);
+                    self.interactive_command_panel.add_response(
+                        format!("✗ Failed to delete all traces: {}", e),
+                        ResponseType::Error,
+                    );
+                } else {
+                    self.interactive_command_panel.add_response(
+                        "⏳ Deleting all traces...".to_string(),
+                        ResponseType::Progress,
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -702,6 +816,92 @@ impl TuiApp {
                     "💔 Script compilation failed for trace_id: {:?}, error: {}",
                     trace_id, error
                 );
+            }
+            RuntimeStatus::TraceEnabled { trace_id } => {
+                self.interactive_command_panel.add_response(
+                    format!("✅ Trace {} enabled successfully", trace_id),
+                    ResponseType::Success,
+                );
+                // Update trace status to Active
+                self.interactive_command_panel.update_trace_status(
+                    crate::trace::TraceStatus::Active,
+                    *trace_id,
+                    None,
+                );
+                info!("Trace {} enabled successfully", trace_id);
+            }
+            RuntimeStatus::TraceDisabled { trace_id } => {
+                self.interactive_command_panel.add_response(
+                    format!("✅ Trace {} disabled successfully", trace_id),
+                    ResponseType::Success,
+                );
+                // Update trace status to Disabled
+                self.interactive_command_panel.update_trace_status(
+                    crate::trace::TraceStatus::Disabled,
+                    *trace_id,
+                    None,
+                );
+                info!("Trace {} disabled successfully", trace_id);
+            }
+            RuntimeStatus::AllTracesEnabled { count } => {
+                self.interactive_command_panel.add_response(
+                    format!("✅ All traces enabled successfully ({} traces)", count),
+                    ResponseType::Success,
+                );
+                info!("All traces enabled successfully ({} traces)", count);
+            }
+            RuntimeStatus::AllTracesDisabled { count } => {
+                self.interactive_command_panel.add_response(
+                    format!("✅ All traces disabled successfully ({} traces)", count),
+                    ResponseType::Success,
+                );
+                info!("All traces disabled successfully ({} traces)", count);
+            }
+            RuntimeStatus::TraceEnableFailed { trace_id, error } => {
+                self.interactive_command_panel.add_response(
+                    format!("✗ Failed to enable trace {}: {}", trace_id, error),
+                    ResponseType::Error,
+                );
+                error!("Failed to enable trace {}: {}", trace_id, error);
+            }
+            RuntimeStatus::TraceDisableFailed { trace_id, error } => {
+                self.interactive_command_panel.add_response(
+                    format!("✗ Failed to disable trace {}: {}", trace_id, error),
+                    ResponseType::Error,
+                );
+                error!("Failed to disable trace {}: {}", trace_id, error);
+            }
+            RuntimeStatus::TraceDeleted { trace_id } => {
+                self.interactive_command_panel.add_response(
+                    format!("✅ Trace {} deleted successfully", trace_id),
+                    ResponseType::Success,
+                );
+                // Remove trace from UI trace manager
+                self.interactive_command_panel
+                    .trace_manager
+                    .remove_trace(*trace_id);
+                info!(
+                    "Trace {} deleted successfully and removed from UI",
+                    trace_id
+                );
+            }
+            RuntimeStatus::AllTracesDeleted { count } => {
+                self.interactive_command_panel.add_response(
+                    format!("✅ All traces deleted successfully ({} traces)", count),
+                    ResponseType::Success,
+                );
+                // Clear all traces from UI trace manager
+                self.interactive_command_panel
+                    .trace_manager
+                    .clear_all_traces();
+                info!("All traces deleted successfully ({} traces)", count);
+            }
+            RuntimeStatus::TraceDeleteFailed { trace_id, error } => {
+                self.interactive_command_panel.add_response(
+                    format!("✗ Failed to delete trace {}: {}", trace_id, error),
+                    ResponseType::Error,
+                );
+                error!("Failed to delete trace {}: {}", trace_id, error);
             }
             _ => {}
         }

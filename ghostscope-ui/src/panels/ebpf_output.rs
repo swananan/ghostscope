@@ -71,17 +71,10 @@ impl EbpfInfoPanel {
         for (trace_index, trace) in self.trace_events.iter().enumerate() {
             let is_latest = trace_index == total_traces - 1;
 
-            // Format timestamp
-            let formatted_time = self.format_timestamp(trace.timestamp);
-
             // Create the main message line
             let message_line = format!(
-                "[{}] [{:^5}] TraceID:{} PID:{} - {}",
-                formatted_time,
-                format!("{:?}", trace.trace_type),
-                trace.trace_id,
-                trace.pid,
-                trace.message
+                "[{:?}] [TraceID:{:^5}] PID:{} - {}",
+                trace.trace_type, trace.trace_id, trace.pid, trace.message
             );
 
             // Wrap the message if needed

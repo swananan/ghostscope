@@ -1,6 +1,9 @@
 use aya::{
     maps::RingBuf,
-    programs::{uprobe::UProbeAttachLocation, ProgramError, UProbe},
+    programs::{
+        uprobe::{UProbeAttachLocation, UProbeLinkId},
+        ProgramError, UProbe,
+    },
     Ebpf, EbpfLoader, VerifierLogLevel,
 };
 use ghostscope_protocol::{consts, MessageParser, MessageType, TypeEncoding, VariableDataMessage};
@@ -31,6 +34,18 @@ pub type Result<T> = std::result::Result<T, LoaderError>;
 pub struct GhostScopeLoader {
     bpf: Ebpf,
     ringbuf: Option<RingBuf<aya::maps::MapData>>,
+    uprobe_link: Option<UProbeLinkId>,
+    // Store attachment parameters for re-enabling
+    attachment_params: Option<UprobeAttachmentParams>,
+}
+
+#[derive(Debug, Clone)]
+struct UprobeAttachmentParams {
+    target_binary: String,
+    function_name: String,
+    offset: Option<u64>,
+    pid: Option<i32>,
+    program_name: String,
 }
 
 impl std::fmt::Debug for GhostScopeLoader {
@@ -38,6 +53,8 @@ impl std::fmt::Debug for GhostScopeLoader {
         f.debug_struct("GhostScopeLoader")
             .field("bpf", &"<eBPF object>")
             .field("ringbuf", &self.ringbuf.is_some())
+            .field("uprobe_attached", &self.uprobe_link.is_some())
+            .field("attachment_params", &self.attachment_params.is_some())
             .finish()
     }
 }
@@ -57,7 +74,12 @@ impl GhostScopeLoader {
         {
             Ok(bpf) => {
                 info!("Successfully loaded eBPF program");
-                Ok(Self { bpf, ringbuf: None })
+                Ok(Self {
+                    bpf,
+                    ringbuf: None,
+                    uprobe_link: None,
+                    attachment_params: None,
+                })
             }
             Err(e) => {
                 error!("Failed to load BPF program: {:?}", e);
@@ -216,7 +238,7 @@ impl GhostScopeLoader {
         };
 
         match attach_result {
-            Ok(_) => {
+            Ok(link) => {
                 if let Some(offset) = offset {
                     info!(
                         "Uprobe attached successfully to {} at offset 0x{:x}",
@@ -228,6 +250,16 @@ impl GhostScopeLoader {
                         target_binary, function_name
                     );
                 }
+
+                // Store the link handle and attachment parameters for later use
+                self.uprobe_link = Some(link);
+                self.attachment_params = Some(UprobeAttachmentParams {
+                    target_binary: target_binary.to_string(),
+                    function_name: function_name.to_string(),
+                    offset,
+                    pid,
+                    program_name,
+                });
             }
             Err(e) => {
                 if let Some(offset) = offset {
@@ -272,6 +304,185 @@ impl GhostScopeLoader {
         info!("Ringbuf map initialized");
 
         Ok(())
+    }
+
+    /// Detach the uprobe (disable tracing) while keeping eBPF resources loaded
+    /// This allows the trace to be quickly re-enabled later
+    pub fn detach_uprobe(&mut self) -> Result<()> {
+        if let Some(link_id) = self.uprobe_link.take() {
+            if let Some(params) = &self.attachment_params {
+                info!("Detaching uprobe...");
+
+                // Get the program to detach the link
+                let program_ref = self.bpf.program_mut(&params.program_name).ok_or_else(|| {
+                    LoaderError::Generic(format!("Program '{}' not found", params.program_name))
+                })?;
+
+                let program: &mut UProbe = program_ref.try_into().map_err(|e| {
+                    LoaderError::Generic(format!(
+                        "Program '{}' is not a UProbe: {:?}",
+                        params.program_name, e
+                    ))
+                })?;
+
+                // Detach the uprobe using the link ID
+                program
+                    .detach(link_id)
+                    .map_err(|e| LoaderError::Program(e))?;
+
+                info!("Uprobe detached successfully");
+                Ok(())
+            } else {
+                error!("No attachment parameters stored");
+                Err(LoaderError::Generic(
+                    "No attachment parameters stored".to_string(),
+                ))
+            }
+        } else {
+            warn!("No uprobe attached, nothing to detach");
+            Ok(())
+        }
+    }
+
+    /// Reattach the uprobe (re-enable tracing) using previously stored parameters
+    /// This requires that attach_uprobe was called previously to store the parameters
+    pub fn reattach_uprobe(&mut self) -> Result<()> {
+        if self.uprobe_link.is_some() {
+            info!("Uprobe already attached");
+            return Ok(());
+        }
+
+        let params = self
+            .attachment_params
+            .as_ref()
+            .ok_or_else(|| {
+                LoaderError::Generic(
+                    "No attachment parameters stored. Call attach_uprobe first.".to_string(),
+                )
+            })?
+            .clone();
+
+        info!("Reattaching uprobe with stored parameters...");
+
+        // Get the program directly (it's already loaded)
+        let program_ref = self.bpf.program_mut(&params.program_name).ok_or_else(|| {
+            LoaderError::Generic(format!("Program '{}' not found", params.program_name))
+        })?;
+
+        let program: &mut UProbe = program_ref.try_into().map_err(|e| {
+            LoaderError::Generic(format!(
+                "Program '{}' is not a UProbe: {:?}",
+                params.program_name, e
+            ))
+        })?;
+
+        // Attach the uprobe directly (don't load - it's already loaded)
+        let attach_result = if let Some(offset) = params.offset {
+            program.attach(
+                UProbeAttachLocation::AbsoluteOffset(offset),
+                &params.target_binary,
+                params.pid,
+                None,
+            )
+        } else {
+            program.attach(
+                params.function_name.as_str(),
+                &params.target_binary,
+                params.pid,
+                None,
+            )
+        };
+
+        match attach_result {
+            Ok(link) => {
+                if let Some(offset) = params.offset {
+                    info!(
+                        "Uprobe reattached successfully to {} at offset 0x{:x}",
+                        params.target_binary, offset
+                    );
+                } else {
+                    info!(
+                        "Uprobe reattached successfully to {}:{}",
+                        params.target_binary, params.function_name
+                    );
+                }
+
+                // Store the new link handle
+                self.uprobe_link = Some(link);
+                Ok(())
+            }
+            Err(e) => {
+                error!("Failed to reattach uprobe: {:?}", e);
+                Err(LoaderError::Program(e))
+            }
+        }
+    }
+
+    /// Check if the uprobe is currently attached
+    pub fn is_uprobe_attached(&self) -> bool {
+        self.uprobe_link.is_some()
+    }
+
+    /// Completely destroy this loader and all associated resources
+    /// This detaches any attached uprobes and clears all eBPF resources
+    /// After calling this, the loader cannot be reused
+    pub fn destroy(&mut self) -> Result<()> {
+        info!("Destroying GhostScopeLoader and all associated resources");
+
+        // First detach uprobe if attached
+        if self.uprobe_link.is_some() {
+            if let Err(e) = self.detach_uprobe() {
+                warn!("Failed to detach uprobe during destroy: {}", e);
+                // Continue with destruction even if detach fails
+            }
+        }
+
+        // Clear attachment parameters
+        self.attachment_params = None;
+
+        // Clear ringbuf reference (this doesn't destroy the actual eBPF map,
+        // but removes our handle to it)
+        self.ringbuf = None;
+
+        // Note: The eBPF programs and maps will be automatically cleaned up
+        // when the `bpf` field is dropped (when this struct is dropped)
+
+        info!("GhostScopeLoader destroyed successfully");
+        Ok(())
+    }
+
+    /// Get current attachment status information
+    pub fn get_attachment_info(&self) -> Option<String> {
+        if let Some(params) = &self.attachment_params {
+            if let Some(offset) = params.offset {
+                Some(format!(
+                    "{}:{} (offset: 0x{:x}, pid: {:?}) - {}",
+                    params.target_binary,
+                    params.function_name,
+                    offset,
+                    params.pid,
+                    if self.is_uprobe_attached() {
+                        "attached"
+                    } else {
+                        "detached"
+                    }
+                ))
+            } else {
+                Some(format!(
+                    "{}:{} (pid: {:?}) - {}",
+                    params.target_binary,
+                    params.function_name,
+                    params.pid,
+                    if self.is_uprobe_attached() {
+                        "attached"
+                    } else {
+                        "detached"
+                    }
+                ))
+            }
+        } else {
+            None
+        }
     }
 
     /// Poll for new events (non-blocking)

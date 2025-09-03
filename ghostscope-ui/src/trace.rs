@@ -5,10 +5,11 @@ use tracing::warn;
 /// Trace status enum
 #[derive(Debug, Clone, PartialEq)]
 pub enum TraceStatus {
-    Loading, // Script is being compiled
-    Active,  // Script is loaded and active
-    Failed,  // Script failed to load
-    Stopped, // Script was stopped
+    Loading,  // Script is being compiled
+    Active,   // Script is loaded and active (uprobe attached)
+    Disabled, // Script is loaded but disabled (uprobe detached)
+    Failed,   // Script failed to load
+    Stopped,  // Script was stopped
 }
 
 /// Individual trace information
@@ -149,6 +150,13 @@ impl TraceManager {
         self.remove_trace(self.next_id);
     }
 
+    /// Clear all traces
+    pub fn clear_all_traces(&mut self) {
+        self.traces.clear();
+        // Reset ID counter to 0 since all traces are deleted
+        self.next_id = 0;
+    }
+
     /// Get summary statistics
     pub fn get_summary(&self) -> TraceSummary {
         let mut active = 0;
@@ -160,6 +168,7 @@ impl TraceManager {
             match trace.status {
                 TraceStatus::Active => active += 1,
                 TraceStatus::Loading => loading += 1,
+                TraceStatus::Disabled => stopped += 1, // Group disabled with stopped
                 TraceStatus::Failed => failed += 1,
                 TraceStatus::Stopped => stopped += 1,
             }
@@ -179,6 +188,7 @@ impl TraceManager {
         let status_symbol = match trace.status {
             TraceStatus::Active => "✅",
             TraceStatus::Loading => "⏳",
+            TraceStatus::Disabled => "⏸️", // Pause symbol for disabled
             TraceStatus::Failed => "❌",
             TraceStatus::Stopped => "⏹️",
         };
@@ -192,6 +202,7 @@ impl TraceManager {
             match trace.status {
                 TraceStatus::Active => "Active",
                 TraceStatus::Loading => "Loading",
+                TraceStatus::Disabled => "Disabled",
                 TraceStatus::Failed => "Failed",
                 TraceStatus::Stopped => "Stopped",
             },
