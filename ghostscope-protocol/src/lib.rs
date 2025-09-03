@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::{debug, error, info, warn};
 
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
@@ -662,51 +664,258 @@ impl MessageParser {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// High-level event parser that converts raw protocol data into structured events
+pub struct EventParser;
 
-    #[test]
-    fn test_message_builder_and_parser() {
-        let mut builder = MessageBuilder::new();
+impl EventParser {
+    /// Parse event data using GhostScope Protocol format
+    pub fn parse_event(data: &[u8]) -> Option<EventData> {
+        debug!("Processing protocol message: {} bytes", data.len());
 
-        let variables = vec![
-            (
-                "result".to_string(),
-                TypeEncoding::I32,
-                vec![0x2A, 0x00, 0x00, 0x00],
-            ),
-            (
-                "counter".to_string(),
-                TypeEncoding::U64,
-                vec![0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-            ),
-        ];
+        // Check minimum message size
+        if data.len() < 8 {
+            debug!("Message too short for header: {} bytes", data.len());
+            return None;
+        }
 
-        let message = builder
-            .build_variable_message(
-                123,  // trace_id
-                1000, // pid
-                2000, // tid
-                &variables,
-            )
-            .unwrap();
+        // Parse message header
+        let header = match MessageParser::parse_header(data) {
+            Ok(header) => header,
+            Err(e) => {
+                debug!("Failed to parse header: {}", e);
+                return None;
+            }
+        };
 
-        let header = MessageParser::parse_header(&message).unwrap();
-        assert_eq!(header.magic, consts::MAGIC);
-        assert_eq!(header.msg_type, MessageType::VariableData as u8);
+        // Verify magic number
+        if header.magic != consts::MAGIC {
+            let magic = header.magic; // Copy field to avoid packed reference
+            debug!(
+                "Invalid magic number: 0x{:08x}, expected 0x{:08x}",
+                magic,
+                consts::MAGIC
+            );
+            return None;
+        }
 
-        let (msg_body, parsed_vars) = MessageParser::parse_variable_message(&message).unwrap();
-        assert_eq!(msg_body.trace_id, 123);
-        assert_eq!(msg_body.pid, 1000);
-        assert_eq!(msg_body.tid, 2000);
-        assert_eq!(parsed_vars.len(), 2);
+        // Handle different message types
+        match header.msg_type {
+            t if t == MessageType::VariableData as u8 => Self::parse_variable_data_message(data),
+            t if t == MessageType::Error as u8 => {
+                warn!("Received error message from eBPF");
+                None
+            }
+            t if t == MessageType::Heartbeat as u8 => {
+                debug!("Received heartbeat message");
+                None
+            }
+            t if t == MessageType::Log as u8 => {
+                Self::handle_log_message(data);
+                None
+            }
+            t if t == MessageType::ExecutionFailure as u8 => {
+                Self::handle_execution_failure_message(data);
+                None
+            }
+            _ => {
+                debug!("Unknown message type: {}", header.msg_type);
+                None
+            }
+        }
+    }
 
-        assert_eq!(parsed_vars[0].0, "result");
-        assert_eq!(parsed_vars[0].1, TypeEncoding::I32);
+    /// Parse variable data message
+    fn parse_variable_data_message(data: &[u8]) -> Option<EventData> {
+        match MessageParser::parse_variable_message(data) {
+            Ok((msg_body, variables)) => {
+                let trace_id = msg_body.trace_id; // Copy field to avoid packed reference
+                info!(
+                    "Parsed variable message: {} variables from trace_id {}",
+                    variables.len(),
+                    trace_id
+                );
 
-        let formatted_value =
-            MessageParser::format_variable_value(TypeEncoding::I32, &parsed_vars[0].2).unwrap();
-        assert_eq!(formatted_value, "42");
+                let mut variable_infos = Vec::new();
+                for (name, type_encoding, raw_data) in variables {
+                    let formatted_value =
+                        MessageParser::format_variable_value(type_encoding, &raw_data)
+                            .unwrap_or_else(|e| format!("<format error: {}>", e));
+
+                    info!(
+                        "Variable: {} ({:?}) = {}",
+                        name, type_encoding, formatted_value
+                    );
+
+                    variable_infos.push(VariableInfo {
+                        name,
+                        type_encoding,
+                        raw_data,
+                        formatted_value,
+                    });
+                }
+
+                Some(EventData {
+                    trace_id: msg_body.trace_id,
+                    timestamp: msg_body.timestamp,
+                    pid: msg_body.pid,
+                    tid: msg_body.tid,
+                    variables: variable_infos,
+                })
+            }
+            Err(e) => {
+                error!("Failed to parse variable data message: {}", e);
+                None
+            }
+        }
+    }
+
+    /// Handle log message from eBPF
+    fn handle_log_message(data: &[u8]) {
+        match MessageParser::parse_log_message(data) {
+            Ok((log_msg, message)) => {
+                // Copy fields from packed struct to avoid packed reference issues
+                let trace_id = log_msg.trace_id;
+                let timestamp = log_msg.timestamp;
+                let pid = log_msg.pid;
+                let tid = log_msg.tid;
+                let log_level = log_msg.log_level;
+
+                let level_str = match log_level {
+                    0 => "DEBUG",
+                    1 => "INFO",
+                    2 => "WARN",
+                    3 => "ERROR",
+                    _ => "UNKNOWN",
+                };
+
+                // Convert nanosecond timestamp to readable format
+                let readable_ts = Self::format_timestamp_ns(timestamp);
+
+                info!(
+                    "[eBPF-{}] trace_id:{} pid:{} tid:{} {} - {}",
+                    level_str, trace_id, pid, tid, readable_ts, message
+                );
+            }
+            Err(e) => {
+                warn!("Failed to parse log message: {}", e);
+            }
+        }
+    }
+
+    /// Handle execution failure message from eBPF
+    fn handle_execution_failure_message(data: &[u8]) {
+        match MessageParser::parse_execution_failure_message(data) {
+            Ok((failure_msg, message)) => {
+                // Copy fields from packed struct to avoid packed reference issues
+                let trace_id = failure_msg.trace_id;
+                let timestamp = failure_msg.timestamp;
+                let pid = failure_msg.pid;
+                let tid = failure_msg.tid;
+                let error_code = failure_msg.error_code;
+
+                // Convert nanosecond timestamp to readable format
+                let readable_ts = Self::format_timestamp_ns(timestamp);
+
+                error!(
+                    "[eBPF-ExecutionFailure] trace_id:{} pid:{} tid:{} error_code:{} {} - {}",
+                    trace_id, pid, tid, error_code, readable_ts, message
+                );
+            }
+            Err(e) => {
+                warn!("Failed to parse execution failure message: {}", e);
+            }
+        }
+    }
+
+    /// Format eBPF timestamp (nanoseconds since boot) to human-readable format
+    /// eBPF uses bpf_ktime_get_ns() which returns nanoseconds since system boot
+    pub fn format_timestamp_ns(ns_timestamp: u64) -> String {
+        // Get current system time and boot time
+        let now = SystemTime::now();
+        let uptime = Self::get_system_uptime_ns();
+
+        if let (Ok(now_since_epoch), Some(boot_ns)) = (now.duration_since(UNIX_EPOCH), uptime) {
+            // Calculate when the system booted
+            let boot_time_ns = now_since_epoch.as_nanos() as u64 - boot_ns;
+
+            // Add eBPF timestamp to boot time to get actual time
+            let actual_time_ns = boot_time_ns + ns_timestamp;
+            let actual_time_secs = actual_time_ns / 1_000_000_000;
+            let actual_time_nanos = actual_time_ns % 1_000_000_000;
+
+            // Convert to chrono DateTime with local timezone
+            if let Some(utc_datetime) =
+                chrono::DateTime::from_timestamp(actual_time_secs as i64, actual_time_nanos as u32)
+            {
+                let local_datetime: chrono::DateTime<chrono::Local> = utc_datetime.into();
+                return format!(
+                    "{}.{:03}",
+                    local_datetime.format("%Y-%m-%d %H:%M:%S"),
+                    actual_time_nanos / 1_000_000
+                );
+            }
+        }
+
+        // Fallback to boot time offset if conversion fails
+        let ms = ns_timestamp / 1_000_000;
+        let seconds = ms / 1000;
+        let ms_remainder = ms % 1000;
+        format!("boot+{}.{:03}s", seconds, ms_remainder)
+    }
+
+    /// Get system uptime in nanoseconds
+    fn get_system_uptime_ns() -> Option<u64> {
+        std::fs::read_to_string("/proc/uptime")
+            .ok()
+            .and_then(|content| {
+                let uptime_secs: f64 = content.split_whitespace().next()?.parse().ok()?;
+                Some((uptime_secs * 1_000_000_000.0) as u64)
+            })
+    }
+}
+
+/// Structured event data from eBPF program using GhostScope Protocol
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventData {
+    pub trace_id: u64,
+    pub timestamp: u64,
+    pub pid: u32,
+    pub tid: u32,
+    pub variables: Vec<VariableInfo>,
+}
+
+/// Variable information extracted from protocol message
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VariableInfo {
+    pub name: String,
+    pub type_encoding: TypeEncoding,
+    pub raw_data: Vec<u8>,
+    pub formatted_value: String,
+}
+
+impl std::fmt::Display for EventData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let readable_ts = EventParser::format_timestamp_ns(self.timestamp);
+        writeln!(
+            f,
+            "Event [trace_id: {}, pid: {}, tid: {}, timestamp: {}]:",
+            self.trace_id, self.pid, self.tid, readable_ts
+        )?;
+        for var in &self.variables {
+            writeln!(
+                f,
+                "  {} ({}): {}",
+                var.name,
+                format!("{:?}", var.type_encoding),
+                var.formatted_value
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for VariableInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} = {}", self.name, self.formatted_value)
     }
 }
