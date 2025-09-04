@@ -4,6 +4,64 @@ use object::{Object, ObjectSection};
 use std::path::Path;
 use tracing::{debug, info, warn};
 
+/// Helper function to match file paths, supporting both exact and relative path matching
+/// This allows queries like "test.c" to match "/path/to/test.c" in DWARF debug info
+fn files_match(dwarf_file_path: &str, query_path: &str) -> bool {
+    use tracing::debug;
+
+    // First try exact match (fastest path)
+    if dwarf_file_path == query_path {
+        debug!(
+            "files_match: exact match '{}' == '{}'",
+            dwarf_file_path, query_path
+        );
+        return true;
+    }
+
+    // Try relative path matching: check if DWARF path ends with the query path
+    // This handles cases like query "test.c" matching DWARF "/full/path/test.c"
+    if dwarf_file_path.ends_with(query_path) {
+        // Make sure it's a proper path component boundary (not just a suffix)
+        let preceding_char_pos = dwarf_file_path.len() - query_path.len();
+        if preceding_char_pos == 0
+            || dwarf_file_path.chars().nth(preceding_char_pos - 1) == Some('/')
+        {
+            debug!(
+                "files_match: relative match '{}' ends with '{}' at proper boundary",
+                dwarf_file_path, query_path
+            );
+            return true;
+        } else {
+            debug!("files_match: '{}' ends with '{}' but not at proper boundary (preceding char at {})", 
+                   dwarf_file_path, query_path, preceding_char_pos);
+        }
+    }
+
+    // Try the reverse: query is longer than DWARF path, check if query ends with DWARF basename
+    if let Some(dwarf_basename) = Path::new(dwarf_file_path).file_name() {
+        if let Some(dwarf_basename_str) = dwarf_basename.to_str() {
+            if query_path.ends_with(dwarf_basename_str) {
+                let preceding_char_pos = query_path.len() - dwarf_basename_str.len();
+                if preceding_char_pos == 0
+                    || query_path.chars().nth(preceding_char_pos - 1) == Some('/')
+                {
+                    debug!(
+                        "files_match: reverse match '{}' basename matches query '{}'",
+                        dwarf_file_path, query_path
+                    );
+                    return true;
+                }
+            }
+        }
+    }
+
+    debug!(
+        "files_match: no match between '{}' and '{}'",
+        dwarf_file_path, query_path
+    );
+    false
+}
+
 /// DWARF debug context
 #[derive(Debug)]
 pub struct DwarfContext {
@@ -15,6 +73,326 @@ pub struct DwarfContext {
     eh_frame: Option<gimli::EhFrame<EndianSlice<'static, LittleEndian>>>,
     debug_frame: Option<gimli::DebugFrame<EndianSlice<'static, LittleEndian>>>,
     cfi_table: Option<CFITable>,
+
+    // High-performance line number index (inspired by addr2line)
+    line_index: Option<LineNumberIndex>,
+    // Variable location mapping for efficient lookups
+    variable_map: Option<VariableLocationMap>,
+    // Enhanced file information management for fast queries
+    file_registry: Option<FileInfoRegistry>,
+}
+
+/// Enhanced file information registry for efficient file path queries
+#[derive(Debug)]
+pub struct FileInfoRegistry {
+    /// All unique file paths in the debug info
+    all_files: Vec<FileInfo>,
+    /// Hash map for exact path lookup: full_path -> file_index
+    exact_path_map: std::collections::HashMap<String, usize>,
+    /// Hash map for basename lookup: basename -> Vec<file_index>
+    basename_map: std::collections::HashMap<String, Vec<usize>>,
+    /// Trie for prefix/suffix matching
+    path_trie: PathTrie,
+    /// Cache for recent queries
+    query_cache: std::collections::HashMap<String, Vec<usize>>,
+}
+
+/// File information with metadata
+#[derive(Debug, Clone)]
+pub struct FileInfo {
+    /// Full file path as stored in DWARF
+    pub full_path: String,
+    /// Just the filename (basename)
+    pub basename: String,
+    /// Directory path
+    pub directory: String,
+    /// File extension
+    pub extension: String,
+    /// Whether this file actually exists on disk
+    pub exists_on_disk: bool,
+    /// Alternative paths where this file might be found
+    pub search_paths: Vec<String>,
+}
+
+/// Simple trie structure for efficient path matching
+#[derive(Debug)]
+pub struct PathTrie {
+    nodes: std::collections::HashMap<String, PathTrieNode>,
+}
+
+#[derive(Debug)]
+struct PathTrieNode {
+    file_indices: Vec<usize>,
+    children: std::collections::HashMap<String, PathTrieNode>,
+}
+
+impl FileInfoRegistry {
+    /// Create new file info registry
+    fn new() -> Self {
+        Self {
+            all_files: Vec::new(),
+            exact_path_map: std::collections::HashMap::new(),
+            basename_map: std::collections::HashMap::new(),
+            path_trie: PathTrie::new(),
+            query_cache: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Add a file to the registry
+    fn add_file(&mut self, full_path: String) -> usize {
+        // Check if already exists
+        if let Some(&index) = self.exact_path_map.get(&full_path) {
+            return index;
+        }
+
+        let path = std::path::Path::new(&full_path);
+        let basename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&full_path)
+            .to_string();
+        let directory = path
+            .parent()
+            .and_then(|p| p.to_str())
+            .unwrap_or("")
+            .to_string();
+        let extension = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_string();
+
+        // Check if file exists on disk
+        let exists_on_disk = path.exists();
+        let mut search_paths = Vec::new();
+
+        if !exists_on_disk {
+            // Generate possible alternative paths
+            search_paths = self.generate_search_paths(&full_path, &basename);
+        }
+
+        let file_info = FileInfo {
+            full_path: full_path.clone(),
+            basename: basename.clone(),
+            directory,
+            extension,
+            exists_on_disk,
+            search_paths,
+        };
+
+        let index = self.all_files.len();
+        self.all_files.push(file_info);
+
+        // Update indices
+        self.exact_path_map.insert(full_path.clone(), index);
+
+        // Update basename map
+        self.basename_map
+            .entry(basename.clone())
+            .or_insert_with(Vec::new)
+            .push(index);
+
+        // Update trie
+        self.path_trie.insert(&full_path, index);
+
+        index
+    }
+
+    /// Generate possible search paths for a file
+    fn generate_search_paths(&self, full_path: &str, basename: &str) -> Vec<String> {
+        let mut search_paths = Vec::new();
+
+        // Add current working directory + basename
+        if let Ok(current_dir) = std::env::current_dir() {
+            search_paths.push(current_dir.join(basename).to_string_lossy().to_string());
+        }
+
+        // Add common source directories
+        let common_dirs = ["src", "source", "include", "lib", "../", "../../"];
+        for dir in &common_dirs {
+            search_paths.push(format!("{}/{}", dir, basename));
+        }
+
+        search_paths
+    }
+
+    /// Query files with flexible matching
+    /// Supports:
+    /// - Exact path matching
+    /// - Basename matching  
+    /// - Partial path matching
+    /// - Extension-based filtering
+    pub fn query_files(&mut self, query: &str) -> Vec<&FileInfo> {
+        // Check cache first
+        if let Some(cached_indices) = self.query_cache.get(query) {
+            return cached_indices
+                .iter()
+                .filter_map(|&i| self.all_files.get(i))
+                .collect();
+        }
+
+        let mut results = Vec::new();
+
+        // Strategy 1: Exact path match
+        if let Some(&index) = self.exact_path_map.get(query) {
+            if let Some(file_info) = self.all_files.get(index) {
+                results.push(index);
+            }
+        }
+
+        // Strategy 2: Basename match
+        if let Some(indices) = self.basename_map.get(query) {
+            results.extend(indices);
+        }
+
+        // Strategy 3: Partial path matching
+        for (i, file_info) in self.all_files.iter().enumerate() {
+            if file_info.full_path.contains(query) && !results.contains(&i) {
+                results.push(i);
+            }
+        }
+
+        // Strategy 4: Fuzzy matching for typos
+        if results.is_empty() {
+            results.extend(self.fuzzy_match(query));
+        }
+
+        // Cache the result
+        self.query_cache.insert(query.to_string(), results.clone());
+
+        results
+            .into_iter()
+            .filter_map(|i| self.all_files.get(i))
+            .collect()
+    }
+
+    /// Fuzzy matching for typos and similar file names
+    fn fuzzy_match(&self, query: &str) -> Vec<usize> {
+        let mut scored_matches = Vec::new();
+
+        for (i, file_info) in self.all_files.iter().enumerate() {
+            let basename_score = self.calculate_similarity(&file_info.basename, query);
+            let full_path_score = self.calculate_similarity(&file_info.full_path, query);
+            let max_score = basename_score.max(full_path_score);
+
+            if max_score > 0.6 {
+                // Threshold for fuzzy matching
+                scored_matches.push((i, max_score));
+            }
+        }
+
+        // Sort by score descending
+        scored_matches.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        scored_matches
+            .into_iter()
+            .take(10) // Limit to top 10 matches
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Calculate string similarity (simplified Levenshtein distance)
+    fn calculate_similarity(&self, s1: &str, s2: &str) -> f64 {
+        if s1.is_empty() && s2.is_empty() {
+            return 1.0;
+        }
+        if s1.is_empty() || s2.is_empty() {
+            return 0.0;
+        }
+
+        let len1 = s1.len();
+        let len2 = s2.len();
+        let max_len = len1.max(len2);
+
+        // Simple approach: check for common subsequences
+        let mut common = 0;
+        let s1_lower = s1.to_lowercase();
+        let s2_lower = s2.to_lowercase();
+
+        for char in s2_lower.chars() {
+            if s1_lower.contains(char) {
+                common += 1;
+            }
+        }
+
+        common as f64 / max_len as f64
+    }
+
+    /// Get all files with a specific extension
+    pub fn get_files_by_extension(&self, ext: &str) -> Vec<&FileInfo> {
+        self.all_files
+            .iter()
+            .filter(|file| file.extension == ext)
+            .collect()
+    }
+
+    /// Get files that exist on disk
+    pub fn get_existing_files(&self) -> Vec<&FileInfo> {
+        self.all_files
+            .iter()
+            .filter(|file| file.exists_on_disk)
+            .collect()
+    }
+
+    /// Get statistics about file registry
+    pub fn get_stats(&self) -> FileRegistryStats {
+        let existing_count = self.all_files.iter().filter(|f| f.exists_on_disk).count();
+
+        FileRegistryStats {
+            total_files: self.all_files.len(),
+            existing_files: existing_count,
+            missing_files: self.all_files.len() - existing_count,
+            cache_size: self.query_cache.len(),
+        }
+    }
+}
+
+impl PathTrie {
+    fn new() -> Self {
+        Self {
+            nodes: std::collections::HashMap::new(),
+        }
+    }
+
+    fn insert(&mut self, path: &str, file_index: usize) {
+        let components: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        PathTrie::insert_components(&components, file_index, &mut self.nodes);
+    }
+
+    fn insert_components(
+        components: &[&str],
+        file_index: usize,
+        nodes: &mut std::collections::HashMap<String, PathTrieNode>,
+    ) {
+        if components.is_empty() {
+            return;
+        }
+
+        let component = components[0].to_string();
+        let node = nodes
+            .entry(component.clone())
+            .or_insert_with(|| PathTrieNode {
+                file_indices: Vec::new(),
+                children: std::collections::HashMap::new(),
+            });
+
+        if components.len() == 1 {
+            // Leaf node
+            node.file_indices.push(file_index);
+        } else {
+            // Continue with remaining components
+            PathTrie::insert_components(&components[1..], file_index, &mut node.children);
+        }
+    }
+}
+
+/// Statistics about the file registry
+#[derive(Debug)]
+pub struct FileRegistryStats {
+    pub total_files: usize,
+    pub existing_files: usize,
+    pub missing_files: usize,
+    pub cache_size: usize,
 }
 
 /// Function information from DWARF
@@ -277,6 +655,43 @@ pub struct EnhancedVariableLocation {
     pub is_optimized_out: bool,
 }
 
+/// High-performance line number index (inspired by addr2line)
+#[derive(Debug)]
+pub struct LineNumberIndex {
+    /// All line sequences sorted by address range  
+    sequences: Vec<LineSequence>,
+    /// File path to index mapping
+    files: Vec<String>,
+    /// Cache for address -> source location lookups
+    addr_cache: std::collections::HashMap<u64, Option<SourceLocation>>,
+    /// Cache for (file, line) -> addresses lookups
+    line_cache: std::collections::HashMap<(String, u32), Vec<u64>>,
+}
+
+/// Line sequence containing continuous line information
+#[derive(Debug, Clone)]
+struct LineSequence {
+    /// Start address of this sequence
+    start_addr: u64,
+    /// End address of this sequence  
+    end_addr: u64,
+    /// Line rows sorted by address
+    rows: Vec<LineRow>,
+}
+
+/// Individual line row mapping address to source location
+#[derive(Debug, Clone)]
+struct LineRow {
+    /// Address in memory
+    address: u64,
+    /// File index in files array
+    file_index: usize,
+    /// Line number (0 means no line info)
+    line: u32,
+    /// Column number (0 means no column info)  
+    column: u32,
+}
+
 /// Variable location mapping for efficient address-based lookups
 #[derive(Debug)]
 pub struct VariableLocationMap {
@@ -292,6 +707,158 @@ struct AddressRangeEntry {
     start: u64,
     end: u64,
     variables: Vec<Variable>,
+}
+
+impl LineNumberIndex {
+    /// Create new empty line number index
+    fn new() -> Self {
+        Self {
+            sequences: Vec::new(),
+            files: Vec::new(),
+            addr_cache: std::collections::HashMap::new(),
+            line_cache: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Fast address to source location lookup using binary search (O(log n))
+    pub fn find_location(&mut self, addr: u64) -> Option<SourceLocation> {
+        // Check cache first
+        if let Some(cached) = self.addr_cache.get(&addr) {
+            return cached.clone();
+        }
+
+        let result = self.find_location_uncached(addr);
+
+        // Cache result for future lookups
+        self.addr_cache.insert(addr, result.clone());
+        result
+    }
+
+    /// Internal uncached lookup implementation
+    fn find_location_uncached(&self, addr: u64) -> Option<SourceLocation> {
+        // Binary search for sequence containing this address
+        let seq_idx = self
+            .sequences
+            .binary_search_by(|sequence| {
+                if addr < sequence.start_addr {
+                    std::cmp::Ordering::Greater
+                } else if addr >= sequence.end_addr {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .ok()?;
+
+        let sequence = &self.sequences[seq_idx];
+
+        // Binary search within sequence for exact address
+        let row_idx = match sequence.rows.binary_search_by(|row| row.address.cmp(&addr)) {
+            Ok(idx) => idx,
+            Err(0) => return None, // Address before first row
+            Err(idx) => idx - 1,   // Use previous row
+        };
+
+        let row = &sequence.rows[row_idx];
+        let file_path = self.files.get(row.file_index)?.clone();
+
+        Some(SourceLocation {
+            file_path,
+            line_number: row.line,
+            column: if row.column != 0 {
+                Some(row.column)
+            } else {
+                None
+            },
+            address: addr,
+        })
+    }
+
+    /// Fast line to addresses lookup using cached mapping (O(1) after first lookup)
+    pub fn get_addresses_for_line(&mut self, file_path: &str, line_number: u32) -> Vec<u64> {
+        let cache_key = (file_path.to_string(), line_number);
+
+        // Check cache first
+        if let Some(cached) = self.line_cache.get(&cache_key) {
+            return cached.clone();
+        }
+
+        let mut addresses = Vec::new();
+
+        // Search all sequences for matching line
+        debug!(
+            "Searching for line {} in {} sequences",
+            line_number,
+            self.sequences.len()
+        );
+        let mut matched_files_count = 0;
+        let mut total_rows_checked = 0;
+        for sequence in &self.sequences {
+            debug!(
+                "Checking sequence with {} rows, address range 0x{:x}-0x{:x}",
+                sequence.rows.len(),
+                sequence.start_addr,
+                sequence.end_addr
+            );
+            for row in &sequence.rows {
+                total_rows_checked += 1;
+                if let Some(file) = self.files.get(row.file_index) {
+                    if files_match(file, file_path) {
+                        matched_files_count += 1;
+                        debug!(
+                            "File matched! Row line: {}, target line: {}, address: 0x{:x}",
+                            row.line, line_number, row.address
+                        );
+                        if row.line == line_number {
+                            debug!("Found exact line match! Adding address 0x{:x}", row.address);
+                            addresses.push(row.address);
+                        }
+                    }
+                }
+            }
+        }
+        debug!(
+            "Search complete: checked {} rows, {} file matches, found {} addresses",
+            total_rows_checked,
+            matched_files_count,
+            addresses.len()
+        );
+
+        // Sort addresses for consistent ordering
+        addresses.sort_unstable();
+        addresses.dedup();
+
+        // Cache result
+        self.line_cache.insert(cache_key, addresses.clone());
+        addresses
+    }
+
+    /// Clear caches to free memory
+    pub fn clear_caches(&mut self) {
+        self.addr_cache.clear();
+        self.line_cache.clear();
+    }
+
+    /// Get statistics about the index
+    pub fn get_statistics(&self) -> LineIndexStats {
+        LineIndexStats {
+            sequence_count: self.sequences.len(),
+            total_rows: self.sequences.iter().map(|s| s.rows.len()).sum(),
+            file_count: self.files.len(),
+            addr_cache_size: self.addr_cache.len(),
+            line_cache_size: self.line_cache.len(),
+        }
+    }
+}
+
+/// Statistics about line number index performance
+#[derive(Debug, Clone)]
+pub struct LineIndexStats {
+    pub sequence_count: usize,
+    pub total_rows: usize,
+    pub file_count: usize,
+    pub addr_cache_size: usize,
+    pub line_cache_size: usize,
 }
 
 impl VariableLocationMap {
@@ -316,12 +883,30 @@ impl VariableLocationMap {
         }) {
             Ok(index) => {
                 let range = &self.address_ranges[index];
+                debug!(
+                    "Found address range 0x{:x}-0x{:x} with {} variables",
+                    range.start,
+                    range.end,
+                    range.variables.len()
+                );
                 for var in &range.variables {
+                    // Debug: show all variables found in range
+                    debug!(
+                        "Checking variable '{}' at address 0x{:x}, scope_ranges: {:?}",
+                        var.name, addr, var.scope_ranges
+                    );
+
                     // Check if variable is actually in scope at this specific address
                     let in_scope = var
                         .scope_ranges
                         .iter()
                         .any(|scope| addr >= scope.start && addr < scope.end);
+                    debug!(
+                        "Variable '{}' in_scope: {}, scope_ranges.is_empty(): {}",
+                        var.name,
+                        in_scope,
+                        var.scope_ranges.is_empty()
+                    );
 
                     if in_scope || var.scope_ranges.is_empty() {
                         let location_expr = var
@@ -343,7 +928,20 @@ impl VariableLocationMap {
             }
             Err(_) => {
                 // Address not found in any range
+                debug!("No address range found for address 0x{:x}", addr);
             }
+        }
+
+        debug!(
+            "Returning {} variables for address 0x{:x}",
+            variables.len(),
+            addr
+        );
+        for var in &variables {
+            debug!(
+                "  Variable: '{}' type: '{}'",
+                var.variable.name, var.variable.type_name
+            );
         }
 
         // Cache the result
@@ -434,10 +1032,19 @@ impl DwarfContext {
             eh_frame,
             debug_frame,
             cfi_table: None,
+            line_index: None,
+            variable_map: None,
+            file_registry: None,
         };
 
         // Build CFI table for efficient lookups
         context.build_cfi_table()?;
+
+        // Build line number index for fast source line lookups
+        context.build_line_index()?;
+
+        // Build variable location map for efficient variable queries
+        context.variable_map = Some(context.build_variable_location_map());
 
         Ok(context)
     }
@@ -464,9 +1071,25 @@ impl DwarfContext {
         None
     }
 
-    /// Get source location for a given address
-    pub fn get_source_location(&self, addr: u64) -> Option<SourceLocation> {
+    /// Get source location for a given address (fast O(log n) lookup using index)
+    pub fn get_source_location(&mut self, addr: u64) -> Option<SourceLocation> {
         debug!("Looking up source location for address: 0x{:x}", addr);
+
+        // Use fast line index if available
+        if let Some(ref mut line_index) = self.line_index {
+            return line_index.find_location(addr);
+        }
+
+        // Fallback to slow lookup if index not available
+        self.get_source_location_slow(addr)
+    }
+
+    /// Slow source location lookup (fallback when index is not built)
+    pub fn get_source_location_slow(&self, addr: u64) -> Option<SourceLocation> {
+        debug!(
+            "Using slow source location lookup for address: 0x{:x}",
+            addr
+        );
 
         // Iterate through compilation units
         let mut units = self.dwarf.units();
@@ -481,12 +1104,46 @@ impl DwarfContext {
         None
     }
 
-    /// Get all addresses for a given source line
-    pub fn get_addresses_for_line(&self, file_path: &str, line_number: u32) -> Vec<LineMapping> {
+    /// Get all addresses for a given source line (fast O(1) lookup using index after first query)
+    pub fn get_addresses_for_line(
+        &mut self,
+        file_path: &str,
+        line_number: u32,
+    ) -> Vec<LineMapping> {
         debug!(
             "Looking up addresses for line {}:{}",
             file_path, line_number
         );
+        // Debug: show all available files in line index
+        if let Some(ref line_index) = self.line_index {
+            debug!("Available files in line index: {:?}", line_index.files);
+        }
+
+        // Use fast line index if available
+        if let Some(ref mut line_index) = self.line_index {
+            let addresses = line_index.get_addresses_for_line(file_path, line_number);
+            return addresses
+                .into_iter()
+                .map(|addr| LineMapping {
+                    address: addr,
+                    file_path: file_path.to_string(),
+                    line_number: line_number,
+                    function_name: None,
+                })
+                .collect();
+        }
+
+        // Fallback to slow lookup if index not available
+        self.get_addresses_for_line_slow(file_path, line_number)
+    }
+
+    /// Slow line to addresses lookup (fallback when index is not built)
+    pub fn get_addresses_for_line_slow(
+        &self,
+        file_path: &str,
+        line_number: u32,
+    ) -> Vec<LineMapping> {
+        debug!("Using slow line lookup for {}:{}", file_path, line_number);
 
         let mut mappings = Vec::new();
         let mut units = self.dwarf.units();
@@ -531,48 +1188,38 @@ impl DwarfContext {
         mappings
     }
 
-    /// Get all variables visible at a given address
-    pub fn get_variables_at_address(&self, addr: u64) -> Vec<Variable> {
+    /// Get all variables visible at a given address (unified interface - uses variable map only)
+    pub fn get_variables_at_address(&mut self, addr: u64) -> Vec<Variable> {
         debug!("Looking up variables at address: 0x{:x}", addr);
 
-        let mut variables = Vec::new();
-        let mut units = self.dwarf.units();
-        let mut unit_count = 0;
-
-        while let Ok(Some(header)) = units.next() {
-            if let Ok(unit) = self.dwarf.unit(header) {
-                unit_count += 1;
-                let before_count = variables.len();
-                self.find_variables_in_unit_concrete(&unit, addr, &mut variables);
-                let vars_in_unit = variables.len() - before_count;
-
-                if vars_in_unit > 0 {
-                    debug!(
-                        "Unit {}: Found {} variables at 0x{:x}",
-                        unit_count, vars_in_unit, addr
-                    );
-                    for var in &variables[before_count..] {
-                        debug!(
-                            "  Variable: {} (type: {}, scope: {:x?}-{:x?})",
-                            var.name, var.type_name, var.scope_start, var.scope_end
-                        );
-                    }
-                }
-            }
+        // Use variable map exclusively - no fallback
+        if let Some(ref mut var_map) = self.variable_map {
+            let enhanced_vars = var_map.get_variables_at_address(addr);
+            return enhanced_vars
+                .into_iter()
+                .map(|ev| Variable {
+                    name: ev.variable.name,
+                    type_name: ev.variable.type_name,
+                    dwarf_type: ev.variable.dwarf_type,
+                    location_expr: ev.variable.location_expr,
+                    scope_ranges: ev.variable.scope_ranges.clone(),
+                    is_parameter: ev.variable.is_parameter,
+                    is_artificial: ev.variable.is_artificial,
+                    // Legacy fields for backward compatibility
+                    location: None,
+                    scope_start: ev.variable.scope_ranges.first().map(|r| r.start),
+                    scope_end: ev.variable.scope_ranges.first().map(|r| r.end),
+                })
+                .collect();
         }
 
-        debug!(
-            "Total: Found {} variables at address 0x{:x} across {} units",
-            variables.len(),
-            addr,
-            unit_count
-        );
-
-        variables
+        // If no variable map is built, return empty - no fallback
+        debug!("No variable map available, returning empty result");
+        Vec::new()
     }
 
     /// Get detailed variable location information
-    pub fn get_variable_location(&self, addr: u64, var_name: &str) -> Option<VariableLocation> {
+    pub fn get_variable_location(&mut self, addr: u64, var_name: &str) -> Option<VariableLocation> {
         let variables = self.get_variables_at_address(addr);
 
         for var in variables {
@@ -585,7 +1232,7 @@ impl DwarfContext {
     }
 
     /// Get enhanced variable location information at a specific address
-    pub fn get_enhanced_variable_locations(&self, addr: u64) -> Vec<EnhancedVariableLocation> {
+    pub fn get_enhanced_variable_locations(&mut self, addr: u64) -> Vec<EnhancedVariableLocation> {
         debug!(
             "Getting enhanced variable locations at address: 0x{:x}",
             addr
@@ -623,6 +1270,152 @@ impl DwarfContext {
             addr
         );
         enhanced_locations
+    }
+
+    /// Build high-performance line number index (inspired by addr2line)
+    fn build_line_index(&mut self) -> Result<()> {
+        debug!("Building line number index for fast source location lookups...");
+
+        let mut sequences = Vec::new();
+        let mut files = Vec::new();
+        let mut file_map = std::collections::HashMap::new();
+
+        let mut units = self.dwarf.units();
+        while let Ok(Some(header)) = units.next() {
+            if let Ok(unit) = self.dwarf.unit(header) {
+                self.build_line_sequences_from_unit(
+                    &unit,
+                    &mut sequences,
+                    &mut files,
+                    &mut file_map,
+                )?;
+            }
+        }
+
+        // Sort sequences by start address for binary search
+        sequences.sort_by_key(|seq| seq.start_addr);
+
+        debug!(
+            "Built line index with {} sequences and {} files",
+            sequences.len(),
+            files.len()
+        );
+
+        self.line_index = Some(LineNumberIndex {
+            sequences,
+            files,
+            addr_cache: std::collections::HashMap::new(),
+            line_cache: std::collections::HashMap::new(),
+        });
+
+        Ok(())
+    }
+
+    /// Build line sequences from a single compilation unit
+    fn build_line_sequences_from_unit(
+        &self,
+        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
+        sequences: &mut Vec<LineSequence>,
+        files: &mut Vec<String>,
+        file_map: &mut std::collections::HashMap<String, usize>,
+    ) -> Result<()> {
+        let line_program = match unit.line_program {
+            Some(ref program) => program,
+            None => return Ok(()),
+        };
+
+        let mut rows = line_program.clone().rows();
+        let mut current_sequence_rows: Vec<LineRow> = Vec::new();
+
+        while let Some((_, row)) = rows.next_row()? {
+            if row.end_sequence() {
+                if !current_sequence_rows.is_empty() {
+                    let start_addr = current_sequence_rows.first().unwrap().address;
+                    let end_addr = row.address();
+
+                    sequences.push(LineSequence {
+                        start_addr,
+                        end_addr,
+                        rows: current_sequence_rows.clone(),
+                    });
+
+                    current_sequence_rows.clear();
+                }
+                continue;
+            }
+
+            let address = row.address();
+            let file_index = self.resolve_file_index(&row, unit, files, file_map)?;
+            let line = row.line().map(|l| l.get() as u32).unwrap_or(0);
+            let column = match row.column() {
+                gimli::ColumnType::LeftEdge => 0,
+                gimli::ColumnType::Column(col) => col.get() as u32,
+            };
+
+            // Merge duplicate addresses
+            if let Some(last_row) = current_sequence_rows.last_mut() {
+                if last_row.address == address {
+                    last_row.file_index = file_index;
+                    last_row.line = line;
+                    last_row.column = column;
+                    continue;
+                }
+            }
+
+            current_sequence_rows.push(LineRow {
+                address,
+                file_index,
+                line,
+                column,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Resolve file index for a line program row
+    fn resolve_file_index(
+        &self,
+        row: &gimli::LineRow,
+        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
+        files: &mut Vec<String>,
+        file_map: &mut std::collections::HashMap<String, usize>,
+    ) -> Result<usize> {
+        let line_program = unit.line_program.as_ref().unwrap();
+        let header = line_program.header();
+
+        if let Some(file_entry) = header.file(row.file_index()) {
+            let path_name = if let Some(directory) = header.directory(file_entry.directory_index())
+            {
+                let dir_str = self
+                    .dwarf
+                    .attr_string(&unit, directory)?
+                    .to_string_lossy()
+                    .to_string();
+                let file_str = self
+                    .dwarf
+                    .attr_string(&unit, file_entry.path_name())?
+                    .to_string_lossy()
+                    .to_string();
+                format!("{}/{}", dir_str, file_str)
+            } else {
+                self.dwarf
+                    .attr_string(&unit, file_entry.path_name())?
+                    .to_string_lossy()
+                    .to_string()
+            };
+
+            if let Some(&index) = file_map.get(&path_name) {
+                Ok(index)
+            } else {
+                let index = files.len();
+                files.push(path_name.clone());
+                file_map.insert(path_name, index);
+                Ok(index)
+            }
+        } else {
+            Ok(0) // Default file index
+        }
     }
 
     /// Build a comprehensive variable location map for efficient lookups
@@ -1170,7 +1963,7 @@ impl DwarfContext {
         None
     }
 
-    /// Fixed version: Find parent scope by analyzing DWARF structure more carefully
+    /// Fixed version: Find parent scope by analyzing DWARF structure through actual parent traversal
     fn find_variable_parent_scope_fixed(
         &self,
         unit: &gimli::Unit<gimli::EndianSlice<gimli::LittleEndian>>,
@@ -1182,81 +1975,81 @@ impl DwarfContext {
             variable_offset
         );
 
-        // Build a map of all scopes first
-        let mut scope_map: std::collections::HashMap<gimli::UnitOffset, AddressRange> =
-            std::collections::HashMap::new();
+        // Build a parent map by traversing the DWARF tree structure
         let mut entries = unit.entries();
+        let mut parent_map: std::collections::HashMap<gimli::UnitOffset, gimli::UnitOffset> =
+            std::collections::HashMap::new();
+        let mut entry_info: std::collections::HashMap<
+            gimli::UnitOffset,
+            (gimli::DwTag, Option<AddressRange>),
+        > = std::collections::HashMap::new();
+        let mut parent_stack: Vec<gimli::UnitOffset> = Vec::new();
 
-        // First pass: collect all scope entries
-        while let Ok(Some((_, entry))) = entries.next_dfs() {
-            match entry.tag() {
+        // Traverse the tree to build parent relationships
+        while let Ok(Some((depth, entry))) = entries.next_dfs() {
+            let entry_offset = entry.offset();
+            let entry_tag = entry.tag();
+
+            // Adjust parent stack based on depth
+            while parent_stack.len() > (depth.max(0) as usize) {
+                parent_stack.pop();
+            }
+
+            // Record parent relationship if we have a parent
+            if let Some(&parent_offset) = parent_stack.last() {
+                parent_map.insert(entry_offset, parent_offset);
+                debug!(
+                    "Entry {:?} has parent {:?} (depth {})",
+                    entry_offset, parent_offset, depth
+                );
+            }
+
+            // Collect scope information for functions and lexical blocks
+            let address_range = match entry_tag {
                 gimli::DW_TAG_subprogram | gimli::DW_TAG_lexical_block => {
-                    if let Some(range) = self.extract_address_range_from_entry(entry) {
+                    let range = self.extract_address_range_from_entry(entry);
+                    if let Some(ref r) = range {
                         debug!(
-                            "Collected scope at offset {:?}: 0x{:x}-0x{:x}",
-                            entry.offset(),
-                            range.start,
-                            range.end
+                            "Collected scope at offset {:?} (depth {}): 0x{:x}-0x{:x}, tag: {:?}",
+                            entry_offset, depth, r.start, r.end, entry_tag
                         );
-                        scope_map.insert(entry.offset(), range);
                     }
+                    range
                 }
-                _ => {}
+                _ => None,
+            };
+
+            entry_info.insert(entry_offset, (entry_tag, address_range));
+
+            // Add to parent stack if this is a scope entry
+            if matches!(
+                entry_tag,
+                gimli::DW_TAG_subprogram | gimli::DW_TAG_lexical_block | gimli::DW_TAG_compile_unit
+            ) {
+                parent_stack.push(entry_offset);
             }
         }
 
-        // Second pass: find the variable and determine its containing scope
-        let mut entries = unit.entries();
-        let mut scope_stack: Vec<gimli::UnitOffset> = Vec::new();
+        // Traverse up the parent chain to find the first scope with an address range
+        let mut current_offset = variable_offset;
 
-        while let Ok(Some((depth, entry))) = entries.next_dfs() {
-            let current_offset = entry.offset();
-
-            if current_offset == variable_offset || scope_map.contains_key(&current_offset) {
-                debug!(
-                    "Processing entry at offset {:?}, depth {}, current scope stack: {:?}, is_scope: {}, is_target: {}",
-                    current_offset, depth, scope_stack, scope_map.contains_key(&current_offset), current_offset == variable_offset
-                );
-            }
-
-            // Maintain scope stack based on depth - ensure we don't pop below zero
-            while scope_stack.len() > depth as usize {
-                let popped = scope_stack.pop();
-                debug!("Popped scope from stack due to depth change: {:?}", popped);
-            }
-
-            // If this is a scope entry, add to stack BEFORE checking for variable
-            if scope_map.contains_key(&current_offset) {
-                scope_stack.push(current_offset);
-                debug!(
-                    "Added scope {:?} to stack at depth {}, stack now: {:?}",
-                    current_offset, depth, scope_stack
-                );
-            }
-
-            // If we found our variable, find its containing scope
-            if current_offset == variable_offset {
-                debug!(
-                    "Found variable at offset {:?}, current scope stack: {:?}",
-                    variable_offset, scope_stack
-                );
-
-                // Look for the most recent scope in the stack
-                for &scope_offset in scope_stack.iter().rev() {
-                    if let Some(range) = scope_map.get(&scope_offset) {
+        while let Some(&parent_offset) = parent_map.get(&current_offset) {
+            if let Some((tag, range_opt)) = entry_info.get(&parent_offset) {
+                if matches!(*tag, gimli::DW_TAG_subprogram | gimli::DW_TAG_lexical_block) {
+                    if let Some(range) = range_opt {
                         debug!(
-                            "Found containing scope for variable: 0x{:x}-0x{:x} (from scope {:?})",
-                            range.start, range.end, scope_offset
+                            "Found parent scope for variable at {:?}: scope {:?} with range 0x{:x}-0x{:x}",
+                            variable_offset, parent_offset, range.start, range.end
                         );
                         return Some(vec![range.clone()]);
                     }
                 }
-                break;
             }
+            current_offset = parent_offset;
         }
 
         debug!(
-            "No containing scope found for variable at offset {:?}",
+            "No parent scope with address range found for variable at offset {:?}",
             variable_offset
         );
         None

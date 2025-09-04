@@ -775,14 +775,11 @@ impl TuiApp {
 
         match &status {
             RuntimeStatus::SourceCodeLoaded(source_info) => {
-                self.source_panel.load_source(
-                    source_info.file_path.clone(),
-                    source_info.content.clone(),
-                    source_info.current_line,
-                );
+                self.source_panel
+                    .load_source(source_info.file_path.clone(), source_info.current_line);
             }
-            RuntimeStatus::SourceCodeLoadFailed(_) => {
-                self.source_panel.clear_source();
+            RuntimeStatus::SourceCodeLoadFailed(error_message) => {
+                self.source_panel.show_error(error_message.clone());
             }
             RuntimeStatus::DwarfLoadingCompleted { .. } => {
                 // Auto-request source code when DWARF loading completes

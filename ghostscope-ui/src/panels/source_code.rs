@@ -32,22 +32,41 @@ impl SourceCodePanel {
         }
     }
 
-    pub fn load_source(
-        &mut self,
-        file_path: String,
-        content: Vec<String>,
-        _highlight_line: Option<usize>, // Ignore highlight_line parameter
-    ) {
-        self.file_path = Some(file_path.clone());
-        self.content = content;
+    pub fn load_source(&mut self, file_path: String, highlight_line: Option<usize>) {
+        // Try to read the file
+        match std::fs::read_to_string(&file_path) {
+            Ok(content) => {
+                let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+                self.file_path = Some(file_path.clone());
+                self.content = lines;
 
-        // Detect language based on file extension
-        self.language = self.detect_language(&file_path);
+                // Detect language based on file extension
+                self.language = self.detect_language(&file_path);
 
-        // Always start at the top of the file
-        self.current_line = 0;
-        self.current_column = 0;
-        self.scroll_offset = 0;
+                // Set cursor to highlight line or start at top
+                if let Some(line) = highlight_line {
+                    self.current_line = line.saturating_sub(1); // Convert to 0-based
+                                                                // Center the view around the current line
+                    if self.current_line >= self.area_height as usize / 2 {
+                        self.scroll_offset = self.current_line - self.area_height as usize / 2;
+                    } else {
+                        self.scroll_offset = 0;
+                    }
+                } else {
+                    self.current_line = 0;
+                    self.scroll_offset = 0;
+                }
+                self.current_column = 0;
+            }
+            Err(e) => {
+                // Show error if file cannot be read
+                self.show_error(format!(
+                    "Cannot read source file '{}': {}. \
+                    Ensure source files are accessible at the paths recorded in debug info.",
+                    file_path, e
+                ));
+            }
+        }
     }
 
     fn detect_language(&self, file_path: &str) -> String {
@@ -98,6 +117,23 @@ impl SourceCodePanel {
     pub fn clear_source(&mut self) {
         self.content = vec!["// No source code loaded".to_string()];
         self.file_path = None;
+        self.current_line = 0;
+        self.current_column = 0;
+        self.scroll_offset = 0;
+    }
+
+    pub fn show_error(&mut self, error_message: String) {
+        self.content = vec![
+            "// Source code loading failed".to_string(),
+            "//".to_string(),
+            format!("// Error: {}", error_message),
+            "//".to_string(),
+            "// To fix this issue:".to_string(),
+            "// 1. Ensure the binary was compiled with debug symbols (-g flag)".to_string(),
+            "// 2. Run from the directory containing source files".to_string(),
+            "// 3. Check that source files are accessible".to_string(),
+        ];
+        self.file_path = Some("Error".to_string());
         self.current_line = 0;
         self.current_column = 0;
         self.scroll_offset = 0;

@@ -93,6 +93,8 @@ impl BinaryAnalyzer {
             debuglink::find_debug_info(&binary_path)?
         };
 
+        info!("Found debug info: {:?}", debug_path);
+
         let debug_info = DebugInfo {
             binary_path: binary_path.clone(),
             debug_path: debug_path.clone(),
@@ -145,13 +147,18 @@ impl BinaryAnalyzer {
     }
 
     /// Get source location for address
-    pub fn get_source_location(&self, addr: u64) -> Option<dwarf::SourceLocation> {
-        self.dwarf_context.as_ref()?.get_source_location(addr)
+    pub fn get_source_location(&mut self, addr: u64) -> Option<dwarf::SourceLocation> {
+        self.dwarf_context.as_mut()?.get_source_location(addr)
     }
 
     /// Get DWARF context for advanced debug information queries
     pub fn dwarf_context(&self) -> Option<&dwarf::DwarfContext> {
         self.dwarf_context.as_ref()
+    }
+
+    /// Get mutable DWARF context for advanced debug information queries
+    pub fn dwarf_context_mut(&mut self) -> Option<&mut dwarf::DwarfContext> {
+        self.dwarf_context.as_mut()
     }
 
     /// Resolve function name to virtual address
@@ -167,8 +174,12 @@ impl BinaryAnalyzer {
     /// Resolve source line to virtual address  
     /// This is a unified interface that handles the complete source line to address resolution
     /// Returns the first address found for the given source line
-    pub fn resolve_source_line_address(&self, file_path: &str, line_number: u32) -> Option<u64> {
-        if let Some(dwarf_context) = &self.dwarf_context {
+    pub fn resolve_source_line_address(
+        &mut self,
+        file_path: &str,
+        line_number: u32,
+    ) -> Option<u64> {
+        if let Some(dwarf_context) = &mut self.dwarf_context {
             let line_mappings = dwarf_context.get_addresses_for_line(file_path, line_number);
             if !line_mappings.is_empty() {
                 Some(line_mappings[0].address)
@@ -193,7 +204,7 @@ impl BinaryAnalyzer {
     /// Calculate uprobe offset for source line
     /// This combines source line resolution and uprobe offset calculation
     pub fn resolve_source_line_uprobe_offset(
-        &self,
+        &mut self,
         file_path: &str,
         line_number: u32,
     ) -> Option<u64> {
@@ -214,8 +225,8 @@ impl BinaryAnalyzer {
 
     /// Get variable size at specific address by variable name
     /// Returns the size in bytes for bpf_probe_read_user, or None if variable not found
-    pub fn get_variable_size(&self, pc: u64, var_name: &str) -> Option<u64> {
-        if let Some(dwarf_ctx) = &self.dwarf_context {
+    pub fn get_variable_size(&mut self, pc: u64, var_name: &str) -> Option<u64> {
+        if let Some(dwarf_ctx) = &mut self.dwarf_context {
             let enhanced_vars = dwarf_ctx.get_enhanced_variable_locations(pc);
             for var_info in enhanced_vars {
                 if var_info.variable.name == var_name {

@@ -26,7 +26,6 @@ pub struct EventRegistry {
 #[derive(Debug, Clone)]
 pub struct SourceCodeInfo {
     pub file_path: String,
-    pub content: Vec<String>,
     pub current_line: Option<usize>,
 }
 

@@ -136,7 +136,6 @@ async fn run_runtime_coordinator(
     mut runtime_channels: ghostscope_ui::RuntimeChannels,
     mut session: Option<GhostSession>,
 ) -> Result<()> {
-    use ghostscope_protocol::MessageType;
     use ghostscope_ui::{RuntimeCommand, RuntimeStatus};
 
     info!("Runtime coordinator started");
@@ -215,7 +214,7 @@ async fn run_runtime_coordinator(
                     }
                     RuntimeCommand::RequestSourceCode => {
                         info!("Source code request received");
-                        handle_source_code_request(&session, &runtime_channels.status_sender).await;
+                        handle_source_code_request(&mut session, &runtime_channels.status_sender).await;
                     }
                     RuntimeCommand::DisableTrace(trace_id) => {
                         info!("Disabling trace: {}", trace_id);
@@ -354,128 +353,63 @@ async fn run_runtime_coordinator(
 
 /// Handle source code request from TUI
 async fn handle_source_code_request(
-    session: &Option<GhostSession>,
+    session: &mut Option<GhostSession>,
     status_sender: &tokio::sync::mpsc::UnboundedSender<ghostscope_ui::RuntimeStatus>,
 ) {
     use ghostscope_ui::{events::SourceCodeInfo, RuntimeStatus};
 
-    if let Some(session) = session {
-        // Try to get source information from DWARF
-        if let Some(binary_analyzer) = &session.binary_analyzer {
-            if let Some(dwarf_context) = binary_analyzer.dwarf_context() {
-                // For now, get main function address and find its source
-                if let Some(main_symbol) = binary_analyzer.find_symbol("main") {
-                    if let Some(source_location) =
-                        dwarf_context.get_source_location(main_symbol.address)
-                    {
-                        info!(
-                            "Found source location: file_path={}, line={}",
-                            source_location.file_path, source_location.line_number
-                        );
+    let result = try_load_source_code(session).await;
 
-                        // Try multiple strategies to find the source file
-                        let possible_paths = get_possible_source_paths(
-                            &source_location.file_path,
-                            &binary_analyzer.debug_info().binary_path,
-                        );
-
-                        for path in possible_paths {
-                            info!("Trying to read source file: {}", path.display());
-                            match std::fs::read_to_string(&path) {
-                                Ok(content) => {
-                                    let lines: Vec<String> =
-                                        content.lines().map(|s| s.to_string()).collect();
-                                    let source_info = SourceCodeInfo {
-                                        file_path: path.to_string_lossy().to_string(),
-                                        content: lines,
-                                        current_line: Some(source_location.line_number as usize),
-                                    };
-                                    let _ = status_sender
-                                        .send(RuntimeStatus::SourceCodeLoaded(source_info));
-                                    return;
-                                }
-                                Err(e) => {
-                                    info!("Failed to read source file {}: {}", path.display(), e);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+    match result {
+        Ok(source_info) => {
+            info!(
+                "Successfully loaded source code from: {}",
+                source_info.file_path
+            );
+            let _ = status_sender.send(RuntimeStatus::SourceCodeLoaded(source_info));
+        }
+        Err(error_msg) => {
+            info!("Source code loading failed: {}", error_msg);
+            let _ = status_sender.send(RuntimeStatus::SourceCodeLoadFailed(error_msg));
         }
     }
-
-    // If we get here, source code loading failed - provide detailed error info
-    if let Some(session) = session {
-        if let Some(binary_analyzer) = &session.binary_analyzer {
-            if let Some(dwarf_context) = binary_analyzer.dwarf_context() {
-                if let Some(main_symbol) = binary_analyzer.find_symbol("main") {
-                    if let Some(source_location) =
-                        dwarf_context.get_source_location(main_symbol.address)
-                    {
-                        // We found DWARF info but couldn't find source files
-                        let possible_paths = get_possible_source_paths(
-                            &source_location.file_path,
-                            &binary_analyzer.debug_info().binary_path,
-                        );
-
-                        let path_list: Vec<String> = possible_paths
-                            .iter()
-                            .map(|p| p.to_string_lossy().to_string())
-                            .collect();
-
-                        let error_msg = format!(
-                            "Source file not found. DWARF reports: '{}' (line {}). Searched paths: {}",
-                            source_location.file_path,
-                            source_location.line_number,
-                            path_list.join(", ")
-                        );
-
-                        let _ = status_sender.send(RuntimeStatus::SourceCodeLoadFailed(error_msg));
-                        return;
-                    }
-                }
-            }
-        }
-    }
-
-    // Fallback error message
-    let _ = status_sender.send(RuntimeStatus::SourceCodeLoadFailed(
-        "No debug information available. Compile with -g for source code display.".to_string(),
-    ));
 }
 
-/// Get possible source file paths based on DWARF info and binary location
-fn get_possible_source_paths(dwarf_file_path: &str, binary_path: &Path) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
+/// Try to load source code, returning detailed error information
+async fn try_load_source_code(
+    session: &mut Option<GhostSession>,
+) -> Result<ghostscope_ui::events::SourceCodeInfo, String> {
+    use ghostscope_ui::events::SourceCodeInfo;
 
-    // 1. Try the original path from DWARF
-    paths.push(PathBuf::from(dwarf_file_path));
+    let session = session
+        .as_mut()
+        .ok_or_else(|| "No active session available".to_string())?;
 
-    // 2. If it's a relative path like "file_1", try common source file names in binary directory
-    if dwarf_file_path.starts_with("file_") || !Path::new(dwarf_file_path).is_absolute() {
-        if let Some(binary_dir) = binary_path.parent() {
-            // Try test_program.c in the same directory as binary
-            paths.push(binary_dir.join("test_program.c"));
+    let binary_analyzer = session
+        .binary_analyzer
+        .as_mut()
+        .ok_or_else(|| "Binary analyzer not available. Try reloading the binary.".to_string())?;
 
-            // Try other common source file extensions
-            let binary_stem = binary_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("main");
+    let main_symbol = binary_analyzer.find_symbol("main").ok_or_else(|| {
+        "Main function not found in binary. Ensure the binary has debug symbols.".to_string()
+    })?;
 
-            for ext in &["c", "cpp", "cc", "cxx"] {
-                paths.push(binary_dir.join(format!("{}.{}", binary_stem, ext)));
-            }
-        }
-    }
+    info!("Found main symbol at address: 0x{:x}", main_symbol.address);
 
-    // 3. If it's a filename without directory, try in binary directory
-    if let Some(filename) = Path::new(dwarf_file_path).file_name() {
-        if let Some(binary_dir) = binary_path.parent() {
-            paths.push(binary_dir.join(filename));
-        }
-    }
+    let source_location = binary_analyzer
+        .get_source_location(main_symbol.address)
+        .ok_or_else(|| {
+            "No source location found for main function. Compile with -g flag.".to_string()
+        })?;
 
-    paths
+    info!(
+        "Found source location: {}:{}",
+        source_location.file_path, source_location.line_number
+    );
+
+    // Return source location info, let UI handle file reading
+    Ok(SourceCodeInfo {
+        file_path: source_location.file_path,
+        current_line: Some(source_location.line_number as usize),
+    })
 }

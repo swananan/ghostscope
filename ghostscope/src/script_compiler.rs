@@ -15,7 +15,7 @@ pub async fn compile_and_load_script_for_tui(
     use ghostscope_ui::RuntimeStatus;
 
     // Step 1: Validate binary analyzer availability
-    let binary_analyzer = match session.binary_analyzer.as_ref() {
+    let binary_analyzer = match session.binary_analyzer.as_mut() {
         Some(analyzer) => analyzer,
         None => {
             let error = "Binary analyzer is required for script compilation".to_string();
@@ -267,7 +267,7 @@ pub async fn compile_and_load_script_for_cli(
     // Step 1: Validate binary analyzer
     let binary_analyzer = session
         .binary_analyzer
-        .as_ref()
+        .as_mut()
         .ok_or_else(|| anyhow::anyhow!("Binary analyzer is required for script compilation"))?;
 
     let binary_path_string = binary_analyzer

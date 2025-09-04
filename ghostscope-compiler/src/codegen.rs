@@ -82,7 +82,7 @@ pub struct CodeGen<'ctx> {
     variable_context: Option<VariableContext>, // Variable scope context for validation
     pending_dwarf_variables: Option<Vec<ghostscope_binary::EnhancedVariableLocation>>, // DWARF variables awaiting population
     debug_logger: DebugLogger<'ctx>,
-    binary_analyzer: Option<*const ghostscope_binary::BinaryAnalyzer>, // CFI and DWARF information access
+    binary_analyzer: Option<*mut ghostscope_binary::BinaryAnalyzer>, // CFI and DWARF information access
     current_trace_id: Option<u32>, // Current trace_id being compiled
 }
 
@@ -123,7 +123,7 @@ impl<'ctx> CodeGen<'ctx> {
     pub fn new_with_binary_analyzer(
         context: &'ctx Context,
         module_name: &str,
-        binary_analyzer: Option<&ghostscope_binary::BinaryAnalyzer>,
+        binary_analyzer: Option<&mut ghostscope_binary::BinaryAnalyzer>,
     ) -> Self {
         let module = context.create_module(module_name);
         let builder = context.create_builder();
@@ -197,7 +197,7 @@ impl<'ctx> CodeGen<'ctx> {
             variable_context: None, // Will be set later when trace point context is available
             pending_dwarf_variables: None, // Will be set when DWARF variables are prepared
             debug_logger: DebugLogger::new(context),
-            binary_analyzer: binary_analyzer.map(|ba| ba as *const _),
+            binary_analyzer: binary_analyzer.map(|ba| ba as *const _ as *mut _),
             current_trace_id: None, // Will be set during compilation
         }
     }
@@ -205,6 +205,14 @@ impl<'ctx> CodeGen<'ctx> {
     /// Set the variable context for scope validation
     pub fn set_variable_context(&mut self, context: VariableContext) {
         self.variable_context = Some(context);
+    }
+
+    /// Set the binary analyzer for DWARF and CFI information access
+    pub fn set_binary_analyzer(
+        &mut self,
+        binary_analyzer: Option<&mut ghostscope_binary::BinaryAnalyzer>,
+    ) {
+        self.binary_analyzer = binary_analyzer.map(|ba| ba as *const _ as *mut _);
     }
 
     /// Prepare DWARF variables for later population during compilation
@@ -3719,7 +3727,7 @@ impl<'ctx> CodeGen<'ctx> {
         // Query the binary analyzer for frame base offset
         if let Some(analyzer_ptr) = self.binary_analyzer {
             unsafe {
-                let analyzer = &*analyzer_ptr;
+                let analyzer = &mut *analyzer_ptr;
                 if let Some(offset) = analyzer.get_frame_base_offset(pc_address) {
                     debug!(
                         "Binary analyzer returned frame base offset {} for PC 0x{:x}",
@@ -3745,7 +3753,7 @@ impl<'ctx> CodeGen<'ctx> {
     fn get_variable_size(&self, pc_address: u64, var_name: &str) -> u64 {
         if let Some(analyzer_ptr) = self.binary_analyzer {
             unsafe {
-                let analyzer = &*analyzer_ptr;
+                let analyzer = &mut *analyzer_ptr;
                 if let Some(size) = analyzer.get_variable_size(pc_address, var_name) {
                     debug!(
                         "Binary analyzer returned size {} bytes for variable '{}' at PC 0x{:x}",

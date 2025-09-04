@@ -323,7 +323,7 @@ pub struct CompilationMetadata {
 /// Main unified compilation interface
 pub fn compile_script_to_uprobe_configs(
     script_source: &str,
-    binary_analyzer: &ghostscope_binary::BinaryAnalyzer,
+    binary_analyzer: &mut ghostscope_binary::BinaryAnalyzer,
     pid: Option<u32>,
     trace_id: Option<u32>,
     save_options: &SaveOptions,
@@ -405,7 +405,7 @@ fn extract_target_from_script(script_source: &str) -> String {
 /// Resolve addresses for all uprobe configs using unified DWARF interfaces
 fn resolve_addresses_for_configs(
     configs: &mut [UProbeConfig],
-    binary_analyzer: &ghostscope_binary::BinaryAnalyzer,
+    binary_analyzer: &mut ghostscope_binary::BinaryAnalyzer,
 ) -> Result<()> {
     info!(
         "Resolving addresses for {} uprobe configurations",
@@ -597,7 +597,7 @@ pub fn compile_ast_to_uprobe_configs(
     trace_id: Option<u32>,
     binary_path: Option<&str>,
     save_ir: bool,
-    binary_analyzer: Option<&ghostscope_binary::BinaryAnalyzer>,
+    mut binary_analyzer: Option<&mut ghostscope_binary::BinaryAnalyzer>,
 ) -> Result<Vec<UProbeConfig>> {
     info!("Starting eBPF compilation from pre-parsed AST for multiple trace patterns...");
     info!(
@@ -657,11 +657,12 @@ pub fn compile_ast_to_uprobe_configs(
 
         // Create new context and codegen for each trace pattern
         let context = Context::create();
-        let mut codegen = codegen::CodeGen::new_with_binary_analyzer(
-            &context,
-            &format!("bpf_output_{}", index),
-            binary_analyzer,
-        );
+        let mut codegen = codegen::CodeGen::new(&context, &format!("bpf_output_{}", index));
+
+        // Set binary analyzer if available
+        if let Some(analyzer) = binary_analyzer.as_mut() {
+            codegen.set_binary_analyzer(Some(analyzer));
+        }
 
         // Create variable context for scope validation
         let mut var_context = ast::VariableContext::new();
@@ -677,8 +678,8 @@ pub fn compile_ast_to_uprobe_configs(
                 file_path, line_number
             );
 
-            if let Some(analyzer) = binary_analyzer {
-                if let Some(dwarf_context) = analyzer.dwarf_context() {
+            if let Some(analyzer) = binary_analyzer.as_mut() {
+                if let Some(dwarf_context) = analyzer.dwarf_context_mut() {
                     // Get all addresses for this source line first
                     let line_mappings =
                         dwarf_context.get_addresses_for_line(file_path, *line_number);
@@ -750,8 +751,8 @@ pub fn compile_ast_to_uprobe_configs(
             line_number,
         } = &pattern
         {
-            if let Some(analyzer) = binary_analyzer {
-                if let Some(dwarf_context) = analyzer.dwarf_context() {
+            if let Some(analyzer) = binary_analyzer.as_mut() {
+                if let Some(dwarf_context) = analyzer.dwarf_context_mut() {
                     // Get all addresses for this source line
                     let line_mappings =
                         dwarf_context.get_addresses_for_line(file_path, *line_number);
@@ -906,7 +907,7 @@ pub fn compile_to_uprobe_configs(
     pid: Option<u32>,
     binary_path: Option<&str>,
     save_ir: bool,
-    binary_analyzer: Option<&ghostscope_binary::BinaryAnalyzer>,
+    binary_analyzer: Option<&mut ghostscope_binary::BinaryAnalyzer>,
 ) -> Result<Vec<UProbeConfig>> {
     info!("Starting eBPF compilation for multiple trace patterns (legacy interface)...");
 
