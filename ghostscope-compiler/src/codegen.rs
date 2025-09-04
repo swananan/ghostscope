@@ -83,6 +83,7 @@ pub struct CodeGen<'ctx> {
     pending_dwarf_variables: Option<Vec<ghostscope_binary::EnhancedVariableLocation>>, // DWARF variables awaiting population
     debug_logger: DebugLogger<'ctx>,
     binary_analyzer: Option<*const ghostscope_binary::BinaryAnalyzer>, // CFI and DWARF information access
+    current_trace_id: Option<u32>, // Current trace_id being compiled
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -197,6 +198,7 @@ impl<'ctx> CodeGen<'ctx> {
             pending_dwarf_variables: None, // Will be set when DWARF variables are prepared
             debug_logger: DebugLogger::new(context),
             binary_analyzer: binary_analyzer.map(|ba| ba as *const _),
+            current_trace_id: None, // Will be set during compilation
         }
     }
 
@@ -1619,8 +1621,12 @@ impl<'ctx> CodeGen<'ctx> {
         function_name: &str,
         trace_statements: &[Statement],
         target_pid: Option<u32>,
+        trace_id: Option<u32>,
         save_ir_path: Option<&str>,
     ) -> Result<&Module<'ctx>> {
+        // Set the current trace_id for code generation
+        self.current_trace_id = trace_id;
+
         // Declare all external functions
         self.declare_external_functions();
 
@@ -1781,7 +1787,7 @@ impl<'ctx> CodeGen<'ctx> {
     // Keep original compile method for backward compatibility
     pub fn compile(&mut self, program: &Program) -> Result<&Module<'ctx>> {
         // For backward compatibility, use "main" as function name and compile all statements
-        self.compile_with_function_name(program, "main", &program.statements, None, None)
+        self.compile_with_function_name(program, "main", &program.statements, None, None, None)
     }
 
     fn declare_external_functions(&mut self) {
@@ -2417,7 +2423,10 @@ impl<'ctx> CodeGen<'ctx> {
         let offset = 8; // Message header length
 
         // VariableDataMessage: [trace_id:u64, timestamp:u64, pid:u32, tid:u32, var_count:u16, reserved:u16]
-        let trace_id = i64_type.const_int(1, false); // Simple trace_id
+        let trace_id_value = self
+            .current_trace_id
+            .unwrap_or(consts::DEFAULT_TRACE_ID as u32) as u64;
+        let trace_id = i64_type.const_int(trace_id_value, false);
         let timestamp = self.get_current_timestamp()?; // Get real timestamp from bpf_ktime_get_ns
 
         // Get real PID/TID using bpf_get_current_pid_tgid()
@@ -3315,8 +3324,11 @@ impl<'ctx> CodeGen<'ctx> {
         // Build LogMessage
         let log_msg_offset = consts::MESSAGE_HEADER_SIZE;
 
-        // trace_id (8 bytes) - simple sequential ID
-        let trace_id = i64_type.const_int(consts::DEFAULT_TRACE_ID, false);
+        // trace_id (8 bytes) - use current trace_id or default
+        let trace_id_value = self
+            .current_trace_id
+            .unwrap_or(consts::DEFAULT_TRACE_ID as u32) as u64;
+        let trace_id = i64_type.const_int(trace_id_value, false);
         self.write_u64_at_offset(buffer, log_msg_offset, trace_id)?;
 
         // timestamp (8 bytes)
@@ -3382,8 +3394,11 @@ impl<'ctx> CodeGen<'ctx> {
         // Build ExecutionFailureMessage
         let failure_msg_offset = consts::MESSAGE_HEADER_SIZE;
 
-        // trace_id (8 bytes) - simple sequential ID
-        let trace_id = i64_type.const_int(consts::DEFAULT_TRACE_ID, false);
+        // trace_id (8 bytes) - use current trace_id or default
+        let trace_id_value = self
+            .current_trace_id
+            .unwrap_or(consts::DEFAULT_TRACE_ID as u32) as u64;
+        let trace_id = i64_type.const_int(trace_id_value, false);
         self.write_u64_at_offset(buffer, failure_msg_offset, trace_id)?;
 
         // timestamp (8 bytes)

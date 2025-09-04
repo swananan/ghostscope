@@ -249,9 +249,7 @@ impl GhostSession {
 
         loop {
             tokio::select! {
-                // 使用 select_all 等待任意一个 loader 有事件
                 result = {
-                    // 创建所有 loader 的 future
                     let futures: Vec<_> = self.command_loaders.iter_mut()
                         .enumerate()
                         .map(|(i, loader)| Box::pin(async move {
@@ -271,7 +269,7 @@ impl GhostSession {
                             }
                         }
                         Err(e) => {
-                            error!("Loader {} 错误: {}", loader_index, e);
+                            error!("Loader {} error: {}", loader_index, e);
                         }
                     }
                 }

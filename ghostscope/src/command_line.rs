@@ -104,6 +104,7 @@ pub async fn run_command_line_runtime(parsed_args: ParsedArgs) -> Result<()> {
         &script_content,
         binary_analyzer,
         session.target_pid,
+        None, // Command line mode doesn't have specific trace_id, use default
         &save_options,
     )?;
 

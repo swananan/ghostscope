@@ -46,6 +46,7 @@ pub async fn compile_and_load_script_with_trace_id(
         script,
         binary_analyzer,
         session.target_pid,
+        Some(trace_id),
         &save_options,
     ) {
         Ok(result) => result,

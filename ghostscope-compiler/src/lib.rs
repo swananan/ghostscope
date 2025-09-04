@@ -205,11 +205,12 @@ pub fn generate_file_name(
 }
 
 /// Generate a unique eBPF function name based on trace pattern
-/// Generate eBPF function name in format: gs_{pid}_{target_exec}_{function_name}_index
+/// Generate eBPF function name in format: gs_{pid}_{target_exec}_{function_name}_{trace_id}
+/// Uses trace_id instead of index to avoid conflicts between different trace instances
 /// Binary name and function name are NOT truncated for eBPF function naming
 pub fn generate_ebpf_function_name(
     pattern: &TracePattern,
-    index: usize,
+    trace_id: Option<u32>,
     pid: Option<u32>,
     binary_path: Option<&str>,
 ) -> String {
@@ -233,6 +234,9 @@ pub fn generate_ebpf_function_name(
         "unknown".to_string()
     };
 
+    // Use trace_id for uniqueness, fallback to 0 if not provided
+    let id_str = trace_id.unwrap_or(0).to_string();
+
     match pattern {
         TracePattern::FunctionName(name) => {
             // Sanitize but don't truncate function name for eBPF function naming
@@ -240,7 +244,7 @@ pub fn generate_ebpf_function_name(
                 .chars()
                 .map(|c| if c.is_alphanumeric() { c } else { '_' })
                 .collect::<String>();
-            format!("gs_{}_{}_{}_{}", pid_str, exec_name, func_name, index)
+            format!("gs_{}_{}_{}_{}", pid_str, exec_name, func_name, id_str)
         }
         TracePattern::Wildcard(pattern) => {
             // Sanitize but don't truncate wildcard pattern for eBPF function naming
@@ -253,10 +257,13 @@ pub fn generate_ebpf_function_name(
                     _ => '_',
                 })
                 .collect::<String>();
-            format!("gs_{}_{}_ptn{}_{}", pid_str, exec_name, pattern_name, index)
+            format!(
+                "gs_{}_{}_ptn{}_{}",
+                pid_str, exec_name, pattern_name, id_str
+            )
         }
         TracePattern::Address(addr) => {
-            format!("gs_{}_{}_{:x}_{}", pid_str, exec_name, addr, index)
+            format!("gs_{}_{}_{:x}_{}", pid_str, exec_name, addr, id_str)
         }
         TracePattern::SourceLine {
             file_path,
@@ -273,7 +280,7 @@ pub fn generate_ebpf_function_name(
                 .collect::<String>();
             format!(
                 "gs_{}_{}_{}_L{}_{}",
-                pid_str, exec_name, sanitized_filename, line_number, index
+                pid_str, exec_name, sanitized_filename, line_number, id_str
             )
         }
     }
@@ -318,6 +325,7 @@ pub fn compile_script_to_uprobe_configs(
     script_source: &str,
     binary_analyzer: &ghostscope_binary::BinaryAnalyzer,
     pid: Option<u32>,
+    trace_id: Option<u32>,
     save_options: &SaveOptions,
 ) -> Result<CompilationResult> {
     info!("Starting unified script compilation...");
@@ -350,6 +358,7 @@ pub fn compile_script_to_uprobe_configs(
     let mut uprobe_configs = compile_ast_to_uprobe_configs(
         &program,
         pid,
+        trace_id,
         save_options.binary_path_hint.as_deref(),
         save_options.save_llvm_ir,
         Some(binary_analyzer),
@@ -585,6 +594,7 @@ pub fn compile_to_llvm_ir(source: &str) -> Result<String> {
 pub fn compile_ast_to_uprobe_configs(
     program: &Program,
     pid: Option<u32>,
+    trace_id: Option<u32>,
     binary_path: Option<&str>,
     save_ir: bool,
     binary_analyzer: Option<&ghostscope_binary::BinaryAnalyzer>,
@@ -621,11 +631,28 @@ pub fn compile_ast_to_uprobe_configs(
     inkwell::targets::Target::initialize_bpf(&config);
     info!("BPF target initialized");
 
+    // Pre-calculate pattern count for trace_id generation
+    let pattern_count = trace_patterns_with_statements.len();
+
     for (index, (pattern, statements)) in trace_patterns_with_statements.into_iter().enumerate() {
         info!("Compiling trace pattern {}: {:?}", index, pattern);
 
         // Generate unique function name for this trace pattern
-        let ebpf_function_name = generate_ebpf_function_name(&pattern, index, pid, binary_path);
+        // Use trace_id directly for single pattern, or combine with index for multiple patterns
+        let pattern_trace_id = match trace_id {
+            Some(base_id) => {
+                // For single pattern scripts, use trace_id directly
+                // For multi-pattern scripts, combine trace_id with pattern index
+                if pattern_count == 1 {
+                    Some(base_id)
+                } else {
+                    Some(base_id * 1000 + index as u32)
+                }
+            }
+            None => Some(index as u32), // Fallback for legacy usage
+        };
+        let ebpf_function_name =
+            generate_ebpf_function_name(&pattern, pattern_trace_id, pid, binary_path);
         info!("Generated eBPF function name: {}", ebpf_function_name);
 
         // Create new context and codegen for each trace pattern
@@ -771,6 +798,7 @@ pub fn compile_ast_to_uprobe_configs(
             &ebpf_function_name,
             statements,
             pid,
+            trace_id,
             ir_file_path.as_deref(),
         ) {
             Ok(module) => module,
@@ -886,7 +914,7 @@ pub fn compile_to_uprobe_configs(
     let program = parser::parse(source)?;
 
     // Call the new function with pre-parsed AST
-    compile_ast_to_uprobe_configs(&program, pid, binary_path, save_ir, binary_analyzer)
+    compile_ast_to_uprobe_configs(&program, pid, None, binary_path, save_ir, binary_analyzer)
 }
 
 /// Compile source code to eBPF bytecode

@@ -155,21 +155,13 @@ impl TraceManager {
         let trace_id = self.next_trace_id;
         self.next_trace_id += 1;
 
-        // Remove any existing trace for this target
-        if let Some(old_trace_id) = self.target_to_trace_id.remove(&target) {
-            if let Some(mut old_trace) = self.traces.remove(&old_trace_id) {
-                // Deactivate the old trace
-                tokio::spawn(async move {
-                    if let Err(e) = old_trace.disable().await {
-                        warn!("Failed to disable old trace {}: {}", old_trace_id, e);
-                    }
-                });
-            }
-        }
+        // Create unique target key by combining target with trace_id
+        // This allows multiple traces for the same target (e.g., same function/line)
+        let unique_target = format!("{}#{}", target, trace_id);
 
         let trace_instance = TraceInstance::new(
             trace_id,
-            target.clone(),
+            target.clone(), // Keep original target for display
             script_content,
             loader,
             binary_path,
@@ -179,9 +171,12 @@ impl TraceManager {
         );
 
         self.traces.insert(trace_id, trace_instance);
-        self.target_to_trace_id.insert(target, trace_id);
+        self.target_to_trace_id.insert(unique_target, trace_id);
 
-        debug!("Added trace {} to manager", trace_id);
+        debug!(
+            "Added trace {} to manager with target '{}'",
+            trace_id, target
+        );
         trace_id
     }
 
