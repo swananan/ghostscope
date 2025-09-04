@@ -8,6 +8,8 @@ use aya::{
 };
 use ghostscope_protocol::{EventData, EventParser};
 use std::convert::TryInto;
+use std::os::unix::io::AsRawFd;
+use tokio::io::unix::AsyncFd;
 use tracing::{error, info, warn};
 
 pub fn hello() -> String {
@@ -485,28 +487,31 @@ impl GhostScopeLoader {
         }
     }
 
-    /// Poll for new events (non-blocking)
-    /// Returns Some(events) if there are events, None if no events available
-    pub fn poll_events(&mut self) -> Result<Option<Vec<EventData>>> {
+    /// Wait for events asynchronously using AsyncFd
+    pub async fn wait_for_events_async(&mut self) -> Result<Vec<EventData>> {
         let ringbuf = self.ringbuf.as_mut().ok_or_else(|| {
             LoaderError::Generic("Ringbuf not initialized. Call attach_uprobe first.".to_string())
         })?;
 
-        let mut events = Vec::new();
+        // Create AsyncFd from the ringbuf's file descriptor
+        let async_fd = AsyncFd::new(ringbuf.as_raw_fd())
+            .map_err(|e| LoaderError::Generic(format!("Failed to create AsyncFd: {}", e)))?;
 
-        // Read all available events without blocking
+        // Wait for the file descriptor to become readable (events available)
+        let _guard = async_fd
+            .readable()
+            .await
+            .map_err(|e| LoaderError::Generic(format!("AsyncFd error: {}", e)))?;
+
+        // Read all available events
+        let mut events = Vec::new();
         while let Some(item) = ringbuf.next() {
-            // Parse event using protocol crate's EventParser
             if let Some(event) = EventParser::parse_event(&item) {
                 events.push(event);
             }
         }
 
-        if events.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(events))
-        }
+        Ok(events)
     }
 
     // Helper functions removed - now using protocol parser

@@ -1,8 +1,11 @@
 use crate::args::ParsedArgs;
 use crate::session::GhostSession;
 use anyhow::Result;
-use ghostscope_ui::{run_tui_mode, EventRegistry};
+use futures::future;
+use ghostscope_protocol::MessageType;
+use ghostscope_ui::{events::TraceEvent, run_tui_mode, EventRegistry};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
 
 /// Run GhostScope in TUI mode with tokio task coordination
@@ -144,10 +147,40 @@ async fn run_runtime_coordinator(
 
     loop {
         tokio::select! {
-            // Poll ringbuf events from all active loaders
-            _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
+            // Wait for events asynchronously from trace manager (TUI mode should use trace manager, not command loaders)
+            events = async {
                 if let Some(ref mut session) = session {
-                    poll_ringbuf_events(session, &trace_sender);
+                    // TUI mode uses trace manager which manages individual trace instances
+                    session.trace_manager.wait_for_all_events_async().await
+                } else {
+                    // No session, return empty events and let the outer loop continue
+                    Vec::new()
+                }
+            }, if session.is_some() => {
+                if let Some(ref session) = session {
+                    // events is Vec<(trace_id, event_string)> from trace manager
+                    for (trace_id, event_string) in events {
+                        // Parse the event string format: "[Trace X] event_content"
+                        let message = if event_string.starts_with(&format!("[Trace {}]", trace_id)) {
+                            event_string
+                        } else {
+                            format!("[Trace {}] {}", trace_id, event_string)
+                        };
+
+                        let trace_event = TraceEvent {
+                            timestamp: SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_nanos() as u64,
+                            trace_id: trace_id as u64, // Convert to u64 for protocol compatibility
+                            pid: session.target_pid.unwrap_or(0),
+                            message,
+                            trace_type: MessageType::VariableData,
+                        };
+
+                        // Send to TUI (ignore errors if channel is closed)
+                        let _ = trace_sender.send(trace_event);
+                    }
                 }
             }
 
@@ -464,100 +497,4 @@ fn get_possible_source_paths(dwarf_file_path: &str, binary_path: &Path) -> Vec<P
     }
 
     paths
-}
-
-/// Poll ringbuf events from all active trace instances and send formatted events to TUI
-fn poll_ringbuf_events(
-    session: &mut GhostSession,
-    trace_sender: &tokio::sync::mpsc::UnboundedSender<ghostscope_ui::events::TraceEvent>,
-) {
-    use ghostscope_protocol::MessageType;
-    use ghostscope_ui::events::TraceEvent;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    // Get current timestamp for events
-    let current_timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-
-    // Poll events from the new trace manager
-    let events_with_ids = session.trace_manager.poll_all_events();
-    for (trace_id, event_string) in events_with_ids {
-        // Parse the event string format: "[Trace X] event_content"
-        let message = if event_string.starts_with(&format!("[Trace {}]", trace_id)) {
-            event_string
-        } else {
-            format!("[Trace {}] {}", trace_id, event_string)
-        };
-
-        let trace_event = TraceEvent {
-            timestamp: current_timestamp,
-            trace_id: trace_id as u64, // Convert to u64 for protocol compatibility
-            pid: session.target_pid.unwrap_or(0),
-            message,
-            trace_type: MessageType::VariableData,
-        };
-
-        // Send to TUI (ignore errors if channel is closed)
-        let _ = trace_sender.send(trace_event);
-    }
-
-    // Legacy support: also poll from old loaders for backward compatibility
-    for (loader_index, loader) in session.loaders.iter_mut().enumerate() {
-        match loader.poll_events() {
-            Ok(Some(events)) => {
-                for event in events {
-                    // Format the main message content
-                    let variables_text = event
-                        .variables
-                        .iter()
-                        .map(|var| format!("{}: {}", var.name, var.formatted_value))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-
-                    let message = if variables_text.is_empty() {
-                        format!("[Legacy Loader {}] Function trace", loader_index)
-                    } else {
-                        format!(
-                            "[Legacy Loader {}] Variables: [{}]",
-                            loader_index, variables_text
-                        )
-                    };
-
-                    let trace_event = TraceEvent {
-                        timestamp: event.timestamp,
-                        trace_id: event.trace_id,
-                        pid: event.pid,
-                        message,
-                        trace_type: MessageType::VariableData,
-                    };
-
-                    // Send to TUI (ignore errors if channel is closed)
-                    let _ = trace_sender.send(trace_event);
-                }
-            }
-            Ok(None) => {
-                // No events available, continue
-            }
-            Err(e) => {
-                // Log error and send error event to TUI
-                error!(
-                    "Error polling events from legacy loader {}: {}",
-                    loader_index, e
-                );
-                let error_event = TraceEvent {
-                    timestamp: current_timestamp,
-                    trace_id: 0, // No trace ID for error events
-                    pid: 0,      // No specific PID for error events
-                    message: format!(
-                        "Error polling events from legacy loader {}: {}",
-                        loader_index, e
-                    ),
-                    trace_type: MessageType::Error,
-                };
-                let _ = trace_sender.send(error_event);
-            }
-        }
-    }
 }

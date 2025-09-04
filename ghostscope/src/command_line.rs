@@ -171,7 +171,7 @@ pub async fn run_command_line_runtime(parsed_args: ParsedArgs) -> Result<()> {
 
     // Step 9: Start event monitoring loop
     session
-        .start_monitoring()
+        .start_event_monitoring()
         .await
         .map_err(|e| anyhow::anyhow!("Event monitoring failed: {}", e))?;
 

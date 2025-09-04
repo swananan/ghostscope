@@ -14,10 +14,7 @@ pub struct GhostSession {
     pub target_pid: Option<u32>,
     pub debug_file: Option<String>,  // Optional debug file path
     pub trace_manager: TraceManager, // Manages all trace instances with their loaders
-
-    // Legacy fields for backward compatibility
-    pub loader: Option<GhostScopeLoader>, // Keep for backward compatibility
-    pub loaders: Vec<GhostScopeLoader>,   // Multiple loaders for multiple uprobes
+    pub command_loaders: Vec<GhostScopeLoader>, // Multiple loaders for command line mode uprobes
     pub is_attached: bool,
 }
 
@@ -36,8 +33,7 @@ impl GhostSession {
                 .as_ref()
                 .map(|p| p.to_string_lossy().to_string()),
             trace_manager: TraceManager::new(),
-            loader: None,
-            loaders: Vec::new(),
+            command_loaders: Vec::new(),
             is_attached: false,
         }
     }
@@ -70,16 +66,11 @@ impl GhostSession {
         Ok(session)
     }
 
-    /// Initialize eBPF loader with compiled program
+    /// Initialize eBPF loader with bytecode
     pub async fn initialize_ebpf(&mut self, bytecode: &[u8]) -> Result<()> {
-        info!(
-            "Initializing eBPF loader with {} bytes of bytecode",
-            bytecode.len()
-        );
-
         let loader = GhostScopeLoader::new(bytecode).context("Failed to create eBPF loader")?;
 
-        self.loader = Some(loader);
+        self.command_loaders.push(loader);
         info!("eBPF loader initialized successfully");
         Ok(())
     }
@@ -162,7 +153,7 @@ impl GhostSession {
         }
 
         // Store the loader for event polling
-        self.loaders.push(loader);
+        self.command_loaders.push(loader);
 
         Ok(())
     }
@@ -170,8 +161,8 @@ impl GhostSession {
     /// Legacy single uprobe attachment (kept for compatibility)
     pub async fn legacy_attach_uprobe(&mut self) -> Result<()> {
         let loader = self
-            .loader
-            .as_mut()
+            .command_loaders
+            .first_mut()
             .ok_or_else(|| anyhow::anyhow!("eBPF loader not initialized"))?;
 
         // TODO: do not use hardcoded function_name
@@ -252,85 +243,61 @@ impl GhostSession {
         Ok(())
     }
 
+    /// Monitor events from multiple loaders using futures::select_all
+    async fn monitor_multiple_loaders(&mut self) -> Result<()> {
+        let mut event_count = 0;
+
+        loop {
+            tokio::select! {
+                // 使用 select_all 等待任意一个 loader 有事件
+                result = {
+                    // 创建所有 loader 的 future
+                    let futures: Vec<_> = self.command_loaders.iter_mut()
+                        .enumerate()
+                        .map(|(i, loader)| Box::pin(async move {
+                            (i, loader.wait_for_events_async().await)
+                        }))
+                        .collect();
+
+                    futures::future::select_all(futures)
+                } => {
+                    let ((loader_index, result), _index, _remaining_futures) = result;
+
+                    match result {
+                        Ok(events) => {
+                            for event in events {
+                                event_count += 1;
+                                info!("[Loader {}] [Event #{}] {}", loader_index, event_count, event);
+                            }
+                        }
+                        Err(e) => {
+                            error!("Loader {} 错误: {}", loader_index, e);
+                        }
+                    }
+                }
+
+                _ = tokio::signal::ctrl_c() => {
+                    info!("Received Ctrl+C, shutting down...");
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     /// Start event monitoring loop
-    pub async fn start_monitoring(&mut self) -> Result<()> {
-        // Check if we have any loaders (new multi-uprobe approach) or fall back to single loader
-        if !self.loaders.is_empty() {
+    pub async fn start_event_monitoring(&mut self) -> Result<()> {
+        if !self.command_loaders.is_empty() {
             info!(
                 "Starting event monitoring loop for {} loaders",
-                self.loaders.len()
+                self.command_loaders.len()
             );
 
-            let mut event_count = 0;
-            loop {
-                tokio::select! {
-                    // Poll eBPF events from all loaders
-                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
-                        for (i, loader) in self.loaders.iter_mut().enumerate() {
-                            match loader.poll_events() {
-                                Ok(Some(events)) => {
-                                    for event in events {
-                                        event_count += 1;
-                                        info!("[Loader {}] [Event #{}] {}", i, event_count, event);
-                                    }
-                                }
-                                Ok(None) => {
-                                    // No events, continue loop
-                                }
-                                Err(e) => {
-                                    error!("Error polling events from loader {}: {}", i, e);
-                                    // Continue with other loaders
-                                }
-                            }
-                        }
-                    }
-
-                    // Handle Ctrl+C
-                    _ = tokio::signal::ctrl_c() => {
-                        info!("Received Ctrl+C, shutting down...");
-                        break;
-                    }
-                }
-            }
-        } else if let Some(ref mut loader) = self.loader {
-            info!("Starting event monitoring loop for single legacy loader");
-
-            let mut event_count = 0;
-            loop {
-                tokio::select! {
-                    // Poll eBPF events
-                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
-                        match loader.poll_events() {
-                            Ok(Some(events)) => {
-                                for event in events {
-                                    event_count += 1;
-                                    info!("[Event #{}] {}", event_count, event);
-                                }
-                            }
-                            Ok(None) => {
-                                // No events, continue loop
-                            }
-                            Err(e) => {
-                                error!("Error polling events: {}", e);
-                                break;
-                            }
-                        }
-                    }
-
-                    // Handle Ctrl+C
-                    _ = tokio::signal::ctrl_c() => {
-                        info!("Received Ctrl+C, shutting down...");
-                        break;
-                    }
-                }
-            }
+            self.monitor_multiple_loaders().await
         } else {
-            return Err(anyhow::anyhow!(
+            Err(anyhow::anyhow!(
                 "No eBPF loaders initialized - unable to monitor events"
-            ));
+            ))
         }
-
-        Ok(())
     }
 
     /// Get debug information summary

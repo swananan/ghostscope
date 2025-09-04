@@ -1,4 +1,5 @@
 use anyhow::Result;
+use futures::future;
 use ghostscope_loader::GhostScopeLoader;
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
@@ -101,24 +102,26 @@ impl TraceInstance {
         Ok(())
     }
 
-    /// Poll events from this trace instance
-    pub fn poll_events(&mut self) -> Result<Option<Vec<String>>> {
+    /// Wait for events asynchronously from this trace instance
+    pub async fn wait_for_events_async(&mut self) -> Result<Vec<String>> {
         if !self.is_enabled {
-            return Ok(None);
+            return Ok(Vec::new());
         }
 
-        match self.loader.poll_events() {
-            Ok(Some(events)) => {
+        match self.loader.wait_for_events_async().await {
+            Ok(events) => {
                 // Add trace_id context to each event
                 let traced_events = events
                     .into_iter()
                     .map(|event| format!("[Trace {}] {}", self.trace_id, event))
                     .collect();
-                Ok(Some(traced_events))
+                Ok(traced_events)
             }
-            Ok(None) => Ok(None),
             Err(e) => {
-                warn!("Error polling events from trace {}: {}", self.trace_id, e);
+                warn!(
+                    "Error waiting for events from trace {}: {}",
+                    self.trace_id, e
+                );
                 Err(e.into())
             }
         }
@@ -277,24 +280,35 @@ impl TraceManager {
         self.traces.keys().cloned().collect()
     }
 
-    /// Poll events from all active traces
-    pub fn poll_all_events(&mut self) -> Vec<(u32, String)> {
+    /// Wait for events asynchronously from all active traces
+    pub async fn wait_for_all_events_async(&mut self) -> Vec<(u32, String)> {
         let mut all_events = Vec::new();
 
-        for (&trace_id, trace) in self.traces.iter_mut() {
-            if trace.is_enabled {
-                match trace.poll_events() {
-                    Ok(Some(events)) => {
-                        for event in events {
-                            all_events.push((trace_id, event));
-                        }
+        // Create futures for all enabled traces
+        let futures: Vec<_> = self
+            .traces
+            .iter_mut()
+            .filter_map(|(&trace_id, trace)| {
+                if trace.is_enabled {
+                    Some(Box::pin(async move {
+                        (trace_id, trace.wait_for_events_async().await)
+                    }))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if !futures.is_empty() {
+            // Use select_all to wait for any trace to have events
+            match futures::future::select_all(futures).await {
+                ((trace_id, Ok(events)), _index, _remaining_futures) => {
+                    for event in events {
+                        all_events.push((trace_id, event));
                     }
-                    Ok(None) => {
-                        // No events from this trace
-                    }
-                    Err(e) => {
-                        warn!("Error polling events from trace {}: {}", trace_id, e);
-                    }
+                }
+                ((trace_id, Err(e)), _index, _remaining_futures) => {
+                    warn!("Error waiting for events from trace {}: {}", trace_id, e);
                 }
             }
         }
