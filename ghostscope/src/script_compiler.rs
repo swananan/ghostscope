@@ -4,8 +4,9 @@ use ghostscope_loader::GhostScopeLoader;
 use std::path::Path;
 use tracing::{error, info, warn};
 
-/// Compile and load a script with trace_id support using the new TraceManager
-pub async fn compile_and_load_script_with_trace_id(
+/// Compile and load script specifically for TUI mode with strict all-or-nothing success
+/// This function ensures that ALL uprobe configurations must succeed for the operation to be considered successful
+pub async fn compile_and_load_script_for_tui(
     script: &str,
     trace_id: u32,
     session: &mut GhostSession,
@@ -84,24 +85,57 @@ pub async fn compile_and_load_script_with_trace_id(
         .to_string();
 
     // Step 5: Process each uprobe configuration and create trace instances
+    // TUI mode requires strict all-or-nothing success: ALL uprobe configs must succeed
+    let mut successful_trace_ids = Vec::new();
+    let expected_trace_count = compilation_result.uprobe_configs.len();
+
     for (i, mut config) in compilation_result.uprobe_configs.into_iter().enumerate() {
         config.binary_path = binary_path.clone();
 
-        let (function_name, uprobe_offset) =
-            match resolve_uprobe_config(&mut config, session, status_sender).await {
-                Ok((name, offset)) => (name, offset),
-                Err(e) => {
-                    warn!("Failed to resolve uprobe config {}: {}", i, e);
-                    continue;
+        // Compiler should have already resolved addresses and offsets
+        let uprobe_offset = match config.uprobe_offset {
+            Some(offset) => offset,
+            None => {
+                let error = format!(
+                    "Uprobe config {} missing uprobe_offset - compilation failed",
+                    i
+                );
+                error!("{}", error);
+                // Clean up any successful traces before failing
+                for &trace_id in &successful_trace_ids {
+                    let _ = session.trace_manager.remove_trace(trace_id).await;
                 }
-            };
+                let _ = status_sender.send(RuntimeStatus::ScriptCompilationFailed {
+                    error: error.clone(),
+                    trace_id,
+                });
+                return Err(anyhow::anyhow!(error));
+            }
+        };
+
+        // Generate target display name from the trace pattern
+        let target_display = generate_target_display_name(&config.trace_pattern);
+
+        info!(
+            "Processing uprobe config {}: target='{}', offset=0x{:x}",
+            i, target_display, uprobe_offset
+        );
 
         // Step 6: Create GhostScopeLoader with compiled eBPF bytecode
         let loader = match GhostScopeLoader::new(&config.ebpf_bytecode) {
             Ok(loader) => loader,
             Err(e) => {
-                error!("Failed to create eBPF loader for config {}: {}", i, e);
-                continue;
+                let error = format!("Failed to create eBPF loader for config {}: {}", i, e);
+                error!("{}", error);
+                // Clean up any successful traces before failing
+                for &trace_id in &successful_trace_ids {
+                    let _ = session.trace_manager.remove_trace(trace_id).await;
+                }
+                let _ = status_sender.send(RuntimeStatus::ScriptCompilationFailed {
+                    error: error.clone(),
+                    trace_id,
+                });
+                return Err(anyhow::anyhow!(error));
             }
         };
 
@@ -111,45 +145,85 @@ pub async fn compile_and_load_script_with_trace_id(
             script.to_string(),
             loader,
             binary_path.clone(),
-            function_name.clone(),
-            uprobe_offset,
+            target_display.clone(),
+            Some(uprobe_offset), // Always use offset for uprobe loading
             session.target_pid,
         );
 
         info!(
-            "Created trace instance {} for function '{}' with uprobe config {}",
-            actual_trace_id, function_name, i
+            "Created trace instance {} for target '{}' with uprobe config {}",
+            actual_trace_id, target_display, i
         );
 
         // Step 8: Activate the trace instance (attach uprobe)
         if let Err(e) = session.trace_manager.activate_trace(actual_trace_id).await {
-            error!("Failed to activate trace {}: {}", actual_trace_id, e);
-            // Remove failed trace
+            let error = format!("Failed to activate trace {}: {}", actual_trace_id, e);
+            error!("{}", error);
+            // Clean up this failed trace and any successful ones
             let _ = session.trace_manager.remove_trace(actual_trace_id).await;
-            continue;
+            for &trace_id in &successful_trace_ids {
+                let _ = session.trace_manager.remove_trace(trace_id).await;
+            }
+            let _ = status_sender.send(RuntimeStatus::ScriptCompilationFailed {
+                error: error.clone(),
+                trace_id,
+            });
+            return Err(anyhow::anyhow!(error));
+        }
+
+        successful_trace_ids.push(actual_trace_id);
+
+        // Send uprobe attached status for UI only after successful activation
+        if let Some(address) = config.function_address {
+            let _ = status_sender.send(RuntimeStatus::UprobeAttached {
+                function: target_display.clone(),
+                address,
+            });
         }
 
         info!(
-            "Successfully activated trace {} for function '{}'",
-            actual_trace_id, function_name
+            "Successfully activated trace {} for target '{}'",
+            actual_trace_id, target_display
         );
     }
 
-    // Step 9: Check if any traces were successfully created
-    if session.trace_manager.active_trace_count() > 0 {
+    // Step 9: Verify ALL uprobe configurations were processed successfully
+    if successful_trace_ids.len() == expected_trace_count {
         let _ = status_sender.send(RuntimeStatus::ScriptCompilationCompleted { trace_id });
         info!(
-            "Script compilation and loading completed successfully using unified interface with {} active traces",
-            session.trace_manager.active_trace_count()
+            "Script compilation and loading completed successfully: ALL {} uprobe configurations attached",
+            expected_trace_count
         );
         Ok(())
     } else {
-        let error = "No traces could be activated".to_string();
+        let error = format!(
+            "Script compilation failed: only {} out of {} uprobe configurations succeeded",
+            successful_trace_ids.len(),
+            expected_trace_count
+        );
+        // This should never happen due to early returns above, but defensive programming
+        for &trace_id in &successful_trace_ids {
+            let _ = session.trace_manager.remove_trace(trace_id).await;
+        }
         let _ = status_sender.send(RuntimeStatus::ScriptCompilationFailed {
             error: error.clone(),
             trace_id,
         });
         Err(anyhow::anyhow!(error))
+    }
+}
+
+/// Generate target display name from trace pattern
+/// This is used for UI display and logging, not for uprobe attachment
+fn generate_target_display_name(pattern: &ghostscope_compiler::ast::TracePattern) -> String {
+    match pattern {
+        ghostscope_compiler::ast::TracePattern::FunctionName(name) => name.clone(),
+        ghostscope_compiler::ast::TracePattern::Wildcard(pattern) => pattern.clone(),
+        ghostscope_compiler::ast::TracePattern::Address(addr) => format!("0x{:x}", addr),
+        ghostscope_compiler::ast::TracePattern::SourceLine {
+            file_path,
+            line_number,
+        } => format!("{}:{}", file_path, line_number),
     }
 }
 
@@ -168,96 +242,6 @@ pub fn extract_target_from_script(script: &str) -> String {
     "unknown".to_string()
 }
 
-/// Resolve uprobe configuration to function name and offset
-/// Uses unified DWARF query interfaces for cleaner code
-async fn resolve_uprobe_config(
-    config: &mut ghostscope_compiler::UProbeConfig,
-    session: &GhostSession,
-    status_sender: &tokio::sync::mpsc::UnboundedSender<ghostscope_ui::RuntimeStatus>,
-) -> Result<(String, Option<u64>)> {
-    use ghostscope_ui::RuntimeStatus;
-
-    let analyzer = session
-        .binary_analyzer
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("No binary analyzer available for address resolution"))?;
-
-    match &config.trace_pattern {
-        ghostscope_compiler::ast::TracePattern::FunctionName(function_name) => {
-            // Use unified function address resolution
-            let address = analyzer
-                .resolve_function_address(function_name)
-                .ok_or_else(|| {
-                    anyhow::anyhow!("Function '{}' not found in binary", function_name)
-                })?;
-
-            let uprobe_offset = analyzer
-                .resolve_function_uprobe_offset(function_name)
-                .unwrap_or(address); // Fallback to address if uprobe offset calculation fails
-
-            // Update config
-            config.function_address = Some(address);
-            config.uprobe_offset = Some(uprobe_offset);
-
-            info!(
-                "Resolved function '{}' to address 0x{:x}",
-                function_name, address
-            );
-
-            // Send uprobe attached status
-            let _ = status_sender.send(RuntimeStatus::UprobeAttached {
-                function: function_name.clone(),
-                address,
-            });
-
-            Ok((function_name.clone(), Some(uprobe_offset)))
-        }
-        ghostscope_compiler::ast::TracePattern::SourceLine {
-            file_path,
-            line_number,
-        } => {
-            // Use unified source line address resolution
-            let address = analyzer
-                .resolve_source_line_address(file_path, *line_number)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "No addresses found for source line {}:{}",
-                        file_path,
-                        line_number
-                    )
-                })?;
-
-            let uprobe_offset = analyzer
-                .resolve_source_line_uprobe_offset(file_path, *line_number)
-                .unwrap_or(address); // Fallback to address if uprobe offset calculation fails
-
-            // Update config
-            config.function_name = None;
-            config.function_address = Some(address);
-            config.uprobe_offset = Some(uprobe_offset);
-
-            let function_name = format!("{}:{}", file_path, line_number);
-
-            info!(
-                "Resolved source line '{}:{}' to address 0x{:x}",
-                file_path, line_number, address
-            );
-
-            // Send uprobe attached status for source line
-            let _ = status_sender.send(RuntimeStatus::UprobeAttached {
-                function: function_name.clone(),
-                address,
-            });
-
-            Ok((function_name, Some(uprobe_offset)))
-        }
-        _ => Err(anyhow::anyhow!(
-            "Trace pattern not yet supported: {:?}",
-            config.trace_pattern
-        )),
-    }
-}
-
 /// Parse and validate script (reuse existing logic)
 fn parse_and_validate_script(script: &str) -> Result<ghostscope_compiler::ast::Program> {
     match ghostscope_compiler::parser::parse(script) {
@@ -270,4 +254,86 @@ fn parse_and_validate_script(script: &str) -> Result<ghostscope_compiler::ast::P
             Err(anyhow::anyhow!("Script parsing failed: {}", e))
         }
     }
+}
+
+/// Compile and load script for command line mode using session.command_loaders
+pub async fn compile_and_load_script_for_cli(
+    script: &str,
+    session: &mut GhostSession,
+    save_options: &ghostscope_compiler::SaveOptions,
+) -> Result<()> {
+    info!("Starting unified script compilation with DWARF integration...");
+
+    // Step 1: Validate binary analyzer
+    let binary_analyzer = session
+        .binary_analyzer
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Binary analyzer is required for script compilation"))?;
+
+    let binary_path_string = binary_analyzer
+        .debug_info()
+        .binary_path
+        .to_string_lossy()
+        .to_string();
+
+    // Step 2: Use unified compilation interface
+    let compilation_result = ghostscope_compiler::compile_script_to_uprobe_configs(
+        script,
+        binary_analyzer,
+        session.target_pid,
+        None, // Command line mode doesn't have specific trace_id, use default
+        save_options,
+    )?;
+
+    info!(
+        "✓ Script compilation successful: {} trace points found, {} uprobe configs generated",
+        compilation_result.trace_count,
+        compilation_result.uprobe_configs.len()
+    );
+    info!("Target info: {}", compilation_result.target_info);
+
+    if save_options.save_llvm_ir || save_options.save_ebpf || save_options.save_ast {
+        info!("Files saved with consistent naming: gs_{{pid}}_{{exec}}_{{func}}_{{index}}");
+    }
+
+    // Step 3: Prepare and attach uprobe configurations
+    let mut uprobe_configs = compilation_result.uprobe_configs;
+
+    for config in uprobe_configs.iter_mut() {
+        config.binary_path = binary_path_string.clone();
+    }
+
+    if uprobe_configs.is_empty() {
+        return Err(anyhow::anyhow!(
+            "No uprobe configurations created - nothing to attach"
+        ));
+    }
+
+    info!("Attaching {} uprobe configurations", uprobe_configs.len());
+    for (i, config) in uprobe_configs.iter().enumerate() {
+        info!(
+            "  Config {}: {:?} -> 0x{:x}",
+            i,
+            config
+                .function_name
+                .as_ref()
+                .unwrap_or(&format!("0x{:x}", config.function_address.unwrap_or(0))),
+            config.uprobe_offset.unwrap_or(0)
+        );
+    }
+
+    // Step 4: Attach uprobes using session's attach_uprobes method
+    session.attach_uprobes(&uprobe_configs).await.map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to attach uprobes: {}. Possible reasons: \
+            1. Need root permissions (run with sudo), \
+            2. Target binary doesn't exist or lacks debug info, \
+            3. Process not running or PID invalid, \
+            4. Function addresses not accessible",
+            e
+        )
+    })?;
+
+    info!("All uprobes attached successfully!");
+    Ok(())
 }

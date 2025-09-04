@@ -8,14 +8,14 @@ use tracing::{debug, info, warn};
 #[derive(Debug)]
 pub struct TraceInstance {
     pub trace_id: u32,
-    pub target: String,             // Function name or target identifier
-    pub script_content: String,     // Original script content
-    pub loader: GhostScopeLoader,   // eBPF loader for this specific trace
-    pub binary_path: String,        // Binary being traced
-    pub function_name: String,      // Specific function being traced
-    pub uprobe_offset: Option<u64>, // Uprobe offset if calculated
-    pub target_pid: Option<u32>,    // Target PID if specified
-    pub is_enabled: bool,           // Whether the uprobe is currently enabled
+    pub target: String, // Target identifier for grouping (e.g., "test_program:L15")
+    pub script_content: String, // Original script content
+    pub loader: GhostScopeLoader, // eBPF loader for this specific trace
+    pub binary_path: String, // Binary being traced
+    pub target_display: String, // Display name for UI (e.g., "main", "file.c:15")
+    pub uprobe_offset: Option<u64>, // Uprobe offset (required for attachment)
+    pub target_pid: Option<u32>, // Target PID if specified
+    pub is_enabled: bool, // Whether the uprobe is currently enabled
 }
 
 impl TraceInstance {
@@ -25,7 +25,7 @@ impl TraceInstance {
         script_content: String,
         loader: GhostScopeLoader,
         binary_path: String,
-        function_name: String,
+        target_display: String,
         uprobe_offset: Option<u64>,
         target_pid: Option<u32>,
     ) -> Self {
@@ -35,7 +35,7 @@ impl TraceInstance {
             script_content,
             loader,
             binary_path,
-            function_name,
+            target_display,
             uprobe_offset,
             target_pid,
             is_enabled: false,
@@ -50,8 +50,8 @@ impl TraceInstance {
         }
 
         info!(
-            "Enabling trace {} for function '{}' in binary '{}'",
-            self.trace_id, self.function_name, self.binary_path
+            "Enabling trace {} for target '{}' in binary '{}'",
+            self.trace_id, self.target_display, self.binary_path
         );
 
         // If the loader already has attachment parameters stored (from previous attach),
@@ -76,7 +76,7 @@ impl TraceInstance {
             );
             self.loader.attach_uprobe(
                 &self.binary_path,
-                &self.function_name,
+                &self.target_display, // Used only for logging; actual attachment uses uprobe_offset
                 self.uprobe_offset,
                 self.target_pid.map(|pid| pid as i32),
             )?;
@@ -148,7 +148,7 @@ impl TraceManager {
         script_content: String,
         loader: GhostScopeLoader,
         binary_path: String,
-        function_name: String,
+        target_display: String,
         uprobe_offset: Option<u64>,
         target_pid: Option<u32>,
     ) -> u32 {
@@ -161,11 +161,11 @@ impl TraceManager {
 
         let trace_instance = TraceInstance::new(
             trace_id,
-            target.clone(), // Keep original target for display
+            target.clone(), // Keep original target for grouping
             script_content,
             loader,
             binary_path,
-            function_name,
+            target_display,
             uprobe_offset,
             target_pid,
         );

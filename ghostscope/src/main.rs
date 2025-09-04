@@ -23,7 +23,7 @@ async fn main() -> Result<()> {
     }
 
     // Validate arguments
-    command_line::validate_arguments(&parsed_args)?;
+    parsed_args.validate()?;
 
     // Route to appropriate runtime mode
     if parsed_args.tui_mode {

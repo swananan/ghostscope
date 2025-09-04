@@ -79,169 +79,34 @@ pub async fn run_command_line_runtime(parsed_args: ParsedArgs) -> Result<()> {
         }
     }
 
-    // Step 6: Compile script using unified interface
-    info!("Starting unified script compilation with DWARF integration...");
-
-    let binary_analyzer = session
-        .binary_analyzer
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Binary analyzer is required for script compilation"))?;
-
-    let binary_path_string = binary_analyzer
-        .debug_info()
-        .binary_path
-        .to_string_lossy()
-        .to_string();
-
+    // Step 6: Compile and load script using unified interface
     let save_options = ghostscope_compiler::SaveOptions {
         save_llvm_ir: parsed_args.should_save_llvm_ir,
         save_ast: parsed_args.should_save_ast,
         save_ebpf: parsed_args.should_save_ebpf,
-        binary_path_hint: Some(binary_path_string.clone()),
+        binary_path_hint: session.get_debug_info().map(|info| {
+            info.binary_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .to_string()
+        }),
     };
 
-    let compilation_result = ghostscope_compiler::compile_script_to_uprobe_configs(
+    crate::script_compiler::compile_and_load_script_for_cli(
         &script_content,
-        binary_analyzer,
-        session.target_pid,
-        None, // Command line mode doesn't have specific trace_id, use default
+        &mut session,
         &save_options,
-    )?;
+    )
+    .await?;
 
-    info!(
-        "✓ Script compilation successful: {} trace points found, {} uprobe configs generated",
-        compilation_result.trace_count,
-        compilation_result.uprobe_configs.len()
-    );
-    info!("Target info: {}", compilation_result.target_info);
-
-    if save_options.save_llvm_ir || save_options.save_ebpf || save_options.save_ast {
-        info!("Files saved with consistent naming: gs_{{pid}}_{{exec}}_{{func}}_{{index}}");
-    }
-
-    // Step 7: Prepare and attach uprobe configurations
-    let mut uprobe_configs = compilation_result.uprobe_configs;
-
-    for config in uprobe_configs.iter_mut() {
-        config.binary_path = binary_path_string.clone();
-    }
-
-    if !uprobe_configs.is_empty() {
-        info!("Attaching {} uprobe configurations", uprobe_configs.len());
-        for (i, config) in uprobe_configs.iter().enumerate() {
-            info!(
-                "  Config {}: {:?} -> 0x{:x}",
-                i,
-                config
-                    .function_name
-                    .as_ref()
-                    .unwrap_or(&format!("0x{:x}", config.function_address.unwrap_or(0))),
-                config.uprobe_offset.unwrap_or(0)
-            );
-        }
-
-        session.attach_uprobes(&uprobe_configs).await.map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to attach uprobes: {}. Possible reasons: \
-                1. Need root permissions (run with sudo), \
-                2. Target binary doesn't exist or lacks debug info, \
-                3. Process not running or PID invalid, \
-                4. Function addresses not accessible",
-                e
-            )
-        })?;
-
-        info!("All uprobes attached successfully! Starting event monitoring...");
-    } else {
-        return Err(anyhow::anyhow!(
-            "No uprobe configurations created - nothing to attach"
-        ));
-    }
-
-    // Step 8: Display usage information
-    info!("\nUsage examples:");
-    info!("  sudo ./ghostscope --script 'trace main {{ print \"Hello\"; }}'");
-    info!("  sudo ./ghostscope --script-file my_trace.gs");
-    info!("  sudo ./ghostscope -s 'trace printf* {{ print $arg0; }}'");
-    info!("\nTrace script syntax:");
-    info!("  trace <function_name> {{ statements... }}");
-    info!("  trace <pattern*> {{ statements... }}");
-    info!("  trace 0x<address> {{ statements... }}");
-    info!("  trace file.c:123 {{ statements... }}");
-    info!("  Special variables: $arg0, $arg1, $retval, $pc, $sp");
-
-    // Step 9: Start event monitoring loop
+    // Step 7: Start event monitoring loop
     session
         .start_event_monitoring()
         .await
         .map_err(|e| anyhow::anyhow!("Event monitoring failed: {}", e))?;
 
     Ok(())
-}
-
-/// Validate command line arguments for consistency and completeness
-pub fn validate_arguments(args: &ParsedArgs) -> Result<()> {
-    // Must have either PID or binary path for meaningful operation
-    if args.pid.is_none() && args.binary_path.is_none() {
-        warn!("No target PID or binary path specified - running in standalone mode");
-    }
-
-    // Cannot specify both PID and binary simultaneously
-    if args.pid.is_some() && args.binary_path.is_some() {
-        // TODO: actually we can
-        return Err(anyhow::anyhow!(
-            "Cannot specify both PID (-p) and binary path simultaneously. Choose one target method."
-        ));
-    }
-
-    if let Some(pid) = args.pid {
-        if !is_pid_running(pid) {
-            return Err(anyhow::anyhow!(
-                "Process with PID {} is not running. Use 'ps -p {}' to verify the process exists",
-                pid,
-                pid
-            ));
-        }
-        info!("✓ Target PID {} is running", pid);
-    }
-
-    // Script file must exist if specified
-    if let Some(script_file) = &args.script_file {
-        if !script_file.exists() {
-            return Err(anyhow::anyhow!(
-                "Script file does not exist: {}",
-                script_file.display()
-            ));
-        }
-        if !script_file.is_file() {
-            return Err(anyhow::anyhow!(
-                "Script path is not a file: {}",
-                script_file.display()
-            ));
-        }
-    }
-
-    // Debug file must exist if specified
-    if let Some(debug_file) = &args.debug_file {
-        if !debug_file.exists() {
-            return Err(anyhow::anyhow!(
-                "Debug file does not exist: {}",
-                debug_file.display()
-            ));
-        }
-    }
-
-    info!("✓ Command line arguments validated successfully");
-    Ok(())
-}
-
-/// Check if a process with given PID is currently running
-fn is_pid_running(pid: u32) -> bool {
-    use std::path::Path;
-
-    // On Linux, check if /proc/PID exists and is a directory
-    let proc_path = format!("/proc/{}", pid);
-    Path::new(&proc_path).is_dir()
 }
 
 /// Get script content from arguments or provide default

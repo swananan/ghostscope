@@ -172,8 +172,8 @@ async fn run_runtime_coordinator(
                         info!("Executing script with trace_id {:?}: {}", trace_id, script);
 
                         if let Some(ref mut session) = session {
-                            // Use the new trace-aware compilation and loading
-                            match crate::script_compiler::compile_and_load_script_with_trace_id(
+                            // Use the new TUI-specific compilation and loading with strict all-or-nothing success
+                            match crate::script_compiler::compile_and_load_script_for_tui(
                                 &script,
                                 trace_id,
                                 session,
