@@ -2,8 +2,8 @@ use crate::args::ParsedArgs;
 use crate::session::GhostSession;
 use anyhow::Result;
 use futures::future;
-use ghostscope_protocol::MessageType;
-use ghostscope_ui::{events::TraceEvent, run_tui_mode, EventRegistry};
+use ghostscope_protocol::{EventData, MessageType};
+use ghostscope_ui::{run_tui_mode, EventRegistry};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
@@ -137,7 +137,6 @@ async fn run_runtime_coordinator(
     mut session: Option<GhostSession>,
 ) -> Result<()> {
     use ghostscope_protocol::MessageType;
-    use ghostscope_ui::events::TraceEvent;
     use ghostscope_ui::{RuntimeCommand, RuntimeStatus};
 
     info!("Runtime coordinator started");
@@ -158,28 +157,10 @@ async fn run_runtime_coordinator(
                 }
             }, if session.is_some() => {
                 if let Some(ref session) = session {
-                    // events is Vec<(trace_id, event_string)> from trace manager
-                    for (trace_id, event_string) in events {
-                        // Parse the event string format: "[Trace X] event_content"
-                        let message = if event_string.starts_with(&format!("[Trace {}]", trace_id)) {
-                            event_string
-                        } else {
-                            format!("[Trace {}] {}", trace_id, event_string)
-                        };
-
-                        let trace_event = TraceEvent {
-                            timestamp: SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_nanos() as u64,
-                            trace_id: trace_id as u64, // Convert to u64 for protocol compatibility
-                            pid: session.target_pid.unwrap_or(0),
-                            message,
-                            trace_type: MessageType::VariableData,
-                        };
-
-                        // Send to TUI (ignore errors if channel is closed)
-                        let _ = trace_sender.send(trace_event);
+                    // events is Vec<EventData> from trace manager
+                    for event_data in events {
+                        // Send EventData directly to TUI (ignore errors if channel is closed)
+                        let _ = trace_sender.send(event_data);
                     }
                 }
             }

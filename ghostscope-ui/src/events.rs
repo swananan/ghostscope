@@ -1,5 +1,5 @@
 use crossterm::event::{KeyEvent, MouseEvent};
-use ghostscope_protocol::MessageType;
+use ghostscope_protocol::{EventData, MessageType, TypeEncoding};
 use tokio::sync::mpsc;
 
 /// TUI events that can be handled by the application
@@ -11,16 +11,6 @@ pub enum TuiEvent {
     Quit,
 }
 
-/// Structured trace event for TUI display
-#[derive(Debug, Clone)]
-pub struct TraceEvent {
-    pub timestamp: u64, // Raw timestamp in nanoseconds, TUI will format for display
-    pub trace_id: u64,
-    pub pid: u32,
-    pub message: String,         // Main trace message content
-    pub trace_type: MessageType, // Use MessageType directly for trace categorization
-}
-
 /// Registry for event communication between TUI and runtime
 #[derive(Debug)]
 pub struct EventRegistry {
@@ -28,7 +18,7 @@ pub struct EventRegistry {
     pub command_sender: mpsc::UnboundedSender<RuntimeCommand>,
 
     // Runtime -> TUI communication
-    pub trace_receiver: mpsc::UnboundedReceiver<TraceEvent>,
+    pub trace_receiver: mpsc::UnboundedReceiver<EventData>,
     pub status_receiver: mpsc::UnboundedReceiver<RuntimeStatus>,
 }
 
@@ -86,7 +76,7 @@ pub enum RuntimeStatus {
 impl EventRegistry {
     pub fn new() -> (Self, RuntimeChannels) {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
-        let (trace_tx, trace_rx) = mpsc::unbounded_channel();
+        let (trace_tx, trace_rx) = mpsc::unbounded_channel::<EventData>();
         let (status_tx, status_rx) = mpsc::unbounded_channel();
 
         let registry = EventRegistry {
@@ -109,7 +99,7 @@ impl EventRegistry {
 #[derive(Debug)]
 pub struct RuntimeChannels {
     pub command_receiver: mpsc::UnboundedReceiver<RuntimeCommand>,
-    pub trace_sender: mpsc::UnboundedSender<TraceEvent>,
+    pub trace_sender: mpsc::UnboundedSender<EventData>,
     pub status_sender: mpsc::UnboundedSender<RuntimeStatus>,
 }
 
@@ -120,7 +110,7 @@ impl RuntimeChannels {
     }
 
     /// Create a trace sender that can be shared with other tasks
-    pub fn create_trace_sender(&self) -> mpsc::UnboundedSender<TraceEvent> {
+    pub fn create_trace_sender(&self) -> mpsc::UnboundedSender<EventData> {
         self.trace_sender.clone()
     }
 }

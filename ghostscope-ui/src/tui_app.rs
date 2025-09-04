@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
 use crate::{
-    events::{EventRegistry, RuntimeCommand, RuntimeStatus, SourceCodeInfo, TraceEvent, TuiEvent},
+    events::{EventRegistry, RuntimeCommand, RuntimeStatus, SourceCodeInfo, TuiEvent},
     panels::{
         CommandAction, EbpfInfoPanel, InteractiveCommandPanel, ResponseType, SourceCodePanel,
     },
@@ -899,7 +899,7 @@ impl TuiApp {
         // to keep it focused on actual eBPF trace events only
     }
 
-    async fn handle_trace_event(&mut self, trace_event: TraceEvent) {
+    async fn handle_trace_event(&mut self, trace_event: ghostscope_protocol::EventData) {
         debug!("Trace event: {:?}", trace_event);
         self.ebpf_info_panel.add_trace_event(trace_event);
     }

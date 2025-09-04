@@ -709,13 +709,9 @@ impl EventParser {
                 debug!("Received heartbeat message");
                 None
             }
-            t if t == MessageType::Log as u8 => {
-                Self::handle_log_message(data);
-                None
-            }
+            t if t == MessageType::Log as u8 => Self::handle_log_message(data),
             t if t == MessageType::ExecutionFailure as u8 => {
-                Self::handle_execution_failure_message(data);
-                None
+                Self::handle_execution_failure_message(data)
             }
             _ => {
                 debug!("Unknown message type: {}", header.msg_type);
@@ -760,6 +756,12 @@ impl EventParser {
                     pid: msg_body.pid,
                     tid: msg_body.tid,
                     variables: variable_infos,
+                    readable_timestamp: Self::format_timestamp_ns(msg_body.timestamp),
+                    message_type: EventMessageType::VariableData,
+                    log_level: None,
+                    error_code: None,
+                    log_message: None,
+                    failure_message: None,
                 })
             }
             Err(e) => {
@@ -770,7 +772,7 @@ impl EventParser {
     }
 
     /// Handle log message from eBPF
-    fn handle_log_message(data: &[u8]) {
+    fn handle_log_message(data: &[u8]) -> Option<EventData> {
         match MessageParser::parse_log_message(data) {
             Ok((log_msg, message)) => {
                 // Copy fields from packed struct to avoid packed reference issues
@@ -795,15 +797,30 @@ impl EventParser {
                     "[eBPF-{}] trace_id:{} pid:{} tid:{} {} - {}",
                     level_str, trace_id, pid, tid, readable_ts, message
                 );
+
+                Some(EventData {
+                    trace_id,
+                    timestamp,
+                    pid,
+                    tid,
+                    variables: Vec::new(), // Log messages don't have variables
+                    readable_timestamp: readable_ts,
+                    message_type: EventMessageType::Log,
+                    log_level: Some(log_level),
+                    error_code: None,
+                    log_message: Some(message.clone()),
+                    failure_message: None,
+                })
             }
             Err(e) => {
                 warn!("Failed to parse log message: {}", e);
+                None
             }
         }
     }
 
     /// Handle execution failure message from eBPF
-    fn handle_execution_failure_message(data: &[u8]) {
+    fn handle_execution_failure_message(data: &[u8]) -> Option<EventData> {
         match MessageParser::parse_execution_failure_message(data) {
             Ok((failure_msg, message)) => {
                 // Copy fields from packed struct to avoid packed reference issues
@@ -820,9 +837,24 @@ impl EventParser {
                     "[eBPF-ExecutionFailure] trace_id:{} pid:{} tid:{} error_code:{} {} - {}",
                     trace_id, pid, tid, error_code, readable_ts, message
                 );
+
+                Some(EventData {
+                    trace_id,
+                    timestamp,
+                    pid,
+                    tid,
+                    variables: Vec::new(), // Execution failure messages don't have variables
+                    readable_timestamp: readable_ts,
+                    message_type: EventMessageType::ExecutionFailure,
+                    log_level: None,
+                    error_code: Some(error_code),
+                    log_message: None,
+                    failure_message: Some(message.clone()),
+                })
             }
             Err(e) => {
                 warn!("Failed to parse execution failure message: {}", e);
+                None
             }
         }
     }
@@ -882,6 +914,21 @@ pub struct EventData {
     pub pid: u32,
     pub tid: u32,
     pub variables: Vec<VariableInfo>,
+    pub readable_timestamp: String,      // Human-readable timestamp
+    pub message_type: EventMessageType,  // Type of the event message
+    pub log_level: Option<u8>,           // For log messages
+    pub error_code: Option<i64>,         // For execution failure messages
+    pub log_message: Option<String>,     // For log messages
+    pub failure_message: Option<String>, // For execution failure messages
+}
+
+/// Type of event message from eBPF
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum EventMessageType {
+    VariableData,     // Variable data message
+    Log,              // Log message
+    ExecutionFailure, // Execution failure message
+    Unknown,          // Unknown message type
 }
 
 /// Variable information extracted from protocol message

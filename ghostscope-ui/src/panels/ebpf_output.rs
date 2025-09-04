@@ -8,10 +8,10 @@ use ratatui::{
 };
 use std::collections::VecDeque;
 
-use crate::events::TraceEvent;
+use ghostscope_protocol::EventData;
 
 pub struct EbpfInfoPanel {
-    pub trace_events: VecDeque<TraceEvent>,
+    pub trace_events: VecDeque<EventData>,
     pub scroll_offset: usize,
     pub max_messages: usize,
     pub auto_scroll: bool,
@@ -27,7 +27,7 @@ impl EbpfInfoPanel {
         }
     }
 
-    pub fn add_trace_event(&mut self, trace_event: TraceEvent) {
+    pub fn add_trace_event(&mut self, trace_event: EventData) {
         self.trace_events.push_back(trace_event);
         if self.trace_events.len() > self.max_messages {
             self.trace_events.pop_front();
@@ -71,11 +71,32 @@ impl EbpfInfoPanel {
         for (trace_index, trace) in self.trace_events.iter().enumerate() {
             let is_latest = trace_index == total_traces - 1;
 
-            // Create the main message line
-            let message_line = format!(
-                "[{:?}] [TraceID:{:^5}] PID:{} - {}",
-                trace.trace_type, trace.trace_id, trace.pid, trace.message
+            // Create the main message line with enhanced information
+            let mut message_line = format!(
+                "{} [TraceID:{}] PID:{} TID:{} [{:?}]",
+                trace.readable_timestamp, trace.trace_id, trace.pid, trace.tid, trace.message_type
             );
+
+            // Add variable information if available
+            if !trace.variables.is_empty() {
+                let variables_info = trace
+                    .variables
+                    .iter()
+                    .map(|var| format!("{}: {}", var.name, var.formatted_value))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                message_line.push_str(&format!(" | Variables: [{}]", variables_info));
+            }
+
+            // Add log message if available
+            if let Some(log_msg) = &trace.log_message {
+                message_line.push_str(&format!(" | Log: {}", log_msg));
+            }
+
+            // Add failure message if available
+            if let Some(failure_msg) = &trace.failure_message {
+                message_line.push_str(&format!(" | Failure: {}", failure_msg));
+            }
 
             // Wrap the message if needed
             let wrapped_lines = self.wrap_text(&message_line, content_width as usize);
@@ -141,36 +162,6 @@ impl EbpfInfoPanel {
         );
 
         frame.render_widget(list, area);
-    }
-
-    /// Format nanosecond timestamp to HH:MM:SS.mmm format using chrono with local timezone
-    fn format_timestamp(&self, timestamp_ns: u64) -> String {
-        // Convert nanoseconds to seconds and nanoseconds
-        let secs = timestamp_ns / 1_000_000_000;
-        let nsecs = (timestamp_ns % 1_000_000_000) as u32;
-
-        // Create UTC DateTime from timestamp
-        let utc_dt: DateTime<Utc> = match Utc.timestamp_opt(secs as i64, nsecs) {
-            chrono::LocalResult::Single(dt) => dt,
-            chrono::LocalResult::None => {
-                // Fallback to current time if timestamp is invalid
-                Utc::now()
-            }
-            chrono::LocalResult::Ambiguous(dt, _) => dt, // Use first occurrence in case of ambiguity
-        };
-
-        // Convert to local timezone
-        let local_dt: DateTime<Local> = DateTime::from(utc_dt);
-
-        // Format as HH:MM:SS.mmm
-        let millis = local_dt.nanosecond() / 1_000_000;
-        format!(
-            "{:02}:{:02}:{:02}.{:03}",
-            local_dt.hour(),
-            local_dt.minute(),
-            local_dt.second(),
-            millis
-        )
     }
 
     /// Wrap text to fit within the specified width

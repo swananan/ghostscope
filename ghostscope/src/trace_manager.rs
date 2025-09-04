@@ -103,19 +103,15 @@ impl TraceInstance {
     }
 
     /// Wait for events asynchronously from this trace instance
-    pub async fn wait_for_events_async(&mut self) -> Result<Vec<String>> {
+    pub async fn wait_for_events_async(&mut self) -> Result<Vec<ghostscope_protocol::EventData>> {
         if !self.is_enabled {
             return Ok(Vec::new());
         }
 
         match self.loader.wait_for_events_async().await {
             Ok(events) => {
-                // Add trace_id context to each event
-                let traced_events = events
-                    .into_iter()
-                    .map(|event| format!("[Trace {}] {}", self.trace_id, event))
-                    .collect();
-                Ok(traced_events)
+                // Return EventData directly, no need to convert to strings
+                Ok(events)
             }
             Err(e) => {
                 warn!(
@@ -281,7 +277,7 @@ impl TraceManager {
     }
 
     /// Wait for events asynchronously from all active traces
-    pub async fn wait_for_all_events_async(&mut self) -> Vec<(u32, String)> {
+    pub async fn wait_for_all_events_async(&mut self) -> Vec<ghostscope_protocol::EventData> {
         let mut all_events = Vec::new();
 
         // Create futures for all enabled traces
@@ -304,7 +300,7 @@ impl TraceManager {
             match futures::future::select_all(futures).await {
                 ((trace_id, Ok(events)), _index, _remaining_futures) => {
                     for event in events {
-                        all_events.push((trace_id, event));
+                        all_events.push(event);
                     }
                 }
                 ((trace_id, Err(e)), _index, _remaining_futures) => {
