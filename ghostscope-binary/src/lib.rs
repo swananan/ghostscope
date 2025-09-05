@@ -1,6 +1,7 @@
 pub mod debuglink;
 pub mod dwarf;
 pub mod elf;
+pub mod scoped_variables;
 pub mod symbol;
 
 pub use dwarf::EnhancedVariableLocation;
