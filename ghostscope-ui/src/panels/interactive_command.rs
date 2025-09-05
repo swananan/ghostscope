@@ -38,6 +38,7 @@ pub enum CommandType {
     EnableAll,
     DisableAll,
     DeleteAll,
+    Info { target: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -366,6 +367,9 @@ impl InteractiveCommandPanel {
         } else if cmd == "info trace" {
             // Show trace status information
             Some(self.format_trace_info())
+        } else if cmd.starts_with("info ") && !cmd.starts_with("info trace") {
+            // info target commands (file:line or function) - these need to be sent to runtime
+            None
         } else if cmd.starts_with("disable ")
             || cmd.starts_with("enable ")
             || cmd.starts_with("delete ")
@@ -444,6 +448,22 @@ impl InteractiveCommandPanel {
                 Some(CommandAction::DeleteTrace(trace_id))
             } else {
                 None // Invalid trace ID
+            }
+        } else if cmd.starts_with("info ") && !cmd.starts_with("info trace") {
+            // Parse info target command
+            let target = cmd.strip_prefix("info ").unwrap().trim().to_string();
+            if !target.is_empty() {
+                // Set waiting state for info command
+                self.input_state = InputState::WaitingResponse {
+                    command: command.to_string(),
+                    sent_time: Instant::now(),
+                    command_type: CommandType::Info {
+                        target: target.clone(),
+                    },
+                };
+                Some(CommandAction::InfoTarget { target })
+            } else {
+                None // Empty target
             }
         } else {
             None
@@ -777,6 +797,9 @@ impl InteractiveCommandPanel {
                 CommandType::EnableAll => format!("❌ Failed to enable all traces: {}", error),
                 CommandType::DisableAll => format!("❌ Failed to disable all traces: {}", error),
                 CommandType::DeleteAll => format!("❌ Failed to delete all traces: {}", error),
+                CommandType::Info { target } => {
+                    format!("❌ Failed to get info for '{}': {}", target, error)
+                }
             };
 
             if let Some(last_item) = self.command_history.last_mut() {
@@ -816,6 +839,9 @@ impl InteractiveCommandPanel {
                 CommandType::EnableAll => "✅ All traces enabled successfully".to_string(),
                 CommandType::DisableAll => "✅ All traces disabled successfully".to_string(),
                 CommandType::DeleteAll => "✅ All traces deleted successfully".to_string(),
+                CommandType::Info { target } => {
+                    format!("✅ Debug info for '{}' retrieved successfully", target)
+                }
             };
 
             if let Some(last_item) = self.command_history.last_mut() {
@@ -2429,4 +2455,5 @@ pub enum CommandAction {
     EnableAllTraces,
     DeleteTrace(u32),
     DeleteAllTraces,
+    InfoTarget { target: String },
 }

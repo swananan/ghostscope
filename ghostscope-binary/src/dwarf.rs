@@ -492,6 +492,34 @@ impl LocationExpression {
             _ => self,
         }
     }
+
+    /// Check if this location expression represents a function parameter
+    /// Parameters are typically stored in registers or frame-based offsets with specific patterns
+    pub fn is_parameter_location(&self) -> bool {
+        match self {
+            // Simple register locations often indicate parameters
+            LocationExpression::Register { reg: _ } => true,
+            // Frame base offsets with positive values are often parameters (passed arguments)
+            LocationExpression::FrameBaseOffset { offset } => *offset >= 0,
+            // Register + offset patterns for parameter passing
+            LocationExpression::RegisterOffset { reg: _, offset: _ } => true,
+            // For location lists, check the most common entry
+            LocationExpression::LocationList { entries } => {
+                if let Some(first_entry) = entries.first() {
+                    first_entry.location_expr.is_parameter_location()
+                } else {
+                    false
+                }
+            }
+            // Stack offsets and complex expressions are typically local variables
+            LocationExpression::StackOffset { offset: _ } => false,
+            LocationExpression::ComputedExpression { .. } => false,
+            LocationExpression::DwarfExpression { .. } => false,
+            // Address and optimized out locations are neither parameters nor locals
+            LocationExpression::Address { addr: _ } => false,
+            LocationExpression::OptimizedOut => false,
+        }
+    }
 }
 
 /// Simplified DWARF operations for common expression evaluation

@@ -3,7 +3,10 @@ use crate::session::GhostSession;
 use anyhow::Result;
 use futures::future;
 use ghostscope_protocol::{EventData, MessageType};
-use ghostscope_ui::{run_tui_mode, EventRegistry};
+use ghostscope_ui::{
+    events::{TargetDebugInfo, TargetType, VariableDebugInfo},
+    run_tui_mode, EventRegistry,
+};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
@@ -338,6 +341,10 @@ async fn run_runtime_coordinator(
                             let _ = runtime_channels.status_sender.send(RuntimeStatus::Error("No debug session available".to_string()));
                         }
                     }
+                    RuntimeCommand::InfoTarget { target } => {
+                        info!("Info target request for: {}", target);
+                        handle_info_target_request(&mut session, &target, &runtime_channels.status_sender).await;
+                    }
                     RuntimeCommand::Shutdown => {
                         info!("Shutdown command received");
                         break;
@@ -411,5 +418,221 @@ async fn try_load_source_code(
     Ok(SourceCodeInfo {
         file_path: source_location.file_path,
         current_line: Some(source_location.line_number as usize),
+    })
+}
+
+/// Handle info target request from TUI
+async fn handle_info_target_request(
+    session: &mut Option<GhostSession>,
+    target: &str,
+    status_sender: &tokio::sync::mpsc::UnboundedSender<ghostscope_ui::RuntimeStatus>,
+) {
+    use ghostscope_ui::{
+        events::{TargetDebugInfo, TargetType, VariableDebugInfo},
+        RuntimeStatus,
+    };
+
+    let result = try_get_target_debug_info(session, target).await;
+
+    match result {
+        Ok(debug_info) => {
+            info!("Successfully retrieved debug info for target: {}", target);
+            let _ = status_sender.send(RuntimeStatus::InfoTargetResult {
+                target: target.to_string(),
+                info: debug_info,
+            });
+        }
+        Err(error_msg) => {
+            info!(
+                "Failed to get debug info for target {}: {}",
+                target, error_msg
+            );
+            let _ = status_sender.send(RuntimeStatus::InfoTargetFailed {
+                target: target.to_string(),
+                error: error_msg,
+            });
+        }
+    }
+}
+
+/// Try to get debug info for a target (function name or file:line)
+async fn try_get_target_debug_info(
+    session: &mut Option<GhostSession>,
+    target: &str,
+) -> Result<TargetDebugInfo, String> {
+    let session = session
+        .as_mut()
+        .ok_or_else(|| "No active session available".to_string())?;
+
+    let binary_analyzer = session
+        .binary_analyzer
+        .as_mut()
+        .ok_or_else(|| "Binary analyzer not available. Try reloading the binary.".to_string())?;
+
+    // Parse the target to determine if it's a function name or file:line
+    if target.contains(':') {
+        // Parse as file:line
+        handle_source_location_target(binary_analyzer, target).await
+    } else {
+        // Parse as function name
+        handle_function_target(binary_analyzer, target).await
+    }
+}
+
+/// Handle function name target
+async fn handle_function_target(
+    binary_analyzer: &mut ghostscope_binary::BinaryAnalyzer,
+    function_name: &str,
+) -> Result<TargetDebugInfo, String> {
+    use ghostscope_ui::events::*;
+
+    let symbol = binary_analyzer
+        .find_symbol(function_name)
+        .ok_or_else(|| format!("Function '{}' not found in binary symbols", function_name))?;
+
+    let symbol_address = symbol.address;
+    info!(
+        "Found function '{}' at address: 0x{:x}",
+        function_name, symbol_address
+    );
+
+    // Get enhanced variables at the function entry point
+    let enhanced_vars = if let Some(dwarf_context) = binary_analyzer.dwarf_context_mut() {
+        dwarf_context.get_enhanced_variable_locations(symbol_address)
+    } else {
+        Vec::new()
+    };
+
+    // Separate parameters and variables
+    let mut parameters = Vec::new();
+    let mut variables = Vec::new();
+
+    for enhanced_var in enhanced_vars {
+        let var_info = VariableDebugInfo {
+            name: enhanced_var.variable.name.clone(),
+            type_name: enhanced_var.variable.type_name.clone(),
+            location_description: format!("{:?}", enhanced_var.variable.location_expr),
+            size: enhanced_var.size,
+            scope_start: enhanced_var.variable.scope_ranges.first().map(|r| r.start),
+            scope_end: enhanced_var.variable.scope_ranges.first().map(|r| r.end),
+        };
+
+        // Use the is_parameter field from DWARF parsing (which is based on DW_TAG_formal_parameter)
+        let is_parameter = enhanced_var.variable.is_parameter;
+
+        info!(
+            "Variable '{}' location: {:?}, is_parameter: {} (from DWARF)",
+            enhanced_var.variable.name, enhanced_var.variable.location_expr, is_parameter
+        );
+
+        if is_parameter {
+            parameters.push(var_info);
+        } else {
+            variables.push(var_info);
+        }
+    }
+
+    // Try to get source location for the function
+    let source_location = binary_analyzer.get_source_location(symbol_address);
+
+    Ok(TargetDebugInfo {
+        target: function_name.to_string(),
+        target_type: TargetType::Function,
+        file_path: source_location.as_ref().map(|sl| sl.file_path.clone()),
+        line_number: source_location.as_ref().map(|sl| sl.line_number),
+        function_name: Some(function_name.to_string()),
+        variables,
+        parameters,
+        address: Some(symbol_address),
+    })
+}
+
+/// Handle source location target (file:line)
+async fn handle_source_location_target(
+    binary_analyzer: &mut ghostscope_binary::BinaryAnalyzer,
+    target: &str,
+) -> Result<TargetDebugInfo, String> {
+    use ghostscope_ui::events::*;
+
+    // Parse file:line format
+    let parts: Vec<&str> = target.split(':').collect();
+    if parts.len() != 2 {
+        return Err(format!(
+            "Invalid target format '{}'. Expected format: file:line",
+            target
+        ));
+    }
+
+    let file_path = parts[0];
+    let line_number = parts[1]
+        .parse::<u32>()
+        .map_err(|_| format!("Invalid line number '{}' in target '{}'", parts[1], target))?;
+
+    // Resolve source line to address
+    let address = binary_analyzer
+        .resolve_source_line_address(file_path, line_number)
+        .ok_or_else(|| format!("Cannot resolve address for {}:{}", file_path, line_number))?;
+
+    info!(
+        "Resolved {}:{} to address: 0x{:x}",
+        file_path, line_number, address
+    );
+
+    // Get enhanced variables at this location
+    let enhanced_vars = if let Some(dwarf_context) = binary_analyzer.dwarf_context_mut() {
+        dwarf_context.get_enhanced_variable_locations(address)
+    } else {
+        Vec::new()
+    };
+
+    // Separate parameters and variables
+    let mut parameters = Vec::new();
+    let mut variables = Vec::new();
+
+    for enhanced_var in enhanced_vars {
+        let var_info = VariableDebugInfo {
+            name: enhanced_var.variable.name.clone(),
+            type_name: enhanced_var.variable.type_name.clone(),
+            location_description: format!("{:?}", enhanced_var.variable.location_expr),
+            size: enhanced_var.size,
+            scope_start: enhanced_var.variable.scope_ranges.first().map(|r| r.start),
+            scope_end: enhanced_var.variable.scope_ranges.first().map(|r| r.end),
+        };
+
+        // Use the is_parameter field from DWARF parsing (which is based on DW_TAG_formal_parameter)
+        let is_parameter = enhanced_var.variable.is_parameter;
+
+        info!(
+            "Variable '{}' location: {:?}, is_parameter: {} (from DWARF)",
+            enhanced_var.variable.name, enhanced_var.variable.location_expr, is_parameter
+        );
+
+        if is_parameter {
+            parameters.push(var_info);
+        } else {
+            variables.push(var_info);
+        }
+    }
+
+    // Try to find containing function
+    let function_symbol = binary_analyzer.symbol_table.find_containing_symbol(address);
+    let function_name = function_symbol.map(|s| s.name.clone());
+
+    // Get the actual source location from the address to get the complete file path
+    let actual_source_location = binary_analyzer.get_source_location(address);
+    let complete_file_path = actual_source_location
+        .as_ref()
+        .map(|sl| sl.file_path.clone())
+        .unwrap_or_else(|| file_path.to_string()); // fallback to user input if no location found
+
+    Ok(TargetDebugInfo {
+        target: target.to_string(),
+        target_type: TargetType::SourceLocation,
+        file_path: Some(complete_file_path),
+        line_number: Some(line_number),
+        function_name,
+        variables,
+        parameters,
+        address: Some(address),
     })
 }

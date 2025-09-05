@@ -29,6 +29,38 @@ pub struct SourceCodeInfo {
     pub current_line: Option<usize>,
 }
 
+/// Debug information for a target (function or source location)
+#[derive(Debug, Clone)]
+pub struct TargetDebugInfo {
+    pub target: String,
+    pub target_type: TargetType,
+    pub file_path: Option<String>,
+    pub line_number: Option<u32>,
+    pub function_name: Option<String>,
+    pub variables: Vec<VariableDebugInfo>,
+    pub parameters: Vec<VariableDebugInfo>,
+    pub address: Option<u64>,
+}
+
+/// Type of target being inspected
+#[derive(Debug, Clone)]
+pub enum TargetType {
+    Function,
+    SourceLocation,
+    Address,
+}
+
+/// Variable debug information
+#[derive(Debug, Clone)]
+pub struct VariableDebugInfo {
+    pub name: String,
+    pub type_name: String,
+    pub location_description: String,
+    pub size: Option<u64>,
+    pub scope_start: Option<u64>,
+    pub scope_end: Option<u64>,
+}
+
 /// Commands that TUI can send to runtime
 #[derive(Debug, Clone)]
 pub enum RuntimeCommand {
@@ -43,6 +75,7 @@ pub enum RuntimeCommand {
     EnableAllTraces,   // Enable all traces
     DeleteTrace(u32),  // Completely delete specific trace and all resources
     DeleteAllTraces,   // Delete all traces and resources
+    InfoTarget { target: String }, // Get debug info for a target (function or file:line)
     Shutdown,
 }
 
@@ -50,25 +83,66 @@ pub enum RuntimeCommand {
 #[derive(Debug, Clone)]
 pub enum RuntimeStatus {
     DwarfLoadingStarted,
-    DwarfLoadingCompleted { symbols_count: usize },
+    DwarfLoadingCompleted {
+        symbols_count: usize,
+    },
     DwarfLoadingFailed(String),
-    ScriptCompilationCompleted { trace_id: u32 },
-    ScriptCompilationFailed { error: String, trace_id: u32 },
-    UprobeAttached { function: String, address: u64 },
-    UprobeDetached { function: String },
+    ScriptCompilationCompleted {
+        trace_id: u32,
+    },
+    ScriptCompilationFailed {
+        error: String,
+        trace_id: u32,
+    },
+    UprobeAttached {
+        function: String,
+        address: u64,
+    },
+    UprobeDetached {
+        function: String,
+    },
     ProcessAttached(u32),
     ProcessDetached,
     SourceCodeLoaded(SourceCodeInfo),
     SourceCodeLoadFailed(String),
-    TraceEnabled { trace_id: u32 },
-    TraceDisabled { trace_id: u32 },
-    AllTracesEnabled { count: usize },
-    AllTracesDisabled { count: usize },
-    TraceEnableFailed { trace_id: u32, error: String },
-    TraceDisableFailed { trace_id: u32, error: String },
-    TraceDeleted { trace_id: u32 },
-    AllTracesDeleted { count: usize },
-    TraceDeleteFailed { trace_id: u32, error: String },
+    TraceEnabled {
+        trace_id: u32,
+    },
+    TraceDisabled {
+        trace_id: u32,
+    },
+    AllTracesEnabled {
+        count: usize,
+    },
+    AllTracesDisabled {
+        count: usize,
+    },
+    TraceEnableFailed {
+        trace_id: u32,
+        error: String,
+    },
+    TraceDisableFailed {
+        trace_id: u32,
+        error: String,
+    },
+    TraceDeleted {
+        trace_id: u32,
+    },
+    AllTracesDeleted {
+        count: usize,
+    },
+    TraceDeleteFailed {
+        trace_id: u32,
+        error: String,
+    },
+    InfoTargetResult {
+        target: String,
+        info: TargetDebugInfo,
+    },
+    InfoTargetFailed {
+        target: String,
+        error: String,
+    },
     Error(String),
 }
 

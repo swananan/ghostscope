@@ -650,6 +650,27 @@ impl TuiApp {
                     );
                 }
             }
+            CommandAction::InfoTarget { target } => {
+                info!("Getting info for target: {}", target);
+                if let Err(e) =
+                    self.event_registry
+                        .command_sender
+                        .send(RuntimeCommand::InfoTarget {
+                            target: target.clone(),
+                        })
+                {
+                    error!("Failed to send info target command: {}", e);
+                    self.interactive_command_panel.add_response(
+                        format!("✗ Failed to get info for target '{}': {}", target, e),
+                        ResponseType::Error,
+                    );
+                } else {
+                    self.interactive_command_panel.add_response(
+                        format!("⏳ Getting debug info for '{}'...", target),
+                        ResponseType::Progress,
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -879,6 +900,19 @@ impl TuiApp {
                 error!("Failed to delete trace {}: {}", trace_id, error);
             }
 
+            RuntimeStatus::InfoTargetResult { target, info } => {
+                self.interactive_command_panel.handle_command_completed();
+                let formatted_info = format_target_debug_info(target, info);
+                self.interactive_command_panel
+                    .add_response(formatted_info, ResponseType::Success);
+            }
+            RuntimeStatus::InfoTargetFailed { target, error } => {
+                self.interactive_command_panel.handle_command_completed();
+                self.interactive_command_panel.add_response(
+                    format!("✗ Failed to get debug info for '{}': {}", target, error),
+                    ResponseType::Error,
+                );
+            }
             RuntimeStatus::Error(error) => {
                 // Handle sync failure for batch operations that send generic errors
                 self.interactive_command_panel.handle_command_failed(error);
@@ -941,4 +975,99 @@ impl TuiApp {
             self.focused_panel == FocusedPanel::InteractiveCommand,
         );
     }
+}
+
+/// Format target debug info for display
+fn format_target_debug_info(target: &str, info: &crate::events::TargetDebugInfo) -> String {
+    use crate::events::TargetType;
+
+    let mut result = String::new();
+
+    // Header with icon
+    match info.target_type {
+        TargetType::Function => {
+            result.push_str(&format!("🔧 Function Debug Info: '{}'\n", target));
+        }
+        TargetType::SourceLocation => {
+            result.push_str(&format!("📍 Source Location: '{}'\n", target));
+        }
+        TargetType::Address => {
+            result.push_str(&format!("🎯 Address Debug Info: '{}'\n", target));
+        }
+    }
+
+    // Location info section
+    result.push_str("\n📂 Location:\n");
+    if let Some(ref file_path) = info.file_path {
+        result.push_str(&format!("   File: {}\n", file_path));
+    }
+    if let Some(line_number) = info.line_number {
+        result.push_str(&format!("   Line: {}\n", line_number));
+    }
+    if let Some(ref func_name) = info.function_name {
+        result.push_str(&format!("   Function: {}\n", func_name));
+    }
+    if let Some(address) = info.address {
+        result.push_str(&format!("   Address: 0x{:x}\n", address));
+    }
+
+    // Parameters section
+    if !info.parameters.is_empty() {
+        result.push_str("\n📥 Parameters:\n");
+        for (i, param) in info.parameters.iter().enumerate() {
+            let prefix = if i == info.parameters.len() - 1 {
+                "   └─"
+            } else {
+                "   ├─"
+            };
+            result.push_str(&format!("{} {} {}", prefix, param.name, param.type_name));
+
+            // Add location and size info in a compact format
+            let mut details = Vec::new();
+            if !param.location_description.is_empty() && param.location_description != "None" {
+                details.push(format!("loc: {}", param.location_description));
+            }
+            if let Some(size) = param.size {
+                details.push(format!("{} bytes", size));
+            }
+
+            if !details.is_empty() {
+                result.push_str(&format!(" ({})", details.join(", ")));
+            }
+            result.push('\n');
+        }
+    }
+
+    // Variables section
+    if !info.variables.is_empty() {
+        result.push_str("\n📦 Local Variables:\n");
+        for (i, var) in info.variables.iter().enumerate() {
+            let prefix = if i == info.variables.len() - 1 {
+                "   └─"
+            } else {
+                "   ├─"
+            };
+            result.push_str(&format!("{} {} {}", prefix, var.name, var.type_name));
+
+            // Add location and size info in a compact format
+            let mut details = Vec::new();
+            if !var.location_description.is_empty() && var.location_description != "None" {
+                details.push(format!("loc: {}", var.location_description));
+            }
+            if let Some(size) = var.size {
+                details.push(format!("{} bytes", size));
+            }
+
+            if !details.is_empty() {
+                result.push_str(&format!(" ({})", details.join(", ")));
+            }
+            result.push('\n');
+        }
+    }
+
+    if info.parameters.is_empty() && info.variables.is_empty() {
+        result.push_str("\n❌ No variables or parameters found in scope\n");
+    }
+
+    result
 }
