@@ -498,8 +498,8 @@ async fn handle_function_target(
 
     // Get enhanced variables at the function entry point using NewScopedVariableSystem
     let enhanced_vars = if let Some(dwarf_context) = binary_analyzer.dwarf_context_mut() {
-        info!("Using NewScopedVariableSystem for function analysis");
-        dwarf_context.get_enhanced_variable_locations_scoped(symbol_address)
+        info!("Using scoped variable system for function analysis");
+        dwarf_context.get_enhanced_variable_locations(symbol_address)
     } else {
         Vec::new()
     };
@@ -581,8 +581,8 @@ async fn handle_source_location_target(
 
     // Get enhanced variables at this location using NewScopedVariableSystem
     let enhanced_vars = if let Some(dwarf_context) = binary_analyzer.dwarf_context_mut() {
-        info!("Using NewScopedVariableSystem for source location analysis");
-        dwarf_context.get_enhanced_variable_locations_scoped(address)
+        info!("Using scoped variable system for source location analysis");
+        dwarf_context.get_enhanced_variable_locations(address)
     } else {
         Vec::new()
     };

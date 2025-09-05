@@ -80,9 +80,7 @@ pub struct DwarfContext {
     // Enhanced file information management for fast queries
     file_registry: Option<FileInfoRegistry>,
 
-    // Variable location mapping for efficient lookups
-    variable_map: Option<VariableLocationMap>,
-    // New scoped variable system (GDB-inspired)
+    // Scoped variable system (GDB-inspired)
     scoped_variable_map: Option<ScopedVariableMap>,
 }
 
@@ -1058,7 +1056,6 @@ impl DwarfContext {
             debug_frame,
             cfi_table: None,
             line_index: None,
-            variable_map: None,
             file_registry: None,
             scoped_variable_map: None,
         };
@@ -1069,10 +1066,7 @@ impl DwarfContext {
         // Build line number index for fast source line lookups
         context.build_line_index()?;
 
-        // Build variable location map for efficient variable queries
-        context.variable_map = Some(context.build_variable_location_map());
-
-        // Build new scoped variable system (experimental)
+        // Build scoped variable system
         info!("Building scoped variable system...");
         context.scoped_variable_map = Some(context.build_scoped_variable_map()?);
 
@@ -1218,61 +1212,33 @@ impl DwarfContext {
         mappings
     }
 
-    /// Get all variables visible at a given address (unified interface - uses variable map only)
-    pub fn get_variables_at_address(&mut self, addr: u64) -> Vec<Variable> {
-        debug!("Looking up variables at address: 0x{:x}", addr);
-
-        // Use variable map exclusively - no fallback
-        if let Some(ref mut var_map) = self.variable_map {
-            let enhanced_vars = var_map.get_variables_at_address(addr);
-            return enhanced_vars
-                .into_iter()
-                .map(|ev| Variable {
-                    name: ev.variable.name,
-                    type_name: ev.variable.type_name,
-                    dwarf_type: ev.variable.dwarf_type,
-                    location_expr: ev.variable.location_expr,
-                    scope_ranges: ev.variable.scope_ranges.clone(),
-                    is_parameter: ev.variable.is_parameter,
-                    is_artificial: ev.variable.is_artificial,
-                    // Legacy fields for backward compatibility
-                    location: None,
-                    scope_start: ev.variable.scope_ranges.first().map(|r| r.start),
-                    scope_end: ev.variable.scope_ranges.first().map(|r| r.end),
-                })
-                .collect();
-        }
-
-        // If no variable map is built, return empty - no fallback
-        debug!("No variable map available, returning empty result");
-        Vec::new()
-    }
-
     /// Get detailed variable location information
     pub fn get_variable_location(&mut self, addr: u64, var_name: &str) -> Option<VariableLocation> {
-        let variables = self.get_variables_at_address(addr);
+        let enhanced_vars = self.get_enhanced_variable_locations(addr);
 
-        for var in variables {
-            if var.name == var_name {
-                return self.parse_variable_location(&var);
+        for enhanced_var in enhanced_vars {
+            if enhanced_var.variable.name == var_name {
+                return self.parse_variable_location(&enhanced_var.variable);
             }
         }
 
         None
     }
 
-    /// Get enhanced variable location information using the new scoped system
-    pub fn get_enhanced_variable_locations_scoped(
-        &mut self,
-        addr: u64,
-    ) -> Vec<EnhancedVariableLocation> {
+    /// Get enhanced variable location information at a specific address
+    pub fn get_enhanced_variable_locations(&mut self, addr: u64) -> Vec<EnhancedVariableLocation> {
+        debug!(
+            "Getting enhanced variable locations at address: 0x{:x}",
+            addr
+        );
+
         if let Some(ref mut scoped_map) = self.scoped_variable_map {
-            debug!("Using new scoped variable system for address 0x{:x}", addr);
+            debug!("Using scoped variable system for address 0x{:x}", addr);
 
             // Get statistics first to debug
             let stats = scoped_map.get_statistics();
             debug!(
-                "Scoped variable system stats: {} variables, {} scopes, {} address entries",
+                "Scoped system stats: {} variables, {} scopes, {} address entries",
                 stats.total_variables, stats.total_scopes, stats.total_address_entries
             );
 
@@ -1283,7 +1249,7 @@ impl DwarfContext {
                 addr
             );
 
-            return results
+            results
                 .into_iter()
                 .map(|result| {
                     EnhancedVariableLocation {
@@ -1306,52 +1272,11 @@ impl DwarfContext {
                         is_optimized_out: result.is_optimized_out,
                     }
                 })
-                .collect();
+                .collect()
         } else {
-            debug!("Scoped variable system not available, falling back to old system");
-            self.get_enhanced_variable_locations(addr)
+            debug!("Scoped variable system not available");
+            Vec::new()
         }
-    }
-
-    /// Get enhanced variable location information at a specific address (legacy system)
-    pub fn get_enhanced_variable_locations(&mut self, addr: u64) -> Vec<EnhancedVariableLocation> {
-        debug!(
-            "Getting enhanced variable locations at address: 0x{:x}",
-            addr
-        );
-
-        let variables = self.get_variables_at_address(addr);
-        let mut enhanced_locations = Vec::new();
-
-        for var in variables {
-            let base_location_expr = var
-                .location_expr
-                .clone()
-                .unwrap_or(LocationExpression::OptimizedOut);
-
-            // Resolve location expression for the specific PC address
-            // This handles location lists by finding the correct entry for this PC
-            let resolved_location_expr = base_location_expr.resolve_at_pc(addr).clone();
-
-            let size = self.get_variable_size(&var);
-            let is_optimized_out =
-                matches!(resolved_location_expr, LocationExpression::OptimizedOut);
-
-            enhanced_locations.push(EnhancedVariableLocation {
-                variable: var,
-                location_at_address: resolved_location_expr,
-                address: addr,
-                size,
-                is_optimized_out,
-            });
-        }
-
-        debug!(
-            "Found {} enhanced variable locations at 0x{:x}",
-            enhanced_locations.len(),
-            addr
-        );
-        enhanced_locations
     }
 
     /// Build high-performance line number index (inspired by addr2line)

@@ -687,7 +687,10 @@ pub fn compile_ast_to_uprobe_configs(
                     if !line_mappings.is_empty() {
                         // Use the first address to find variables in scope
                         let target_addr = line_mappings[0].address;
-                        let variables = dwarf_context.get_variables_at_address(target_addr);
+                        let enhanced_variables =
+                            dwarf_context.get_enhanced_variable_locations(target_addr);
+                        let variables: Vec<_> =
+                            enhanced_variables.iter().map(|ev| &ev.variable).collect();
 
                         info!(
                             "Found {} variables in scope at {}:{} (address 0x{:x})",
@@ -703,7 +706,7 @@ pub fn compile_ast_to_uprobe_configs(
                                 "  Adding variable '{}' of type '{}' to scope",
                                 var.name, var.type_name
                             );
-                            var_context.add_variable(var.name);
+                            var_context.add_variable(var.name.clone());
                         }
                     } else {
                         error!(
