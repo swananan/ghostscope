@@ -179,10 +179,10 @@ async fn run_runtime_coordinator(
                                 &script,
                                 trace_id,
                                 session,
-                                &runtime_channels.status_sender
                             ).await {
                                 Ok(_) => {
                                     info!("Script with trace_id {} compiled and loaded successfully", trace_id);
+                                    let _ = runtime_channels.status_sender.send(RuntimeStatus::ScriptCompilationCompleted { trace_id });
                                 }
                                 Err(e) => {
                                     let _target = crate::script_compiler::extract_target_from_script(&script);

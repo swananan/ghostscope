@@ -1,8 +1,7 @@
 use crate::session::GhostSession;
 use anyhow::Result;
 use ghostscope_loader::GhostScopeLoader;
-use std::path::Path;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 /// Compile and load script specifically for TUI mode with strict all-or-nothing success
 /// This function ensures that ALL uprobe configurations must succeed for the operation to be considered successful
@@ -10,22 +9,12 @@ pub async fn compile_and_load_script_for_tui(
     script: &str,
     trace_id: u32,
     session: &mut GhostSession,
-    status_sender: &tokio::sync::mpsc::UnboundedSender<ghostscope_ui::RuntimeStatus>,
 ) -> Result<()> {
-    use ghostscope_ui::RuntimeStatus;
-
     // Step 1: Validate binary analyzer availability
-    let binary_analyzer = match session.binary_analyzer.as_mut() {
-        Some(analyzer) => analyzer,
-        None => {
-            let error = "Binary analyzer is required for script compilation".to_string();
-            let _ = status_sender.send(RuntimeStatus::ScriptCompilationFailed {
-                error: error.clone(),
-                trace_id,
-            });
-            return Err(anyhow::anyhow!(error));
-        }
-    };
+    let binary_analyzer = session
+        .binary_analyzer
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("Binary analyzer is required for script compilation"))?;
 
     // Step 2: Configure save options (no file saving in TUI mode)
     let binary_path_hint = binary_analyzer
@@ -43,23 +32,14 @@ pub async fn compile_and_load_script_for_tui(
     };
 
     // Step 3: Use unified compilation interface
-    let compilation_result = match ghostscope_compiler::compile_script_to_uprobe_configs(
+    let compilation_result = ghostscope_compiler::compile_script_to_uprobe_configs(
         script,
         binary_analyzer,
         session.target_pid,
         Some(trace_id),
         &save_options,
-    ) {
-        Ok(result) => result,
-        Err(e) => {
-            let error = format!("Script compilation failed: {}", e);
-            let _ = status_sender.send(RuntimeStatus::ScriptCompilationFailed {
-                error: error.clone(),
-                trace_id,
-            });
-            return Err(anyhow::anyhow!(error));
-        }
-    };
+    )
+    .map_err(|e| anyhow::anyhow!("Script compilation failed: {}", e))?;
 
     info!(
         "Script compilation successful: {} trace points found, {} uprobe configs generated, target: {}",
@@ -69,12 +49,9 @@ pub async fn compile_and_load_script_for_tui(
     );
 
     if compilation_result.uprobe_configs.is_empty() {
-        let error = "No valid uprobe configurations generated from script".to_string();
-        let _ = status_sender.send(RuntimeStatus::ScriptCompilationFailed {
-            error: error.clone(),
-            trace_id,
-        });
-        return Err(anyhow::anyhow!(error));
+        return Err(anyhow::anyhow!(
+            "No valid uprobe configurations generated from script"
+        ));
     }
 
     // Step 4: Get binary path for trace instances
@@ -105,10 +82,6 @@ pub async fn compile_and_load_script_for_tui(
                 for &trace_id in &successful_trace_ids {
                     let _ = session.trace_manager.remove_trace(trace_id).await;
                 }
-                let _ = status_sender.send(RuntimeStatus::ScriptCompilationFailed {
-                    error: error.clone(),
-                    trace_id,
-                });
                 return Err(anyhow::anyhow!(error));
             }
         };
@@ -131,10 +104,6 @@ pub async fn compile_and_load_script_for_tui(
                 for &trace_id in &successful_trace_ids {
                     let _ = session.trace_manager.remove_trace(trace_id).await;
                 }
-                let _ = status_sender.send(RuntimeStatus::ScriptCompilationFailed {
-                    error: error.clone(),
-                    trace_id,
-                });
                 return Err(anyhow::anyhow!(error));
             }
         };
@@ -164,22 +133,10 @@ pub async fn compile_and_load_script_for_tui(
             for &trace_id in &successful_trace_ids {
                 let _ = session.trace_manager.remove_trace(trace_id).await;
             }
-            let _ = status_sender.send(RuntimeStatus::ScriptCompilationFailed {
-                error: error.clone(),
-                trace_id,
-            });
             return Err(anyhow::anyhow!(error));
         }
 
         successful_trace_ids.push(actual_trace_id);
-
-        // Send uprobe attached status for UI only after successful activation
-        if let Some(address) = config.function_address {
-            let _ = status_sender.send(RuntimeStatus::UprobeAttached {
-                function: target_display.clone(),
-                address,
-            });
-        }
 
         info!(
             "Successfully activated trace {} for target '{}'",
@@ -189,7 +146,6 @@ pub async fn compile_and_load_script_for_tui(
 
     // Step 9: Verify ALL uprobe configurations were processed successfully
     if successful_trace_ids.len() == expected_trace_count {
-        let _ = status_sender.send(RuntimeStatus::ScriptCompilationCompleted { trace_id });
         info!(
             "Script compilation and loading completed successfully: ALL {} uprobe configurations attached",
             expected_trace_count
@@ -205,10 +161,6 @@ pub async fn compile_and_load_script_for_tui(
         for &trace_id in &successful_trace_ids {
             let _ = session.trace_manager.remove_trace(trace_id).await;
         }
-        let _ = status_sender.send(RuntimeStatus::ScriptCompilationFailed {
-            error: error.clone(),
-            trace_id,
-        });
         Err(anyhow::anyhow!(error))
     }
 }
@@ -240,20 +192,6 @@ pub fn extract_target_from_script(script: &str) -> String {
         }
     }
     "unknown".to_string()
-}
-
-/// Parse and validate script (reuse existing logic)
-fn parse_and_validate_script(script: &str) -> Result<ghostscope_compiler::ast::Program> {
-    match ghostscope_compiler::parser::parse(script) {
-        Ok(parsed) => {
-            info!("Script parsing completed successfully");
-            Ok(parsed)
-        }
-        Err(e) => {
-            error!("Script parsing failed: {}", e);
-            Err(anyhow::anyhow!("Script parsing failed: {}", e))
-        }
-    }
 }
 
 /// Compile and load script for command line mode using session.command_loaders
