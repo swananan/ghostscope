@@ -306,6 +306,12 @@ impl TuiApp {
                     self.cycle_focus();
                 }
             }
+            KeyCode::BackTab => {
+                // Shift+Tab: reverse cycle focus between panels
+                // In Script Editor mode, we still allow reverse cycling for navigation
+                debug!("Shift+Tab pressed, reverse cycling focus");
+                self.cycle_focus_reverse();
+            }
             _ => {
                 self.handle_panel_input(key).await?;
             }
@@ -950,6 +956,15 @@ impl TuiApp {
             FocusedPanel::Source => FocusedPanel::EbpfInfo,
             FocusedPanel::EbpfInfo => FocusedPanel::InteractiveCommand,
             FocusedPanel::InteractiveCommand => FocusedPanel::Source,
+        };
+    }
+
+    fn cycle_focus_reverse(&mut self) {
+        // Shift+Tab navigation follows reverse order: Input -> Output -> Source
+        self.focused_panel = match self.focused_panel {
+            FocusedPanel::Source => FocusedPanel::InteractiveCommand,
+            FocusedPanel::EbpfInfo => FocusedPanel::Source,
+            FocusedPanel::InteractiveCommand => FocusedPanel::EbpfInfo,
         };
     }
 
