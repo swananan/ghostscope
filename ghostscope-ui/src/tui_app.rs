@@ -35,6 +35,7 @@ pub struct TuiApp {
     layout_mode: LayoutMode,
     focused_panel: FocusedPanel,
     expecting_window_nav: bool,
+    is_fullscreen: bool,
 
     // Ctrl+w timeout mechanism
     ctrl_w_timeout: Option<std::time::Instant>,
@@ -66,6 +67,7 @@ impl TuiApp {
             layout_mode,
             focused_panel: FocusedPanel::InteractiveCommand,
             expecting_window_nav: false,
+            is_fullscreen: false,
             ctrl_w_timeout: None,
             event_registry,
         })
@@ -234,6 +236,14 @@ impl TuiApp {
                     // Switch layout mode
                     self.switch_layout();
                     debug!("Switched layout to {:?}", self.layout_mode);
+                    self.expecting_window_nav = false;
+                    self.ctrl_w_timeout = None; // Clear timeout
+                    return Ok(false);
+                }
+                KeyCode::Char('z') => {
+                    // Toggle fullscreen mode for current panel
+                    self.toggle_fullscreen();
+                    debug!("Toggled fullscreen mode for {:?}", self.focused_panel);
                     self.expecting_window_nav = false;
                     self.ctrl_w_timeout = None; // Clear timeout
                     return Ok(false);
@@ -951,6 +961,12 @@ impl TuiApp {
     }
 
     fn cycle_focus(&mut self) {
+        // Exit fullscreen mode when switching panels
+        if self.is_fullscreen {
+            self.is_fullscreen = false;
+            debug!("Exited fullscreen mode due to panel switch");
+        }
+
         // Tab navigation follows same order as visual layout: Source -> Output -> Input
         self.focused_panel = match self.focused_panel {
             FocusedPanel::Source => FocusedPanel::EbpfInfo,
@@ -960,6 +976,12 @@ impl TuiApp {
     }
 
     fn cycle_focus_reverse(&mut self) {
+        // Exit fullscreen mode when switching panels
+        if self.is_fullscreen {
+            self.is_fullscreen = false;
+            debug!("Exited fullscreen mode due to panel switch");
+        }
+
         // Shift+Tab navigation follows reverse order: Input -> Output -> Source
         self.focused_panel = match self.focused_panel {
             FocusedPanel::Source => FocusedPanel::InteractiveCommand,
@@ -975,7 +997,18 @@ impl TuiApp {
         };
     }
 
+    fn toggle_fullscreen(&mut self) {
+        self.is_fullscreen = !self.is_fullscreen;
+        debug!("Toggled fullscreen mode: {}", self.is_fullscreen);
+    }
+
     fn move_focus(&mut self, direction: &str) {
+        // Exit fullscreen mode when switching panels
+        if self.is_fullscreen {
+            self.is_fullscreen = false;
+            debug!("Exited fullscreen mode due to panel switch");
+        }
+
         match self.layout_mode {
             LayoutMode::Horizontal => match direction {
                 "left" => {
@@ -1161,42 +1194,58 @@ impl TuiApp {
     fn render(&mut self, frame: &mut ratatui::Frame) {
         let size = frame.area();
 
-        let chunks = match self.layout_mode {
-            LayoutMode::Horizontal => {
-                Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([
-                        Constraint::Ratio(4, 10), // Source code panel - 40%
-                        Constraint::Ratio(3, 10), // eBPF output panel - 30%
-                        Constraint::Ratio(3, 10), // Interactive command panel - 30%
-                    ])
-                    .split(size)
+        if self.is_fullscreen {
+            // In fullscreen mode, give the focused panel the entire screen
+            match self.focused_panel {
+                FocusedPanel::Source => {
+                    self.source_panel.render(frame, size, true);
+                }
+                FocusedPanel::EbpfInfo => {
+                    self.ebpf_info_panel.render(frame, size, true);
+                }
+                FocusedPanel::InteractiveCommand => {
+                    self.interactive_command_panel.render(frame, size, true);
+                }
             }
-            LayoutMode::Vertical => {
-                Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Ratio(4, 10), // Source code panel - 40%
-                        Constraint::Ratio(3, 10), // eBPF output panel - 30%
-                        Constraint::Ratio(3, 10), // Interactive command panel - 30%
-                    ])
-                    .split(size)
-            }
-        };
+        } else {
+            // Normal multi-panel layout
+            let chunks = match self.layout_mode {
+                LayoutMode::Horizontal => {
+                    Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([
+                            Constraint::Ratio(4, 10), // Source code panel - 40%
+                            Constraint::Ratio(3, 10), // eBPF output panel - 30%
+                            Constraint::Ratio(3, 10), // Interactive command panel - 30%
+                        ])
+                        .split(size)
+                }
+                LayoutMode::Vertical => {
+                    Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Ratio(4, 10), // Source code panel - 40%
+                            Constraint::Ratio(3, 10), // eBPF output panel - 30%
+                            Constraint::Ratio(3, 10), // Interactive command panel - 30%
+                        ])
+                        .split(size)
+                }
+            };
 
-        // Render panels with focus indication
-        self.source_panel
-            .render(frame, chunks[0], self.focused_panel == FocusedPanel::Source);
-        self.ebpf_info_panel.render(
-            frame,
-            chunks[1],
-            self.focused_panel == FocusedPanel::EbpfInfo,
-        );
-        self.interactive_command_panel.render(
-            frame,
-            chunks[2],
-            self.focused_panel == FocusedPanel::InteractiveCommand,
-        );
+            // Render panels with focus indication
+            self.source_panel
+                .render(frame, chunks[0], self.focused_panel == FocusedPanel::Source);
+            self.ebpf_info_panel.render(
+                frame,
+                chunks[1],
+                self.focused_panel == FocusedPanel::EbpfInfo,
+            );
+            self.interactive_command_panel.render(
+                frame,
+                chunks[2],
+                self.focused_panel == FocusedPanel::InteractiveCommand,
+            );
+        }
     }
 }
 
