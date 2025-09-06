@@ -2,6 +2,7 @@ use anyhow::Result;
 use futures::future;
 use ghostscope_loader::GhostScopeLoader;
 use std::collections::HashMap;
+use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
 /// Individual trace instance with associated eBPF loader
@@ -130,6 +131,7 @@ pub struct TraceManager {
     traces: HashMap<u32, TraceInstance>,
     next_trace_id: u32,
     target_to_trace_id: HashMap<String, u32>, // Map target name to trace_id
+    no_trace_wait_notify: Notify,             // Notify when first trace is successfully enabled
 }
 
 impl TraceManager {
@@ -138,6 +140,7 @@ impl TraceManager {
             traces: HashMap::new(),
             next_trace_id: 0,
             target_to_trace_id: HashMap::new(),
+            no_trace_wait_notify: Notify::new(),
         }
     }
 
@@ -302,6 +305,9 @@ impl TraceManager {
                     warn!("Error waiting for events from trace {}: {}", trace_id, e);
                 }
             }
+        } else {
+            // No active traces, wait for the first trace to be successfully enabled
+            self.no_trace_wait_notify.notified().await;
         }
 
         all_events
@@ -319,8 +325,18 @@ impl TraceManager {
 
     /// Enable a specific trace by ID
     pub async fn enable_trace(&mut self, trace_id: u32) -> Result<()> {
+        // Check if this is the first trace being enabled (from 0 to 1)
+        let was_no_active_traces = self.active_trace_count() == 0;
+
         if let Some(trace) = self.traces.get_mut(&trace_id) {
-            trace.enable().await
+            trace.enable().await?;
+
+            // If this was the first trace being enabled, notify waiters
+            if was_no_active_traces && self.active_trace_count() == 1 {
+                self.no_trace_wait_notify.notify_waiters();
+            }
+
+            Ok(())
         } else {
             Err(anyhow::anyhow!("Trace {} not found", trace_id))
         }
