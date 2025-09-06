@@ -583,14 +583,26 @@ impl TuiApp {
             },
             FocusedPanel::EbpfInfo => match key.code {
                 KeyCode::Up | KeyCode::Char('k') => {
-                    self.ebpf_info_panel.scroll_up();
+                    self.ebpf_info_panel.move_cursor_up();
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    self.ebpf_info_panel.scroll_down();
+                    self.ebpf_info_panel.move_cursor_down();
+                }
+                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.ebpf_info_panel.move_cursor_down_10();
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.ebpf_info_panel.move_cursor_up_10();
+                }
+                KeyCode::Esc => {
+                    self.ebpf_info_panel.hide_cursor();
                 }
                 KeyCode::Home | KeyCode::Char('g') => {
                     self.ebpf_info_panel.scroll_offset = 0;
                     self.ebpf_info_panel.auto_scroll = false;
+                    self.ebpf_info_panel.show_cursor = false;
+                    self.ebpf_info_panel.cursor_trace_index = 0;
+                    self.ebpf_info_panel.display_mode = crate::panels::DisplayMode::AutoRefresh;
                 }
                 KeyCode::End | KeyCode::Char('G') => {
                     self.ebpf_info_panel.scroll_to_bottom();
@@ -600,46 +612,28 @@ impl TuiApp {
             FocusedPanel::Source => {
                 match key.code {
                     KeyCode::Up | KeyCode::Char('k') => {
-                        self.source_panel.clear_number_buffer(); // Clear any pending number input
                         self.source_panel.move_up();
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        self.source_panel.clear_number_buffer(); // Clear any pending number input
                         self.source_panel.move_down();
                     }
                     KeyCode::Left | KeyCode::Char('h') => {
-                        self.source_panel.clear_number_buffer(); // Clear any pending number input
                         self.source_panel.move_left();
                     }
                     KeyCode::Right | KeyCode::Char('l') => {
-                        self.source_panel.clear_number_buffer(); // Clear any pending number input
                         self.source_panel.move_right();
                     }
                     KeyCode::Char('g') => {
-                        // Handle vim-style number + g navigation and gg combination
-                        self.source_panel.handle_g_key();
+                        self.source_panel.move_to_top();
                     }
                     KeyCode::Char('G') => {
-                        // Handle vim-style number + G navigation
-                        self.source_panel.handle_uppercase_g_key();
+                        self.source_panel.move_to_bottom();
                     }
-                    KeyCode::Esc => {
-                        // ESC key cancels any pending number input
-                        self.source_panel.clear_number_buffer();
-                    }
-                    KeyCode::Char(c) if c.is_ascii_digit() => {
-                        // Handle number input for vim-style navigation
-                        self.source_panel.handle_number_input(c);
-                    }
-                    _ => {
-                        // Any other key clears the number buffer
-                        self.source_panel.clear_number_buffer();
-                    }
+                    _ => {}
                 }
 
                 // Handle Ctrl+key combinations
                 if key.modifiers.contains(KeyModifiers::CONTROL) {
-                    self.source_panel.clear_number_buffer(); // Clear any pending number input
                     match key.code {
                         KeyCode::Char('d') => {
                             self.source_panel.move_down_fast();
