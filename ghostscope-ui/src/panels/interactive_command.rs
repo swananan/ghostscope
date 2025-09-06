@@ -1178,6 +1178,38 @@ impl InteractiveCommandPanel {
         }
     }
 
+    /// Insert tab (4 spaces) in script (Ctrl+i)
+    pub fn insert_tab_in_script(&mut self) {
+        debug!("insert_tab_in_script called");
+        if let Some(ref mut cache) = self.script_cache {
+            debug!(
+                "Script cache found, cursor_line: {}, cursor_col: {}",
+                cache.cursor_line, cache.cursor_col
+            );
+            if cache.cursor_line < cache.lines.len() {
+                // Insert 4 spaces at cursor position
+                let spaces = "    "; // 4 spaces
+                cache.lines[cache.cursor_line].insert_str(cache.cursor_col, spaces);
+                cache.cursor_col += 4;
+                cache.status = ScriptStatus::Draft;
+                debug!(
+                    "Inserted 4 spaces at position {}, new cursor_col: {}",
+                    cache.cursor_col - 4,
+                    cache.cursor_col
+                );
+            } else if cache.cursor_line == cache.lines.len() {
+                // Cursor is after last line, create a new line with 4 spaces
+                cache.lines.push("    ".to_string());
+                cache.cursor_line += 1;
+                cache.cursor_col = 4;
+                cache.status = ScriptStatus::Draft;
+                debug!("Created new line with 4 spaces");
+            }
+        } else {
+            debug!("No script cache found");
+        }
+    }
+
     /// Check if we can edit again (F2 key)
     pub fn can_edit_script(&self) -> bool {
         if let Some(ref cache) = self.script_cache {

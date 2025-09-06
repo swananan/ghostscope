@@ -230,13 +230,42 @@ impl TuiApp {
                     .send(RuntimeCommand::Shutdown);
                 return Ok(true);
             }
-            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                // Set expectation for next j/k key
-                self.expecting_window_nav = true;
-                debug!("Expecting window navigation key (j/k)");
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Handle Ctrl+w based on current focus and mode
+                if self.focused_panel == FocusedPanel::InteractiveCommand {
+                    // In Interactive Command panel, Ctrl+w is for text editing
+                    match self.interactive_command_panel.mode {
+                        crate::panels::InteractionMode::Input => {
+                            self.interactive_command_panel.delete_previous_word();
+                        }
+                        crate::panels::InteractionMode::ScriptEditor => {
+                            self.interactive_command_panel
+                                .delete_previous_word_in_script();
+                        }
+                        _ => {
+                            // In command mode, use for window navigation
+                            self.expecting_window_nav = true;
+                            debug!("Expecting window navigation key (j/k)");
+                        }
+                    }
+                } else {
+                    // In other panels, use for window navigation
+                    self.expecting_window_nav = true;
+                    debug!("Expecting window navigation key (j/k)");
+                }
             }
             KeyCode::Tab => {
-                self.cycle_focus();
+                // In Script Editor mode, Tab should insert 4 spaces instead of cycling focus
+                if self.focused_panel == FocusedPanel::InteractiveCommand
+                    && self.interactive_command_panel.mode
+                        == crate::panels::InteractionMode::ScriptEditor
+                {
+                    debug!("Tab pressed in Script Editor mode, inserting 4 spaces");
+                    self.interactive_command_panel.insert_tab_in_script();
+                } else {
+                    // Normal Tab behavior: cycle focus between panels
+                    self.cycle_focus();
+                }
             }
             _ => {
                 self.handle_panel_input(key).await?;
@@ -351,17 +380,19 @@ impl TuiApp {
                                     _ => {} // Ignore in command mode
                                 }
                             }
-                            'w' => {
-                                // Delete previous word
-                                match self.interactive_command_panel.mode {
-                                    crate::panels::InteractionMode::Input => {
-                                        self.interactive_command_panel.delete_previous_word();
-                                    }
-                                    crate::panels::InteractionMode::ScriptEditor => {
-                                        self.interactive_command_panel
-                                            .delete_previous_word_in_script();
-                                    }
-                                    _ => {} // Ignore in command mode
+                            'i' => {
+                                // Insert tab (4 spaces) - only in Script Editor mode
+                                debug!(
+                                    "Ctrl+i pressed, mode: {:?}",
+                                    self.interactive_command_panel.mode
+                                );
+                                if self.interactive_command_panel.mode
+                                    == crate::panels::InteractionMode::ScriptEditor
+                                {
+                                    debug!("Inserting tab in script editor");
+                                    self.interactive_command_panel.insert_tab_in_script();
+                                } else {
+                                    debug!("Not in script editor mode, ignoring Ctrl+i");
                                 }
                             }
                             _ => {
