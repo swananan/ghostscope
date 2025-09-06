@@ -212,7 +212,6 @@ impl TuiApp {
                     self.toggle_fullscreen();
                     debug!("Toggled fullscreen mode for {:?}", self.focused_panel);
                     self.expecting_window_nav = false;
-                    self.ctrl_w_timeout = None; // Clear timeout
                     return Ok(false);
                 }
                 _ => {
