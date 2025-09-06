@@ -356,6 +356,83 @@ impl InteractiveCommandPanel {
         }
     }
 
+    // ===== Readline/Emacs-style keyboard shortcuts =====
+
+    /// Move cursor to beginning of line (Ctrl+a)
+    pub fn move_to_beginning(&mut self) {
+        // Don't accept input when waiting for response
+        if !self.should_show_input_prompt() {
+            return;
+        }
+        self.cursor_position = 0;
+        self.update_static_lines();
+    }
+
+    /// Move cursor to end of line (Ctrl+e)
+    pub fn move_to_end(&mut self) {
+        // Don't accept input when waiting for response
+        if !self.should_show_input_prompt() {
+            return;
+        }
+        self.cursor_position = self.input_text.len();
+        self.update_static_lines();
+    }
+
+    /// Delete from cursor to end of line (Ctrl+k)
+    pub fn delete_to_end(&mut self) {
+        // Don't accept input when waiting for response
+        if !self.should_show_input_prompt() {
+            return;
+        }
+        if self.cursor_position < self.input_text.len() {
+            self.input_text.truncate(self.cursor_position);
+            self.update_static_lines();
+        }
+    }
+
+    /// Delete from cursor to beginning of line (Ctrl+u)
+    pub fn delete_to_beginning(&mut self) {
+        // Don't accept input when waiting for response
+        if !self.should_show_input_prompt() {
+            return;
+        }
+        if self.cursor_position > 0 {
+            self.input_text = self.input_text[self.cursor_position..].to_string();
+            self.cursor_position = 0;
+            self.update_static_lines();
+        }
+    }
+
+    /// Delete previous word (Ctrl+w)
+    pub fn delete_previous_word(&mut self) {
+        // Don't accept input when waiting for response
+        if !self.should_show_input_prompt() {
+            return;
+        }
+        if self.cursor_position == 0 {
+            return;
+        }
+
+        let text = &self.input_text;
+        let mut pos = self.cursor_position;
+
+        // Skip whitespace backwards
+        while pos > 0 && text.chars().nth(pos - 1).unwrap_or(' ').is_whitespace() {
+            pos -= 1;
+        }
+
+        // Skip current word backwards
+        while pos > 0 && !text.chars().nth(pos - 1).unwrap_or(' ').is_whitespace() {
+            pos -= 1;
+        }
+
+        if pos < self.cursor_position {
+            self.input_text = format!("{}{}", &text[..pos], &text[self.cursor_position..]);
+            self.cursor_position = pos;
+            self.update_static_lines();
+        }
+    }
+
     /// Handle built-in commands and return response if handled
     /// Returns Some(response) for locally handled commands, None for commands that need external processing
     fn handle_builtin_command(&self, command: &str) -> Option<String> {
@@ -1024,6 +1101,79 @@ impl InteractiveCommandPanel {
                 && cache.cursor_col < cache.lines[cache.cursor_line].len()
             {
                 cache.cursor_col += 1;
+            }
+        }
+    }
+
+    // ===== Readline/Emacs-style keyboard shortcuts for Script Editor =====
+
+    /// Move cursor to beginning of current line in script (Ctrl+a)
+    pub fn move_to_beginning_in_script(&mut self) {
+        if let Some(ref mut cache) = self.script_cache {
+            cache.cursor_col = 0;
+            cache.status = ScriptStatus::Draft;
+        }
+    }
+
+    /// Move cursor to end of current line in script (Ctrl+e)
+    pub fn move_to_end_in_script(&mut self) {
+        if let Some(ref mut cache) = self.script_cache {
+            if cache.cursor_line < cache.lines.len() {
+                cache.cursor_col = cache.lines[cache.cursor_line].len();
+            } else {
+                cache.cursor_col = 0;
+            }
+            cache.status = ScriptStatus::Draft;
+        }
+    }
+
+    /// Delete from cursor to end of current line in script (Ctrl+k)
+    pub fn delete_to_end_in_script(&mut self) {
+        if let Some(ref mut cache) = self.script_cache {
+            if cache.cursor_line < cache.lines.len() {
+                cache.lines[cache.cursor_line].truncate(cache.cursor_col);
+                cache.status = ScriptStatus::Draft;
+            }
+        }
+    }
+
+    /// Delete from cursor to beginning of current line in script (Ctrl+u)
+    pub fn delete_to_beginning_in_script(&mut self) {
+        if let Some(ref mut cache) = self.script_cache {
+            if cache.cursor_line < cache.lines.len() && cache.cursor_col > 0 {
+                let line = &cache.lines[cache.cursor_line];
+                cache.lines[cache.cursor_line] = line[cache.cursor_col..].to_string();
+                cache.cursor_col = 0;
+                cache.status = ScriptStatus::Draft;
+            }
+        }
+    }
+
+    /// Delete previous word in script (Ctrl+w)
+    pub fn delete_previous_word_in_script(&mut self) {
+        if let Some(ref mut cache) = self.script_cache {
+            if cache.cursor_line >= cache.lines.len() || cache.cursor_col == 0 {
+                return;
+            }
+
+            let line = &cache.lines[cache.cursor_line];
+            let mut pos = cache.cursor_col;
+
+            // Skip whitespace backwards
+            while pos > 0 && line.chars().nth(pos - 1).unwrap_or(' ').is_whitespace() {
+                pos -= 1;
+            }
+
+            // Skip current word backwards
+            while pos > 0 && !line.chars().nth(pos - 1).unwrap_or(' ').is_whitespace() {
+                pos -= 1;
+            }
+
+            if pos < cache.cursor_col {
+                cache.lines[cache.cursor_line] =
+                    format!("{}{}", &line[..pos], &line[cache.cursor_col..]);
+                cache.cursor_col = pos;
+                cache.status = ScriptStatus::Draft;
             }
         }
     }

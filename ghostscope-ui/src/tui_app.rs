@@ -230,7 +230,7 @@ impl TuiApp {
                     .send(RuntimeCommand::Shutdown);
                 return Ok(true);
             }
-            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 // Set expectation for next j/k key
                 self.expecting_window_nav = true;
                 debug!("Expecting window navigation key (j/k)");
@@ -249,17 +249,143 @@ impl TuiApp {
         match self.focused_panel {
             FocusedPanel::InteractiveCommand => match key.code {
                 KeyCode::Char(c) => {
-                    // Check for Ctrl+S in ScriptEditor mode
-                    if key.modifiers.contains(KeyModifiers::CONTROL) && c == 's' {
-                        if self.interactive_command_panel.mode
-                            == crate::panels::InteractionMode::ScriptEditor
-                        {
-                            // Submit script with Ctrl+S
-                            if let Some(action) = self.interactive_command_panel.submit_script() {
-                                self.handle_command_action(action).await?;
+                    // Handle Ctrl+key combinations
+                    if key.modifiers.contains(KeyModifiers::CONTROL) {
+                        match c {
+                            's' => {
+                                if self.interactive_command_panel.mode
+                                    == crate::panels::InteractionMode::ScriptEditor
+                                {
+                                    // Submit script with Ctrl+S
+                                    if let Some(action) =
+                                        self.interactive_command_panel.submit_script()
+                                    {
+                                        self.handle_command_action(action).await?;
+                                    }
+                                }
+                            }
+                            'a' => {
+                                // Move to beginning of line
+                                match self.interactive_command_panel.mode {
+                                    crate::panels::InteractionMode::Input => {
+                                        self.interactive_command_panel.move_to_beginning();
+                                    }
+                                    crate::panels::InteractionMode::ScriptEditor => {
+                                        self.interactive_command_panel
+                                            .move_to_beginning_in_script();
+                                    }
+                                    _ => {} // Ignore in command mode
+                                }
+                            }
+                            'e' => {
+                                // Move to end of line
+                                match self.interactive_command_panel.mode {
+                                    crate::panels::InteractionMode::Input => {
+                                        self.interactive_command_panel.move_to_end();
+                                    }
+                                    crate::panels::InteractionMode::ScriptEditor => {
+                                        self.interactive_command_panel.move_to_end_in_script();
+                                    }
+                                    _ => {} // Ignore in command mode
+                                }
+                            }
+                            'h' => {
+                                // Delete character before cursor (Backspace)
+                                match self.interactive_command_panel.mode {
+                                    crate::panels::InteractionMode::Input => {
+                                        self.interactive_command_panel.delete_char();
+                                    }
+                                    crate::panels::InteractionMode::ScriptEditor => {
+                                        self.interactive_command_panel.delete_char_in_script();
+                                    }
+                                    _ => {} // Ignore in command mode
+                                }
+                            }
+                            'b' => {
+                                // Move cursor left one character
+                                match self.interactive_command_panel.mode {
+                                    crate::panels::InteractionMode::Input => {
+                                        self.interactive_command_panel.move_cursor_left();
+                                    }
+                                    crate::panels::InteractionMode::ScriptEditor => {
+                                        self.interactive_command_panel.move_cursor_left_in_script();
+                                    }
+                                    _ => {} // Ignore in command mode
+                                }
+                            }
+                            'f' => {
+                                // Move cursor right one character
+                                match self.interactive_command_panel.mode {
+                                    crate::panels::InteractionMode::Input => {
+                                        self.interactive_command_panel.move_cursor_right();
+                                    }
+                                    crate::panels::InteractionMode::ScriptEditor => {
+                                        self.interactive_command_panel
+                                            .move_cursor_right_in_script();
+                                    }
+                                    _ => {} // Ignore in command mode
+                                }
+                            }
+                            'k' => {
+                                // Delete from cursor to end of line
+                                match self.interactive_command_panel.mode {
+                                    crate::panels::InteractionMode::Input => {
+                                        self.interactive_command_panel.delete_to_end();
+                                    }
+                                    crate::panels::InteractionMode::ScriptEditor => {
+                                        self.interactive_command_panel.delete_to_end_in_script();
+                                    }
+                                    _ => {} // Ignore in command mode
+                                }
+                            }
+                            'u' => {
+                                // Delete from cursor to beginning of line
+                                match self.interactive_command_panel.mode {
+                                    crate::panels::InteractionMode::Input => {
+                                        self.interactive_command_panel.delete_to_beginning();
+                                    }
+                                    crate::panels::InteractionMode::ScriptEditor => {
+                                        self.interactive_command_panel
+                                            .delete_to_beginning_in_script();
+                                    }
+                                    _ => {} // Ignore in command mode
+                                }
+                            }
+                            'w' => {
+                                // Delete previous word
+                                match self.interactive_command_panel.mode {
+                                    crate::panels::InteractionMode::Input => {
+                                        self.interactive_command_panel.delete_previous_word();
+                                    }
+                                    crate::panels::InteractionMode::ScriptEditor => {
+                                        self.interactive_command_panel
+                                            .delete_previous_word_in_script();
+                                    }
+                                    _ => {} // Ignore in command mode
+                                }
+                            }
+                            _ => {
+                                // For other Ctrl+key combinations, treat as regular character input
+                                match self.interactive_command_panel.mode {
+                                    crate::panels::InteractionMode::Command => {
+                                        // Handle command navigation keys
+                                        let key_str = c.to_string();
+                                        self.interactive_command_panel
+                                            .handle_vim_navigation(&key_str);
+                                    }
+                                    crate::panels::InteractionMode::ScriptEditor => {
+                                        // Insert character in script
+                                        self.interactive_command_panel.insert_char_in_script(c);
+                                    }
+                                    crate::panels::InteractionMode::Input => {
+                                        // In input mode, all characters are inserted as input
+                                        self.interactive_command_panel.insert_char(c);
+                                    }
+                                }
                             }
                         }
                     } else {
+                        // Regular character input (no Ctrl modifier)
                         match self.interactive_command_panel.mode {
                             crate::panels::InteractionMode::Command => {
                                 // Handle command navigation keys
