@@ -370,6 +370,12 @@ impl DwarfExpressionEvaluator {
             context.pc_address
         );
 
+        // Try to optimize common CFI patterns first
+        if let Some(optimized_result) = self.try_cfi_pattern_optimization(operations, context)? {
+            debug!("Used CFI pattern optimization");
+            return Ok(optimized_result);
+        }
+
         // Convert legacy operations and evaluate on stack machine
         let new_operations: Result<Vec<DwarfOperation>, ExpressionError> = operations
             .iter()
@@ -393,6 +399,79 @@ impl DwarfExpressionEvaluator {
             Err(e) => {
                 error!("Failed to convert CFI operations: {}", e);
                 Err(e)
+            }
+        }
+    }
+
+    /// Try to optimize common CFI patterns without full evaluation
+    fn try_cfi_pattern_optimization(
+        &self,
+        operations: &[DwarfOp],
+        context: &CFIContext,
+    ) -> Result<Option<u64>, ExpressionError> {
+        match operations {
+            // Simple register offset: DW_OP_breg + offset
+            [DwarfOp::Breg(reg, offset)] => {
+                debug!(
+                    "CFI pattern: Simple register offset (reg {} + {})",
+                    reg, offset
+                );
+                if let Some(&reg_value) = context.available_registers.get(reg) {
+                    let result = (reg_value as i64 + offset) as u64;
+                    debug!(
+                        "CFI optimization result: 0x{:x} + {} = 0x{:x}",
+                        reg_value, offset, result
+                    );
+                    Ok(Some(result))
+                } else {
+                    debug!("CFI register {} not available in context", reg);
+                    Ok(None)
+                }
+            }
+
+            // Register offset with additional constant: DW_OP_breg + DW_OP_plus_uconst
+            [DwarfOp::Breg(reg, base_offset), DwarfOp::PlusUconst(additional)] => {
+                debug!(
+                    "CFI pattern: Register with additional offset (reg {} + {} + {})",
+                    reg, base_offset, additional
+                );
+                if let Some(&reg_value) = context.available_registers.get(reg) {
+                    let result = (reg_value as i64 + base_offset + (*additional as i64)) as u64;
+                    debug!(
+                        "CFI optimization result: 0x{:x} + {} + {} = 0x{:x}",
+                        reg_value, base_offset, additional, result
+                    );
+                    Ok(Some(result))
+                } else {
+                    debug!("CFI register {} not available in context", reg);
+                    Ok(None)
+                }
+            }
+
+            // Direct register value: DW_OP_reg
+            [DwarfOp::Reg(reg)] => {
+                debug!("CFI pattern: Direct register value (reg {})", reg);
+                if let Some(&reg_value) = context.available_registers.get(reg) {
+                    debug!("CFI optimization result: reg {} = 0x{:x}", reg, reg_value);
+                    Ok(Some(reg_value))
+                } else {
+                    debug!("CFI register {} not available in context", reg);
+                    Ok(None)
+                }
+            }
+
+            // Constant value: DW_OP_const
+            [DwarfOp::Const(value)] => {
+                debug!("CFI pattern: Constant value ({})", value);
+                Ok(Some(*value as u64))
+            }
+
+            _ => {
+                debug!(
+                    "CFI pattern: No optimization available for {} operations",
+                    operations.len()
+                );
+                Ok(None)
             }
         }
     }
@@ -612,8 +691,6 @@ impl DwarfExpressionEvaluator {
     // Placeholder implementations for core methods - will be implemented in subsequent tasks
 
     fn convert_legacy_dwarf_op(&self, op: &DwarfOp) -> Result<DwarfOperation, ExpressionError> {
-        // TODO: Implement conversion from legacy DwarfOp to new DwarfOperation
-        // This will be implemented in task 2
         match op {
             DwarfOp::Const(val) => Ok(DwarfOperation::Literal(*val)),
             DwarfOp::Reg(reg) => Ok(DwarfOperation::Register(*reg)),
@@ -621,7 +698,9 @@ impl DwarfExpressionEvaluator {
             DwarfOp::Fbreg(offset) => Ok(DwarfOperation::FrameBase(*offset)),
             DwarfOp::Deref => Ok(DwarfOperation::Deref(8)), // Default to 8-byte deref
             DwarfOp::Plus => Ok(DwarfOperation::Add),
-            DwarfOp::PlusUconst(val) => Ok(DwarfOperation::Constu(*val)),
+            // PlusUconst is a combined operation: push constant and add
+            // For CFI evaluation, we handle it as a single RegisterOffset operation
+            DwarfOp::PlusUconst(val) => Ok(DwarfOperation::Literal(*val as i64)),
             DwarfOp::Dup => Ok(DwarfOperation::Dup),
             DwarfOp::Drop => Ok(DwarfOperation::Drop),
             DwarfOp::Swap => Ok(DwarfOperation::Swap),

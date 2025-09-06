@@ -3,6 +3,7 @@ pub mod codegen;
 pub mod debug_logger;
 pub mod map;
 pub mod parser;
+pub mod platform;
 
 use crate::ast::{Program, TracePattern};
 use codegen::CodeGenError;
@@ -788,6 +789,39 @@ pub fn compile_ast_to_uprobe_configs(
             }
         }
 
+        // Extract compile-time PC address based on pattern type
+        let compile_time_pc = match &pattern {
+            ast::TracePattern::SourceLine {
+                file_path,
+                line_number,
+            } => {
+                if let Some(analyzer) = binary_analyzer.as_mut() {
+                    if let Some(dwarf_context) = analyzer.dwarf_context_mut() {
+                        let line_mappings =
+                            dwarf_context.get_addresses_for_line(file_path, *line_number);
+                        if !line_mappings.is_empty() {
+                            Some(line_mappings[0].address)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            ast::TracePattern::FunctionName(func_name) => {
+                if let Some(analyzer) = binary_analyzer.as_mut() {
+                    analyzer.resolve_function_address(func_name)
+                } else {
+                    None
+                }
+            }
+            ast::TracePattern::Address(addr) => Some(*addr),
+            ast::TracePattern::Wildcard(_) => None, // Wildcards don't have fixed PC
+        };
+
         // Generate file base name using consistent naming
         let file_base_name = generate_file_name(&pattern, index, pid, binary_path);
 
@@ -803,6 +837,7 @@ pub fn compile_ast_to_uprobe_configs(
             statements,
             pid,
             trace_id,
+            compile_time_pc, // Pass the compile-time PC address
             ir_file_path.as_deref(),
         ) {
             Ok(module) => module,

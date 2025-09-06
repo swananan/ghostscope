@@ -2,8 +2,9 @@
 // Provides efficient PC -> variable set lookup with proper scoping and shadowing
 
 use crate::dwarf::{DwarfType, LocationExpression};
+use crate::expression::{DwarfExpressionEvaluator, EvaluationContext, EvaluationResult};
 use std::collections::{BTreeSet, HashMap, HashSet};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 pub type VariableId = u32;
 pub type ScopeId = u32;
@@ -70,6 +71,8 @@ pub struct VariableResult {
     pub location_at_address: LocationExpression,
     pub scope_depth: usize,
     pub is_optimized_out: bool,
+    /// Enhanced evaluation result for LLVM codegen
+    pub evaluation_result: Option<EvaluationResult>,
 }
 
 /// Efficient variable storage with proper scoping based on GDB design
@@ -93,6 +96,9 @@ pub struct ScopedVariableMap {
     /// Next available IDs
     next_variable_id: VariableId,
     next_scope_id: ScopeId,
+
+    /// Expression evaluator for variable location evaluation
+    expression_evaluator: DwarfExpressionEvaluator,
 }
 
 impl ScopedVariableMap {
@@ -106,6 +112,7 @@ impl ScopedVariableMap {
             root_scopes: Vec::new(),
             next_variable_id: 1,
             next_scope_id: 1,
+            expression_evaluator: DwarfExpressionEvaluator::new(),
         }
     }
 
@@ -202,6 +209,38 @@ impl ScopedVariableMap {
                             );
                             let location = self.resolve_location_at_address(var_ref, addr);
 
+                            // Evaluate location expression directly for enhanced codegen
+                            let evaluation_result = {
+                                let context = EvaluationContext {
+                                    pc_address: addr,
+                                    frame_base: None, // Would be populated from CFI in real usage
+                                    call_frame_cfa: None, // Would be populated from CFI in real usage
+                                    available_registers: std::collections::HashMap::new(), // Would be populated in real usage
+                                    address_size: 8, // Assume 64-bit
+                                };
+
+                                match self
+                                    .expression_evaluator
+                                    .evaluate_for_codegen(&location, addr, &context)
+                                {
+                                    Ok(result) => {
+                                        debug!(
+                                            "Successfully evaluated location expression for '{}' at PC 0x{:x}: {:?}",
+                                            var_info.name, addr, result
+                                        );
+                                        Some(result)
+                                    }
+                                    Err(e) => {
+                                        error!(
+                                            "Failed to evaluate expression for variable '{}' at address 0x{:x}: {} - Location: {:?}",
+                                            var_info.name, addr, e, location
+                                        );
+                                        // Continue processing other variables even if one fails
+                                        None
+                                    }
+                                }
+                            };
+
                             let result = VariableResult {
                                 variable_info: var_info.clone(),
                                 location_at_address: location.clone(),
@@ -210,6 +249,7 @@ impl ScopedVariableMap {
                                     location,
                                     LocationExpression::OptimizedOut
                                 ),
+                                evaluation_result,
                             };
 
                             // Handle variable shadowing: inner scope (lower depth) wins

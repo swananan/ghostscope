@@ -22,51 +22,13 @@ use tracing::{debug, error, info, warn};
 use crate::ast::{BinaryOp, Expr, Program, Statement, VarType, VariableContext};
 use crate::debug_logger::DebugLogger;
 use crate::map::{MapError, MapManager};
+use crate::platform;
 use ghostscope_binary::dwarf::{
     DwarfEncoding, DwarfType, EnhancedVariableLocation, LocationExpression,
 };
+use ghostscope_binary::expression::{AccessStep, ArithOp, EvaluationResult, RegisterAccess};
+use ghostscope_binary::scoped_variables::VariableResult;
 use ghostscope_protocol::{consts, MessageType, TypeEncoding};
-
-/// Register indices for pt_regs array access in eBPF
-/// Dynamically calculated from aya's pt_regs structure layout using offset_of! macro
-///
-/// Note: In eBPF, pt_regs is typically accessed as an array of u64 values,
-/// where each register is at a specific index. This is the standard approach
-/// used in eBPF programs for accessing register values.
-///
-/// The indices are calculated by dividing the field offset by the size of u64,
-/// which gives us the array index for accessing pt_regs as a u64 array.
-mod pt_regs_indices {
-    use aya_ebpf_bindings::bindings::pt_regs;
-
-    // Size of u64 in bytes for array index calculation
-    const U64_SIZE: usize = core::mem::size_of::<u64>();
-
-    // Core registers - calculated from pt_regs structure layout
-    pub const R15: usize = core::mem::offset_of!(pt_regs, r15) / U64_SIZE;
-    pub const R14: usize = core::mem::offset_of!(pt_regs, r14) / U64_SIZE;
-    pub const R13: usize = core::mem::offset_of!(pt_regs, r13) / U64_SIZE;
-    pub const R12: usize = core::mem::offset_of!(pt_regs, r12) / U64_SIZE;
-    pub const RBP: usize = core::mem::offset_of!(pt_regs, rbp) / U64_SIZE; // Frame pointer
-    pub const RBX: usize = core::mem::offset_of!(pt_regs, rbx) / U64_SIZE;
-    pub const R11: usize = core::mem::offset_of!(pt_regs, r11) / U64_SIZE;
-    pub const R10: usize = core::mem::offset_of!(pt_regs, r10) / U64_SIZE;
-    pub const R9: usize = core::mem::offset_of!(pt_regs, r9) / U64_SIZE;
-    pub const R8: usize = core::mem::offset_of!(pt_regs, r8) / U64_SIZE;
-    pub const RAX: usize = core::mem::offset_of!(pt_regs, rax) / U64_SIZE; // Return value
-    pub const RCX: usize = core::mem::offset_of!(pt_regs, rcx) / U64_SIZE; // 4th argument
-    pub const RDX: usize = core::mem::offset_of!(pt_regs, rdx) / U64_SIZE; // 3rd argument
-    pub const RSI: usize = core::mem::offset_of!(pt_regs, rsi) / U64_SIZE; // 2nd argument
-    pub const RDI: usize = core::mem::offset_of!(pt_regs, rdi) / U64_SIZE; // 1st argument
-
-    // Special registers
-    pub const ORIG_RAX: usize = core::mem::offset_of!(pt_regs, orig_rax) / U64_SIZE; // Original syscall number
-    pub const RIP: usize = core::mem::offset_of!(pt_regs, rip) / U64_SIZE; // Instruction pointer
-    pub const CS: usize = core::mem::offset_of!(pt_regs, cs) / U64_SIZE; // Code segment
-    pub const EFLAGS: usize = core::mem::offset_of!(pt_regs, eflags) / U64_SIZE; // Flags register
-    pub const RSP: usize = core::mem::offset_of!(pt_regs, rsp) / U64_SIZE; // Stack pointer
-    pub const SS: usize = core::mem::offset_of!(pt_regs, ss) / U64_SIZE; // Stack segment
-}
 
 pub struct CodeGen<'ctx> {
     context: &'ctx Context,
@@ -74,16 +36,18 @@ pub struct CodeGen<'ctx> {
     builder: Builder<'ctx>,
     di_builder: DebugInfoBuilder<'ctx>,
     compile_unit: inkwell::debug_info::DICompileUnit<'ctx>,
+    // TODO: Remove these legacy fields after migration to runtime access
     variables: HashMap<String, PointerValue<'ctx>>,
-    var_types: HashMap<String, VarType>, // Track variable types
-    optimized_out_vars: HashMap<String, bool>, // Track which variables are optimized out
-    var_pc_addresses: HashMap<String, u64>, // Track PC addresses for variables (for size calculation)
+    var_types: HashMap<String, VarType>,
+    optimized_out_vars: HashMap<String, bool>,
+    var_pc_addresses: HashMap<String, u64>,
     map_manager: MapManager<'ctx>,
     variable_context: Option<VariableContext>, // Variable scope context for validation
     pending_dwarf_variables: Option<Vec<ghostscope_binary::EnhancedVariableLocation>>, // DWARF variables awaiting population
     debug_logger: DebugLogger<'ctx>,
     binary_analyzer: Option<*mut ghostscope_binary::BinaryAnalyzer>, // CFI and DWARF information access
     current_trace_id: Option<u32>, // Current trace_id being compiled
+    current_compile_time_pc: Option<u64>, // PC address from source line for DWARF queries
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -108,6 +72,10 @@ pub enum CodeGenError {
 
     #[error("DWARF expression error: {0}")]
     DwarfError(String),
+    #[error("Unsupported operation: {0}")]
+    UnsupportedOperation(String),
+    #[error("Invalid expression: {0}")]
+    InvalidExpression(String),
 
     #[error("Debug info error: {0}")]
     DebugInfo(String),
@@ -189,6 +157,7 @@ impl<'ctx> CodeGen<'ctx> {
             builder,
             di_builder,
             compile_unit,
+            // TODO: Remove these legacy fields after migration to runtime access
             variables: HashMap::new(),
             var_types: HashMap::new(),
             optimized_out_vars: HashMap::new(),
@@ -198,7 +167,8 @@ impl<'ctx> CodeGen<'ctx> {
             pending_dwarf_variables: None, // Will be set when DWARF variables are prepared
             debug_logger: DebugLogger::new(context),
             binary_analyzer: binary_analyzer.map(|ba| ba as *const _ as *mut _),
-            current_trace_id: None, // Will be set during compilation
+            current_trace_id: None,        // Will be set during compilation
+            current_compile_time_pc: None, // Will be set when processing trace statements
         }
     }
 
@@ -230,378 +200,6 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
-    /// Populate only the variables that are actually used in the script from DWARF location information
-    pub fn populate_variables_from_dwarf(
-        &mut self,
-        enhanced_variables: &[ghostscope_binary::EnhancedVariableLocation],
-        ctx_param: PointerValue<'ctx>,
-        used_variables: &std::collections::HashSet<String>, // Only variables used in the script
-    ) -> Result<()> {
-        info!(
-            "Analyzing {} DWARF variables, will generate code for {} used variables",
-            enhanced_variables.len(),
-            used_variables.len()
-        );
-
-        // Group variables by name for scope-based resolution
-        let mut variables_by_name: std::collections::HashMap<
-            String,
-            Vec<&ghostscope_binary::EnhancedVariableLocation>,
-        > = std::collections::HashMap::new();
-
-        // Group all variables by name
-        for enhanced_var in enhanced_variables {
-            let var = &enhanced_var.variable;
-
-            // Skip variables not used in the script
-            if !used_variables.contains(&var.name) {
-                debug!(
-                    "Skipping unused variable '{}' - not referenced in script",
-                    var.name
-                );
-                continue;
-            }
-
-            variables_by_name
-                .entry(var.name.clone())
-                .or_insert_with(Vec::new)
-                .push(enhanced_var);
-        }
-
-        // For each used variable name, select the best candidate based on scope hierarchy
-        // First collect all the selected variables to avoid borrowing conflicts
-        let mut selected_variables = Vec::new();
-
-        for (var_name, candidates) in variables_by_name {
-            let best_candidate =
-                self.select_best_variable_by_scope(&candidates, var_name.clone())?;
-
-            if let Some(enhanced_var) = best_candidate {
-                // Clone the data to avoid borrowing conflicts
-                selected_variables.push((var_name, enhanced_var.clone()));
-            } else {
-                warn!(
-                    "No suitable variable found for '{}' in current scope",
-                    var_name
-                );
-            }
-        }
-
-        // Now process the selected variables without borrowing conflicts
-        for (var_name, enhanced_var) in selected_variables {
-            let var = &enhanced_var.variable;
-
-            info!(
-                "Processing used DWARF variable: '{}' of type '{}' (scope-resolved)",
-                var.name, var.type_name
-            );
-
-            // Convert DWARF location expression to LLVM pointer
-            let variable_ptr = match &enhanced_var.location_at_address {
-                LocationExpression::Register { reg } => {
-                    debug!("Variable '{}' is in register {}", var.name, reg);
-                    // For eBPF, we need to extract register values from the context
-                    self.create_register_access(ctx_param, *reg, &var.name)?
-                }
-                LocationExpression::StackOffset { offset } => {
-                    debug!("Variable '{}' is at stack offset {}", var.name, offset);
-                    self.create_stack_offset_access(
-                        ctx_param,
-                        *offset,
-                        &var.name,
-                        enhanced_var.address,
-                    )?
-                }
-                LocationExpression::FrameBaseOffset { offset } => {
-                    debug!(
-                        "Variable '{}' is at frame base + offset {} at PC 0x{:x}",
-                        var.name, offset, enhanced_var.address
-                    );
-                    self.create_frame_base_offset_access(
-                        ctx_param,
-                        *offset,
-                        &var.name,
-                        enhanced_var.address,
-                    )?
-                }
-                LocationExpression::Address { addr } => {
-                    debug!(
-                        "Variable '{}' is at absolute address 0x{:x}",
-                        var.name, addr
-                    );
-                    self.create_absolute_address_access(*addr, &var.name, enhanced_var.address)?
-                }
-                LocationExpression::OptimizedOut => {
-                    warn!(
-                        "Variable '{}' was optimized out, creating placeholder",
-                        var.name
-                    );
-                    // Mark this variable as optimized out
-                    self.optimized_out_vars.insert(var.name.clone(), true);
-                    self.create_optimized_out_placeholder(&var.name)?
-                }
-                LocationExpression::RegisterOffset { reg, offset } => {
-                    debug!(
-                        "Variable '{}' is at register {} + offset {}",
-                        var.name, reg, offset
-                    );
-                    self.create_register_offset_access(ctx_param, *reg, *offset, &var.name)?
-                }
-                LocationExpression::ComputedExpression {
-                    operations,
-                    requires_frame_base,
-                    requires_registers,
-                } => {
-                    debug!(
-                        "Variable '{}' has computed expression with {} operations (frame_base: {}, registers: {:?})",
-                        var.name, operations.len(), requires_frame_base, requires_registers
-                    );
-                    self.create_computed_expression_access(
-                        ctx_param,
-                        operations,
-                        *requires_frame_base,
-                        requires_registers,
-                        &var.name,
-                    )?
-                }
-                LocationExpression::DwarfExpression { bytecode: _ } => {
-                    warn!(
-                        "Variable '{}' has complex DWARF expression, using fallback",
-                        var.name
-                    );
-                    self.create_complex_expression_fallback(&var.name)?
-                }
-                LocationExpression::LocationList { entries: _ } => {
-                    // This should never happen because resolve_at_pc() should have been called
-                    // in get_enhanced_variable_locations to resolve the location list
-                    warn!(
-                        "Variable '{}' has unresolved location list, this should not happen",
-                        var.name
-                    );
-                    self.create_optimized_out_placeholder(&var.name)?
-                }
-            };
-
-            // Determine variable type from DWARF information
-            let var_type = self.determine_var_type_from_dwarf(&var.dwarf_type);
-
-            // Add to code generation HashMaps
-            self.variables.insert(var.name.clone(), variable_ptr);
-            self.var_types.insert(var.name.clone(), var_type);
-            self.var_pc_addresses
-                .insert(var.name.clone(), enhanced_var.address);
-
-            info!(
-                "Successfully added used DWARF variable '{}' to code generation context",
-                var.name
-            );
-        }
-
-        info!(
-            "Generated LLVM IR code for {} used variables",
-            self.variables.len()
-        );
-        Ok(())
-    }
-
-    /// Select the best variable from multiple candidates based on scope hierarchy
-    /// Prefers variables in the most specific (innermost) scope first
-    fn select_best_variable_by_scope<'a>(
-        &self,
-        candidates: &[&'a ghostscope_binary::EnhancedVariableLocation],
-        var_name: String,
-    ) -> Result<Option<&'a ghostscope_binary::EnhancedVariableLocation>> {
-        if candidates.is_empty() {
-            return Ok(None);
-        }
-
-        if candidates.len() == 1 {
-            info!(
-                "Single candidate found for variable '{}', using it directly",
-                var_name
-            );
-            return Ok(Some(candidates[0]));
-        }
-
-        info!(
-            "Multiple candidates ({}) found for variable '{}', selecting best scope",
-            candidates.len(),
-            var_name
-        );
-
-        // Score each candidate based on scope specificity
-        let mut scored_candidates: Vec<(usize, &ghostscope_binary::EnhancedVariableLocation)> =
-            Vec::new();
-
-        for candidate in candidates {
-            // Get target address from first candidate
-            let target_address = candidates[0].address;
-            let score = self.calculate_scope_score_with_address(candidate, target_address);
-            scored_candidates.push((score, candidate));
-
-            // Check if variable scope contains target address
-            let in_scope = candidate.variable.scope_ranges.is_empty()
-                || candidate
-                    .variable
-                    .scope_ranges
-                    .iter()
-                    .any(|range| target_address >= range.start && target_address < range.end);
-
-            info!(
-                "Variable '{}' candidate - type={}, scope_ranges={:?}, in_scope_at_target=0x{:x}:{}, location_expr={:?}, score={}",
-                var_name, candidate.variable.type_name, candidate.variable.scope_ranges,
-                target_address, in_scope, candidate.location_at_address, score
-            );
-        }
-
-        // Sort by score (higher score = better match, more specific scope)
-        scored_candidates.sort_by(|a, b| b.0.cmp(&a.0));
-
-        let best_candidate = scored_candidates[0].1;
-
-        // Log detailed information about the selected variable
-        let target_address = candidates[0].address;
-        let in_scope = best_candidate.variable.scope_ranges.is_empty()
-            || best_candidate
-                .variable
-                .scope_ranges
-                .iter()
-                .any(|range| target_address >= range.start && target_address < range.end);
-
-        info!(
-            "SELECTED: Variable '{}' with score {} - type: {}, scope_ranges: {:?}, in_scope_at_0x{:x}: {}, location: {:?}",
-            var_name, scored_candidates[0].0, best_candidate.variable.type_name,
-            best_candidate.variable.scope_ranges, target_address, in_scope, best_candidate.location_at_address
-        );
-
-        Ok(Some(best_candidate))
-    }
-
-    /// Calculate scope specificity score for a variable candidate
-    /// Higher score means more specific (better) scope
-    fn calculate_scope_score(
-        &self,
-        candidate: &ghostscope_binary::EnhancedVariableLocation,
-    ) -> usize {
-        let var = &candidate.variable;
-
-        // Base score starts at 0
-        let mut score = 0;
-
-        // If variable has scope ranges, prefer those with smaller ranges (more specific)
-        if !var.scope_ranges.is_empty() {
-            // Calculate total range size - smaller ranges get higher scores
-            let total_range_size: u64 = var
-                .scope_ranges
-                .iter()
-                .map(|range| range.end.saturating_sub(range.start))
-                .sum();
-
-            // Use the inverse of range size as the primary score component
-            // This heavily favors smaller scopes
-            score += if total_range_size > 0 {
-                // Scale down to prevent overflow: (100000 / size)
-                let inverted_score = 100000_u64.saturating_div(total_range_size.max(1));
-                inverted_score as usize
-            } else {
-                50000 // High score for zero-size ranges (very specific)
-            };
-
-            // Additional bonus for having scope information
-            score += 10000;
-        } else {
-            // Variables without explicit scope get a much lower base score
-            // But still allow them to compete based on other factors
-            score += 5000;
-        }
-
-        // Prefer local variables over parameters (parameters are usually in outer scope)
-        if !var.is_parameter {
-            score += 1000;
-        }
-
-        // Avoid artificial/compiler-generated variables if possible
-        if !var.is_artificial {
-            score += 500;
-        }
-
-        debug!("Variable '{}' scope score calculation: range_size={}, has_scope={}, is_param={}, is_artificial={}, final_score={}", 
-               var.name,
-               var.scope_ranges.iter().map(|r| r.end.saturating_sub(r.start)).sum::<u64>(),
-               !var.scope_ranges.is_empty(),
-               var.is_parameter,
-               var.is_artificial,
-               score);
-
-        score
-    }
-
-    /// Calculate scope specificity score considering target address containment
-    /// Higher score means better match - prioritizes variables whose scope contains target address
-    fn calculate_scope_score_with_address(
-        &self,
-        candidate: &ghostscope_binary::EnhancedVariableLocation,
-        target_address: u64,
-    ) -> usize {
-        let var = &candidate.variable;
-        let mut score = 0;
-
-        // Check if target address is within any of the variable's scope ranges
-        let in_target_scope = var.scope_ranges.is_empty()
-            || var
-                .scope_ranges
-                .iter()
-                .any(|range| target_address >= range.start && target_address < range.end);
-
-        // HEAVILY prioritize variables whose scope contains the target address
-        if in_target_scope {
-            score += 1000000; // Massive bonus for being in correct scope
-        }
-
-        // If variable has scope ranges, prefer those with smaller ranges (more specific)
-        if !var.scope_ranges.is_empty() {
-            let total_range_size: u64 = var
-                .scope_ranges
-                .iter()
-                .map(|range| range.end.saturating_sub(range.start))
-                .sum();
-
-            // Use the inverse of range size as the score component
-            score += if total_range_size > 0 {
-                let inverted_score = 100000_u64.saturating_div(total_range_size.max(1));
-                inverted_score as usize
-            } else {
-                50000 // High score for zero-size ranges
-            };
-
-            // Additional bonus for having scope information
-            score += 10000;
-        } else {
-            // Variables without explicit scope get a lower base score
-            score += 5000;
-        }
-
-        // Prefer local variables over parameters
-        if !var.is_parameter {
-            score += 1000;
-        }
-
-        // Avoid artificial/compiler-generated variables if possible
-        if !var.is_artificial {
-            score += 500;
-        }
-
-        debug!("Variable '{}' enhanced scope score: target_addr=0x{:x}, in_target_scope={}, range_size={}, has_scope={}, is_param={}, is_artificial={}, final_score={}", 
-               var.name, target_address, in_target_scope,
-               var.scope_ranges.iter().map(|r| r.end.saturating_sub(r.start)).sum::<u64>(),
-               !var.scope_ranges.is_empty(),
-               var.is_parameter,
-               var.is_artificial,
-               score);
-
-        score
-    }
-
     /// Create register access for DWARF variables stored in CPU registers
     fn create_register_access(
         &mut self,
@@ -615,26 +213,30 @@ impl<'ctx> CodeGen<'ctx> {
         );
 
         // For eBPF uprobes, we need to read from the pt_regs structure
-        // pt_regs structure: [r15, r14, r13, r12, rbp, rbx, r11, r10, r9, r8, rax, rcx, rdx, rsi, rdi, orig_rax, rip, cs, eflags, rsp, ss]
-        // Convert DWARF register number to pt_regs array index
-        let pt_regs_index = self.convert_dwarf_reg_to_pt_regs_index(register);
+        // Convert DWARF register number to pt_regs byte offset
+        let pt_regs_byte_offset =
+            platform::dwarf_reg_to_pt_regs_byte_offset(register).ok_or_else(|| {
+                CodeGenError::InvalidExpression(format!(
+                    "Unsupported DWARF register {} for current platform",
+                    register
+                ))
+            })?;
 
         let i64_type = self.context.i64_type();
         let _ptr_type = self.context.ptr_type(AddressSpace::default());
 
-        // For eBPF, access register values from pt_regs safely
-        let reg_index = self
-            .context
-            .i64_type()
-            .const_int(pt_regs_index as u64, false);
+        // For eBPF, access register values from pt_regs safely using i64 array index
+        // pt_regs byte offset / 8 = i64 array index
+        let i64_index = pt_regs_byte_offset / 8;
+        let reg_index_const = i64_type.const_int(i64_index as u64, false);
 
-        // Get pointer to the register in pt_regs
+        // Get pointer to the register in pt_regs (pt_regs as i64 array)
         let reg_ptr = unsafe {
             self.builder
                 .build_gep(
                     i64_type,
                     ctx_param,
-                    &[reg_index],
+                    &[reg_index_const],
                     &format!("{}_reg_ptr", var_name),
                 )
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?
@@ -642,192 +244,6 @@ impl<'ctx> CodeGen<'ctx> {
 
         // Register values can be read directly from pt_regs (kernel memory)
         Ok(reg_ptr)
-    }
-
-    /// Create stack offset access for DWARF variables on the stack
-    /// Returns a global storage pointer containing the read data
-    fn create_stack_offset_access(
-        &mut self,
-        ctx_param: PointerValue<'ctx>,
-        offset: i64,
-        var_name: &str,
-        pc_address: u64,
-    ) -> Result<PointerValue<'ctx>> {
-        debug!(
-            "Creating stack access for variable '{}' at stack offset {}",
-            var_name, offset
-        );
-
-        let i64_type = self.context.i64_type();
-        let i32_type = self.context.i32_type();
-        let ptr_type = self.context.ptr_type(AddressSpace::default());
-
-        // Get the stack pointer from pt_regs using aya's pt_regs structure
-        let rsp_index = self
-            .context
-            .i64_type()
-            .const_int(pt_regs_indices::RSP as u64, false);
-        let rsp_ptr = unsafe {
-            self.builder
-                .build_gep(i64_type, ctx_param, &[rsp_index], "rsp_ptr")
-                .map_err(|e| CodeGenError::Builder(e.to_string()))?
-        };
-
-        let rsp_value = self
-            .builder
-            .build_load(i64_type, rsp_ptr, "rsp_value")
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?
-            .into_int_value();
-
-        // Calculate the variable address (RSP + offset)
-        let var_offset_const = self.context.i64_type().const_int(offset as u64, offset < 0);
-        let user_var_addr = if offset >= 0 {
-            self.builder
-                .build_int_add(rsp_value, var_offset_const, &format!("{}_addr", var_name))
-        } else {
-            self.builder.build_int_sub(
-                rsp_value,
-                var_offset_const.const_neg(),
-                &format!("{}_addr", var_name),
-            )
-        }
-        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-        // Convert to pointer for user memory address
-        let user_ptr = self
-            .builder
-            .build_int_to_ptr(user_var_addr, ptr_type, &format!("{}_user_ptr", var_name))
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-        // Create global storage for the variable data (eBPF kernel memory)
-        // Use unique name based on variable name and address to avoid duplicates
-        let unique_name = format!(
-            "_stack_var_{}_{:x}",
-            var_name,
-            user_var_addr.get_name().to_string_lossy().len()
-        );
-        // Get variable size and create appropriate type
-        let var_size = self.get_variable_size(pc_address, var_name);
-        let storage_type = self.get_llvm_type_for_size(var_size);
-        let storage_global =
-            self.module
-                .add_global(storage_type, Some(AddressSpace::default()), &unique_name);
-
-        // Initialize with zero value of correct type
-        let zero_value: inkwell::values::BasicValueEnum = match storage_type {
-            inkwell::types::BasicTypeEnum::IntType(int_type) => int_type.const_zero().into(),
-            _ => self.context.i64_type().const_zero().into(), // Fallback
-        };
-        storage_global.set_initializer(&zero_value);
-
-        // Use bpf_probe_read_user() to safely copy data from user memory to eBPF storage
-        let helper_id = self
-            .context
-            .i64_type()
-            .const_int(BPF_FUNC_probe_read_user as u64, false);
-        let helper_fn_type = i64_type.fn_type(
-            &[
-                ptr_type.into(), // dst
-                i32_type.into(), // size
-                ptr_type.into(), // unsafe_ptr
-            ],
-            false,
-        );
-        let helper_fn_ptr = self
-            .builder
-            .build_int_to_ptr(
-                helper_id,
-                helper_fn_type.ptr_type(AddressSpace::default()),
-                "probe_read_user_fn",
-            )
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-        let size = i32_type.const_int(var_size, false);
-        let probe_read_result = self
-            .builder
-            .build_indirect_call(
-                helper_fn_type,
-                helper_fn_ptr,
-                &[
-                    storage_global.as_pointer_value().into(),
-                    size.into(),
-                    user_ptr.into(),
-                ],
-                "probe_read_result",
-            )
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-        // Check bpf_probe_read_user return value and handle errors
-        if let Either::Left(BasicValueEnum::IntValue(result_int)) =
-            probe_read_result.try_as_basic_value()
-        {
-            // Check if bpf_probe_read_user failed (non-zero return value)
-            let zero_value = i64_type.const_int(0, false);
-            let is_error = self
-                .builder
-                .build_int_compare(
-                    inkwell::IntPredicate::NE,
-                    result_int,
-                    zero_value,
-                    "probe_read_failed",
-                )
-                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-            // Create conditional branch for error handling
-            let current_fn = self
-                .builder
-                .get_insert_block()
-                .unwrap()
-                .get_parent()
-                .unwrap();
-            let error_block = self
-                .context
-                .append_basic_block(current_fn, "probe_read_error");
-            let success_block = self
-                .context
-                .append_basic_block(current_fn, "probe_read_success");
-            let continue_block = self
-                .context
-                .append_basic_block(current_fn, "probe_read_continue");
-
-            self.builder
-                .build_conditional_branch(is_error, error_block, success_block)
-                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-            // Error block - send execution failure message
-            self.builder.position_at_end(error_block);
-            // Use the full i64 return value directly, no truncation needed
-            if let BasicValueEnum::IntValue(error_code_int) = result_int.as_basic_value_enum() {
-                let error_msg = format!("bpf_probe_read_user failed for variable '{}'", var_name);
-                // Pass the runtime LLVM value instead of constant
-                self.send_execution_failure(1, error_code_int, &error_msg)?;
-            }
-
-            // Return error - set storage to zero and jump to continue block
-            let zero_storage = storage_global.as_pointer_value();
-            self.builder
-                .build_store(zero_storage, i64_type.const_int(0, false))
-                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-            self.builder
-                .build_unconditional_branch(continue_block)
-                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-            // Success block - no special processing needed, just continue
-            self.builder.position_at_end(success_block);
-            self.builder
-                .build_unconditional_branch(continue_block)
-                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-            // Continue block - continue with normal execution
-            self.builder.position_at_end(continue_block);
-        }
-
-        debug!(
-            "Stack variable '{}' data safely read into global storage",
-            var_name
-        );
-        Ok(storage_global.as_pointer_value())
     }
 
     /// Create frame base offset access for DWARF variables relative to frame base
@@ -840,54 +256,165 @@ impl<'ctx> CodeGen<'ctx> {
         pc_address: u64,
     ) -> Result<PointerValue<'ctx>> {
         debug!(
-            "Creating frame base access for variable '{}' at offset {}",
+            "Creating frame base access for variable '{}' at offset {} using CFI expression evaluation",
             var_name, offset
         );
 
-        // Frame base calculation for DW_OP_fbreg using CFI information
-        // We now use CFI to determine the precise frame base location
+        // Use CFI expression evaluator to calculate frame base dynamically
         let i64_type = self.context.i64_type();
         let i32_type = self.context.i32_type();
         let ptr_type = self.context.ptr_type(AddressSpace::default());
 
-        // Get RBP from pt_regs using aya's pt_regs structure
-        let rbp_index = self
-            .context
-            .i64_type()
-            .const_int(pt_regs_indices::RBP as u64, false);
-        let rbp_ptr = unsafe {
-            self.builder
-                .build_gep(i64_type, ctx_param, &[rbp_index], "rbp_ptr")
-                .map_err(|e| CodeGenError::Builder(e.to_string()))?
+        // MUST use DWARF expression evaluation to get frame base address
+        // Get the enhanced variable location with evaluation result
+        let frame_base_addr = if let Some(analyzer_ptr) = self.binary_analyzer {
+            unsafe {
+                let analyzer = &mut *analyzer_ptr;
+                // Use DWARF context to get CFI information and evaluate expressions
+                if let Some(dwarf_context) = analyzer.dwarf_context().as_ref() {
+                    if let Some(cfi_entry) = dwarf_context.get_cfi_at_pc(pc_address) {
+                        match &cfi_entry.cfa_rule {
+                            ghostscope_binary::dwarf::CFARule::RegisterOffset {
+                                register,
+                                offset,
+                            } => {
+                                debug!("DWARF CFI rule: Register {} + offset {}", register, offset);
+
+                                // Generate LLVM IR based on DWARF CFI rule
+                                let reg_index =
+                                    self.context.i64_type().const_int(*register as u64, false);
+                                let reg_ptr = unsafe {
+                                    self.builder
+                                        .build_gep(
+                                            i64_type,
+                                            ctx_param,
+                                            &[reg_index],
+                                            &format!("reg_{}_ptr_dwarf", register),
+                                        )
+                                        .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                                };
+
+                                let reg_value = self
+                                    .builder
+                                    .build_load(
+                                        i64_type,
+                                        reg_ptr,
+                                        &format!("reg_{}_value_dwarf", register),
+                                    )
+                                    .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                                    .into_int_value();
+
+                                let offset_const = self
+                                    .context
+                                    .i64_type()
+                                    .const_int(offset.unsigned_abs(), offset < &0);
+                                if offset >= &0 {
+                                    self.builder.build_int_add(
+                                        reg_value,
+                                        offset_const,
+                                        "frame_base_dwarf_add",
+                                    )
+                                } else {
+                                    self.builder.build_int_sub(
+                                        reg_value,
+                                        offset_const,
+                                        "frame_base_dwarf_sub",
+                                    )
+                                }
+                                .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                            }
+
+                            ghostscope_binary::dwarf::CFARule::Expression(operations) => {
+                                debug!("DWARF CFI expression with {} operations", operations.len());
+
+                                // Build register context from pt_regs
+                                let mut register_values = std::collections::HashMap::new();
+                                for reg_num in 0..16 {
+                                    // x86_64 general-purpose registers
+                                    let reg_index =
+                                        self.context.i64_type().const_int(reg_num, false);
+                                    let reg_ptr = unsafe {
+                                        self.builder
+                                            .build_gep(
+                                                i64_type,
+                                                ctx_param,
+                                                &[reg_index],
+                                                &format!("reg_{}_ptr_expr", reg_num),
+                                            )
+                                            .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                                    };
+
+                                    let reg_value = self
+                                        .builder
+                                        .build_load(
+                                            i64_type,
+                                            reg_ptr,
+                                            &format!("reg_{}_value_expr", reg_num),
+                                        )
+                                        .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                                        .into_int_value();
+
+                                    register_values.insert(reg_num as u16, reg_value);
+                                }
+
+                                // Use DWARF expression evaluator to compute frame base
+                                let cfi_context = ghostscope_binary::expression::CFIContext {
+                                    pc_address,
+                                    available_registers: register_values
+                                        .iter()
+                                        .map(|(k, v)| {
+                                            (*k, v.get_zero_extended_constant().unwrap_or(0))
+                                        })
+                                        .collect(),
+                                    address_size: 8,
+                                };
+
+                                match dwarf_context
+                                    .get_expression_evaluator()
+                                    .evaluate_for_cfi(operations, &cfi_context)
+                                {
+                                    Ok(frame_base_addr) => {
+                                        debug!("DWARF expression evaluation succeeded: frame_base = 0x{:x}", frame_base_addr);
+                                        self.context.i64_type().const_int(frame_base_addr, false)
+                                    }
+                                    Err(e) => {
+                                        return Err(CodeGenError::InvalidExpression(format!(
+                                            "DWARF expression evaluation failed for PC 0x{:x}: {}",
+                                            pc_address, e
+                                        )));
+                                    }
+                                }
+                            }
+
+                            ghostscope_binary::dwarf::CFARule::Undefined => {
+                                return Err(CodeGenError::InvalidExpression(format!(
+                                    "DWARF CFI rule undefined for PC 0x{:x} - cannot determine frame base",
+                                    pc_address
+                                )));
+                            }
+                        }
+                    } else {
+                        return Err(CodeGenError::InvalidExpression(format!(
+                            "No DWARF CFI entry found for PC 0x{:x} - cannot determine frame base",
+                            pc_address
+                        )));
+                    }
+                } else {
+                    return Err(CodeGenError::InvalidExpression(
+                        "No DWARF context available - cannot evaluate CFI expressions".to_string(),
+                    ));
+                }
+            }
+        } else {
+            return Err(CodeGenError::InvalidExpression(
+                "No binary analyzer available - cannot evaluate DWARF expressions".to_string(),
+            ));
         };
 
-        let rbp_value = self
-            .builder
-            .build_load(i64_type, rbp_ptr, "rbp_value")
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?
-            .into_int_value();
-
-        // Debug: Generate eBPF bpf_trace_printk for RBP value
-        self.generate_rbp_trace_printk(var_name, rbp_value)?;
-
-        // CFI-based frame base calculation using PC-specific rules
-        // Query CFI information based on the actual PC address
-        let cfi_offset_value = self.get_cfi_offset_for_pc(pc_address);
-
         debug!(
-            "Using CFI-enhanced frame base calculation for PC 0x{:x}: frame_base = RBP + {}, variable_addr = (RBP + {}) + {}",
-            pc_address, cfi_offset_value, cfi_offset_value, offset
+            "CFI expression evaluation for PC 0x{:x} completed, calculating variable address: frame_base + {}",
+            pc_address, offset
         );
-
-        // Calculate: frame_base = RBP + cfi_offset
-        let cfi_offset = self
-            .context
-            .i64_type()
-            .const_int(cfi_offset_value as u64, false);
-        let frame_base = self
-            .builder
-            .build_int_add(rbp_value, cfi_offset, "frame_base_cfi")
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
 
         // Calculate: variable_addr = frame_base + variable_offset
         let var_offset_const = self
@@ -896,26 +423,18 @@ impl<'ctx> CodeGen<'ctx> {
             .const_int(offset.unsigned_abs(), offset < 0);
         let user_var_addr = if offset >= 0 {
             self.builder.build_int_add(
-                frame_base,
+                frame_base_addr,
                 var_offset_const,
-                &format!("{}_addr_cfi", var_name),
+                &format!("{}_addr_cfi_eval", var_name),
             )
         } else {
             self.builder.build_int_sub(
-                frame_base,
+                frame_base_addr,
                 var_offset_const,
-                &format!("{}_addr_cfi", var_name),
+                &format!("{}_addr_cfi_eval", var_name),
             )
         }
         .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-        debug!(
-            "CFI calculation for '{}': RBP + {} + ({}) = final_addr (should be RBP + {})",
-            var_name,
-            cfi_offset_value,
-            offset,
-            cfi_offset_value + offset
-        );
 
         // Convert to pointer for user memory address
         let user_ptr = self
@@ -1057,161 +576,127 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(storage_global.as_pointer_value())
     }
 
-    /// Create absolute address access for DWARF variables at fixed memory locations
-    /// Returns a global storage pointer containing the read data
-    fn create_absolute_address_access(
+    /// Evaluate CFI expression to get frame base address dynamically
+    /// This implements the proper CFI -> DWARF expression evaluation -> LLVM IR pipeline
+    fn evaluate_cfi_frame_base(
         &mut self,
-        address: u64,
-        var_name: &str,
+        ctx_param: PointerValue<'ctx>,
         pc_address: u64,
-    ) -> Result<PointerValue<'ctx>> {
+    ) -> Result<IntValue<'ctx>> {
         debug!(
-            "Creating absolute address access for variable '{}' at 0x{:x}",
-            var_name, address
+            "Evaluating CFI frame base expression for PC 0x{:x} using DWARF expression evaluator",
+            pc_address
         );
 
         let i64_type = self.context.i64_type();
-        let i32_type = self.context.i32_type();
-        let ptr_type = self.context.ptr_type(AddressSpace::default());
 
-        // Convert address to pointer for user memory
-        let addr_const = self.context.i64_type().const_int(address, false);
+        // Get CFI rule from binary analyzer
+        if let Some(analyzer_ptr) = self.binary_analyzer {
+            unsafe {
+                let analyzer = &mut *analyzer_ptr;
+                // Use existing frame base offset method from BinaryAnalyzer
+                if let Some(frame_base_offset) = analyzer.get_frame_base_offset(pc_address) {
+                    debug!(
+                        "Got frame base offset {} for PC 0x{:x}",
+                        frame_base_offset, pc_address
+                    );
 
-        let user_ptr = self
-            .builder
-            .build_int_to_ptr(addr_const, ptr_type, &format!("{}_user_ptr", var_name))
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                    // Generate LLVM IR for RBP + frame_base_offset
+                    let rbp_index = self
+                        .context
+                        .i64_type()
+                        .const_int(platform::pt_regs_indices::RBP as u64, false);
+                    let rbp_ptr = unsafe {
+                        self.builder
+                            .build_gep(i64_type, ctx_param, &[rbp_index], "rbp_ptr_cfi")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                    };
 
-        // Create global storage for the variable data (eBPF kernel memory)
-        // Use unique name based on variable name and address to avoid duplicates
-        let unique_name = format!("_abs_var_{}_{:x}", var_name, address);
-        // Get variable size and create appropriate type
-        let var_size = self.get_variable_size(pc_address, var_name);
-        let storage_type = self.get_llvm_type_for_size(var_size);
-        let storage_global =
-            self.module
-                .add_global(storage_type, Some(AddressSpace::default()), &unique_name);
+                    let rbp_value = self
+                        .builder
+                        .build_load(i64_type, rbp_ptr, "rbp_value_cfi")
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                        .into_int_value();
 
-        // Initialize with zero value of correct type
-        let zero_value: inkwell::values::BasicValueEnum = match storage_type {
-            inkwell::types::BasicTypeEnum::IntType(int_type) => int_type.const_zero().into(),
-            _ => self.context.i64_type().const_zero().into(), // Fallback
-        };
-        storage_global.set_initializer(&zero_value);
+                    let cfi_offset = self
+                        .context
+                        .i64_type()
+                        .const_int(frame_base_offset.unsigned_abs(), frame_base_offset < 0);
+                    let frame_base = if frame_base_offset >= 0 {
+                        self.builder
+                            .build_int_add(rbp_value, cfi_offset, "frame_base_cfi")
+                    } else {
+                        self.builder
+                            .build_int_sub(rbp_value, cfi_offset, "frame_base_cfi")
+                    }
+                    .map_err(|e| CodeGenError::Builder(e.to_string()))?;
 
-        // Use bpf_probe_read_user() to safely copy data from user memory to eBPF storage
-        let helper_id = self
-            .context
-            .i64_type()
-            .const_int(BPF_FUNC_probe_read_user as u64, false);
-        let helper_fn_type = i64_type.fn_type(
-            &[
-                ptr_type.into(), // dst
-                i32_type.into(), // size
-                ptr_type.into(), // unsafe_ptr
-            ],
-            false,
-        );
-        let helper_fn_ptr = self
-            .builder
-            .build_int_to_ptr(
-                helper_id,
-                helper_fn_type.ptr_type(AddressSpace::default()),
-                "probe_read_user_fn",
-            )
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                    Ok(frame_base)
+                } else {
+                    debug!(
+                        "No frame base offset found for PC 0x{:x}, using RBP + 16 default",
+                        pc_address
+                    );
+                    // Default fallback to RBP + 16
+                    let rbp_index = self
+                        .context
+                        .i64_type()
+                        .const_int(platform::pt_regs_indices::RBP as u64, false);
+                    let rbp_ptr = unsafe {
+                        self.builder
+                            .build_gep(i64_type, ctx_param, &[rbp_index], "rbp_ptr_default_cfi")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                    };
 
-        let size = i32_type.const_int(var_size, false);
-        let probe_read_result = self
-            .builder
-            .build_indirect_call(
-                helper_fn_type,
-                helper_fn_ptr,
-                &[
-                    storage_global.as_pointer_value().into(),
-                    size.into(),
-                    user_ptr.into(),
-                ],
-                "probe_read_result",
-            )
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                    let rbp_value = self
+                        .builder
+                        .build_load(i64_type, rbp_ptr, "rbp_value_default_cfi")
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                        .into_int_value();
 
-        // Check bpf_probe_read_user return value and handle errors
-        if let Either::Left(BasicValueEnum::IntValue(result_int)) =
-            probe_read_result.try_as_basic_value()
-        {
-            // Check if bpf_probe_read_user failed (non-zero return value)
-            let zero_value = i64_type.const_int(0, false);
-            let is_error = self
-                .builder
-                .build_int_compare(
-                    inkwell::IntPredicate::NE,
-                    result_int,
-                    zero_value,
-                    "probe_read_failed",
-                )
-                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                    let default_offset = self.context.i64_type().const_int(16, false);
+                    let frame_base = self
+                        .builder
+                        .build_int_add(rbp_value, default_offset, "frame_base_default_cfi")
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
 
-            // Create conditional branch for error handling
-            let current_fn = self
-                .builder
-                .get_insert_block()
-                .unwrap()
-                .get_parent()
-                .unwrap();
-            let error_block = self
-                .context
-                .append_basic_block(current_fn, "probe_read_error_abs");
-            let success_block = self
-                .context
-                .append_basic_block(current_fn, "probe_read_success_abs");
-            let continue_block = self
-                .context
-                .append_basic_block(current_fn, "probe_read_continue_abs");
-
-            self.builder
-                .build_conditional_branch(is_error, error_block, success_block)
-                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-            // Error block - send execution failure message
-            self.builder.position_at_end(error_block);
-            // Use the full i64 return value directly, no truncation needed
-            if let BasicValueEnum::IntValue(error_code_int) = result_int.as_basic_value_enum() {
-                let error_msg = format!(
-                    "bpf_probe_read_user failed for absolute address variable '{}'",
-                    var_name
-                );
-                self.send_execution_failure(3, error_code_int, &error_msg)?;
+                    Ok(frame_base)
+                }
             }
+        } else {
+            debug!("No binary analyzer available for CFI evaluation, using RBP + 16");
+            // No analyzer available - use RBP + 16 default
+            let rbp_index = self
+                .context
+                .i64_type()
+                .const_int(platform::pt_regs_indices::RBP as u64, false);
+            let rbp_ptr = unsafe {
+                self.builder
+                    .build_gep(i64_type, ctx_param, &[rbp_index], "rbp_ptr_no_analyzer")
+                    .map_err(|e| CodeGenError::Builder(e.to_string()))?
+            };
 
-            // Return error - set storage to zero and jump to continue block
-            let zero_storage = storage_global.as_pointer_value();
-            self.builder
-                .build_store(zero_storage, i64_type.const_int(0, false))
+            let rbp_value = self
+                .builder
+                .build_load(i64_type, rbp_ptr, "rbp_value_no_analyzer")
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                .into_int_value();
+
+            let default_offset = self.context.i64_type().const_int(16, false);
+            let frame_base = self
+                .builder
+                .build_int_add(rbp_value, default_offset, "frame_base_no_analyzer")
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?;
 
-            self.builder
-                .build_unconditional_branch(continue_block)
-                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-            // Success block - no special processing needed, just continue
-            self.builder.position_at_end(success_block);
-            self.builder
-                .build_unconditional_branch(continue_block)
-                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-            // Continue block - continue with normal execution
-            self.builder.position_at_end(continue_block);
+            Ok(frame_base)
         }
-
-        debug!(
-            "Absolute address variable '{}' data safely read into global storage",
-            var_name
-        );
-        Ok(storage_global.as_pointer_value())
     }
 
-    /// Create placeholder for optimized out variables
+    /// Create absolute address access for DWARF variables at fixed memory locations
+    /// Returns a global storage pointer containing the read data
+    // Note: create_absolute_address_access method removed - use create_absolute_address_variable_access instead
+
+    /// Create optimized out placeholder for variables
     fn create_optimized_out_placeholder(&mut self, var_name: &str) -> Result<PointerValue<'ctx>> {
         debug!(
             "Creating optimized out placeholder for variable '{}'",
@@ -1562,35 +1047,6 @@ impl<'ctx> CodeGen<'ctx> {
         }
     }
 
-    /// Convert DWARF register number to pt_regs array index
-    /// Using aya's pt_regs structure indices
-    fn convert_dwarf_reg_to_pt_regs_index(&self, dwarf_reg: u16) -> usize {
-        match dwarf_reg {
-            // x86_64 DWARF register mappings to pt_regs indices
-            0 => pt_regs_indices::RAX,  // RAX -> pt_regs[RAX]
-            1 => pt_regs_indices::RCX,  // RCX -> pt_regs[RCX]
-            2 => pt_regs_indices::RDX,  // RDX -> pt_regs[RDX]
-            3 => pt_regs_indices::RBX,  // RBX -> pt_regs[RBX]
-            4 => pt_regs_indices::RSP,  // RSP -> pt_regs[RSP]
-            5 => pt_regs_indices::RBP,  // RBP -> pt_regs[RBP]
-            6 => pt_regs_indices::RSI,  // RSI -> pt_regs[RSI]
-            7 => pt_regs_indices::RDI,  // RDI -> pt_regs[RDI]
-            8 => pt_regs_indices::R8,   // R8 -> pt_regs[R8]
-            9 => pt_regs_indices::R9,   // R9 -> pt_regs[R9]
-            10 => pt_regs_indices::R10, // R10 -> pt_regs[R10]
-            11 => pt_regs_indices::R11, // R11 -> pt_regs[R11]
-            12 => pt_regs_indices::R12, // R12 -> pt_regs[R12]
-            13 => pt_regs_indices::R13, // R13 -> pt_regs[R13]
-            14 => pt_regs_indices::R14, // R14 -> pt_regs[R14]
-            15 => pt_regs_indices::R15, // R15 -> pt_regs[R15]
-            16 => pt_regs_indices::RIP, // RIP -> pt_regs[RIP]
-            _ => {
-                warn!("Unknown DWARF register {}, defaulting to RAX", dwarf_reg);
-                pt_regs_indices::RAX // Default to RAX
-            }
-        }
-    }
-
     /// Determine VarType from DWARF type information
     fn determine_var_type_from_dwarf(&self, dwarf_type: &Option<DwarfType>) -> VarType {
         match dwarf_type {
@@ -1630,10 +1086,12 @@ impl<'ctx> CodeGen<'ctx> {
         trace_statements: &[Statement],
         target_pid: Option<u32>,
         trace_id: Option<u32>,
+        compile_time_pc: Option<u64>, // PC address for compile-time DWARF queries
         save_ir_path: Option<&str>,
     ) -> Result<&Module<'ctx>> {
-        // Set the current trace_id for code generation
+        // Set the current trace_id and compile-time PC for code generation
         self.current_trace_id = trace_id;
+        self.current_compile_time_pc = compile_time_pc;
 
         // Declare all external functions
         self.declare_external_functions();
@@ -1739,7 +1197,13 @@ impl<'ctx> CodeGen<'ctx> {
                 )
                 .map_err(|e| CodeGenError::MapError(e.to_string()))?;
 
-            self.populate_variables_from_dwarf(&dwarf_variables, ctx_param, &used_variables)?;
+            // Pre-calculate variable access using DWARF expression evaluation
+            // This avoids runtime DWARF lookups which are not possible
+            // Variables will be queried and compiled just-in-time during send_variable_data
+            debug!(
+                "Pre-calculated {} DWARF variables for compile-time use",
+                dwarf_variables.len()
+            );
         } else {
             // Create required maps even if no DWARF variables
             // Use 8 pages (32KB) for ringbuf map
@@ -1795,7 +1259,15 @@ impl<'ctx> CodeGen<'ctx> {
     // Keep original compile method for backward compatibility
     pub fn compile(&mut self, program: &Program) -> Result<&Module<'ctx>> {
         // For backward compatibility, use "main" as function name and compile all statements
-        self.compile_with_function_name(program, "main", &program.statements, None, None, None)
+        self.compile_with_function_name(
+            program,
+            "main",
+            &program.statements,
+            None,
+            None,
+            None,
+            None,
+        )
     }
 
     fn declare_external_functions(&mut self) {
@@ -2254,38 +1726,361 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
-    /// Send variable data using protocol format
-    fn send_variable_data(&mut self, var_name: &str) -> Result<()> {
-        // Validate variable exists
-        self.validate_variable_access(var_name)?;
+    /// Get compile-time PC address for DWARF queries
+    fn get_compile_time_pc_address(&self) -> Result<u64> {
+        self.current_compile_time_pc.ok_or_else(|| {
+            CodeGenError::InvalidExpression(
+                "No compile-time PC address available for DWARF query".to_string(),
+            )
+        })
+    }
 
-        let var_ptr = *self
-            .variables
-            .get(var_name)
-            .ok_or_else(|| CodeGenError::VariableNotFound(var_name.to_string()))?;
-        let var_type = self
-            .var_types
-            .get(var_name)
-            .ok_or_else(|| CodeGenError::VariableNotFound(var_name.to_string()))?
-            .clone();
+    /// Query DWARF for variable location at compile-time PC
+    fn query_dwarf_for_variable(
+        &self,
+        var_name: &str,
+        pc: u64,
+    ) -> Result<ghostscope_binary::expression::EvaluationResult> {
+        if let Some(analyzer_ptr) = self.binary_analyzer {
+            unsafe {
+                let analyzer = &mut *analyzer_ptr;
+                if let Some(dwarf_context) = analyzer.dwarf_context_mut() {
+                    let enhanced_vars = dwarf_context.get_enhanced_variable_locations(pc);
 
-        info!("Sending variable data: {} (type: {:?})", var_name, var_type);
-
-        // Check if variable is optimized out and handle separately
-        if *self.optimized_out_vars.get(var_name).unwrap_or(&false) {
-            info!(
-                "Variable '{}' is optimized out, sending OptimizedOut protocol message",
-                var_name
-            );
-            // Get PC address for the variable (needed for size calculation)
-            let pc_address = self.var_pc_addresses.get(var_name).copied().unwrap_or(0);
-            self.build_and_send_optimized_out_message(var_name, &var_type, pc_address)
-        } else {
-            // Build protocol message for normal variables
-            // Get PC address for the variable to calculate correct size
-            let pc_address = self.var_pc_addresses.get(var_name).copied().unwrap_or(0);
-            self.build_and_send_protocol_message(var_name, &var_type, var_ptr, pc_address)
+                    for var_info in enhanced_vars {
+                        if var_info.variable.name == var_name {
+                            if let Some(ref eval_result) = var_info.evaluation_result {
+                                return Ok(eval_result.clone());
+                            }
+                        }
+                    }
+                }
+            }
         }
+
+        Err(CodeGenError::VariableNotFound(format!(
+            "Variable '{}' not found in DWARF at compile-time PC 0x{:x}",
+            var_name, pc
+        )))
+    }
+
+    /// Send variable data using protocol format - compile-time DWARF query + LLVM IR generation
+    fn send_variable_data(&mut self, var_name: &str) -> Result<()> {
+        debug!("Generating LLVM IR for variable: {}", var_name);
+
+        // Get compile-time PC address for DWARF query
+        let compile_time_pc = self.get_compile_time_pc_address()?;
+        debug!(
+            "Using compile-time PC 0x{:x} for DWARF query of '{}'",
+            compile_time_pc, var_name
+        );
+
+        // Query DWARF for variable location at compile-time
+        match self.query_dwarf_for_variable(var_name, compile_time_pc) {
+            Ok(location_expr) => {
+                debug!(
+                    "DWARF query successful for '{}': {:?}",
+                    var_name, location_expr
+                );
+
+                // Generate LLVM IR based on DWARF expression evaluation result
+                let ctx_param = self.get_current_function_ctx_param()?;
+                match location_expr {
+                    ghostscope_binary::expression::EvaluationResult::FrameOffset(offset) => {
+                        debug!(
+                            "Generating frame-based access for '{}' at offset {}",
+                            var_name, offset
+                        );
+                        let var_ptr =
+                            self.generate_frame_based_access_ir(ctx_param, offset, var_name)?;
+                        let var_type = self
+                            .get_variable_type_from_dwarf(var_name, compile_time_pc)
+                            .unwrap_or(VarType::Int);
+                        self.build_and_send_protocol_message(
+                            var_name,
+                            &var_type,
+                            var_ptr,
+                            compile_time_pc,
+                        )
+                    }
+                    ghostscope_binary::expression::EvaluationResult::Register(reg_access) => {
+                        debug!(
+                            "Generating register access for '{}': reg={}",
+                            var_name, reg_access.register
+                        );
+                        let var_ptr =
+                            self.generate_register_access_ir(ctx_param, &reg_access, var_name)?;
+                        let var_type = self
+                            .get_variable_type_from_dwarf(var_name, compile_time_pc)
+                            .unwrap_or(VarType::Int);
+                        self.build_and_send_protocol_message(
+                            var_name,
+                            &var_type,
+                            var_ptr,
+                            compile_time_pc,
+                        )
+                    }
+                    ghostscope_binary::expression::EvaluationResult::Address(addr) => {
+                        debug!(
+                            "Generating absolute address access for '{}' at 0x{:x}",
+                            var_name, addr
+                        );
+                        let var_ptr = self.generate_absolute_address_access_ir(addr, var_name)?;
+                        let var_type = self
+                            .get_variable_type_from_dwarf(var_name, compile_time_pc)
+                            .unwrap_or(VarType::Int);
+                        self.build_and_send_protocol_message(
+                            var_name,
+                            &var_type,
+                            var_ptr,
+                            compile_time_pc,
+                        )
+                    }
+                    ghostscope_binary::expression::EvaluationResult::Optimized => {
+                        debug!("Variable '{}' is optimized out", var_name);
+                        let var_type = VarType::Int;
+                        self.build_and_send_optimized_out_message(
+                            var_name,
+                            &var_type,
+                            compile_time_pc,
+                        )
+                    }
+                    _ => {
+                        debug!(
+                            "Unsupported expression type for '{}', treating as optimized out",
+                            var_name
+                        );
+                        let var_type = VarType::Int;
+                        self.build_and_send_optimized_out_message(
+                            var_name,
+                            &var_type,
+                            compile_time_pc,
+                        )
+                    }
+                }
+            }
+            Err(CodeGenError::VariableNotFound(_)) => {
+                debug!(
+                    "Variable '{}' not found in DWARF, treating as optimized out",
+                    var_name
+                );
+                let var_type = VarType::Int;
+                let pc_const = compile_time_pc;
+                self.build_and_send_optimized_out_message(var_name, &var_type, pc_const)
+            }
+            Err(e) => Err(e), // Other errors should propagate
+        }
+    }
+
+    /// Generate LLVM IR for frame-based variable access
+    fn generate_frame_based_access_ir(
+        &mut self,
+        ctx_param: PointerValue<'ctx>,
+        offset: i64,
+        var_name: &str,
+    ) -> Result<PointerValue<'ctx>> {
+        debug!(
+            "Generating frame-based access IR for '{}' with offset {}",
+            var_name, offset
+        );
+
+        // Get compile-time PC address for CFI query
+        let compile_time_pc = self.get_compile_time_pc_address()?;
+
+        // Get frame base using CFI information
+        // This generates LLVM IR to calculate frame_base + offset at runtime
+        let frame_base_ptr = self.get_frame_base_from_pt_regs(ctx_param, compile_time_pc)?;
+
+        // Generate address calculation IR
+        let i64_type = self.context.i64_type();
+        let offset_const = i64_type.const_int(offset.abs() as u64, false);
+
+        // frame_base_ptr is already the frame base address value, convert it to integer
+        let frame_base_value = self
+            .builder
+            .build_ptr_to_int(frame_base_ptr, i64_type, "frame_base")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        let var_addr = if offset >= 0 {
+            self.builder
+                .build_int_add(frame_base_value, offset_const, "var_addr")
+        } else {
+            self.builder
+                .build_int_sub(frame_base_value, offset_const, "var_addr")
+        }
+        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let var_ptr = self
+            .builder
+            .build_int_to_ptr(var_addr, ptr_type, &format!("{}_ptr", var_name))
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        // Generate safe memory read IR
+        let var_size = 8; // Default to 8 bytes, could be enhanced with DWARF type info
+        self.create_safe_user_memory_read(var_ptr, var_size, var_name)
+    }
+
+    /// Generate LLVM IR for register-based variable access
+    fn generate_register_access_ir(
+        &mut self,
+        ctx_param: PointerValue<'ctx>,
+        reg_access: &ghostscope_binary::expression::RegisterAccess,
+        var_name: &str,
+    ) -> Result<PointerValue<'ctx>> {
+        debug!(
+            "Generating register access IR for '{}': reg={}, offset={:?}, deref={}",
+            var_name, reg_access.register, reg_access.offset, reg_access.dereference
+        );
+
+        // Reuse existing register access logic
+        self.create_register_variable_access(reg_access, var_name, ctx_param)
+    }
+
+    /// Generate LLVM IR for absolute address variable access
+    fn generate_absolute_address_access_ir(
+        &mut self,
+        addr: u64,
+        var_name: &str,
+    ) -> Result<PointerValue<'ctx>> {
+        debug!(
+            "Generating absolute address access IR for '{}' at 0x{:x}",
+            var_name, addr
+        );
+
+        // Reuse existing absolute address access logic
+        self.create_absolute_address_variable_access(addr, var_name)
+    }
+
+    /// Get frame base pointer from pt_regs context based on CFI information
+    fn get_frame_base_from_pt_regs(
+        &mut self,
+        ctx_param: PointerValue<'ctx>,
+        pc_address: u64,
+    ) -> Result<PointerValue<'ctx>> {
+        let i64_type = self.context.i64_type();
+
+        // Query CFI information to determine frame base calculation
+        if let Some(analyzer_ptr) = self.binary_analyzer {
+            unsafe {
+                let analyzer = &mut *analyzer_ptr;
+                if let Some(dwarf_context) = analyzer.dwarf_context_mut() {
+                    // Get CFI rule for frame base at this PC address
+                    if let Some(cfi_rule) = dwarf_context.get_cfi_rule_for_pc(pc_address) {
+                        debug!(
+                            "Using CFI rule for frame base at PC 0x{:x}: {:?}",
+                            pc_address, cfi_rule
+                        );
+
+                        return match cfi_rule {
+                            ghostscope_binary::dwarf::CFARule::RegisterOffset {
+                                register,
+                                offset,
+                            } => {
+                                debug!("Frame base: register {} + offset {}", register, offset);
+
+                                // Convert DWARF register number to pt_regs byte offset
+                                let pt_regs_byte_offset = platform::dwarf_reg_to_pt_regs_byte_offset(*register)
+                                    .ok_or_else(|| CodeGenError::InvalidExpression(
+                                        format!("Unsupported DWARF register {} for current platform", register)
+                                    ))?;
+
+                                // Calculate i64 index for GEP (pt_regs is array of i64)
+                                // pt_regs byte offset / 8 = i64 array index  
+                                let i64_index = pt_regs_byte_offset / 8;
+                                let reg_index_const = i64_type.const_int(i64_index as u64, false);
+
+                                let reg_ptr = self
+                                    .builder
+                                    .build_gep(
+                                        i64_type,
+                                        ctx_param,
+                                        &[reg_index_const],
+                                        "frame_base_reg_ptr",
+                                    )
+                                    .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+                                // If there's an offset, we need to load the register value and add the offset
+                                if *offset != 0 {
+                                    // Load register value directly (reg_ptr is already correct i64*)
+                                    let reg_value = self
+                                        .builder
+                                        .build_load(i64_type, reg_ptr, "frame_base_reg_value")
+                                        .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                                        .into_int_value();
+
+                                    let offset_const =
+                                        i64_type.const_int(offset.abs() as u64, false);
+                                    let frame_base_value = if *offset >= 0 {
+                                        self.builder
+                                            .build_int_add(
+                                                reg_value,
+                                                offset_const,
+                                                "frame_base_with_offset",
+                                            )
+                                            .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                                    } else {
+                                        self.builder
+                                            .build_int_sub(
+                                                reg_value,
+                                                offset_const,
+                                                "frame_base_with_offset",
+                                            )
+                                            .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                                    };
+
+                                    // Convert back to pointer
+                                    let ptr_type = self.context.ptr_type(AddressSpace::default());
+                                    self.builder
+                                        .build_int_to_ptr(
+                                            frame_base_value,
+                                            ptr_type,
+                                            "frame_base_ptr",
+                                        )
+                                        .map_err(|e| CodeGenError::Builder(e.to_string()))
+                                } else {
+                                    // No offset, load register value and convert to pointer
+                                    let reg_value = self
+                                        .builder
+                                        .build_load(i64_type, reg_ptr, "frame_base_reg_value")
+                                        .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                                        .into_int_value();
+
+                                    // Convert register value to pointer
+                                    let ptr_type = self.context.ptr_type(AddressSpace::default());
+                                    self.builder
+                                        .build_int_to_ptr(reg_value, ptr_type, "frame_base_ptr")
+                                        .map_err(|e| CodeGenError::Builder(e.to_string()))
+                                }
+                            }
+                            ghostscope_binary::dwarf::CFARule::Expression(_ops) => {
+                                Err(CodeGenError::InvalidExpression(
+                                    format!(
+                                        "Complex CFI expression not supported at PC 0x{:x}. Frame base calculation requires simple register+offset rule.",
+                                        pc_address
+                                    ),
+                                ))
+                            }
+                            ghostscope_binary::dwarf::CFARule::Undefined => {
+                                Err(CodeGenError::InvalidExpression(
+                                    format!(
+                                        "Frame base undefined at PC 0x{:x}. No CFI rule available for frame base calculation.",
+                                        pc_address
+                                    ),
+                                ))
+                            }
+                        };
+                    }
+                }
+            }
+        }
+
+        Err(CodeGenError::InvalidExpression(
+            format!(
+                "No CFI information available for PC 0x{:x}. Cannot determine frame base without CFI data.",
+                pc_address
+            ),
+        ))
     }
 
     /// Build and send protocol format message
@@ -3864,5 +3659,720 @@ impl<'ctx> CodeGen<'ctx> {
 
         debug!("RBP trace_printk call generated successfully");
         Ok(())
+    }
+
+    /// Create computed access from a sequence of access steps
+    fn create_computed_access_from_steps(
+        &mut self,
+        ctx_param: PointerValue<'ctx>,
+        steps: &[AccessStep],
+        var_name: &str,
+    ) -> Result<PointerValue<'ctx>> {
+        let i64_type = self.context.i64_type();
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+
+        let mut current_value: Option<BasicValueEnum<'ctx>> = None;
+
+        for (i, step) in steps.iter().enumerate() {
+            debug!(
+                "Processing step {} for variable '{}': {:?}",
+                i, var_name, step
+            );
+
+            current_value = Some(match step {
+                AccessStep::LoadRegister(reg) => {
+                    let reg_ptr = self.create_register_access(
+                        ctx_param,
+                        *reg,
+                        &format!("{}_step{}", var_name, i),
+                    )?;
+                    self.builder
+                        .build_load(i64_type, reg_ptr, &format!("{}_reg{}_value", var_name, reg))
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                }
+
+                AccessStep::AddConstant(constant) => {
+                    let base = current_value.ok_or_else(|| {
+                        CodeGenError::InvalidExpression("No base value for AddConstant".to_string())
+                    })?;
+
+                    let base_int = if let BasicValueEnum::IntValue(int_val) = base {
+                        int_val
+                    } else if let BasicValueEnum::PointerValue(ptr_val) = base {
+                        self.builder
+                            .build_ptr_to_int(
+                                ptr_val,
+                                i64_type,
+                                &format!("{}_ptr_to_int", var_name),
+                            )
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                    } else {
+                        return Err(CodeGenError::InvalidExpression(
+                            "Invalid base type for AddConstant".to_string(),
+                        ));
+                    };
+
+                    let constant_val =
+                        i64_type.const_int(constant.unsigned_abs() as u64, *constant < 0);
+
+                    if *constant >= 0 {
+                        self.builder.build_int_add(
+                            base_int,
+                            constant_val,
+                            &format!("{}_add_const", var_name),
+                        )
+                    } else {
+                        self.builder.build_int_sub(
+                            base_int,
+                            constant_val,
+                            &format!("{}_sub_const", var_name),
+                        )
+                    }
+                    .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                    .into()
+                }
+
+                AccessStep::LoadFrameBase => {
+                    // This would require CFI context to resolve frame base
+                    // For now, fall back to RSP-based frame base estimation
+                    warn!("LoadFrameBase step encountered, using RSP-based fallback for variable '{}'", var_name);
+                    let rsp_index =
+                        i64_type.const_int(platform::pt_regs_indices::RSP as u64, false);
+                    let rsp_ptr = unsafe {
+                        self.builder
+                            .build_gep(i64_type, ctx_param, &[rsp_index], "frame_base_rsp")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                    };
+                    self.builder
+                        .build_load(i64_type, rsp_ptr, "frame_base_value")
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                }
+
+                AccessStep::Dereference { size } => {
+                    let addr = current_value.ok_or_else(|| {
+                        CodeGenError::InvalidExpression(
+                            "No address value for Dereference".to_string(),
+                        )
+                    })?;
+
+                    let addr_int = if let BasicValueEnum::IntValue(int_val) = addr {
+                        int_val
+                    } else if let BasicValueEnum::PointerValue(ptr_val) = addr {
+                        self.builder
+                            .build_ptr_to_int(
+                                ptr_val,
+                                i64_type,
+                                &format!("{}_deref_addr", var_name),
+                            )
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                    } else {
+                        return Err(CodeGenError::InvalidExpression(
+                            "Invalid address type for Dereference".to_string(),
+                        ));
+                    };
+
+                    // Use bpf_probe_read_user to safely read user memory
+                    let addr_ptr = self
+                        .builder
+                        .build_int_to_ptr(addr_int, ptr_type, &format!("{}_deref_ptr", var_name))
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+                    self.create_safe_user_memory_read(
+                        addr_ptr,
+                        *size,
+                        &format!("{}_deref", var_name),
+                    )?
+                    .into()
+                }
+
+                AccessStep::LoadCallFrameCFA => {
+                    // Load Call Frame CFA - would require CFI context
+                    warn!("LoadCallFrameCFA step encountered, using RSP-based fallback for variable '{}'", var_name);
+                    let rsp_index =
+                        i64_type.const_int(platform::pt_regs_indices::RSP as u64, false);
+                    let rsp_ptr = unsafe {
+                        self.builder
+                            .build_gep(i64_type, ctx_param, &[rsp_index], "cfa_rsp")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                    };
+                    self.builder
+                        .build_load(i64_type, rsp_ptr, "cfa_value")
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                }
+
+                AccessStep::Conditional { .. } => {
+                    return Err(CodeGenError::UnsupportedOperation(
+                        "Conditional access steps not yet implemented".to_string(),
+                    ));
+                }
+
+                AccessStep::Piece { .. } => {
+                    return Err(CodeGenError::UnsupportedOperation(
+                        "Piece access steps not yet implemented".to_string(),
+                    ));
+                }
+
+                AccessStep::ArithmeticOp(op) => {
+                    return Err(CodeGenError::UnsupportedOperation(format!(
+                        "ArithmeticOp {:?} not yet implemented in computed access",
+                        op
+                    )));
+                }
+            });
+        }
+
+        // Convert final result to pointer
+        let final_value = current_value.ok_or_else(|| {
+            CodeGenError::InvalidExpression("Computed access produced no result".to_string())
+        })?;
+
+        match final_value {
+            BasicValueEnum::IntValue(int_val) => {
+                let ptr_type = self.context.ptr_type(AddressSpace::default());
+                self.builder
+                    .build_int_to_ptr(int_val, ptr_type, &format!("{}_final_ptr", var_name))
+                    .map_err(|e| CodeGenError::Builder(e.to_string()))
+            }
+            BasicValueEnum::PointerValue(ptr_val) => Ok(ptr_val),
+            _ => Err(CodeGenError::InvalidExpression(
+                "Invalid final result type".to_string(),
+            )),
+        }
+    }
+
+    /// Create access for immediate values by storing them in a global variable
+    fn create_immediate_value_access(
+        &mut self,
+        value: i64,
+        var_name: &str,
+    ) -> Result<PointerValue<'ctx>> {
+        let i64_type = self.context.i64_type();
+        let global_name = format!("immediate_value_{}", var_name);
+
+        debug!(
+            "Creating immediate value global '{}' with value {}",
+            global_name, value
+        );
+
+        let global_var = self.module.add_global(i64_type, None, &global_name);
+        global_var.set_initializer(&i64_type.const_int(value as u64, value < 0));
+        global_var.set_constant(true);
+
+        Ok(global_var.as_pointer_value())
+    }
+
+    /// Create memory dereference from a pointer value using bpf_probe_read_user
+    fn create_memory_dereference_from_ptr(
+        &mut self,
+        ptr: PointerValue<'ctx>,
+        var_name: &str,
+    ) -> Result<PointerValue<'ctx>> {
+        // Default to 8 bytes for pointer dereference
+        self.create_safe_user_memory_read(ptr, 8, var_name)
+    }
+
+    /// Create safe user memory read using bpf_probe_read_user helper
+    fn create_safe_user_memory_read(
+        &mut self,
+        src_ptr: PointerValue<'ctx>,
+        size: usize,
+        var_name: &str,
+    ) -> Result<PointerValue<'ctx>> {
+        let i64_type = self.context.i64_type();
+        let i32_type = self.context.i32_type();
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+
+        // Create a global variable to store the read result
+        let result_type: BasicTypeEnum = match size {
+            1 => self.context.i8_type().into(),
+            2 => self.context.i16_type().into(),
+            4 => i32_type.into(),
+            8 => i64_type.into(),
+            _ => self.context.i8_type().array_type(size as u32).into(),
+        };
+
+        let global_name = format!("deref_result_{}", var_name);
+        let result_global = self.module.add_global(result_type, None, &global_name);
+        result_global.set_initializer(&result_type.const_zero());
+        let result_ptr = result_global.as_pointer_value();
+
+        // Use bpf_probe_read_user to safely read from user space
+        let helper_id = i64_type.const_int(BPF_FUNC_probe_read_user as u64, false);
+        let helper_fn_type = i64_type.fn_type(
+            &[
+                ptr_type.into(), // dst
+                i32_type.into(), // size
+                ptr_type.into(), // src
+            ],
+            false,
+        );
+        let helper_fn_ptr = self
+            .builder
+            .build_int_to_ptr(
+                helper_id,
+                self.context.ptr_type(AddressSpace::default()),
+                "probe_read_user_fn",
+            )
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        let size_val = i32_type.const_int(size as u64, false);
+        let _result = self
+            .builder
+            .build_indirect_call(
+                helper_fn_type,
+                helper_fn_ptr,
+                &[result_ptr.into(), size_val.into(), src_ptr.into()],
+                &format!("probe_read_{}", var_name),
+            )
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        debug!(
+            "Created safe user memory read for variable '{}', size: {}",
+            var_name, size
+        );
+        Ok(result_ptr)
+    }
+
+    /// Create access for implicit values from DWARF expressions
+    fn create_implicit_value_access(
+        &mut self,
+        bytes: &[u8],
+        var_name: &str,
+    ) -> Result<PointerValue<'ctx>> {
+        let global_name = format!("implicit_value_{}", var_name);
+
+        debug!(
+            "Creating implicit value global '{}' with {} bytes",
+            global_name,
+            bytes.len()
+        );
+
+        // Create an array type for the bytes
+        let byte_array_type = self.context.i8_type().array_type(bytes.len() as u32);
+        let global_var = self.module.add_global(byte_array_type, None, &global_name);
+
+        // Create array constant from bytes
+        let byte_constants: Vec<_> = bytes
+            .iter()
+            .map(|&b| self.context.i8_type().const_int(b as u64, false))
+            .collect();
+        let array_const = self.context.i8_type().const_array(&byte_constants);
+
+        global_var.set_initializer(&array_const);
+        global_var.set_constant(true);
+
+        Ok(global_var.as_pointer_value())
+    }
+
+    /// Get the current function's ctx parameter (uprobe context)
+    fn get_current_function_ctx_param(&self) -> Result<PointerValue<'ctx>> {
+        let current_fn = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| CodeGenError::Builder("No current basic block".to_string()))?
+            .get_parent()
+            .ok_or_else(|| CodeGenError::Builder("No parent function".to_string()))?;
+
+        let ctx_param = current_fn
+            .get_first_param()
+            .ok_or_else(|| CodeGenError::Builder("No ctx parameter found".to_string()))?
+            .into_pointer_value();
+
+        Ok(ctx_param)
+    }
+
+    /// Get current PC address from pt_regs context
+    fn get_current_pc_address(&mut self, ctx_param: PointerValue<'ctx>) -> Result<IntValue<'ctx>> {
+        let i64_type = self.context.i64_type();
+
+        // Get RIP (PC) from pt_regs - it's at offset for x86_64
+        // For uprobe, RIP contains the current instruction address
+        let rip_index = self
+            .context
+            .i64_type()
+            .const_int(platform::pt_regs_indices::RIP as u64, false);
+        let rip_ptr = unsafe {
+            self.builder
+                .build_gep(i64_type, ctx_param, &[rip_index], "rip_ptr")
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?
+        };
+
+        let pc_address = self
+            .builder
+            .build_load(i64_type, rip_ptr, "pc_address")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?
+            .into_int_value();
+
+        Ok(pc_address)
+    }
+
+    /// DEPRECATED: Create runtime variable access using DWARF expression evaluation
+    /// This function is deprecated and should not be used in the new architecture.
+    /// Use compile-time PC addresses with send_variable_data instead.
+    fn create_runtime_variable_access(
+        &mut self,
+        var_name: &str,
+        _pc_address: IntValue<'ctx>,
+        _ctx_param: PointerValue<'ctx>,
+    ) -> Result<PointerValue<'ctx>> {
+        // This function is deprecated in the new architecture
+        // All variable access should use compile-time DWARF queries
+        Err(CodeGenError::InvalidExpression(
+            format!("DEPRECATED: Runtime DWARF queries are no longer supported. Variable '{}' should be accessed via compile-time PC queries in send_variable_data.", var_name),
+        ))
+    }
+
+    /// Generate LLVM variable access code from DWARF expression evaluation result
+    fn generate_variable_access_from_evaluation(
+        &mut self,
+        var_info: &ghostscope_binary::dwarf::EnhancedVariableLocation,
+        var_name: &str,
+        ctx_param: PointerValue<'ctx>,
+        pc_address: u64,
+    ) -> Result<PointerValue<'ctx>> {
+        if let Some(ref evaluation_result) = var_info.evaluation_result {
+            match evaluation_result {
+                ghostscope_binary::expression::EvaluationResult::Register(reg_access) => {
+                    self.create_register_variable_access(reg_access, var_name, ctx_param)
+                }
+                ghostscope_binary::expression::EvaluationResult::FrameOffset(offset) => self
+                    .create_frame_offset_variable_access(*offset, var_name, ctx_param, pc_address),
+                ghostscope_binary::expression::EvaluationResult::Address(address) => {
+                    self.create_absolute_address_variable_access(*address, var_name)
+                }
+                ghostscope_binary::expression::EvaluationResult::ComputedAccess {
+                    steps, ..
+                } => self.create_computed_variable_access(steps, var_name, ctx_param),
+                ghostscope_binary::expression::EvaluationResult::Optimized => {
+                    self.create_optimized_out_placeholder(var_name)
+                }
+                ghostscope_binary::expression::EvaluationResult::StackOffset(offset) => {
+                    // Stack offset - similar to frame offset but relative to stack pointer
+                    self.create_frame_offset_variable_access(
+                        *offset, var_name, ctx_param, pc_address,
+                    )
+                }
+                ghostscope_binary::expression::EvaluationResult::CFAOffset(offset) => {
+                    // CFA offset - use frame base calculation with CFI
+                    self.create_frame_offset_variable_access(
+                        *offset, var_name, ctx_param, pc_address,
+                    )
+                }
+                ghostscope_binary::expression::EvaluationResult::Composite(_components) => {
+                    // Composite types - for now, treat as optimized out
+                    // TODO: Implement composite variable access
+                    debug!(
+                        "Composite variable access not yet implemented for '{}'",
+                        var_name
+                    );
+                    self.create_optimized_out_placeholder(var_name)
+                }
+                ghostscope_binary::expression::EvaluationResult::ImplicitValue(_value) => {
+                    // Implicit values - constants embedded in DWARF
+                    // TODO: Implement implicit value handling
+                    debug!(
+                        "Implicit value access not yet implemented for '{}'",
+                        var_name
+                    );
+                    self.create_optimized_out_placeholder(var_name)
+                }
+                ghostscope_binary::expression::EvaluationResult::Value(_value) => {
+                    // Direct values - constants
+                    // TODO: Implement direct value handling
+                    debug!("Direct value access not yet implemented for '{}'", var_name);
+                    self.create_optimized_out_placeholder(var_name)
+                }
+            }
+        } else {
+            // Fallback: try to use location expression directly
+            match &var_info.location_at_address {
+                ghostscope_binary::dwarf::LocationExpression::Register { reg } => {
+                    let reg_access = ghostscope_binary::expression::RegisterAccess {
+                        register: *reg,
+                        offset: None,
+                        dereference: false,
+                        size: Some(8), // Default to 8 bytes for register access
+                    };
+                    self.create_register_variable_access(&reg_access, var_name, ctx_param)
+                }
+                ghostscope_binary::dwarf::LocationExpression::RegisterOffset { reg, offset } => {
+                    let reg_access = ghostscope_binary::expression::RegisterAccess {
+                        register: *reg,
+                        offset: Some(*offset),
+                        dereference: true,
+                        size: Some(8), // Default to 8 bytes for register dereference
+                    };
+                    self.create_register_variable_access(&reg_access, var_name, ctx_param)
+                }
+                ghostscope_binary::dwarf::LocationExpression::FrameBaseOffset { offset } => self
+                    .create_frame_offset_variable_access(*offset, var_name, ctx_param, pc_address),
+                ghostscope_binary::dwarf::LocationExpression::OptimizedOut => {
+                    self.create_optimized_out_placeholder(var_name)
+                }
+                _ => {
+                    warn!(
+                        "Unsupported location expression for variable '{}': {:?}",
+                        var_name, var_info.location_at_address
+                    );
+                    self.create_optimized_out_placeholder(var_name)
+                }
+            }
+        }
+    }
+
+    /// Create register-based variable access
+    fn create_register_variable_access(
+        &mut self,
+        reg_access: &ghostscope_binary::expression::RegisterAccess,
+        var_name: &str,
+        ctx_param: PointerValue<'ctx>,
+    ) -> Result<PointerValue<'ctx>> {
+        let i64_type = self.context.i64_type();
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+
+        // Get register value from pt_regs
+        let reg_index = self
+            .context
+            .i64_type()
+            .const_int(reg_access.register as u64, false);
+        let reg_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    i64_type,
+                    ctx_param,
+                    &[reg_index],
+                    &format!("reg_{}_ptr", reg_access.register),
+                )
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?
+        };
+
+        let mut reg_value = self
+            .builder
+            .build_load(
+                i64_type,
+                reg_ptr,
+                &format!("reg_{}_value", reg_access.register),
+            )
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?
+            .into_int_value();
+
+        // Apply offset if present
+        if let Some(offset) = reg_access.offset {
+            let offset_const = self
+                .context
+                .i64_type()
+                .const_int(offset.unsigned_abs(), offset < 0);
+            reg_value = if offset >= 0 {
+                self.builder
+                    .build_int_add(
+                        reg_value,
+                        offset_const,
+                        &format!("{}_reg_offset_add", var_name),
+                    )
+                    .map_err(|e| CodeGenError::Builder(e.to_string()))?
+            } else {
+                self.builder
+                    .build_int_sub(
+                        reg_value,
+                        offset_const,
+                        &format!("{}_reg_offset_sub", var_name),
+                    )
+                    .map_err(|e| CodeGenError::Builder(e.to_string()))?
+            };
+        }
+
+        if reg_access.dereference {
+            // Convert to pointer and use safe memory read
+            let user_ptr = self
+                .builder
+                .build_int_to_ptr(reg_value, ptr_type, &format!("{}_reg_ptr", var_name))
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+            // Get variable size (default to 8 bytes)
+            let var_size = 8; // Default size, could be enhanced with DWARF type info
+
+            // Use existing safe memory read implementation
+            self.create_safe_user_memory_read(user_ptr, var_size, var_name)
+        } else {
+            // Direct register access - create global storage for the value
+            let storage_global = self.module.add_global(
+                i64_type,
+                Some(AddressSpace::default()),
+                &format!("reg_var_{}", var_name),
+            );
+            storage_global.set_initializer(&i64_type.const_zero());
+
+            // Store register value
+            self.builder
+                .build_store(storage_global.as_pointer_value(), reg_value)
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+            Ok(storage_global.as_pointer_value())
+        }
+    }
+
+    /// Create frame offset-based variable access
+    fn create_frame_offset_variable_access(
+        &mut self,
+        offset: i64,
+        var_name: &str,
+        ctx_param: PointerValue<'ctx>,
+        pc_address: u64,
+    ) -> Result<PointerValue<'ctx>> {
+        // Use existing frame base access with DWARF expression evaluation
+        self.create_frame_base_offset_access(ctx_param, offset, var_name, pc_address)
+    }
+
+    /// Create absolute address-based variable access
+    fn create_absolute_address_variable_access(
+        &mut self,
+        address: u64,
+        var_name: &str,
+    ) -> Result<PointerValue<'ctx>> {
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+
+        // Convert address to pointer
+        let addr_const = self.context.i64_type().const_int(address, false);
+        let user_ptr = self
+            .builder
+            .build_int_to_ptr(addr_const, ptr_type, &format!("{}_abs_ptr", var_name))
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        // Default size - could be enhanced with DWARF type info
+        let var_size = 8;
+
+        // Use existing safe memory read implementation
+        self.create_safe_user_memory_read(user_ptr, var_size, var_name)
+    }
+
+    /// Create computed access-based variable access
+    fn create_computed_variable_access(
+        &mut self,
+        steps: &[ghostscope_binary::expression::AccessStep],
+        var_name: &str,
+        ctx_param: PointerValue<'ctx>,
+    ) -> Result<PointerValue<'ctx>> {
+        let i64_type = self.context.i64_type();
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+
+        let mut current_value: Option<IntValue<'ctx>> = None;
+
+        for step in steps {
+            match step {
+                ghostscope_binary::expression::AccessStep::LoadRegister(reg_num) => {
+                    let reg_index = self.context.i64_type().const_int(*reg_num as u64, false);
+                    let reg_ptr = unsafe {
+                        self.builder
+                            .build_gep(
+                                i64_type,
+                                ctx_param,
+                                &[reg_index],
+                                &format!("step_reg_{}_ptr", reg_num),
+                            )
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                    };
+
+                    let reg_value = self
+                        .builder
+                        .build_load(i64_type, reg_ptr, &format!("step_reg_{}_value", reg_num))
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                        .into_int_value();
+
+                    current_value = Some(reg_value);
+                }
+                ghostscope_binary::expression::AccessStep::AddConstant(offset) => {
+                    let base = current_value.ok_or_else(|| {
+                        CodeGenError::InvalidExpression("No base value for addition".to_string())
+                    })?;
+
+                    let offset_const = self
+                        .context
+                        .i64_type()
+                        .const_int(offset.unsigned_abs(), *offset < 0);
+                    let result = if *offset >= 0 {
+                        self.builder
+                            .build_int_add(base, offset_const, &format!("{}_step_add", var_name))
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                    } else {
+                        self.builder
+                            .build_int_sub(base, offset_const, &format!("{}_step_sub", var_name))
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                    };
+
+                    current_value = Some(result);
+                }
+                ghostscope_binary::expression::AccessStep::Dereference { size } => {
+                    let addr = current_value.ok_or_else(|| {
+                        CodeGenError::InvalidExpression("No address to dereference".to_string())
+                    })?;
+
+                    let user_ptr = self
+                        .builder
+                        .build_int_to_ptr(addr, ptr_type, &format!("{}_step_deref_ptr", var_name))
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+                    // Use safe memory read and return early since this produces a pointer
+                    return self.create_safe_user_memory_read(user_ptr, *size, var_name);
+                }
+                _ => {
+                    return Err(CodeGenError::NotImplemented(format!(
+                        "Access step {:?} not implemented",
+                        step
+                    )));
+                }
+            }
+        }
+
+        // If we get here without a dereference, create a global storage for the final value
+        if let Some(final_value) = current_value {
+            let storage_global = self.module.add_global(
+                i64_type,
+                Some(AddressSpace::default()),
+                &format!("computed_var_{}", var_name),
+            );
+            storage_global.set_initializer(&i64_type.const_zero());
+
+            self.builder
+                .build_store(storage_global.as_pointer_value(), final_value)
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+            Ok(storage_global.as_pointer_value())
+        } else {
+            Err(CodeGenError::InvalidExpression(
+                "Computed access produced no result".to_string(),
+            ))
+        }
+    }
+
+    /// Get variable type from DWARF information
+    fn get_variable_type_from_dwarf(&self, var_name: &str, pc_address: u64) -> Option<VarType> {
+        if let Some(analyzer_ptr) = self.binary_analyzer {
+            unsafe {
+                let analyzer = &mut *analyzer_ptr;
+                if let Some(dwarf_context) = analyzer.dwarf_context_mut() {
+                    let enhanced_vars = dwarf_context.get_enhanced_variable_locations(pc_address);
+
+                    for var_info in enhanced_vars {
+                        if var_info.variable.name == var_name {
+                            // Convert DWARF type to VarType
+                            return match var_info.variable.type_name.as_str() {
+                                t if t.contains("int")
+                                    || t.contains("long")
+                                    || t.contains("short") =>
+                                {
+                                    Some(VarType::Int)
+                                }
+                                t if t.contains("float") || t.contains("double") => {
+                                    Some(VarType::Float)
+                                }
+                                t if t.contains("char") => Some(VarType::String),
+                                _ => Some(VarType::Int), // Default to int
+                            };
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 }

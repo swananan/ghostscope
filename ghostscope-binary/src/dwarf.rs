@@ -1,3 +1,4 @@
+use crate::expression::{CFIContext, DwarfExpressionEvaluator};
 use crate::scoped_variables::{AddressRange, ScopeId, ScopeType, ScopedVariableMap};
 use crate::{BinaryError, Result};
 use gimli::{Dwarf, EndianSlice, LittleEndian, Reader, UnwindSection};
@@ -82,6 +83,8 @@ pub struct DwarfContext {
 
     // Scoped variable system (GDB-inspired)
     scoped_variable_map: Option<ScopedVariableMap>,
+    // DWARF expression evaluator for CFI and variable location evaluation
+    expression_evaluator: DwarfExpressionEvaluator,
 }
 
 /// Enhanced file information registry for efficient file path queries
@@ -676,6 +679,8 @@ pub struct EnhancedVariableLocation {
     pub address: u64,
     pub size: Option<u64>,
     pub is_optimized_out: bool,
+    /// Enhanced evaluation result from DWARF expression evaluator
+    pub evaluation_result: Option<crate::expression::EvaluationResult>,
 }
 
 /// High-performance line number index (inspired by addr2line)
@@ -945,6 +950,7 @@ impl VariableLocationMap {
                             address: addr,
                             size: None, // TODO: Extract from dwarf_type
                             is_optimized_out,
+                            evaluation_result: None, // Legacy path without expression evaluation
                         });
                     }
                 }
@@ -1058,6 +1064,7 @@ impl DwarfContext {
             line_index: None,
             file_registry: None,
             scoped_variable_map: None,
+            expression_evaluator: DwarfExpressionEvaluator::new(),
         };
 
         // Build CFI table for efficient lookups
@@ -1270,6 +1277,7 @@ impl DwarfContext {
                         address: addr,
                         size: result.variable_info.size,
                         is_optimized_out: result.is_optimized_out,
+                        evaluation_result: result.evaluation_result.clone(),
                     }
                 })
                 .collect()
@@ -4068,12 +4076,31 @@ impl DwarfContext {
                     debug!("CFI rule undefined for PC 0x{:x}", pc);
                     None
                 }
-                CFARule::Expression(_) => {
+                CFARule::Expression(ops) => {
                     debug!(
-                        "CFI rule uses expression for PC 0x{:x} (not yet supported)",
+                        "Evaluating CFI expression for frame base offset at PC 0x{:x}",
                         pc
                     );
-                    None
+                    let cfi_context = CFIContext {
+                        pc_address: pc,
+                        available_registers: std::collections::HashMap::new(), // Use empty for frame base
+                        address_size: 8,
+                    };
+
+                    match self
+                        .expression_evaluator
+                        .evaluate_for_cfi(ops, &cfi_context)
+                    {
+                        Ok(frame_base) => {
+                            debug!("Frame base expression evaluated to: 0x{:x}", frame_base);
+                            // For frame base, return 0 as the offset since we already have the absolute address
+                            Some(0)
+                        }
+                        Err(e) => {
+                            debug!("Failed to evaluate frame base expression: {}", e);
+                            None
+                        }
+                    }
                 }
             }
         } else {
@@ -4118,6 +4145,11 @@ impl DwarfContext {
         }
     }
 
+    /// Get CFI rule for frame base calculation at a specific PC
+    pub fn get_cfi_rule_for_pc(&self, pc: u64) -> Option<&CFARule> {
+        self.get_cfi_at_pc(pc).map(|entry| &entry.cfa_rule)
+    }
+
     /// Calculate CFA (Canonical Frame Address) for a specific PC
     pub fn calculate_cfa_at_pc(
         &self,
@@ -4134,9 +4166,27 @@ impl DwarfContext {
                         None
                     }
                 }
-                CFARule::Expression(_ops) => {
-                    debug!("CFA expression evaluation not yet implemented");
-                    None
+                CFARule::Expression(ops) => {
+                    debug!("Evaluating CFA expression with {} operations", ops.len());
+                    let cfi_context = CFIContext {
+                        pc_address: pc,
+                        available_registers: registers.clone(),
+                        address_size: 8, // Assume 64-bit for now
+                    };
+
+                    match self
+                        .expression_evaluator
+                        .evaluate_for_cfi(ops, &cfi_context)
+                    {
+                        Ok(cfa_value) => {
+                            debug!("CFA expression evaluated to: 0x{:x}", cfa_value);
+                            Some(cfa_value)
+                        }
+                        Err(e) => {
+                            debug!("Failed to evaluate CFA expression: {}", e);
+                            None
+                        }
+                    }
                 }
                 CFARule::Undefined => {
                     debug!("CFA undefined at PC 0x{:x}", pc);
@@ -4177,6 +4227,11 @@ impl DwarfContext {
 
     /// Get frame base offset for a variable at a specific PC
     /// This is key for accurate fbreg-based variable access
+    /// Get access to the DWARF expression evaluator for CFI expression evaluation
+    pub fn get_expression_evaluator(&self) -> &crate::expression::DwarfExpressionEvaluator {
+        &self.expression_evaluator
+    }
+
     pub fn get_frame_base_info(&self, pc: u64) -> Option<FrameBaseInfo> {
         // For now, return a simple frame base rule using RBP
         // TODO: Implement proper CFA-based frame base calculation
