@@ -16,6 +16,10 @@ pub struct SourceCodePanel {
     pub area_height: u16, // Store the current area height for scroll calculations
     pub language: String, // Programming language for syntax highlighting
     pub syntax_highlighter: SyntaxHighlighter,
+
+    pub number_buffer: String, // Buffer for collecting numbers before 'g'
+    pub expecting_g: bool,     // Whether we're expecting a 'g' after numbers
+    pub g_pressed: bool,       // Whether 'g' was pressed (for 'gg' combination)
 }
 
 impl SourceCodePanel {
@@ -29,6 +33,9 @@ impl SourceCodePanel {
             area_height: 10,           // Default height
             language: "c".to_string(), // Default to C
             syntax_highlighter: SyntaxHighlighter::new(),
+            number_buffer: String::new(),
+            expecting_g: false,
+            g_pressed: false,
         }
     }
 
@@ -185,6 +192,72 @@ impl SourceCodePanel {
         }
     }
 
+    /// Handle number input for vim-style number + g navigation
+    pub fn handle_number_input(&mut self, digit: char) {
+        if digit.is_ascii_digit() {
+            self.number_buffer.push(digit);
+            self.expecting_g = true;
+        }
+    }
+
+    /// Handle 'g' key for vim-style navigation
+    pub fn handle_g_key(&mut self) -> bool {
+        if self.g_pressed {
+            // Second 'g' - 'gg' combination, go to top
+            self.move_to_top();
+            self.g_pressed = false;
+            return true;
+        } else {
+            // First 'g' - set flag and wait for second 'g'
+            self.g_pressed = true;
+            return true;
+        }
+    }
+
+    /// Handle 'G' key for vim-style navigation
+    pub fn handle_uppercase_g_key(&mut self) -> bool {
+        if self.expecting_g {
+            if self.number_buffer.is_empty() {
+                // Just 'G' - go to bottom (like vim)
+                self.move_to_bottom();
+            } else {
+                // Number + 'G' - go to specific line
+                if let Ok(line_num) = self.number_buffer.parse::<usize>() {
+                    self.goto_line(line_num);
+                }
+            }
+            self.clear_number_buffer();
+            return true;
+        } else {
+            // Just 'G' - go to bottom
+            self.move_to_bottom();
+            return true;
+        }
+    }
+
+    /// Clear the number buffer and reset expecting_g state
+    pub fn clear_number_buffer(&mut self) {
+        self.number_buffer.clear();
+        self.expecting_g = false;
+        self.g_pressed = false;
+    }
+
+    /// Go to a specific line number (1-based, like vim)
+    pub fn goto_line(&mut self, line_number: usize) {
+        if self.content.is_empty() {
+            return;
+        }
+
+        // Convert 1-based line number to 0-based index
+        let target_line = if line_number == 0 { 0 } else { line_number - 1 };
+
+        // If line number is greater than total lines, go to the last line
+        let max_line = self.content.len() - 1;
+        self.current_line = target_line.min(max_line);
+        self.current_column = 0;
+        self.ensure_cursor_visible();
+    }
+
     pub fn move_right(&mut self) {
         if let Some(current_line_content) = self.content.get(self.current_line) {
             if self.current_column < current_line_content.len() {
@@ -305,6 +378,74 @@ impl SourceCodePanel {
         );
 
         frame.render_widget(list, area);
+
+        // Display input buffer in bottom right corner
+        if is_focused && (!self.number_buffer.is_empty() || self.g_pressed) {
+            let mut display_text = String::new();
+
+            if !self.number_buffer.is_empty() {
+                display_text.push_str(&self.number_buffer);
+            }
+
+            if self.g_pressed {
+                display_text.push('g');
+            }
+
+            if !display_text.is_empty() {
+                // Create a nice display with hint text
+                let hint_text = if self.g_pressed && self.number_buffer.is_empty() {
+                    "Press 'g' again for top"
+                } else if !self.number_buffer.is_empty() && !self.g_pressed {
+                    "Press 'G' to jump to line"
+                } else if !self.number_buffer.is_empty() && self.g_pressed {
+                    "Press 'G' to jump to line"
+                } else {
+                    ""
+                };
+
+                // Create styled spans with different colors for numbers and hints
+                let mut spans = Vec::new();
+
+                // Add the input text (numbers + g) with green color
+                spans.push(Span::styled(
+                    display_text.clone(),
+                    Style::default()
+                        .fg(Color::Green) // Green for input
+                        .bg(Color::Rgb(30, 30, 30)), // Dark gray background
+                ));
+
+                // Add hint text with border color if present
+                if !hint_text.is_empty() {
+                    spans.push(Span::styled(
+                        format!(" ({})", hint_text),
+                        Style::default()
+                            .fg(border_style.fg.unwrap_or(Color::White)) // Same as border color
+                            .bg(Color::Rgb(30, 30, 30)), // Dark gray background
+                    ));
+                }
+
+                let text = ratatui::text::Text::from(ratatui::text::Line::from(spans));
+
+                // Calculate total text width for positioning
+                let full_text = if !hint_text.is_empty() {
+                    format!("{} ({})", display_text, hint_text)
+                } else {
+                    display_text
+                };
+
+                // Position in bottom right corner with some padding
+                let text_width = full_text.len() as u16;
+                let display_x = area.x + area.width.saturating_sub(text_width + 2);
+                let display_y = area.y + area.height.saturating_sub(1);
+
+                // Render the text
+                frame.render_widget(
+                    ratatui::widgets::Paragraph::new(text)
+                        .alignment(ratatui::layout::Alignment::Right),
+                    Rect::new(display_x, display_y, text_width + 2, 1),
+                );
+            }
+        }
 
         if is_focused && !self.content.is_empty() {
             self.ensure_column_bounds();

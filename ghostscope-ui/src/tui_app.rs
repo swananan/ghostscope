@@ -600,28 +600,46 @@ impl TuiApp {
             FocusedPanel::Source => {
                 match key.code {
                     KeyCode::Up | KeyCode::Char('k') => {
+                        self.source_panel.clear_number_buffer(); // Clear any pending number input
                         self.source_panel.move_up();
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
+                        self.source_panel.clear_number_buffer(); // Clear any pending number input
                         self.source_panel.move_down();
                     }
                     KeyCode::Left | KeyCode::Char('h') => {
+                        self.source_panel.clear_number_buffer(); // Clear any pending number input
                         self.source_panel.move_left();
                     }
                     KeyCode::Right | KeyCode::Char('l') => {
+                        self.source_panel.clear_number_buffer(); // Clear any pending number input
                         self.source_panel.move_right();
                     }
                     KeyCode::Char('g') => {
-                        self.source_panel.move_to_top();
+                        // Handle vim-style number + g navigation and gg combination
+                        self.source_panel.handle_g_key();
                     }
                     KeyCode::Char('G') => {
-                        self.source_panel.move_to_bottom();
+                        // Handle vim-style number + G navigation
+                        self.source_panel.handle_uppercase_g_key();
                     }
-                    _ => {}
+                    KeyCode::Esc => {
+                        // ESC key cancels any pending number input
+                        self.source_panel.clear_number_buffer();
+                    }
+                    KeyCode::Char(c) if c.is_ascii_digit() => {
+                        // Handle number input for vim-style navigation
+                        self.source_panel.handle_number_input(c);
+                    }
+                    _ => {
+                        // Any other key clears the number buffer
+                        self.source_panel.clear_number_buffer();
+                    }
                 }
 
                 // Handle Ctrl+key combinations
                 if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    self.source_panel.clear_number_buffer(); // Clear any pending number input
                     match key.code {
                         KeyCode::Char('d') => {
                             self.source_panel.move_down_fast();
