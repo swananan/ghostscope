@@ -751,6 +751,7 @@ impl EventParser {
                 }
 
                 Some(EventData {
+                    message_number: 0, // Will be assigned by UI
                     trace_id: msg_body.trace_id,
                     timestamp: msg_body.timestamp,
                     pid: msg_body.pid,
@@ -799,6 +800,7 @@ impl EventParser {
                 );
 
                 Some(EventData {
+                    message_number: 0, // Will be assigned by UI
                     trace_id,
                     timestamp,
                     pid,
@@ -839,6 +841,7 @@ impl EventParser {
                 );
 
                 Some(EventData {
+                    message_number: 0, // Will be assigned by UI
                     trace_id,
                     timestamp,
                     pid,
@@ -909,6 +912,7 @@ impl EventParser {
 /// Structured event data from eBPF program using GhostScope Protocol
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventData {
+    pub message_number: u64, // Unique message number assigned by UI
     pub trace_id: u64,
     pub timestamp: u64,
     pub pid: u32,
@@ -945,8 +949,8 @@ impl std::fmt::Display for EventData {
         let readable_ts = EventParser::format_timestamp_ns(self.timestamp);
         writeln!(
             f,
-            "Event [trace_id: {}, pid: {}, tid: {}, timestamp: {}]:",
-            self.trace_id, self.pid, self.tid, readable_ts
+            "Event [no: {}, trace_id: {}, pid: {}, tid: {}, timestamp: {}]:",
+            self.message_number, self.trace_id, self.pid, self.tid, readable_ts
         )?;
         for var in &self.variables {
             writeln!(

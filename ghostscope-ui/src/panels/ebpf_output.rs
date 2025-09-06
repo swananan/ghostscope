@@ -12,8 +12,8 @@ use ghostscope_protocol::EventData;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DisplayMode {
-    AutoRefresh,  // Default mode: always show latest trace, auto-scroll
-    Scroll,       // Manual mode: show cursor, manual navigation
+    AutoRefresh, // Default mode: always show latest trace, auto-scroll
+    Scroll,      // Manual mode: show cursor, manual navigation
 }
 
 pub struct EbpfInfoPanel {
@@ -21,9 +21,10 @@ pub struct EbpfInfoPanel {
     pub scroll_offset: usize,
     pub max_messages: usize,
     pub auto_scroll: bool,
-    pub cursor_trace_index: usize,  // Index of the selected trace (not line)
-    pub show_cursor: bool,          // Whether to show cursor highlighting
-    pub display_mode: DisplayMode,  // Current display mode
+    pub cursor_trace_index: usize, // Index of the selected trace (not line)
+    pub show_cursor: bool,         // Whether to show cursor highlighting
+    pub display_mode: DisplayMode, // Current display mode
+    pub next_message_number: u64,  // Next message number to assign
 }
 
 impl EbpfInfoPanel {
@@ -36,10 +37,15 @@ impl EbpfInfoPanel {
             cursor_trace_index: 0,
             show_cursor: false,
             display_mode: DisplayMode::AutoRefresh,
+            next_message_number: 1, // Start from 1
         }
     }
 
-    pub fn add_trace_event(&mut self, trace_event: EventData) {
+    pub fn add_trace_event(&mut self, mut trace_event: EventData) {
+        // Assign message number
+        trace_event.message_number = self.next_message_number;
+        self.next_message_number += 1;
+
         self.trace_events.push_back(trace_event);
         if self.trace_events.len() > self.max_messages {
             self.trace_events.pop_front();
@@ -117,7 +123,12 @@ impl EbpfInfoPanel {
     }
 
     /// Ensure the cursor trace is visible by adjusting scroll offset
-    fn ensure_cursor_visible(&mut self, total_items: usize, available_height: usize, content_width: usize) {
+    fn ensure_cursor_visible(
+        &mut self,
+        total_items: usize,
+        available_height: usize,
+        content_width: usize,
+    ) {
         if total_items <= available_height {
             // All items fit, no scrolling needed
             self.scroll_offset = 0;
@@ -130,17 +141,31 @@ impl EbpfInfoPanel {
             if trace_index == self.cursor_trace_index {
                 break;
             }
-            
+
             // Count actual lines for this trace (including wrapped lines)
             // Use the same content width calculation as in render method
+            let message_type_short = match trace.message_type {
+                ghostscope_protocol::EventMessageType::VariableData => "VAR",
+                ghostscope_protocol::EventMessageType::Log => "LOG",
+                ghostscope_protocol::EventMessageType::ExecutionFailure => "ERR",
+                ghostscope_protocol::EventMessageType::Unknown => "UNK",
+            };
+
             let mut message_line = format!(
-                "{} [TraceID:{}] PID:{} TID:{} [{:?}]",
-                trace.readable_timestamp, trace.trace_id, trace.pid, trace.tid, trace.message_type
+                "{} [No:{}] TraceID:{} PID:{} TID:{} [{}]",
+                trace.readable_timestamp,
+                trace.message_number,
+                trace.trace_id,
+                trace.pid,
+                trace.tid,
+                message_type_short
             );
 
             // Add variable information if available
             if !trace.variables.is_empty() {
-                let variables_info = trace.variables.iter()
+                let variables_info = trace
+                    .variables
+                    .iter()
                     .map(|var| format!("{}: {}", var.name, var.formatted_value))
                     .collect::<Vec<_>>()
                     .join(", ");
@@ -179,20 +204,34 @@ impl EbpfInfoPanel {
 
         // Add trace events with clean, simple formatting
         let total_traces = self.trace_events.len();
-        
+
         for (trace_index, trace) in self.trace_events.iter().enumerate() {
             let is_latest = trace_index == total_traces - 1;
             let is_cursor_trace = self.show_cursor && trace_index == self.cursor_trace_index;
 
             // Create the main message line with enhanced information
+            let message_type_short = match trace.message_type {
+                ghostscope_protocol::EventMessageType::VariableData => "VAR",
+                ghostscope_protocol::EventMessageType::Log => "LOG",
+                ghostscope_protocol::EventMessageType::ExecutionFailure => "ERR",
+                ghostscope_protocol::EventMessageType::Unknown => "UNK",
+            };
+
             let mut message_line = format!(
-                "{} [TraceID:{}] PID:{} TID:{} [{:?}]",
-                trace.readable_timestamp, trace.trace_id, trace.pid, trace.tid, trace.message_type
+                "{} [No:{}] TraceID:{} PID:{} TID:{} [{}]",
+                trace.readable_timestamp,
+                trace.message_number,
+                trace.trace_id,
+                trace.pid,
+                trace.tid,
+                message_type_short
             );
 
             // Add variable information if available
             if !trace.variables.is_empty() {
-                let variables_info = trace.variables.iter()
+                let variables_info = trace
+                    .variables
+                    .iter()
                     .map(|var| format!("{}: {}", var.name, var.formatted_value))
                     .collect::<Vec<_>>()
                     .join(", ");
@@ -215,9 +254,9 @@ impl EbpfInfoPanel {
             // Determine the style based on latest message and cursor position
             let final_style = if is_cursor_trace {
                 // Cursor highlighting - use pink/magenta with bold and reverse for better terminal visibility
-                Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(ratatui::style::Modifier::BOLD | ratatui::style::Modifier::REVERSED)
+                Style::default().fg(Color::Magenta).add_modifier(
+                    ratatui::style::Modifier::BOLD | ratatui::style::Modifier::REVERSED,
+                )
             } else if is_latest {
                 // Latest message highlighting
                 Style::default()
@@ -259,7 +298,11 @@ impl EbpfInfoPanel {
             }
             DisplayMode::Scroll => {
                 // Scroll mode: ensure cursor trace is visible
-                self.ensure_cursor_visible(all_items.len(), available_height as usize, content_width as usize);
+                self.ensure_cursor_visible(
+                    all_items.len(),
+                    available_height as usize,
+                    content_width as usize,
+                );
             }
         }
 
