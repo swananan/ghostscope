@@ -36,6 +36,9 @@ pub struct TuiApp {
     focused_panel: FocusedPanel,
     expecting_window_nav: bool,
 
+    // Ctrl+w timeout mechanism
+    ctrl_w_timeout: Option<std::time::Instant>,
+
     // Event communication
     event_registry: EventRegistry,
 }
@@ -63,6 +66,7 @@ impl TuiApp {
             layout_mode,
             focused_panel: FocusedPanel::InteractiveCommand,
             expecting_window_nav: false,
+            ctrl_w_timeout: None,
             event_registry,
         })
     }
@@ -90,6 +94,30 @@ impl TuiApp {
         // Main event loop with event-driven rendering
         let result = loop {
             tokio::select! {
+                // Check for Ctrl+w timeout
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                    if let Some(timeout) = self.ctrl_w_timeout {
+                        if timeout.elapsed().as_millis() >= 300 {
+                            // Timeout reached, execute delete word action
+                            debug!("Ctrl+w timeout reached, executing delete word action");
+                            if self.focused_panel == FocusedPanel::InteractiveCommand {
+                                match self.interactive_command_panel.mode {
+                                    crate::panels::InteractionMode::Input => {
+                                        self.interactive_command_panel.delete_previous_word();
+                                    }
+                                    crate::panels::InteractionMode::ScriptEditor => {
+                                        self.interactive_command_panel.delete_previous_word_in_script();
+                                    }
+                                    _ => {} // Should not happen
+                                }
+                            }
+                            self.ctrl_w_timeout = None;
+                            self.expecting_window_nav = false;
+                            needs_render = true;
+                        }
+                    }
+                }
+
                 // Handle crossterm events (keyboard, mouse, resize)
                 Some(event_result) = event_stream.next() => {
                     match event_result {
@@ -169,6 +197,7 @@ impl TuiApp {
                     }
                     debug!("Window nav: moved focus down to {:?}", self.focused_panel);
                     self.expecting_window_nav = false;
+                    self.ctrl_w_timeout = None; // Clear timeout
                     return Ok(false);
                 }
                 KeyCode::Char('k') => {
@@ -178,6 +207,7 @@ impl TuiApp {
                     }
                     debug!("Window nav: moved focus up to {:?}", self.focused_panel);
                     self.expecting_window_nav = false;
+                    self.ctrl_w_timeout = None; // Clear timeout
                     return Ok(false);
                 }
                 KeyCode::Char('h') => {
@@ -187,6 +217,7 @@ impl TuiApp {
                     }
                     debug!("Window nav: moved focus left to {:?}", self.focused_panel);
                     self.expecting_window_nav = false;
+                    self.ctrl_w_timeout = None; // Clear timeout
                     return Ok(false);
                 }
                 KeyCode::Char('l') => {
@@ -196,6 +227,7 @@ impl TuiApp {
                     }
                     debug!("Window nav: moved focus right to {:?}", self.focused_panel);
                     self.expecting_window_nav = false;
+                    self.ctrl_w_timeout = None; // Clear timeout
                     return Ok(false);
                 }
                 KeyCode::Char('v') => {
@@ -203,12 +235,14 @@ impl TuiApp {
                     self.switch_layout();
                     debug!("Switched layout to {:?}", self.layout_mode);
                     self.expecting_window_nav = false;
+                    self.ctrl_w_timeout = None; // Clear timeout
                     return Ok(false);
                 }
                 _ => {
                     // Any other key cancels window navigation expectation
                     self.expecting_window_nav = false;
-                    // Fall through to normal key handling
+                    self.ctrl_w_timeout = None; // Clear timeout
+                                                // Fall through to normal key handling
                 }
             }
         }
@@ -231,25 +265,30 @@ impl TuiApp {
                 return Ok(true);
             }
             KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                // Handle Ctrl+w based on current focus and mode
+                // Handle Ctrl+w with timeout mechanism
                 if self.focused_panel == FocusedPanel::InteractiveCommand {
-                    // In Interactive Command panel, Ctrl+w is for text editing
+                    // In Interactive Command panel, check mode
                     match self.interactive_command_panel.mode {
                         crate::panels::InteractionMode::Input => {
-                            self.interactive_command_panel.delete_previous_word();
+                            // Set timeout for potential window navigation
+                            self.ctrl_w_timeout = Some(std::time::Instant::now());
+                            self.expecting_window_nav = true;
+                            debug!("Ctrl+w pressed in Input mode, waiting for navigation key or timeout");
                         }
                         crate::panels::InteractionMode::ScriptEditor => {
-                            self.interactive_command_panel
-                                .delete_previous_word_in_script();
+                            // Set timeout for potential window navigation
+                            self.ctrl_w_timeout = Some(std::time::Instant::now());
+                            self.expecting_window_nav = true;
+                            debug!("Ctrl+w pressed in Script mode, waiting for navigation key or timeout");
                         }
                         _ => {
-                            // In command mode, use for window navigation
+                            // In command mode, use for window navigation immediately
                             self.expecting_window_nav = true;
                             debug!("Expecting window navigation key (j/k)");
                         }
                     }
                 } else {
-                    // In other panels, use for window navigation
+                    // In other panels, use for window navigation immediately
                     self.expecting_window_nav = true;
                     debug!("Expecting window navigation key (j/k)");
                 }
