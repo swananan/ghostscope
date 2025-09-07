@@ -1,4 +1,4 @@
-use crate::syntax_highlight::{SyntaxHighlighter, Token, TokenType};
+use crate::syntax_highlight::SyntaxHighlighter;
 use ratatui::{
     layout::Rect,
     style::{Color, Style},
@@ -12,8 +12,10 @@ pub struct SourceCodePanel {
     pub current_line: usize,
     pub current_column: usize, // Add horizontal cursor position
     pub scroll_offset: usize,
+    pub horizontal_scroll_offset: usize, // Add horizontal scroll offset
     pub file_path: Option<String>,
     pub area_height: u16, // Store the current area height for scroll calculations
+    pub area_width: u16,  // Store the current area width for horizontal scroll calculations
     pub language: String, // Programming language for syntax highlighting
     pub syntax_highlighter: SyntaxHighlighter,
 
@@ -29,8 +31,10 @@ impl SourceCodePanel {
             current_line: 0,
             current_column: 0,
             scroll_offset: 0,
+            horizontal_scroll_offset: 0,
             file_path: None,
             area_height: 10,           // Default height
+            area_width: 80,            // Default width
             language: "c".to_string(), // Default to C
             syntax_highlighter: SyntaxHighlighter::new(),
             number_buffer: String::new(),
@@ -64,6 +68,7 @@ impl SourceCodePanel {
                     self.scroll_offset = 0;
                 }
                 self.current_column = 0;
+                self.horizontal_scroll_offset = 0;
             }
             Err(e) => {
                 // Show error if file cannot be read
@@ -127,6 +132,7 @@ impl SourceCodePanel {
         self.current_line = 0;
         self.current_column = 0;
         self.scroll_offset = 0;
+        self.horizontal_scroll_offset = 0;
     }
 
     pub fn show_error(&mut self, error_message: String) {
@@ -144,6 +150,7 @@ impl SourceCodePanel {
         self.current_line = 0;
         self.current_column = 0;
         self.scroll_offset = 0;
+        self.horizontal_scroll_offset = 0;
     }
 
     pub fn move_up(&mut self) {
@@ -182,6 +189,7 @@ impl SourceCodePanel {
         self.current_line = 0;
         self.current_column = 0;
         self.scroll_offset = 0;
+        self.horizontal_scroll_offset = 0;
     }
 
     pub fn move_to_bottom(&mut self) {
@@ -255,6 +263,7 @@ impl SourceCodePanel {
         let max_line = self.content.len() - 1;
         self.current_line = target_line.min(max_line);
         self.current_column = 0;
+        self.horizontal_scroll_offset = 0;
         self.ensure_cursor_visible();
     }
 
@@ -262,11 +271,21 @@ impl SourceCodePanel {
         if let Some(current_line_content) = self.content.get(self.current_line) {
             if self.current_column < current_line_content.len() {
                 self.current_column += 1;
+                // If we just moved to the end of the line, immediately jump to next line
+                if self.current_column == current_line_content.len()
+                    && self.current_line + 1 < self.content.len()
+                {
+                    self.current_line += 1;
+                    self.current_column = 0;
+                    self.ensure_cursor_visible();
+                }
             } else if self.current_line + 1 < self.content.len() {
+                // Already at end of line, jump to next line
                 self.current_line += 1;
                 self.current_column = 0;
                 self.ensure_cursor_visible();
             }
+            // If we're at the end of the last line, stay there (don't move)
         }
         self.ensure_column_bounds();
     }
@@ -274,25 +293,59 @@ impl SourceCodePanel {
     pub fn move_left(&mut self) {
         if self.current_column > 0 {
             self.current_column -= 1;
+            // If we just moved to the beginning of the line, immediately jump to previous line end
+            if self.current_column == 0 && self.current_line > 0 {
+                self.current_line -= 1;
+                if let Some(prev_line_content) = self.content.get(self.current_line) {
+                    // Jump to the last character of the previous line, not the newline position
+                    self.current_column = if prev_line_content.is_empty() {
+                        0
+                    } else {
+                        prev_line_content.len() - 1
+                    };
+                }
+                self.ensure_cursor_visible();
+            }
         } else if self.current_line > 0 {
+            // Already at beginning of line, jump to end of previous line
             self.current_line -= 1;
             if let Some(prev_line_content) = self.content.get(self.current_line) {
-                self.current_column = prev_line_content.len();
+                // Jump to the last character of the previous line, not the newline position
+                self.current_column = if prev_line_content.is_empty() {
+                    0
+                } else {
+                    prev_line_content.len() - 1
+                };
             }
             self.ensure_cursor_visible();
         }
+        // If we're at the beginning of the first line, stay there (don't move)
         self.ensure_column_bounds();
     }
 
     fn adjust_column_for_new_line(&mut self, old_column: usize) {
         if let Some(current_line_content) = self.content.get(self.current_line) {
-            self.current_column = old_column.min(current_line_content.len());
+            if current_line_content.is_empty() {
+                // Empty line, stay at column 0
+                self.current_column = 0;
+            } else {
+                // Adjust column to stay within the line, but prefer last character over newline position
+                let max_column = current_line_content.len() - 1; // Last character position
+                self.current_column = old_column.min(max_column);
+            }
         }
     }
 
     fn ensure_column_bounds(&mut self) {
         if let Some(current_line_content) = self.content.get(self.current_line) {
-            self.current_column = self.current_column.min(current_line_content.len());
+            if current_line_content.is_empty() {
+                // Empty line, stay at column 0
+                self.current_column = 0;
+            } else {
+                // Ensure column is within bounds, but prefer last character over newline position
+                let max_column = current_line_content.len() - 1; // Last character position
+                self.current_column = self.current_column.min(max_column);
+            }
         }
     }
 
@@ -301,29 +354,68 @@ impl SourceCodePanel {
             return;
         }
 
+        // Vertical scrolling logic
         let visible_lines = (self.area_height.saturating_sub(2)) as usize;
 
         if self.content.len() <= visible_lines {
             self.scroll_offset = 0;
-            return;
+        } else {
+            let scrolloff = visible_lines / 3;
+            let ideal_scroll = self.current_line.saturating_sub(scrolloff);
+            let max_scroll = self.content.len().saturating_sub(visible_lines);
+            let near_end = self.current_line >= max_scroll.saturating_add(scrolloff);
+
+            if near_end {
+                self.scroll_offset = max_scroll;
+            } else {
+                self.scroll_offset = ideal_scroll.min(max_scroll);
+            }
         }
 
-        let scrolloff = visible_lines / 3;
+        // Horizontal scrolling logic
+        self.ensure_horizontal_cursor_visible();
+    }
 
-        let ideal_scroll = self.current_line.saturating_sub(scrolloff);
+    fn ensure_horizontal_cursor_visible(&mut self) {
+        if let Some(current_line_content) = self.content.get(self.current_line) {
+            // Calculate available width for content (subtract line numbers and borders)
+            let line_number_width = 5; // "1234 " format
+            let border_width = 2; // left and right borders
+            let available_width = (self
+                .area_width
+                .saturating_sub(line_number_width + border_width))
+                as usize;
 
-        let max_scroll = self.content.len().saturating_sub(visible_lines);
-        let near_end = self.current_line >= max_scroll.saturating_add(scrolloff);
+            if current_line_content.len() <= available_width {
+                // Line fits entirely, no horizontal scrolling needed
+                self.horizontal_scroll_offset = 0;
+            } else {
+                // Line is longer than available width, need horizontal scrolling
+                let scrolloff = available_width / 3; // Keep some context around cursor
 
-        if near_end {
-            self.scroll_offset = max_scroll;
-        } else {
-            self.scroll_offset = ideal_scroll.min(max_scroll);
+                // Calculate ideal horizontal scroll position
+                let ideal_scroll = self.current_column.saturating_sub(scrolloff);
+
+                // Calculate maximum possible scroll
+                let max_scroll = current_line_content.len().saturating_sub(available_width);
+
+                // Check if we're near the end of the line
+                let near_end = self.current_column >= max_scroll.saturating_add(scrolloff);
+
+                if near_end {
+                    // Near the end, scroll to show the end
+                    self.horizontal_scroll_offset = max_scroll;
+                } else {
+                    // Normal case, scroll to keep cursor visible with context
+                    self.horizontal_scroll_offset = ideal_scroll.min(max_scroll);
+                }
+            }
         }
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, is_focused: bool) {
         self.area_height = area.height;
+        self.area_width = area.width;
 
         if is_focused {
             self.ensure_cursor_visible();
@@ -344,8 +436,15 @@ impl SourceCodePanel {
                     Style::default().fg(Color::DarkGray)
                 };
 
-                // Apply syntax highlighting
-                let highlighted_spans = self.highlight_line(line);
+                // Apply horizontal scrolling to the line content
+                let visible_line = if self.horizontal_scroll_offset < line.len() {
+                    &line[self.horizontal_scroll_offset..]
+                } else {
+                    ""
+                };
+
+                // Apply syntax highlighting to the visible portion
+                let highlighted_spans = self.highlight_line(visible_line);
 
                 let mut spans = vec![Span::styled(format!("{:4} ", line_num), line_number_style)];
                 spans.extend(highlighted_spans);
@@ -453,9 +552,21 @@ impl SourceCodePanel {
             let cursor_y =
                 area.y + 1 + (self.current_line.saturating_sub(self.scroll_offset)) as u16;
             let line_number_width = 5u16;
-            let cursor_x = area.x + 1 + line_number_width + self.current_column as u16;
 
-            if cursor_y < area.y + area.height - 1 && cursor_x < area.x + area.width - 1 {
+            // Calculate cursor X position considering horizontal scroll
+            let visible_cursor_column = if self.current_column >= self.horizontal_scroll_offset {
+                self.current_column - self.horizontal_scroll_offset
+            } else {
+                0 // Cursor is to the left of visible area
+            };
+
+            let cursor_x = area.x + 1 + line_number_width + visible_cursor_column as u16;
+
+            // Only render cursor if it's within the visible area
+            if cursor_y < area.y + area.height - 1
+                && cursor_x < area.x + area.width - 1
+                && cursor_x >= area.x + 1 + line_number_width
+            {
                 frame.render_widget(
                     Block::default().style(Style::default().bg(Color::Cyan)),
                     Rect::new(cursor_x, cursor_y, 1, 1),

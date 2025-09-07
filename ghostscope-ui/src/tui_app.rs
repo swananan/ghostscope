@@ -149,10 +149,7 @@ impl TuiApp {
 
         // Cleanup terminal
         disable_raw_mode()?;
-        execute!(
-            terminal.backend_mut(),
-            LeaveAlternateScreen
-        )?;
+        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
         // Mouse capture was not enabled, so no need to disable it
         terminal.show_cursor()?;
 
