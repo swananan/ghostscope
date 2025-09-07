@@ -212,6 +212,7 @@ impl SourceCodePanel {
     pub fn handle_g_key(&mut self) -> bool {
         if self.g_pressed {
             // Second 'g' - 'gg' combination, go to top
+            self.clear_number_buffer();
             self.move_to_top();
             self.g_pressed = false;
             return true;

@@ -585,22 +585,32 @@ impl TuiApp {
             FocusedPanel::Source => {
                 match key.code {
                     KeyCode::Up | KeyCode::Char('k') => {
+                        self.source_panel.clear_number_buffer();
                         self.source_panel.move_up();
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
+                        self.source_panel.clear_number_buffer();
                         self.source_panel.move_down();
                     }
                     KeyCode::Left | KeyCode::Char('h') => {
+                        self.source_panel.clear_number_buffer();
                         self.source_panel.move_left();
                     }
                     KeyCode::Right | KeyCode::Char('l') => {
+                        self.source_panel.clear_number_buffer();
                         self.source_panel.move_right();
                     }
                     KeyCode::Char('g') => {
-                        self.source_panel.move_to_top();
+                        self.source_panel.handle_g_key();
                     }
                     KeyCode::Char('G') => {
-                        self.source_panel.move_to_bottom();
+                        self.source_panel.handle_uppercase_g_key();
+                    }
+                    KeyCode::Char(digit) if digit.is_ascii_digit() => {
+                        self.source_panel.handle_number_input(digit);
+                    }
+                    KeyCode::Esc => {
+                        self.source_panel.clear_number_buffer();
                     }
                     _ => {}
                 }
@@ -609,9 +619,11 @@ impl TuiApp {
                 if key.modifiers.contains(KeyModifiers::CONTROL) {
                     match key.code {
                         KeyCode::Char('d') => {
+                            self.source_panel.clear_number_buffer();
                             self.source_panel.move_down_fast();
                         }
                         KeyCode::Char('u') => {
+                            self.source_panel.clear_number_buffer();
                             self.source_panel.move_up_fast();
                         }
                         _ => {}
