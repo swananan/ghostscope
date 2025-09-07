@@ -1,7 +1,7 @@
 // DWARF Expression Evaluator
 // Provides comprehensive DWARF expression evaluation with structured results for LLVM codegen
 
-use crate::dwarf::{DwarfOp, LocationExpression};
+use crate::dwarf::{DwarfContext, DwarfOp, LocationExpression};
 use crate::scoped_variables::AddressRange;
 use std::collections::HashMap;
 use tracing::{debug, error, warn};
@@ -187,7 +187,7 @@ pub struct RegisterAccess {
 }
 
 /// Expression evaluation result - structured information for LLVM code generation
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum EvaluationResult {
     /// Simple memory address
     Address(u64),
@@ -225,6 +225,95 @@ pub enum EvaluationResult {
     Value(i64),
 }
 
+impl std::fmt::Debug for EvaluationResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EvaluationResult::Address(addr) => {
+                write!(f, "Address(0x{:x})", addr)
+            }
+            EvaluationResult::Register(reg_access) => {
+                let mut result = format!("Register(%{}", reg_access.register);
+                if let Some(offset) = reg_access.offset {
+                    if offset >= 0 {
+                        result.push_str(&format!("+{}", offset));
+                    } else {
+                        result.push_str(&format!("{}", offset));
+                    }
+                }
+                if reg_access.dereference {
+                    result.push_str(" -> deref");
+                    if let Some(size) = reg_access.size {
+                        result.push_str(&format!("({})", size));
+                    }
+                }
+                result.push(')');
+                write!(f, "{}", result)
+            }
+            EvaluationResult::StackOffset(offset) => {
+                write!(f, "Stack({:+})", offset)
+            }
+            EvaluationResult::FrameOffset(offset) => {
+                write!(f, "Frame({:+})", offset)
+            }
+            EvaluationResult::CFAOffset(offset) => {
+                write!(f, "CFA({:+})", offset)
+            }
+            EvaluationResult::Composite(results) => {
+                write!(f, "Composite[")?;
+                for (i, result) in results.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{:?}", result)?;
+                }
+                write!(f, "]")
+            }
+            EvaluationResult::ImplicitValue(bytes) => {
+                write!(f, "ImplicitValue({} bytes: 0x", bytes.len())?;
+                for byte in bytes.iter().take(8) {
+                    // Show first 8 bytes
+                    write!(f, "{:02x}", byte)?;
+                }
+                if bytes.len() > 8 {
+                    write!(f, "...")?;
+                }
+                write!(f, ")")
+            }
+            EvaluationResult::ComputedAccess {
+                steps,
+                requires_registers,
+                requires_frame_base,
+                requires_cfa,
+            } => {
+                write!(f, "Computed({} steps", steps.len())?;
+                if *requires_frame_base {
+                    write!(f, ", +Frame")?;
+                }
+                if *requires_cfa {
+                    write!(f, ", +CFA")?;
+                }
+                if !requires_registers.is_empty() {
+                    write!(f, ", +Regs[")?;
+                    for (i, reg) in requires_registers.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ",")?;
+                        }
+                        write!(f, "%{}", reg)?;
+                    }
+                    write!(f, "]")?;
+                }
+                write!(f, ")")
+            }
+            EvaluationResult::Optimized => {
+                write!(f, "OptimizedOut")
+            }
+            EvaluationResult::Value(value) => {
+                write!(f, "Value({})", value)
+            }
+        }
+    }
+}
+
 /// Optimized expression patterns for fast evaluation
 #[derive(Debug, Clone, PartialEq)]
 pub enum OptimizedPattern {
@@ -241,9 +330,6 @@ pub enum OptimizedPattern {
 #[derive(Debug, Clone)]
 pub struct EvaluationContext {
     pub pc_address: u64,
-    pub frame_base: Option<u64>,
-    pub call_frame_cfa: Option<u64>,
-    pub available_registers: HashMap<u16, u64>,
     pub address_size: u8, // Target architecture address size (4 or 8 bytes)
 }
 
@@ -251,9 +337,6 @@ impl Default for EvaluationContext {
     fn default() -> Self {
         Self {
             pc_address: 0,
-            frame_base: None,
-            call_frame_cfa: None,
-            available_registers: HashMap::new(),
             address_size: 8, // Default to 64-bit
         }
     }
@@ -299,7 +382,179 @@ impl DwarfExpressionEvaluator {
         }
     }
 
-    /// Main entry: evaluate LocationExpression for LLVM codegen
+    /// Universal DWARF expression evaluator for LLVM codegen
+    ///
+    /// This is the core interface that can evaluate any DWARF expression operations.
+    /// It handles CFI queries internally when encountering FrameBase or CallFrameCFA operations.
+    pub fn evaluate_dwarf_expression_for_codegen(
+        &self,
+        operations: &[DwarfOperation],
+        pc_address: u64,
+        context: &EvaluationContext,
+        dwarf_context: Option<&DwarfContext>,
+    ) -> Result<EvaluationResult, ExpressionError> {
+        debug!(
+            "Evaluating {} DWARF operations for codegen at PC 0x{:x}",
+            operations.len(),
+            pc_address
+        );
+
+        // Handle single operation patterns for optimization
+        if operations.len() == 1 {
+            return self.evaluate_single_operation_for_codegen(
+                &operations[0],
+                pc_address,
+                context,
+                dwarf_context,
+            );
+        }
+
+        // Handle common patterns
+        if let Some(result) = self.analyze_operation_patterns_for_codegen(
+            operations,
+            pc_address,
+            context,
+            dwarf_context,
+        )? {
+            return Ok(result);
+        }
+
+        // Fall back to step-by-step evaluation with CFI-aware operations
+        self.evaluate_operations_with_cfi(operations, pc_address, context, dwarf_context)
+    }
+
+    /// Enhanced entry: evaluate LocationExpression for LLVM codegen with CFI support
+    pub fn evaluate_location_for_codegen(
+        &self,
+        location_expr: &LocationExpression,
+        pc_address: u64,
+        context: &EvaluationContext,
+        dwarf_context: Option<&DwarfContext>,
+    ) -> Result<EvaluationResult, ExpressionError> {
+        debug!(
+            "Evaluating location expression for codegen with CFI at PC 0x{:x}",
+            pc_address
+        );
+
+        match location_expr {
+            LocationExpression::ComputedExpression {
+                operations,
+                requires_frame_base,
+                requires_registers,
+            } => {
+                debug!(
+                    "Evaluating computed expression with {} operations",
+                    operations.len()
+                );
+
+                // Convert legacy DwarfOp to new DwarfOperation
+                let new_operations: Result<Vec<DwarfOperation>, ExpressionError> = operations
+                    .iter()
+                    .map(|op| self.convert_legacy_dwarf_op(op))
+                    .collect();
+
+                match new_operations {
+                    Ok(ops) => {
+                        // Use the universal evaluator with CFI support
+                        self.evaluate_dwarf_expression_for_codegen(
+                            &ops,
+                            pc_address,
+                            context,
+                            dwarf_context,
+                        )
+                    }
+                    Err(e) => {
+                        error!("Failed to convert legacy DWARF operations: {}", e);
+                        Err(e)
+                    }
+                }
+            }
+
+            LocationExpression::LocationList { entries } => {
+                debug!("Processing location list with {} entries", entries.len());
+
+                // Find applicable entry for this PC
+                for entry in entries {
+                    if pc_address >= entry.start_pc && pc_address < entry.end_pc {
+                        debug!(
+                            "Found matching location list entry: PC 0x{:x} in range 0x{:x}-0x{:x}",
+                            pc_address, entry.start_pc, entry.end_pc
+                        );
+                        // Recursively evaluate the location expression for this PC range
+                        return self.evaluate_location_for_codegen(
+                            &entry.location_expr,
+                            pc_address,
+                            context,
+                            dwarf_context,
+                        );
+                    }
+                }
+
+                debug!(
+                    "No matching location list entry found for PC 0x{:x}",
+                    pc_address
+                );
+                Ok(EvaluationResult::Optimized)
+            }
+
+            // Handle simple expressions
+            LocationExpression::Register { reg } => {
+                Ok(EvaluationResult::Register(RegisterAccess {
+                    register: *reg,
+                    offset: None,
+                    dereference: false,
+                    size: None,
+                }))
+            }
+
+            LocationExpression::RegisterOffset { reg, offset } => {
+                Ok(EvaluationResult::Register(RegisterAccess {
+                    register: *reg,
+                    offset: Some(*offset),
+                    dereference: false,
+                    size: None,
+                }))
+            }
+
+            LocationExpression::FrameBaseOffset { offset } => {
+                // Use CFI-aware frame base evaluation
+                if let Some(dwarf_ctx) = dwarf_context {
+                    if let Some(cfi_rule) = dwarf_ctx.get_cfi_rule_for_pc(pc_address) {
+                        debug!(
+                            "Found CFI rule for frame base offset at PC 0x{:x}: {:?}",
+                            pc_address, cfi_rule
+                        );
+                        return self.combine_cfi_with_offset(
+                            &cfi_rule, *offset, dwarf_ctx, pc_address, context,
+                        );
+                    }
+                }
+                // Fallback
+                warn!(
+                    "No CFI context for frame base offset at PC 0x{:x}",
+                    pc_address
+                );
+                Ok(EvaluationResult::FrameOffset(*offset))
+            }
+
+            LocationExpression::OptimizedOut => Ok(EvaluationResult::Optimized),
+
+            LocationExpression::DwarfExpression { bytecode } => {
+                warn!("Raw DWARF bytecode not yet supported for CFI-aware evaluation");
+                Ok(EvaluationResult::Optimized)
+            }
+
+            _ => {
+                warn!(
+                    "Unsupported location expression for CFI-aware evaluation: {:?}",
+                    location_expr
+                );
+                Ok(EvaluationResult::Optimized)
+            }
+        }
+    }
+
+    /// Main entry: evaluate LocationExpression for LLVM codegen (backward compatibility)
     pub fn evaluate_for_codegen(
         &self,
         location_expr: &LocationExpression,
@@ -410,55 +665,8 @@ impl DwarfExpressionEvaluator {
         context: &CFIContext,
     ) -> Result<Option<u64>, ExpressionError> {
         match operations {
-            // Simple register offset: DW_OP_breg + offset
-            [DwarfOp::Breg(reg, offset)] => {
-                debug!(
-                    "CFI pattern: Simple register offset (reg {} + {})",
-                    reg, offset
-                );
-                if let Some(&reg_value) = context.available_registers.get(reg) {
-                    let result = (reg_value as i64 + offset) as u64;
-                    debug!(
-                        "CFI optimization result: 0x{:x} + {} = 0x{:x}",
-                        reg_value, offset, result
-                    );
-                    Ok(Some(result))
-                } else {
-                    debug!("CFI register {} not available in context", reg);
-                    Ok(None)
-                }
-            }
-
-            // Register offset with additional constant: DW_OP_breg + DW_OP_plus_uconst
-            [DwarfOp::Breg(reg, base_offset), DwarfOp::PlusUconst(additional)] => {
-                debug!(
-                    "CFI pattern: Register with additional offset (reg {} + {} + {})",
-                    reg, base_offset, additional
-                );
-                if let Some(&reg_value) = context.available_registers.get(reg) {
-                    let result = (reg_value as i64 + base_offset + (*additional as i64)) as u64;
-                    debug!(
-                        "CFI optimization result: 0x{:x} + {} + {} = 0x{:x}",
-                        reg_value, base_offset, additional, result
-                    );
-                    Ok(Some(result))
-                } else {
-                    debug!("CFI register {} not available in context", reg);
-                    Ok(None)
-                }
-            }
-
-            // Direct register value: DW_OP_reg
-            [DwarfOp::Reg(reg)] => {
-                debug!("CFI pattern: Direct register value (reg {})", reg);
-                if let Some(&reg_value) = context.available_registers.get(reg) {
-                    debug!("CFI optimization result: reg {} = 0x{:x}", reg, reg_value);
-                    Ok(Some(reg_value))
-                } else {
-                    debug!("CFI register {} not available in context", reg);
-                    Ok(None)
-                }
-            }
+            // We don't need CFI optimization branches for this eBPF debugging tool
+            // All patterns will generate symbolic expressions instead
 
             // Constant value: DW_OP_const
             [DwarfOp::Const(value)] => {
@@ -1047,6 +1255,282 @@ impl DwarfExpressionEvaluator {
         }
     }
 
+    /// Evaluate single operation with CFI awareness for codegen
+    fn evaluate_single_operation_for_codegen(
+        &self,
+        operation: &DwarfOperation,
+        pc_address: u64,
+        context: &EvaluationContext,
+        dwarf_context: Option<&DwarfContext>,
+    ) -> Result<EvaluationResult, ExpressionError> {
+        debug!("Evaluating single operation with CFI: {:?}", operation);
+
+        match operation {
+            DwarfOperation::Register(reg) => Ok(EvaluationResult::Register(RegisterAccess {
+                register: *reg,
+                offset: None,
+                dereference: false,
+                size: None,
+            })),
+
+            DwarfOperation::RegisterOffset(reg, offset) => {
+                Ok(EvaluationResult::Register(RegisterAccess {
+                    register: *reg,
+                    offset: Some(*offset),
+                    dereference: false,
+                    size: None,
+                }))
+            }
+
+            DwarfOperation::FrameBase(offset) => {
+                // Query CFI for frame base calculation
+                if let Some(dwarf_ctx) = dwarf_context {
+                    if let Some(cfi_rule) = dwarf_ctx.get_cfi_rule_for_pc(pc_address) {
+                        debug!(
+                            "Found CFI rule for frame base at PC 0x{:x}: {:?}",
+                            pc_address, cfi_rule
+                        );
+                        return self.combine_cfi_with_offset(
+                            &cfi_rule, *offset, dwarf_ctx, pc_address, context,
+                        );
+                    }
+                }
+                // Fallback to simple frame offset
+                warn!(
+                    "No CFI context available for frame base at PC 0x{:x}, using simple offset",
+                    pc_address
+                );
+                Ok(EvaluationResult::FrameOffset(*offset))
+            }
+
+            DwarfOperation::CallFrameCFA => {
+                // Query CFI for CFA calculation
+                if let Some(dwarf_ctx) = dwarf_context {
+                    if let Some(cfi_rule) = dwarf_ctx.get_cfi_rule_for_pc(pc_address) {
+                        debug!(
+                            "Found CFI rule for CFA at PC 0x{:x}: {:?}",
+                            pc_address, cfi_rule
+                        );
+                        return self
+                            .combine_cfi_with_offset(&cfi_rule, 0, dwarf_ctx, pc_address, context);
+                    }
+                }
+                // Fallback to simple CFA offset
+                warn!("No CFI context available for CFA at PC 0x{:x}", pc_address);
+                Ok(EvaluationResult::CFAOffset(0))
+            }
+
+            DwarfOperation::Address(addr) => Ok(EvaluationResult::Address(*addr)),
+
+            DwarfOperation::Literal(value) | DwarfOperation::Consts(value) => {
+                Ok(EvaluationResult::Value(*value))
+            }
+
+            _ => {
+                // For other operations, evaluate normally and convert result
+                let mut stack = Vec::new();
+                self.execute_operation(operation, &mut stack, context)?;
+                let value = stack.last().copied().unwrap_or(0);
+                Ok(EvaluationResult::Value(value))
+            }
+        }
+    }
+
+    /// Pattern analysis with CFI awareness
+    fn analyze_operation_patterns_for_codegen(
+        &self,
+        operations: &[DwarfOperation],
+        pc_address: u64,
+        context: &EvaluationContext,
+        dwarf_context: Option<&DwarfContext>,
+    ) -> Result<Option<EvaluationResult>, ExpressionError> {
+        // Handle common patterns with CFI awareness
+        match operations {
+            // Frame base + offset: DW_OP_fbreg <offset>
+            [DwarfOperation::FrameBase(offset)] => {
+                Ok(Some(self.evaluate_single_operation_for_codegen(
+                    &DwarfOperation::FrameBase(*offset),
+                    pc_address,
+                    context,
+                    dwarf_context,
+                )?))
+            }
+
+            // Frame base dereference: DW_OP_fbreg <offset>, DW_OP_deref
+            [DwarfOperation::FrameBase(offset), DwarfOperation::Deref(size)] => {
+                if let Some(dwarf_ctx) = dwarf_context {
+                    if let Some(cfi_rule) = dwarf_ctx.get_cfi_rule_for_pc(pc_address) {
+                        // Convert CFI rule to register access with dereference
+                        let base_result = self.combine_cfi_with_offset(
+                            &cfi_rule, *offset, dwarf_ctx, pc_address, context,
+                        )?;
+                        if let EvaluationResult::Register(mut reg_access) = base_result {
+                            reg_access.dereference = true;
+                            reg_access.size = Some(*size);
+                            return Ok(Some(EvaluationResult::Register(reg_access)));
+                        }
+                    }
+                }
+                // Fallback to computed access
+                Ok(Some(EvaluationResult::ComputedAccess {
+                    steps: vec![
+                        AccessStep::LoadFrameBase,
+                        AccessStep::AddConstant(*offset),
+                        AccessStep::Dereference { size: *size },
+                    ],
+                    requires_frame_base: true,
+                    requires_registers: vec![],
+                    requires_cfa: false,
+                }))
+            }
+
+            // Other patterns can be added here
+            _ => Ok(None),
+        }
+    }
+
+    /// Combine CFI rule with offset for final calculation
+    fn combine_cfi_with_offset(
+        &self,
+        cfi_rule: &crate::dwarf::CFARule,
+        offset: i64,
+        dwarf_context: &DwarfContext,
+        pc_address: u64,
+        context: &EvaluationContext,
+    ) -> Result<EvaluationResult, ExpressionError> {
+        use crate::dwarf::CFARule;
+
+        match cfi_rule {
+            CFARule::RegisterOffset {
+                register,
+                offset: cfi_offset,
+            } => {
+                // Combine CFI offset with variable offset
+                let final_offset = cfi_offset + offset;
+                Ok(EvaluationResult::Register(RegisterAccess {
+                    register: *register,
+                    offset: Some(final_offset),
+                    dereference: false,
+                    size: None,
+                }))
+            }
+
+            CFARule::Expression(dwarf_ops) => {
+                // Convert legacy DwarfOp to DwarfOperation and evaluate recursively
+                debug!(
+                    "Evaluating CFI expression with {} operations",
+                    dwarf_ops.len()
+                );
+                let converted_ops: Result<Vec<DwarfOperation>, ExpressionError> = dwarf_ops
+                    .iter()
+                    .map(|op| self.convert_legacy_dwarf_op(op))
+                    .collect();
+
+                match converted_ops {
+                    Ok(operations) => {
+                        // Recursively evaluate CFI expression
+                        let cfi_result = self.evaluate_dwarf_expression_for_codegen(
+                            &operations,
+                            pc_address,
+                            context,
+                            Some(dwarf_context),
+                        )?;
+
+                        // Apply offset to the CFI result
+                        self.apply_offset_to_result(cfi_result, offset)
+                    }
+                    Err(e) => {
+                        error!("Failed to convert CFI expression: {}", e);
+                        Err(e)
+                    }
+                }
+            }
+
+            CFARule::Undefined => Err(ExpressionError::EvaluationFailed(format!(
+                "CFI rule undefined at PC 0x{:x}",
+                pc_address
+            ))),
+        }
+    }
+
+    /// Apply offset to evaluation result
+    fn apply_offset_to_result(
+        &self,
+        mut result: EvaluationResult,
+        offset: i64,
+    ) -> Result<EvaluationResult, ExpressionError> {
+        if offset == 0 {
+            return Ok(result);
+        }
+
+        match &mut result {
+            EvaluationResult::Register(reg_access) => {
+                let current_offset = reg_access.offset.unwrap_or(0);
+                reg_access.offset = Some(current_offset + offset);
+                Ok(result)
+            }
+            EvaluationResult::Address(addr) => {
+                *addr = ((*addr as i64) + offset) as u64;
+                Ok(result)
+            }
+            EvaluationResult::Value(value) => {
+                *value += offset;
+                Ok(result)
+            }
+            _ => {
+                debug!(
+                    "Cannot apply offset {} to result type: {:?}",
+                    offset, result
+                );
+                Ok(result)
+            }
+        }
+    }
+
+    /// Full evaluation with CFI awareness (fallback method)
+    fn evaluate_operations_with_cfi(
+        &self,
+        operations: &[DwarfOperation],
+        pc_address: u64,
+        context: &EvaluationContext,
+        dwarf_context: Option<&DwarfContext>,
+    ) -> Result<EvaluationResult, ExpressionError> {
+        debug!(
+            "Performing full CFI-aware evaluation of {} operations",
+            operations.len()
+        );
+
+        // For now, fall back to existing evaluation and enhance step by step
+        // TODO: Implement full CFI-aware stack evaluation
+        let steps = self.operations_to_access_steps(operations);
+        Ok(EvaluationResult::ComputedAccess {
+            steps,
+            requires_frame_base: operations
+                .iter()
+                .any(|op| matches!(op, DwarfOperation::FrameBase(_))),
+            requires_registers: self.extract_required_registers(operations),
+            requires_cfa: operations
+                .iter()
+                .any(|op| matches!(op, DwarfOperation::CallFrameCFA)),
+        })
+    }
+
+    /// Extract required registers from operations
+    fn extract_required_registers(&self, operations: &[DwarfOperation]) -> Vec<u16> {
+        let mut registers = Vec::new();
+        for op in operations {
+            match op {
+                DwarfOperation::Register(reg) | DwarfOperation::RegisterOffset(reg, _) => {
+                    if !registers.contains(reg) {
+                        registers.push(*reg);
+                    }
+                }
+                _ => {}
+            }
+        }
+        registers
+    }
+
     /// Execute a single DWARF operation on the expression stack
     fn execute_operation(
         &self,
@@ -1080,22 +1564,25 @@ impl DwarfExpressionEvaluator {
             DwarfOperation::Consts(value) => stack.push(*value),
 
             // === Register Operations ===
+            // These operations should not be used in symbolic expression generation
+            // All register accesses should go through symbolic paths instead
             DwarfOperation::Register(reg) => {
-                debug!("Register operation: reg {}", reg);
-                if let Some(&value) = context.available_registers.get(reg) {
-                    stack.push(value as i64);
-                } else {
-                    return Err(ExpressionError::InvalidRegister(*reg));
-                }
+                debug!("Register operation: reg {} (should use symbolic path)", reg);
+                return Err(ExpressionError::EvaluationFailed(format!(
+                    "Register {} access requires codegen handling",
+                    reg
+                )));
             }
 
             DwarfOperation::RegisterOffset(reg, offset) => {
-                debug!("Register offset operation: reg {} + {}", reg, offset);
-                if let Some(&reg_value) = context.available_registers.get(reg) {
-                    stack.push((reg_value as i64) + offset);
-                } else {
-                    return Err(ExpressionError::InvalidRegister(*reg));
-                }
+                debug!(
+                    "Register offset operation: reg {} + {} (should use symbolic path)",
+                    reg, offset
+                );
+                return Err(ExpressionError::EvaluationFailed(format!(
+                    "Register {} offset {} requires codegen handling",
+                    reg, offset
+                )));
             }
 
             // === Stack Manipulation ===
@@ -1346,23 +1833,23 @@ impl DwarfExpressionEvaluator {
             }
 
             // === Frame Base and CFA Operations ===
+            // These operations should generate symbolic expressions instead of actual calculations
             DwarfOperation::FrameBase(offset) => {
-                debug!("Frame base operation with offset: {}", offset);
-                let frame_base = context
-                    .frame_base
-                    .ok_or(ExpressionError::FrameBaseUnavailable)?
-                    as i64;
-                stack.push(frame_base + offset);
+                debug!(
+                    "Frame base operation with offset: {} (should use symbolic path)",
+                    offset
+                );
+                return Err(ExpressionError::EvaluationFailed(format!(
+                    "Frame base {} requires codegen handling",
+                    offset
+                )));
             }
 
             DwarfOperation::CallFrameCFA => {
-                debug!("Call frame CFA operation");
-                let cfa = context
-                    .call_frame_cfa
-                    .ok_or(ExpressionError::EvaluationFailed(
-                        "CFA not available".into(),
-                    ))? as i64;
-                stack.push(cfa);
+                debug!("Call frame CFA operation (should use symbolic path)");
+                return Err(ExpressionError::EvaluationFailed(
+                    "CFA requires codegen handling".into(),
+                ));
             }
 
             // === Memory Operations ===
@@ -1584,9 +2071,6 @@ impl DwarfExpressionEvaluator {
     fn cfi_to_eval_context(&self, cfi_context: &CFIContext) -> EvaluationContext {
         EvaluationContext {
             pc_address: cfi_context.pc_address,
-            frame_base: None,
-            call_frame_cfa: None,
-            available_registers: cfi_context.available_registers.clone(),
             address_size: cfi_context.address_size,
         }
     }

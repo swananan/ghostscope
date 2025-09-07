@@ -116,6 +116,8 @@ impl ScopedVariableMap {
         }
     }
 
+    /// Get variables at address with CFI-aware DWARF expression evaluation
+
     /// Get variables at address with proper scoping and shadowing (main public API)
     pub fn get_variables_at_address(&mut self, addr: u64) -> Vec<VariableResult> {
         debug!(
@@ -209,37 +211,8 @@ impl ScopedVariableMap {
                             );
                             let location = self.resolve_location_at_address(var_ref, addr);
 
-                            // Evaluate location expression directly for enhanced codegen
-                            let evaluation_result = {
-                                let context = EvaluationContext {
-                                    pc_address: addr,
-                                    frame_base: None, // Would be populated from CFI in real usage
-                                    call_frame_cfa: None, // Would be populated from CFI in real usage
-                                    available_registers: std::collections::HashMap::new(), // Would be populated in real usage
-                                    address_size: 8, // Assume 64-bit
-                                };
-
-                                match self
-                                    .expression_evaluator
-                                    .evaluate_for_codegen(&location, addr, &context)
-                                {
-                                    Ok(result) => {
-                                        debug!(
-                                            "Successfully evaluated location expression for '{}' at PC 0x{:x}: {:?}",
-                                            var_info.name, addr, result
-                                        );
-                                        Some(result)
-                                    }
-                                    Err(e) => {
-                                        error!(
-                                            "Failed to evaluate expression for variable '{}' at address 0x{:x}: {} - Location: {:?}",
-                                            var_info.name, addr, e, location
-                                        );
-                                        // Continue processing other variables even if one fails
-                                        None
-                                    }
-                                }
-                            };
+                            // Expression evaluation is now done on-demand in DwarfContext
+                            let evaluation_result = None;
 
                             let result = VariableResult {
                                 variable_info: var_info.clone(),
@@ -283,6 +256,8 @@ impl ScopedVariableMap {
 
         results
     }
+
+    /// Core lookup algorithm with CFI-aware DWARF expression evaluation
 
     /// Find active scopes at address, ordered by depth (innermost first)
     fn find_active_scopes_at_address(&self, addr: u64) -> Vec<ScopeId> {

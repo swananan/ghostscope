@@ -1,4 +1,4 @@
-use crate::expression::{CFIContext, DwarfExpressionEvaluator};
+use crate::expression::{CFIContext, DwarfExpressionEvaluator, EvaluationResult};
 use crate::scoped_variables::{AddressRange, ScopeId, ScopeType, ScopedVariableMap};
 use crate::{BinaryError, Result};
 use gimli::{Dwarf, EndianSlice, LittleEndian, Reader, UnwindSection};
@@ -1239,7 +1239,8 @@ impl DwarfContext {
             addr
         );
 
-        if let Some(ref mut scoped_map) = self.scoped_variable_map {
+        // Step 1: Get variable information from ScopedVariableMap (release mutable borrow)
+        let variable_results = if let Some(ref mut scoped_map) = self.scoped_variable_map {
             debug!("Using scoped variable system for address 0x{:x}", addr);
 
             // Get statistics first to debug
@@ -1249,16 +1250,26 @@ impl DwarfContext {
                 stats.total_variables, stats.total_scopes, stats.total_address_entries
             );
 
-            let results = scoped_map.get_variables_at_address(addr);
+            scoped_map.get_variables_at_address(addr)
+        } else {
+            Vec::new()
+        };
+
+        // Step 2: Perform CFI-aware expression evaluation for each variable (can now use self immutably)
+        if !variable_results.is_empty() {
             debug!(
                 "Scoped variable system returned {} variables for address 0x{:x}",
-                results.len(),
+                variable_results.len(),
                 addr
             );
 
-            results
+            variable_results
                 .into_iter()
                 .map(|result| {
+                    // Perform real-time CFI-aware expression evaluation
+                    let evaluation_result =
+                        self.evaluate_variable_location_with_cfi(&result.location_at_address, addr);
+
                     EnhancedVariableLocation {
                         variable: Variable {
                             name: result.variable_info.name.clone(),
@@ -1277,13 +1288,51 @@ impl DwarfContext {
                         address: addr,
                         size: result.variable_info.size,
                         is_optimized_out: result.is_optimized_out,
-                        evaluation_result: result.evaluation_result.clone(),
+                        evaluation_result,
                     }
                 })
                 .collect()
         } else {
             debug!("Scoped variable system not available");
             Vec::new()
+        }
+    }
+
+    /// Evaluate a variable location expression with CFI awareness
+    fn evaluate_variable_location_with_cfi(
+        &self,
+        location_expr: &LocationExpression,
+        addr: u64,
+    ) -> Option<EvaluationResult> {
+        use crate::expression::EvaluationContext;
+
+        // Build evaluation context for symbolic expression derivation
+        let context = EvaluationContext {
+            pc_address: addr,
+            address_size: 8, // TODO: Use TARGET_POINTER_WIDTH macro instead of hardcoded value
+        };
+
+        // Perform CFI-aware expression evaluation
+        match self.expression_evaluator.evaluate_location_for_codegen(
+            location_expr,
+            addr,
+            &context,
+            Some(self),
+        ) {
+            Ok(result) => {
+                debug!(
+                    "Successfully evaluated CFI-aware expression at 0x{:x}: {:?}",
+                    addr, result
+                );
+                Some(result)
+            }
+            Err(e) => {
+                debug!(
+                    "Failed to evaluate CFI-aware expression at 0x{:x}: {} - Location: {:?}",
+                    addr, e, location_expr
+                );
+                None
+            }
         }
     }
 

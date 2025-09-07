@@ -509,10 +509,18 @@ async fn handle_function_target(
     let mut variables = Vec::new();
 
     for enhanced_var in enhanced_vars {
+        // Use the enhanced evaluation result if available, otherwise fall back to raw location expression
+        let location_description = if let Some(evaluation_result) = &enhanced_var.evaluation_result
+        {
+            format!("{:?}", evaluation_result)
+        } else {
+            format!("{:?} (raw)", enhanced_var.variable.location_expr)
+        };
+
         let var_info = VariableDebugInfo {
             name: enhanced_var.variable.name.clone(),
             type_name: enhanced_var.variable.type_name.clone(),
-            location_description: format!("{:?}", enhanced_var.variable.location_expr),
+            location_description,
             size: enhanced_var.size,
             scope_start: enhanced_var.variable.scope_ranges.first().map(|r| r.start),
             scope_end: enhanced_var.variable.scope_ranges.first().map(|r| r.end),
@@ -521,9 +529,16 @@ async fn handle_function_target(
         // Use the is_parameter field from DWARF parsing (which is based on DW_TAG_formal_parameter)
         let is_parameter = enhanced_var.variable.is_parameter;
 
+        // Log using enhanced evaluation result if available
+        let log_location = if let Some(evaluation_result) = &enhanced_var.evaluation_result {
+            format!("{:?}", evaluation_result)
+        } else {
+            format!("{:?} (raw)", enhanced_var.variable.location_expr)
+        };
+
         info!(
-            "Variable '{}' location: {:?}, is_parameter: {} (from DWARF)",
-            enhanced_var.variable.name, enhanced_var.variable.location_expr, is_parameter
+            "Variable '{}' location: {}, is_parameter: {} (from DWARF)",
+            enhanced_var.variable.name, log_location, is_parameter
         );
 
         if is_parameter {
@@ -592,10 +607,18 @@ async fn handle_source_location_target(
     let mut variables = Vec::new();
 
     for enhanced_var in enhanced_vars {
+        // Use the enhanced evaluation result if available, otherwise fall back to raw location expression
+        let location_description = if let Some(evaluation_result) = &enhanced_var.evaluation_result
+        {
+            format!("{:?}", evaluation_result)
+        } else {
+            format!("{:?} (raw)", enhanced_var.variable.location_expr)
+        };
+
         let var_info = VariableDebugInfo {
             name: enhanced_var.variable.name.clone(),
             type_name: enhanced_var.variable.type_name.clone(),
-            location_description: format!("{:?}", enhanced_var.variable.location_expr),
+            location_description,
             size: enhanced_var.size,
             scope_start: enhanced_var.variable.scope_ranges.first().map(|r| r.start),
             scope_end: enhanced_var.variable.scope_ranges.first().map(|r| r.end),
@@ -604,9 +627,16 @@ async fn handle_source_location_target(
         // Use the is_parameter field from DWARF parsing (which is based on DW_TAG_formal_parameter)
         let is_parameter = enhanced_var.variable.is_parameter;
 
+        // Log using enhanced evaluation result if available
+        let log_location = if let Some(evaluation_result) = &enhanced_var.evaluation_result {
+            format!("{:?}", evaluation_result)
+        } else {
+            format!("{:?} (raw)", enhanced_var.variable.location_expr)
+        };
+
         info!(
-            "Variable '{}' location: {:?}, is_parameter: {} (from DWARF)",
-            enhanced_var.variable.name, enhanced_var.variable.location_expr, is_parameter
+            "Variable '{}' location: {}, is_parameter: {} (from DWARF)",
+            enhanced_var.variable.name, log_location, is_parameter
         );
 
         if is_parameter {
