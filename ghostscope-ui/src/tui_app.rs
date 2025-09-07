@@ -1,9 +1,8 @@
 use std::io;
-use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyModifiers},
+    event::{Event, EventStream, KeyCode, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -13,11 +12,10 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     Terminal,
 };
-use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
 use crate::{
-    events::{EventRegistry, RuntimeCommand, RuntimeStatus, SourceCodeInfo, TuiEvent},
+    events::{EventRegistry, RuntimeCommand, RuntimeStatus},
     panels::{
         CommandAction, EbpfInfoPanel, InteractiveCommandPanel, ResponseType, SourceCodePanel,
     },
@@ -73,7 +71,9 @@ impl TuiApp {
         // Setup terminal
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        execute!(stdout, EnterAlternateScreen)?;
+        // Mouse capture disabled to allow standard copy/paste functionality
+        // execute!(stdout, EnableMouseCapture)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
@@ -105,7 +105,7 @@ impl TuiApp {
                                 }
                                 Event::Mouse(mouse) => {
                                     debug!("Mouse event: {:?}", mouse);
-                                    // TODO: Handle mouse events for panel resizing
+                                    // Mouse capture disabled - mouse events ignored to allow standard copy/paste
                                 }
                                 Event::Resize(_, _) => {
                                     needs_render = true;
@@ -151,9 +151,9 @@ impl TuiApp {
         disable_raw_mode()?;
         execute!(
             terminal.backend_mut(),
-            LeaveAlternateScreen,
-            DisableMouseCapture
+            LeaveAlternateScreen
         )?;
+        // Mouse capture was not enabled, so no need to disable it
         terminal.show_cursor()?;
 
         info!("TUI mode exited");
