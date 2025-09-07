@@ -32,7 +32,7 @@ pub async fn compile_and_load_script_for_tui(
     };
 
     // Step 3: Use unified compilation interface
-    let compilation_result = ghostscope_compiler::compile_script_to_uprobe_configs(
+    let compilation_result = ghostscope_compiler::compile_script(
         script,
         binary_analyzer,
         session.target_pid,
@@ -215,7 +215,7 @@ pub async fn compile_and_load_script_for_cli(
         .to_string();
 
     // Step 2: Use unified compilation interface
-    let compilation_result = ghostscope_compiler::compile_script_to_uprobe_configs(
+    let compilation_result = ghostscope_compiler::compile_script(
         script,
         binary_analyzer,
         session.target_pid,
