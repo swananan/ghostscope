@@ -1776,12 +1776,8 @@ impl InteractiveCommandPanel {
         // Calculate which lines to show
         let total_lines = self.static_lines.len();
         let start_idx = if self.mode == InteractionMode::Command {
-            // In command mode, ensure cursor line is visible
-            if self.command_cursor_line >= max_lines {
-                self.command_cursor_line + 1 - max_lines
-            } else {
-                0
-            }
+            // In command mode, static index is not used for slicing; keep 0 here.
+            0
         } else {
             // In input mode, ensure current input line is always visible
             self.calculate_scroll_to_show_current_input(max_lines, content_width)
@@ -1797,49 +1793,138 @@ impl InteractiveCommandPanel {
             start_idx,
             end_idx
         );
-        for i in start_idx..end_idx {
-            if let Some(line) = self.static_lines.get(i) {
-                {
-                    debug!(
-                        "Regular line: line_type={:?}, response_type={:?}",
-                        line.line_type, line.response_type
-                    );
-                    // Handle text wrapping and styling for other content
-                    let wrapped_lines = self.wrap_text(&line.content, content_width);
+        if self.mode == InteractionMode::Command {
+            // Render by wrapped-line window
+            let start_rendered =
+                self.calculate_command_mode_start_rendered(max_lines, content_width);
+            let mut accumulated_rendered: usize = 0;
+            let mut started = false;
+            let mut remaining = max_lines;
 
-                    for wrapped_line in wrapped_lines {
-                        let spans = {
-                            match line.line_type {
-                                LineType::Command => {
-                                    vec![Span::styled(
-                                        wrapped_line,
-                                        Style::default().fg(Color::Gray),
-                                    )]
-                                }
-                                LineType::Response => {
-                                    // Special handling for ScriptDisplay in history
-                                    if line.response_type == Some(ResponseType::ScriptDisplay) {
-                                        self.format_script_display_line(&wrapped_line)
-                                    } else {
-                                        // Regular response styling
-                                        let style = self.get_response_style(&line.content);
-                                        vec![Span::styled(wrapped_line, style)]
-                                    }
-                                }
-                                LineType::CurrentInput => {
-                                    let style = if self.mode == InteractionMode::Input {
-                                        Style::default()
-                                            .fg(Color::Yellow)
-                                            .add_modifier(Modifier::BOLD)
-                                    } else {
-                                        Style::default().fg(Color::White)
-                                    };
+            for line in &self.static_lines {
+                let wrapped_lines = self.wrap_text(&line.content, content_width);
+                let line_wrapped_len = wrapped_lines.len();
+
+                if !started {
+                    if accumulated_rendered + line_wrapped_len <= start_rendered {
+                        accumulated_rendered += line_wrapped_len;
+                        continue;
+                    }
+                    // This is the first visible static line. Determine how many wrapped lines to skip.
+                    let skip = start_rendered.saturating_sub(accumulated_rendered);
+                    for wrapped_line in wrapped_lines.into_iter().skip(skip) {
+                        let spans = match line.line_type {
+                            LineType::Command => {
+                                vec![Span::styled(wrapped_line, Style::default().fg(Color::Gray))]
+                            }
+                            LineType::Response => {
+                                if line.response_type == Some(ResponseType::ScriptDisplay) {
+                                    self.format_script_display_line(&wrapped_line)
+                                } else {
+                                    let style = self.get_response_style(&line.content);
                                     vec![Span::styled(wrapped_line, style)]
                                 }
                             }
+                            LineType::CurrentInput => {
+                                let style = if self.mode == InteractionMode::Input {
+                                    Style::default()
+                                        .fg(Color::Yellow)
+                                        .add_modifier(Modifier::BOLD)
+                                } else {
+                                    Style::default().fg(Color::White)
+                                };
+                                vec![Span::styled(wrapped_line, style)]
+                            }
                         };
-
                         items.push(ListItem::new(Line::from(spans)));
+                        remaining = remaining.saturating_sub(1);
+                        if remaining == 0 {
+                            break;
+                        }
+                    }
+                    started = true;
+                    if remaining == 0 { /* filled viewport */ }
+                } else {
+                    for wrapped_line in wrapped_lines {
+                        let spans = match line.line_type {
+                            LineType::Command => {
+                                vec![Span::styled(wrapped_line, Style::default().fg(Color::Gray))]
+                            }
+                            LineType::Response => {
+                                if line.response_type == Some(ResponseType::ScriptDisplay) {
+                                    self.format_script_display_line(&wrapped_line)
+                                } else {
+                                    let style = self.get_response_style(&line.content);
+                                    vec![Span::styled(wrapped_line, style)]
+                                }
+                            }
+                            LineType::CurrentInput => {
+                                let style = if self.mode == InteractionMode::Input {
+                                    Style::default()
+                                        .fg(Color::Yellow)
+                                        .add_modifier(Modifier::BOLD)
+                                } else {
+                                    Style::default().fg(Color::White)
+                                };
+                                vec![Span::styled(wrapped_line, style)]
+                            }
+                        };
+                        items.push(ListItem::new(Line::from(spans)));
+                        remaining = remaining.saturating_sub(1);
+                        if remaining == 0 {
+                            break;
+                        }
+                    }
+                }
+                if remaining == 0 {
+                    break;
+                }
+            }
+        } else {
+            for i in start_idx..end_idx {
+                if let Some(line) = self.static_lines.get(i) {
+                    {
+                        debug!(
+                            "Regular line: line_type={:?}, response_type={:?}",
+                            line.line_type, line.response_type
+                        );
+                        // Handle text wrapping and styling for other content
+                        let wrapped_lines = self.wrap_text(&line.content, content_width);
+
+                        for wrapped_line in wrapped_lines {
+                            let spans = {
+                                match line.line_type {
+                                    LineType::Command => {
+                                        vec![Span::styled(
+                                            wrapped_line,
+                                            Style::default().fg(Color::Gray),
+                                        )]
+                                    }
+                                    LineType::Response => {
+                                        // Special handling for ScriptDisplay in history
+                                        if line.response_type == Some(ResponseType::ScriptDisplay) {
+                                            self.format_script_display_line(&wrapped_line)
+                                        } else {
+                                            // Regular response styling
+                                            let style = self.get_response_style(&line.content);
+                                            vec![Span::styled(wrapped_line, style)]
+                                        }
+                                    }
+                                    LineType::CurrentInput => {
+                                        let style = if self.mode == InteractionMode::Input {
+                                            Style::default()
+                                                .fg(Color::Yellow)
+                                                .add_modifier(Modifier::BOLD)
+                                        } else {
+                                            Style::default().fg(Color::White)
+                                        };
+                                        vec![Span::styled(wrapped_line, style)]
+                                    }
+                                }
+                            };
+
+                            items.push(ListItem::new(Line::from(spans)));
+                        }
                     }
                 }
             }
@@ -1852,6 +1937,42 @@ impl InteractiveCommandPanel {
         if is_focused {
             self.render_cursor(frame, area, start_idx);
         }
+    }
+
+    /// Calculate the start rendered-line offset for command mode so that the cursor
+    /// is visible within the viewport. Accounts for wrapped lines.
+    fn calculate_command_mode_start_rendered(
+        &self,
+        max_lines: usize,
+        content_width: usize,
+    ) -> usize {
+        if self.static_lines.is_empty() {
+            return 0;
+        }
+
+        // Compute rendered index of the cursor (in wrapped-line space)
+        let mut rendered_before_cursor_line: usize = 0;
+        for i in 0..self.command_cursor_line.min(self.static_lines.len()) {
+            if let Some(line) = self.static_lines.get(i) {
+                rendered_before_cursor_line += self.wrap_text(&line.content, content_width).len();
+            }
+        }
+
+        let mut cursor_wrapped_offset: usize = 0;
+        if let Some(selected_line) = self.static_lines.get(self.command_cursor_line) {
+            let wrapped = self.wrap_text(&selected_line.content, content_width);
+            let mut remaining = self.command_cursor_column;
+            for (idx, seg) in wrapped.iter().enumerate() {
+                if remaining <= seg.len() {
+                    cursor_wrapped_offset = idx;
+                    break;
+                }
+                remaining = remaining.saturating_sub(seg.len());
+            }
+        }
+
+        let cursor_rendered_index = rendered_before_cursor_line + cursor_wrapped_offset;
+        cursor_rendered_index.saturating_sub(max_lines.saturating_sub(1))
     }
 
     fn render_cursor(&self, frame: &mut Frame, area: Rect, start_idx: usize) {
@@ -1948,7 +2069,8 @@ impl InteractiveCommandPanel {
 
                 // Calculate the actual rendered position of the selected line
                 let mut rendered_line_pos = 0;
-                for i in start_idx..self.static_lines.len() {
+                // Count rendered lines from the beginning to the selected static line
+                for i in 0..self.static_lines.len() {
                     if i == self.command_cursor_line {
                         break;
                     }
@@ -1976,7 +2098,11 @@ impl InteractiveCommandPanel {
                     }
 
                     rendered_line_pos += cursor_line_offset;
-                    let relative_line = rendered_line_pos.saturating_sub(start_idx);
+
+                    // In command mode, we page by rendered lines, not static indices
+                    let start_rendered = self
+                        .calculate_command_mode_start_rendered(area.height as usize, content_width);
+                    let relative_line = rendered_line_pos.saturating_sub(start_rendered);
 
                     if relative_line < area.height as usize {
                         let cursor_x = area.x + remaining_cursor_pos as u16;
