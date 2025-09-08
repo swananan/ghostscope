@@ -506,6 +506,24 @@ impl ScopedVariableMap {
     pub fn get_scope(&self, scope_id: ScopeId) -> Option<&Scope> {
         self.scopes.get(&scope_id)
     }
+
+    /// Find all addresses for functions with the given name
+    pub fn find_function_addresses(&self, function_name: &str) -> Vec<u64> {
+        let mut addresses = Vec::new();
+
+        for scope in self.scopes.values() {
+            if let ScopeType::Function { name, address } = &scope.scope_type {
+                if name == function_name {
+                    addresses.push(*address);
+                }
+            }
+        }
+
+        // Sort addresses for consistent ordering
+        addresses.sort_unstable();
+        addresses.dedup();
+        addresses
+    }
 }
 
 /// Statistics about the scoped variable map

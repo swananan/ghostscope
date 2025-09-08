@@ -4445,6 +4445,15 @@ impl DwarfContext {
             requires_cfa: false, // Will be true when CFI is fully implemented
         })
     }
+
+    /// Find all addresses for functions with the given name using DWARF information
+    pub fn get_function_addresses_by_name(&self, function_name: &str) -> Vec<u64> {
+        if let Some(scoped_map) = &self.scoped_variable_map {
+            scoped_map.find_function_addresses(function_name)
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 /// Frame base information for a specific PC location

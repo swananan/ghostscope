@@ -166,11 +166,40 @@ impl BinaryAnalyzer {
 
     /// Resolve function name to virtual address
     /// This is a unified interface that handles the complete function name to address resolution
+    /// First tries DWARF information, then falls back to symbol table
     pub fn resolve_function_address(&self, func_name: &str) -> Option<u64> {
+        // First try DWARF information
+        if let Some(dwarf_context) = &self.dwarf_context {
+            let addresses = dwarf_context.get_function_addresses_by_name(func_name);
+            if !addresses.is_empty() {
+                return Some(addresses[0]); // Return first address for compatibility
+            }
+        }
+
+        // Fall back to symbol table
         if let Some(symbol) = self.find_symbol(func_name) {
             Some(symbol.address)
         } else {
             None
+        }
+    }
+
+    /// Get all addresses for a function name using DWARF information first
+    /// Returns all addresses that correspond to the given function name
+    pub fn get_all_function_addresses(&self, func_name: &str) -> Vec<u64> {
+        // First try DWARF information
+        if let Some(dwarf_context) = &self.dwarf_context {
+            let addresses = dwarf_context.get_function_addresses_by_name(func_name);
+            if !addresses.is_empty() {
+                return addresses;
+            }
+        }
+
+        // Fall back to symbol table (single address)
+        if let Some(symbol) = self.find_symbol(func_name) {
+            vec![symbol.address]
+        } else {
+            Vec::new()
         }
     }
 

@@ -486,70 +486,102 @@ async fn handle_function_target(
 ) -> Result<TargetDebugInfo, String> {
     use ghostscope_ui::events::*;
 
-    let symbol = binary_analyzer
-        .find_symbol(function_name)
-        .ok_or_else(|| format!("Function '{}' not found in binary symbols", function_name))?;
+    // Use DWARF information first, then fall back to symbol table
+    let addresses = binary_analyzer.get_all_function_addresses(function_name);
 
-    let symbol_address = symbol.address;
-    info!(
-        "Found function '{}' at address: 0x{:x}",
-        function_name, symbol_address
-    );
-
-    // Get enhanced variables at the function entry point using NewScopedVariableSystem
-    let enhanced_vars = if let Some(dwarf_context) = binary_analyzer.dwarf_context_mut() {
-        info!("Using scoped variable system for function analysis");
-        dwarf_context.get_enhanced_variable_locations(symbol_address)
-    } else {
-        Vec::new()
-    };
-
-    // Separate parameters and variables
-    let mut parameters = Vec::new();
-    let mut variables = Vec::new();
-
-    for enhanced_var in enhanced_vars {
-        // Use the enhanced evaluation result if available, otherwise fall back to raw location expression
-        let location_description = if let Some(evaluation_result) = &enhanced_var.evaluation_result
-        {
-            format!("{:?}", evaluation_result)
-        } else {
-            format!("{:?} (raw)", enhanced_var.variable.location_expr)
-        };
-
-        let var_info = VariableDebugInfo {
-            name: enhanced_var.variable.name.clone(),
-            type_name: enhanced_var.variable.type_name.clone(),
-            location_description,
-            size: enhanced_var.size,
-            scope_start: enhanced_var.variable.scope_ranges.first().map(|r| r.start),
-            scope_end: enhanced_var.variable.scope_ranges.first().map(|r| r.end),
-        };
-
-        // Use the is_parameter field from DWARF parsing (which is based on DW_TAG_formal_parameter)
-        let is_parameter = enhanced_var.variable.is_parameter;
-
-        // Log using enhanced evaluation result if available
-        let log_location = if let Some(evaluation_result) = &enhanced_var.evaluation_result {
-            format!("{:?}", evaluation_result)
-        } else {
-            format!("{:?} (raw)", enhanced_var.variable.location_expr)
-        };
-
-        info!(
-            "Variable '{}' location: {}, is_parameter: {} (from DWARF)",
-            enhanced_var.variable.name, log_location, is_parameter
-        );
-
-        if is_parameter {
-            parameters.push(var_info);
-        } else {
-            variables.push(var_info);
-        }
+    if addresses.is_empty() {
+        return Err(format!(
+            "Function '{}' not found in DWARF info or symbols",
+            function_name
+        ));
     }
 
-    // Try to get source location for the function
-    let source_location = binary_analyzer.get_source_location(symbol_address);
+    info!(
+        "Found function '{}' at {} address(es): [{}]",
+        function_name,
+        addresses.len(),
+        addresses
+            .iter()
+            .map(|a| format!("0x{:x}", a))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    // Analyze variables for each address separately
+    let mut address_mappings = Vec::new();
+
+    for address in &addresses {
+        info!(
+            "Analyzing variables at address 0x{:x} for function '{}'",
+            address, function_name
+        );
+
+        // Get enhanced variables at this address using ScopedVariableSystem
+        let enhanced_vars = if let Some(dwarf_context) = binary_analyzer.dwarf_context_mut() {
+            info!(
+                "Using scoped variable system for function analysis at 0x{:x}",
+                address
+            );
+            dwarf_context.get_enhanced_variable_locations(*address)
+        } else {
+            Vec::new()
+        };
+
+        // Separate parameters and variables for this address
+        let mut parameters = Vec::new();
+        let mut variables = Vec::new();
+
+        for enhanced_var in enhanced_vars {
+            // Use the enhanced evaluation result if available, otherwise fall back to raw location expression
+            let location_description =
+                if let Some(evaluation_result) = &enhanced_var.evaluation_result {
+                    format!("{:?}", evaluation_result)
+                } else {
+                    format!("{:?} (raw)", enhanced_var.variable.location_expr)
+                };
+
+            let var_info = VariableDebugInfo {
+                name: enhanced_var.variable.name.clone(),
+                type_name: enhanced_var.variable.type_name.clone(),
+                location_description,
+                size: enhanced_var.size,
+                scope_start: enhanced_var.variable.scope_ranges.first().map(|r| r.start),
+                scope_end: enhanced_var.variable.scope_ranges.first().map(|r| r.end),
+            };
+
+            // Use the is_parameter field from DWARF parsing (which is based on DW_TAG_formal_parameter)
+            let is_parameter = enhanced_var.variable.is_parameter;
+
+            // Log using enhanced evaluation result if available
+            let log_location = if let Some(evaluation_result) = &enhanced_var.evaluation_result {
+                format!("{:?}", evaluation_result)
+            } else {
+                format!("{:?} (raw)", enhanced_var.variable.location_expr)
+            };
+
+            info!(
+                "Address 0x{:x}: Variable '{}' location: {}, is_parameter: {} (from DWARF)",
+                *address, enhanced_var.variable.name, log_location, is_parameter
+            );
+
+            if is_parameter {
+                parameters.push(var_info);
+            } else {
+                variables.push(var_info);
+            }
+        }
+
+        address_mappings.push(AddressMapping {
+            address: *address,
+            function_name: Some(function_name.to_string()),
+            variables,
+            parameters,
+        });
+    }
+
+    // Try to get source location for the main function address
+    let first_address = addresses[0];
+    let source_location = binary_analyzer.get_source_location(first_address);
 
     Ok(TargetDebugInfo {
         target: function_name.to_string(),
@@ -557,12 +589,7 @@ async fn handle_function_target(
         file_path: source_location.as_ref().map(|sl| sl.file_path.clone()),
         line_number: source_location.as_ref().map(|sl| sl.line_number),
         function_name: Some(function_name.to_string()),
-        address_mappings: vec![AddressMapping {
-            address: symbol_address,
-            function_name: Some(function_name.to_string()),
-            variables,
-            parameters,
-        }],
+        address_mappings,
     })
 }
 
