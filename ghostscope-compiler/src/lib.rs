@@ -4,7 +4,6 @@ pub mod codegen;
 pub mod debug_logger;
 pub mod map;
 pub mod parser;
-pub mod platform;
 
 use crate::ast_compiler::AstCompiler;
 use codegen::CodeGenError;

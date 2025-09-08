@@ -16,3 +16,6 @@ anyhow = { workspace = true }
 
 # Path and file operations
 memmap2 = "0.9"
+
+# Internal dependencies
+ghostscope-protocol = { path = "../ghostscope-protocol" }

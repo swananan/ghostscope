@@ -545,6 +545,16 @@ pub enum DwarfOp {
     Deref,
     /// Add two values on stack
     Plus,
+    /// Subtract two values on stack
+    Sub,
+    /// Multiply two values on stack
+    Mul,
+    /// Divide two values on stack
+    Div,
+    /// Modulo operation on two values on stack
+    Mod,
+    /// Negate the top stack value
+    Neg,
     /// Add constant to top of stack
     PlusUconst(u64),
     /// Duplicate top stack value
@@ -3620,6 +3630,11 @@ impl DwarfContext {
 
             // Arithmetic operations
             gimli::Operation::Plus => Some(DwarfOp::Plus),
+            gimli::Operation::Minus => Some(DwarfOp::Sub),
+            gimli::Operation::Mul => Some(DwarfOp::Mul),
+            gimli::Operation::Div => Some(DwarfOp::Div),
+            gimli::Operation::Mod => Some(DwarfOp::Mod),
+            gimli::Operation::Neg => Some(DwarfOp::Neg),
             gimli::Operation::PlusConstant { value } => Some(DwarfOp::PlusUconst(value)),
 
             // Memory operations

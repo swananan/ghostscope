@@ -3,6 +3,7 @@
 
 use crate::dwarf::{DwarfContext, DwarfOp, LocationExpression};
 use crate::scoped_variables::AddressRange;
+use ghostscope_protocol::platform;
 use std::collections::HashMap;
 use tracing::{debug, error, warn};
 
@@ -225,6 +226,13 @@ pub enum EvaluationResult {
     Value(i64),
 }
 
+/// Helper function to get register name for debugging display
+fn get_register_name(reg: u16) -> String {
+    platform::dwarf_reg_to_name(reg)
+        .map(|name| format!("%{}", name))
+        .unwrap_or_else(|| format!("%{}", reg))
+}
+
 impl std::fmt::Debug for EvaluationResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -232,7 +240,8 @@ impl std::fmt::Debug for EvaluationResult {
                 write!(f, "Address(0x{:x})", addr)
             }
             EvaluationResult::Register(reg_access) => {
-                let mut result = format!("Register(%{}", reg_access.register);
+                let reg_name = get_register_name(reg_access.register);
+                let mut result = format!("Register({})", reg_name);
                 if let Some(offset) = reg_access.offset {
                     if offset >= 0 {
                         result.push_str(&format!("+{}", offset));
@@ -246,7 +255,6 @@ impl std::fmt::Debug for EvaluationResult {
                         result.push_str(&format!("({})", size));
                     }
                 }
-                result.push(')');
                 write!(f, "{}", result)
             }
             EvaluationResult::StackOffset(offset) => {
@@ -285,24 +293,92 @@ impl std::fmt::Debug for EvaluationResult {
                 requires_frame_base,
                 requires_cfa,
             } => {
-                write!(f, "Computed({} steps", steps.len())?;
+                write!(f, "Computed[")?;
+
+                // Format steps in a readable way
+                for (i, step) in steps.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " → ")?;
+                    }
+                    match step {
+                        AccessStep::LoadRegister(reg) => {
+                            if let Some(reg_name) = platform::dwarf_reg_to_name(*reg) {
+                                write!(f, "Load(%{})", reg_name)?;
+                            } else {
+                                write!(f, "Load(%{})", reg)?;
+                            }
+                        }
+                        AccessStep::AddConstant(val) => {
+                            if *val >= 0 {
+                                write!(f, "+{}", val)?;
+                            } else {
+                                write!(f, "{}", val)?;
+                            }
+                        }
+                        AccessStep::LoadFrameBase => write!(f, "FrameBase")?,
+                        AccessStep::LoadCallFrameCFA => write!(f, "CFA")?,
+                        AccessStep::Dereference { size } => {
+                            write!(f, "Deref({})", size)?;
+                        }
+                        AccessStep::ArithmeticOp(op) => {
+                            let op_str = match op {
+                                ArithOp::Add => "+",
+                                ArithOp::Sub => "-",
+                                ArithOp::Mul => "*",
+                                ArithOp::Div => "/",
+                                ArithOp::Mod => "%",
+                                ArithOp::And => "&",
+                                ArithOp::Or => "|",
+                                ArithOp::Xor => "^",
+                                ArithOp::Not => "!",
+                                ArithOp::Shl => "<<",
+                                ArithOp::Shr => ">>",
+                                ArithOp::Shra => ">>a",
+                                ArithOp::Neg => "neg",
+                                ArithOp::Abs => "abs",
+                                ArithOp::Eq => "==",
+                                ArithOp::Ne => "!=",
+                                ArithOp::Lt => "<",
+                                ArithOp::Gt => ">",
+                                ArithOp::Le => "<=",
+                                ArithOp::Ge => ">=",
+                            };
+                            write!(f, "{}", op_str)?;
+                        }
+                        AccessStep::Conditional { condition, .. } => {
+                            write!(f, "If({:?})", condition)?;
+                        }
+                        AccessStep::Piece { size, offset } => {
+                            write!(f, "Piece({}, {})", size, offset)?;
+                        }
+                    }
+                }
+
+                // Add requirements summary
+                let mut reqs = Vec::new();
                 if *requires_frame_base {
-                    write!(f, ", +Frame")?;
+                    reqs.push("Frame".to_string());
                 }
                 if *requires_cfa {
-                    write!(f, ", +CFA")?;
+                    reqs.push("CFA".to_string());
                 }
                 if !requires_registers.is_empty() {
-                    write!(f, ", +Regs[")?;
-                    for (i, reg) in requires_registers.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ",")?;
-                        }
-                        write!(f, "%{}", reg)?;
-                    }
-                    write!(f, "]")?;
+                    let reg_names: Vec<String> = requires_registers
+                        .iter()
+                        .map(|reg| {
+                            platform::dwarf_reg_to_name(*reg)
+                                .map(|name| name.to_string())
+                                .unwrap_or_else(|| format!("R{}", reg))
+                        })
+                        .collect();
+                    reqs.push(format!("Regs[{}]", reg_names.join(",")));
                 }
-                write!(f, ")")
+
+                if !reqs.is_empty() {
+                    write!(f, " | needs: {}", reqs.join(", "))?;
+                }
+
+                write!(f, "]")
             }
             EvaluationResult::Optimized => {
                 write!(f, "OptimizedOut")
@@ -906,6 +982,11 @@ impl DwarfExpressionEvaluator {
             DwarfOp::Fbreg(offset) => Ok(DwarfOperation::FrameBase(*offset)),
             DwarfOp::Deref => Ok(DwarfOperation::Deref(8)), // Default to 8-byte deref
             DwarfOp::Plus => Ok(DwarfOperation::Add),
+            DwarfOp::Sub => Ok(DwarfOperation::Sub),
+            DwarfOp::Mul => Ok(DwarfOperation::Mul),
+            DwarfOp::Div => Ok(DwarfOperation::Div),
+            DwarfOp::Mod => Ok(DwarfOperation::Mod),
+            DwarfOp::Neg => Ok(DwarfOperation::Neg),
             // PlusUconst is a combined operation: push constant and add
             // For CFI evaluation, we handle it as a single RegisterOffset operation
             DwarfOp::PlusUconst(val) => Ok(DwarfOperation::Literal(*val as i64)),
@@ -2030,6 +2111,26 @@ impl DwarfExpressionEvaluator {
 
                 DwarfOp::Plus => {
                     steps.push(AccessStep::ArithmeticOp(ArithOp::Add));
+                }
+
+                DwarfOp::Sub => {
+                    steps.push(AccessStep::ArithmeticOp(ArithOp::Sub));
+                }
+
+                DwarfOp::Mul => {
+                    steps.push(AccessStep::ArithmeticOp(ArithOp::Mul));
+                }
+
+                DwarfOp::Div => {
+                    steps.push(AccessStep::ArithmeticOp(ArithOp::Div));
+                }
+
+                DwarfOp::Mod => {
+                    steps.push(AccessStep::ArithmeticOp(ArithOp::Mod));
+                }
+
+                DwarfOp::Neg => {
+                    steps.push(AccessStep::ArithmeticOp(ArithOp::Neg));
                 }
 
                 DwarfOp::PlusUconst(value) => {

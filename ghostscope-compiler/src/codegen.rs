@@ -22,12 +22,12 @@ use tracing::{debug, error, info, warn};
 use crate::ast::{BinaryOp, Expr, Program, Statement, VarType, VariableContext};
 use crate::debug_logger::DebugLogger;
 use crate::map::{MapError, MapManager};
-use crate::platform;
 use ghostscope_binary::dwarf::{
     DwarfEncoding, DwarfType, EnhancedVariableLocation, LocationExpression,
 };
 use ghostscope_binary::expression::{AccessStep, ArithOp, EvaluationResult, RegisterAccess};
 use ghostscope_binary::scoped_variables::VariableResult;
+use ghostscope_protocol::platform;
 use ghostscope_protocol::{consts, MessageType, TypeEncoding};
 
 pub struct CodeGen<'ctx> {
@@ -2066,6 +2066,61 @@ impl<'ctx> CodeGen<'ctx> {
                         let result = self
                             .builder
                             .build_int_sub(a, b, &format!("{}_sub_{}", var_name, i))
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        stack.push(result);
+                    }
+                    ArithOp::Mul => {
+                        if stack.len() < 2 {
+                            return Err(CodeGenError::DwarfError(
+                                "Stack underflow in Mul".to_string(),
+                            ));
+                        }
+                        let b = stack.pop().unwrap();
+                        let a = stack.pop().unwrap();
+                        let result = self
+                            .builder
+                            .build_int_mul(a, b, &format!("{}_mul_{}", var_name, i))
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        stack.push(result);
+                    }
+                    ArithOp::Div => {
+                        if stack.len() < 2 {
+                            return Err(CodeGenError::DwarfError(
+                                "Stack underflow in Div".to_string(),
+                            ));
+                        }
+                        let b = stack.pop().unwrap();
+                        let a = stack.pop().unwrap();
+                        let result = self
+                            .builder
+                            .build_int_signed_div(a, b, &format!("{}_div_{}", var_name, i))
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        stack.push(result);
+                    }
+                    ArithOp::Mod => {
+                        if stack.len() < 2 {
+                            return Err(CodeGenError::DwarfError(
+                                "Stack underflow in Mod".to_string(),
+                            ));
+                        }
+                        let b = stack.pop().unwrap();
+                        let a = stack.pop().unwrap();
+                        let result = self
+                            .builder
+                            .build_int_signed_rem(a, b, &format!("{}_mod_{}", var_name, i))
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        stack.push(result);
+                    }
+                    ArithOp::Neg => {
+                        if stack.is_empty() {
+                            return Err(CodeGenError::DwarfError(
+                                "Stack underflow in Neg".to_string(),
+                            ));
+                        }
+                        let a = stack.pop().unwrap();
+                        let result = self
+                            .builder
+                            .build_int_neg(a, &format!("{}_neg_{}", var_name, i))
                             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
                         stack.push(result);
                     }
@@ -4207,8 +4262,9 @@ impl<'ctx> CodeGen<'ctx> {
                 }
 
                 AccessStep::ArithmeticOp(op) => {
-                    return Err(CodeGenError::UnsupportedOperation(format!(
-                        "ArithmeticOp {:?} not yet implemented in computed access",
+                    // Complex arithmetic operations in computed access - should use the main implementation
+                    return Err(CodeGenError::DwarfError(format!(
+                        "ArithmeticOp {:?} should be handled in the main computed access path",
                         op
                     )));
                 }
