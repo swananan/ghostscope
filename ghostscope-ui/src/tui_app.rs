@@ -1248,65 +1248,168 @@ fn format_target_debug_info(target: &str, info: &crate::events::TargetDebugInfo)
     if let Some(ref func_name) = info.function_name {
         result.push_str(&format!("   Function: {}\n", func_name));
     }
-    if let Some(address) = info.address {
-        result.push_str(&format!("   Address: 0x{:x}\n", address));
-    }
-
-    // Parameters section
-    if !info.parameters.is_empty() {
-        result.push_str("\n📥 Parameters:\n");
-        for (i, param) in info.parameters.iter().enumerate() {
-            let prefix = if i == info.parameters.len() - 1 {
-                "   └─"
-            } else {
-                "   ├─"
-            };
-            result.push_str(&format!("{} {} {}", prefix, param.name, param.type_name));
-
-            // Add location and size info in a compact format
-            let mut details = Vec::new();
-            if !param.location_description.is_empty() && param.location_description != "None" {
-                details.push(format!("loc: {}", param.location_description));
+    // Address mappings section
+    if !info.address_mappings.is_empty() {
+        if info.address_mappings.len() == 1 {
+            // Single address - show inline
+            let mapping = &info.address_mappings[0];
+            result.push_str(&format!("   Address: 0x{:x}", mapping.address));
+            if let Some(ref func_name) = mapping.function_name {
+                result.push_str(&format!(" ({})", func_name));
             }
-            if let Some(size) = param.size {
-                details.push(format!("{} bytes", size));
-            }
-
-            if !details.is_empty() {
-                result.push_str(&format!(" ({})", details.join(", ")));
+            result.push('\n');
+        } else {
+            // Multiple addresses - show summary first
+            result.push_str(&format!("   Addresses ({}): ", info.address_mappings.len()));
+            for (i, mapping) in info.address_mappings.iter().enumerate() {
+                if i > 0 {
+                    result.push_str(", ");
+                }
+                result.push_str(&format!("[{}] 0x{:x}", i, mapping.address));
             }
             result.push('\n');
         }
     }
 
-    // Variables section
-    if !info.variables.is_empty() {
-        result.push_str("\n📦 Local Variables:\n");
-        for (i, var) in info.variables.iter().enumerate() {
-            let prefix = if i == info.variables.len() - 1 {
-                "   └─"
-            } else {
-                "   ├─"
-            };
-            result.push_str(&format!("{} {} {}", prefix, var.name, var.type_name));
+    // Variables and parameters section - handle multiple addresses
+    if !info.address_mappings.is_empty() {
+        if info.address_mappings.len() == 1 {
+            // Single address - show parameters and variables normally
+            let mapping = &info.address_mappings[0];
 
-            // Add location and size info in a compact format
-            let mut details = Vec::new();
-            if !var.location_description.is_empty() && var.location_description != "None" {
-                details.push(format!("loc: {}", var.location_description));
-            }
-            if let Some(size) = var.size {
-                details.push(format!("{} bytes", size));
+            if !mapping.parameters.is_empty() {
+                result.push_str("\n📥 Parameters:\n");
+                for (i, param) in mapping.parameters.iter().enumerate() {
+                    let prefix = if i == mapping.parameters.len() - 1 {
+                        "   └─"
+                    } else {
+                        "   ├─"
+                    };
+                    result.push_str(&format!("{} {} {}", prefix, param.name, param.type_name));
+
+                    // Add location and size info in a compact format
+                    let mut details = Vec::new();
+                    if !param.location_description.is_empty()
+                        && param.location_description != "None"
+                    {
+                        details.push(format!("loc: {}", param.location_description));
+                    }
+                    if let Some(size) = param.size {
+                        details.push(format!("{} bytes", size));
+                    }
+
+                    if !details.is_empty() {
+                        result.push_str(&format!(" ({})", details.join(", ")));
+                    }
+                    result.push('\n');
+                }
             }
 
-            if !details.is_empty() {
-                result.push_str(&format!(" ({})", details.join(", ")));
+            if !mapping.variables.is_empty() {
+                result.push_str("\n📦 Local Variables:\n");
+                for (i, var) in mapping.variables.iter().enumerate() {
+                    let prefix = if i == mapping.variables.len() - 1 {
+                        "   └─"
+                    } else {
+                        "   ├─"
+                    };
+                    result.push_str(&format!("{} {} {}", prefix, var.name, var.type_name));
+
+                    // Add location and size info in a compact format
+                    let mut details = Vec::new();
+                    if !var.location_description.is_empty() && var.location_description != "None" {
+                        details.push(format!("loc: {}", var.location_description));
+                    }
+                    if let Some(size) = var.size {
+                        details.push(format!("{} bytes", size));
+                    }
+
+                    if !details.is_empty() {
+                        result.push_str(&format!(" ({})", details.join(", ")));
+                    }
+                    result.push('\n');
+                }
             }
-            result.push('\n');
+        } else {
+            // Multiple addresses - show detailed breakdown
+            result.push_str(&format!(
+                "\n📍 Address Mappings ({}):\n",
+                info.address_mappings.len()
+            ));
+
+            for (i, mapping) in info.address_mappings.iter().enumerate() {
+                result.push_str(&format!("\n[{}] 0x{:x}", i, mapping.address));
+                if let Some(ref func_name) = mapping.function_name {
+                    result.push_str(&format!(" ({})", func_name));
+                }
+                result.push('\n');
+
+                // Parameters for this address
+                if !mapping.parameters.is_empty() {
+                    result.push_str("📥 Parameters:\n");
+                    for (j, param) in mapping.parameters.iter().enumerate() {
+                        let prefix = if j == mapping.parameters.len() - 1 {
+                            "   └─"
+                        } else {
+                            "   ├─"
+                        };
+                        result.push_str(&format!("{} {} {}", prefix, param.name, param.type_name));
+
+                        let mut details = Vec::new();
+                        if !param.location_description.is_empty()
+                            && param.location_description != "None"
+                        {
+                            details.push(format!("loc: {}", param.location_description));
+                        }
+                        if let Some(size) = param.size {
+                            details.push(format!("{} bytes", size));
+                        }
+
+                        if !details.is_empty() {
+                            result.push_str(&format!(" ({})", details.join(", ")));
+                        }
+                        result.push('\n');
+                    }
+                }
+
+                // Variables for this address
+                if !mapping.variables.is_empty() {
+                    result.push_str("📦 Local Variables:\n");
+                    for (j, var) in mapping.variables.iter().enumerate() {
+                        let prefix = if j == mapping.variables.len() - 1 {
+                            "   └─"
+                        } else {
+                            "   ├─"
+                        };
+                        result.push_str(&format!("{} {} {}", prefix, var.name, var.type_name));
+
+                        let mut details = Vec::new();
+                        if !var.location_description.is_empty()
+                            && var.location_description != "None"
+                        {
+                            details.push(format!("loc: {}", var.location_description));
+                        }
+                        if let Some(size) = var.size {
+                            details.push(format!("{} bytes", size));
+                        }
+
+                        if !details.is_empty() {
+                            result.push_str(&format!(" ({})", details.join(", ")));
+                        }
+                        result.push('\n');
+                    }
+                }
+            }
         }
     }
 
-    if info.parameters.is_empty() && info.variables.is_empty() {
+    // Check if we have any variables or parameters across all mappings
+    let has_any_data = info
+        .address_mappings
+        .iter()
+        .any(|mapping| !mapping.parameters.is_empty() || !mapping.variables.is_empty());
+
+    if !has_any_data {
         result.push_str("\n❌ No variables or parameters found in scope\n");
     }
 

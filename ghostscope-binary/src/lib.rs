@@ -2,6 +2,7 @@ pub mod debuglink;
 pub mod dwarf;
 pub mod elf;
 pub mod expression;
+pub mod line_lookup;
 pub mod scoped_variables;
 pub mod symbol;
 
@@ -173,9 +174,25 @@ impl BinaryAnalyzer {
         }
     }
 
+    /// Get all addresses for a source line
+    /// Returns all addresses that correspond to the given source line
+    pub fn get_all_source_line_addresses(&mut self, file_path: &str, line_number: u32) -> Vec<u64> {
+        if let Some(dwarf_context) = &mut self.dwarf_context {
+            let line_mappings = dwarf_context.get_addresses_for_line(file_path, line_number);
+            let mut addresses: Vec<u64> = line_mappings.into_iter().map(|m| m.address).collect();
+
+            // Sort addresses for consistent display
+            addresses.sort_unstable();
+            addresses.dedup();
+            addresses
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Resolve source line to virtual address  
     /// This is a unified interface that handles the complete source line to address resolution
-    /// Returns the first address found for the given source line
+    /// Returns the best address found for the given source line (for backward compatibility)
     pub fn resolve_source_line_address(
         &mut self,
         file_path: &str,
@@ -183,11 +200,45 @@ impl BinaryAnalyzer {
     ) -> Option<u64> {
         if let Some(dwarf_context) = &mut self.dwarf_context {
             let line_mappings = dwarf_context.get_addresses_for_line(file_path, line_number);
-            if !line_mappings.is_empty() {
-                Some(line_mappings[0].address)
-            } else {
-                None
+            if line_mappings.is_empty() {
+                return None;
             }
+
+            // If only one address, use it
+            if line_mappings.len() == 1 {
+                return Some(line_mappings[0].address);
+            }
+
+            // Multiple addresses found - choose the best one
+            // Strategy: prefer addresses that are in symbol/function ranges
+            let mut best_address = line_mappings[0].address;
+            let mut best_score = 0u32;
+
+            for mapping in &line_mappings {
+                let mut score = 0u32;
+
+                // Check if this address is within a known symbol
+                if let Some(symbol) = self.find_symbol_by_address(mapping.address) {
+                    score += 10; // High priority for addresses in symbols
+
+                    // Extra bonus for function symbols
+                    if matches!(symbol.kind, crate::symbol::SymbolType::Function) {
+                        score += 5;
+                    }
+                }
+
+                // Prefer higher addresses (usually main implementations vs inlined)
+                if mapping.address > best_address {
+                    score += 1;
+                }
+
+                if score > best_score || (score == best_score && mapping.address > best_address) {
+                    best_address = mapping.address;
+                    best_score = score;
+                }
+            }
+
+            Some(best_address)
         } else {
             None
         }

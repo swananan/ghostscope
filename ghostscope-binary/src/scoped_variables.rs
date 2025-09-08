@@ -324,10 +324,24 @@ impl ScopedVariableMap {
 
     /// Check if variable is visible at given address
     fn is_variable_visible_at_address(&self, var_ref: &VariableRef, addr: u64) -> bool {
-        var_ref
+        let visible = var_ref
             .address_ranges
             .iter()
-            .any(|range| addr >= range.start && addr < range.end)
+            .any(|range| addr >= range.start && addr < range.end);
+
+        if !visible {
+            debug!(
+                "ScopedVariableMap: Variable '{}' NOT visible at 0x{:x}. Address ranges: {:?}",
+                var_ref.variable_id, addr, var_ref.address_ranges
+            );
+        } else {
+            debug!(
+                "ScopedVariableMap: Variable '{}' IS visible at 0x{:x}",
+                var_ref.variable_id, addr
+            );
+        }
+
+        visible
     }
 
     /// Resolve variable location at specific address

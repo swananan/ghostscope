@@ -557,9 +557,12 @@ async fn handle_function_target(
         file_path: source_location.as_ref().map(|sl| sl.file_path.clone()),
         line_number: source_location.as_ref().map(|sl| sl.line_number),
         function_name: Some(function_name.to_string()),
-        variables,
-        parameters,
-        address: Some(symbol_address),
+        address_mappings: vec![AddressMapping {
+            address: symbol_address,
+            function_name: Some(function_name.to_string()),
+            variables,
+            parameters,
+        }],
     })
 }
 
@@ -584,87 +587,116 @@ async fn handle_source_location_target(
         .parse::<u32>()
         .map_err(|_| format!("Invalid line number '{}' in target '{}'", parts[1], target))?;
 
-    // Resolve source line to address
-    let address = binary_analyzer
-        .resolve_source_line_address(file_path, line_number)
-        .ok_or_else(|| format!("Cannot resolve address for {}:{}", file_path, line_number))?;
+    // Resolve source line to all addresses
+    let addresses = binary_analyzer.get_all_source_line_addresses(file_path, line_number);
 
-    info!(
-        "Resolved {}:{} to address: 0x{:x}",
-        file_path, line_number, address
-    );
-
-    // Get enhanced variables at this location using NewScopedVariableSystem
-    let enhanced_vars = if let Some(dwarf_context) = binary_analyzer.dwarf_context_mut() {
-        info!("Using scoped variable system for source location analysis");
-        dwarf_context.get_enhanced_variable_locations(address)
-    } else {
-        Vec::new()
-    };
-
-    // Separate parameters and variables
-    let mut parameters = Vec::new();
-    let mut variables = Vec::new();
-
-    for enhanced_var in enhanced_vars {
-        // Use the enhanced evaluation result if available, otherwise fall back to raw location expression
-        let location_description = if let Some(evaluation_result) = &enhanced_var.evaluation_result
-        {
-            format!("{:?}", evaluation_result)
-        } else {
-            format!("{:?} (raw)", enhanced_var.variable.location_expr)
-        };
-
-        let var_info = VariableDebugInfo {
-            name: enhanced_var.variable.name.clone(),
-            type_name: enhanced_var.variable.type_name.clone(),
-            location_description,
-            size: enhanced_var.size,
-            scope_start: enhanced_var.variable.scope_ranges.first().map(|r| r.start),
-            scope_end: enhanced_var.variable.scope_ranges.first().map(|r| r.end),
-        };
-
-        // Use the is_parameter field from DWARF parsing (which is based on DW_TAG_formal_parameter)
-        let is_parameter = enhanced_var.variable.is_parameter;
-
-        // Log using enhanced evaluation result if available
-        let log_location = if let Some(evaluation_result) = &enhanced_var.evaluation_result {
-            format!("{:?}", evaluation_result)
-        } else {
-            format!("{:?} (raw)", enhanced_var.variable.location_expr)
-        };
-
-        info!(
-            "Variable '{}' location: {}, is_parameter: {} (from DWARF)",
-            enhanced_var.variable.name, log_location, is_parameter
-        );
-
-        if is_parameter {
-            parameters.push(var_info);
-        } else {
-            variables.push(var_info);
-        }
+    if addresses.is_empty() {
+        return Err(format!(
+            "Cannot resolve any address for {}:{}",
+            file_path, line_number
+        ));
     }
 
-    // Try to find containing function
-    let function_symbol = binary_analyzer.symbol_table.find_containing_symbol(address);
-    let function_name = function_symbol.map(|s| s.name.clone());
+    info!(
+        "Resolved {}:{} to {} address(es): [{}]",
+        file_path,
+        line_number,
+        addresses.len(),
+        addresses
+            .iter()
+            .map(|a| format!("0x{:x}", a))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 
-    // Get the actual source location from the address to get the complete file path
-    let actual_source_location = binary_analyzer.get_source_location(address);
+    // Analyze variables for each address separately
+    let mut address_mappings = Vec::new();
+
+    for address in &addresses {
+        info!("Analyzing variables at address 0x{:x}", address);
+
+        let enhanced_vars = if let Some(dwarf_context) = binary_analyzer.dwarf_context_mut() {
+            dwarf_context.get_enhanced_variable_locations(*address)
+        } else {
+            Vec::new()
+        };
+
+        // Separate parameters and variables for this address
+        let mut parameters = Vec::new();
+        let mut variables = Vec::new();
+
+        for enhanced_var in enhanced_vars {
+            // Use the enhanced evaluation result if available, otherwise fall back to raw location expression
+            let location_description =
+                if let Some(evaluation_result) = &enhanced_var.evaluation_result {
+                    format!("{:?}", evaluation_result)
+                } else {
+                    format!("{:?} (raw)", enhanced_var.variable.location_expr)
+                };
+
+            let var_info = VariableDebugInfo {
+                name: enhanced_var.variable.name.clone(),
+                type_name: enhanced_var.variable.type_name.clone(),
+                location_description,
+                size: enhanced_var.size,
+                scope_start: enhanced_var.variable.scope_ranges.first().map(|r| r.start),
+                scope_end: enhanced_var.variable.scope_ranges.first().map(|r| r.end),
+            };
+
+            let is_parameter = enhanced_var.variable.is_parameter;
+
+            // Log using enhanced evaluation result if available
+            let log_location = if let Some(evaluation_result) = &enhanced_var.evaluation_result {
+                format!("{:?}", evaluation_result)
+            } else {
+                format!("{:?} (raw)", enhanced_var.variable.location_expr)
+            };
+
+            info!(
+                "Address 0x{:x}: Variable '{}' location: {}, is_parameter: {} (from DWARF)",
+                *address, enhanced_var.variable.name, log_location, is_parameter
+            );
+
+            if is_parameter {
+                parameters.push(var_info);
+            } else {
+                variables.push(var_info);
+            }
+        }
+
+        // Find containing function for this address
+        let function_symbol = binary_analyzer
+            .symbol_table
+            .find_containing_symbol(*address);
+        let function_name = function_symbol.map(|s| s.name.clone());
+
+        address_mappings.push(AddressMapping {
+            address: *address,
+            function_name,
+            variables,
+            parameters,
+        });
+    }
+
+    // Get the actual source location from the first address to get the complete file path
+    let first_address = address_mappings[0].address;
+    let actual_source_location = binary_analyzer.get_source_location(first_address);
     let complete_file_path = actual_source_location
         .as_ref()
         .map(|sl| sl.file_path.clone())
         .unwrap_or_else(|| file_path.to_string()); // fallback to user input if no location found
+
+    // Try to get overall function name (from first mapping or fallback)
+    let overall_function_name = address_mappings
+        .first()
+        .and_then(|m| m.function_name.clone());
 
     Ok(TargetDebugInfo {
         target: target.to_string(),
         target_type: TargetType::SourceLocation,
         file_path: Some(complete_file_path),
         line_number: Some(line_number),
-        function_name,
-        variables,
-        parameters,
-        address: Some(address),
+        function_name: overall_function_name,
+        address_mappings,
     })
 }

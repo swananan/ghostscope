@@ -37,9 +37,16 @@ pub struct TargetDebugInfo {
     pub file_path: Option<String>,
     pub line_number: Option<u32>,
     pub function_name: Option<String>,
+    pub address_mappings: Vec<AddressMapping>,
+}
+
+/// Debug information for a specific address
+#[derive(Debug, Clone)]
+pub struct AddressMapping {
+    pub address: u64,
+    pub function_name: Option<String>,
     pub variables: Vec<VariableDebugInfo>,
     pub parameters: Vec<VariableDebugInfo>,
-    pub address: Option<u64>,
 }
 
 /// Type of target being inspected
