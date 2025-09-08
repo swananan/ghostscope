@@ -517,12 +517,46 @@ async fn handle_function_target(
         );
 
         // Get enhanced variables at this address using ScopedVariableSystem
-        let enhanced_vars = if let Some(dwarf_context) = binary_analyzer.dwarf_context_mut() {
+        let mut enhanced_vars = if let Some(dwarf_context) = binary_analyzer.dwarf_context_mut() {
             info!(
                 "Using scoped variable system for function analysis at 0x{:x}",
                 address
             );
-            dwarf_context.get_enhanced_variable_locations(*address)
+            let mut vars = dwarf_context.get_enhanced_variable_locations(*address);
+
+            // Compute new evaluation results for variables that don't have them
+            for var in vars.iter_mut() {
+                if var.evaluation_result.is_none() {
+                    let context = ghostscope_binary::expression::EvaluationContext {
+                        pc_address: *address,
+                        address_size: 8,
+                    };
+
+                    match dwarf_context
+                        .get_expression_evaluator()
+                        .evaluate_location_with_enhanced_types(
+                            &var.location_at_address,
+                            *address,
+                            &context,
+                            Some(dwarf_context),
+                        ) {
+                        Ok(new_result) => {
+                            info!(
+                                "Computed new evaluation result for '{}': {:?}",
+                                var.variable.name, new_result
+                            );
+                            var.evaluation_result = Some(new_result);
+                        }
+                        Err(e) => {
+                            info!(
+                                "Failed to compute new evaluation result for '{}': {}",
+                                var.variable.name, e
+                            );
+                        }
+                    }
+                }
+            }
+            vars
         } else {
             Vec::new()
         };
@@ -532,7 +566,7 @@ async fn handle_function_target(
         let mut variables = Vec::new();
 
         for enhanced_var in enhanced_vars {
-            // Use the enhanced evaluation result if available, otherwise fall back to raw location expression
+            // NEW: Use the enhanced type-safe evaluation result first, then fall back to legacy result
             let location_description =
                 if let Some(evaluation_result) = &enhanced_var.evaluation_result {
                     format!("{:?}", evaluation_result)
@@ -642,8 +676,42 @@ async fn handle_source_location_target(
     for address in &addresses {
         info!("Analyzing variables at address 0x{:x}", address);
 
-        let enhanced_vars = if let Some(dwarf_context) = binary_analyzer.dwarf_context_mut() {
-            dwarf_context.get_enhanced_variable_locations(*address)
+        let mut enhanced_vars = if let Some(dwarf_context) = binary_analyzer.dwarf_context_mut() {
+            let mut vars = dwarf_context.get_enhanced_variable_locations(*address);
+
+            // Compute new evaluation results for variables that don't have them
+            for var in vars.iter_mut() {
+                if var.evaluation_result.is_none() {
+                    let context = ghostscope_binary::expression::EvaluationContext {
+                        pc_address: *address,
+                        address_size: 8,
+                    };
+
+                    match dwarf_context
+                        .get_expression_evaluator()
+                        .evaluate_location_with_enhanced_types(
+                            &var.location_at_address,
+                            *address,
+                            &context,
+                            Some(dwarf_context),
+                        ) {
+                        Ok(new_result) => {
+                            info!(
+                                "Computed new evaluation result for '{}': {:?}",
+                                var.variable.name, new_result
+                            );
+                            var.evaluation_result = Some(new_result);
+                        }
+                        Err(e) => {
+                            info!(
+                                "Failed to compute new evaluation result for '{}': {}",
+                                var.variable.name, e
+                            );
+                        }
+                    }
+                }
+            }
+            vars
         } else {
             Vec::new()
         };
@@ -653,7 +721,7 @@ async fn handle_source_location_target(
         let mut variables = Vec::new();
 
         for enhanced_var in enhanced_vars {
-            // Use the enhanced evaluation result if available, otherwise fall back to raw location expression
+            // NEW: Use the enhanced type-safe evaluation result first, then fall back to legacy result
             let location_description =
                 if let Some(evaluation_result) = &enhanced_var.evaluation_result {
                     format!("{:?}", evaluation_result)

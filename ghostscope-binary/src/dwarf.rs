@@ -692,7 +692,6 @@ pub struct EnhancedVariableLocation {
     pub address: u64,
     pub size: Option<u64>,
     pub is_optimized_out: bool,
-    /// Enhanced evaluation result from DWARF expression evaluator
     pub evaluation_result: Option<crate::expression::EvaluationResult>,
 }
 
@@ -1010,7 +1009,7 @@ impl VariableLocationMap {
                             address: addr,
                             size: None, // TODO: Extract from dwarf_type
                             is_optimized_out,
-                            evaluation_result: None, // Legacy path without expression evaluation
+                            evaluation_result: None, // Will be computed separately if needed
                         });
                     }
                 }
@@ -1344,9 +1343,23 @@ impl DwarfContext {
             variable_results
                 .into_iter()
                 .map(|result| {
-                    // Perform real-time CFI-aware expression evaluation
-                    let evaluation_result =
-                        self.evaluate_variable_location_with_cfi(&result.location_at_address, addr);
+                    // Perform real-time CFI-aware expression evaluation using enhanced types
+                    let evaluation_result = {
+                        use crate::expression::EvaluationContext;
+                        let context = EvaluationContext {
+                            pc_address: addr,
+                            address_size: 8,
+                        };
+
+                        self.expression_evaluator
+                            .evaluate_location_with_enhanced_types(
+                                &result.location_at_address,
+                                addr,
+                                &context,
+                                Some(self),
+                            )
+                            .ok()
+                    };
 
                     EnhancedVariableLocation {
                         variable: Variable {
@@ -1373,44 +1386,6 @@ impl DwarfContext {
         } else {
             debug!("Scoped variable system not available");
             Vec::new()
-        }
-    }
-
-    /// Evaluate a variable location expression with CFI awareness
-    fn evaluate_variable_location_with_cfi(
-        &self,
-        location_expr: &LocationExpression,
-        addr: u64,
-    ) -> Option<EvaluationResult> {
-        use crate::expression::EvaluationContext;
-
-        // Build evaluation context for symbolic expression derivation
-        let context = EvaluationContext {
-            pc_address: addr,
-            address_size: 8, // TODO: Use TARGET_POINTER_WIDTH macro instead of hardcoded value
-        };
-
-        // Perform CFI-aware expression evaluation
-        match self.expression_evaluator.evaluate_location_for_codegen(
-            location_expr,
-            addr,
-            &context,
-            Some(self),
-        ) {
-            Ok(result) => {
-                debug!(
-                    "Successfully evaluated CFI-aware expression at 0x{:x}: {:?}",
-                    addr, result
-                );
-                Some(result)
-            }
-            Err(e) => {
-                debug!(
-                    "Failed to evaluate CFI-aware expression at 0x{:x}: {} - Location: {:?}",
-                    addr, e, location_expr
-                );
-                None
-            }
         }
     }
 
