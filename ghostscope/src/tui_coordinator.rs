@@ -534,11 +534,12 @@ async fn handle_function_target(
 
                     match dwarf_context
                         .get_expression_evaluator()
+                        .ok_or_else(|| "Expression evaluator not available".to_string())?
                         .evaluate_location_with_enhanced_types(
                             &var.location_at_address,
                             *address,
                             &context,
-                            Some(dwarf_context),
+                            None, // Pass None to avoid borrowing conflicts
                         ) {
                         Ok(new_result) => {
                             info!(
@@ -689,11 +690,12 @@ async fn handle_source_location_target(
 
                     match dwarf_context
                         .get_expression_evaluator()
+                        .ok_or_else(|| "Expression evaluator not available".to_string())?
                         .evaluate_location_with_enhanced_types(
                             &var.location_at_address,
                             *address,
                             &context,
-                            Some(dwarf_context),
+                            None, // Pass None to avoid borrowing conflicts
                         ) {
                         Ok(new_result) => {
                             info!(

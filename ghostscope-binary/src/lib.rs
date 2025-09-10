@@ -1,3 +1,4 @@
+pub mod cfi;
 pub mod debuglink;
 pub mod dwarf;
 pub mod elf;

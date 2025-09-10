@@ -524,6 +524,11 @@ impl ScopedVariableMap {
         addresses.dedup();
         addresses
     }
+
+    /// Get mutable reference to the expression evaluator
+    pub fn get_expression_evaluator_mut(&mut self) -> &mut DwarfExpressionEvaluator {
+        &mut self.expression_evaluator
+    }
 }
 
 /// Statistics about the scoped variable map

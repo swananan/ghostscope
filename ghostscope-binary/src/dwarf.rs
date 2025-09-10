@@ -1,11 +1,11 @@
-use crate::expression::{CFIContext, DwarfExpressionEvaluator, EvaluationResult};
-use crate::line_lookup::{LineLocation, LineLookup};
+use crate::expression::DwarfExpressionEvaluator;
+use crate::line_lookup::LineLookup;
 use crate::scoped_variables::{AddressRange, ScopeId, ScopeType, ScopedVariableMap};
-use crate::{BinaryError, Result};
-use gimli::{Dwarf, EndianSlice, LittleEndian, Reader, UnwindSection};
+use crate::Result;
+use gimli::{Dwarf, EndianSlice, LittleEndian, Reader};
 use object::{Object, ObjectSection};
 use std::path::Path;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Helper function to match file paths, supporting both exact and relative path matching
 /// This allows queries like "test.c" to match "/path/to/test.c" in DWARF debug info
@@ -75,7 +75,8 @@ pub struct DwarfContext {
     // CFI information
     eh_frame: Option<gimli::EhFrame<EndianSlice<'static, LittleEndian>>>,
     debug_frame: Option<gimli::DebugFrame<EndianSlice<'static, LittleEndian>>>,
-    cfi_table: Option<CFITable>,
+    // New CFI context for simplified DWARF expression-only interface
+    cfi_context: Option<crate::cfi::CFIContext>,
 
     // High-performance line number index (inspired by addr2line)
     line_index: Option<LineNumberIndex>,
@@ -565,51 +566,6 @@ pub enum DwarfOp {
     Swap,
     /// Stack has the address, not the value (DW_OP_stack_value)
     StackValue,
-}
-
-/// CFI (Call Frame Information) table for efficient PC-based lookups
-#[derive(Debug, Clone)]
-pub struct CFITable {
-    pub entries: Vec<CFIEntry>, // Sorted by PC range start for binary search
-    pub pc_to_fde_map: std::collections::HashMap<u64, usize>, // PC to FDE index mapping
-}
-
-/// CFI entry containing frame information for a specific PC range
-#[derive(Debug, Clone)]
-pub struct CFIEntry {
-    pub pc_range: (u64, u64), // Start and end PC addresses
-    pub cfa_rule: CFARule,    // Canonical Frame Address rule
-    pub register_rules: std::collections::HashMap<u16, RegisterRule>, // Register recovery rules
-}
-
-/// CFA (Canonical Frame Address) calculation rule
-#[derive(Debug, Clone)]
-pub enum CFARule {
-    /// CFA = register + offset
-    RegisterOffset { register: u16, offset: i64 },
-    /// CFA calculated by DWARF expression
-    Expression(Vec<DwarfOp>),
-    /// Undefined CFA
-    Undefined,
-}
-
-/// Register recovery rule for unwinding
-#[derive(Debug, Clone)]
-pub enum RegisterRule {
-    /// Register is undefined
-    Undefined,
-    /// Register value is unchanged
-    SameValue,
-    /// Register stored at CFA + offset
-    Offset(i64),
-    /// Register value is CFA + offset
-    ValOffset(i64),
-    /// Register stored in another register
-    Register(u16),
-    /// Register value calculated by DWARF expression
-    Expression(Vec<DwarfOp>),
-    /// Register value is result of DWARF expression
-    ValExpression(Vec<DwarfOp>),
 }
 
 /// DWARF type information
@@ -1114,21 +1070,89 @@ impl DwarfContext {
             debug_frame.is_some()
         );
 
+        info!(
+            "About to check CFI condition: debug_frame.is_some() || eh_frame.is_some() = {}",
+            debug_frame.is_some() || eh_frame.is_some()
+        );
+
+        // Initialize CFI context before moving file_data
+        let cfi_context = if debug_frame.is_some() || eh_frame.is_some() {
+            info!("Starting CFI context initialization - found eh_frame or debug_frame");
+            let mut cfi_context = crate::cfi::CFIContext::new();
+
+            // Set up base addresses properly for .eh_frame
+            let mut base_addresses = gimli::BaseAddresses::default();
+
+            // For .eh_frame, we need to set the eh_frame base address
+            if let Some(eh_frame_section) = object_file.section_by_name(".eh_frame") {
+                let address = eh_frame_section.address();
+                debug!("Setting .eh_frame base address to 0x{:x}", address);
+                base_addresses = base_addresses.set_eh_frame(address);
+            }
+
+            // For .eh_frame_hdr, we need to set the eh_frame_hdr base address
+            if let Some(eh_frame_hdr_section) = object_file.section_by_name(".eh_frame_hdr") {
+                let address = eh_frame_hdr_section.address();
+                debug!("Setting .eh_frame_hdr base address to 0x{:x}", address);
+                base_addresses = base_addresses.set_eh_frame_hdr(address);
+            }
+
+            // Load .debug_frame if available
+            if let Some(ref _debug_frame) = debug_frame {
+                if let Some(debug_frame_data) = get_section_data(&object_file, ".debug_frame") {
+                    debug!(
+                        "Loading CFI from .debug_frame section ({} bytes)",
+                        debug_frame_data.len()
+                    );
+                    cfi_context.load_from_debug_frame(debug_frame_data, base_addresses.clone())?;
+                }
+            }
+
+            // Load .eh_frame_hdr for efficient lookup first
+            if let Some(eh_frame_hdr_data) = get_section_data(&object_file, ".eh_frame_hdr") {
+                info!(
+                    "Loading CFI from .eh_frame_hdr section ({} bytes) for efficient lookup",
+                    eh_frame_hdr_data.len()
+                );
+                if let Err(e) =
+                    cfi_context.load_eh_frame_hdr(eh_frame_hdr_data, base_addresses.clone())
+                {
+                    error!("Failed to load .eh_frame_hdr: {}", e);
+                }
+            } else {
+                error!(
+                    "ERROR: .eh_frame_hdr section not found - CFI efficient lookup will not work!"
+                );
+            }
+
+            // Load .eh_frame if available
+            if let Some(ref _eh_frame) = eh_frame {
+                if let Some(eh_frame_data) = get_section_data(&object_file, ".eh_frame") {
+                    debug!(
+                        "Loading CFI from .eh_frame section ({} bytes)",
+                        eh_frame_data.len()
+                    );
+                    cfi_context.load_from_eh_frame(eh_frame_data, base_addresses)?;
+                }
+            }
+
+            Some(cfi_context)
+        } else {
+            None
+        };
+
         let mut context = Self {
             dwarf,
             _file_data: file_data,
             eh_frame,
             debug_frame,
-            cfi_table: None,
+            cfi_context,
             line_index: None,
             line_lookup: None,
             file_registry: None,
             scoped_variable_map: None,
             expression_evaluator: DwarfExpressionEvaluator::new(),
         };
-
-        // Build CFI table for efficient lookups
-        context.build_cfi_table()?;
 
         // Build line number index for fast source line lookups
         context.build_line_index()?;
@@ -3881,13 +3905,21 @@ fn load_dwarf_sections(
 
 /// Get section data from object file
 fn get_section_data<'a>(object_file: &'a object::File, name: &str) -> Option<&'a [u8]> {
+    debug!("Looking for section: {}", name);
     for section in object_file.sections() {
         if let Ok(section_name) = section.name() {
+            debug!("Found section: {}", section_name);
             if section_name == name {
-                return section.data().ok();
+                if let Ok(data) = section.data() {
+                    debug!("Found section {} with {} bytes", name, data.len());
+                    return Some(data);
+                } else {
+                    debug!("Failed to get data for section {}", name);
+                }
             }
         }
     }
+    debug!("Section {} not found", name);
     None
 }
 
@@ -3933,519 +3965,58 @@ fn load_debug_frame_section(
 }
 
 impl DwarfContext {
-    /// Build CFI table for efficient PC-based lookups
-    fn build_cfi_table(&mut self) -> Result<()> {
-        info!("Building CFI table for efficient PC-based lookups");
-
-        let mut entries = Vec::new();
-        let mut pc_to_fde_map = std::collections::HashMap::new();
-
-        // Process .eh_frame section if available
-        if let Some(ref eh_frame) = self.eh_frame {
-            info!("Processing .eh_frame section for CFI information");
-            self.parse_eh_frame_entries(eh_frame, &mut entries, &mut pc_to_fde_map)?;
-        }
-
-        // Process .debug_frame section if available
-        if let Some(ref debug_frame) = self.debug_frame {
-            info!("Processing .debug_frame section for CFI information");
-            self.parse_debug_frame_entries(debug_frame, &mut entries, &mut pc_to_fde_map)?;
-        }
-
-        // If no CFI information found, create fallback entries
-        if entries.is_empty() {
-            warn!("No CFI information found, creating fallback entries");
-            self.create_fallback_cfi_entries(&mut entries, &mut pc_to_fde_map)?;
-        }
-
-        // Sort entries by PC range start for efficient binary search
-        entries.sort_by_key(|entry: &CFIEntry| entry.pc_range.0);
-
-        info!(
-            "CFI table built successfully with {} entries",
-            entries.len()
-        );
-        for (i, entry) in entries.iter().enumerate().take(5) {
-            debug!(
-                "  Entry {}: PC 0x{:x}-0x{:x}, CFA rule: {:?}",
-                i, entry.pc_range.0, entry.pc_range.1, entry.cfa_rule
-            );
-        }
-        if entries.len() > 5 {
-            debug!("  ... and {} more entries", entries.len() - 5);
-        }
-
-        self.cfi_table = Some(CFITable {
-            entries,
-            pc_to_fde_map,
-        });
-
-        info!("CFI table successfully built with real eh_frame parsing");
-        Ok(())
+    /// Get the new CFI context for DWARF expression-only queries
+    pub fn cfi_context(&self) -> Option<&crate::cfi::CFIContext> {
+        self.cfi_context.as_ref()
     }
 
-    /// Parse .eh_frame section for CFI information
-    fn parse_eh_frame_entries(
-        &self,
-        eh_frame: &gimli::EhFrame<gimli::EndianSlice<'static, gimli::LittleEndian>>,
-        entries: &mut Vec<CFIEntry>,
-        pc_to_fde_map: &mut std::collections::HashMap<u64, usize>,
-    ) -> Result<()> {
-        info!("Parsing .eh_frame section for CFI information");
-
-        let mut parsed_entries = 0;
-
-        // Set up BaseAddresses for proper PC-relative address resolution
-        let mut bases = gimli::BaseAddresses::default();
-
-        // For .eh_frame, we need to set both text and eh_frame bases
-        if let (Some(text_base), Some(eh_frame_base)) =
-            (self.get_text_section_base(), self.get_eh_frame_base())
-        {
-            bases = bases.set_text(text_base).set_eh_frame(eh_frame_base);
-            debug!(
-                "Set BaseAddresses - text: 0x{:x}, eh_frame: 0x{:x}",
-                text_base, eh_frame_base
-            );
+    /// Get function addresses by name using scoped variable map
+    pub fn get_function_addresses_by_name(&self, func_name: &str) -> Vec<u64> {
+        if let Some(ref scoped_var_map) = self.scoped_variable_map {
+            scoped_var_map.find_function_addresses(func_name)
         } else {
-            debug!("Could not determine section bases, using default BaseAddresses");
+            vec![]
         }
-
-        let mut fdes = eh_frame.entries(&bases);
-
-        while let Some(fde_result) = fdes.next()? {
-            match fde_result {
-                gimli::CieOrFde::Cie(cie) => {
-                    debug!("Found CIE (Common Information Entry)");
-                    self.log_cie_info(&cie);
-                }
-                gimli::CieOrFde::Fde(partial_fde) => {
-                    debug!("Found partial FDE, attempting to parse...");
-                    match partial_fde.parse(|_, bases, o| eh_frame.cie_from_offset(bases, o)) {
-                        Ok(fde) => {
-                            debug!(
-                                "Successfully parsed FDE for PC range 0x{:x}-0x{:x}",
-                                fde.initial_address(),
-                                fde.initial_address() + fde.len()
-                            );
-
-                            match self.parse_fde_to_cfi_entry(&fde) {
-                                Ok(Some(cfi_entry)) => {
-                                    let entry_index = entries.len();
-
-                                    // Add PC mappings for efficient lookup
-                                    let start_pc = cfi_entry.pc_range.0;
-                                    let end_pc = cfi_entry.pc_range.1;
-
-                                    for pc in (start_pc..end_pc).step_by(8) {
-                                        pc_to_fde_map.insert(pc, entry_index);
-                                    }
-
-                                    debug!(
-                                        "Successfully created CFI entry: PC range 0x{:x}-0x{:x}, CFA rule: {:?}",
-                                        start_pc, end_pc, cfi_entry.cfa_rule
-                                    );
-
-                                    entries.push(cfi_entry);
-                                    parsed_entries += 1;
-                                }
-                                Ok(None) => {
-                                    debug!("FDE parsed but no CFI entry created");
-                                }
-                                Err(e) => {
-                                    debug!("Failed to convert FDE to CFI entry: {:?}", e);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            debug!("Failed to parse FDE: {:?}", e);
-                        }
-                    }
-                }
-            }
-        }
-
-        info!(
-            "Successfully parsed {} FDE entries from .eh_frame",
-            parsed_entries
-        );
-        Ok(())
     }
 
-    /// Parse .debug_frame section for CFI information
-    fn parse_debug_frame_entries(
-        &self,
-        debug_frame: &gimli::DebugFrame<gimli::EndianSlice<'static, gimli::LittleEndian>>,
-        entries: &mut Vec<CFIEntry>,
-        pc_to_fde_map: &mut std::collections::HashMap<u64, usize>,
-    ) -> Result<()> {
-        info!("Parsing .debug_frame section for CFI information");
-
-        let mut parsed_entries = 0;
-
-        // Set up BaseAddresses for proper PC-relative address resolution
-        let mut bases = gimli::BaseAddresses::default();
-        if let Some(text_base) = self.get_text_section_base() {
-            bases = bases.set_text(text_base);
-            debug!(
-                "Set debug_frame BaseAddresses with text section base: 0x{:x}",
-                text_base
-            );
-        } else {
-            debug!("Could not determine text section base for debug_frame");
-        }
-
-        let mut fdes = debug_frame.entries(&bases);
-
-        while let Some(fde_result) = fdes.next()? {
-            match fde_result {
-                gimli::CieOrFde::Cie(cie) => {
-                    debug!("Found CIE in debug_frame");
-                    self.log_cie_info(&cie);
-                }
-                gimli::CieOrFde::Fde(partial_fde) => {
-                    if let Ok(fde) =
-                        partial_fde.parse(|_, bases, o| debug_frame.cie_from_offset(bases, o))
-                    {
-                        debug!("Found FDE in debug_frame");
-                        if let Some(cfi_entry) = self.parse_fde_to_cfi_entry(&fde)? {
-                            let entry_index = entries.len();
-
-                            let start_pc = cfi_entry.pc_range.0;
-                            let end_pc = cfi_entry.pc_range.1;
-
-                            for pc in (start_pc..end_pc).step_by(8) {
-                                pc_to_fde_map.insert(pc, entry_index);
-                            }
-
-                            debug!(
-                                "Parsed debug_frame FDE: PC range 0x{:x}-0x{:x}",
-                                start_pc, end_pc
-                            );
-
-                            entries.push(cfi_entry);
-                            parsed_entries += 1;
-                        }
-                    }
-                }
-            }
-        }
-
-        info!(
-            "Successfully parsed {} FDE entries from .debug_frame",
-            parsed_entries
-        );
-        Ok(())
+    /// Get frame base offset at PC (simplified implementation)
+    pub fn get_frame_base_offset_at_pc(&self, _pc: u64) -> Option<i64> {
+        // TODO: Implement using new CFI context
+        None
     }
 
-    /// Get the base address of the .text section for BaseAddresses
-    fn get_text_section_base(&self) -> Option<u64> {
-        // For PIE executables, the base is usually 0
-        // The actual addresses are relative to load address
-        Some(0x0)
+    /// Get CFI rule for PC (placeholder implementation)
+    pub fn get_cfi_rule_for_pc(&self, _pc: u64) -> Option<String> {
+        // TODO: Implement using new CFI context
+        // For now return a placeholder
+        None
     }
 
-    /// Get the base address of the .eh_frame section
-    fn get_eh_frame_base(&self) -> Option<u64> {
-        // Based on readelf output: .eh_frame is at 0x20e8
-        Some(0x20e8)
-    }
-
-    /// Log CIE information for debugging
-    fn log_cie_info<T: gimli::Reader>(&self, cie: &gimli::CommonInformationEntry<T>) {
-        debug!(
-            "CIE: version={}, return_address_register={}, code_alignment_factor={}, data_alignment_factor={}",
-            cie.version(),
-            cie.return_address_register().0,
-            cie.code_alignment_factor(),
-            cie.data_alignment_factor()
-        );
-    }
-
-    /// Parse an FDE into a CFI entry (simplified approach)
-    fn parse_fde_to_cfi_entry<T: gimli::Reader>(
-        &self,
-        fde: &gimli::FrameDescriptionEntry<T>,
-    ) -> Result<Option<CFIEntry>> {
-        let initial_pc = fde.initial_address();
-        let len = fde.len();
-        let pc_range = (initial_pc, initial_pc + len);
-
-        debug!(
-            "Parsing FDE for PC range 0x{:x}-0x{:x}",
-            initial_pc,
-            initial_pc + len
-        );
-
-        // For now, create a simplified CFI entry based on common x86_64 patterns
-        // This provides practical functionality while avoiding complex gimli API usage
-        let cie = fde.cie();
-
-        // Determine CFA rule based on CIE information
-        let cfa_rule = if cie.return_address_register() == gimli::Register(16) {
-            // x86_64 - assume standard frame layout
-            CFARule::RegisterOffset {
-                register: 6, // RBP
-                offset: 16,  // Standard x86_64 frame: RBP + 16
-            }
-        } else {
-            // Fallback to RSP-based
-            CFARule::RegisterOffset {
-                register: 7, // RSP
-                offset: 8,   // Standard call: RSP + 8
-            }
-        };
-
-        debug!(
-            "  Created CFI entry: CFA = %{} + {} for PC range 0x{:x}-0x{:x}",
-            match &cfa_rule {
-                CFARule::RegisterOffset { register, .. } => *register,
-                _ => 0,
-            },
-            match &cfa_rule {
-                CFARule::RegisterOffset { offset, .. } => *offset,
-                _ => 0,
-            },
-            initial_pc,
-            initial_pc + len
-        );
-
-        Ok(Some(CFIEntry {
-            pc_range,
-            cfa_rule,
-            register_rules: std::collections::HashMap::new(),
-        }))
-    }
-
-    /// Create fallback CFI entries when no CFI information is available
-    fn create_fallback_cfi_entries(
+    /// Get expression evaluator from scoped variable map
+    pub fn get_expression_evaluator(
         &mut self,
-        entries: &mut Vec<CFIEntry>,
-        pc_to_fde_map: &mut std::collections::HashMap<u64, usize>,
-    ) -> Result<()> {
-        info!("Creating fallback CFI entries based on typical x86_64 frame patterns");
-
-        // Create a general fallback entry for all PC ranges
-        let fallback_entry = CFIEntry {
-            pc_range: (0, u64::MAX),
-            cfa_rule: CFARule::RegisterOffset {
-                register: 6, // RBP on x86_64
-                offset: 16,  // Common frame layout: RBP + 16
-            },
-            register_rules: std::collections::HashMap::new(),
-        };
-
-        let entry_index = entries.len();
-        entries.push(fallback_entry);
-
-        // Map some common PC ranges
-        for pc in (0x1000..0x10000).step_by(8) {
-            pc_to_fde_map.insert(pc, entry_index);
-        }
-
-        info!("Created fallback CFI entry for PC range 0x0-0xffffffffffffffff");
-        Ok(())
-    }
-
-    /// Get CFI offset for frame base calculation at a specific PC address
-    /// Returns the offset to add to the base register to get the frame base
-    /// This is the main interface for codegen to query frame base offsets
-    pub fn get_frame_base_offset_at_pc(&self, pc: u64) -> Option<i64> {
-        debug!("Querying frame base offset for PC 0x{:x}", pc);
-
-        if let Some(cfi_entry) = self.get_cfi_at_pc(pc) {
-            match &cfi_entry.cfa_rule {
-                CFARule::RegisterOffset { register, offset } => {
-                    debug!(
-                        "Found CFI rule for PC 0x{:x}: CFA = %{} + {} (frame base offset = {})",
-                        pc, register, offset, offset
-                    );
-
-                    // For frame base calculation, we assume CFA = frame_base
-                    // Return the offset from the base register (usually RBP or RSP)
-                    Some(*offset)
-                }
-                CFARule::Undefined => {
-                    debug!("CFI rule undefined for PC 0x{:x}", pc);
-                    None
-                }
-                CFARule::Expression(ops) => {
-                    debug!(
-                        "Evaluating CFI expression for frame base offset at PC 0x{:x}",
-                        pc
-                    );
-                    let cfi_context = CFIContext {
-                        pc_address: pc,
-                        available_registers: std::collections::HashMap::new(), // Use empty for frame base
-                        address_size: 8,
-                    };
-
-                    match self
-                        .expression_evaluator
-                        .evaluate_for_cfi(ops, &cfi_context)
-                    {
-                        Ok(frame_base) => {
-                            debug!("Frame base expression evaluated to: 0x{:x}", frame_base);
-                            // For frame base, return 0 as the offset since we already have the absolute address
-                            Some(0)
-                        }
-                        Err(e) => {
-                            debug!("Failed to evaluate frame base expression: {}", e);
-                            None
-                        }
-                    }
-                }
-            }
-        } else {
-            debug!("No CFI entry found for PC 0x{:x}", pc);
-            None
-        }
-    }
-
-    /// Get detailed CFI information for a specific PC address (for advanced use)
-    pub fn get_cfi_at_pc(&self, pc: u64) -> Option<&CFIEntry> {
-        if let Some(ref table) = self.cfi_table {
-            // Try fast lookup first
-            if let Some(&index) = table.pc_to_fde_map.get(&(pc & !7)) {
-                if let Some(entry) = table.entries.get(index) {
-                    if pc >= entry.pc_range.0 && pc < entry.pc_range.1 {
-                        return Some(entry);
-                    }
-                }
-            }
-
-            // Fallback to binary search
-            match table
-                .entries
-                .binary_search_by_key(&pc, |entry| entry.pc_range.0)
-            {
-                Ok(index) => table.entries.get(index),
-                Err(index) => {
-                    if index > 0 {
-                        let entry = &table.entries[index - 1];
-                        if pc >= entry.pc_range.0 && pc < entry.pc_range.1 {
-                            Some(entry)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                }
-            }
+    ) -> Option<&mut crate::expression::DwarfExpressionEvaluator> {
+        if let Some(ref mut scoped_var_map) = self.scoped_variable_map {
+            Some(scoped_var_map.get_expression_evaluator_mut())
         } else {
             None
         }
     }
 
-    /// Get CFI rule for frame base calculation at a specific PC
-    pub fn get_cfi_rule_for_pc(&self, pc: u64) -> Option<&CFARule> {
-        self.get_cfi_at_pc(pc).map(|entry| &entry.cfa_rule)
-    }
-
-    /// Calculate CFA (Canonical Frame Address) for a specific PC
-    pub fn calculate_cfa_at_pc(
+    /// Get CFA evaluation result for given PC using the new direct evaluation approach  
+    pub fn get_cfa_evaluation_result(
         &self,
         pc: u64,
-        registers: &std::collections::HashMap<u16, u64>,
-    ) -> Option<u64> {
-        if let Some(cfi_entry) = self.get_cfi_at_pc(pc) {
-            match &cfi_entry.cfa_rule {
-                CFARule::RegisterOffset { register, offset } => {
-                    if let Some(&reg_value) = registers.get(register) {
-                        Some(reg_value.wrapping_add(*offset as u64))
-                    } else {
-                        debug!("Register {} not available for CFA calculation", register);
-                        None
-                    }
-                }
-                CFARule::Expression(ops) => {
-                    debug!("Evaluating CFA expression with {} operations", ops.len());
-                    let cfi_context = CFIContext {
-                        pc_address: pc,
-                        available_registers: registers.clone(),
-                        address_size: 8, // Assume 64-bit for now
-                    };
-
-                    match self
-                        .expression_evaluator
-                        .evaluate_for_cfi(ops, &cfi_context)
-                    {
-                        Ok(cfa_value) => {
-                            debug!("CFA expression evaluated to: 0x{:x}", cfa_value);
-                            Some(cfa_value)
-                        }
-                        Err(e) => {
-                            debug!("Failed to evaluate CFA expression: {}", e);
-                            None
-                        }
-                    }
-                }
-                CFARule::Undefined => {
-                    debug!("CFA undefined at PC 0x{:x}", pc);
-                    None
-                }
-            }
-        } else {
-            debug!("No CFI information available for PC 0x{:x}", pc);
-            None
-        }
+    ) -> Option<crate::expression::EvaluationResult> {
+        // Use the new CFI method that returns EvaluationResult directly
+        self.cfi_context.as_ref()?.get_cfa_expression(pc)
     }
 
-    /// Calculate frame base for a specific PC using CFA information
-    /// This provides a more accurate frame base than assuming RBP
-    pub fn calculate_frame_base_at_pc(
-        &self,
-        pc: u64,
-        registers: &std::collections::HashMap<u16, u64>,
-    ) -> Option<u64> {
-        // Try to use CFA as frame base if available
-        if let Some(cfa) = self.calculate_cfa_at_pc(pc, registers) {
-            debug!("Using CFA 0x{:x} as frame base for PC 0x{:x}", cfa, pc);
-            Some(cfa)
-        } else {
-            // Fallback to RBP (register 6 on x86_64) as frame base
-            if let Some(&rbp_value) = registers.get(&6) {
-                debug!(
-                    "Using RBP 0x{:x} as frame base for PC 0x{:x} (CFI not available)",
-                    rbp_value, pc
-                );
-                Some(rbp_value)
-            } else {
-                debug!("No frame base available for PC 0x{:x} (no CFI, no RBP)", pc);
-                None
-            }
-        }
-    }
-
-    /// Get frame base offset for a variable at a specific PC
-    /// This is key for accurate fbreg-based variable access
-    /// Get access to the DWARF expression evaluator for CFI expression evaluation
-    pub fn get_expression_evaluator(&self) -> &crate::expression::DwarfExpressionEvaluator {
-        &self.expression_evaluator
-    }
-
-    pub fn get_frame_base_info(&self, pc: u64) -> Option<FrameBaseInfo> {
-        // For now, return a simple frame base rule using RBP
-        // TODO: Implement proper CFA-based frame base calculation
-        Some(FrameBaseInfo {
-            pc,
-            base_register: 6,    // RBP on x86_64
-            base_offset: 0,      // Usually RBP itself is the frame base
-            requires_cfa: false, // Will be true when CFI is fully implemented
-        })
-    }
-
-    /// Find all addresses for functions with the given name using DWARF information
-    pub fn get_function_addresses_by_name(&self, function_name: &str) -> Vec<u64> {
-        if let Some(scoped_map) = &self.scoped_variable_map {
-            scoped_map.find_function_addresses(function_name)
-        } else {
-            Vec::new()
-        }
+    /// Check if CFI context is available
+    pub fn has_cfi_context(&self) -> bool {
+        self.cfi_context.is_some()
     }
 }
-
 /// Frame base information for a specific PC location
 #[derive(Debug, Clone)]
 pub struct FrameBaseInfo {
