@@ -23,5 +23,10 @@ anyhow = "1.0.93"
 tracing = "0.1.41"
 tracing-log = "0.2.0"
 thiserror = "2.0.12"
-aya = { path = "../aya/aya" }
+aya = "0.13.1"
+aya-ebpf-bindings = "0.1.1"
 tokio = { version = "1.0", features = ["full"] }
+
+[patch.crates-io]
+aya = { git = "https://github.com/aya-rs/aya", rev = "9261554e3c6ca37e401ec23a287a1ddf9cb1f26d" }
+aya-ebpf-bindings = { git = "https://github.com/aya-rs/aya", rev = "9261554e3c6ca37e401ec23a287a1ddf9cb1f26d" }

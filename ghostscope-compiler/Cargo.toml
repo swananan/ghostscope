@@ -11,6 +11,6 @@ tracing = { workspace = true }
 tracing-log = { workspace = true }
 thiserror = { workspace = true }
 tracing-subscriber = { workspace = true }
-aya-ebpf-bindings = "0.1.1"
+aya-ebpf-bindings = { workspace = true }
 ghostscope-binary = { path = "../ghostscope-binary" }
 ghostscope-protocol = { path = "../ghostscope-protocol" }

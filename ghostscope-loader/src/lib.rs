@@ -231,12 +231,12 @@ impl GhostScopeLoader {
             program.attach(
                 UProbeAttachLocation::AbsoluteOffset(offset),
                 target_binary,
-                pid,
+                None,
                 None,
             )
         } else {
             // Use function name-based attachment
-            program.attach(function_name, target_binary, pid, None)
+            program.attach(function_name, target_binary, None, None)
         };
 
         match attach_result {
@@ -383,14 +383,14 @@ impl GhostScopeLoader {
             program.attach(
                 UProbeAttachLocation::AbsoluteOffset(offset),
                 &params.target_binary,
-                params.pid,
+                None,
                 None,
             )
         } else {
             program.attach(
                 params.function_name.as_str(),
                 &params.target_binary,
-                params.pid,
+                None,
                 None,
             )
         };
