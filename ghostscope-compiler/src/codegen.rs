@@ -244,34 +244,23 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(reg_ptr)
     }
 
-    /// Get register value from eBPF context
+    /// Get register value from eBPF context using platform-specific mappings
     fn get_register_value(
         &mut self,
         ctx_param: PointerValue<'ctx>,
         register: u16,
     ) -> Result<IntValue<'ctx>> {
-        debug!("Getting value for register {}", register);
+        debug!("Getting value for DWARF register {}", register);
 
-        // For x86_64 register mapping in eBPF context
-        // This is a simplified mapping - real implementation would need complete register context
-        let reg_offset = match register {
-            0 => 0,                           // RAX
-            1 => 8,                           // RDX
-            2 => 16,                          // RCX
-            3 => 24,                          // RBX
-            4 => 32,                          // RSI
-            5 => 40,                          // RDI
-            6 => 48,                          // RBP
-            7 => 56,                          // RSP
-            8..=15 => (register - 8 + 8) * 8, // R8-R15
-            _ => {
-                warn!("Unknown register {}, using offset 0", register);
-                0
-            }
-        };
+        // Use platform-specific DWARF register to pt_regs offset mapping
+        let reg_offset = platform::dwarf_reg_to_pt_regs_byte_offset_x86_64(register)
+            .ok_or_else(|| {
+                warn!("Unsupported DWARF register {}", register);
+                CodeGenError::UnsupportedRegister(register)
+            })?;
 
         let i64_type = self.context.i64_type();
-        let offset_value = i64_type.const_int(reg_offset.into(), false);
+        let offset_value = i64_type.const_int(reg_offset as u64, false);
 
         // Get pointer to register in context
         let ptr_type = self.context.ptr_type(AddressSpace::default());
@@ -373,15 +362,67 @@ impl<'ctx> CodeGen<'ctx> {
     /// Determine VarType from DWARF type information
     fn determine_var_type_from_dwarf(&self, dwarf_type: &Option<DwarfType>) -> VarType {
         match dwarf_type {
-            Some(DwarfType::BaseType { encoding, .. }) => {
+            Some(DwarfType::BaseType { encoding, size, name }) => {
                 match encoding {
-                    DwarfEncoding::Signed | DwarfEncoding::Unsigned => VarType::Int,
-                    DwarfEncoding::Float => VarType::Int, // Treat as int for now
-                    _ => VarType::Int,
+                    DwarfEncoding::Signed | DwarfEncoding::Unsigned => {
+                        // Support different integer sizes
+                        VarType::Int
+                    }
+                    DwarfEncoding::Float => {
+                        // Properly support floating point types
+                        VarType::Float
+                    }
+                    DwarfEncoding::Boolean => VarType::Int, // Treat boolean as int
+                    DwarfEncoding::Address => VarType::Int, // Address as int
+                    DwarfEncoding::Unknown => {
+                        // Fallback: try to infer from type name
+                        if name.contains("char") {
+                            VarType::String
+                        } else {
+                            VarType::Int
+                        }
+                    }
                 }
             }
-            Some(DwarfType::PointerType { .. }) => VarType::Int, // Pointers as int
-            _ => VarType::Int,                                   // Default to int for unknown types
+            Some(DwarfType::PointerType { target_type, .. }) => {
+                // Check if it's a pointer to char (string)
+                if let DwarfType::BaseType { name, .. } = target_type.as_ref() {
+                    if name.contains("char") {
+                        VarType::String
+                    } else {
+                        VarType::Int // Pointers to other types as int
+                    }
+                } else {
+                    VarType::Int // Generic pointer as int
+                }
+            }
+            Some(DwarfType::ArrayType { element_type, .. }) => {
+                // Arrays typically treated as addresses
+                if let DwarfType::BaseType { name, .. } = element_type.as_ref() {
+                    if name.contains("char") {
+                        VarType::String // char arrays as strings
+                    } else {
+                        VarType::Int // Other arrays as int (address)
+                    }
+                } else {
+                    VarType::Int
+                }
+            }
+            Some(DwarfType::StructType { .. }) => {
+                // Structs are typically accessed by address
+                VarType::Int
+            }
+            Some(DwarfType::UnknownType { name }) => {
+                // Try to infer from type name as fallback
+                if name.contains("float") || name.contains("double") {
+                    VarType::Float
+                } else if name.contains("char") {
+                    VarType::String
+                } else {
+                    VarType::Int
+                }
+            }
+            None => VarType::Int, // Default to int for missing type info
         }
     }
 
@@ -4211,20 +4252,8 @@ impl<'ctx> CodeGen<'ctx> {
 
                     for var_info in enhanced_vars {
                         if var_info.variable.name == var_name {
-                            // Convert DWARF type to VarType
-                            return match var_info.variable.type_name.as_str() {
-                                t if t.contains("int")
-                                    || t.contains("long")
-                                    || t.contains("short") =>
-                                {
-                                    Some(VarType::Int)
-                                }
-                                t if t.contains("float") || t.contains("double") => {
-                                    Some(VarType::Float)
-                                }
-                                t if t.contains("char") => Some(VarType::String),
-                                _ => Some(VarType::Int), // Default to int
-                            };
+                            // Use the structured DWARF type information instead of string matching
+                            return Some(self.determine_var_type_from_dwarf(&var_info.variable.dwarf_type));
                         }
                     }
                 }
