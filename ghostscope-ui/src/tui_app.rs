@@ -407,6 +407,22 @@ impl TuiApp {
                                     debug!("Not in script editor mode, ignoring Ctrl+i");
                                 }
                             }
+                            'p' => {
+                                // Ctrl+p: history up (previous command) in input mode
+                                if self.interactive_command_panel.mode
+                                    == crate::panels::InteractionMode::Input
+                                {
+                                    self.interactive_command_panel.history_up();
+                                }
+                            }
+                            'n' => {
+                                // Ctrl+n: history down (next command) in input mode
+                                if self.interactive_command_panel.mode
+                                    == crate::panels::InteractionMode::Input
+                                {
+                                    self.interactive_command_panel.history_down();
+                                }
+                            }
                             _ => {
                                 // For other Ctrl+key combinations, treat as regular character input
                                 match self.interactive_command_panel.mode {

@@ -127,6 +127,9 @@ pub struct InteractiveCommandPanel {
 
     // Trace management
     pub trace_manager: TraceManager,
+
+    // Backup of unsent input when navigating history (for Ctrl+n restore)
+    unsent_input_backup: Option<String>,
 }
 
 impl InteractiveCommandPanel {
@@ -147,6 +150,7 @@ impl InteractiveCommandPanel {
             trace_manager: TraceManager::new(),
             styled_buffer: None,
             styled_at_history_index: None,
+            unsent_input_backup: None,
         };
         panel.update_static_lines();
         panel
@@ -1566,6 +1570,13 @@ impl InteractiveCommandPanel {
             return;
         }
 
+        // If starting navigation, back up current unsent input once
+        if self.history_index.is_none() && self.unsent_input_backup.is_none() {
+            if !self.input_text.is_empty() {
+                self.unsent_input_backup = Some(self.input_text.clone());
+            }
+        }
+
         let new_index = match self.history_index {
             None => self.command_history.len() - 1,
             Some(i) if i > 0 => i - 1,
@@ -1590,9 +1601,14 @@ impl InteractiveCommandPanel {
                 self.cursor_position = self.input_text.len();
             }
             Some(_) => {
+                // Leaving history navigation; restore unsent input if present
                 self.history_index = None;
-                self.input_text.clear();
-                self.cursor_position = 0;
+                if let Some(backup) = self.unsent_input_backup.take() {
+                    self.input_text = backup;
+                    self.cursor_position = self.input_text.len();
+                } else {
+                    // No backup, keep current input unchanged (do nothing)
+                }
             }
         }
         self.update_static_lines();
