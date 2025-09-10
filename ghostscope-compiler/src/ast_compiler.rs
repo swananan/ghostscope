@@ -121,17 +121,132 @@ impl<'a> AstCompiler<'a> {
         pid: Option<u32>,
         index: usize,
     ) -> Result<(), CompileError> {
-        // Step 1: Immediately resolve target info using DWARF
-        let target_info = self.resolve_target_info(pattern)?;
-        debug!("Resolved target: {:?}", target_info);
+        match pattern {
+            TracePattern::SourceLine {
+                file_path,
+                line_number,
+            } => {
+                // Obtain addresses first in a separate scope to avoid holding a mutable borrow of self
+                let (addresses, binary_path_string) =
+                    if let Some(analyzer) = &mut self.binary_analyzer {
+                        let addrs = analyzer.get_all_source_line_addresses(file_path, *line_number);
+                        let bin = analyzer
+                            .debug_info()
+                            .binary_path
+                            .to_string_lossy()
+                            .to_string();
+                        (addrs, bin)
+                    } else {
+                        (
+                            Vec::new(),
+                            self.binary_path_hint.clone().unwrap_or_default(),
+                        )
+                    };
 
-        // Step 2: Immediately generate eBPF bytecode for this target
-        let uprobe_config = self.generate_ebpf_for_target(&target_info, statements, pid, index)?;
+                if addresses.is_empty() {
+                    warn!(
+                        "No addresses resolved for source line {}:{}; skipping",
+                        file_path, line_number
+                    );
+                    return Ok(());
+                }
 
-        // Step 3: Store result
-        self.uprobe_configs.push(uprobe_config);
+                debug!(
+                    "Resolved {}:{} to {} address(es)",
+                    file_path,
+                    line_number,
+                    addresses.len()
+                );
 
-        Ok(())
+                for (pc_idx, address) in addresses.iter().enumerate() {
+                    let target_info = ResolvedTarget {
+                        function_name: Some(format!("{}:{}", file_path, line_number)),
+                        function_address: Some(*address),
+                        binary_path: binary_path_string.clone(),
+                        uprobe_offset: Some(*address), // For line addresses, offset equals address
+                        pattern: pattern.clone(),
+                    };
+
+                    let uprobe_config = self.generate_ebpf_for_target(
+                        &target_info,
+                        statements,
+                        pid,
+                        index + pc_idx,
+                    )?;
+                    self.uprobe_configs.push(uprobe_config);
+                }
+                Ok(())
+            }
+            TracePattern::FunctionName(func_name) => {
+                // Resolve all addresses for the function name and generate per-PC programs
+                let (addresses, binary_path_string) = if let Some(analyzer) = &self.binary_analyzer
+                {
+                    let addrs = analyzer.get_all_function_addresses(func_name);
+                    let bin = analyzer
+                        .debug_info()
+                        .binary_path
+                        .to_string_lossy()
+                        .to_string();
+                    (addrs, bin)
+                } else {
+                    (
+                        Vec::new(),
+                        self.binary_path_hint.clone().unwrap_or_default(),
+                    )
+                };
+
+                if addresses.is_empty() {
+                    warn!(
+                        "No addresses resolved for function '{}'; skipping",
+                        func_name
+                    );
+                    return Ok(());
+                }
+
+                debug!(
+                    "Resolved function '{}' to {} address(es)",
+                    func_name,
+                    addresses.len()
+                );
+
+                // We may need analyzer again to compute precise uprobe offsets
+                for (pc_idx, address) in addresses.iter().enumerate() {
+                    let uprobe_offset = if let Some(analyzer) = &self.binary_analyzer {
+                        analyzer
+                            .calculate_uprobe_offset_from_address(*address)
+                            .unwrap_or(*address)
+                    } else {
+                        *address
+                    };
+
+                    let target_info = ResolvedTarget {
+                        function_name: Some(func_name.clone()),
+                        function_address: Some(*address),
+                        binary_path: binary_path_string.clone(),
+                        uprobe_offset: Some(uprobe_offset),
+                        pattern: pattern.clone(),
+                    };
+
+                    let uprobe_config = self.generate_ebpf_for_target(
+                        &target_info,
+                        statements,
+                        pid,
+                        index + pc_idx,
+                    )?;
+                    self.uprobe_configs.push(uprobe_config);
+                }
+                Ok(())
+            }
+            _ => {
+                // Default: single target resolution
+                let target_info = self.resolve_target_info(pattern)?;
+                debug!("Resolved target: {:?}", target_info);
+                let uprobe_config =
+                    self.generate_ebpf_for_target(&target_info, statements, pid, index)?;
+                self.uprobe_configs.push(uprobe_config);
+                Ok(())
+            }
+        }
     }
 
     /// Resolve target information using DWARF queries
@@ -366,7 +481,11 @@ impl<'a> AstCompiler<'a> {
             } => {
                 // Create consistent name for source lines
                 let sanitized_path = file_path.replace(".", "_").replace("/", "_");
-                format!("ghostscope_line_{}_{}", line_number, sanitized_path)
+                // Include index to disambiguate multiple PCs for the same line
+                format!(
+                    "ghostscope_line_{}_{}_{}",
+                    line_number, sanitized_path, index
+                )
             }
             TracePattern::Address(addr) => {
                 format!("ghostscope_addr_0x{:x}_{}", addr, index)

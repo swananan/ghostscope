@@ -39,6 +39,7 @@ pub enum CommandType {
     DisableAll,
     DeleteAll,
     Info { target: String },
+    InfoTrace { trace_id: Option<u32> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -86,6 +87,12 @@ pub struct StaticTextLine {
     pub response_type: Option<ResponseType>,
 }
 
+#[derive(Debug, Clone)]
+pub enum StyledContent {
+    Plain(String),
+    Lines(Vec<ratatui::text::Line<'static>>),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LineType {
     Command,
@@ -111,6 +118,10 @@ pub struct InteractiveCommandPanel {
 
     pub static_lines: Vec<StaticTextLine>,
 
+    // Optional styled buffer for the last response
+    styled_buffer: Option<Vec<ratatui::text::Line<'static>>>,
+    styled_at_history_index: Option<usize>,
+
     // UI state
     pub scroll_offset: usize,
 
@@ -134,6 +145,8 @@ impl InteractiveCommandPanel {
             static_lines: Vec::new(),
             scroll_offset: 0,
             trace_manager: TraceManager::new(),
+            styled_buffer: None,
+            styled_at_history_index: None,
         };
         panel.update_static_lines();
         panel
@@ -459,6 +472,39 @@ impl InteractiveCommandPanel {
         }
     }
 
+    pub fn start_info_trace_request(&mut self, id_opt: Option<u32>) {
+        // Validate locally: if id is provided, ensure it exists in UI trace manager
+        if let Some(id) = id_opt {
+            if self.trace_manager.get_trace(id).is_none() {
+                self.add_response(format!("✗ Invalid trace id: {}", id), ResponseType::Error);
+                return;
+            }
+        }
+
+        // Enter waiting state so input prompt is hidden until runtime responds
+        self.input_state = InputState::WaitingResponse {
+            command: match id_opt {
+                Some(id) => format!("info trace {}", id),
+                None => "info trace".to_string(),
+            },
+            sent_time: Instant::now(),
+            command_type: CommandType::InfoTrace { trace_id: id_opt },
+        };
+
+        // Show progress line
+        self.add_response(
+            match id_opt {
+                Some(id) => format!("⏳ Gathering trace {} info...", id),
+                None => "⏳ Gathering all traces info...".to_string(),
+            },
+            ResponseType::Progress,
+        );
+    }
+
+    pub fn is_waiting_response(&self) -> bool {
+        matches!(self.input_state, InputState::WaitingResponse { .. })
+    }
+
     /// Parse disable/enable/delete commands and return appropriate CommandAction
     fn parse_enable_disable_command_sync(&mut self, command: &str) -> Option<CommandAction> {
         let cmd = command.trim();
@@ -565,6 +611,16 @@ impl InteractiveCommandPanel {
                     "  {}\n",
                     self.trace_manager.format_trace_info(trace)
                 ));
+                // Append mounts if available from runtime cache
+                if let Some(mounts) = self.trace_manager.get_mounts(trace.id) {
+                    output.push_str(&format!("    mounts ({}):\n", mounts.len()));
+                    for (i, (pc, prog)) in mounts.iter().enumerate() {
+                        output.push_str(&format!(
+                            "      - [{}] pc=0x{:x}, program={}\n",
+                            i, pc, prog
+                        ));
+                    }
+                }
             }
         } else {
             output.push_str("No traces currently loaded.");
@@ -849,6 +905,10 @@ impl InteractiveCommandPanel {
                         }
                     }
                 }
+                CommandType::InfoTrace { .. } => {
+                    // Info trace completion handled like other commands
+                    self.add_success_response_and_clear_waiting();
+                }
                 _ => {
                     // Non-script commands are handled by specific command completion handlers
                     // Don't process trace status changes for these
@@ -877,6 +937,10 @@ impl InteractiveCommandPanel {
                 CommandType::Info { target } => {
                     format!("❌ Failed to get info for '{}': {}", target, error)
                 }
+                CommandType::InfoTrace { trace_id } => match trace_id {
+                    Some(id) => format!("❌ Failed to get info for trace {}: {}", id, error),
+                    None => format!("❌ Failed to get info for all traces: {}", error),
+                },
             };
 
             if let Some(last_item) = self.command_history.last_mut() {
@@ -919,6 +983,10 @@ impl InteractiveCommandPanel {
                 CommandType::Info { target } => {
                     format!("✅ Debug info for '{}' retrieved successfully", target)
                 }
+                CommandType::InfoTrace { trace_id } => match trace_id {
+                    Some(id) => format!("✅ Trace {} info retrieved successfully", id),
+                    None => "✅ All traces info retrieved successfully".to_string(),
+                },
             };
 
             if let Some(last_item) = self.command_history.last_mut() {
@@ -946,6 +1014,10 @@ impl InteractiveCommandPanel {
                 CommandType::Script { .. } => {
                     // Script completion is handled by update_trace_status
                 }
+                CommandType::InfoTrace { .. } => {
+                    // Info trace completion handled like other commands
+                    self.add_success_response_and_clear_waiting();
+                }
                 _ => {
                     // Handle other command completions
                     self.add_success_response_and_clear_waiting();
@@ -960,6 +1032,10 @@ impl InteractiveCommandPanel {
             match command_type {
                 CommandType::Script { .. } => {
                     // Script failures are handled by update_trace_status
+                }
+                CommandType::InfoTrace { .. } => {
+                    // Info trace failures handled here
+                    self.add_error_response_and_clear_waiting(error);
                 }
                 _ => {
                     // Handle other command failures
@@ -1407,6 +1483,39 @@ impl InteractiveCommandPanel {
         self.update_static_lines();
     }
 
+    /// Add a styled response using ratatui Lines (bypasses ANSI)
+    pub fn add_styled_response(&mut self, lines: Vec<ratatui::text::Line<'static>>) {
+        // Attach styled buffer to the latest history item (create one if needed)
+        let mut attach_index = None;
+        if let Some(last_item) = self.command_history.last() {
+            if last_item.response_type == Some(ResponseType::ScriptDisplay) {
+                // Create a fresh history item to hold the styled response
+                self.add_to_history("".to_string(), Some(String::new()));
+                attach_index = Some(self.command_history.len().saturating_sub(1));
+            } else {
+                attach_index = Some(self.command_history.len().saturating_sub(1));
+            }
+        } else {
+            // No history yet: create an empty item so rendering has an anchor
+            self.add_to_history("".to_string(), Some(String::new()));
+            attach_index = Some(self.command_history.len().saturating_sub(1));
+        }
+
+        if let Some(idx) = attach_index {
+            if let Some(item) = self.command_history.get_mut(idx) {
+                item.response = Some(String::new());
+                item.response_type = Some(ResponseType::Success);
+            }
+            self.styled_at_history_index = Some(idx);
+            // Move cursor to end, so the prompt appears after this new response
+            self.command_cursor_line = self.static_lines.len().saturating_sub(1);
+            self.command_cursor_column = 0;
+        }
+
+        self.styled_buffer = Some(lines);
+        self.update_static_lines();
+    }
+
     /// Add a response specifically for script completion - appends to existing script display
     pub fn add_script_completion_response(
         &mut self,
@@ -1581,7 +1690,7 @@ impl InteractiveCommandPanel {
         );
 
         // Render static text content using original method
-        self.render_static_content(frame, content_area, is_focused);
+        self.render_static_content_with_styled(frame, content_area, is_focused);
 
         // Render border
         let block = Block::default()
@@ -1770,6 +1879,10 @@ impl InteractiveCommandPanel {
     }
 
     fn render_static_content(&self, frame: &mut Frame, area: Rect, is_focused: bool) {
+        self.render_static_content_with_styled(frame, area, is_focused)
+    }
+
+    fn render_static_content_with_styled(&self, frame: &mut Frame, area: Rect, is_focused: bool) {
         let max_lines = area.height as usize;
         let content_width = area.width.saturating_sub(2) as usize;
 
@@ -1786,7 +1899,7 @@ impl InteractiveCommandPanel {
         let end_idx = (start_idx + max_lines).min(total_lines);
 
         // Render visible lines
-        let mut items = Vec::new();
+        let mut items: Vec<ListItem> = Vec::new();
         debug!(
             "Rendering {} static lines (showing {}-{})",
             self.static_lines.len(),
@@ -1923,12 +2036,32 @@ impl InteractiveCommandPanel {
                                 }
                             };
 
+                            // Push rendered plain line
                             items.push(ListItem::new(Line::from(spans)));
+
+                            // Immediately after a Response line that is our styled anchor,
+                            // inject the styled lines so they appear before the CurrentInput line.
+                            if line.line_type == LineType::Response {
+                                if let (Some(styled_lines), Some(anchor_idx)) =
+                                    (&self.styled_buffer, self.styled_at_history_index)
+                                {
+                                    if line.history_index == Some(anchor_idx) {
+                                        for l in styled_lines.iter() {
+                                            items.push(ListItem::new(l.clone()));
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
         }
+
+        // If we have a styled buffer anchored to a specific history index, and that index
+        // corresponds to a visible Response line, inject the styled lines right after it.
+        // Note: when in non-Command mode, we want the styled output to appear immediately
+        // after its placeholder response and BEFORE the CurrentInput line.
 
         let list = List::new(items);
         frame.render_widget(list, area);
@@ -2024,7 +2157,18 @@ impl InteractiveCommandPanel {
                     break;
                 }
                 let wrapped_lines = self.wrap_text(&line.content, content_width);
-                total_rendered_lines_before_scroll += wrapped_lines.len();
+                let mut count = wrapped_lines.len();
+                // Include styled lines injected after the anchor response
+                if line.line_type == LineType::Response {
+                    if let (Some(styled_lines), Some(anchor_idx)) =
+                        (&self.styled_buffer, self.styled_at_history_index)
+                    {
+                        if line.history_index == Some(anchor_idx) {
+                            count = count.saturating_add(styled_lines.len());
+                        }
+                    }
+                }
+                total_rendered_lines_before_scroll += count;
             }
 
             if found_current_input {
@@ -2037,7 +2181,17 @@ impl InteractiveCommandPanel {
                 for static_idx in 0..start_idx {
                     if let Some(line) = self.static_lines.get(static_idx) {
                         let wrapped_lines = self.wrap_text(&line.content, content_width);
-                        rendered_lines_before_start_idx += wrapped_lines.len();
+                        let mut count = wrapped_lines.len();
+                        if line.line_type == LineType::Response {
+                            if let (Some(styled_lines), Some(anchor_idx)) =
+                                (&self.styled_buffer, self.styled_at_history_index)
+                            {
+                                if line.history_index == Some(anchor_idx) {
+                                    count = count.saturating_add(styled_lines.len());
+                                }
+                            }
+                        }
+                        rendered_lines_before_start_idx += count;
                     }
                 }
 
@@ -2408,7 +2562,19 @@ impl InteractiveCommandPanel {
 
         for (static_idx, line) in self.static_lines.iter().enumerate() {
             let wrapped_lines = self.wrap_text(&line.content, content_width);
-            let line_rendered_count = wrapped_lines.len();
+            let mut line_rendered_count = wrapped_lines.len();
+
+            // If this line is the styled anchor response, include styled rows in rendered count
+            if line.line_type == LineType::Response {
+                if let (Some(styled_lines), Some(anchor_idx)) =
+                    (&self.styled_buffer, self.styled_at_history_index)
+                {
+                    if line.history_index == Some(anchor_idx) {
+                        line_rendered_count =
+                            line_rendered_count.saturating_add(styled_lines.len());
+                    }
+                }
+            }
 
             rendered_positions.push((total_rendered_lines, line_rendered_count));
 

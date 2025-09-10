@@ -83,6 +83,7 @@ pub enum RuntimeCommand {
     DeleteTrace(u32),  // Completely delete specific trace and all resources
     DeleteAllTraces,   // Delete all traces and resources
     InfoTarget { target: String }, // Get debug info for a target (function or file:line)
+    InfoTrace { trace_id: Option<u32> }, // Get info for one/all traces
     Shutdown,
 }
 
@@ -150,7 +151,23 @@ pub enum RuntimeStatus {
         target: String,
         error: String,
     },
+    /// Detailed info for a trace (summary + mounts)
+    TraceInfo {
+        trace_id: u32,
+        target: String,
+        status: String,
+        pid: Option<u32>,
+        binary: String,
+        script_preview: Option<String>,
+        mounts: Vec<TraceMountInfo>,
+    },
     Error(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct TraceMountInfo {
+    pub offset: u64,
+    pub program: String,
 }
 
 impl EventRegistry {

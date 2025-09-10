@@ -202,6 +202,56 @@ async fn run_runtime_coordinator(
                             });
                         }
                     }
+                    RuntimeCommand::InfoTrace { trace_id } => {
+                        if let Some(ref session) = session {
+                            let ids: Vec<u32> = match trace_id {
+                                Some(id) => vec![id],
+                                None => session.trace_manager.get_all_trace_ids(),
+                            };
+                            for id in ids {
+                                if let Some(snap) = session.trace_manager.get_trace_snapshot(id) {
+                                    let status = if snap.is_enabled { "Active" } else { "Disabled" }.to_string();
+                                    // Build a cleaner script preview: prefer first non-empty line inside braces
+                                    let script_preview = {
+                                        let raw = snap.script_content.as_str();
+                                        let inner = if let (Some(open), Some(close)) = (raw.find('{'), raw.rfind('}')) {
+                                            if close > open { Some(&raw[open+1..close]) } else { None }
+                                        } else { None };
+                                        let candidate = inner.unwrap_or(raw);
+                                        let first_line = candidate
+                                            .lines()
+                                            .map(|l| l.trim())
+                                            .filter(|l| !l.is_empty())
+                                            .find(|_| true)
+                                            .or_else(|| raw.lines().skip(1).map(|l| l.trim()).find(|l| !l.is_empty()));
+                                        first_line.map(|l| {
+                                            let mut s = l.to_string();
+                                            if s.len() > 120 { s.truncate(120); }
+                                            s
+                                        })
+                                    };
+                                    let mounts = snap
+                                        .mounts
+                                        .into_iter()
+                                        .map(|(offset, program)| ghostscope_ui::events::TraceMountInfo { offset, program })
+                                        .collect();
+                                    let _ = runtime_channels.status_sender.send(ghostscope_ui::events::RuntimeStatus::TraceInfo {
+                                        trace_id: snap.trace_id,
+                                        target: snap.target_display,
+                                        status,
+                                        pid: snap.target_pid,
+                                        binary: snap.binary_path,
+                                        script_preview,
+                                        mounts,
+                                    });
+                                } else {
+                                    warn!("InfoTrace requested for non-existent trace {}", id);
+                                }
+                            }
+                        } else {
+                            warn!("InfoTrace requested but no session available");
+                        }
+                    }
                     RuntimeCommand::AttachToProcess(pid) => {
                         info!("Attaching to process: {}", pid);
                         // TODO: Implement process attachment

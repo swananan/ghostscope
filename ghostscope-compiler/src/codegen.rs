@@ -253,8 +253,8 @@ impl<'ctx> CodeGen<'ctx> {
         debug!("Getting value for DWARF register {}", register);
 
         // Use platform-specific DWARF register to pt_regs offset mapping
-        let reg_offset = platform::dwarf_reg_to_pt_regs_byte_offset_x86_64(register)
-            .ok_or_else(|| {
+        let reg_offset =
+            platform::dwarf_reg_to_pt_regs_byte_offset_x86_64(register).ok_or_else(|| {
                 warn!("Unsupported DWARF register {}", register);
                 CodeGenError::UnsupportedRegister(register)
             })?;
@@ -362,7 +362,11 @@ impl<'ctx> CodeGen<'ctx> {
     /// Determine VarType from DWARF type information
     fn determine_var_type_from_dwarf(&self, dwarf_type: &Option<DwarfType>) -> VarType {
         match dwarf_type {
-            Some(DwarfType::BaseType { encoding, size, name }) => {
+            Some(DwarfType::BaseType {
+                encoding,
+                size,
+                name,
+            }) => {
                 match encoding {
                     DwarfEncoding::Signed | DwarfEncoding::Unsigned => {
                         // Support different integer sizes
@@ -4253,7 +4257,9 @@ impl<'ctx> CodeGen<'ctx> {
                     for var_info in enhanced_vars {
                         if var_info.variable.name == var_name {
                             // Use the structured DWARF type information instead of string matching
-                            return Some(self.determine_var_type_from_dwarf(&var_info.variable.dwarf_type));
+                            return Some(
+                                self.determine_var_type_from_dwarf(&var_info.variable.dwarf_type),
+                            );
                         }
                     }
                 }

@@ -73,6 +73,8 @@ impl TraceInfo {
 pub struct TraceManager {
     traces: HashMap<u32, TraceInfo>,
     next_id: u32,
+    // Cache mounts reported by runtime: trace_id -> Vec<(pc, program)>
+    mounts: HashMap<u32, Vec<(u64, String)>>,
 }
 
 impl TraceManager {
@@ -80,6 +82,7 @@ impl TraceManager {
         Self {
             traces: HashMap::new(),
             next_id: 0,
+            mounts: HashMap::new(),
         }
     }
 
@@ -183,15 +186,32 @@ impl TraceManager {
         }
     }
 
-    /// Format trace info for display
-    pub fn format_trace_info(&self, trace: &TraceInfo) -> String {
-        let status_symbol = match trace.status {
+    /// Get emoji for a TraceStatus (single source of truth)
+    pub fn status_emoji(status: &TraceStatus) -> &'static str {
+        match status {
             TraceStatus::Active => "✅",
             TraceStatus::Loading => "⏳",
-            TraceStatus::Disabled => "⏸️", // Pause symbol for disabled
+            TraceStatus::Disabled => "⏸️",
             TraceStatus::Failed => "❌",
             TraceStatus::Stopped => "⏹️",
-        };
+        }
+    }
+
+    /// Get emoji for a string status (used by info trace rendering)
+    pub fn status_emoji_from_str(status: &str) -> &'static str {
+        match status {
+            s if s.eq_ignore_ascii_case("active") => "✅",
+            s if s.eq_ignore_ascii_case("loading") => "⏳",
+            s if s.eq_ignore_ascii_case("disabled") => "⏸️",
+            s if s.eq_ignore_ascii_case("failed") => "❌",
+            s if s.eq_ignore_ascii_case("stopped") => "⏹️",
+            _ => "",
+        }
+    }
+
+    /// Format trace info for display
+    pub fn format_trace_info(&self, trace: &TraceInfo) -> String {
+        let status_symbol = Self::status_emoji(&trace.status);
 
         let duration = trace.format_duration(trace.created_time);
         let mut info = format!(
@@ -214,6 +234,14 @@ impl TraceManager {
         }
 
         info
+    }
+
+    pub fn get_mounts(&self, trace_id: u32) -> Option<&Vec<(u64, String)>> {
+        self.mounts.get(&trace_id)
+    }
+
+    pub fn set_mounts(&mut self, trace_id: u32, mounts: Vec<(u64, String)>) {
+        self.mounts.insert(trace_id, mounts);
     }
 }
 

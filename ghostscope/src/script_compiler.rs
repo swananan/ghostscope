@@ -1,4 +1,5 @@
 use crate::session::GhostSession;
+use crate::trace_manager::TraceMountPoint;
 use anyhow::Result;
 use ghostscope_loader::GhostScopeLoader;
 use tracing::{error, info};
@@ -61,15 +62,22 @@ pub async fn compile_and_load_script_for_tui(
         .to_string_lossy()
         .to_string();
 
-    // Step 5: Process each uprobe configuration and create trace instances
-    // TUI mode requires strict all-or-nothing success: ALL uprobe configs must succeed
-    let mut successful_trace_ids = Vec::new();
-    let expected_trace_count = compilation_result.uprobe_configs.len();
+    // Step 5: Group all uprobe configurations into a single Trace with multiple mount points
+    // TUI mode requires strict all-or-nothing success: ALL uprobe configs must be valid
+    let expected_mounts = compilation_result.uprobe_configs.len();
+    if expected_mounts == 0 {
+        return Err(anyhow::anyhow!("No uprobe configurations generated"));
+    }
 
+    // Use the first pattern's display as the trace display name
+    let target_display =
+        generate_target_display_name(&compilation_result.uprobe_configs[0].trace_pattern);
+
+    // Build all mount points
+    let mut mounts: Vec<TraceMountPoint> = Vec::with_capacity(expected_mounts);
     for (i, mut config) in compilation_result.uprobe_configs.into_iter().enumerate() {
         config.binary_path = binary_path.clone();
 
-        // Compiler should have already resolved addresses and offsets
         let uprobe_offset = match config.uprobe_offset {
             Some(offset) => offset,
             None => {
@@ -78,91 +86,60 @@ pub async fn compile_and_load_script_for_tui(
                     i
                 );
                 error!("{}", error);
-                // Clean up any successful traces before failing
-                for &trace_id in &successful_trace_ids {
-                    let _ = session.trace_manager.remove_trace(trace_id).await;
-                }
                 return Err(anyhow::anyhow!(error));
             }
         };
 
-        // Generate target display name from the trace pattern
-        let target_display = generate_target_display_name(&config.trace_pattern);
-
         info!(
-            "Processing uprobe config {}: target='{}', offset=0x{:x}",
-            i, target_display, uprobe_offset
+            "Preparing mount {}: target='{}', offset=0x{:x}, prog='{}'",
+            i, target_display, uprobe_offset, config.ebpf_function_name
         );
 
-        // Step 6: Create GhostScopeLoader with compiled eBPF bytecode
         let loader = match GhostScopeLoader::new(&config.ebpf_bytecode) {
             Ok(loader) => loader,
             Err(e) => {
-                let error = format!("Failed to create eBPF loader for config {}: {}", i, e);
+                let error = format!("Failed to create eBPF loader for mount {}: {}", i, e);
                 error!("{}", error);
-                // Clean up any successful traces before failing
-                for &trace_id in &successful_trace_ids {
-                    let _ = session.trace_manager.remove_trace(trace_id).await;
-                }
                 return Err(anyhow::anyhow!(error));
             }
         };
 
-        // Step 7: Add trace instance to TraceManager
-        let actual_trace_id = session.trace_manager.add_trace(
-            compilation_result.target_info.clone(),
-            script.to_string(),
+        mounts.push(TraceMountPoint {
             loader,
-            binary_path.clone(),
-            target_display.clone(),
-            Some(uprobe_offset), // Always use offset for uprobe loading
-            session.target_pid,
-        );
-
-        info!(
-            "Created trace instance {} for target '{}' with uprobe config {}",
-            actual_trace_id, target_display, i
-        );
-
-        // Step 8: Activate the trace instance (attach uprobe)
-        if let Err(e) = session.trace_manager.activate_trace(actual_trace_id).await {
-            let error = format!("Failed to activate trace {}: {}", actual_trace_id, e);
-            error!("{}", error);
-            // Clean up this failed trace and any successful ones
-            let _ = session.trace_manager.remove_trace(actual_trace_id).await;
-            for &trace_id in &successful_trace_ids {
-                let _ = session.trace_manager.remove_trace(trace_id).await;
-            }
-            return Err(anyhow::anyhow!(error));
-        }
-
-        successful_trace_ids.push(actual_trace_id);
-
-        info!(
-            "Successfully activated trace {} for target '{}'",
-            actual_trace_id, target_display
-        );
+            uprobe_offset,
+            ebpf_function_name: config.ebpf_function_name,
+        });
     }
 
-    // Step 9: Verify ALL uprobe configurations were processed successfully
-    if successful_trace_ids.len() == expected_trace_count {
-        info!(
-            "Script compilation and loading completed successfully: ALL {} uprobe configurations attached",
-            expected_trace_count
-        );
-        Ok(())
-    } else {
-        let error = format!(
-            "Script compilation failed: only {} out of {} uprobe configurations succeeded",
-            successful_trace_ids.len(),
-            expected_trace_count
-        );
-        // This should never happen due to early returns above, but defensive programming
-        for &trace_id in &successful_trace_ids {
-            let _ = session.trace_manager.remove_trace(trace_id).await;
-        }
-        Err(anyhow::anyhow!(error))
+    // Step 6: Add a single trace instance with multiple mounts
+    let actual_trace_id = session.trace_manager.add_trace(
+        compilation_result.target_info.clone(),
+        script.to_string(),
+        mounts,
+        binary_path.clone(),
+        target_display.clone(),
+        session.target_pid,
+    );
+
+    info!(
+        "Created multi-mount trace instance {} for target '{}' with {} mounts",
+        actual_trace_id, target_display, expected_mounts
+    );
+
+    // Step 7: Activate the trace instance (attach all uprobes)
+    if let Err(e) = session.trace_manager.activate_trace(actual_trace_id).await {
+        let error = format!("Failed to activate trace {}: {}", actual_trace_id, e);
+        error!("{}", error);
+        let _ = session.trace_manager.remove_trace(actual_trace_id).await;
+        return Err(anyhow::anyhow!(error));
     }
+
+    info!(
+        "Successfully activated trace {} for target '{}' with all mounts",
+        actual_trace_id, target_display
+    );
+
+    Ok(())
 }
 
 /// Generate target display name from trace pattern

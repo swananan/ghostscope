@@ -903,6 +903,20 @@ impl TuiApp {
                 .command_sender
                 .send(RuntimeCommand::Shutdown);
             self.should_quit = true;
+        } else if trimmed == "info trace" || trimmed.starts_with("info trace ") {
+            let id_opt = trimmed
+                .strip_prefix("info trace ")
+                .and_then(|s| s.parse::<u32>().ok());
+            // Delegate waiting-state management and local id validation to panel
+            self.interactive_command_panel
+                .start_info_trace_request(id_opt);
+            if self.interactive_command_panel.is_waiting_response() {
+                // Only send to runtime if accepted (valid and now waiting)
+                let _ = self
+                    .event_registry
+                    .command_sender
+                    .send(RuntimeCommand::InfoTrace { trace_id: id_opt });
+            }
         } else if trimmed.is_empty() {
             // Ignore empty commands
         } else {
@@ -1019,7 +1033,7 @@ impl TuiApp {
     async fn handle_runtime_status(&mut self, status: RuntimeStatus) {
         debug!("Runtime status: {:?}", status);
 
-        match &status {
+        match status {
             RuntimeStatus::SourceCodeLoaded(source_info) => {
                 self.source_panel
                     .load_source(source_info.file_path.clone(), source_info.current_line);
@@ -1038,7 +1052,7 @@ impl TuiApp {
                 // Update trace status in the interactive panel
                 self.interactive_command_panel.update_trace_status(
                     crate::trace::TraceStatus::Active,
-                    *trace_id,
+                    trace_id,
                     None,
                 );
 
@@ -1047,11 +1061,112 @@ impl TuiApp {
                     trace_id
                 );
             }
+            // Note: mount details after compilation will be shown via TraceInfo as needed
+            RuntimeStatus::TraceInfo {
+                trace_id,
+                target,
+                status,
+                pid,
+                binary,
+                script_preview,
+                mounts,
+            } => {
+                // Ensure we end waiting state so input prompt is rendered after the response
+                self.interactive_command_panel.handle_command_completed();
+                use ratatui::style::{Color, Modifier, Style};
+                use ratatui::text::{Line, Span};
+
+                let mut lines: Vec<Line<'static>> = Vec::new();
+
+                // Title
+                lines.push(Line::from(vec![Span::styled(
+                    format!("✓ Trace {}", trace_id),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                )]));
+
+                // Helper to style label/value
+                let label_style = Style::default().fg(Color::Cyan);
+                let value_style = Style::default();
+
+                // target
+                lines.push(Line::from(vec![
+                    Span::styled("  target : ", label_style),
+                    Span::styled(target, value_style),
+                ]));
+
+                // status with emoji + color
+                let emoji = crate::trace::TraceManager::status_emoji_from_str(&status);
+                let status_color = match status.to_ascii_lowercase().as_str() {
+                    "active" => Color::Green,
+                    "loading" => Color::Yellow,
+                    "disabled" => Color::Gray,
+                    "stopped" => Color::Gray,
+                    "failed" => Color::Red,
+                    _ => Color::Reset,
+                };
+                let mut status_spans = vec![Span::styled("  status : ", label_style)];
+                if !emoji.is_empty() {
+                    status_spans.push(Span::raw(format!("{} ", emoji)));
+                }
+                status_spans.push(Span::styled(status, Style::default().fg(status_color)));
+                lines.push(Line::from(status_spans));
+
+                // pid
+                if let Some(p) = pid {
+                    lines.push(Line::from(vec![
+                        Span::styled("  pid    : ", label_style),
+                        Span::styled(p.to_string(), value_style),
+                    ]));
+                }
+
+                // binary
+                lines.push(Line::from(vec![
+                    Span::styled("  binary : ", label_style),
+                    Span::styled(binary, value_style),
+                ]));
+
+                // script preview
+                if let Some(pre) = script_preview {
+                    lines.push(Line::from(vec![
+                        Span::styled("  script : ", label_style),
+                        Span::styled(pre, value_style),
+                    ]));
+                }
+
+                // mounts header
+                lines.push(Line::from(vec![
+                    Span::styled("  mounts : ", label_style),
+                    Span::styled(mounts.len().to_string(), value_style),
+                ]));
+
+                // mounts list
+                for (i, m) in mounts.iter().enumerate() {
+                    lines.push(Line::from(vec![
+                        Span::raw("    - ["),
+                        Span::styled(i.to_string(), Style::default().fg(Color::Gray)),
+                        Span::raw("] "),
+                        Span::styled(
+                            format!("pc=0x{:x}", m.offset),
+                            Style::default().fg(Color::Yellow),
+                        ),
+                        Span::raw(", program="),
+                        Span::styled(m.program.clone(), Style::default().fg(Color::Gray)),
+                    ]));
+                }
+
+                self.interactive_command_panel.add_styled_response(lines);
+                // Ensure input mode and reset cursor to the end
+                self.interactive_command_panel.enter_input_mode();
+                self.interactive_command_panel.cursor_position =
+                    self.interactive_command_panel.input_text.len();
+            }
             RuntimeStatus::ScriptCompilationFailed { error, trace_id } => {
                 // Update trace status in the interactive panel
                 self.interactive_command_panel.update_trace_status(
                     crate::trace::TraceStatus::Failed,
-                    *trace_id,
+                    trace_id,
                     Some(error.clone()),
                 );
 
@@ -1065,7 +1180,7 @@ impl TuiApp {
                 self.interactive_command_panel.handle_command_completed();
                 self.interactive_command_panel.update_trace_status(
                     crate::trace::TraceStatus::Active,
-                    *trace_id,
+                    trace_id,
                     None,
                 );
                 info!("Trace {} enabled successfully", trace_id);
@@ -1075,7 +1190,7 @@ impl TuiApp {
                 self.interactive_command_panel.handle_command_completed();
                 self.interactive_command_panel.update_trace_status(
                     crate::trace::TraceStatus::Disabled,
-                    *trace_id,
+                    trace_id,
                     None,
                 );
                 info!("Trace {} disabled successfully", trace_id);
@@ -1092,12 +1207,12 @@ impl TuiApp {
             }
             RuntimeStatus::TraceEnableFailed { trace_id, error } => {
                 // Handle sync failure for enable command
-                self.interactive_command_panel.handle_command_failed(error);
+                self.interactive_command_panel.handle_command_failed(&error);
                 error!("Failed to enable trace {}: {}", trace_id, error);
             }
             RuntimeStatus::TraceDisableFailed { trace_id, error } => {
                 // Handle sync failure for disable command
-                self.interactive_command_panel.handle_command_failed(error);
+                self.interactive_command_panel.handle_command_failed(&error);
                 error!("Failed to disable trace {}: {}", trace_id, error);
             }
             RuntimeStatus::TraceDeleted { trace_id } => {
@@ -1105,7 +1220,7 @@ impl TuiApp {
                 self.interactive_command_panel.handle_command_completed();
                 self.interactive_command_panel
                     .trace_manager
-                    .remove_trace(*trace_id);
+                    .remove_trace(trace_id);
                 info!(
                     "Trace {} deleted successfully and removed from UI",
                     trace_id
@@ -1121,13 +1236,13 @@ impl TuiApp {
             }
             RuntimeStatus::TraceDeleteFailed { trace_id, error } => {
                 // Handle sync failure for delete command
-                self.interactive_command_panel.handle_command_failed(error);
+                self.interactive_command_panel.handle_command_failed(&error);
                 error!("Failed to delete trace {}: {}", trace_id, error);
             }
 
             RuntimeStatus::InfoTargetResult { target, info } => {
                 self.interactive_command_panel.handle_command_completed();
-                let formatted_info = format_target_debug_info(target, info);
+                let formatted_info = format_target_debug_info(&target, &info);
                 self.interactive_command_panel
                     .add_response(formatted_info, ResponseType::Success);
             }
@@ -1140,7 +1255,7 @@ impl TuiApp {
             }
             RuntimeStatus::Error(error) => {
                 // Handle sync failure for batch operations that send generic errors
-                self.interactive_command_panel.handle_command_failed(error);
+                self.interactive_command_panel.handle_command_failed(&error);
                 error!("Runtime error: {}", error);
             }
             _ => {}
