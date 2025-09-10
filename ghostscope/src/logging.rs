@@ -1,24 +1,23 @@
 use anyhow::Result;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer;
 
 const DEFAULT_LOG_FILE: &str = "ghostscope.log";
 
-pub fn initialize_logging(log_file_path: Option<&str>, tui_mode: bool) -> Result<()> {
-    eprintln!("Starting logging initialization...");
+static INIT_GUARD: OnceLock<()> = OnceLock::new();
 
-    // Initialize log to tracing adapter to capture aya's log:: output
-    match tracing_log::LogTracer::init() {
-        Ok(()) => eprintln!("LogTracer initialized successfully"),
-        Err(e) => eprintln!("Warning: Failed to initialize log tracer: {}", e),
+pub fn initialize_logging(log_file_path: Option<&str>, tui_mode: bool) -> Result<()> {
+    if INIT_GUARD.set(()).is_err() {
+        // Already initialized elsewhere; do nothing and succeed
+        return Ok(());
     }
 
-    // Set up the log level for detailed debugging - include aya debug logs
-    let rust_log = "debug,ghostscope=debug,ghostscope_compiler=debug,ghostscope_loader=debug,aya=debug,aya_obj=debug";
-    std::env::set_var("RUST_LOG", rust_log);
-    eprintln!("Set RUST_LOG to: {}", rust_log);
+    // Initialize log to tracing adapter to capture aya's log:: output
+    // Initialize LogTracer but ignore 'already set' errors to avoid noisy output
+    let _ = tracing_log::LogTracer::init();
 
     // Determine log file path: use provided path or default to current directory
     let log_path = match log_file_path {
@@ -35,8 +34,6 @@ pub fn initialize_logging(log_file_path: Option<&str>, tui_mode: bool) -> Result
 
     match maybe_log_file {
         Ok(log_file) => {
-            eprintln!("Successfully created log file: {}", log_path.display());
-
             // Configure file output
             let file_subscriber = tracing_subscriber::fmt::layer()
                 .with_file(true)
@@ -48,45 +45,30 @@ pub fn initialize_logging(log_file_path: Option<&str>, tui_mode: bool) -> Result
 
             if tui_mode {
                 // TUI mode: only log to file
-                match tracing_subscriber::registry()
+                let init_res = tracing_subscriber::registry()
                     .with(file_subscriber)
-                    .try_init()
-                {
-                    Ok(()) => eprintln!(
-                        "Tracing subscriber initialized successfully (file-only for TUI mode)"
-                    ),
-                    Err(e) => eprintln!("Warning: Failed to initialize tracing subscriber: {}", e),
-                }
+                    .try_init();
+                let _ = init_res; // ignore AlreadyInit errors silently
             } else {
                 // Non-TUI mode: dual output to file and stdout
-                match tracing_subscriber::registry()
+                let init_res = tracing_subscriber::registry()
                     .with(file_subscriber)
                     .with(tracing_subscriber::fmt::layer().with_writer(std::io::stdout))
-                    .try_init()
-                {
-                    Ok(()) => eprintln!(
-                        "Tracing subscriber initialized successfully with file and stdout output"
-                    ),
-                    Err(e) => eprintln!("Warning: Failed to initialize tracing subscriber: {}", e),
-                }
+                    .try_init();
+                let _ = init_res;
             }
 
-            eprintln!("Tracing subscriber initialized successfully");
+            // No additional stdout prints
         }
         Err(_) => {
             // Fallback to stdout only if file creation fails
-            match tracing_subscriber::fmt()
+            let init_res = tracing_subscriber::fmt()
                 .with_file(true)
                 .with_line_number(true)
                 .with_target(true)
                 .with_env_filter(tracing_subscriber::filter::EnvFilter::from_default_env())
-                .try_init()
-            {
-                Ok(()) => eprintln!("Tracing subscriber initialized successfully (stdout only)"),
-                Err(e) => eprintln!("Warning: Failed to initialize tracing subscriber: {}", e),
-            }
-
-            eprintln!("Warning: Could not create log file, using stdout only");
+                .try_init();
+            let _ = init_res;
         }
     }
 
