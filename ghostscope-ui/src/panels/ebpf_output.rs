@@ -1,9 +1,9 @@
 // Removed unused chrono imports
 use ratatui::{
     layout::Rect,
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, List, ListItem},
+    widgets::{Block, BorderType, Borders, Paragraph},
     Frame,
 };
 use std::collections::VecDeque;
@@ -197,144 +197,312 @@ impl EbpfInfoPanel {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, is_focused: bool) {
-        let mut all_items = Vec::new();
-
-        // Calculate content width for text wrapping (subtract borders and padding)
-        let content_width = area.width.saturating_sub(6); // 2 for borders + 4 for padding
-
-        // Add trace events with clean, simple formatting
-        let total_traces = self.trace_events.len();
-
-        for (trace_index, trace) in self.trace_events.iter().enumerate() {
-            let is_latest = trace_index == total_traces - 1;
-            let is_cursor_trace = self.show_cursor && trace_index == self.cursor_trace_index;
-
-            // Create the main message line with enhanced information
-            let message_type_short = match trace.message_type {
-                ghostscope_protocol::EventMessageType::VariableData => "VAR",
-                ghostscope_protocol::EventMessageType::Log => "LOG",
-                ghostscope_protocol::EventMessageType::ExecutionFailure => "ERR",
-                ghostscope_protocol::EventMessageType::Unknown => "UNK",
-            };
-
-            let mut message_line = format!(
-                "{} [No:{}] TraceID:{} PID:{} TID:{} [{}]",
-                trace.readable_timestamp,
-                trace.message_number,
-                trace.trace_id,
-                trace.pid,
-                trace.tid,
-                message_type_short
-            );
-
-            // Add variable information if available
-            if !trace.variables.is_empty() {
-                let variables_info = trace
-                    .variables
-                    .iter()
-                    .map(|var| format!("{}: {}", var.name, var.formatted_value))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                message_line.push_str(&format!(" | Variables: [{}]", variables_info));
-            }
-
-            // Add log message if available
-            if let Some(log_msg) = &trace.log_message {
-                message_line.push_str(&format!(" | Log: {}", log_msg));
-            }
-
-            // Add failure message if available
-            if let Some(failure_msg) = &trace.failure_message {
-                message_line.push_str(&format!(" | Failure: {}", failure_msg));
-            }
-
-            // Wrap the message if needed
-            let wrapped_lines = self.wrap_text(&message_line, content_width as usize);
-
-            // Determine the style based on latest message and cursor position
-            let final_style = if is_cursor_trace {
-                // Cursor highlighting - use pink/magenta with bold and reverse for better terminal visibility
-                Style::default().fg(Color::Magenta).add_modifier(
-                    ratatui::style::Modifier::BOLD | ratatui::style::Modifier::REVERSED,
-                )
-            } else if is_latest {
-                // Latest message highlighting
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(ratatui::style::Modifier::BOLD)
-            } else {
-                // Normal style
-                Style::default().fg(Color::White)
-            };
-
-            // Add each line of the trace
-            for (line_index, line) in wrapped_lines.iter().enumerate() {
-                if line_index == 0 {
-                    // First line - use the full styled message
-                    all_items.push(ListItem::new(Line::from(vec![Span::styled(
-                        line.clone(),
-                        final_style,
-                    )])));
-                } else {
-                    // Continuation lines - indent and use same style
-                    let indent = " ".repeat(4); // Simple 4-space indent
-                    all_items.push(ListItem::new(Line::from(vec![Span::styled(
-                        format!("{}{}", indent, line),
-                        final_style,
-                    )])));
-                }
-            }
-        }
-
-        // Apply scrolling based on display mode
-        let available_height = area.height.saturating_sub(2); // Subtract borders
-
-        match self.display_mode {
-            DisplayMode::AutoRefresh => {
-                // Auto-refresh mode: always show latest events
-                if all_items.len() > available_height as usize {
-                    self.scroll_offset = all_items.len().saturating_sub(available_height as usize);
-                }
-            }
-            DisplayMode::Scroll => {
-                // Scroll mode: ensure cursor trace is visible
-                self.ensure_cursor_visible(
-                    all_items.len(),
-                    available_height as usize,
-                    content_width as usize,
-                );
-            }
-        }
-
-        // Ensure cursor trace index is within bounds
-        if self.cursor_trace_index >= self.trace_events.len() {
-            self.cursor_trace_index = self.trace_events.len().saturating_sub(1);
-        }
-
-        let visible_items: Vec<_> = all_items.into_iter().skip(self.scroll_offset).collect();
-
+        // Outer panel block
         let border_style = if is_focused {
             Style::default().fg(Color::Cyan)
         } else {
             Style::default()
         };
+        let panel_block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(if is_focused {
+                BorderType::Thick
+            } else {
+                BorderType::Plain
+            })
+            .title(format!(
+                "eBPF Trace Output ({} events)",
+                self.trace_events.len()
+            ))
+            .border_style(border_style);
+        frame.render_widget(panel_block, area);
 
-        let list = List::new(visible_items).block(
-            Block::default()
+        // Content area inside outer border
+        if area.width <= 2 || area.height <= 2 {
+            return;
+        }
+        let content_area = Rect {
+            x: area.x + 1,
+            y: area.y + 1,
+            width: area.width - 2,
+            height: area.height - 2,
+        };
+        let content_width = content_area.width as usize;
+
+        // Pre-compute card heights and bodies
+        struct Card {
+            header_no_bold: String,
+            header_number: String,
+            header_rest: String,
+            body_lines: Vec<Line<'static>>,
+            total_height: u16,
+            is_error: bool,
+            is_latest: bool,
+        }
+        let mut cards: Vec<Card> = Vec::new();
+
+        let total_traces = self.trace_events.len();
+        for (trace_index, trace) in self.trace_events.iter().enumerate() {
+            let is_latest = trace_index == total_traces - 1;
+            let is_error = matches!(
+                trace.message_type,
+                ghostscope_protocol::EventMessageType::ExecutionFailure
+            );
+
+            // Header: remove type tag per request
+            // Header parts: only number should be bold -> split into two strings
+            let header_no_bold = String::from("[No:");
+            let header_number = format!("{}", trace.message_number);
+            let header_rest = format!(
+                "] {} TraceID:{} PID:{} TID:{}",
+                trace.readable_timestamp, trace.trace_id, trace.pid, trace.tid
+            );
+
+            let mut body_lines: Vec<Line> = Vec::new();
+            // Variables: show as key-value pairs, no "vars:" label; values bold
+            if !trace.variables.is_empty() {
+                let indent = "  ";
+                for var in &trace.variables {
+                    let name = &var.name;
+                    let value = &var.formatted_value;
+                    let name_prefix = format!("{}{}: ", indent, name);
+                    let name_prefix_width = name_prefix.len();
+                    let wrap_width = content_width.saturating_sub(name_prefix_width);
+                    let wrapped_vals = self.wrap_text(value, wrap_width);
+                    for (i, seg) in wrapped_vals.into_iter().enumerate() {
+                        if i == 0 {
+                            body_lines.push(Line::from(vec![
+                                Span::styled(
+                                    name_prefix.clone(),
+                                    Style::default().fg(Color::DarkGray),
+                                ),
+                                Span::styled(
+                                    seg,
+                                    Style::default()
+                                        .fg(Color::White)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                            ]));
+                        } else {
+                            body_lines.push(Line::from(vec![
+                                Span::styled(
+                                    " ".repeat(name_prefix_width),
+                                    Style::default().fg(Color::DarkGray),
+                                ),
+                                Span::styled(
+                                    seg,
+                                    Style::default()
+                                        .fg(Color::White)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                            ]));
+                        }
+                    }
+                }
+            }
+            // Log
+            if let Some(log_msg) = &trace.log_message {
+                let prefix = "log: ";
+                let wrapped =
+                    self.wrap_text(log_msg, content_width.saturating_sub(2 + prefix.len()));
+                for (i, seg) in wrapped.into_iter().enumerate() {
+                    let indent = "  ";
+                    if i == 0 {
+                        body_lines.push(Line::from(vec![
+                            Span::raw(indent),
+                            Span::styled(prefix, Style::default().fg(Color::DarkGray)),
+                            Span::styled(
+                                seg,
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        ]));
+                    } else {
+                        body_lines.push(Line::from(vec![
+                            Span::raw(indent),
+                            Span::styled(
+                                " ".repeat(prefix.len()),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                            Span::styled(
+                                seg,
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        ]));
+                    }
+                }
+            }
+            // Failure
+            if let Some(failure_msg) = &trace.failure_message {
+                let prefix = "failure: ";
+                let wrapped =
+                    self.wrap_text(failure_msg, content_width.saturating_sub(2 + prefix.len()));
+                for (i, seg) in wrapped.into_iter().enumerate() {
+                    let indent = "  ";
+                    if i == 0 {
+                        body_lines.push(Line::from(vec![
+                            Span::raw(indent),
+                            Span::styled(prefix, Style::default().fg(Color::DarkGray)),
+                            Span::styled(
+                                seg,
+                                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                            ),
+                        ]));
+                    } else {
+                        body_lines.push(Line::from(vec![
+                            Span::raw(indent),
+                            Span::styled(
+                                " ".repeat(prefix.len()),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                            Span::styled(
+                                seg,
+                                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                            ),
+                        ]));
+                    }
+                }
+            }
+
+            // Minimum inner height is at least 1 line body (even if empty)
+            let inner_height = u16::max(1, body_lines.len() as u16);
+            // Card total height includes borders
+            let total_height = inner_height + 2;
+            cards.push(Card {
+                header_no_bold,
+                header_number,
+                header_rest,
+                body_lines,
+                total_height,
+                is_error,
+                is_latest,
+            });
+        }
+
+        // Determine starting card index based on mode and cursor visibility
+        let mut start_index = 0usize;
+        let viewport_height = content_area.height;
+        match self.display_mode {
+            DisplayMode::AutoRefresh => {
+                // Fit as many cards from the end as possible
+                let mut h: u16 = 0;
+                start_index = cards.len();
+                while start_index > 0 {
+                    let next_h = h.saturating_add(cards[start_index - 1].total_height);
+                    if next_h > viewport_height {
+                        break;
+                    }
+                    h = next_h;
+                    start_index -= 1;
+                }
+            }
+            DisplayMode::Scroll => {
+                // Ensure cursor card is fully visible
+                let cursor = self.cursor_trace_index.min(cards.len().saturating_sub(1));
+                // If current start doesn't show cursor, adjust
+                // First try to keep cursor as the last visible card
+                let mut h: u16 = 0;
+                let mut i = cursor + 1;
+                while i > 0 {
+                    let ch = cards[i - 1].total_height;
+                    if h + ch > viewport_height {
+                        break;
+                    }
+                    h += ch;
+                    i -= 1;
+                }
+                start_index = i;
+            }
+        }
+
+        // Render visible cards
+        let mut y = content_area.y;
+        for (idx, card) in cards.iter().enumerate().skip(start_index) {
+            if y >= content_area.y + content_area.height {
+                break;
+            }
+            let height = card
+                .total_height
+                .min(content_area.y + content_area.height - y);
+            if height < 2 {
+                break;
+            }
+
+            let is_cursor = self.show_cursor && idx == self.cursor_trace_index;
+            let title_style = Style::default().add_modifier(Modifier::BOLD);
+
+            let mut border_style = Style::default();
+            let mut border_type = BorderType::Plain;
+            if is_cursor {
+                border_style = Style::default().fg(Color::Yellow);
+                border_type = BorderType::Thick;
+            } else if card.is_latest {
+                border_style = Style::default().fg(Color::Green);
+                border_type = BorderType::Thick;
+            } else if card.is_error {
+                border_style = Style::default().fg(Color::Red);
+            }
+
+            // Title text color follows border color for latest or focused cards; otherwise gray
+            let title_color = if is_cursor {
+                Color::Yellow
+            } else if card.is_latest {
+                Color::Green
+            } else {
+                Color::Gray
+            };
+
+            let card_block = Block::default()
                 .borders(Borders::ALL)
-                .border_type(if is_focused {
-                    BorderType::Thick
-                } else {
-                    BorderType::Plain
-                })
-                .title(format!(
-                    "eBPF Trace Output ({} events)",
-                    self.trace_events.len()
-                ))
-                .border_style(border_style),
-        );
+                .border_type(border_type)
+                .border_style(border_style)
+                .title(Line::from(vec![
+                    Span::styled(
+                        card.header_no_bold.clone(),
+                        Style::default().fg(title_color),
+                    ),
+                    Span::styled(
+                        card.header_number.clone(),
+                        Style::default()
+                            .fg(Color::LightMagenta)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(card.header_rest.clone(), Style::default().fg(title_color)),
+                ]));
 
-        frame.render_widget(list, area);
+            let card_area = Rect {
+                x: content_area.x,
+                y,
+                width: content_area.width,
+                height,
+            };
+            frame.render_widget(card_block, card_area);
+
+            // Inner area
+            if card_area.width > 2 && card_area.height > 2 {
+                let inner = Rect {
+                    x: card_area.x + 1,
+                    y: card_area.y + 1,
+                    width: card_area.width - 2,
+                    height: card_area.height - 2,
+                };
+                // Build Paragraph from visible body lines
+                let max_body_lines = inner.height as usize;
+                let body = if card.body_lines.is_empty() {
+                    vec![Line::from("")]
+                } else {
+                    card.body_lines.clone()
+                };
+                let lines = body.into_iter().take(max_body_lines).collect::<Vec<_>>();
+                let para = Paragraph::new(lines);
+                frame.render_widget(para, inner);
+            }
+
+            y = y.saturating_add(height);
+        }
     }
 
     /// Wrap text to fit within the specified width
