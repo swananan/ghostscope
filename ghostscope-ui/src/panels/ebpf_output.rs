@@ -25,6 +25,9 @@ pub struct EbpfInfoPanel {
     pub show_cursor: bool,         // Whether to show cursor highlighting
     pub display_mode: DisplayMode, // Current display mode
     pub next_message_number: u64,  // Next message number to assign
+    // Numeric jump input for N+G
+    pub numeric_prefix: Option<String>,
+    pub g_pressed: bool, // whether first 'g' was pressed (for 'gg')
 }
 
 impl EbpfInfoPanel {
@@ -38,6 +41,8 @@ impl EbpfInfoPanel {
             show_cursor: false,
             display_mode: DisplayMode::AutoRefresh,
             next_message_number: 1, // Start from 1
+            numeric_prefix: None,
+            g_pressed: false,
         }
     }
 
@@ -103,6 +108,79 @@ impl EbpfInfoPanel {
         self.enter_scroll_mode();
         let max_index = self.trace_events.len().saturating_sub(1);
         self.cursor_trace_index = (self.cursor_trace_index + 10).min(max_index);
+    }
+
+    // Jump to first trace (gg)
+    pub fn jump_to_first(&mut self) {
+        self.enter_scroll_mode();
+        self.cursor_trace_index = 0;
+    }
+
+    // Jump to last trace (G without prefix)
+    pub fn jump_to_last(&mut self) {
+        self.enter_scroll_mode();
+        self.cursor_trace_index = self.trace_events.len().saturating_sub(1);
+    }
+
+    // Start or append numeric prefix for N G
+    pub fn push_numeric_digit(&mut self, ch: char) {
+        if ch.is_ascii_digit() {
+            self.enter_scroll_mode();
+            let s = self.numeric_prefix.get_or_insert_with(String::new);
+            if s.len() < 9 {
+                s.push(ch);
+            }
+            // typing number cancels pending 'g'
+            self.g_pressed = false;
+        }
+    }
+
+    // Confirm 'G' action: if numeric prefix present, jump to that message number; else jump to last
+    pub fn confirm_goto(&mut self) {
+        if let Some(s) = self.numeric_prefix.take() {
+            if let Ok(num) = s.parse::<u64>() {
+                self.jump_to_message_number(num);
+                return;
+            }
+        }
+        self.jump_to_last();
+    }
+
+    // Jump to specific message number (1-based). Clamp to [first,last]
+    pub fn jump_to_message_number(&mut self, message_number: u64) {
+        self.enter_scroll_mode();
+        if self.trace_events.is_empty() {
+            self.cursor_trace_index = 0;
+            return;
+        }
+        let mut target_idx = None;
+        for (idx, ev) in self.trace_events.iter().enumerate() {
+            if ev.message_number >= message_number {
+                target_idx = Some(idx);
+                break;
+            }
+        }
+        let idx = target_idx.unwrap_or_else(|| self.trace_events.len().saturating_sub(1));
+        self.cursor_trace_index = idx;
+    }
+
+    // Exit to auto-refresh (ESC)
+    pub fn exit_to_auto_refresh(&mut self) {
+        self.numeric_prefix = None;
+        self.g_pressed = false;
+        self.hide_cursor();
+        self.scroll_to_bottom();
+    }
+
+    // Handle 'g' key (support 'gg')
+    pub fn handle_g_key(&mut self) {
+        self.enter_scroll_mode();
+        if self.g_pressed {
+            self.g_pressed = false;
+            self.jump_to_first();
+        } else {
+            self.g_pressed = true;
+        }
     }
 
     /// Enter scroll mode and set cursor to the last trace
@@ -402,16 +480,25 @@ impl EbpfInfoPanel {
             DisplayMode::Scroll => {
                 // Ensure cursor card is fully visible
                 let cursor = self.cursor_trace_index.min(cards.len().saturating_sub(1));
-                // If current start doesn't show cursor, adjust
-                // First try to keep cursor as the last visible card
-                let mut h: u16 = 0;
-                let mut i = cursor + 1;
-                while i > 0 {
-                    let ch = cards[i - 1].total_height;
-                    if h + ch > viewport_height {
+                // Try to place cursor card slightly below center if possible
+                let mut h_below: u16 = 0;
+                let mut end = cursor;
+                while end < cards.len() {
+                    let ch = cards[end].total_height;
+                    if h_below + ch > viewport_height {
                         break;
                     }
-                    h += ch;
+                    h_below += ch;
+                    end += 1;
+                }
+                let mut h_above: u16 = 0;
+                let mut i = cursor;
+                while i > 0 {
+                    let ch = cards[i - 1].total_height;
+                    if h_above + h_below + ch > viewport_height {
+                        break;
+                    }
+                    h_above += ch;
                     i -= 1;
                 }
                 start_index = i;
@@ -502,6 +589,50 @@ impl EbpfInfoPanel {
             }
 
             y = y.saturating_add(height);
+        }
+
+        // Render numeric prefix or 'g' hint (style consistent with SourceCode panel)
+        if self.g_pressed || self.numeric_prefix.is_some() {
+            let input_text = if let Some(ref s) = self.numeric_prefix {
+                format!("{}G", s)
+            } else {
+                "g".to_string()
+            };
+            let hint_text = if self.g_pressed && self.numeric_prefix.is_none() {
+                " Press 'g' again for top"
+            } else if self.numeric_prefix.is_some() {
+                " Press 'G' to jump to message"
+            } else {
+                ""
+            };
+            let full_text = if hint_text.is_empty() {
+                input_text.clone()
+            } else {
+                format!("{} ({})", input_text, &hint_text[1..])
+            };
+
+            let text_width = full_text.len() as u16;
+            let display_x = content_area.x + content_area.width.saturating_sub(text_width + 2);
+            let display_y = content_area.y + content_area.height.saturating_sub(1);
+
+            let mut spans = vec![Span::styled(
+                input_text,
+                Style::default().fg(Color::Green).bg(Color::Rgb(30, 30, 30)),
+            )];
+            if !hint_text.is_empty() {
+                spans.push(Span::styled(
+                    format!(" ({})", &hint_text[1..]),
+                    Style::default()
+                        .fg(border_style.fg.unwrap_or(Color::White))
+                        .bg(Color::Rgb(30, 30, 30)),
+                ));
+            }
+
+            let text = ratatui::text::Text::from(ratatui::text::Line::from(spans));
+            frame.render_widget(
+                ratatui::widgets::Paragraph::new(text).alignment(ratatui::layout::Alignment::Right),
+                Rect::new(display_x, display_y, text_width + 2, 1),
+            );
         }
     }
 

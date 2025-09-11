@@ -570,34 +570,42 @@ impl TuiApp {
 
                 _ => {}
             },
-            FocusedPanel::EbpfInfo => match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.ebpf_info_panel.move_cursor_up();
+            FocusedPanel::EbpfInfo => {
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.ebpf_info_panel.move_cursor_up();
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.ebpf_info_panel.move_cursor_down();
+                    }
+                    KeyCode::Char('g') => {
+                        self.ebpf_info_panel.handle_g_key();
+                    }
+                    KeyCode::Char('G') => {
+                        self.ebpf_info_panel.confirm_goto();
+                    }
+                    KeyCode::Char(d) if d.is_ascii_digit() => {
+                        self.ebpf_info_panel.push_numeric_digit(d);
+                    }
+                    KeyCode::Esc => {
+                        self.ebpf_info_panel.exit_to_auto_refresh();
+                    }
+                    _ => {}
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.ebpf_info_panel.move_cursor_down();
+
+                // Handle Ctrl+key combinations for Ebpf panel
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    match key.code {
+                        KeyCode::Char('d') => {
+                            self.ebpf_info_panel.move_cursor_down_10();
+                        }
+                        KeyCode::Char('u') => {
+                            self.ebpf_info_panel.move_cursor_up_10();
+                        }
+                        _ => {}
+                    }
                 }
-                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.ebpf_info_panel.move_cursor_down_10();
-                }
-                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.ebpf_info_panel.move_cursor_up_10();
-                }
-                KeyCode::Esc => {
-                    self.ebpf_info_panel.hide_cursor();
-                }
-                KeyCode::Home | KeyCode::Char('g') => {
-                    self.ebpf_info_panel.scroll_offset = 0;
-                    self.ebpf_info_panel.auto_scroll = false;
-                    self.ebpf_info_panel.show_cursor = false;
-                    self.ebpf_info_panel.cursor_trace_index = 0;
-                    self.ebpf_info_panel.display_mode = crate::panels::DisplayMode::AutoRefresh;
-                }
-                KeyCode::End | KeyCode::Char('G') => {
-                    self.ebpf_info_panel.scroll_to_bottom();
-                }
-                _ => {}
-            },
+            }
             FocusedPanel::Source => {
                 match key.code {
                     KeyCode::Up | KeyCode::Char('k') => {
