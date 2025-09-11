@@ -324,10 +324,15 @@ impl ScopedVariableMap {
 
     /// Check if variable is visible at given address
     fn is_variable_visible_at_address(&self, var_ref: &VariableRef, addr: u64) -> bool {
-        let visible = var_ref
-            .address_ranges
-            .iter()
-            .any(|range| addr >= range.start && addr < range.end);
+        let visible = var_ref.address_ranges.iter().any(|range| {
+            if range.start == range.end {
+                // Handle point locations (e.g., [0x1157, 0x1157) for inlined function entry points)
+                addr == range.start
+            } else {
+                // Handle regular ranges [start, end)
+                addr >= range.start && addr < range.end
+            }
+        });
 
         if !visible {
             debug!(
@@ -479,11 +484,15 @@ impl ScopedVariableMap {
         let mut active_scopes = Vec::new();
 
         for scope in self.scopes.values() {
-            if scope
-                .address_ranges
-                .iter()
-                .any(|range| addr >= range.start && addr < range.end)
-            {
+            if scope.address_ranges.iter().any(|range| {
+                if range.start == range.end {
+                    // Handle point locations (e.g., [0x1157, 0x1157) for inlined function entry points)
+                    addr == range.start
+                } else {
+                    // Handle regular ranges [start, end)
+                    addr >= range.start && addr < range.end
+                }
+            }) {
                 active_scopes.push(scope.id);
             }
         }
@@ -512,16 +521,29 @@ impl ScopedVariableMap {
         let mut addresses = Vec::new();
 
         for scope in self.scopes.values() {
-            if let ScopeType::Function { name, address } = &scope.scope_type {
-                if name == function_name {
-                    addresses.push(*address);
+            match &scope.scope_type {
+                // Handle regular (non-inlined) functions
+                ScopeType::Function { name, address } => {
+                    if name == function_name {
+                        addresses.push(*address);
+                    }
                 }
+                // Handle inlined functions
+                ScopeType::InlinedSubroutine { origin_func } => {
+                    if origin_func == function_name {
+                        // For inlined functions, use the first address range start as the representative address
+                        if let Some(first_range) = scope.address_ranges.first() {
+                            addresses.push(first_range.start);
+                        }
+                    }
+                }
+                _ => {} // Ignore other scope types
             }
         }
 
         // Sort addresses for consistent ordering
         addresses.sort_unstable();
-        addresses.dedup();
+        addresses.dedup(); // Remove potential duplicates from overlapping ranges
         addresses
     }
 

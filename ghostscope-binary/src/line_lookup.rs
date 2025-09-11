@@ -29,6 +29,24 @@ struct LineRow {
     file_index: u64,
     line: u32,
     column: u32,
+    /// Statement boundary marker - preferred breakpoint location
+    is_stmt: bool,
+    /// End of function prologue - good place for breakpoints
+    prologue_end: bool,
+    /// Beginning of function epilogue
+    epilogue_begin: bool,
+    /// View number for discriminating multiple entries at same address (DWARF 5)
+    view: u32,
+    /// Discriminator for distinguishing different inline contexts
+    discriminator: u32,
+}
+
+/// DWARF flags for an address
+#[derive(Debug, Clone)]
+struct AddressFlags {
+    is_stmt: bool,
+    prologue_end: bool,
+    epilogue_begin: bool,
 }
 
 /// Parsed line information for efficient lookup
@@ -86,13 +104,27 @@ impl LineInfo {
                 gimli::ColumnType::Column(x) => x.get() as u32,
             };
 
+            // Extract DWARF statement flags for proper breakpoint placement
+            let is_stmt = row.is_stmt();
+            let prologue_end = row.prologue_end();
+            let epilogue_begin = row.epilogue_begin();
+
+            // Get DWARF 5 fields for inline function discrimination
+            let view = row.discriminator() as u32; // Convert to u32
+            let discriminator = row.discriminator() as u32; // Convert to u32
+
             // Key difference from addr2line: we want to collect ALL line mappings
-            // for the same address, not just replace them
+            // for the same address, not just replace them - this preserves inline function context
             sequence_rows.push(LineRow {
                 address,
                 file_index,
                 line,
                 column,
+                is_stmt,
+                prologue_end,
+                epilogue_begin,
+                view,
+                discriminator,
             });
         }
 
@@ -169,19 +201,26 @@ impl LineInfo {
 
                         if row.line == line_number {
                             debug!(
-                                "LineInfo: exact line match! Adding address 0x{:x}",
-                                row.address
+                                "LineInfo: exact line match at address 0x{:x}, is_stmt: {}, view: {}",
+                                row.address, row.is_stmt, row.view
                             );
-                            addresses.push(row.address);
+                            // Following GDB strategy: only add addresses that are statement boundaries
+                            if row.is_stmt {
+                                addresses.push(row.address);
+                            } else {
+                                debug!(
+                                    "LineInfo: skipping non-statement address 0x{:x}",
+                                    row.address
+                                );
+                            }
                         }
                     }
                 }
             }
         }
 
-        // Remove duplicates and sort
+        // Sort addresses but keep duplicates (needed for inline function context)
         addresses.sort_unstable();
-        addresses.dedup();
 
         debug!(
             "LineInfo: search complete - checked {} rows, {} file matches, found {} addresses",
@@ -190,9 +229,78 @@ impl LineInfo {
             addresses.len()
         );
 
+        // Filter addresses following GDB-style logic: keep only statement boundaries
+        let filtered_addresses = self.filter_addresses_gdb_style(addresses);
+
         // Cache result
-        self.line_cache.insert(cache_key, addresses.clone());
-        addresses
+        self.line_cache
+            .insert(cache_key, filtered_addresses.clone());
+        filtered_addresses
+    }
+
+    /// Filter addresses using GDB-style logic: prefer statement boundaries
+    /// Based on GDB's find_line_common which ignores non-statement entries
+    fn filter_addresses_gdb_style(&self, addresses: Vec<u64>) -> Vec<u64> {
+        if addresses.is_empty() {
+            return addresses;
+        }
+
+        debug!(
+            "LineInfo: filtering {} addresses using GDB-style logic (is_stmt only)",
+            addresses.len()
+        );
+
+        // GDB approach: only keep addresses marked as statement boundaries
+        let mut stmt_addresses = Vec::new();
+
+        for &addr in &addresses {
+            let flags = self.get_address_flags(addr);
+            if flags.is_stmt {
+                debug!("LineInfo: keeping address 0x{:x} (is_stmt=true)", addr);
+                stmt_addresses.push(addr);
+            } else {
+                debug!("LineInfo: ignoring address 0x{:x} (is_stmt=false)", addr);
+            }
+        }
+
+        // If no statement addresses found, return all addresses as fallback
+        if stmt_addresses.is_empty() {
+            debug!(
+                "LineInfo: no statement addresses found, keeping all {} addresses as fallback",
+                addresses.len()
+            );
+            addresses
+        } else {
+            debug!(
+                "LineInfo: filtered to {} statement addresses",
+                stmt_addresses.len()
+            );
+            stmt_addresses
+        }
+    }
+
+    /// Get DWARF flags for a specific address
+    fn get_address_flags(&self, address: u64) -> AddressFlags {
+        for sequence in &self.sequences {
+            if let Ok(idx) = sequence
+                .rows
+                .binary_search_by(|row| row.address.cmp(&address))
+            {
+                let row = &sequence.rows[idx];
+                return AddressFlags {
+                    is_stmt: row.is_stmt,
+                    prologue_end: row.prologue_end,
+                    epilogue_begin: row.epilogue_begin,
+                };
+            }
+        }
+
+        // Default flags if not found
+        AddressFlags {
+            is_stmt: false,
+            prologue_end: false,
+            epilogue_begin: false,
+        }
     }
 
     /// Find location information for a specific address

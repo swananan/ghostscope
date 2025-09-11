@@ -165,26 +165,6 @@ impl BinaryAnalyzer {
         self.dwarf_context.as_mut()
     }
 
-    /// Resolve function name to virtual address
-    /// This is a unified interface that handles the complete function name to address resolution
-    /// First tries DWARF information, then falls back to symbol table
-    pub fn resolve_function_address(&self, func_name: &str) -> Option<u64> {
-        // First try DWARF information
-        if let Some(dwarf_context) = &self.dwarf_context {
-            let addresses = dwarf_context.get_function_addresses_by_name(func_name);
-            if !addresses.is_empty() {
-                return Some(addresses[0]); // Return first address for compatibility
-            }
-        }
-
-        // Fall back to symbol table
-        if let Some(symbol) = self.find_symbol(func_name) {
-            Some(symbol.address)
-        } else {
-            None
-        }
-    }
-
     /// Get all addresses for a function name using DWARF information first
     /// Returns all addresses that correspond to the given function name
     pub fn get_all_function_addresses(&self, func_name: &str) -> Vec<u64> {
@@ -217,92 +197,6 @@ impl BinaryAnalyzer {
             addresses
         } else {
             Vec::new()
-        }
-    }
-
-    /// Resolve source line to virtual address  
-    /// This is a unified interface that handles the complete source line to address resolution
-    /// Returns the best address found for the given source line (for backward compatibility)
-    pub fn resolve_source_line_address(
-        &mut self,
-        file_path: &str,
-        line_number: u32,
-    ) -> Option<u64> {
-        if let Some(dwarf_context) = &mut self.dwarf_context {
-            let line_mappings = dwarf_context.get_addresses_for_line(file_path, line_number);
-            if line_mappings.is_empty() {
-                return None;
-            }
-
-            // If only one address, use it
-            if line_mappings.len() == 1 {
-                return Some(line_mappings[0].address);
-            }
-
-            // Multiple addresses found - choose the best one
-            // Strategy: prefer addresses that are in symbol/function ranges
-            let mut best_address = line_mappings[0].address;
-            let mut best_score = 0u32;
-
-            for mapping in &line_mappings {
-                let mut score = 0u32;
-
-                // Check if this address is within a known symbol
-                if let Some(symbol) = self.find_symbol_by_address(mapping.address) {
-                    score += 10; // High priority for addresses in symbols
-
-                    // Extra bonus for function symbols
-                    if matches!(symbol.kind, crate::symbol::SymbolType::Function) {
-                        score += 5;
-                    }
-                }
-
-                // Prefer higher addresses (usually main implementations vs inlined)
-                if mapping.address > best_address {
-                    score += 1;
-                }
-
-                if score > best_score || (score == best_score && mapping.address > best_address) {
-                    best_address = mapping.address;
-                    best_score = score;
-                }
-            }
-
-            Some(best_address)
-        } else {
-            None
-        }
-    }
-
-    /// Calculate uprobe offset for function name
-    /// This combines function name resolution and uprobe offset calculation
-    pub fn resolve_function_uprobe_offset(&self, func_name: &str) -> Option<u64> {
-        if let Some(symbol) = self.find_symbol(func_name) {
-            symbol.uprobe_offset()
-        } else {
-            None
-        }
-    }
-
-    /// Calculate uprobe offset for source line
-    /// This combines source line resolution and uprobe offset calculation
-    pub fn resolve_source_line_uprobe_offset(
-        &mut self,
-        file_path: &str,
-        line_number: u32,
-    ) -> Option<u64> {
-        if let Some(virtual_addr) = self.resolve_source_line_address(file_path, line_number) {
-            // For source line, we can use the virtual address directly as uprobe offset
-            // or try to find containing symbol for better offset calculation
-            if let Some(symbol) = self.find_symbol_by_address(virtual_addr) {
-                // Found exact symbol match, use symbol's uprobe offset
-                symbol.uprobe_offset()
-            } else {
-                // Use the virtual address directly (fallback)
-                self.calculate_uprobe_offset_from_address(virtual_addr)
-            }
-        } else {
-            None
         }
     }
 

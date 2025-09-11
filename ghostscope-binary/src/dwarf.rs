@@ -71,6 +71,8 @@ pub struct DwarfContext {
     dwarf: Dwarf<EndianSlice<'static, LittleEndian>>,
     // Keep the file data alive
     _file_data: Box<[u8]>,
+    // Base addresses for proper DWARF parsing
+    base_addresses: gimli::BaseAddresses,
 
     // CFI information
     eh_frame: Option<gimli::EhFrame<EndianSlice<'static, LittleEndian>>>,
@@ -78,8 +80,6 @@ pub struct DwarfContext {
     // New CFI context for simplified DWARF expression-only interface
     cfi_context: Option<crate::cfi::CFIContext>,
 
-    // High-performance line number index (inspired by addr2line)
-    line_index: Option<LineNumberIndex>,
     // New line lookup system (based on addr2line)
     line_lookup: Option<LineLookup>,
     // Enhanced file information management for fast queries
@@ -651,43 +651,6 @@ pub struct EnhancedVariableLocation {
     pub evaluation_result: Option<crate::expression::EvaluationResult>,
 }
 
-/// High-performance line number index (inspired by addr2line)
-#[derive(Debug)]
-pub struct LineNumberIndex {
-    /// All line sequences sorted by address range  
-    sequences: Vec<LineSequence>,
-    /// File path to index mapping
-    files: Vec<String>,
-    /// Cache for address -> source location lookups
-    addr_cache: std::collections::HashMap<u64, Option<SourceLocation>>,
-    /// Cache for (file, line) -> addresses lookups
-    line_cache: std::collections::HashMap<(String, u32), Vec<u64>>,
-}
-
-/// Line sequence containing continuous line information
-#[derive(Debug, Clone)]
-struct LineSequence {
-    /// Start address of this sequence
-    start_addr: u64,
-    /// End address of this sequence  
-    end_addr: u64,
-    /// Line rows sorted by address
-    rows: Vec<LineRow>,
-}
-
-/// Individual line row mapping address to source location
-#[derive(Debug, Clone)]
-struct LineRow {
-    /// Address in memory
-    address: u64,
-    /// File index in files array
-    file_index: usize,
-    /// Line number (0 means no line info)
-    line: u32,
-    /// Column number (0 means no column info)  
-    column: u32,
-}
-
 /// Variable location mapping for efficient address-based lookups
 #[derive(Debug)]
 pub struct VariableLocationMap {
@@ -703,137 +666,6 @@ struct AddressRangeEntry {
     start: u64,
     end: u64,
     variables: Vec<Variable>,
-}
-
-impl LineNumberIndex {
-    /// Create new empty line number index
-    fn new() -> Self {
-        Self {
-            sequences: Vec::new(),
-            files: Vec::new(),
-            addr_cache: std::collections::HashMap::new(),
-            line_cache: std::collections::HashMap::new(),
-        }
-    }
-
-    /// Fast address to source location lookup using binary search (O(log n))
-    pub fn find_location(&mut self, addr: u64) -> Option<SourceLocation> {
-        // Check cache first
-        if let Some(cached) = self.addr_cache.get(&addr) {
-            return cached.clone();
-        }
-
-        let result = self.find_location_uncached(addr);
-
-        // Cache result for future lookups
-        self.addr_cache.insert(addr, result.clone());
-        result
-    }
-
-    /// Internal uncached lookup implementation
-    fn find_location_uncached(&self, addr: u64) -> Option<SourceLocation> {
-        // Binary search for sequence containing this address
-        let seq_idx = self
-            .sequences
-            .binary_search_by(|sequence| {
-                if addr < sequence.start_addr {
-                    std::cmp::Ordering::Greater
-                } else if addr >= sequence.end_addr {
-                    std::cmp::Ordering::Less
-                } else {
-                    std::cmp::Ordering::Equal
-                }
-            })
-            .ok()?;
-
-        let sequence = &self.sequences[seq_idx];
-
-        // Binary search within sequence for exact address
-        let row_idx = match sequence.rows.binary_search_by(|row| row.address.cmp(&addr)) {
-            Ok(idx) => idx,
-            Err(0) => return None, // Address before first row
-            Err(idx) => idx - 1,   // Use previous row
-        };
-
-        let row = &sequence.rows[row_idx];
-        let file_path = self.files.get(row.file_index)?.clone();
-
-        Some(SourceLocation {
-            file_path,
-            line_number: row.line,
-            column: if row.column != 0 {
-                Some(row.column)
-            } else {
-                None
-            },
-            address: addr,
-        })
-    }
-
-    /// Fast line to addresses lookup using cached mapping (O(1) after first lookup)
-    pub fn get_addresses_for_line(&mut self, file_path: &str, line_number: u32) -> Vec<u64> {
-        let cache_key = (file_path.to_string(), line_number);
-
-        // Check cache first
-        if let Some(cached) = self.line_cache.get(&cache_key) {
-            return cached.clone();
-        }
-
-        let mut addresses = Vec::new();
-
-        // Search all sequences for matching line
-        debug!(
-            "Searching for line {} in {} sequences",
-            line_number,
-            self.sequences.len()
-        );
-        let mut matched_files_count = 0;
-        let mut total_rows_checked = 0;
-        for sequence in &self.sequences {
-            debug!(
-                "Checking sequence with {} rows, address range 0x{:x}-0x{:x}",
-                sequence.rows.len(),
-                sequence.start_addr,
-                sequence.end_addr
-            );
-            for row in &sequence.rows {
-                total_rows_checked += 1;
-                if let Some(file) = self.files.get(row.file_index) {
-                    if files_match(file, file_path) {
-                        matched_files_count += 1;
-                        debug!(
-                            "File matched! Row line: {}, target line: {}, address: 0x{:x}",
-                            row.line, line_number, row.address
-                        );
-                        if row.line == line_number {
-                            debug!("Found exact line match! Adding address 0x{:x}", row.address);
-                            addresses.push(row.address);
-                        }
-                    }
-                }
-            }
-        }
-        debug!(
-            "Search complete: checked {} rows, {} file matches, found {} addresses",
-            total_rows_checked,
-            matched_files_count,
-            addresses.len()
-        );
-
-        // Sort addresses for consistent ordering
-        addresses.sort_unstable();
-        addresses.dedup();
-
-        // Cache result
-        self.line_cache.insert(cache_key, addresses.clone());
-        addresses
-    }
-
-    /// Clear caches to free memory
-    pub fn clear_caches(&mut self) {
-        self.addr_cache.clear();
-        self.line_cache.clear();
-    }
 }
 
 impl DwarfContext {
@@ -875,22 +707,6 @@ impl DwarfContext {
 
         self.line_lookup = Some(line_lookup);
         Ok(())
-    }
-
-    /// Get statistics about the line lookup system  
-    pub fn get_line_lookup_statistics(&self) -> Option<LineIndexStats> {
-        if let Some(ref line_lookup) = self.line_lookup {
-            // For now, return basic stats - we could expand this later
-            Some(LineIndexStats {
-                sequence_count: 0,  // TODO: get from LineLookup
-                total_rows: 0,      // TODO: get from LineLookup
-                file_count: 0,      // TODO: get from LineLookup
-                addr_cache_size: 0, // TODO: get from LineLookup
-                line_cache_size: 0, // TODO: get from LineLookup
-            })
-        } else {
-            None
-        }
     }
 }
 
@@ -1075,13 +891,20 @@ impl DwarfContext {
             debug_frame.is_some() || eh_frame.is_some()
         );
 
+        // Set up base addresses properly for DWARF sections - define early for DwarfContext
+        let mut base_addresses = gimli::BaseAddresses::default();
+
         // Initialize CFI context before moving file_data
         let cfi_context = if debug_frame.is_some() || eh_frame.is_some() {
             info!("Starting CFI context initialization - found eh_frame or debug_frame");
             let mut cfi_context = crate::cfi::CFIContext::new();
 
-            // Set up base addresses properly for .eh_frame
-            let mut base_addresses = gimli::BaseAddresses::default();
+            // For .text section - needed for location lists
+            if let Some(text_section) = object_file.section_by_name(".text") {
+                let address = text_section.address();
+                debug!("Setting .text base address to 0x{:x}", address);
+                base_addresses = base_addresses.set_text(address);
+            }
 
             // For .eh_frame, we need to set the eh_frame base address
             if let Some(eh_frame_section) = object_file.section_by_name(".eh_frame") {
@@ -1132,7 +955,7 @@ impl DwarfContext {
                         "Loading CFI from .eh_frame section ({} bytes)",
                         eh_frame_data.len()
                     );
-                    cfi_context.load_from_eh_frame(eh_frame_data, base_addresses)?;
+                    cfi_context.load_from_eh_frame(eh_frame_data, base_addresses.clone())?;
                 }
             }
 
@@ -1144,18 +967,15 @@ impl DwarfContext {
         let mut context = Self {
             dwarf,
             _file_data: file_data,
+            base_addresses,
             eh_frame,
             debug_frame,
             cfi_context,
-            line_index: None,
             line_lookup: None,
             file_registry: None,
             scoped_variable_map: None,
             expression_evaluator: DwarfExpressionEvaluator::new(),
         };
-
-        // Build line number index for fast source line lookups
-        context.build_line_index()?;
 
         // Build scoped variable system
         info!("Building scoped variable system...");
@@ -1194,9 +1014,16 @@ impl DwarfContext {
     pub fn get_source_location(&mut self, addr: u64) -> Option<SourceLocation> {
         debug!("Looking up source location for address: 0x{:x}", addr);
 
-        // Use fast line index if available
-        if let Some(ref mut line_index) = self.line_index {
-            return line_index.find_location(addr);
+        // Use line lookup system if available
+        if let Some(ref line_lookup) = self.line_lookup {
+            if let Some(location) = line_lookup.find_location(addr) {
+                return Some(SourceLocation {
+                    file_path: location.file_path,
+                    line_number: location.line_number,
+                    column: Some(location.column),
+                    address: addr,
+                });
+            }
         }
 
         // Fallback to slow lookup if index not available
@@ -1234,25 +1061,10 @@ impl DwarfContext {
             file_path, line_number
         );
 
-        // Priority 1: Use new LineLookup system (based on addr2line)
+        // Use LineLookup system if available
         if let Some(ref mut line_lookup) = self.line_lookup {
-            debug!("Using new LineLookup system (based on addr2line)");
+            debug!("Using LineLookup system");
             let addresses = line_lookup.find_addresses_for_line(file_path, line_number);
-            return addresses
-                .into_iter()
-                .map(|addr| LineMapping {
-                    address: addr,
-                    file_path: file_path.to_string(),
-                    line_number: line_number,
-                    function_name: None, // Function name resolution removed - rely on scoped variable system
-                })
-                .collect();
-        }
-
-        // Priority 2: Use legacy line index if available
-        if let Some(ref mut line_index) = self.line_index {
-            debug!("Using legacy line index");
-            let addresses = line_index.get_addresses_for_line(file_path, line_number);
             return addresses
                 .into_iter()
                 .map(|addr| LineMapping {
@@ -1264,60 +1076,9 @@ impl DwarfContext {
                 .collect();
         }
 
-        // Priority 3: Fallback to slow lookup if index not available
-        debug!("Using slow fallback lookup");
-        self.get_addresses_for_line_slow(file_path, line_number)
-    }
-
-    /// Slow line to addresses lookup (fallback when index is not built)
-    pub fn get_addresses_for_line_slow(
-        &self,
-        file_path: &str,
-        line_number: u32,
-    ) -> Vec<LineMapping> {
-        debug!("Using slow line lookup for {}:{}", file_path, line_number);
-
-        let mut mappings = Vec::new();
-        let mut units = self.dwarf.units();
-        let mut unit_count = 0;
-        let mut total_lines_found = 0;
-
-        while let Ok(Some(header)) = units.next() {
-            if let Ok(unit) = self.dwarf.unit(header) {
-                unit_count += 1;
-                let before_count = mappings.len();
-                self.find_line_addresses_in_unit_concrete(
-                    &unit,
-                    file_path,
-                    line_number,
-                    &mut mappings,
-                );
-                let lines_in_unit = mappings.len() - before_count;
-                total_lines_found += lines_in_unit;
-
-                if lines_in_unit > 0 {
-                    debug!(
-                        "Unit {}: Found {} addresses for {}:{}",
-                        unit_count, lines_in_unit, file_path, line_number
-                    );
-                }
-            }
-        }
-
-        debug!(
-            "Processed {} compilation units, found {} total addresses for {}:{}",
-            unit_count, total_lines_found, file_path, line_number
-        );
-
-        // Sort by address for consistent ordering
-        mappings.sort_by_key(|m| m.address);
-
-        if mappings.is_empty() {
-            debug!("No addresses found - dumping available line info for debugging...");
-            self.debug_dump_line_info(file_path, line_number);
-        }
-
-        mappings
+        // If no line lookup system available, return empty
+        debug!("No line lookup system available");
+        Vec::new()
     }
 
     /// Get detailed variable location information
@@ -1370,19 +1131,40 @@ impl DwarfContext {
                     // Perform real-time CFI-aware expression evaluation using enhanced types
                     let evaluation_result = {
                         use crate::expression::EvaluationContext;
-                        let context = EvaluationContext {
-                            pc_address: addr,
-                            address_size: 8,
-                        };
 
-                        self.expression_evaluator
-                            .evaluate_location_with_enhanced_types(
-                                &result.location_at_address,
+                        // Check if parameter is optimized out and try recovery for inlined functions
+                        if result.is_optimized_out && result.variable_info.is_parameter {
+                            if let Some(recovered_location) = self.try_recover_inlined_parameter(
                                 addr,
-                                &context,
-                                Some(self),
-                            )
-                            .ok()
+                                &result.variable_info.name,
+                                result.scope_depth,
+                            ) {
+                                debug!(
+                                    "Recovered location for inlined parameter '{}': {:?}",
+                                    result.variable_info.name, recovered_location
+                                );
+                                // Use the recovered location directly as a normal memory location result
+                                Some(crate::expression::EvaluationResult::MemoryLocation(
+                                    recovered_location,
+                                ))
+                            } else {
+                                None
+                            }
+                        } else {
+                            let context = EvaluationContext {
+                                pc_address: addr,
+                                address_size: 8,
+                            };
+
+                            self.expression_evaluator
+                                .evaluate_location_with_enhanced_types(
+                                    &result.location_at_address,
+                                    addr,
+                                    &context,
+                                    Some(self),
+                                )
+                                .ok()
+                        }
                     };
 
                     EnhancedVariableLocation {
@@ -1410,152 +1192,6 @@ impl DwarfContext {
         } else {
             debug!("Scoped variable system not available");
             Vec::new()
-        }
-    }
-
-    /// Build high-performance line number index (inspired by addr2line)
-    fn build_line_index(&mut self) -> Result<()> {
-        debug!("Building line number index for fast source location lookups...");
-
-        let mut sequences = Vec::new();
-        let mut files = Vec::new();
-        let mut file_map = std::collections::HashMap::new();
-
-        let mut units = self.dwarf.units();
-        while let Ok(Some(header)) = units.next() {
-            if let Ok(unit) = self.dwarf.unit(header) {
-                self.build_line_sequences_from_unit(
-                    &unit,
-                    &mut sequences,
-                    &mut files,
-                    &mut file_map,
-                )?;
-            }
-        }
-
-        // Sort sequences by start address for binary search
-        sequences.sort_by_key(|seq| seq.start_addr);
-
-        debug!(
-            "Built line index with {} sequences and {} files",
-            sequences.len(),
-            files.len()
-        );
-
-        self.line_index = Some(LineNumberIndex {
-            sequences,
-            files,
-            addr_cache: std::collections::HashMap::new(),
-            line_cache: std::collections::HashMap::new(),
-        });
-
-        Ok(())
-    }
-
-    /// Build line sequences from a single compilation unit
-    fn build_line_sequences_from_unit(
-        &self,
-        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
-        sequences: &mut Vec<LineSequence>,
-        files: &mut Vec<String>,
-        file_map: &mut std::collections::HashMap<String, usize>,
-    ) -> Result<()> {
-        let line_program = match unit.line_program {
-            Some(ref program) => program,
-            None => return Ok(()),
-        };
-
-        let mut rows = line_program.clone().rows();
-        let mut current_sequence_rows: Vec<LineRow> = Vec::new();
-
-        while let Some((_, row)) = rows.next_row()? {
-            if row.end_sequence() {
-                if !current_sequence_rows.is_empty() {
-                    let start_addr = current_sequence_rows.first().unwrap().address;
-                    let end_addr = row.address();
-
-                    sequences.push(LineSequence {
-                        start_addr,
-                        end_addr,
-                        rows: current_sequence_rows.clone(),
-                    });
-
-                    current_sequence_rows.clear();
-                }
-                continue;
-            }
-
-            let address = row.address();
-            let file_index = self.resolve_file_index(&row, unit, files, file_map)?;
-            let line = row.line().map(|l| l.get() as u32).unwrap_or(0);
-            let column = match row.column() {
-                gimli::ColumnType::LeftEdge => 0,
-                gimli::ColumnType::Column(col) => col.get() as u32,
-            };
-
-            // Merge duplicate addresses
-            if let Some(last_row) = current_sequence_rows.last_mut() {
-                if last_row.address == address {
-                    last_row.file_index = file_index;
-                    last_row.line = line;
-                    last_row.column = column;
-                    continue;
-                }
-            }
-
-            current_sequence_rows.push(LineRow {
-                address,
-                file_index,
-                line,
-                column,
-            });
-        }
-
-        Ok(())
-    }
-
-    /// Resolve file index for a line program row
-    fn resolve_file_index(
-        &self,
-        row: &gimli::LineRow,
-        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
-        files: &mut Vec<String>,
-        file_map: &mut std::collections::HashMap<String, usize>,
-    ) -> Result<usize> {
-        let line_program = unit.line_program.as_ref().unwrap();
-        let header = line_program.header();
-
-        if let Some(file_entry) = header.file(row.file_index()) {
-            let path_name = if let Some(directory) = header.directory(file_entry.directory_index())
-            {
-                let dir_str = self
-                    .dwarf
-                    .attr_string(&unit, directory)?
-                    .to_string_lossy()
-                    .to_string();
-                let file_str = self
-                    .dwarf
-                    .attr_string(&unit, file_entry.path_name())?
-                    .to_string_lossy()
-                    .to_string();
-                format!("{}/{}", dir_str, file_str)
-            } else {
-                self.dwarf
-                    .attr_string(&unit, file_entry.path_name())?
-                    .to_string_lossy()
-                    .to_string()
-            };
-
-            if let Some(&index) = file_map.get(&path_name) {
-                Ok(index)
-            } else {
-                let index = files.len();
-                files.push(path_name.clone());
-                file_map.insert(path_name, index);
-                Ok(index)
-            }
-        } else {
-            Ok(0) // Default file index
         }
     }
 
@@ -1911,13 +1547,20 @@ impl DwarfContext {
         // If no direct name, try to get it from abstract origin
         if name.is_empty() {
             if let Some(origin_offset) = abstract_origin {
-                // Use a simpler approach - we know calculate_something functions use abstract_origin
-                // For now, just hardcode the name since we confirmed from DWARF dump it points to "calculate_something"
-                name = "calculate_something".to_string();
-                debug!(
-                    "Got function name '{}' from abstract origin at offset 0x{:x}",
-                    name, origin_offset.0
-                );
+                if let Some(origin_name) = self
+                    .resolve_abstract_origin(unit, gimli::AttributeValue::UnitRef(origin_offset))
+                {
+                    name = origin_name;
+                    debug!(
+                        "Got function name '{}' from abstract origin at offset 0x{:x}",
+                        name, origin_offset.0
+                    );
+                } else {
+                    debug!(
+                        "Failed to resolve function name from abstract origin at offset 0x{:x}",
+                        origin_offset.0
+                    );
+                }
             }
         }
 
@@ -2627,63 +2270,6 @@ impl DwarfContext {
         })
     }
 
-    /// Find all addresses for a specific line in compilation unit (concrete types)
-    fn find_line_addresses_in_unit_concrete(
-        &self,
-        unit: &gimli::Unit<gimli::EndianSlice<gimli::LittleEndian>>,
-        target_file: &str,
-        target_line: u32,
-        mappings: &mut Vec<LineMapping>,
-    ) {
-        let line_program = match unit.line_program.clone() {
-            Some(program) => program,
-            None => return,
-        };
-
-        let mut rows = line_program.rows();
-
-        while let Ok(Some((header, row))) = rows.next_row() {
-            let line_number = match row.line() {
-                Some(line) => line.get() as u32,
-                None => continue,
-            };
-
-            if line_number == target_line {
-                // Get actual file path from DWARF using UnitRef for proper string resolution
-                let file_path = if let Some(file) = header.file(row.file_index()) {
-                    match self.render_file_concrete(unit, file, header) {
-                        Ok(path) => path,
-                        Err(_) => format!("file_{}", row.file_index()),
-                    }
-                } else {
-                    format!("file_{}", row.file_index())
-                };
-
-                // Check if this matches our target file
-                let matches_target = file_path == target_file ||                           // Exact match
-                    file_path.ends_with(target_file) ||                  // Path ends with target
-                    target_file.ends_with(&file_path) ||                 // Target ends with path
-                    file_path.split('/').last() == Some(target_file) ||   // Base name match
-                    target_file.split('/').last() == file_path.split('/').last(); // Both base names match
-
-                if matches_target {
-                    debug!(
-                        "Found matching line: {} at 0x{:x}",
-                        file_path,
-                        row.address()
-                    );
-                    let mapping = LineMapping {
-                        file_path,
-                        line_number,
-                        address: row.address(),
-                        function_name: None, // Function name resolution removed - rely on scoped variable system
-                    };
-                    mappings.push(mapping);
-                }
-            }
-        }
-    }
-
     /// Find variables visible at a specific address in compilation unit (concrete types)
     fn find_variables_in_unit_concrete(
         &self,
@@ -3048,10 +2634,25 @@ impl DwarfContext {
                 let mut address_ranges = Vec::new();
 
                 while let Ok(Some(range)) = ranges.next() {
-                    address_ranges.push(AddressRange {
-                        start: range.begin,
-                        end: range.end,
-                    });
+                    debug!(
+                        "DWARF range: start=0x{:x}, end=0x{:x}, length={}",
+                        range.begin,
+                        range.end,
+                        range.end.wrapping_sub(range.begin)
+                    );
+                    // Skip zero-length ranges like [x, x), which represent point locations.
+                    // GDB-style behavior prefers the next executable instruction range instead.
+                    if range.begin != range.end {
+                        address_ranges.push(AddressRange {
+                            start: range.begin,
+                            end: range.end,
+                        });
+                    } else {
+                        debug!(
+                            "Skipping zero-length DWARF range [0x{:x}, 0x{:x})",
+                            range.begin, range.end
+                        );
+                    }
                 }
 
                 if !address_ranges.is_empty() {
@@ -3462,7 +3063,10 @@ impl DwarfContext {
         );
         let mut entry_count = 0;
         loop {
-            match locations.next() {
+            let next_result = locations.next();
+            debug!("Location list iteration result: {:?}", next_result);
+
+            match next_result {
                 Ok(Some(location_list_entry)) => {
                     entry_count += 1;
                     let start_pc = location_list_entry.range.begin;
@@ -3471,6 +3075,10 @@ impl DwarfContext {
                     debug!(
                         "Location list entry #{}: PC 0x{:x}-0x{:x}",
                         entry_count, start_pc, end_pc
+                    );
+                    debug!(
+                        "  Raw expression data length: {}",
+                        location_list_entry.data.0.len()
                     );
 
                     // Parse the expression data for this PC range
@@ -3732,6 +3340,24 @@ impl DwarfContext {
                 Some(LocationExpression::Address { addr: *addr as u64 })
             }
 
+            // breg + stack_value = register offset with value semantics
+            (DwarfOp::Breg(reg, offset), DwarfOp::StackValue) => {
+                debug!(
+                    "Register offset with stack value pattern: reg {} + {} (value)",
+                    reg, offset
+                );
+                Some(LocationExpression::RegisterOffset {
+                    reg: *reg,
+                    offset: *offset,
+                })
+            }
+
+            // reg + stack_value = register with value semantics
+            (DwarfOp::Reg(reg), DwarfOp::StackValue) => {
+                debug!("Register with stack value pattern: reg {} (value)", reg);
+                Some(LocationExpression::Register { reg: *reg })
+            }
+
             _ => None,
         }
     }
@@ -3908,13 +3534,12 @@ fn get_section_data<'a>(object_file: &'a object::File, name: &str) -> Option<&'a
     debug!("Looking for section: {}", name);
     for section in object_file.sections() {
         if let Ok(section_name) = section.name() {
-            debug!("Found section: {}", section_name);
             if section_name == name {
                 if let Ok(data) = section.data() {
                     debug!("Found section {} with {} bytes", name, data.len());
                     return Some(data);
                 } else {
-                    debug!("Failed to get data for section {}", name);
+                    error!("Failed to get data for section {}", name);
                 }
             }
         }
@@ -4015,6 +3640,131 @@ impl DwarfContext {
     /// Check if CFI context is available
     pub fn has_cfi_context(&self) -> bool {
         self.cfi_context.is_some()
+    }
+
+    /// Try to recover inlined parameter value by analyzing actual DWARF location expressions
+    /// Returns a LocationResult that can be used to read the parameter value
+    pub fn try_recover_inlined_parameter(
+        &self,
+        pc: u64,
+        param_name: &str,
+        scope_depth: usize,
+    ) -> Option<crate::expression::LocationResult> {
+        debug!(
+            "Attempting to recover inlined parameter '{}' at PC 0x{:x}",
+            param_name, pc
+        );
+
+        // Instead of hardcoded guesses, we need to:
+        // 1. Find the inlined subroutine DIE that contains this PC
+        // 2. Look for the formal parameter with matching abstract_origin
+        // 3. Parse its DW_AT_location expression
+        // 4. Convert the expression to proper LocationResult
+
+        if let Some(location_result) =
+            self.find_inlined_parameter_location(pc, param_name, scope_depth)
+        {
+            debug!(
+                "Successfully recovered inlined parameter '{}' from DWARF: {:?}",
+                param_name, location_result
+            );
+            Some(location_result)
+        } else {
+            debug!(
+                "Could not find DWARF location information for inlined parameter '{}'",
+                param_name
+            );
+            None
+        }
+    }
+
+    /// Find the actual DWARF location information for an inlined parameter
+    fn find_inlined_parameter_location(
+        &self,
+        pc: u64,
+        param_name: &str,
+        _scope_depth: usize,
+    ) -> Option<crate::expression::LocationResult> {
+        debug!(
+            "Searching DWARF for inlined parameter '{}' at PC 0x{:x}",
+            param_name, pc
+        );
+
+        // For now, return a simplified implementation that indicates this needs to be implemented
+        // The full implementation would involve complex DWARF traversal with gimli
+        debug!(
+            "DWARF parameter location parsing not yet fully implemented for '{}'",
+            param_name
+        );
+
+        None
+    }
+
+    /// Check if a variable might be a substitute for an inlined parameter
+    fn might_be_parameter_substitute(
+        &self,
+        variable: &crate::scoped_variables::VariableInfo,
+        param_name: &str,
+    ) -> bool {
+        // Pattern 1: Variable name contains the parameter name (e.g., "a.1" for parameter "a")
+        if variable.name.starts_with(&format!("{}.1", param_name))
+            || variable.name.starts_with(&format!("{}_", param_name))
+        {
+            return true;
+        }
+
+        // Pattern 2: For simple parameters like "a" and "b", look for single-letter variables
+        // in registers that might be compiler-generated substitutes
+        if param_name.len() == 1 && variable.name.len() == 1 {
+            // Check if this is a different single-letter variable that could be the substitute
+            return variable.name != param_name;
+        }
+
+        // Pattern 3: Look for computed values or temporaries
+        if variable.name.starts_with("tmp") || variable.name.starts_with("_") {
+            return true;
+        }
+
+        false
+    }
+
+    /// Create a LocationResult from a LocationExpression for parameter recovery
+    fn create_substitute_location(
+        &self,
+        location_expr: &LocationExpression,
+    ) -> Option<crate::expression::LocationResult> {
+        use crate::expression::LocationResult;
+
+        match location_expr {
+            LocationExpression::Register { reg } => Some(LocationResult::RegisterAddress {
+                register: *reg,
+                offset: None,
+                size: None,
+            }),
+            LocationExpression::FrameBaseOffset { offset } => {
+                // Frame-relative access - would need frame base register
+                // For x86_64, this is typically RBP (register 6)
+                Some(LocationResult::RegisterAddress {
+                    register: 6, // RBP on x86_64
+                    offset: Some(*offset),
+                    size: None,
+                })
+            }
+            LocationExpression::ComputedExpression { .. } => {
+                // Complex expressions would need full evaluation
+                // For now, return None to indicate we can't handle this case
+                debug!("Complex location expression not supported for parameter recovery");
+                None
+            }
+            LocationExpression::OptimizedOut => {
+                debug!("Substitute variable is also optimized out");
+                None
+            }
+            _ => {
+                debug!("Unsupported location expression type for parameter recovery");
+                None
+            }
+        }
     }
 }
 /// Frame base information for a specific PC location

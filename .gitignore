@@ -44,3 +44,5 @@ DWARF*
 TUI_IN*
 kernel.dwarf
 *.bt
+gdb*
+.gdb*
