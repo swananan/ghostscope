@@ -1900,7 +1900,7 @@ impl InteractiveCommandPanel {
 
     fn render_static_content_with_styled(&self, frame: &mut Frame, area: Rect, is_focused: bool) {
         let max_lines = area.height as usize;
-        let content_width = area.width.saturating_sub(2) as usize;
+        let content_width = area.width as usize;
 
         // Calculate which lines to show
         let total_lines = self.static_lines.len();
@@ -2238,7 +2238,7 @@ impl InteractiveCommandPanel {
             return;
         }
 
-        let content_width = area.width.saturating_sub(2) as usize;
+        let content_width = area.width as usize;
         let prompt = self.get_prompt();
         let prompt_len = prompt.len();
         let full_text = format!("{}{}", prompt, self.input_text);
@@ -2309,7 +2309,7 @@ impl InteractiveCommandPanel {
 
         if self.mode == InteractionMode::Input {
             // Input mode: render cursor on current input line, considering text wrapping
-            let content_width = area.width.saturating_sub(2) as usize;
+            let content_width = area.width as usize;
             let prompt = self.get_prompt();
             let prompt_len = prompt.len();
             let full_text = format!("{}{}", prompt, self.input_text);
@@ -2412,7 +2412,7 @@ impl InteractiveCommandPanel {
         } else if self.mode == InteractionMode::Command {
             // Command mode: render cursor on selected line, considering text wrapping
             if self.command_cursor_line < self.static_lines.len() {
-                let content_width = area.width.saturating_sub(2) as usize;
+                let content_width = area.width as usize;
 
                 // Calculate the actual rendered position of the selected line
                 let mut rendered_line_pos = 0;
@@ -2468,37 +2468,41 @@ impl InteractiveCommandPanel {
         }
     }
 
-    /// Wrap text to fit within the specified width
-    /// Simple character-based wrapping to avoid word breaking issues
+    /// Wrap text to fit within the specified width using display width (Unicode-aware)
     fn wrap_text(&self, text: &str, width: usize) -> Vec<String> {
+        use unicode_width::UnicodeWidthChar;
+
         if width == 0 || text.is_empty() {
             return vec![text.to_string()];
         }
 
-        let mut lines = Vec::new();
+        let mut lines: Vec<String> = Vec::new();
         let mut current_line = String::new();
+        let mut current_width: usize = 0;
 
         for ch in text.chars() {
             if ch == '\n' {
-                // Handle explicit line breaks
                 lines.push(current_line);
                 current_line = String::new();
-            } else if current_line.len() >= width {
-                // Line is full, start a new one
-                lines.push(current_line);
-                current_line = ch.to_string();
-            } else {
-                // Add character to current line
-                current_line.push(ch);
+                current_width = 0;
+                continue;
             }
+
+            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0).max(1);
+            if current_width + ch_width > width {
+                lines.push(current_line);
+                current_line = String::new();
+                current_width = 0;
+            }
+
+            current_line.push(ch);
+            current_width += ch_width;
         }
 
-        // Add the last line if it's not empty
         if !current_line.is_empty() {
             lines.push(current_line);
         }
 
-        // Ensure we always return at least one line
         if lines.is_empty() {
             vec![text.to_string()]
         } else {

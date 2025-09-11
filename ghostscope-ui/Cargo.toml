@@ -12,3 +12,4 @@ tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] } 
+unicode-width = "0.1"
