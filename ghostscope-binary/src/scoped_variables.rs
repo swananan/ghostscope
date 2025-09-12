@@ -90,6 +90,9 @@ pub struct ScopedVariableMap {
     /// Cache for recent lookups
     lookup_cache: HashMap<u64, Vec<VariableResult>>,
 
+    /// Map from abstract_origin offset (unit-relative) to variables created from it
+    origin_to_variables: HashMap<u64, Vec<VariableId>>,
+
     /// Root scopes (compilation units)
     root_scopes: Vec<ScopeId>,
 
@@ -109,6 +112,7 @@ impl ScopedVariableMap {
             scopes: HashMap::new(),
             address_to_scopes: Vec::new(),
             lookup_cache: HashMap::new(),
+            origin_to_variables: HashMap::new(),
             root_scopes: Vec::new(),
             next_variable_id: 1,
             next_scope_id: 1,
@@ -446,6 +450,22 @@ impl ScopedVariableMap {
         }
     }
 
+    /// Register a mapping from abstract_origin offset to a variable id
+    pub fn register_origin_mapping(&mut self, origin_offset: u64, variable_id: VariableId) {
+        self.origin_to_variables
+            .entry(origin_offset)
+            .or_insert_with(Vec::new)
+            .push(variable_id);
+    }
+
+    /// Find variable ids by abstract_origin offset (unit-relative offset value)
+    pub fn find_variables_by_abstract_origin(&self, origin_offset: u64) -> Vec<VariableId> {
+        self.origin_to_variables
+            .get(&origin_offset)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Build the address-to-scopes lookup table (call after all scopes are added)
     pub fn build_address_lookup(&mut self) {
         debug!("Building address-to-scopes lookup table...");
@@ -550,6 +570,11 @@ impl ScopedVariableMap {
     /// Get mutable reference to the expression evaluator
     pub fn get_expression_evaluator_mut(&mut self) -> &mut DwarfExpressionEvaluator {
         &mut self.expression_evaluator
+    }
+
+    /// Get immutable variable info by id
+    pub fn get_variable_info(&self, variable_id: VariableId) -> Option<&VariableInfo> {
+        self.variables.get(&variable_id)
     }
 }
 

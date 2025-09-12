@@ -133,6 +133,19 @@ pub mod consts {
     // Default values
     pub const DEFAULT_TRACE_ID: u64 = 1;
     pub const MAX_STRING_LENGTH: usize = 256;
+
+    // Type sizes (bytes) for 64-bit architecture
+    pub const CHAR_SIZE: u64 = 1;
+    pub const SHORT_SIZE: u64 = 2;
+    pub const INT_SIZE: u64 = 4;
+    pub const LONG_SIZE: u64 = 8; // 64-bit architecture
+    pub const LONG_LONG_SIZE: u64 = 8;
+    pub const FLOAT_SIZE: u64 = 4;
+    pub const DOUBLE_SIZE: u64 = 8;
+    pub const LONG_DOUBLE_SIZE: u64 = 16; // x86-64 extended precision
+    pub const BOOL_SIZE: u64 = 1;
+    pub const POINTER_SIZE: u64 = 8; // 64-bit pointers
+    pub const SIZE_T_SIZE: u64 = 8; // 64-bit architecture
 }
 
 pub mod log_levels {

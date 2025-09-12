@@ -7,62 +7,22 @@ use object::{Object, ObjectSection};
 use std::path::Path;
 use tracing::{debug, error, info, warn};
 
-/// Helper function to match file paths, supporting both exact and relative path matching
-/// This allows queries like "test.c" to match "/path/to/test.c" in DWARF debug info
-fn files_match(dwarf_file_path: &str, query_path: &str) -> bool {
-    use tracing::debug;
+/// Abstract variable information from abstract origin (names and types)
+#[derive(Debug, Clone)]
+struct AbstractVariableInfo {
+    name: String,
+    type_name: String,
+    dwarf_type: Option<DwarfType>,
+    is_parameter: bool,
+    abstract_origin_offset: gimli::UnitOffset<usize>,
+}
 
-    // First try exact match (fastest path)
-    if dwarf_file_path == query_path {
-        debug!(
-            "files_match: exact match '{}' == '{}'",
-            dwarf_file_path, query_path
-        );
-        return true;
-    }
-
-    // Try relative path matching: check if DWARF path ends with the query path
-    // This handles cases like query "test.c" matching DWARF "/full/path/test.c"
-    if dwarf_file_path.ends_with(query_path) {
-        // Make sure it's a proper path component boundary (not just a suffix)
-        let preceding_char_pos = dwarf_file_path.len() - query_path.len();
-        if preceding_char_pos == 0
-            || dwarf_file_path.chars().nth(preceding_char_pos - 1) == Some('/')
-        {
-            debug!(
-                "files_match: relative match '{}' ends with '{}' at proper boundary",
-                dwarf_file_path, query_path
-            );
-            return true;
-        } else {
-            debug!("files_match: '{}' ends with '{}' but not at proper boundary (preceding char at {})", 
-                   dwarf_file_path, query_path, preceding_char_pos);
-        }
-    }
-
-    // Try the reverse: query is longer than DWARF path, check if query ends with DWARF basename
-    if let Some(dwarf_basename) = Path::new(dwarf_file_path).file_name() {
-        if let Some(dwarf_basename_str) = dwarf_basename.to_str() {
-            if query_path.ends_with(dwarf_basename_str) {
-                let preceding_char_pos = query_path.len() - dwarf_basename_str.len();
-                if preceding_char_pos == 0
-                    || query_path.chars().nth(preceding_char_pos - 1) == Some('/')
-                {
-                    debug!(
-                        "files_match: reverse match '{}' basename matches query '{}'",
-                        dwarf_file_path, query_path
-                    );
-                    return true;
-                }
-            }
-        }
-    }
-
-    debug!(
-        "files_match: no match between '{}' and '{}'",
-        dwarf_file_path, query_path
-    );
-    false
+/// Concrete variable information from inlined subroutine children (location expressions)
+#[derive(Debug, Clone)]
+struct ConcreteVariableInfo {
+    abstract_origin_ref: gimli::UnitOffset<usize>,
+    location_expr: LocationExpression,
+    concrete_offset: gimli::UnitOffset<usize>,
 }
 
 /// DWARF debug context
@@ -74,10 +34,7 @@ pub struct DwarfContext {
     // Base addresses for proper DWARF parsing
     base_addresses: gimli::BaseAddresses,
 
-    // CFI information
-    eh_frame: Option<gimli::EhFrame<EndianSlice<'static, LittleEndian>>>,
-    debug_frame: Option<gimli::DebugFrame<EndianSlice<'static, LittleEndian>>>,
-    // New CFI context for simplified DWARF expression-only interface
+    // CFI context for simplified DWARF expression-only interface
     cfi_context: Option<crate::cfi::CFIContext>,
 
     // New line lookup system (based on addr2line)
@@ -1081,19 +1038,6 @@ impl DwarfContext {
         Vec::new()
     }
 
-    /// Get detailed variable location information
-    pub fn get_variable_location(&mut self, addr: u64, var_name: &str) -> Option<VariableLocation> {
-        let enhanced_vars = self.get_enhanced_variable_locations(addr);
-
-        for enhanced_var in enhanced_vars {
-            if enhanced_var.variable.name == var_name {
-                return self.parse_variable_location(&enhanced_var.variable);
-            }
-        }
-
-        None
-    }
-
     /// Get enhanced variable location information at a specific address
     pub fn get_enhanced_variable_locations(&mut self, addr: u64) -> Vec<EnhancedVariableLocation> {
         debug!(
@@ -1282,217 +1226,166 @@ impl DwarfContext {
         scoped_map: &mut ScopedVariableMap,
         parent_scope_id: ScopeId,
     ) -> Result<()> {
-        let mut entries = unit.entries();
+        debug!("Starting DWARF DIE traversal (entries_tree) for scoped variable system");
         let mut scope_stack = vec![parent_scope_id];
-        let mut last_created_scope: Option<ScopeId> = None;
 
-        debug!("Starting DWARF DIE traversal for scoped variable system");
-        debug!("Initial scope stack: {:?}", scope_stack);
+        // Build a tree cursor starting from the root of this unit
+        let mut tree = unit.entries_tree(None)?;
+        let root = tree.root()?;
 
-        while let Ok(Some((depth, entry))) = entries.next_dfs() {
-            debug!(
-                "Processing DIE at offset {:?}, tag: {:?}, depth: {}",
-                entry.offset(),
-                entry.tag(),
-                depth
-            );
+        // Traverse only the children of the unit root (compilation unit)
+        let mut children = root.children();
+        while let Some(child) = children.next()? {
+            self.traverse_die_tree(unit, child, scoped_map, &mut scope_stack)?;
+        }
 
-            // Special handling for scope-creating DIEs and their immediate children
-            let should_skip_depth_adjustment = if let Some(_last_scope) = last_created_scope {
-                // If we just created a scope and this is a child DIE (variable/parameter),
-                // don't adjust the stack - the child should belong to the newly created scope
-                matches!(
-                    entry.tag(),
-                    gimli::DW_TAG_variable | gimli::DW_TAG_formal_parameter
-                ) && depth >= 0 // Only for structural children, not attributes
-            } else {
-                false
-            };
+        Ok(())
+    }
 
-            // Adjust scope stack based on depth - use GDB-style scoping logic
-            let depth_usize = if depth >= 0 && !should_skip_depth_adjustment {
-                let depth_usize = depth as usize;
+    /// Structured DFS over DIE tree with explicit scope push/pop
+    fn traverse_die_tree(
+        &self,
+        unit: &gimli::Unit<gimli::EndianSlice<gimli::LittleEndian>>,
+        node: gimli::EntriesTreeNode<gimli::EndianSlice<gimli::LittleEndian>>,
+        scoped_map: &mut ScopedVariableMap,
+        scope_stack: &mut Vec<ScopeId>,
+    ) -> Result<()> {
+        let entry = node.entry();
+        let current_parent = *scope_stack.last().unwrap();
 
-                // Calculate expected stack size based on depth
-                // depth 0 = compilation unit (1 element)
-                // depth 1 = functions at top level (2 elements)
-                // depth 2 = function parameters/variables or nested blocks (3 elements)
-                let expected_stack_size = depth_usize.saturating_add(1);
+        debug!(
+            "[traverse] offset={:?}, tag={} (0x{:x}), stack_depth={}",
+            entry.offset(),
+            self.format_dwarf_tag(entry.tag()),
+            entry.tag().0,
+            scope_stack.len() - 1
+        );
 
-                debug!(
-                    "Positive depth {}, expected stack size: {}, current stack size: {}",
-                    depth,
-                    expected_stack_size,
-                    scope_stack.len()
-                );
-
-                // Only pop scopes if we're at the same level or going up in the hierarchy
-                // This ensures that function parameters/variables stay in their function's scope
-                if scope_stack.len() > expected_stack_size {
-                    // We need to pop some scopes because we've moved up or across in the DIE tree
-                    while scope_stack.len() > expected_stack_size {
-                        let popped_scope = scope_stack.pop();
+        match entry.tag() {
+            gimli::DW_TAG_subprogram => {
+                let die_name = self.extract_die_name(entry, unit);
+                let address_ranges = self
+                    .extract_function_ranges(entry, unit, &die_name)
+                    .unwrap_or_else(|_| Vec::new());
+                if !address_ranges.is_empty() {
+                    if let Some(function_info) = self.parse_function_scope(entry, unit) {
+                        let function_scope_id = scoped_map.add_scope(
+                            Some(current_parent),
+                            ScopeType::Function {
+                                name: function_info.name.clone(),
+                                address: function_info.low_pc,
+                            },
+                            address_ranges,
+                        );
                         debug!(
-                            "Popped scope {:?} from stack (depth adjustment)",
-                            popped_scope
+                            "[traverse] PUSH function '{}' -> scope_id={:?}",
+                            function_info.name, function_scope_id
                         );
-                    }
-                    // Clear the last created scope since we've moved to a different part of the tree
-                    last_created_scope = None;
-                } else {
-                    // We're going deeper or staying at the same level - don't pop
-                    debug!("Keeping current scope stack (going deeper or same level)");
-                }
+                        scope_stack.push(function_scope_id);
 
-                depth_usize
-            } else if should_skip_depth_adjustment {
-                debug!(
-                    "Skipping depth adjustment for child DIE of newly created scope (depth: {})",
-                    depth
-                );
-                depth.max(0) as usize
-            } else {
-                // For negative depths, don't adjust the stack - this usually indicates
-                // attributes or other non-structural elements that shouldn't affect scoping
-                debug!(
-                    "Negative depth {} encountered for entry at {:?}, keeping current scope stack",
-                    depth,
-                    entry.offset()
-                );
-                0 // Use 0 as default depth for display purposes
-            };
-
-            debug!("Current scope stack: {:?}", scope_stack);
-            let current_parent = *scope_stack.last().unwrap();
-
-            match entry.tag() {
-                gimli::DW_TAG_subprogram => {
-                    // Create function scope with proper address range extraction
-                    let address_ranges = self.extract_address_ranges_from_entry(entry, unit);
-                    debug!("Function address ranges: {:?}", address_ranges);
-                    if !address_ranges.is_empty() {
-                        if let Some(function_info) = self.parse_function_scope(entry, unit) {
-                            debug!(
-                                "Creating function scope for '{}' at 0x{:x} with {} address ranges",
-                                function_info.name,
-                                function_info.low_pc,
-                                address_ranges.len()
-                            );
-                            let function_scope_id = scoped_map.add_scope(
-                                Some(current_parent),
-                                ScopeType::Function {
-                                    name: function_info.name.clone(),
-                                    address: function_info.low_pc,
-                                },
-                                address_ranges,
-                            );
-                            debug!(
-                                "Created function scope '{}' with ID {:?}, pushing to stack",
-                                function_info.name, function_scope_id
-                            );
-                            scope_stack.push(function_scope_id);
-                            last_created_scope = Some(function_scope_id); // Track newly created scope
-                            debug!("Updated scope stack: {:?}", scope_stack);
-                        } else {
-                            debug!("Failed to parse function scope information");
+                        let mut children = node.children();
+                        while let Some(child) = children.next()? {
+                            self.traverse_die_tree(unit, child, scoped_map, scope_stack)?;
                         }
-                    } else {
-                        debug!("Function has no valid address ranges, skipping");
-                    }
-                }
-                gimli::DW_TAG_lexical_block => {
-                    // Create lexical block scope with proper address range extraction
-                    let address_ranges = self.extract_address_ranges_from_entry(entry, unit);
-                    if !address_ranges.is_empty() {
-                        let block_scope_id = scoped_map.add_scope(
-                            Some(current_parent),
-                            ScopeType::LexicalBlock { depth: depth_usize },
-                            address_ranges,
-                        );
-                        scope_stack.push(block_scope_id);
-                        last_created_scope = Some(block_scope_id); // Track newly created scope
-                    }
-                }
-                gimli::DW_TAG_inlined_subroutine => {
-                    // Create inlined function scope with proper address range extraction
-                    let address_ranges = self.extract_address_ranges_from_entry(entry, unit);
-                    if !address_ranges.is_empty() {
-                        let origin_func = self
-                            .get_origin_function_name(entry, unit)
-                            .unwrap_or_else(|| "unknown".to_string());
 
-                        let inlined_scope_id = scoped_map.add_scope(
-                            Some(current_parent),
-                            ScopeType::InlinedSubroutine { origin_func },
-                            address_ranges,
-                        );
-                        scope_stack.push(inlined_scope_id);
-                        last_created_scope = Some(inlined_scope_id); // Track newly created scope
+                        let popped = scope_stack.pop();
+                        debug!("[traverse] POP function scope_id={:?}", popped);
+                        return Ok(());
                     }
                 }
-                gimli::DW_TAG_variable | gimli::DW_TAG_formal_parameter => {
-                    // Parse variable and add to current scope
-                    let tag_name = if entry.tag() == gimli::DW_TAG_variable {
-                        "variable"
-                    } else {
-                        "formal_parameter"
-                    };
-                    debug!(
-                        "Found {} at offset {:?}, scope_stack depth: {}, current stack: {:?}",
-                        tag_name,
-                        entry.offset(),
-                        scope_stack.len(),
-                        scope_stack
+
+                // Even if no scope created, still traverse children
+                let mut children = node.children();
+                while let Some(child) = children.next()? {
+                    self.traverse_die_tree(unit, child, scoped_map, scope_stack)?;
+                }
+            }
+            gimli::DW_TAG_lexical_block => {
+                let die_name = self.extract_die_name(entry, unit);
+                let address_ranges = self
+                    .extract_function_ranges(entry, unit, &die_name)
+                    .unwrap_or_else(|_| Vec::new());
+                if !address_ranges.is_empty() {
+                    let block_scope_id = scoped_map.add_scope(
+                        Some(current_parent),
+                        ScopeType::LexicalBlock {
+                            depth: scope_stack.len(),
+                        },
+                        address_ranges,
                     );
-                    if let Some(current_scope_id) = scope_stack.last() {
-                        debug!(
-                            "Adding {} to scope {:?} (stack position {})",
-                            tag_name,
-                            current_scope_id,
-                            scope_stack.len() - 1
-                        );
+                    debug!(
+                        "[traverse] PUSH lexical_block depth={} -> scope_id={:?}",
+                        scope_stack.len(),
+                        block_scope_id
+                    );
+                    scope_stack.push(block_scope_id);
 
-                        // Log which scope this variable will be added to
-                        if let Some(scope) = scoped_map.get_scope(*current_scope_id) {
-                            debug!(
-                                "Target scope {:?} type: {:?}, has {} existing variables",
-                                current_scope_id,
-                                scope.scope_type,
-                                scope.variables.len()
-                            );
-                        }
-
-                        self.parse_and_add_variable(entry, unit, scoped_map, *current_scope_id)?;
-
-                        // Log the updated scope state
-                        if let Some(scope) = scoped_map.get_scope(*current_scope_id) {
-                            debug!(
-                                "After adding variable, scope {:?} now has {} variables",
-                                current_scope_id,
-                                scope.variables.len()
-                            );
-                        }
-
-                        // Keep last_created_scope active to protect subsequent variables/parameters
-                        // It will be cleared when we encounter non-variable DIEs
-                    } else {
-                        warn!(
-                            "No scope available for {} at offset {:?}",
-                            tag_name,
-                            entry.offset()
-                        );
+                    let mut children = node.children();
+                    while let Some(child) = children.next()? {
+                        self.traverse_die_tree(unit, child, scoped_map, scope_stack)?;
                     }
+
+                    let popped = scope_stack.pop();
+                    debug!("[traverse] POP lexical_block scope_id={:?}", popped);
+                    return Ok(());
                 }
-                _ => {
-                    // For other entry types that might contain variables, continue traversal
-                    // but don't create new scopes
-                    // Clear last_created_scope when encountering non-variable/parameter DIEs
-                    if !matches!(
-                        entry.tag(),
-                        gimli::DW_TAG_variable | gimli::DW_TAG_formal_parameter
-                    ) {
-                        last_created_scope = None;
+
+                // No range -> still traverse children
+                let mut children = node.children();
+                while let Some(child) = children.next()? {
+                    self.traverse_die_tree(unit, child, scoped_map, scope_stack)?;
+                }
+            }
+            gimli::DW_TAG_inlined_subroutine => {
+                let origin_func = self
+                    .get_origin_function_name(entry, unit)
+                    .unwrap_or_else(|| "unknown".to_string());
+                let address_ranges = self
+                    .extract_inlined_ranges(entry, unit, &origin_func)
+                    .unwrap_or_else(|_| Vec::new());
+                if !address_ranges.is_empty() {
+                    let inlined_scope_id = scoped_map.add_scope(
+                        Some(current_parent),
+                        ScopeType::InlinedSubroutine { origin_func },
+                        address_ranges,
+                    );
+                    debug!(
+                        "[traverse] PUSH inlined_subroutine -> scope_id={:?}",
+                        inlined_scope_id
+                    );
+                    scope_stack.push(inlined_scope_id);
+
+                    let mut children = node.children();
+                    while let Some(child) = children.next()? {
+                        self.traverse_die_tree(unit, child, scoped_map, scope_stack)?;
                     }
+
+                    let popped = scope_stack.pop();
+                    debug!("[traverse] POP inlined_subroutine scope_id={:?}", popped);
+                    return Ok(());
+                }
+
+                // No ranges -> still traverse children
+                let mut children = node.children();
+                while let Some(child) = children.next()? {
+                    self.traverse_die_tree(unit, child, scoped_map, scope_stack)?;
+                }
+            }
+            gimli::DW_TAG_variable | gimli::DW_TAG_formal_parameter => {
+                if let Some(current_scope_id) = scope_stack.last().cloned() {
+                    debug!(
+                        "[traverse] add {} to scope_id={:?}",
+                        self.format_dwarf_tag(entry.tag()),
+                        current_scope_id
+                    );
+                    self.parse_and_add_variable(entry, unit, scoped_map, current_scope_id)?;
+                }
+            }
+            _ => {
+                // Default: just walk children
+                let mut children = node.children();
+                while let Some(child) = children.next()? {
+                    self.traverse_die_tree(unit, child, scoped_map, scope_stack)?;
                 }
             }
         }
@@ -1506,9 +1399,10 @@ impl DwarfContext {
         entry: &gimli::DebuggingInformationEntry<gimli::EndianSlice<gimli::LittleEndian>>,
         unit: &gimli::Unit<gimli::EndianSlice<gimli::LittleEndian>>,
     ) -> Option<FunctionInfo> {
+        let die_name = self.extract_die_name(entry, unit);
+        debug!("Processing function DIE: {}", die_name);
+
         let mut name = String::new();
-        let mut low_pc = 0;
-        let mut high_pc = None;
         let mut abstract_origin = None;
 
         let mut attrs = entry.attrs();
@@ -1526,20 +1420,7 @@ impl DwarfContext {
                         abstract_origin = Some(offset);
                     }
                 }
-                gimli::DW_AT_low_pc => {
-                    if let gimli::AttributeValue::Addr(addr) = attr.value() {
-                        low_pc = addr;
-                    }
-                }
-                gimli::DW_AT_high_pc => match attr.value() {
-                    gimli::AttributeValue::Addr(addr) => {
-                        high_pc = Some(addr);
-                    }
-                    gimli::AttributeValue::Udata(offset) => {
-                        high_pc = Some(low_pc + offset);
-                    }
-                    _ => {}
-                },
+                // Address ranges are now handled by extract_function_ranges
                 _ => {}
             }
         }
@@ -1564,26 +1445,41 @@ impl DwarfContext {
             }
         }
 
-        if !name.is_empty() && low_pc > 0 {
-            debug!(
-                "Successfully parsed function scope: name='{}', low_pc=0x{:x}, high_pc={:?}",
-                name, low_pc, high_pc
-            );
-            Some(FunctionInfo {
-                name,
-                low_pc,
-                high_pc,
-                file_path: None,
-                line_number: None,
-                parameters: Vec::new(),
-                local_variables: Vec::new(),
-            })
-        } else {
-            debug!(
-                "Failed to parse function scope: name='{}', low_pc=0x{:x}",
-                name, low_pc
-            );
-            None
+        // Use layered address extraction instead of duplicate parsing
+        match self.extract_function_ranges(entry, unit, &die_name) {
+            Ok(ranges) if !ranges.is_empty() && !name.is_empty() => {
+                let low_pc = ranges.first().unwrap().start;
+                let high_pc = ranges.last().unwrap().end;
+
+                debug!(
+                    "Successfully parsed function scope: name='{}', ranges count={}, first_range=[0x{:x}, 0x{:x})",
+                    name, ranges.len(), low_pc, high_pc
+                );
+
+                Some(FunctionInfo {
+                    name,
+                    low_pc,
+                    high_pc: Some(high_pc),
+                    file_path: None,
+                    line_number: None,
+                    parameters: Vec::new(),
+                    local_variables: Vec::new(),
+                })
+            }
+            Ok(_) => {
+                debug!(
+                    "Failed to parse function scope: name='{}', no valid address ranges found",
+                    name
+                );
+                None
+            }
+            Err(e) => {
+                debug!(
+                    "Failed to parse function scope due to address extraction error: name='{}', error={}",
+                    name, e
+                );
+                None
+            }
         }
     }
 
@@ -1603,6 +1499,32 @@ impl DwarfContext {
             scope_id
         );
 
+        // Inspect concrete DIE for quick telemetry: has DW_AT_location? abstract_origin?
+        let mut has_concrete_location = false;
+        let mut concrete_location_kind = "none";
+        let mut abstract_origin_offset: Option<gimli::UnitOffset> = None;
+        {
+            let mut attrs = entry.attrs();
+            while let Ok(Some(attr)) = attrs.next() {
+                match attr.name() {
+                    gimli::DW_AT_location => {
+                        has_concrete_location = true;
+                        concrete_location_kind = match attr.value() {
+                            gimli::AttributeValue::Exprloc(_) => "exprloc",
+                            gimli::AttributeValue::LocationListsRef(_) => "loclist",
+                            _ => "other",
+                        };
+                    }
+                    gimli::DW_AT_abstract_origin => {
+                        if let gimli::AttributeValue::UnitRef(off) = attr.value() {
+                            abstract_origin_offset = Some(off);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         // Log the target scope information
         if let Some(scope) = scoped_map.get_scope(scope_id) {
             debug!(
@@ -1617,7 +1539,40 @@ impl DwarfContext {
         }
 
         // Enhanced variable parsing that doesn't depend on specific address
-        if let Some(variable) = self.parse_variable_for_scope(unit, entry) {
+        if let Some(mut variable) = self.parse_variable_for_scope(unit, entry) {
+            // If no location_expr but we have an abstract_origin, try resolve via existing origin mapping
+            if variable.location_expr.is_none() {
+                if let Some(origin_off) = abstract_origin_offset {
+                    let off_val = origin_off.0 as u64;
+                    let candidates = scoped_map.find_variables_by_abstract_origin(off_val);
+                    if !candidates.is_empty() {
+                        for cand_id in candidates {
+                            if let Some(cand) = scoped_map.get_variable_info(cand_id) {
+                                if let Some(expr) = &cand.location_expr {
+                                    debug!(
+                                        "Resolved missing location via origin mapping 0x{:x} from var_id={:?}",
+                                        off_val, cand_id
+                                    );
+                                    variable.location_expr = Some(expr.clone());
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        debug!(
+                            "No existing variables registered for origin 0x{:x} to borrow location from",
+                            off_val
+                        );
+                    }
+                }
+            }
+            debug!(
+                "Variable merge result: has_location_expr={}, concrete_has_location={}, concrete_loc_kind={}, origin_offset={:?}",
+                variable.location_expr.is_some(),
+                has_concrete_location,
+                concrete_location_kind,
+                abstract_origin_offset
+            );
             debug!(
                 "Successfully parsed variable '{}' (is_parameter: {}, type: '{}', artificial: {})",
                 variable.name, variable.is_parameter, variable.type_name, variable.is_artificial
@@ -1634,6 +1589,37 @@ impl DwarfContext {
                 self.get_variable_size(&variable),
             );
             debug!("Created variable with ID {:?}", variable_id);
+
+            // If this variable originated from an abstract_origin/specification, register mapping
+            // Prefer abstract_origin if present on entry; otherwise if parse merged from spec/origin, we cannot know exact offset here
+            let mut origin_off: Option<u64> = None;
+            let mut spec_off: Option<u64> = None;
+            let mut attrs = entry.attrs();
+            while let Ok(Some(attr)) = attrs.next() {
+                if attr.name() == gimli::DW_AT_abstract_origin {
+                    if let gimli::AttributeValue::UnitRef(off) = attr.value() {
+                        origin_off = Some(off.0 as u64);
+                    }
+                } else if attr.name() == gimli::DW_AT_specification {
+                    if let gimli::AttributeValue::UnitRef(off) = attr.value() {
+                        spec_off = Some(off.0 as u64);
+                    }
+                }
+            }
+            if let Some(off) = origin_off {
+                scoped_map.register_origin_mapping(off, variable_id);
+                debug!(
+                    "Registered origin mapping: origin_off=0x{:x} -> var_id={:?}",
+                    off, variable_id
+                );
+            }
+            if let Some(off) = spec_off {
+                scoped_map.register_origin_mapping(off, variable_id);
+                debug!(
+                    "Registered specification mapping: spec_off=0x{:x} -> var_id={:?}",
+                    off, variable_id
+                );
+            }
 
             // Get the current scope's address ranges
             let scope_address_ranges = if let Some(scope) = scoped_map.get_scope(scope_id) {
@@ -1708,6 +1694,8 @@ impl DwarfContext {
         let mut scope_start = None;
         let mut scope_end = None;
         let mut abstract_origin = None;
+        let mut specification = None;
+        let mut is_artificial = false;
 
         let unit_ref = unit.unit_ref(&self.dwarf);
 
@@ -1727,6 +1715,11 @@ impl DwarfContext {
                         abstract_origin = Some(offset);
                     }
                 }
+                gimli::DW_AT_specification => {
+                    if let gimli::AttributeValue::UnitRef(offset) = attr.value() {
+                        specification = Some(offset);
+                    }
+                }
                 gimli::DW_AT_type => {
                     if let gimli::AttributeValue::UnitRef(type_offset) = attr.value() {
                         if let Some((resolved_type_name, resolved_dwarf_type)) =
@@ -1743,6 +1736,10 @@ impl DwarfContext {
                 }
                 gimli::DW_AT_location => {
                     location_expr = self.parse_location_expression(unit, attr.value());
+                }
+                gimli::DW_AT_artificial => {
+                    // Any presence of the flag means true
+                    is_artificial = true;
                 }
                 gimli::DW_AT_low_pc => {
                     if let gimli::AttributeValue::Addr(pc) = attr.value() {
@@ -1764,28 +1761,64 @@ impl DwarfContext {
             }
         }
 
-        // If no direct name, try to get it from abstract origin
-        if name.is_empty() {
-            if let Some(origin_offset) = abstract_origin {
-                // For now, we'll extract the name from the DWARF dump data we know
-                // This is a simplified approach for the current debugging scenario
-                if let Ok(Some(origin_attr)) = entry.attr_value(gimli::DW_AT_abstract_origin) {
-                    if let gimli::AttributeValue::UnitRef(ref_offset) = origin_attr {
-                        // Based on the DWARF dump, we know the offsets and their names
-                        match ref_offset.0 {
-                            0x3c2 => name = "a".to_string(),      // Parameter 'a'
-                            0x3cc => name = "b".to_string(),      // Parameter 'b'
-                            0x3d6 => name = "result".to_string(), // Variable 'result'
-                            _ => {
-                                debug!("Unknown abstract origin offset: 0x{:x}", ref_offset.0);
-                                name = "unknown_var".to_string();
+        // If fields are missing, try to resolve via specification then abstract_origin
+        if name.is_empty() || type_name.is_empty() || location_expr.is_none() {
+            let mut to_visit: Vec<gimli::UnitOffset> = Vec::new();
+            if let Some(spec) = specification {
+                to_visit.push(spec);
+            }
+            if let Some(origin) = abstract_origin {
+                to_visit.push(origin);
+            }
+
+            // Limit the chain length defensively
+            let mut visited = 0usize;
+            while let Some(off) = to_visit.pop() {
+                if visited > 8 {
+                    break;
+                }
+                visited += 1;
+                if let Ok(origin_entry) = unit.entry(off) {
+                    let mut oattrs = origin_entry.attrs();
+                    while let Ok(Some(oattr)) = oattrs.next() {
+                        match oattr.name() {
+                            gimli::DW_AT_name if name.is_empty() => {
+                                if let Ok(s) = unit_ref.attr_string(oattr.value()) {
+                                    name = s.to_string_lossy().into_owned();
+                                }
                             }
+                            gimli::DW_AT_type if type_name.is_empty() => {
+                                if let gimli::AttributeValue::UnitRef(t_off) = oattr.value() {
+                                    if let Some((resolved_type_name, resolved_dwarf_type)) =
+                                        self.resolve_type_info_concrete(unit, t_off)
+                                    {
+                                        type_name = resolved_type_name;
+                                        dwarf_type = resolved_dwarf_type;
+                                    }
+                                }
+                            }
+                            gimli::DW_AT_location if location_expr.is_none() => {
+                                location_expr = self.parse_location_expression(unit, oattr.value());
+                            }
+                            gimli::DW_AT_artificial => {
+                                is_artificial = true;
+                            }
+                            gimli::DW_AT_specification => {
+                                if let gimli::AttributeValue::UnitRef(next) = oattr.value() {
+                                    to_visit.push(next);
+                                }
+                            }
+                            gimli::DW_AT_abstract_origin => {
+                                if let gimli::AttributeValue::UnitRef(next) = oattr.value() {
+                                    to_visit.push(next);
+                                }
+                            }
+                            _ => {}
                         }
-                        debug!(
-                            "Got variable name '{}' from abstract origin at offset 0x{:x}",
-                            name, ref_offset.0
-                        );
                     }
+                }
+                if !name.is_empty() && !type_name.is_empty() && location_expr.is_some() {
+                    break;
                 }
             }
         }
@@ -1809,7 +1842,7 @@ impl DwarfContext {
             location_expr,
             scope_ranges,
             is_parameter: entry.tag() == gimli::DW_TAG_formal_parameter,
-            is_artificial: false, // TODO: Detect DW_AT_artificial
+            is_artificial,
 
             // Legacy fields for backward compatibility
             location: Some("dwarf_location".to_string()),
@@ -1835,13 +1868,34 @@ impl DwarfContext {
                         end: list_entry.end_pc,
                     };
 
-                    // Find intersections with scope ranges
-                    for scope_range in scope_ranges {
-                        if let Some(intersection) =
-                            self.intersect_single_range(scope_range, &list_range)
-                        {
-                            location_at_ranges
-                                .push((intersection, list_entry.location_expr.clone()));
+                    // Special handling for point ranges (start == end), common in inlined params
+                    if list_range.start == list_range.end {
+                        let point = list_range.start;
+                        for scope_range in scope_ranges {
+                            let contains_point = if scope_range.start == scope_range.end {
+                                point == scope_range.start
+                            } else {
+                                point >= scope_range.start && point < scope_range.end
+                            };
+                            if contains_point {
+                                location_at_ranges.push((
+                                    AddressRange {
+                                        start: point,
+                                        end: point,
+                                    },
+                                    list_entry.location_expr.clone(),
+                                ));
+                            }
+                        }
+                    } else {
+                        // Regular non-empty range: intersect with scope ranges
+                        for scope_range in scope_ranges {
+                            if let Some(intersection) =
+                                self.intersect_single_range(scope_range, &list_range)
+                            {
+                                location_at_ranges
+                                    .push((intersection, list_entry.location_expr.clone()));
+                            }
                         }
                     }
                 }
@@ -1898,6 +1952,333 @@ impl DwarfContext {
         }
     }
 
+    /// Parse inlined subroutine scope with complete abstract_origin handling
+    fn parse_inlined_subroutine_scope(
+        &self,
+        inlined_entry: &gimli::DebuggingInformationEntry<gimli::EndianSlice<gimli::LittleEndian>>,
+        unit: &gimli::Unit<gimli::EndianSlice<gimli::LittleEndian>>,
+        scoped_map: &mut ScopedVariableMap,
+        inlined_scope_id: ScopeId,
+    ) -> Result<()> {
+        debug!(
+            "=== PARSING INLINED SUBROUTINE SCOPE at offset {:?} ===",
+            inlined_entry.offset()
+        );
+
+        // First, get abstract_origin reference if it exists
+        let mut abstract_origin_offset = None;
+        let mut attrs = inlined_entry.attrs();
+        while let Ok(Some(attr)) = attrs.next() {
+            if attr.name() == gimli::DW_AT_abstract_origin {
+                if let gimli::AttributeValue::UnitRef(offset) = attr.value() {
+                    abstract_origin_offset = Some(offset);
+                    debug!("Found abstract_origin reference: {:?}", offset);
+                    break;
+                }
+            }
+        }
+
+        // Parse parameters and variables from abstract origin (for names/types)
+        let mut abstract_params_vars = Vec::new();
+        if let Some(origin_offset) = abstract_origin_offset {
+            debug!("Parsing abstract origin at offset {:?}", origin_offset);
+            abstract_params_vars =
+                self.parse_abstract_origin_parameters_variables(unit, origin_offset)?;
+            debug!(
+                "Found {} abstract parameters/variables from origin",
+                abstract_params_vars.len()
+            );
+        }
+
+        // Parse direct children of inlined subroutine (for concrete location expressions)
+        let mut concrete_params_vars = Vec::new();
+        let mut cursor_tree = unit.entries_tree(Some(inlined_entry.offset()))?;
+        if let Ok(inlined_node) = cursor_tree.root() {
+            let mut children = inlined_node.children();
+            while let Some(child) = children.next()? {
+                let child_entry = child.entry();
+                match child_entry.tag() {
+                    gimli::DW_TAG_formal_parameter | gimli::DW_TAG_variable => {
+                        debug!(
+                            "Found concrete {} at offset {:?}",
+                            if child_entry.tag() == gimli::DW_TAG_formal_parameter {
+                                "parameter"
+                            } else {
+                                "variable"
+                            },
+                            child_entry.offset()
+                        );
+
+                        if let Some(concrete_var) =
+                            self.parse_concrete_parameter_variable(unit, child_entry)
+                        {
+                            concrete_params_vars.push(concrete_var);
+                        }
+                    }
+                    _ => {
+                        // Skip other types of children for now
+                    }
+                }
+            }
+        }
+
+        debug!(
+            "Found {} concrete parameters/variables",
+            concrete_params_vars.len()
+        );
+
+        // Merge abstract and concrete information
+        self.merge_and_add_inlined_variables(
+            &abstract_params_vars,
+            &concrete_params_vars,
+            scoped_map,
+            inlined_scope_id,
+        )?;
+
+        Ok(())
+    }
+
+    /// Parse abstract origin to get parameter and variable names/types
+    fn parse_abstract_origin_parameters_variables(
+        &self,
+        unit: &gimli::Unit<gimli::EndianSlice<gimli::LittleEndian>>,
+        origin_offset: gimli::UnitOffset<usize>,
+    ) -> Result<Vec<AbstractVariableInfo>> {
+        let mut result = Vec::new();
+
+        // Navigate to the abstract origin entry
+        let mut cursor = unit.entries_at_offset(origin_offset)?;
+        cursor.next_entry()?;
+
+        if let Some(origin_entry) = cursor.current() {
+            debug!(
+                "Processing abstract origin entry at offset {:?}, tag: {:?}",
+                origin_entry.offset(),
+                origin_entry.tag()
+            );
+
+            // Parse children of the abstract function
+            let mut cursor_tree = unit.entries_tree(Some(origin_offset))?;
+            if let Ok(origin_node) = cursor_tree.root() {
+                let mut children = origin_node.children();
+                while let Some(child) = children.next()? {
+                    let child_entry = child.entry();
+                    match child_entry.tag() {
+                        gimli::DW_TAG_formal_parameter | gimli::DW_TAG_variable => {
+                            if let Some(abstract_var) =
+                                self.parse_abstract_variable(unit, child_entry)
+                            {
+                                debug!(
+                                    "Parsed abstract {}: name='{}', type='{}'",
+                                    if child_entry.tag() == gimli::DW_TAG_formal_parameter {
+                                        "parameter"
+                                    } else {
+                                        "variable"
+                                    },
+                                    abstract_var.name,
+                                    abstract_var.type_name
+                                );
+                                result.push(abstract_var);
+                            }
+                        }
+                        _ => {
+                            // Skip non-variable/parameter children
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Parse abstract variable info (name, type from abstract origin)
+    fn parse_abstract_variable(
+        &self,
+        unit: &gimli::Unit<gimli::EndianSlice<gimli::LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<gimli::EndianSlice<gimli::LittleEndian>>,
+    ) -> Option<AbstractVariableInfo> {
+        let mut name = String::new();
+        let mut type_name = "unknown_type".to_string();
+        let mut dwarf_type = None;
+        let is_parameter = entry.tag() == gimli::DW_TAG_formal_parameter;
+
+        let mut attrs = entry.attrs();
+        while let Ok(Some(attr)) = attrs.next() {
+            match attr.name() {
+                gimli::DW_AT_name => {
+                    let unit_ref = unit.unit_ref(&self.dwarf);
+                    if let Ok(name_str) = unit_ref.attr_string(attr.value()) {
+                        name = name_str.to_string_lossy().into_owned();
+                    }
+                }
+                gimli::DW_AT_type => {
+                    if let gimli::AttributeValue::UnitRef(type_offset) = attr.value() {
+                        if let Some((resolved_type_name, resolved_dwarf_type)) =
+                            self.resolve_type_info_concrete(unit, type_offset)
+                        {
+                            type_name = resolved_type_name;
+                            dwarf_type = resolved_dwarf_type;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if !name.is_empty() {
+            Some(AbstractVariableInfo {
+                name,
+                type_name,
+                dwarf_type,
+                is_parameter,
+                abstract_origin_offset: entry.offset(),
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Parse concrete parameter/variable (location expression from concrete instance)
+    fn parse_concrete_parameter_variable(
+        &self,
+        unit: &gimli::Unit<gimli::EndianSlice<gimli::LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<gimli::EndianSlice<gimli::LittleEndian>>,
+    ) -> Option<ConcreteVariableInfo> {
+        let mut abstract_origin_ref = None;
+        let mut location_expr = None;
+
+        debug!(
+            "Parsing concrete parameter/variable at offset {:?}",
+            entry.offset()
+        );
+
+        let mut attrs = entry.attrs();
+        while let Ok(Some(attr)) = attrs.next() {
+            match attr.name() {
+                gimli::DW_AT_abstract_origin => {
+                    if let gimli::AttributeValue::UnitRef(offset) = attr.value() {
+                        abstract_origin_ref = Some(offset);
+                        debug!("Found abstract_origin reference: {:?}", offset);
+                    }
+                }
+                gimli::DW_AT_location => {
+                    debug!("Found DW_AT_location attribute");
+                    location_expr = self.parse_location_expression(unit, attr.value());
+                    debug!("Parsed location expression: {:?}", location_expr);
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(origin_ref) = abstract_origin_ref {
+            debug!(
+                "Creating ConcreteVariableInfo with origin {:?} and location {:?}",
+                origin_ref,
+                location_expr
+                    .as_ref()
+                    .unwrap_or(&LocationExpression::OptimizedOut)
+            );
+            Some(ConcreteVariableInfo {
+                abstract_origin_ref: origin_ref,
+                location_expr: location_expr.unwrap_or(LocationExpression::OptimizedOut),
+                concrete_offset: entry.offset(),
+            })
+        } else {
+            debug!(
+                "No abstract_origin found for concrete parameter at offset {:?}",
+                entry.offset()
+            );
+            None
+        }
+    }
+
+    /// Merge abstract and concrete information, then add to scoped map
+    fn merge_and_add_inlined_variables(
+        &self,
+        abstract_vars: &[AbstractVariableInfo],
+        concrete_vars: &[ConcreteVariableInfo],
+        scoped_map: &mut ScopedVariableMap,
+        inlined_scope_id: ScopeId,
+    ) -> Result<()> {
+        debug!(
+            "Merging {} abstract vars with {} concrete vars",
+            abstract_vars.len(),
+            concrete_vars.len()
+        );
+
+        // Create a map from abstract_origin_offset to concrete variable info
+        let concrete_map: std::collections::HashMap<_, _> = concrete_vars
+            .iter()
+            .map(|concrete| (concrete.abstract_origin_ref, concrete))
+            .collect();
+
+        let scope_ranges = if let Some(scope) = scoped_map.get_scope(inlined_scope_id) {
+            scope.address_ranges.clone()
+        } else {
+            return Err(crate::BinaryError::Dwarf(
+                gimli::Error::NoEntryAtGivenOffset,
+            ));
+        };
+
+        // For each abstract variable, find its concrete counterpart and merge
+        for abstract_var in abstract_vars {
+            let location_expr = if let Some(concrete_var) =
+                concrete_map.get(&abstract_var.abstract_origin_offset)
+            {
+                debug!(
+                    "Found concrete location for '{}': {:?}",
+                    abstract_var.name, concrete_var.location_expr
+                );
+                concrete_var.location_expr.clone()
+            } else {
+                debug!(
+                    "No concrete location found for '{}', marking as OptimizedOut",
+                    abstract_var.name
+                );
+                LocationExpression::OptimizedOut
+            };
+
+            // Create and add the merged variable
+            let variable_id = scoped_map.add_variable(
+                abstract_var.name.clone(),
+                abstract_var.type_name.clone(),
+                abstract_var.dwarf_type.clone(),
+                Some(location_expr.clone()),
+                abstract_var.is_parameter,
+                false, // Not artificial for inlined function vars
+                None,  // Size calculation can be added later if needed
+            );
+
+            // Create location_at_ranges for the variable
+            let location_at_ranges: Vec<(AddressRange, LocationExpression)> = scope_ranges
+                .iter()
+                .map(|range| (range.clone(), location_expr.clone()))
+                .collect();
+
+            // Add variable to scope with proper address ranges
+            scoped_map.add_variable_to_scope(
+                inlined_scope_id,
+                variable_id,
+                scope_ranges.clone(),
+                location_at_ranges,
+            );
+
+            debug!(
+                "Added inlined {} '{}' to scope {:?}",
+                if abstract_var.is_parameter {
+                    "parameter"
+                } else {
+                    "variable"
+                },
+                abstract_var.name,
+                inlined_scope_id
+            );
+        }
+
+        Ok(())
+    }
+
     /// Get origin function name for inlined subroutine by resolving abstract_origin
     fn get_origin_function_name(
         &self,
@@ -1938,9 +2319,9 @@ impl DwarfContext {
         let origin_offset = match attr_value {
             gimli::AttributeValue::UnitRef(offset) => offset,
             gimli::AttributeValue::DebugInfoRef(offset) => {
-                // Cross-unit reference - more complex to resolve
-                debug!(
-                    "Cross-unit abstract_origin reference not fully supported: {:?}",
+                // Cross-unit reference - not implemented yet
+                error!(
+                    "TODO: Cross-CU abstract_origin (DebugInfoRef {:?}) not supported yet; please implement cross-unit resolution.",
                     offset
                 );
                 return None;
@@ -2019,37 +2400,38 @@ impl DwarfContext {
 
     /// Infer variable size from type name patterns (fallback method)
     fn infer_size_from_type_name(&self, type_name: &str) -> Option<u64> {
+        use ghostscope_protocol::consts;
+
         match type_name {
             // Standard C integer types
-            "char" | "signed char" | "unsigned char" => Some(1),
-            "short" | "short int" | "signed short" | "unsigned short" => Some(2),
-            "int" | "signed int" | "unsigned int" => Some(4),
-            "long" | "long int" | "signed long" | "unsigned long" => {
-                // Depends on architecture, assume 64-bit
-                Some(8)
+            "char" | "signed char" | "unsigned char" => Some(consts::CHAR_SIZE),
+            "short" | "short int" | "signed short" | "unsigned short" => Some(consts::SHORT_SIZE),
+            "int" | "signed int" | "unsigned int" => Some(consts::INT_SIZE),
+            "long" | "long int" | "signed long" | "unsigned long" => Some(consts::LONG_SIZE),
+            "long long" | "long long int" | "signed long long" | "unsigned long long" => {
+                Some(consts::LONG_LONG_SIZE)
             }
-            "long long" | "long long int" | "signed long long" | "unsigned long long" => Some(8),
 
             // Standard integer type aliases
-            "int8_t" | "uint8_t" => Some(1),
-            "int16_t" | "uint16_t" => Some(2),
-            "int32_t" | "uint32_t" => Some(4),
-            "int64_t" | "uint64_t" => Some(8),
+            "int8_t" | "uint8_t" => Some(consts::CHAR_SIZE),
+            "int16_t" | "uint16_t" => Some(consts::SHORT_SIZE),
+            "int32_t" | "uint32_t" => Some(consts::INT_SIZE),
+            "int64_t" | "uint64_t" => Some(consts::LONG_LONG_SIZE),
 
             // Floating point types
-            "float" => Some(4),
-            "double" => Some(8),
-            "long double" => Some(16), // x86-64 extended precision
+            "float" => Some(consts::FLOAT_SIZE),
+            "double" => Some(consts::DOUBLE_SIZE),
+            "long double" => Some(consts::LONG_DOUBLE_SIZE),
 
             // Boolean type
-            "bool" | "_Bool" => Some(1),
+            "bool" | "_Bool" => Some(consts::BOOL_SIZE),
 
             // Size type
-            "size_t" | "ssize_t" => Some(8), // 64-bit architecture
-            "ptrdiff_t" => Some(8),
+            "size_t" | "ssize_t" => Some(consts::SIZE_T_SIZE),
+            "ptrdiff_t" => Some(consts::SIZE_T_SIZE),
 
             // Pointer types (any type ending with '*')
-            t if t.ends_with('*') => Some(8), // 64-bit pointers
+            t if t.ends_with('*') => Some(consts::POINTER_SIZE),
 
             // Unknown types
             _ => {
@@ -2589,11 +2971,16 @@ impl DwarfContext {
     }
 
     /// Extract address ranges from a DWARF entry (supports both single range and range lists)
-    fn extract_address_ranges_from_entry(
+    /// Extract raw address ranges from DWARF entry (bottom layer - pure extraction)
+    /// Supports DWARF 5 format only, preserves all ranges including zero-length
+    fn extract_raw_address_ranges(
         &self,
         entry: &gimli::DebuggingInformationEntry<gimli::EndianSlice<gimli::LittleEndian>>,
         unit: &gimli::Unit<gimli::EndianSlice<gimli::LittleEndian>>,
-    ) -> Vec<AddressRange> {
+        entry_name: &str, // For better debugging
+    ) -> Result<Vec<AddressRange>> {
+        debug!("=== EXTRACTING RAW ADDRESS RANGES for {} ===", entry_name);
+
         let mut attrs = entry.attrs();
         let mut low_pc = None;
         let mut high_pc = None;
@@ -2605,72 +2992,116 @@ impl DwarfContext {
                 gimli::DW_AT_low_pc => {
                     if let gimli::AttributeValue::Addr(pc) = attr.value() {
                         low_pc = Some(pc);
+                        debug!("Found DW_AT_low_pc: 0x{:x}", pc);
                     }
                 }
                 gimli::DW_AT_high_pc => match attr.value() {
-                    gimli::AttributeValue::Addr(pc) => high_pc = Some(pc),
+                    gimli::AttributeValue::Addr(pc) => {
+                        high_pc = Some(pc);
+                        debug!("Found DW_AT_high_pc (absolute): 0x{:x}", pc);
+                    }
                     gimli::AttributeValue::Udata(size) => {
                         if let Some(start) = low_pc {
                             high_pc = Some(start + size);
+                            debug!(
+                                "Found DW_AT_high_pc (offset): {} -> 0x{:x}",
+                                size,
+                                start + size
+                            );
                         }
                     }
                     _ => {}
                 },
                 gimli::DW_AT_ranges => {
-                    if let gimli::AttributeValue::RangeListsRef(offset) = attr.value() {
-                        ranges_offset = Some(offset);
+                    match attr.value() {
+                        gimli::AttributeValue::RangeListsRef(offset) => {
+                            ranges_offset = Some(offset);
+                            debug!("Found DW_AT_ranges (DWARF 5): offset=0x{:x}", offset.0);
+                        }
+                        gimli::AttributeValue::SecOffset(_) => {
+                            // Older DWARF range formats not supported here yet
+                            return Err(crate::BinaryError::Dwarf(gimli::Error::MissingUnitDie));
+                        }
+                        _ => {
+                            debug!("Unsupported DW_AT_ranges format: {:?}", attr.value());
+                        }
                     }
-                    // TODO: Handle legacy SecOffset format if needed
                 }
                 _ => {}
             }
         }
 
-        // If we have ranges offset, parse the range list
+        // If we have ranges offset, parse the range list (DWARF 5 only)
         if let Some(ranges_offset) = ranges_offset {
-            // Convert RawRangeListsOffset to RangeListsOffset
             let converted_offset = gimli::RangeListsOffset(ranges_offset.0);
-            if let Ok(mut ranges) = self.dwarf.ranges(unit, converted_offset) {
-                let mut address_ranges = Vec::new();
+            match self.dwarf.ranges(unit, converted_offset) {
+                Ok(mut ranges) => {
+                    let mut address_ranges = Vec::new();
 
-                while let Ok(Some(range)) = ranges.next() {
-                    debug!(
-                        "DWARF range: start=0x{:x}, end=0x{:x}, length={}",
-                        range.begin,
-                        range.end,
-                        range.end.wrapping_sub(range.begin)
-                    );
-                    // Skip zero-length ranges like [x, x), which represent point locations.
-                    // GDB-style behavior prefers the next executable instruction range instead.
-                    if range.begin != range.end {
-                        address_ranges.push(AddressRange {
-                            start: range.begin,
-                            end: range.end,
-                        });
-                    } else {
+                    while let Ok(Some(range)) = ranges.next() {
                         debug!(
-                            "Skipping zero-length DWARF range [0x{:x}, 0x{:x})",
-                            range.begin, range.end
+                            "DWARF range: start=0x{:x}, end=0x{:x}, length={}",
+                            range.begin,
+                            range.end,
+                            range.end.saturating_sub(range.begin)
                         );
+                        if range.begin < range.end {
+                            address_ranges.push(AddressRange {
+                                start: range.begin,
+                                end: range.end,
+                            });
+                        } else {
+                            debug!(
+                                "Filtered zero-length range [0x{:x}, 0x{:x}) for {}",
+                                range.begin, range.end, entry_name
+                            );
+                        }
                     }
-                }
 
-                if !address_ranges.is_empty() {
                     debug!(
-                        "Extracted {} address ranges from DW_AT_ranges",
-                        address_ranges.len()
+                        "Extracted {} address ranges from DW_AT_ranges for {}",
+                        address_ranges.len(),
+                        entry_name
                     );
-                    return address_ranges;
+                    return Ok(address_ranges);
+                }
+                Err(e) => {
+                    debug!("Failed to parse DW_AT_ranges for {}: {:?}", entry_name, e);
                 }
             }
         }
 
         // Fallback to simple low_pc/high_pc range
         if let (Some(start), Some(end)) = (low_pc, high_pc) {
-            vec![AddressRange { start, end }]
+            debug!(
+                "Using low_pc/high_pc range for {}: [0x{:x}, 0x{:x})",
+                entry_name, start, end
+            );
+            Ok(vec![AddressRange { start, end }])
         } else {
-            Vec::new()
+            debug!("No address ranges found for {}", entry_name);
+            Ok(Vec::new())
         }
+    }
+
+    /// Extract address ranges for function scopes (middle layer)
+    fn extract_function_ranges(
+        &self,
+        entry: &gimli::DebuggingInformationEntry<gimli::EndianSlice<gimli::LittleEndian>>,
+        unit: &gimli::Unit<gimli::EndianSlice<gimli::LittleEndian>>,
+        function_name: &str,
+    ) -> Result<Vec<AddressRange>> {
+        self.extract_raw_address_ranges(entry, unit, &format!("function({})", function_name))
+    }
+
+    /// Extract address ranges for inlined subroutines (middle layer)  
+    fn extract_inlined_ranges(
+        &self,
+        entry: &gimli::DebuggingInformationEntry<gimli::EndianSlice<gimli::LittleEndian>>,
+        unit: &gimli::Unit<gimli::EndianSlice<gimli::LittleEndian>>,
+        origin_func: &str,
+    ) -> Result<Vec<AddressRange>> {
+        self.extract_raw_address_ranges(entry, unit, &format!("inlined({})", origin_func))
     }
 
     /// Extract single address range from a DWARF entry (legacy method for compatibility)
@@ -2683,7 +3114,9 @@ impl DwarfContext {
         let mut units = self.dwarf.units();
         if let Ok(Some(header)) = units.next() {
             if let Ok(unit) = self.dwarf.unit(header) {
-                let ranges = self.extract_address_ranges_from_entry(entry, &unit);
+                let ranges = self
+                    .extract_function_ranges(entry, &unit, "legacy")
+                    .unwrap_or_default();
                 return ranges.first().cloned();
             }
         }
@@ -3030,9 +3463,6 @@ impl DwarfContext {
         unit: &gimli::Unit<gimli::EndianSlice<gimli::LittleEndian>>,
         offset: gimli::LocationListsOffset<usize>,
     ) -> Option<LocationExpression> {
-        debug!("Parsing location lists at offset 0x{:x}", offset.0);
-
-        // Try to get location lists from DWARF context
         debug!(
             "Attempting to get location lists from DWARF context for offset 0x{:x}",
             offset.0
@@ -3073,9 +3503,20 @@ impl DwarfContext {
                     let end_pc = location_list_entry.range.end;
 
                     debug!(
-                        "Location list entry #{}: PC 0x{:x}-0x{:x}",
-                        entry_count, start_pc, end_pc
+                        "Location list entry #{}: PC 0x{:x}-0x{:x} (range length: {})",
+                        entry_count,
+                        start_pc,
+                        end_pc,
+                        end_pc.saturating_sub(start_pc)
                     );
+
+                    // Check for zero-length ranges
+                    if start_pc == end_pc {
+                        debug!(
+                            "  Warning: Zero-length address range [0x{:x}, 0x{:x})",
+                            start_pc, end_pc
+                        );
+                    }
                     debug!(
                         "  Raw expression data length: {}",
                         location_list_entry.data.0.len()
@@ -3545,6 +3986,35 @@ fn get_section_data<'a>(object_file: &'a object::File, name: &str) -> Option<&'a
         }
     }
     debug!("Section {} not found", name);
+
+    // Fallback for GNU compressed debug sections like .zdebug_loc, .zdebug_info, etc.
+    if let Some(stripped) = name.strip_prefix(".debug_") {
+        let zname = format!(".zdebug_{}", stripped);
+        debug!("Trying compressed section fallback: {}", zname);
+        for section in object_file.sections() {
+            if let Ok(section_name) = section.name() {
+                if section_name == zname {
+                    match section.data() {
+                        Ok(data) => {
+                            debug!(
+                                "Found compressed section {} with {} bytes (passing raw to gimli)",
+                                zname,
+                                data.len()
+                            );
+                            return Some(data);
+                        }
+                        Err(e) => {
+                            error!(
+                                "Failed to get data for compressed section {}: {:?}",
+                                zname, e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        debug!("Compressed fallback {} not found either", zname);
+    }
     None
 }
 
@@ -3645,7 +4115,7 @@ impl DwarfContext {
     /// Try to recover inlined parameter value by analyzing actual DWARF location expressions
     /// Returns a LocationResult that can be used to read the parameter value
     pub fn try_recover_inlined_parameter(
-        &self,
+        &mut self,
         pc: u64,
         param_name: &str,
         scope_depth: usize,
@@ -3680,7 +4150,7 @@ impl DwarfContext {
 
     /// Find the actual DWARF location information for an inlined parameter
     fn find_inlined_parameter_location(
-        &self,
+        &mut self,
         pc: u64,
         param_name: &str,
         _scope_depth: usize,
@@ -3690,14 +4160,460 @@ impl DwarfContext {
             param_name, pc
         );
 
-        // For now, return a simplified implementation that indicates this needs to be implemented
-        // The full implementation would involve complex DWARF traversal with gimli
+        // Use our comprehensive inlined function parsing system
+        // Look for the parameter in the scoped variable system first
+        if let Some(scoped_map) = &mut self.scoped_variable_map {
+            let variables = scoped_map.get_variables_at_address(pc);
+            for var_result in variables {
+                if var_result.variable_info.name == param_name
+                    && var_result.variable_info.is_parameter
+                {
+                    // Check if this parameter has a non-OptimizedOut location in its original scope
+                    // This would indicate our inlined function parsing found a valid location
+                    match &var_result.variable_info.location_expr {
+                        Some(LocationExpression::OptimizedOut) => {
+                            // The scoped system also shows OptimizedOut, so we need to try
+                            // manual DWARF location list parsing with broader address ranges
+                            debug!("Scoped system shows OptimizedOut for '{}', trying manual location parsing", param_name);
+                            return self.try_manual_inlined_location_parsing(pc, param_name);
+                        }
+                        Some(location_expr) => {
+                            debug!(
+                                "Found valid location for '{}' in scoped system: {:?}",
+                                param_name, location_expr
+                            );
+                            // Convert LocationExpression to LocationResult
+                            return self
+                                .convert_location_expression_to_result(location_expr.clone());
+                        }
+                        None => {
+                            debug!(
+                                "No location information for parameter '{}' in scoped system",
+                                param_name
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         debug!(
-            "DWARF parameter location parsing not yet fully implemented for '{}'",
+            "Could not find parameter '{}' in scoped system, trying manual parsing",
             param_name
         );
+        self.try_manual_inlined_location_parsing(pc, param_name)
+    }
 
+    /// Try manual parsing of inlined parameter locations from DWARF
+    fn try_manual_inlined_location_parsing(
+        &self,
+        pc: u64,
+        param_name: &str,
+    ) -> Option<crate::expression::LocationResult> {
+        debug!(
+            "Attempting manual DWARF parsing for inlined parameter '{}' at PC 0x{:x}",
+            param_name, pc
+        );
+
+        // Try to find the inlined subroutine that contains this PC and manually parse its parameters
+        let mut units = self.dwarf.units();
+        while let Ok(Some(header)) = units.next() {
+            let unit = match self.dwarf.unit(header) {
+                Ok(unit) => unit,
+                Err(e) => {
+                    debug!("Failed to get unit: {:?}", e);
+                    continue;
+                }
+            };
+            let mut cursor = unit.entries();
+
+            while let Ok(Some((_, entry))) = cursor.next_dfs() {
+                if entry.tag() == gimli::DW_TAG_inlined_subroutine {
+                    // Check if this inlined subroutine contains our PC
+                    let mut in_range = false;
+                    let mut attrs = entry.attrs();
+                    while let Ok(Some(attr)) = attrs.next() {
+                        if attr.name() == gimli::DW_AT_ranges {
+                            let address_ranges = self
+                                .extract_inlined_ranges(entry, &unit, "scan")
+                                .unwrap_or_default();
+                            for range in &address_ranges {
+                                if pc >= range.start && pc <= range.end {
+                                    in_range = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if in_range {
+                        debug!("Found inlined subroutine containing PC 0x{:x}, looking for parameter '{}'", pc, param_name);
+
+                        // Look for the parameter in the children of this inlined subroutine
+                        if let Some(result) =
+                            self.parse_inlined_subroutine_parameter_manual(entry, &unit, param_name)
+                        {
+                            return Some(result);
+                        }
+                    }
+                }
+            }
+        } // End of while let Ok(Some(header)) = units.next()
+
+        debug!(
+            "Manual parsing failed to find inlined parameter '{}'",
+            param_name
+        );
         None
+    }
+
+    /// Manually parse a specific parameter from an inlined subroutine DIE  
+    fn parse_inlined_subroutine_parameter_manual(
+        &self,
+        inlined_entry: &gimli::DebuggingInformationEntry<gimli::EndianSlice<gimli::LittleEndian>>,
+        unit: &gimli::Unit<gimli::EndianSlice<gimli::LittleEndian>>,
+        target_param_name: &str,
+    ) -> Option<crate::expression::LocationResult> {
+        debug!(
+            "Manually parsing parameters from inlined subroutine at offset {:?}",
+            inlined_entry.offset()
+        );
+
+        // Create a tree cursor to navigate children
+        let mut cursor_tree = match unit.entries_tree(Some(inlined_entry.offset())) {
+            Ok(tree) => tree,
+            Err(e) => {
+                debug!("Failed to create entries tree: {:?}", e);
+                return None;
+            }
+        };
+
+        let inlined_node = match cursor_tree.root() {
+            Ok(node) => node,
+            Err(e) => {
+                debug!("Failed to get root node: {:?}", e);
+                return None;
+            }
+        };
+
+        // Look through children for formal parameters
+        let mut children = inlined_node.children();
+        let mut child_count = 0;
+        while let Ok(Some(child)) = children.next() {
+            child_count += 1;
+            let child_entry = child.entry();
+            debug!(
+                "Found child entry #{}: tag={:?}, offset={:?}",
+                child_count,
+                child_entry.tag(),
+                child_entry.offset()
+            );
+
+            if child_entry.tag() == gimli::DW_TAG_formal_parameter {
+                debug!("Found formal parameter child");
+
+                // Check abstract_origin to get parameter name
+                let mut abstract_origin_ref = None;
+                let mut location_expr = None;
+
+                let mut attrs = child_entry.attrs();
+                while let Ok(Some(attr)) = attrs.next() {
+                    debug!("Found attribute: {:?} = {:?}", attr.name(), attr.value());
+                    match attr.name() {
+                        gimli::DW_AT_abstract_origin => {
+                            debug!("Found abstract_origin attribute");
+                            if let gimli::AttributeValue::UnitRef(offset) = attr.value() {
+                                debug!("abstract_origin points to offset: {:?}", offset);
+                                abstract_origin_ref = Some(offset);
+                            }
+                        }
+                        gimli::DW_AT_location => {
+                            debug!("Found location attribute");
+                            // Parse location expression, allowing zero-length ranges
+                            location_expr =
+                                self.parse_location_expression_allow_zero_range(unit, attr.value());
+                            debug!("Parsed location expression: {:?}", location_expr);
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Get parameter name from abstract origin
+                if let Some(origin_offset) = abstract_origin_ref {
+                    debug!(
+                        "Looking up parameter name from abstract_origin at offset {:?}",
+                        origin_offset
+                    );
+                    if let Some(param_name) =
+                        self.get_parameter_name_from_offset(unit, origin_offset)
+                    {
+                        debug!("Found parameter name '{}' from abstract_origin", param_name);
+                        if param_name == target_param_name {
+                            debug!(
+                                "Found matching parameter '{}', location: {:?}",
+                                param_name, location_expr
+                            );
+
+                            // Convert to LocationResult
+                            if let Some(location) = location_expr {
+                                debug!("Converting location expression to result: {:?}", location);
+                                return self.convert_location_expression_to_result(location);
+                            } else {
+                                debug!(
+                                    "No location expression found for parameter '{}'",
+                                    param_name
+                                );
+                            }
+                        } else {
+                            debug!(
+                                "Parameter name '{}' doesn't match target '{}'",
+                                param_name, target_param_name
+                            );
+                        }
+                    } else {
+                        debug!(
+                            "Failed to get parameter name from abstract_origin at offset {:?}",
+                            origin_offset
+                        );
+                    }
+                } else {
+                    debug!("No abstract_origin found for this formal parameter");
+                }
+            }
+        }
+
+        debug!(
+            "Finished scanning {} children, no matching parameter found",
+            child_count
+        );
+        None
+    }
+
+    /// Future: Implement alternative location list access methods if needed
+
+    /// Get parameter name from abstract origin offset
+    fn get_parameter_name_from_offset(
+        &self,
+        unit: &gimli::Unit<gimli::EndianSlice<gimli::LittleEndian>>,
+        offset: gimli::UnitOffset<usize>,
+    ) -> Option<String> {
+        debug!(
+            "get_parameter_name_from_offset: Looking up name at offset {:?}",
+            offset
+        );
+
+        let mut cursor = match unit.entries_at_offset(offset) {
+            Ok(cursor) => cursor,
+            Err(e) => {
+                debug!(
+                    "get_parameter_name_from_offset: Failed to get entries at offset {:?}: {:?}",
+                    offset, e
+                );
+                return None;
+            }
+        };
+
+        // Try to get the entry at the offset - cursor may need to advance to the target
+        let entry = if let Some(entry) = cursor.current() {
+            debug!(
+                "get_parameter_name_from_offset: Found entry at cursor.current(), tag: {:?}",
+                entry.tag()
+            );
+            entry
+        } else {
+            debug!("get_parameter_name_from_offset: cursor.current() is None, trying next_entry()");
+            match cursor.next_entry() {
+                Ok(Some(_)) => {
+                    if let Some(entry) = cursor.current() {
+                        debug!("get_parameter_name_from_offset: Found entry after next_entry(), tag: {:?}", entry.tag());
+                        entry
+                    } else {
+                        debug!("get_parameter_name_from_offset: cursor.current() still None after next_entry()");
+                        return None;
+                    }
+                }
+                Ok(None) => {
+                    debug!("get_parameter_name_from_offset: next_entry() returned None");
+                    return None;
+                }
+                Err(e) => {
+                    debug!(
+                        "get_parameter_name_from_offset: next_entry() failed: {:?}",
+                        e
+                    );
+                    return None;
+                }
+            }
+        };
+
+        let mut attrs = entry.attrs();
+        while let Ok(Some(attr)) = attrs.next() {
+            debug!(
+                "get_parameter_name_from_offset: Found attribute: {:?} = {:?}",
+                attr.name(),
+                attr.value()
+            );
+            if attr.name() == gimli::DW_AT_name {
+                debug!("get_parameter_name_from_offset: Found DW_AT_name attribute");
+                let unit_ref = unit.unit_ref(&self.dwarf);
+                if let Ok(name_str) = unit_ref.attr_string(attr.value()) {
+                    let name = name_str.to_string_lossy().into_owned();
+                    debug!(
+                        "get_parameter_name_from_offset: Successfully extracted name: '{}'",
+                        name
+                    );
+                    return Some(name);
+                } else {
+                    debug!("get_parameter_name_from_offset: Failed to convert attr_string");
+                }
+            }
+        }
+        debug!("get_parameter_name_from_offset: No DW_AT_name attribute found");
+        None
+    }
+
+    /// Parse location expression allowing zero-length ranges (special handling for inline functions)
+    fn parse_location_expression_allow_zero_range(
+        &self,
+        unit: &gimli::Unit<gimli::EndianSlice<gimli::LittleEndian>>,
+        attr_value: gimli::AttributeValue<gimli::EndianSlice<gimli::LittleEndian>>,
+    ) -> Option<LocationExpression> {
+        // For zero-length ranges that are common in inline functions, we should accept them
+        // even if they don't match the exact PC we're querying
+        match attr_value {
+            gimli::AttributeValue::LocationListsRef(offset) => {
+                debug!(
+                    "Parsing location list at offset 0x{:x} (allowing zero ranges)",
+                    offset.0
+                );
+
+                // Additional debugging for problematic offsets
+                if matches!(offset.0, 0xfe | 0x10f) {
+                    debug!(
+                        "CRITICAL: Parsing problematic offset 0x{:x} for parameter location",
+                        offset.0
+                    );
+                    debug!(
+                        "Unit header: version={:?}, address_size={}, format={:?}",
+                        unit.header.version(),
+                        unit.header.address_size(),
+                        unit.header.format()
+                    );
+                }
+
+                // Try with proper base address for DWARF 5 compatibility
+                let mut locations = match self.dwarf.locations(unit, offset) {
+                    Ok(locations) => {
+                        debug!(
+                            "Successfully created location list iterator for offset 0x{:x}",
+                            offset.0
+                        );
+                        locations
+                    }
+                    Err(e) => {
+                        debug!("Failed to get location lists: {:?}", e);
+                        if matches!(offset.0, 0xfe | 0x10f) {
+                            debug!("CRITICAL: Failed to get location lists for parameter at offset 0x{:x}: {:?}", offset.0, e);
+                            // Try alternative approach - check if we need to use raw location data
+                            debug!("Attempting alternative location list access...");
+
+                            // For now, continue with standard processing
+                        }
+                        return Some(LocationExpression::OptimizedOut);
+                    }
+                };
+
+                // Accept the first valid location expression, even with zero-length range
+                debug!("Starting to iterate through location list entries...");
+                let mut entry_count = 0;
+                while let Ok(Some(location_list_entry)) = locations.next() {
+                    entry_count += 1;
+                    debug!(
+                        "Found location entry: range 0x{:x}-0x{:x} (length: {})",
+                        location_list_entry.range.begin,
+                        location_list_entry.range.end,
+                        location_list_entry
+                            .range
+                            .end
+                            .saturating_sub(location_list_entry.range.begin)
+                    );
+
+                    // Parse the expression regardless of range length
+                    let location_expr = self
+                        .parse_expression_bytecode(location_list_entry.data.0.slice(), unit)
+                        .unwrap_or(LocationExpression::OptimizedOut);
+
+                    if !matches!(location_expr, LocationExpression::OptimizedOut) {
+                        debug!(
+                            "Successfully parsed location expression: {:?}",
+                            location_expr
+                        );
+                        return Some(location_expr);
+                    }
+                }
+
+                debug!(
+                    "Processed {} location list entries, no valid location expressions found",
+                    entry_count
+                );
+
+                // Extra debugging for critical offsets
+                if matches!(offset.0, 0xfe | 0x10f) {
+                    debug!("CRITICAL: Parameter location list at offset 0x{:x} is empty! This indicates the compiler optimized away location info.", offset.0);
+                    debug!(
+                        "SOLUTION: Will attempt parameter value inference from call site context."
+                    );
+                }
+                Some(LocationExpression::OptimizedOut)
+            }
+            gimli::AttributeValue::Exprloc(expression) => {
+                debug!("Parsing direct expression of {} bytes", expression.0.len());
+                self.parse_expression_bytecode(expression.0.slice(), unit)
+            }
+            _ => {
+                debug!("Unsupported location attribute type: {:?}", attr_value);
+                Some(LocationExpression::OptimizedOut)
+            }
+        }
+    }
+
+    /// Convert LocationExpression to LocationResult for the recovery system
+    fn convert_location_expression_to_result(
+        &self,
+        location_expr: LocationExpression,
+    ) -> Option<crate::expression::LocationResult> {
+        use crate::expression::LocationResult;
+
+        match location_expr {
+            LocationExpression::Register { reg } => Some(LocationResult::RegisterAddress {
+                register: reg,
+                offset: None,
+                size: None,
+            }),
+            LocationExpression::RegisterOffset { reg, offset } => {
+                Some(LocationResult::RegisterAddress {
+                    register: reg,
+                    offset: Some(offset),
+                    size: None,
+                })
+            }
+            LocationExpression::ComputedExpression { operations, .. } => {
+                // Convert operations to LocationResult - this would need more implementation
+                debug!(
+                    "ComputedExpression conversion not yet implemented: {:?}",
+                    operations
+                );
+                None
+            }
+            LocationExpression::OptimizedOut => None,
+            _ => {
+                debug!(
+                    "Unsupported LocationExpression type for conversion: {:?}",
+                    location_expr
+                );
+                None
+            }
+        }
     }
 
     /// Check if a variable might be a substitute for an inlined parameter
@@ -3764,6 +4680,50 @@ impl DwarfContext {
                 debug!("Unsupported location expression type for parameter recovery");
                 None
             }
+        }
+    }
+
+    /// Extract DW_AT_name from DIE entry for debugging (priority function)
+    /// Should be called first to identify what DIE we're processing
+    fn extract_die_name(
+        &self,
+        entry: &gimli::DebuggingInformationEntry<gimli::EndianSlice<gimli::LittleEndian>>,
+        unit: &gimli::Unit<gimli::EndianSlice<gimli::LittleEndian>>,
+    ) -> String {
+        let mut attrs = entry.attrs();
+        while let Ok(Some(attr)) = attrs.next() {
+            if attr.name() == gimli::DW_AT_name {
+                let unit_ref = unit.unit_ref(&self.dwarf);
+                if let Ok(name_str) = unit_ref.attr_string(attr.value()) {
+                    return name_str.to_string_lossy().into_owned();
+                }
+            }
+        }
+        format!("unnamed_{:?}", entry.tag())
+    }
+
+    /// Format DWARF tag as human-readable string for debug output
+    fn format_dwarf_tag(&self, tag: gimli::DwTag) -> &'static str {
+        match tag {
+            gimli::DW_TAG_compile_unit => "DW_TAG_compile_unit",
+            gimli::DW_TAG_subprogram => "DW_TAG_subprogram",
+            gimli::DW_TAG_variable => "DW_TAG_variable",
+            gimli::DW_TAG_formal_parameter => "DW_TAG_formal_parameter",
+            gimli::DW_TAG_lexical_block => "DW_TAG_lexical_block",
+            gimli::DW_TAG_inlined_subroutine => "DW_TAG_inlined_subroutine",
+            gimli::DW_TAG_base_type => "DW_TAG_base_type",
+            gimli::DW_TAG_pointer_type => "DW_TAG_pointer_type",
+            gimli::DW_TAG_const_type => "DW_TAG_const_type",
+            gimli::DW_TAG_volatile_type => "DW_TAG_volatile_type",
+            gimli::DW_TAG_typedef => "DW_TAG_typedef",
+            gimli::DW_TAG_array_type => "DW_TAG_array_type",
+            gimli::DW_TAG_structure_type => "DW_TAG_structure_type",
+            gimli::DW_TAG_union_type => "DW_TAG_union_type",
+            gimli::DW_TAG_enumeration_type => "DW_TAG_enumeration_type",
+            gimli::DW_TAG_member => "DW_TAG_member",
+            gimli::DW_TAG_enumerator => "DW_TAG_enumerator",
+            gimli::DW_TAG_subrange_type => "DW_TAG_subrange_type",
+            _ => "DW_TAG_unknown",
         }
     }
 }
