@@ -891,13 +891,13 @@ impl InteractiveCommandPanel {
             match command_type {
                 CommandType::Script => {
                     // Only handle script compilation status changes
-                    match status.as_str() {
-                        "Failed" => {
+                    match crate::events::TraceStatus::from_string(&status) {
+                        crate::events::TraceStatus::Failed => {
                             if let Some(error) = &error_message {
                                 self.add_error_response_and_clear_waiting(error);
                             }
                         }
-                        "Active" => {
+                        crate::events::TraceStatus::Active => {
                             self.add_success_response_and_clear_waiting();
                         }
                         _ => {

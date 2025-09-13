@@ -2,6 +2,44 @@ use crossterm::event::{KeyEvent, MouseEvent};
 use ghostscope_protocol::{EventData, MessageType, TypeEncoding};
 use tokio::sync::mpsc;
 
+/// Trace status enumeration for shared use between UI and runtime
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TraceStatus {
+    Active,
+    Disabled,
+    Failed,
+}
+
+impl TraceStatus {
+    /// Convert to display string
+    pub fn to_string(&self) -> String {
+        match self {
+            TraceStatus::Active => "Active".to_string(),
+            TraceStatus::Disabled => "Disabled".to_string(),
+            TraceStatus::Failed => "Failed".to_string(),
+        }
+    }
+
+    /// Convert to emoji representation
+    pub fn to_emoji(&self) -> String {
+        match self {
+            TraceStatus::Active => "✅".to_string(),
+            TraceStatus::Disabled => "⏸️".to_string(),
+            TraceStatus::Failed => "❌".to_string(),
+        }
+    }
+
+    /// Parse from string (for backward compatibility)
+    pub fn from_string(s: &str) -> Self {
+        match s {
+            "Active" => TraceStatus::Active,
+            "Disabled" => TraceStatus::Disabled,
+            "Failed" => TraceStatus::Failed,
+            _ => TraceStatus::Failed, // Default to Failed for unknown status
+        }
+    }
+}
+
 /// TUI events that can be handled by the application
 #[derive(Debug, Clone)]
 pub enum TuiEvent {
@@ -181,7 +219,7 @@ pub enum RuntimeStatus {
     TraceInfo {
         trace_id: u32,
         target: String,
-        status: String,
+        status: TraceStatus,
         pid: Option<u32>,
         binary: String,
         script_preview: Option<String>,
@@ -213,12 +251,8 @@ pub struct TraceSummaryInfo {
 pub struct TraceDetailInfo {
     pub trace_id: u32,
     pub target_display: String,
-    pub status: String,       // "Active", "Disabled", etc.
-    pub status_emoji: String, // "✅", "⏸️", etc.
-    pub duration: String,     // "5m32s", "1h5m", etc.
-    pub script_preview: Option<String>,
-    pub pc: u64,
-    pub error_message: Option<String>,
+    pub status: TraceStatus,
+    pub duration: String, // "5m32s", "1h5m", etc.
 }
 
 impl EventRegistry {

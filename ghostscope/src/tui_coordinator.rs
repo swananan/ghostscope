@@ -214,7 +214,11 @@ async fn run_runtime_coordinator(
                             };
                             for id in ids {
                                 if let Some(snap) = session.trace_manager.get_trace_snapshot(id) {
-                                    let status = if snap.is_enabled { "Active" } else { "Disabled" }.to_string();
+                                    let status = if snap.is_enabled {
+                                        ghostscope_ui::events::TraceStatus::Active
+                                    } else {
+                                        ghostscope_ui::events::TraceStatus::Disabled
+                                    };
                                     // Build a cleaner script preview: prefer first non-empty line inside braces
                                     let script_preview = {
                                         let raw = snap.script_content.as_str();
@@ -281,12 +285,8 @@ async fn run_runtime_coordinator(
                                 .map(|t| ghostscope_ui::events::TraceDetailInfo {
                                     trace_id: t.trace_id,
                                     target_display: t.target_display,
-                                    status: t.status_text,
-                                    status_emoji: t.status_emoji,
+                                    status: t.status,
                                     duration: t.duration,
-                                    script_preview: t.script_preview,
-                                    pc: t.pc,
-                                    error_message: t.error_message,
                                 })
                                 .collect();
 

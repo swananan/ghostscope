@@ -1136,20 +1136,20 @@ impl TuiApp {
                 ]));
 
                 // status with emoji + color
-                let emoji = if status == "Active" { "✅" } else { "⏸️" };
-                let status_color = match status.to_ascii_lowercase().as_str() {
-                    "active" => Color::Green,
-                    "loading" => Color::Yellow,
-                    "disabled" => Color::Gray,
-                    "stopped" => Color::Gray,
-                    "failed" => Color::Red,
-                    _ => Color::Reset,
+                let emoji = status.to_emoji();
+                let status_color = match status {
+                    crate::events::TraceStatus::Active => Color::Green,
+                    crate::events::TraceStatus::Disabled => Color::Gray,
+                    crate::events::TraceStatus::Failed => Color::Red,
                 };
                 let mut status_spans = vec![Span::styled("  status : ", label_style)];
                 if !emoji.is_empty() {
                     status_spans.push(Span::raw(format!("{} ", emoji)));
                 }
-                status_spans.push(Span::styled(status, Style::default().fg(status_color)));
+                status_spans.push(Span::styled(
+                    status.to_string(),
+                    Style::default().fg(status_color),
+                ));
                 lines.push(Line::from(status_spans));
 
                 // pid
@@ -1205,7 +1205,7 @@ impl TuiApp {
                 // Handle sync response for enable command and update trace status
                 self.interactive_command_panel.handle_command_completed();
                 self.interactive_command_panel.update_trace_status(
-                    "Active".to_string(),
+                    crate::events::TraceStatus::Active.to_string(),
                     trace_id,
                     None,
                 );
@@ -1215,7 +1215,7 @@ impl TuiApp {
                 // Handle sync response for disable command and update trace status
                 self.interactive_command_panel.handle_command_completed();
                 self.interactive_command_panel.update_trace_status(
-                    "Disabled".to_string(),
+                    crate::events::TraceStatus::Disabled.to_string(),
                     trace_id,
                     None,
                 );
@@ -1296,25 +1296,12 @@ impl TuiApp {
                     for trace in traces {
                         response.push_str(&format!(
                             "  {} [{}] {} - {} ({})\n",
-                            trace.status_emoji,
+                            trace.status.to_emoji(),
                             trace.trace_id,
                             trace.target_display,
-                            trace.status,
+                            trace.status.to_string(),
                             trace.duration
                         ));
-
-                        // Add script preview if available
-                        if let Some(script_preview) = &trace.script_preview {
-                            response.push_str(&format!("    Script: {}\n", script_preview));
-                        }
-
-                        // Add PC information
-                        response.push_str(&format!("    PC: 0x{:x}\n", trace.pc));
-
-                        // Add error message if available
-                        if let Some(error_msg) = &trace.error_message {
-                            response.push_str(&format!("    Error: {}\n", error_msg));
-                        }
 
                         response.push('\n');
                     }

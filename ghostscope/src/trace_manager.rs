@@ -1,5 +1,6 @@
 use anyhow::Result;
 use ghostscope_loader::GhostScopeLoader;
+use ghostscope_ui::events::TraceStatus;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
@@ -46,12 +47,12 @@ impl TraceInstance {
         }
     }
 
-    /// Get trace status as string for display
-    pub fn status_string(&self) -> String {
+    /// Get trace status as enum
+    pub fn status(&self) -> TraceStatus {
         if self.is_enabled {
-            "Active".to_string()
+            TraceStatus::Active
         } else {
-            "Disabled".to_string()
+            TraceStatus::Disabled
         }
     }
 
@@ -249,8 +250,7 @@ impl TraceSummary {
 pub struct FormattedTraceInfo {
     pub trace_id: u32,
     pub target_display: String,
-    pub status_emoji: String,
-    pub status_text: String,
+    pub status: TraceStatus,
     pub duration: String,
     pub script_preview: Option<String>,
     pub pc: u64,
@@ -261,7 +261,11 @@ impl FormattedTraceInfo {
     pub fn format_line(&self) -> String {
         let mut line = format!(
             "{} [{}] {} - {} ({})",
-            self.status_emoji, self.trace_id, self.target_display, self.status_text, self.duration
+            self.status.to_emoji(),
+            self.trace_id,
+            self.target_display,
+            self.status.to_string(),
+            self.duration
         );
 
         if let Some(ref error) = self.error_message {
@@ -605,8 +609,7 @@ impl TraceManager {
             FormattedTraceInfo {
                 trace_id,
                 target_display: trace.target_display.clone(),
-                status_emoji: Self::status_emoji(trace.is_enabled).to_string(),
-                status_text: trace.status_string(),
+                status: trace.status(),
                 duration: self.format_duration(trace_id),
                 script_preview: trace.script_preview(),
                 pc: trace.pc,
