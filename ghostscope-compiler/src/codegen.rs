@@ -3920,14 +3920,19 @@ impl<'ctx> CodeGen<'ctx> {
         var_name: &str,
         ctx_param: PointerValue<'ctx>,
     ) -> Result<PointerValue<'ctx>> {
+        use ghostscope_binary::expression::{AccessStep, ArithOp};
+
         let i64_type = self.context.i64_type();
         let ptr_type = self.context.ptr_type(AddressSpace::default());
 
-        let mut current_value: Option<IntValue<'ctx>> = None;
+        // Use stack-based approach like execute_computed_access_steps for complex operations
+        let mut stack: Vec<IntValue<'ctx>> = Vec::new();
 
-        for step in steps {
+        for (i, step) in steps.iter().enumerate() {
+            debug!("  Variable access step {}: {:?}", i, step);
+
             match step {
-                ghostscope_binary::expression::AccessStep::LoadRegister(reg_num) => {
+                AccessStep::LoadRegister(reg_num) => {
                     // Convert DWARF register number to pt_regs byte offset
                     let pt_regs_byte_offset = platform::dwarf_reg_to_pt_regs_byte_offset(*reg_num)
                         .ok_or_else(|| {
@@ -3959,12 +3964,15 @@ impl<'ctx> CodeGen<'ctx> {
                         .map_err(|e| CodeGenError::Builder(e.to_string()))?
                         .into_int_value();
 
-                    current_value = Some(reg_value);
+                    stack.push(reg_value);
                 }
-                ghostscope_binary::expression::AccessStep::AddConstant(offset) => {
-                    let base = current_value.ok_or_else(|| {
-                        CodeGenError::InvalidExpression("No base value for addition".to_string())
-                    })?;
+                AccessStep::AddConstant(offset) => {
+                    if stack.is_empty() {
+                        return Err(CodeGenError::DwarfError(
+                            "Stack underflow in AddConstant".to_string(),
+                        ));
+                    }
+                    let base = stack.pop().unwrap();
 
                     let offset_const = self
                         .context
@@ -3980,12 +3988,106 @@ impl<'ctx> CodeGen<'ctx> {
                             .map_err(|e| CodeGenError::Builder(e.to_string()))?
                     };
 
-                    current_value = Some(result);
+                    stack.push(result);
                 }
-                ghostscope_binary::expression::AccessStep::Dereference { size } => {
-                    let addr = current_value.ok_or_else(|| {
-                        CodeGenError::InvalidExpression("No address to dereference".to_string())
-                    })?;
+                AccessStep::ArithmeticOp(op) => match op {
+                    ArithOp::Add => {
+                        if stack.len() < 2 {
+                            return Err(CodeGenError::DwarfError(
+                                "Stack underflow in Add".to_string(),
+                            ));
+                        }
+                        let b = stack.pop().unwrap();
+                        let a = stack.pop().unwrap();
+                        let result = self
+                            .builder
+                            .build_int_add(a, b, &format!("{}_add_{}", var_name, i))
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        stack.push(result);
+                    }
+                    ArithOp::Sub => {
+                        if stack.len() < 2 {
+                            return Err(CodeGenError::DwarfError(
+                                "Stack underflow in Sub".to_string(),
+                            ));
+                        }
+                        let b = stack.pop().unwrap();
+                        let a = stack.pop().unwrap();
+                        let result = self
+                            .builder
+                            .build_int_sub(a, b, &format!("{}_sub_{}", var_name, i))
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        stack.push(result);
+                    }
+                    ArithOp::Mul => {
+                        if stack.len() < 2 {
+                            return Err(CodeGenError::DwarfError(
+                                "Stack underflow in Mul".to_string(),
+                            ));
+                        }
+                        let b = stack.pop().unwrap();
+                        let a = stack.pop().unwrap();
+                        let result = self
+                            .builder
+                            .build_int_mul(a, b, &format!("{}_mul_{}", var_name, i))
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        stack.push(result);
+                    }
+                    ArithOp::Div => {
+                        if stack.len() < 2 {
+                            return Err(CodeGenError::DwarfError(
+                                "Stack underflow in Div".to_string(),
+                            ));
+                        }
+                        let b = stack.pop().unwrap();
+                        let a = stack.pop().unwrap();
+                        let result = self
+                            .builder
+                            .build_int_signed_div(a, b, &format!("{}_div_{}", var_name, i))
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        stack.push(result);
+                    }
+                    ArithOp::Mod => {
+                        if stack.len() < 2 {
+                            return Err(CodeGenError::DwarfError(
+                                "Stack underflow in Mod".to_string(),
+                            ));
+                        }
+                        let b = stack.pop().unwrap();
+                        let a = stack.pop().unwrap();
+                        let result = self
+                            .builder
+                            .build_int_signed_rem(a, b, &format!("{}_mod_{}", var_name, i))
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        stack.push(result);
+                    }
+                    ArithOp::Neg => {
+                        if stack.is_empty() {
+                            return Err(CodeGenError::DwarfError(
+                                "Stack underflow in Neg".to_string(),
+                            ));
+                        }
+                        let a = stack.pop().unwrap();
+                        let result = self
+                            .builder
+                            .build_int_neg(a, &format!("{}_neg_{}", var_name, i))
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        stack.push(result);
+                    }
+                    _ => {
+                        return Err(CodeGenError::DwarfError(format!(
+                            "Arithmetic operation {:?} not yet implemented",
+                            op
+                        )));
+                    }
+                },
+                AccessStep::Dereference { size } => {
+                    if stack.is_empty() {
+                        return Err(CodeGenError::InvalidExpression(
+                            "No address to dereference".to_string(),
+                        ));
+                    }
+                    let addr = stack.pop().unwrap();
 
                     let user_ptr = self
                         .builder
@@ -4005,7 +4107,7 @@ impl<'ctx> CodeGen<'ctx> {
         }
 
         // If we get here without a dereference, create a global storage for the final value
-        if let Some(final_value) = current_value {
+        if let Some(final_value) = stack.pop() {
             let storage_global = self.module.add_global(
                 i64_type,
                 Some(AddressSpace::default()),
