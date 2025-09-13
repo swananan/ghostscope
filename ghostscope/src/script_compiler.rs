@@ -1,5 +1,4 @@
 use crate::session::GhostSession;
-use crate::trace_manager::TraceMountPoint;
 use anyhow::Result;
 use ghostscope_loader::GhostScopeLoader;
 use ghostscope_ui::events::{ExecutionStatus, ScriptCompilationDetails, ScriptExecutionResult};
@@ -81,7 +80,7 @@ pub async fn compile_and_load_script_for_tui(
 
     // Step 5: Process compilation results at PC level for detailed error reporting
     let mut execution_results: Vec<ScriptExecutionResult> = Vec::new();
-    let mut successful_mounts: Vec<TraceMountPoint> = Vec::new();
+    let mut successful_traces: Vec<(u64, GhostScopeLoader, String)> = Vec::new();
     let mut success_count = 0;
     let mut failed_count = 0;
 
@@ -141,11 +140,7 @@ pub async fn compile_and_load_script_for_tui(
                             status: ExecutionStatus::Success,
                         });
 
-                        successful_mounts.push(TraceMountPoint {
-                            loader,
-                            uprobe_offset: config.uprobe_offset.unwrap_or(pc_address),
-                            ebpf_function_name: config.ebpf_function_name,
-                        });
+                        successful_traces.push((pc_address, loader, config.ebpf_function_name));
                         success_count += 1;
                         info!(
                             "✓ Successfully prepared target '{}' at 0x{:x}",
@@ -198,58 +193,53 @@ pub async fn compile_and_load_script_for_tui(
     // Step 6: Create trace instances - one per successful target if multiple, or one combined if single target
     let mut trace_ids = Vec::new();
 
-    if !successful_mounts.is_empty() {
-        // For now, create a single trace with all successful mounts
-        // Future enhancement could create separate traces per PC
-        let trace_id = session.trace_manager.add_trace(
-            compilation_result.target_info.clone(),
-            script.to_string(),
-            successful_mounts,
-            binary_path.clone(),
-            target_display.clone(),
-            session.target_pid,
-        );
+    if !successful_traces.is_empty() {
+        // Create a separate trace for each successful PC
+        for (pc, loader, ebpf_function_name) in successful_traces {
+            let trace_id = session.trace_manager.add_trace(
+                compilation_result.target_info.clone(),
+                script.to_string(),
+                pc,
+                binary_path.clone(),
+                target_display.clone(),
+                session.target_pid,
+                Some(loader),
+                ebpf_function_name,
+            );
 
-        info!(
-            "Created trace instance {} for target '{}' with {} successful mounts",
-            trace_id, target_display, success_count
-        );
+            info!(
+                "Created trace instance {} for target '{}' at PC 0x{:x}",
+                trace_id, target_display, pc
+            );
 
-        // Step 7: Try to activate the trace instance (attach all uprobes)
-        match session.trace_manager.activate_trace(trace_id).await {
-            Ok(_) => {
-                info!(
-                    "Successfully activated trace {} for target '{}' with {} mounts",
-                    trace_id, target_display, success_count
-                );
-                trace_ids.push(trace_id);
-            }
-            Err(e) => {
-                let error_msg = format!("Failed to activate trace {}: {}", trace_id, e);
-                error!("{}", error_msg);
-                let _ = session.trace_manager.remove_trace(trace_id).await;
+            // Step 7: Try to activate the trace instance
+            match session.trace_manager.activate_trace(trace_id) {
+                Ok(_) => {
+                    info!(
+                        "Successfully activated trace {} for target '{}' at PC 0x{:x}",
+                        trace_id, target_display, pc
+                    );
+                    trace_ids.push(trace_id);
+                }
+                Err(e) => {
+                    let error_msg = format!("Failed to activate trace {}: {}", trace_id, e);
+                    error!("{}", error_msg);
+                    let _ = session.trace_manager.remove_trace(trace_id);
 
-                // If trace activation failed, all uprobes failed to load
-                // Mark all previously successful targets as failed
-                for result in &mut execution_results {
-                    if matches!(result.status, ExecutionStatus::Success) {
-                        result.status =
-                            ExecutionStatus::Failed(format!("Uprobe attachment failed: {}", e));
+                    // If trace activation failed, mark this PC as failed
+                    for result in &mut execution_results {
+                        if matches!(result.status, ExecutionStatus::Success)
+                            && result.pc_address == pc
+                        {
+                            result.status =
+                                ExecutionStatus::Failed(format!("Uprobe attachment failed: {}", e));
+                        }
                     }
                 }
-
-                // Update counts
-                failed_count += success_count;
-                success_count = 0;
-
-                info!(
-                    "Trace activation failed, marking all {} targets as failed",
-                    failed_count
-                );
             }
         }
     } else {
-        info!("No successful mounts to create trace instance");
+        info!("No successful PCs to create trace instances");
     }
 
     // Step 8: Return detailed compilation results

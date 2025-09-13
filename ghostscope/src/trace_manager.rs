@@ -1,20 +1,11 @@
 use anyhow::Result;
-// use futures::future; // removed unused import
 use ghostscope_loader::GhostScopeLoader;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 use tracing::{debug, error, info, warn};
 
-/// Individual trace mount point (one PC / one eBPF program)
-#[derive(Debug)]
-pub struct TraceMountPoint {
-    pub loader: GhostScopeLoader,
-    pub uprobe_offset: u64,
-    pub ebpf_function_name: String,
-}
-
-/// Individual trace instance with associated eBPF loaders (multiple PCs)
+/// Individual trace instance with single PC value
 #[derive(Debug)]
 pub struct TraceInstance {
     pub trace_id: u32,
@@ -22,9 +13,11 @@ pub struct TraceInstance {
     pub script_content: String, // Original script content
     pub binary_path: String, // Binary being traced
     pub target_display: String, // Display name for UI (e.g., "main", "file.c:15")
-    pub mounts: Vec<TraceMountPoint>, // Multiple uprobe mounts for this trace
+    pub pc: u64,        // Program counter value for this trace
     pub target_pid: Option<u32>, // Target PID if specified
     pub is_enabled: bool, // Whether the uprobe is currently enabled
+    pub loader: Option<GhostScopeLoader>, // eBPF loader for this trace
+    pub ebpf_function_name: String, // eBPF function name for uprobe attachment
 }
 
 impl TraceInstance {
@@ -32,20 +25,24 @@ impl TraceInstance {
         trace_id: u32,
         target: String,
         script_content: String,
-        mounts: Vec<TraceMountPoint>,
+        pc: u64,
         binary_path: String,
         target_display: String,
         target_pid: Option<u32>,
+        loader: Option<GhostScopeLoader>,
+        ebpf_function_name: String,
     ) -> Self {
         Self {
             trace_id,
             target,
             script_content,
-            mounts,
+            pc,
             binary_path,
             target_display,
             target_pid,
             is_enabled: false,
+            loader,
+            ebpf_function_name,
         }
     }
 
@@ -69,132 +66,119 @@ impl TraceInstance {
         None
     }
 
-    /// Enable this trace instance (attach uprobe)
-    pub async fn enable(&mut self) -> Result<()> {
+    /// Enable this trace instance
+    pub fn enable(&mut self) -> Result<()> {
         if self.is_enabled {
             info!("Trace {} is already enabled", self.trace_id);
             return Ok(());
         }
 
         info!(
-            "Enabling trace {} ({} mount(s)) for target '{}' in binary '{}'",
-            self.trace_id,
-            self.mounts.len(),
-            self.target_display,
-            self.binary_path
+            "Enabling trace {} for target '{}' at PC 0x{:x} in binary '{}'",
+            self.trace_id, self.target_display, self.pc, self.binary_path
         );
 
-        // Attach all mount points - continue even if some fail
-        let mut successful_attachments = 0;
-        let mut failed_attachments = 0;
-
-        for (i, mount) in self.mounts.iter_mut().enumerate() {
-            if mount.loader.is_uprobe_attached() {
-                warn!(
-                    "Uprobe already attached for trace {} mount {}",
-                    self.trace_id, i
-                );
-                successful_attachments += 1;
-                continue;
-            } else if mount.loader.get_attachment_info().is_some() {
+        // Attach uprobe using the loader
+        if let Some(ref mut loader) = self.loader {
+            if loader.is_uprobe_attached() {
+                warn!("Uprobe already attached for trace {}", self.trace_id);
+                self.is_enabled = true;
+                return Ok(());
+            } else if loader.get_attachment_info().is_some() {
                 info!(
-                    "Re-attaching uprobe for trace {} mount {} (program already loaded)",
-                    self.trace_id, i
+                    "Re-attaching uprobe for trace {} (program already loaded)",
+                    self.trace_id
                 );
-                match mount.loader.reattach_uprobe() {
+                match loader.reattach_uprobe() {
                     Ok(_) => {
-                        successful_attachments += 1;
                         info!(
-                            "✓ Successfully re-attached uprobe for trace {} mount {}",
-                            self.trace_id, i
+                            "✓ Successfully re-attached uprobe for trace {}",
+                            self.trace_id
                         );
+                        self.is_enabled = true;
+                        return Ok(());
                     }
                     Err(e) => {
-                        failed_attachments += 1;
                         error!(
-                            "❌ Failed to re-attach uprobe for trace {} mount {}: {}",
-                            self.trace_id, i, e
+                            "❌ Failed to re-attach uprobe for trace {}: {}",
+                            self.trace_id, e
                         );
+                        return Err(anyhow::anyhow!("Failed to re-attach uprobe: {}", e));
                     }
                 }
             } else {
                 info!(
-                    "Attaching uprobe for trace {} mount {} at offset 0x{:x} using program '{}'",
-                    self.trace_id, i, mount.uprobe_offset, mount.ebpf_function_name
+                    "Attaching uprobe for trace {} at offset 0x{:x} using program '{}'",
+                    self.trace_id, self.pc, self.ebpf_function_name
                 );
-                match mount.loader.attach_uprobe(
+                match loader.attach_uprobe(
                     &self.binary_path,
-                    &mount.ebpf_function_name,
-                    Some(mount.uprobe_offset),
+                    &self.ebpf_function_name,
+                    Some(self.pc),
                     self.target_pid.map(|pid| pid as i32),
                 ) {
                     Ok(_) => {
-                        successful_attachments += 1;
                         info!(
-                            "✓ Successfully attached uprobe for trace {} mount {} at 0x{:x}",
-                            self.trace_id, i, mount.uprobe_offset
+                            "✓ Successfully attached uprobe for trace {} at 0x{:x}",
+                            self.trace_id, self.pc
                         );
+                        self.is_enabled = true;
+                        Ok(())
                     }
                     Err(e) => {
-                        failed_attachments += 1;
                         error!(
-                            "❌ Failed to attach uprobe for trace {} mount {} at 0x{:x}: {}",
-                            self.trace_id, i, mount.uprobe_offset, e
+                            "❌ Failed to attach uprobe for trace {} at 0x{:x}: {}",
+                            self.trace_id, self.pc, e
                         );
+                        Err(anyhow::anyhow!("Failed to attach uprobe: {}", e))
                     }
                 }
             }
-        }
-
-        // Log summary
-        if successful_attachments > 0 && failed_attachments == 0 {
-            info!(
-                "Trace {} enabled successfully with all {} mount(s)",
-                self.trace_id, successful_attachments
-            );
-        } else if successful_attachments > 0 && failed_attachments > 0 {
-            warn!(
-                "Trace {} partially enabled: {} successful, {} failed mount(s)",
-                self.trace_id, successful_attachments, failed_attachments
-            );
         } else {
-            error!(
-                "Trace {} failed to enable: all {} mount(s) failed",
-                self.trace_id, failed_attachments
-            );
-            return Err(anyhow::anyhow!(
-                "All uprobe attachments failed for trace {}",
-                self.trace_id
-            ));
+            error!("No eBPF loader available for trace {}", self.trace_id);
+            Err(anyhow::anyhow!("No eBPF loader available"))
         }
-
-        self.is_enabled = true;
-        info!("Trace {} enabled successfully", self.trace_id);
-        Ok(())
     }
 
-    /// Disable this trace instance (detach uprobe but keep eBPF resources)
-    pub async fn disable(&mut self) -> Result<()> {
+    /// Disable this trace instance
+    pub fn disable(&mut self) -> Result<()> {
         if !self.is_enabled {
             info!("Trace {} is already disabled", self.trace_id);
             return Ok(());
         }
 
-        info!(
-            "Disabling trace {} ({} mount(s))",
-            self.trace_id,
-            self.mounts.len()
-        );
-        // Detach all uprobes while keeping eBPF resources
-        for (i, mount) in self.mounts.iter_mut().enumerate() {
-            if mount.loader.is_uprobe_attached() {
-                info!("Detaching mount {} for trace {}", i, self.trace_id);
-                mount.loader.detach_uprobe()?;
+        info!("Disabling trace {} at PC 0x{:x}", self.trace_id, self.pc);
+
+        // Detach uprobe using the loader
+        if let Some(ref mut loader) = self.loader {
+            if loader.is_uprobe_attached() {
+                info!("Detaching uprobe for trace {}", self.trace_id);
+                match loader.detach_uprobe() {
+                    Ok(_) => {
+                        info!("✓ Successfully detached uprobe for trace {}", self.trace_id);
+                        self.is_enabled = false;
+                        Ok(())
+                    }
+                    Err(e) => {
+                        error!(
+                            "❌ Failed to detach uprobe for trace {}: {}",
+                            self.trace_id, e
+                        );
+                        Err(anyhow::anyhow!("Failed to detach uprobe: {}", e))
+                    }
+                }
+            } else {
+                warn!(
+                    "Uprobe not attached for trace {}, marking as disabled",
+                    self.trace_id
+                );
+                self.is_enabled = false;
+                Ok(())
             }
+        } else {
+            error!("No eBPF loader available for trace {}", self.trace_id);
+            Err(anyhow::anyhow!("No eBPF loader available"))
         }
-        self.is_enabled = false;
-        info!("Trace {} disabled successfully", self.trace_id);
-        Ok(())
     }
 
     /// Wait for events asynchronously from this trace instance
@@ -203,26 +187,22 @@ impl TraceInstance {
             return Ok(Vec::new());
         }
 
-        // Collect events from all mounts; return first ready set
-        // Iterate and return the first mount that has events to keep behavior similar to select_all
-        for (i, mount) in self.mounts.iter_mut().enumerate() {
-            match mount.loader.wait_for_events_async().await {
-                Ok(events) if !events.is_empty() => {
-                    return Ok(events);
-                }
-                Ok(_empty) => {
-                    continue;
-                }
+        // Wait for events using the loader
+        if let Some(ref mut loader) = self.loader {
+            match loader.wait_for_events_async().await {
+                Ok(events) => Ok(events),
                 Err(e) => {
                     warn!(
-                        "Error waiting for events from trace {} mount {}: {}",
-                        self.trace_id, i, e
+                        "Error waiting for events from trace {}: {}",
+                        self.trace_id, e
                     );
-                    return Err(e.into());
+                    Err(e.into())
                 }
             }
+        } else {
+            error!("No eBPF loader available for trace {}", self.trace_id);
+            Err(anyhow::anyhow!("No eBPF loader available"))
         }
-        Ok(Vec::new())
     }
 }
 
@@ -235,7 +215,8 @@ pub struct TraceSnapshot {
     pub target_display: String,
     pub target_pid: Option<u32>,
     pub is_enabled: bool,
-    pub mounts: Vec<(u64, String)>,
+    pub pc: u64,
+    pub ebpf_function_name: String,
 }
 
 /// Summary statistics for all traces
@@ -272,7 +253,7 @@ pub struct FormattedTraceInfo {
     pub status_text: String,
     pub duration: String,
     pub script_preview: Option<String>,
-    pub mounts: Vec<(u64, String)>,
+    pub pc: u64,
     pub error_message: Option<String>,
 }
 
@@ -318,10 +299,12 @@ impl TraceManager {
         &mut self,
         target: String,
         script_content: String,
-        mounts: Vec<TraceMountPoint>,
+        pc: u64,
         binary_path: String,
         target_display: String,
         target_pid: Option<u32>,
+        loader: Option<GhostScopeLoader>,
+        ebpf_function_name: String,
     ) -> u32 {
         let trace_id = self.next_trace_id;
         self.next_trace_id += 1;
@@ -341,10 +324,12 @@ impl TraceManager {
             trace_id,
             target.clone(), // Keep original target for grouping
             script_content,
-            mounts,
+            pc,
             binary_path,
             target_display,
             target_pid,
+            loader,
+            ebpf_function_name,
         );
 
         self.traces.insert(trace_id, trace_instance);
@@ -358,17 +343,12 @@ impl TraceManager {
     }
 
     /// Enable a trace by ID (duplicate of enable_trace method - keeping for compatibility)
-    pub async fn activate_trace(&mut self, trace_id: u32) -> Result<()> {
-        self.enable_trace(trace_id).await
-    }
-
-    /// Disable a trace by ID (duplicate of disable_trace method - keeping for compatibility)
-    pub async fn deactivate_trace(&mut self, trace_id: u32) -> Result<()> {
-        self.disable_trace(trace_id).await
+    pub fn activate_trace(&mut self, trace_id: u32) -> Result<()> {
+        self.enable_trace(trace_id)
     }
 
     /// Remove a trace by ID (legacy method, use delete_trace for complete cleanup)
-    pub async fn remove_trace(&mut self, trace_id: u32) -> Result<()> {
+    pub fn remove_trace(&mut self, trace_id: u32) -> Result<()> {
         if let Some(mut trace) = self.traces.remove(&trace_id) {
             // Remove from target mapping
             self.target_to_trace_id.remove(&trace.target);
@@ -376,7 +356,7 @@ impl TraceManager {
             self.trace_created_times.remove(&trace_id);
 
             // Disable all mounts if still active
-            trace.disable().await?;
+            trace.disable()?;
 
             debug!("Removed trace {} from manager", trace_id);
             Ok(())
@@ -386,7 +366,7 @@ impl TraceManager {
     }
 
     /// Completely delete a trace by ID, destroying all associated resources
-    pub async fn delete_trace(&mut self, trace_id: u32) -> Result<()> {
+    pub fn delete_trace(&mut self, trace_id: u32) -> Result<()> {
         if let Some(trace) = self.traces.remove(&trace_id) {
             // Remove from target mapping
             self.target_to_trace_id.remove(&trace.target);
@@ -395,10 +375,10 @@ impl TraceManager {
 
             info!("Deleting trace {} and all associated resources", trace_id);
 
-            // Completely destroy all loaders and eBPF resources
-            let mounts = trace.mounts;
-            for mut mount in mounts {
-                let _ = mount.loader.destroy();
+            // Destroy eBPF loader and all associated resources
+            if let Some(mut loader) = trace.loader {
+                let _ = loader.destroy();
+                info!("Destroyed eBPF loader for trace {}", trace_id);
             }
 
             info!("Trace {} deleted successfully", trace_id);
@@ -409,14 +389,14 @@ impl TraceManager {
     }
 
     /// Delete all traces, destroying all associated resources
-    pub async fn delete_all_traces(&mut self) -> Result<usize> {
+    pub fn delete_all_traces(&mut self) -> Result<usize> {
         let trace_ids: Vec<u32> = self.traces.keys().cloned().collect();
         let count = trace_ids.len();
 
         info!("Deleting all {} traces and their resources", count);
 
         for trace_id in trace_ids {
-            if let Err(e) = self.delete_trace(trace_id).await {
+            if let Err(e) = self.delete_trace(trace_id) {
                 warn!("Failed to delete trace {}: {}", trace_id, e);
             }
         }
@@ -455,14 +435,9 @@ impl TraceManager {
         self.traces.keys().cloned().collect()
     }
 
-    /// Get mount infos for a trace (offset + program name)
-    pub fn get_trace_mount_infos(&self, trace_id: u32) -> Option<Vec<(u64, String)>> {
-        self.traces.get(&trace_id).map(|t| {
-            t.mounts
-                .iter()
-                .map(|m| (m.uprobe_offset, m.ebpf_function_name.clone()))
-                .collect()
-        })
+    /// Get PC value for a trace
+    pub fn get_trace_pc(&self, trace_id: u32) -> Option<u64> {
+        self.traces.get(&trace_id).map(|t| t.pc)
     }
 
     /// Wait for events asynchronously from all active traces
@@ -515,12 +490,12 @@ impl TraceManager {
     }
 
     /// Enable a specific trace by ID
-    pub async fn enable_trace(&mut self, trace_id: u32) -> Result<()> {
+    pub fn enable_trace(&mut self, trace_id: u32) -> Result<()> {
         // Check if this is the first trace being enabled (from 0 to 1)
         let was_no_active_traces = self.active_trace_count() == 0;
 
         if let Some(trace) = self.traces.get_mut(&trace_id) {
-            trace.enable().await?;
+            trace.enable()?;
 
             // If this was the first trace being enabled, notify waiters
             if was_no_active_traces && self.active_trace_count() == 1 {
@@ -534,19 +509,19 @@ impl TraceManager {
     }
 
     /// Disable a specific trace by ID
-    pub async fn disable_trace(&mut self, trace_id: u32) -> Result<()> {
+    pub fn disable_trace(&mut self, trace_id: u32) -> Result<()> {
         if let Some(trace) = self.traces.get_mut(&trace_id) {
-            trace.disable().await
+            trace.disable()
         } else {
             Err(anyhow::anyhow!("Trace {} not found", trace_id))
         }
     }
 
     /// Enable all traces
-    pub async fn enable_all_traces(&mut self) -> Result<()> {
+    pub fn enable_all_traces(&mut self) -> Result<()> {
         let trace_ids: Vec<u32> = self.traces.keys().cloned().collect();
         for trace_id in trace_ids {
-            if let Err(e) = self.enable_trace(trace_id).await {
+            if let Err(e) = self.enable_trace(trace_id) {
                 warn!("Failed to enable trace {}: {}", trace_id, e);
             }
         }
@@ -554,10 +529,10 @@ impl TraceManager {
     }
 
     /// Disable all traces  
-    pub async fn disable_all_traces(&mut self) -> Result<()> {
+    pub fn disable_all_traces(&mut self) -> Result<()> {
         let trace_ids: Vec<u32> = self.traces.keys().cloned().collect();
         for trace_id in trace_ids {
-            if let Err(e) = self.disable_trace(trace_id).await {
+            if let Err(e) = self.disable_trace(trace_id) {
                 warn!("Failed to disable trace {}: {}", trace_id, e);
             }
         }
@@ -573,11 +548,8 @@ impl TraceManager {
             target_display: t.target_display.clone(),
             target_pid: t.target_pid,
             is_enabled: t.is_enabled,
-            mounts: t
-                .mounts
-                .iter()
-                .map(|m| (m.uprobe_offset, m.ebpf_function_name.clone()))
-                .collect(),
+            pc: t.pc,
+            ebpf_function_name: t.ebpf_function_name.clone(),
         })
     }
 
@@ -637,11 +609,7 @@ impl TraceManager {
                 status_text: trace.status_string(),
                 duration: self.format_duration(trace_id),
                 script_preview: trace.script_preview(),
-                mounts: trace
-                    .mounts
-                    .iter()
-                    .map(|m| (m.uprobe_offset, m.ebpf_function_name.clone()))
-                    .collect(),
+                pc: trace.pc,
                 error_message: None, // Currently not tracking errors in TraceManager
             }
         })
@@ -669,13 +637,8 @@ impl TraceManager {
             let traces = self.get_all_formatted_traces();
             for trace in traces {
                 output.push_str(&format!("  {}\n", trace.format_line()));
-                // Add mount information
-                if !trace.mounts.is_empty() {
-                    output.push_str(&format!("    mounts ({}):\n", trace.mounts.len()));
-                    for (i, (pc, prog)) in trace.mounts.iter().enumerate() {
-                        output.push_str(&format!("      [{}] PC=0x{:x} program={}\n", i, pc, prog));
-                    }
-                }
+                // Add PC information
+                output.push_str(&format!("    PC: 0x{:x}\n", trace.pc));
             }
         } else {
             output.push_str("No traces currently loaded.");

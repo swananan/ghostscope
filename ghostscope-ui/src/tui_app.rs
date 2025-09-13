@@ -1108,7 +1108,7 @@ impl TuiApp {
                 pid,
                 binary,
                 script_preview,
-                mounts,
+                pc,
             } => {
                 // Ensure we end waiting state so input prompt is rendered after the response
                 self.interactive_command_panel.handle_command_completed();
@@ -1174,26 +1174,11 @@ impl TuiApp {
                     ]));
                 }
 
-                // mounts header
+                // PC information
                 lines.push(Line::from(vec![
-                    Span::styled("  mounts : ", label_style),
-                    Span::styled(mounts.len().to_string(), value_style),
+                    Span::styled("  pc     : ", label_style),
+                    Span::styled(format!("0x{:x}", pc), Style::default().fg(Color::Yellow)),
                 ]));
-
-                // mounts list
-                for (i, m) in mounts.iter().enumerate() {
-                    lines.push(Line::from(vec![
-                        Span::raw("    - ["),
-                        Span::styled(i.to_string(), Style::default().fg(Color::Gray)),
-                        Span::raw("] "),
-                        Span::styled(
-                            format!("pc=0x{:x}", m.offset),
-                            Style::default().fg(Color::Yellow),
-                        ),
-                        Span::raw(", program="),
-                        Span::styled(m.program.clone(), Style::default().fg(Color::Gray)),
-                    ]));
-                }
 
                 self.interactive_command_panel.add_styled_response(lines);
                 // Ensure input mode and reset cursor to the end
@@ -1323,16 +1308,8 @@ impl TuiApp {
                             response.push_str(&format!("    Script: {}\n", script_preview));
                         }
 
-                        // Add mount information
-                        if !trace.mounts.is_empty() {
-                            response.push_str(&format!("    Mounts ({}):\n", trace.mounts.len()));
-                            for (i, mount) in trace.mounts.iter().enumerate() {
-                                response.push_str(&format!(
-                                    "      [{}] PC=0x{:x} program={}\n",
-                                    i, mount.offset, mount.program
-                                ));
-                            }
-                        }
+                        // Add PC information
+                        response.push_str(&format!("    PC: 0x{:x}\n", trace.pc));
 
                         // Add error message if available
                         if let Some(error_msg) = &trace.error_message {

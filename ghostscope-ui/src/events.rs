@@ -177,7 +177,7 @@ pub enum RuntimeStatus {
         target: String,
         error: String,
     },
-    /// Detailed info for a trace (summary + mounts)
+    /// Detailed info for a trace (summary + PC)
     TraceInfo {
         trace_id: u32,
         target: String,
@@ -185,7 +185,7 @@ pub enum RuntimeStatus {
         pid: Option<u32>,
         binary: String,
         script_preview: Option<String>,
-        mounts: Vec<TraceMountInfo>,
+        pc: u64,
     },
     /// All trace info with structured data for UI rendering
     TraceInfoAll {
@@ -198,12 +198,6 @@ pub enum RuntimeStatus {
         error: String,
     },
     Error(String),
-}
-
-#[derive(Debug, Clone)]
-pub struct TraceMountInfo {
-    pub offset: u64,
-    pub program: String,
 }
 
 /// Summary information for all traces
@@ -223,7 +217,7 @@ pub struct TraceDetailInfo {
     pub status_emoji: String, // "✅", "⏸️", etc.
     pub duration: String,     // "5m32s", "1h5m", etc.
     pub script_preview: Option<String>,
-    pub mounts: Vec<TraceMountInfo>,
+    pub pc: u64,
     pub error_message: Option<String>,
 }
 

@@ -234,11 +234,6 @@ async fn run_runtime_coordinator(
                                             s
                                         })
                                     };
-                                    let mounts = snap
-                                        .mounts
-                                        .into_iter()
-                                        .map(|(offset, program)| ghostscope_ui::events::TraceMountInfo { offset, program })
-                                        .collect();
                                     let _ = runtime_channels.status_sender.send(ghostscope_ui::events::RuntimeStatus::TraceInfo {
                                         trace_id: snap.trace_id,
                                         target: snap.target_display,
@@ -246,7 +241,7 @@ async fn run_runtime_coordinator(
                                         pid: snap.target_pid,
                                         binary: snap.binary_path,
                                         script_preview,
-                                        mounts,
+                                        pc: snap.pc,
                                     });
                                 } else {
                                     warn!("InfoTrace requested for non-existent trace {}", id);
@@ -290,9 +285,7 @@ async fn run_runtime_coordinator(
                                     status_emoji: t.status_emoji,
                                     duration: t.duration,
                                     script_preview: t.script_preview,
-                                    mounts: t.mounts.into_iter().map(|(offset, program)| {
-                                        ghostscope_ui::events::TraceMountInfo { offset, program }
-                                    }).collect(),
+                                    pc: t.pc,
                                     error_message: t.error_message,
                                 })
                                 .collect();
@@ -332,7 +325,7 @@ async fn run_runtime_coordinator(
                     RuntimeCommand::DisableTrace(trace_id) => {
                         info!("Disabling trace: {}", trace_id);
                         if let Some(ref mut session) = session {
-                            match session.trace_manager.disable_trace(trace_id).await {
+                            match session.trace_manager.disable_trace(trace_id) {
                                 Ok(_) => {
                                     info!("Trace {} disabled successfully", trace_id);
                                     let _ = runtime_channels.status_sender.send(RuntimeStatus::TraceDisabled { trace_id });
@@ -355,7 +348,7 @@ async fn run_runtime_coordinator(
                     RuntimeCommand::EnableTrace(trace_id) => {
                         info!("Enabling trace: {}", trace_id);
                         if let Some(ref mut session) = session {
-                            match session.trace_manager.enable_trace(trace_id).await {
+                            match session.trace_manager.enable_trace(trace_id) {
                                 Ok(_) => {
                                     info!("Trace {} enabled successfully", trace_id);
                                     let _ = runtime_channels.status_sender.send(RuntimeStatus::TraceEnabled { trace_id });
@@ -379,7 +372,7 @@ async fn run_runtime_coordinator(
                         info!("Disabling all traces");
                         if let Some(ref mut session) = session {
                             let trace_count = session.trace_manager.active_trace_count();
-                            match session.trace_manager.disable_all_traces().await {
+                            match session.trace_manager.disable_all_traces() {
                                 Ok(_) => {
                                     info!("All {} traces disabled successfully", trace_count);
                                     let _ = runtime_channels.status_sender.send(RuntimeStatus::AllTracesDisabled { count: trace_count });
@@ -397,7 +390,7 @@ async fn run_runtime_coordinator(
                         info!("Enabling all traces");
                         if let Some(ref mut session) = session {
                             let trace_count = session.trace_manager.trace_count();
-                            match session.trace_manager.enable_all_traces().await {
+                            match session.trace_manager.enable_all_traces() {
                                 Ok(_) => {
                                     info!("All {} traces enabled successfully", trace_count);
                                     let _ = runtime_channels.status_sender.send(RuntimeStatus::AllTracesEnabled { count: trace_count });
@@ -414,7 +407,7 @@ async fn run_runtime_coordinator(
                     RuntimeCommand::DeleteTrace(trace_id) => {
                         info!("Deleting trace: {}", trace_id);
                         if let Some(ref mut session) = session {
-                            match session.trace_manager.delete_trace(trace_id).await {
+                            match session.trace_manager.delete_trace(trace_id) {
                                 Ok(_) => {
                                     info!("Trace {} deleted successfully", trace_id);
                                     let _ = runtime_channels.status_sender.send(RuntimeStatus::TraceDeleted { trace_id });
@@ -437,7 +430,7 @@ async fn run_runtime_coordinator(
                     RuntimeCommand::DeleteAllTraces => {
                         info!("Deleting all traces");
                         if let Some(ref mut session) = session {
-                            match session.trace_manager.delete_all_traces().await {
+                            match session.trace_manager.delete_all_traces() {
                                 Ok(count) => {
                                     info!("All {} traces deleted successfully", count);
                                     let _ = runtime_channels.status_sender.send(RuntimeStatus::AllTracesDeleted { count });
