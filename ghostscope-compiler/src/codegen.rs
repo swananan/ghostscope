@@ -1191,7 +1191,12 @@ impl<'ctx> CodeGen<'ctx> {
                 if let Some(evaluation_result) = var_info.evaluation_result {
                     let var_type = self
                         .get_variable_type_from_dwarf(var_name, compile_time_pc)
-                        .unwrap_or(VarType::Int);
+                        .ok_or_else(|| {
+                            CodeGenError::InvalidExpression(format!(
+                                "Failed to determine type for variable '{}' at PC 0x{:x}",
+                                var_name, compile_time_pc
+                            ))
+                        })?;
 
                     // Use new type-safe evaluation system - no runtime type checking needed!
                     let var_ptr = self.execute_evaluation_result(
@@ -1217,13 +1222,10 @@ impl<'ctx> CodeGen<'ctx> {
                 }
             }
             Err(CodeGenError::VariableNotFound(_)) => {
-                debug!(
-                    "Variable '{}' not found in DWARF, treating as optimized out",
-                    var_name
-                );
-                let var_type = VarType::Int;
-                let pc_const = compile_time_pc;
-                self.build_and_send_optimized_out_message(var_name, &var_type, pc_const)
+                Err(CodeGenError::InvalidExpression(format!(
+                    "Variable '{}' not found in DWARF at PC 0x{:x}",
+                    var_name, compile_time_pc
+                )))
             }
             Err(e) => Err(e), // Other errors should propagate
         }

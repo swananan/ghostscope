@@ -211,6 +211,9 @@ impl InteractiveCommandPanel {
 
         // Return to ready state
         self.input_state = InputState::Ready;
+
+        // Refresh static lines to ensure current input prompt is shown
+        self.update_static_lines();
     }
 
     /// Check if command has timed out (optional timeout handling)
@@ -222,6 +225,9 @@ impl InteractiveCommandPanel {
                     ResponseType::Error,
                 );
                 self.input_state = InputState::Ready;
+
+                // Refresh static lines to ensure current input prompt is shown
+                self.update_static_lines();
                 return true;
             }
         }
@@ -874,6 +880,56 @@ impl InteractiveCommandPanel {
         }
     }
 
+    /// Handle detailed script compilation results
+    pub fn handle_script_compilation_details(
+        &mut self,
+        details: crate::events::ScriptCompilationDetails,
+    ) {
+        debug!(
+            "handle_script_compilation_details called with trace_id {}, {}/{} successful",
+            details.trace_id, details.success_count, details.total_count
+        );
+
+        // Update trace manager with the overall status
+        let overall_status = if details.success_count == details.total_count {
+            TraceStatus::Active
+        } else if details.success_count > 0 {
+            TraceStatus::Active // Partially successful is still considered active
+        } else {
+            TraceStatus::Failed
+        };
+
+        self.trace_manager.update_trace_status(
+            details.trace_id,
+            overall_status,
+            if details.failed_count > 0 {
+                Some(format!(
+                    "{}/{} targets failed",
+                    details.failed_count, details.total_count
+                ))
+            } else {
+                None
+            },
+        );
+
+        // Always show detailed response regardless of input state
+        // This ensures users see the compilation results even if the state has changed
+        self.add_detailed_script_response_and_clear_waiting(&details);
+
+        // If we were waiting for a response, clear the waiting state and reset mode
+        if let InputState::WaitingResponse { .. } = &self.input_state {
+            self.input_state = InputState::Ready;
+
+            // Reset to input mode to allow new commands
+            if self.mode == InteractionMode::ScriptEditor {
+                self.mode = InteractionMode::Input;
+            }
+
+            // Update static lines to show the new input prompt
+            self.update_static_lines();
+        }
+    }
+
     /// Update trace status when runtime provides feedback
     pub fn update_trace_status(
         &mut self,
@@ -963,6 +1019,63 @@ impl InteractiveCommandPanel {
         self.input_state = InputState::Ready;
         self.update_static_lines();
         debug!("Added error response and cleared waiting state");
+    }
+
+    /// Add detailed script compilation response and clear waiting state
+    fn add_detailed_script_response_and_clear_waiting(
+        &mut self,
+        details: &crate::events::ScriptCompilationDetails,
+    ) {
+        debug!(
+            "add_detailed_script_response_and_clear_waiting called with {} results",
+            details.results.len()
+        );
+        let mut messages = Vec::new();
+
+        // Overall status message
+        if details.success_count == details.total_count {
+            messages.push("✅ Script compiled and loaded successfully".to_string());
+        } else if details.success_count > 0 {
+            messages.push(format!(
+                "⚠️ Script partially loaded ({}/{} targets successful)",
+                details.success_count, details.total_count
+            ));
+        } else {
+            messages.push("❌ Script compilation failed".to_string());
+        }
+
+        // Add detailed results for each target
+        for result in &details.results {
+            // Check if target_name already contains PC information
+            let display_name = if result.target_name.contains("(PC: 0x") {
+                // target_name already includes PC info, use it as is
+                result.target_name.clone()
+            } else {
+                // target_name doesn't include PC info, add it
+                format!("{} (PC: 0x{:x})", result.target_name, result.pc_address)
+            };
+
+            match &result.status {
+                crate::events::ExecutionStatus::Success => {
+                    messages.push(format!("  ✅ {} - Success", display_name));
+                }
+                crate::events::ExecutionStatus::Failed(error) => {
+                    messages.push(format!("  ❌ {} - Failed: {}", display_name, error));
+                }
+                crate::events::ExecutionStatus::Skipped(reason) => {
+                    messages.push(format!("  ⏭️ {} - Skipped: {}", display_name, reason));
+                }
+            }
+        }
+
+        // Combine all messages into a single response
+        let combined_message = messages.join("\n");
+        debug!(
+            "Adding combined message with {} lines: {}",
+            messages.len(),
+            combined_message
+        );
+        self.add_response(combined_message, ResponseType::Info);
     }
 
     /// Add success response and clear waiting state

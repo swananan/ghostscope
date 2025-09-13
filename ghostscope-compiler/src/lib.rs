@@ -32,7 +32,7 @@ pub enum CompileError {
 pub type Result<T> = std::result::Result<T, CompileError>;
 
 // Public re-exports from ast_compiler module
-pub use ast_compiler::{CompilationResult, UProbeConfig};
+pub use ast_compiler::{CompilationResult, PCCompilationResult, UProbeConfig};
 
 /// Save options for compilation output
 #[derive(Debug, Clone)]

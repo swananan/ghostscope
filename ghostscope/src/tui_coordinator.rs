@@ -174,15 +174,21 @@ async fn run_runtime_coordinator(
                         info!("Executing script with trace_id {:?}: {}", trace_id, script);
 
                         if let Some(ref mut session) = session {
-                            // Use the new TUI-specific compilation and loading with strict all-or-nothing success
+                            // Use the new TUI-specific compilation and loading with detailed results
                             match crate::script_compiler::compile_and_load_script_for_tui(
                                 &script,
                                 trace_id,
                                 session,
                             ).await {
-                                Ok(_) => {
-                                    info!("Script with trace_id {} compiled and loaded successfully", trace_id);
-                                    let _ = runtime_channels.status_sender.send(RuntimeStatus::ScriptCompilationCompleted { trace_id });
+                                Ok(details) => {
+                                    info!("Script with trace_id {} compiled with detailed results: {:?} successful",
+                                          trace_id, details);
+
+                                    // Types are now unified, no conversion needed
+                                    let _ = runtime_channels.status_sender.send(RuntimeStatus::ScriptCompilationCompleted {
+                                        trace_id,
+                                        details: Some(details),
+                                    });
                                 }
                                 Err(e) => {
                                     let _target = crate::script_compiler::extract_target_from_script(&script);

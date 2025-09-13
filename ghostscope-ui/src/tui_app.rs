@@ -1072,18 +1072,27 @@ impl TuiApp {
                     .command_sender
                     .send(RuntimeCommand::RequestSourceCode);
             }
-            RuntimeStatus::ScriptCompilationCompleted { trace_id } => {
-                // Update trace status in the interactive panel
-                self.interactive_command_panel.update_trace_status(
-                    crate::trace::TraceStatus::Active,
-                    trace_id,
-                    None,
-                );
-
-                info!(
-                    "✅ Script compilation completed successfully for trace_id: {:?}",
-                    trace_id
-                );
+            RuntimeStatus::ScriptCompilationCompleted { trace_id, details } => {
+                // Handle detailed script compilation results if available
+                if let Some(details) = details {
+                    self.interactive_command_panel
+                        .handle_script_compilation_details(details);
+                    info!(
+                        "✅ Script compilation completed with detailed results for trace_id: {:?}",
+                        trace_id
+                    );
+                } else {
+                    // Fallback to simple status update for backward compatibility
+                    self.interactive_command_panel.update_trace_status(
+                        crate::trace::TraceStatus::Active,
+                        trace_id,
+                        None,
+                    );
+                    info!(
+                        "✅ Script compilation completed successfully for trace_id: {:?}",
+                        trace_id
+                    );
+                }
             }
             // Note: mount details after compilation will be shown via TraceInfo as needed
             RuntimeStatus::TraceInfo {

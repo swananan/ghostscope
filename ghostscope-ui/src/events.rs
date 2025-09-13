@@ -87,8 +87,33 @@ pub enum RuntimeCommand {
     Shutdown,
 }
 
-/// Status updates from runtime to TUI
+/// Execution status for individual script targets
 #[derive(Debug, Clone)]
+pub enum ExecutionStatus {
+    Success,
+    Failed(String),  // Contains error message
+    Skipped(String), // Contains reason for skipping
+}
+
+/// Result of executing a single script target (PC/function)
+#[derive(Debug, Clone)]
+pub struct ScriptExecutionResult {
+    pub pc_address: u64,
+    pub target_name: String,
+    pub status: ExecutionStatus,
+}
+
+/// Detailed compilation result for a script with multiple targets
+#[derive(Debug, Clone)]
+pub struct ScriptCompilationDetails {
+    pub trace_id: u32,
+    pub results: Vec<ScriptExecutionResult>,
+    pub total_count: usize,
+    pub success_count: usize,
+    pub failed_count: usize,
+}
+
+#[derive(Debug)]
 pub enum RuntimeStatus {
     DwarfLoadingStarted,
     DwarfLoadingCompleted {
@@ -97,6 +122,7 @@ pub enum RuntimeStatus {
     DwarfLoadingFailed(String),
     ScriptCompilationCompleted {
         trace_id: u32,
+        details: Option<ScriptCompilationDetails>, // Optional for backward compatibility
     },
     ScriptCompilationFailed {
         error: String,

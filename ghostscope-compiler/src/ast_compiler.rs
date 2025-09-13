@@ -3,7 +3,7 @@ use crate::codegen::CodeGen;
 use crate::CompileError;
 use ghostscope_binary::BinaryAnalyzer;
 use inkwell::context::Context;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Resolved target information from DWARF queries
 #[derive(Debug, Clone)]
@@ -43,10 +43,24 @@ pub struct UProbeConfig {
     pub ebpf_function_name: String,
 }
 
-/// Compilation result containing all uprobe configurations
+/// Result of compiling a single PC address
+#[derive(Debug, Clone)]
+pub struct PCCompilationResult {
+    /// PC address for this compilation attempt
+    pub pc_address: u64,
+    /// Target name (function name or source location)
+    pub target_name: String,
+    /// Whether compilation succeeded
+    pub success: bool,
+    /// Error message if compilation failed
+    pub error_message: Option<String>,
+}
+
+/// Compilation result containing all uprobe configurations and detailed PC results
 #[derive(Debug)]
 pub struct CompilationResult {
     pub uprobe_configs: Vec<UProbeConfig>,
+    pub pc_results: Vec<PCCompilationResult>,
     pub trace_count: usize,
     pub target_info: String,
 }
@@ -55,6 +69,7 @@ pub struct CompilationResult {
 pub struct AstCompiler<'a> {
     binary_analyzer: Option<&'a mut BinaryAnalyzer>,
     uprobe_configs: Vec<UProbeConfig>,
+    pc_results: Vec<PCCompilationResult>,
     binary_path_hint: Option<String>,
     trace_id: Option<u32>,
 }
@@ -68,6 +83,7 @@ impl<'a> AstCompiler<'a> {
         Self {
             binary_analyzer,
             uprobe_configs: Vec::new(),
+            pc_results: Vec::new(),
             binary_path_hint,
             trace_id,
         }
@@ -85,17 +101,56 @@ impl<'a> AstCompiler<'a> {
         );
 
         // Single-pass traversal: process each statement immediately
+        // Continue processing even if some trace points fail
+        let mut successful_trace_points = 0;
+        let mut failed_trace_points = 0;
+
         for (index, stmt) in program.statements.iter().enumerate() {
             match stmt {
                 Statement::TracePoint { pattern, body } => {
                     debug!("Processing trace point {}: {:?}", index, pattern);
-                    self.process_trace_point(pattern, body, pid, index)?;
+                    match self.process_trace_point(pattern, body, pid, index) {
+                        Ok(_) => {
+                            successful_trace_points += 1;
+                            info!(
+                                "✓ Successfully processed trace point {}: {:?}",
+                                index, pattern
+                            );
+                        }
+                        Err(e) => {
+                            failed_trace_points += 1;
+                            error!(
+                                "❌ Failed to process trace point {}: {:?} - Error: {}",
+                                index, pattern, e
+                            );
+                            // Continue processing other trace points
+                        }
+                    }
                 }
                 _ => {
                     warn!("Skipping non-trace statement: {:?}", stmt);
                     // TODO: Non-trace statements are ignored in current implementation
                 }
             }
+        }
+
+        // Log summary
+        if successful_trace_points > 0 && failed_trace_points == 0 {
+            info!(
+                "All {} trace points processed successfully",
+                successful_trace_points
+            );
+        } else if successful_trace_points > 0 && failed_trace_points > 0 {
+            warn!(
+                "Partial success: {} trace points successful, {} failed",
+                successful_trace_points, failed_trace_points
+            );
+        } else {
+            error!("All {} trace points failed to process", failed_trace_points);
+            return Err(CompileError::Other(format!(
+                "All {} trace points failed to process",
+                failed_trace_points
+            )));
         }
 
         // Generate target info summary
@@ -108,6 +163,7 @@ impl<'a> AstCompiler<'a> {
 
         Ok(CompilationResult {
             uprobe_configs: std::mem::take(&mut self.uprobe_configs),
+            pc_results: std::mem::take(&mut self.pc_results),
             trace_count: self.uprobe_configs.len(),
             target_info,
         })
@@ -158,6 +214,10 @@ impl<'a> AstCompiler<'a> {
                     addresses.len()
                 );
 
+                // Process each address - continue even if some fail
+                let mut successful_addresses = 0;
+                let mut failed_addresses = 0;
+
                 for (pc_idx, address) in addresses.iter().enumerate() {
                     let target_info = ResolvedTarget {
                         function_name: Some(format!("{}:{}", file_path, line_number)),
@@ -167,13 +227,68 @@ impl<'a> AstCompiler<'a> {
                         pattern: pattern.clone(),
                     };
 
-                    let uprobe_config = self.generate_ebpf_for_target(
+                    let target_name = format!("{}:{}", file_path, line_number);
+                    let result = self.generate_ebpf_for_target(
                         &target_info,
                         statements,
                         pid,
                         index + pc_idx,
-                    )?;
-                    self.uprobe_configs.push(uprobe_config);
+                    );
+
+                    // Record the result for this PC address
+                    let pc_result = match &result {
+                        Ok(_) => PCCompilationResult {
+                            pc_address: *address,
+                            target_name: target_name.clone(),
+                            success: true,
+                            error_message: None,
+                        },
+                        Err(e) => PCCompilationResult {
+                            pc_address: *address,
+                            target_name: target_name.clone(),
+                            success: false,
+                            error_message: Some(e.to_string()),
+                        },
+                    };
+                    self.pc_results.push(pc_result);
+
+                    match result {
+                        Ok(uprobe_config) => {
+                            self.uprobe_configs.push(uprobe_config);
+                            successful_addresses += 1;
+                            info!(
+                                "✓ Successfully generated eBPF for {}:{} at 0x{:x}",
+                                file_path, line_number, address
+                            );
+                        }
+                        Err(e) => {
+                            failed_addresses += 1;
+                            error!(
+                                "❌ Failed to generate eBPF for {}:{} at 0x{:x}: {}",
+                                file_path, line_number, address, e
+                            );
+                            // Continue processing other addresses
+                        }
+                    }
+                }
+
+                // Log summary for this trace point
+                if successful_addresses > 0 && failed_addresses == 0 {
+                    info!(
+                        "All {} addresses for {}:{} processed successfully",
+                        successful_addresses, file_path, line_number
+                    );
+                } else if successful_addresses > 0 && failed_addresses > 0 {
+                    warn!(
+                        "Partial success for {}:{}: {} successful, {} failed addresses",
+                        file_path, line_number, successful_addresses, failed_addresses
+                    );
+                } else {
+                    error!(
+                        "All {} addresses for {}:{} failed to process",
+                        failed_addresses, file_path, line_number
+                    );
+                    // Don't return error here - let the caller decide based on overall results
                 }
                 Ok(())
             }
@@ -210,6 +325,10 @@ impl<'a> AstCompiler<'a> {
                 );
 
                 // We may need analyzer again to compute precise uprobe offsets
+                // Process each address - continue even if some fail
+                let mut successful_addresses = 0;
+                let mut failed_addresses = 0;
+
                 for (pc_idx, address) in addresses.iter().enumerate() {
                     let uprobe_offset = if let Some(analyzer) = &self.binary_analyzer {
                         analyzer
@@ -227,13 +346,68 @@ impl<'a> AstCompiler<'a> {
                         pattern: pattern.clone(),
                     };
 
-                    let uprobe_config = self.generate_ebpf_for_target(
+                    let target_name = func_name.clone();
+                    let result = self.generate_ebpf_for_target(
                         &target_info,
                         statements,
                         pid,
                         index + pc_idx,
-                    )?;
-                    self.uprobe_configs.push(uprobe_config);
+                    );
+
+                    // Record the result for this PC address
+                    let pc_result = match &result {
+                        Ok(_) => PCCompilationResult {
+                            pc_address: *address,
+                            target_name: target_name.clone(),
+                            success: true,
+                            error_message: None,
+                        },
+                        Err(e) => PCCompilationResult {
+                            pc_address: *address,
+                            target_name: target_name.clone(),
+                            success: false,
+                            error_message: Some(e.to_string()),
+                        },
+                    };
+                    self.pc_results.push(pc_result);
+
+                    match result {
+                        Ok(uprobe_config) => {
+                            self.uprobe_configs.push(uprobe_config);
+                            successful_addresses += 1;
+                            info!(
+                                "✓ Successfully generated eBPF for function '{}' at 0x{:x}",
+                                func_name, address
+                            );
+                        }
+                        Err(e) => {
+                            failed_addresses += 1;
+                            error!(
+                                "❌ Failed to generate eBPF for function '{}' at 0x{:x}: {}",
+                                func_name, address, e
+                            );
+                            // Continue processing other addresses
+                        }
+                    }
+                }
+
+                // Log summary for this trace point
+                if successful_addresses > 0 && failed_addresses == 0 {
+                    info!(
+                        "All {} addresses for function '{}' processed successfully",
+                        successful_addresses, func_name
+                    );
+                } else if successful_addresses > 0 && failed_addresses > 0 {
+                    warn!(
+                        "Partial success for function '{}': {} successful, {} failed addresses",
+                        func_name, successful_addresses, failed_addresses
+                    );
+                } else {
+                    error!(
+                        "All {} addresses for function '{}' failed to process",
+                        failed_addresses, func_name
+                    );
+                    // Don't return error here - let the caller decide based on overall results
                 }
                 Ok(())
             }

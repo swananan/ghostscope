@@ -3,7 +3,7 @@ use anyhow::Result;
 use ghostscope_loader::GhostScopeLoader;
 use std::collections::HashMap;
 use tokio::sync::Notify;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Individual trace mount point (one PC / one eBPF program)
 #[derive(Debug)]
@@ -63,32 +63,88 @@ impl TraceInstance {
             self.binary_path
         );
 
-        // Attach all mount points
+        // Attach all mount points - continue even if some fail
+        let mut successful_attachments = 0;
+        let mut failed_attachments = 0;
+
         for (i, mount) in self.mounts.iter_mut().enumerate() {
             if mount.loader.is_uprobe_attached() {
                 warn!(
                     "Uprobe already attached for trace {} mount {}",
                     self.trace_id, i
                 );
+                successful_attachments += 1;
                 continue;
             } else if mount.loader.get_attachment_info().is_some() {
                 info!(
                     "Re-attaching uprobe for trace {} mount {} (program already loaded)",
                     self.trace_id, i
                 );
-                mount.loader.reattach_uprobe()?;
+                match mount.loader.reattach_uprobe() {
+                    Ok(_) => {
+                        successful_attachments += 1;
+                        info!(
+                            "✓ Successfully re-attached uprobe for trace {} mount {}",
+                            self.trace_id, i
+                        );
+                    }
+                    Err(e) => {
+                        failed_attachments += 1;
+                        error!(
+                            "❌ Failed to re-attach uprobe for trace {} mount {}: {}",
+                            self.trace_id, i, e
+                        );
+                    }
+                }
             } else {
                 info!(
                     "Attaching uprobe for trace {} mount {} at offset 0x{:x} using program '{}'",
                     self.trace_id, i, mount.uprobe_offset, mount.ebpf_function_name
                 );
-                mount.loader.attach_uprobe(
+                match mount.loader.attach_uprobe(
                     &self.binary_path,
                     &mount.ebpf_function_name,
                     Some(mount.uprobe_offset),
                     self.target_pid.map(|pid| pid as i32),
-                )?;
+                ) {
+                    Ok(_) => {
+                        successful_attachments += 1;
+                        info!(
+                            "✓ Successfully attached uprobe for trace {} mount {} at 0x{:x}",
+                            self.trace_id, i, mount.uprobe_offset
+                        );
+                    }
+                    Err(e) => {
+                        failed_attachments += 1;
+                        error!(
+                            "❌ Failed to attach uprobe for trace {} mount {} at 0x{:x}: {}",
+                            self.trace_id, i, mount.uprobe_offset, e
+                        );
+                    }
+                }
             }
+        }
+
+        // Log summary
+        if successful_attachments > 0 && failed_attachments == 0 {
+            info!(
+                "Trace {} enabled successfully with all {} mount(s)",
+                self.trace_id, successful_attachments
+            );
+        } else if successful_attachments > 0 && failed_attachments > 0 {
+            warn!(
+                "Trace {} partially enabled: {} successful, {} failed mount(s)",
+                self.trace_id, successful_attachments, failed_attachments
+            );
+        } else {
+            error!(
+                "Trace {} failed to enable: all {} mount(s) failed",
+                self.trace_id, failed_attachments
+            );
+            return Err(anyhow::anyhow!(
+                "All uprobe attachments failed for trace {}",
+                self.trace_id
+            ));
         }
 
         self.is_enabled = true;
