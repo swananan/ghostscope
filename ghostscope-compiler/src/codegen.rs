@@ -1185,7 +1185,6 @@ impl<'ctx> CodeGen<'ctx> {
                 );
 
                 // Extract variable size with fallback
-                let var_size = var_info.size.unwrap_or(8) as usize;
                 let ctx_param = self.get_current_function_ctx_param()?;
 
                 // First try to use new evaluation system
@@ -1202,26 +1201,6 @@ impl<'ctx> CodeGen<'ctx> {
                         compile_time_pc,
                     )?;
 
-                    self.build_and_send_protocol_message(
-                        var_name,
-                        &var_type,
-                        var_ptr,
-                        compile_time_pc,
-                    )
-                }
-                // Use pre-computed evaluation result (no re-evaluation needed)
-                else if let Some(evaluation_result) = &var_info.evaluation_result {
-                    let var_type = self
-                        .get_variable_type_from_dwarf(var_name, compile_time_pc)
-                        .unwrap_or(VarType::Int);
-
-                    // Generate LLVM code directly from EvaluationResult
-                    let var_ptr = self.execute_evaluation_result(
-                        ctx_param,
-                        evaluation_result,
-                        var_name,
-                        compile_time_pc,
-                    )?;
                     self.build_and_send_protocol_message(
                         var_name,
                         &var_type,
@@ -4044,9 +4023,7 @@ impl<'ctx> CodeGen<'ctx> {
         }
     }
 
-    /// Get variable type from DWARF information
-
-    /// NEW: Execute EvaluationResult with enhanced type safety
+    /// Execute EvaluationResult with enhanced type safety
     fn execute_evaluation_result(
         &mut self,
         ctx_param: PointerValue<'ctx>,
@@ -4269,6 +4246,7 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     /// Create register value access (register contains the value directly)
+    /// This is a simplified wrapper around create_register_variable_access
     fn create_register_value_access(
         &mut self,
         ctx_param: PointerValue<'ctx>,
@@ -4280,45 +4258,16 @@ impl<'ctx> CodeGen<'ctx> {
             var_name, register
         );
 
-        // Convert DWARF register number to pt_regs byte offset
-        let pt_regs_byte_offset =
-            platform::dwarf_reg_to_pt_regs_byte_offset(register).ok_or_else(|| {
-                CodeGenError::InvalidExpression(format!(
-                    "Unsupported DWARF register {} for current platform",
-                    register
-                ))
-            })?;
-
-        let i64_type = self.context.i64_type();
-        let i64_index = pt_regs_byte_offset / 8;
-        let reg_index_const = i64_type.const_int(i64_index as u64, false);
-
-        // Read the register value directly (not as an address)
-        let reg_ptr = unsafe {
-            self.builder
-                .build_gep(
-                    i64_type,
-                    ctx_param,
-                    &[reg_index_const],
-                    &format!("reg_{}_ptr", register),
-                )
-                .map_err(|e| {
-                    CodeGenError::Builder(format!("Failed to build GEP for register: {}", e))
-                })?
+        // Create a simplified RegisterAccess for direct register value access
+        let reg_access = ghostscope_binary::expression::RegisterAccess {
+            register,
+            offset: None,       // No offset for direct register value
+            dereference: false, // Don't dereference, we want the register value itself
+            size: Some(8),      // Default to 8 bytes
         };
 
-        let register_value = self
-            .builder
-            .build_load(i64_type, reg_ptr, &format!("reg_{}_value", register))
-            .map_err(|e| {
-                CodeGenError::Builder(format!("Failed to build load for register: {}", e))
-            })?;
-
-        // For register values, create immediate access since we have the value
-        let int_value = register_value.into_int_value();
-        // Convert LLVM IntValue to i64 for create_immediate_value_access
-        let value_i64 = int_value.get_sign_extended_constant().unwrap_or(0);
-        self.create_immediate_value_access(value_i64, var_name)
+        // Reuse the existing implementation
+        self.create_register_variable_access(&reg_access, var_name, ctx_param)
     }
 
     /// Create register address access (register + offset = address to dereference)

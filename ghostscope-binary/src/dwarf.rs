@@ -925,8 +925,6 @@ impl DwarfContext {
             dwarf,
             _file_data: file_data,
             base_addresses,
-            eh_frame,
-            debug_frame,
             cfi_context,
             line_lookup: None,
             file_registry: None,
@@ -3464,9 +3462,10 @@ impl DwarfContext {
         offset: gimli::LocationListsOffset<usize>,
     ) -> Option<LocationExpression> {
         debug!(
-            "Attempting to get location lists from DWARF context for offset 0x{:x}",
+            "Getting location lists for offset 0x{:x} (dwarf.locations method)",
             offset.0
         );
+
         let mut locations = match self.dwarf.locations(unit, offset) {
             Ok(locations) => {
                 debug!(
@@ -3510,10 +3509,10 @@ impl DwarfContext {
                         end_pc.saturating_sub(start_pc)
                     );
 
-                    // Check for zero-length ranges
+                    // Check for zero-length ranges - these are valid in DWARF (point locations)
                     if start_pc == end_pc {
                         debug!(
-                            "  Warning: Zero-length address range [0x{:x}, 0x{:x})",
+                            "  Zero-length address range [0x{:x}, 0x{:x}) - point location",
                             start_pc, end_pc
                         );
                     }

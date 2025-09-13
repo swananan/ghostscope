@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 # ELF and DWARF parsing
 object = "0.36"
-gimli = "0.31"
+gimli = { path = "/mnt/500g/code/gimli" }
 addr2line = "0.24"
 
 # Error handling and logging
