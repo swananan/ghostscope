@@ -1,4 +1,3 @@
-use crate::trace::{TraceManager, TraceStatus};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
@@ -31,7 +30,7 @@ pub enum InputState {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CommandType {
-    Script { trace_id: u32 },
+    Script,
     Enable { trace_id: u32 },
     Disable { trace_id: u32 },
     Delete { trace_id: u32 },
@@ -40,6 +39,7 @@ pub enum CommandType {
     DeleteAll,
     Info { target: String },
     InfoTrace { trace_id: Option<u32> },
+    InfoTraceAll,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -125,9 +125,6 @@ pub struct InteractiveCommandPanel {
     // UI state
     pub scroll_offset: usize,
 
-    // Trace management
-    pub trace_manager: TraceManager,
-
     // Backup of unsent input when navigating history (for Ctrl+n restore)
     unsent_input_backup: Option<String>,
 }
@@ -147,7 +144,6 @@ impl InteractiveCommandPanel {
             command_cursor_column: 0,
             static_lines: Vec::new(),
             scroll_offset: 0,
-            trace_manager: TraceManager::new(),
             styled_buffer: None,
             styled_at_history_index: None,
             unsent_input_backup: None,
@@ -458,15 +454,15 @@ impl InteractiveCommandPanel {
 
     /// Handle built-in commands and return response if handled
     /// Returns Some(response) for locally handled commands, None for commands that need external processing
-    fn handle_builtin_command(&self, command: &str) -> Option<String> {
+    fn handle_builtin_command(&mut self, command: &str) -> Option<String> {
         let cmd = command.trim();
 
         if cmd == "info" {
             // Show general info help
             Some(self.format_info_help())
         } else if cmd == "info trace" {
-            // Show trace status information
-            Some(self.format_trace_info())
+            // This will be handled as a runtime command, not a built-in
+            None
         } else if cmd.starts_with("info ") && !cmd.starts_with("info trace") {
             // info target commands (file:line or function) - these need to be sent to runtime
             None
@@ -483,13 +479,8 @@ impl InteractiveCommandPanel {
     }
 
     pub fn start_info_trace_request(&mut self, id_opt: Option<u32>) {
-        // Validate locally: if id is provided, ensure it exists in UI trace manager
-        if let Some(id) = id_opt {
-            if self.trace_manager.get_trace(id).is_none() {
-                self.add_response(format!("✗ Invalid trace id: {}", id), ResponseType::Error);
-                return;
-            }
-        }
+        // TODO: In the new architecture, validation will be done by ghostscope runtime
+        // We can remove local validation since ghostscope is the source of truth
 
         // Enter waiting state so input prompt is hidden until runtime responds
         self.input_state = InputState::WaitingResponse {
@@ -598,6 +589,13 @@ impl InteractiveCommandPanel {
             } else {
                 None // Empty target
             }
+        } else if cmd == "info trace" {
+            self.input_state = InputState::WaitingResponse {
+                command: command.to_string(),
+                sent_time: Instant::now(),
+                command_type: CommandType::InfoTraceAll,
+            };
+            Some(CommandAction::InfoTraceAll)
         } else {
             None
         }
@@ -606,37 +604,6 @@ impl InteractiveCommandPanel {
     /// Format general info help message
     fn format_info_help(&self) -> String {
         "Available commands:\n  info trace - Show current trace status\n  disable <id|all> - Disable trace(s)\n  enable <id|all> - Enable trace(s)\n  delete <id|all> - Delete trace(s) and all resources\n  trace <target> - Create new trace".to_string()
-    }
-
-    /// Format trace information using TraceManager
-    fn format_trace_info(&self) -> String {
-        let summary = self.trace_manager.get_summary();
-        let mut output = format!("Trace Status: {}\n", summary.format());
-
-        if summary.total > 0 {
-            output.push_str("\nTrace Details:\n");
-            let traces = self.trace_manager.get_all_traces();
-            for trace in traces {
-                output.push_str(&format!(
-                    "  {}\n",
-                    self.trace_manager.format_trace_info(trace)
-                ));
-                // Append mounts if available from runtime cache
-                if let Some(mounts) = self.trace_manager.get_mounts(trace.id) {
-                    output.push_str(&format!("    mounts ({}):\n", mounts.len()));
-                    for (i, (pc, prog)) in mounts.iter().enumerate() {
-                        output.push_str(&format!(
-                            "      - [{}] pc=0x{:x}, program={}\n",
-                            i, pc, prog
-                        ));
-                    }
-                }
-            }
-        } else {
-            output.push_str("No traces currently loaded.");
-        }
-
-        output
     }
 
     pub fn submit_command(&mut self) -> Option<CommandAction> {
@@ -845,19 +812,14 @@ impl InteractiveCommandPanel {
             self.update_static_lines();
 
             // 5.5. Create trace record when script is submitted (only for successful submissions)
-            let trace_id = self
-                .trace_manager
-                .add_trace(target.clone(), script_content.clone());
-            debug!(
-                "Created trace record with ID: {} for target: {}",
-                trace_id, target
-            );
+            // trace_id will be generated by ghostscope runtime
+            debug!("Submitting script for target: {}", target);
 
             // 6. Set waiting state - this hides input box but stays in Input mode
             self.input_state = InputState::WaitingResponse {
                 command: command.clone(),
                 sent_time: Instant::now(),
-                command_type: CommandType::Script { trace_id },
+                command_type: CommandType::Script,
             };
             debug!("Set input_state to WaitingResponse");
 
@@ -865,14 +827,8 @@ impl InteractiveCommandPanel {
                 "Before final check, script_cache exists = {}",
                 self.script_cache.is_some()
             );
-            debug!(
-                "Returning CommandAction::SubmitScript with trace_id: {}",
-                trace_id
-            );
-            Some(CommandAction::SubmitScript {
-                script: command,
-                trace_id,
-            })
+            debug!("Returning CommandAction::SubmitScript");
+            Some(CommandAction::SubmitScript { script: command })
         } else {
             debug!("No script cache found, returning None");
             debug!("script_cache is None, this might be the issue!");
@@ -887,30 +843,14 @@ impl InteractiveCommandPanel {
     ) {
         debug!(
             "handle_script_compilation_details called with trace_id {}, {}/{} successful",
-            details.trace_id, details.success_count, details.total_count
+            details.trace_ids.len(),
+            details.success_count,
+            details.total_count
         );
 
         // Update trace manager with the overall status
-        let overall_status = if details.success_count == details.total_count {
-            TraceStatus::Active
-        } else if details.success_count > 0 {
-            TraceStatus::Active // Partially successful is still considered active
-        } else {
-            TraceStatus::Failed
-        };
-
-        self.trace_manager.update_trace_status(
-            details.trace_id,
-            overall_status,
-            if details.failed_count > 0 {
-                Some(format!(
-                    "{}/{} targets failed",
-                    details.failed_count, details.total_count
-                ))
-            } else {
-                None
-            },
-        );
+        // In the new architecture, trace status is managed by ghostscope runtime
+        // The UI doesn't need to maintain local status - all status comes from the runtime
 
         // Always show detailed response regardless of input state
         // This ensures users see the compilation results even if the state has changed
@@ -930,10 +870,10 @@ impl InteractiveCommandPanel {
         }
     }
 
-    /// Update trace status when runtime provides feedback
+    /// Update trace status when runtime provides feedback - deprecated in new architecture
     pub fn update_trace_status(
         &mut self,
-        status: TraceStatus,
+        status: String, // Changed from TraceStatus to String
         trace_id: u32,
         error_message: Option<String>,
     ) {
@@ -942,22 +882,22 @@ impl InteractiveCommandPanel {
             status, trace_id, error_message
         );
 
-        self.trace_manager
-            .update_trace_status(trace_id, status.clone(), error_message.clone());
+        // Trace status is now managed by ghostscope runtime, not by UI
+        // This method call is deprecated in the new architecture
 
         // Update UI based on status change - only handle script-related status here
         // Other command types are handled by handle_command_completed/failed
         if let InputState::WaitingResponse { command_type, .. } = &self.input_state {
             match command_type {
-                CommandType::Script { .. } => {
+                CommandType::Script => {
                     // Only handle script compilation status changes
-                    match status {
-                        TraceStatus::Failed => {
+                    match status.as_str() {
+                        "Failed" => {
                             if let Some(error) = &error_message {
                                 self.add_error_response_and_clear_waiting(error);
                             }
                         }
-                        TraceStatus::Active => {
+                        "Active" => {
                             self.add_success_response_and_clear_waiting();
                         }
                         _ => {
@@ -1001,6 +941,9 @@ impl InteractiveCommandPanel {
                     Some(id) => format!("❌ Failed to get info for trace {}: {}", id, error),
                     None => format!("❌ Failed to get info for all traces: {}", error),
                 },
+                CommandType::InfoTraceAll => {
+                    format!("❌ Failed to get info for all traces: {}", error)
+                }
             };
 
             if let Some(last_item) = self.command_history.last_mut() {
@@ -1104,6 +1047,9 @@ impl InteractiveCommandPanel {
                     Some(id) => format!("✅ Trace {} info retrieved successfully", id),
                     None => "✅ All traces info retrieved successfully".to_string(),
                 },
+                CommandType::InfoTraceAll => {
+                    "✅ All traces info retrieved successfully".to_string()
+                }
             };
 
             if let Some(last_item) = self.command_history.last_mut() {
@@ -1133,6 +1079,10 @@ impl InteractiveCommandPanel {
                 }
                 CommandType::InfoTrace { .. } => {
                     // Info trace completion handled like other commands
+                    self.add_success_response_and_clear_waiting();
+                }
+                CommandType::InfoTraceAll => {
+                    // InfoTraceAll completion handled like other commands
                     self.add_success_response_and_clear_waiting();
                 }
                 _ => {
@@ -1165,7 +1115,7 @@ impl InteractiveCommandPanel {
     /// Cancel script editing and return to input mode
     pub fn cancel_script_editor(&mut self) {
         if self.mode == InteractionMode::ScriptEditor {
-            self.trace_manager.remove_latest_trace();
+            // In the new architecture, trace removal is handled by ghostscope runtime
 
             // Add termination message before switching modes
             self.add_response(
@@ -3231,7 +3181,7 @@ pub enum CommandAction {
     ExecuteCommand(String),
     EnterScriptMode(String),
     AddScriptLine(String),
-    SubmitScript { script: String, trace_id: u32 },
+    SubmitScript { script: String },
     CancelScript,
     DisableTrace(u32),
     EnableTrace(u32),
@@ -3240,4 +3190,5 @@ pub enum CommandAction {
     DeleteTrace(u32),
     DeleteAllTraces,
     InfoTarget { target: String },
+    InfoTraceAll, // Request all trace information from runtime
 }

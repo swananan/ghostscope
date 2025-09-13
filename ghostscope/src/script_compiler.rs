@@ -9,7 +9,6 @@ use tracing::{error, info};
 /// This function collects detailed results for each PC/target and returns comprehensive status
 pub async fn compile_and_load_script_for_tui(
     script: &str,
-    trace_id: u32,
     session: &mut GhostSession,
 ) -> Result<ScriptCompilationDetails> {
     // Step 1: Validate binary analyzer availability
@@ -39,7 +38,7 @@ pub async fn compile_and_load_script_for_tui(
         script,
         binary_analyzer,
         session.target_pid,
-        Some(trace_id),
+        None, // Let the system generate its own trace_id
         &save_options,
     ) {
         Ok(result) => result,
@@ -47,7 +46,7 @@ pub async fn compile_and_load_script_for_tui(
             error!("Script compilation failed: {}", e);
             // Return a compilation result with no uprobe configs but with error details
             return Ok(ScriptCompilationDetails {
-                trace_id,
+                trace_ids: vec![], // No traces generated on compilation failure
                 results: vec![ScriptExecutionResult {
                     pc_address: 0,
                     target_name: "script_compilation".to_string(),
@@ -196,8 +195,12 @@ pub async fn compile_and_load_script_for_tui(
         }
     }
 
-    // Step 6: Create trace instance only if we have successful mounts
-    let actual_trace_id = if !successful_mounts.is_empty() {
+    // Step 6: Create trace instances - one per successful target if multiple, or one combined if single target
+    let mut trace_ids = Vec::new();
+
+    if !successful_mounts.is_empty() {
+        // For now, create a single trace with all successful mounts
+        // Future enhancement could create separate traces per PC
         let trace_id = session.trace_manager.add_trace(
             compilation_result.target_info.clone(),
             script.to_string(),
@@ -219,7 +222,7 @@ pub async fn compile_and_load_script_for_tui(
                     "Successfully activated trace {} for target '{}' with {} mounts",
                     trace_id, target_display, success_count
                 );
-                Some(trace_id)
+                trace_ids.push(trace_id);
             }
             Err(e) => {
                 let error_msg = format!("Failed to activate trace {}: {}", trace_id, e);
@@ -243,13 +246,11 @@ pub async fn compile_and_load_script_for_tui(
                     "Trace activation failed, marking all {} targets as failed",
                     failed_count
                 );
-                None
             }
         }
     } else {
         info!("No successful mounts to create trace instance");
-        None
-    };
+    }
 
     // Step 8: Return detailed compilation results
     // If all targets failed, return an error instead of success
@@ -262,7 +263,7 @@ pub async fn compile_and_load_script_for_tui(
     let total_count = success_count + failed_count;
 
     let details = ScriptCompilationDetails {
-        trace_id: actual_trace_id.unwrap_or(trace_id), // Use provided trace_id if no actual trace created
+        trace_ids, // List of generated trace IDs
         results: execution_results,
         total_count,
         success_count,

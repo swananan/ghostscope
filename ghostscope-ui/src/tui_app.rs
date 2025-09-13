@@ -708,8 +708,8 @@ impl TuiApp {
                 info!("Added script line: {}", line);
                 // Script line added to panel, additional processing logic can be added here
             }
-            CommandAction::SubmitScript { script, trace_id } => {
-                info!("Submitting script id {}: {}", trace_id, script);
+            CommandAction::SubmitScript { script } => {
+                info!("Submitting script: {}", script);
 
                 // Parse the script to extract target and content
                 let parsed_script = self.parse_trace_script(&script);
@@ -721,13 +721,12 @@ impl TuiApp {
                     // Add the script content to display with formatting
                     self.add_script_display(&target_owned, &script_content_owned);
 
-                    // Send script to main program for processing (legacy mode without trace_id)
+                    // Send script to main program for processing
                     if let Err(e) =
                         self.event_registry
                             .command_sender
                             .send(RuntimeCommand::ExecuteScript {
                                 command: script.clone(),
-                                trace_id,
                             })
                     {
                         error!("Failed to send script: {}", e);
@@ -884,6 +883,25 @@ impl TuiApp {
                 } else {
                     self.interactive_command_panel.add_response(
                         format!("⏳ Getting debug info for '{}'...", target),
+                        ResponseType::Progress,
+                    );
+                }
+            }
+            CommandAction::InfoTraceAll => {
+                info!("Getting synchronized trace information");
+                if let Err(e) = self
+                    .event_registry
+                    .command_sender
+                    .send(RuntimeCommand::InfoTraceAll)
+                {
+                    error!("Failed to send info trace sync command: {}", e);
+                    self.interactive_command_panel.add_response(
+                        format!("✗ Failed to get trace info: {}", e),
+                        ResponseType::Error,
+                    );
+                } else {
+                    self.interactive_command_panel.add_response(
+                        "⏳ Getting all traces info...".to_string(),
                         ResponseType::Progress,
                     );
                 }
@@ -1072,27 +1090,15 @@ impl TuiApp {
                     .command_sender
                     .send(RuntimeCommand::RequestSourceCode);
             }
-            RuntimeStatus::ScriptCompilationCompleted { trace_id, details } => {
-                // Handle detailed script compilation results if available
-                if let Some(details) = details {
-                    self.interactive_command_panel
-                        .handle_script_compilation_details(details);
-                    info!(
-                        "✅ Script compilation completed with detailed results for trace_id: {:?}",
-                        trace_id
-                    );
-                } else {
-                    // Fallback to simple status update for backward compatibility
-                    self.interactive_command_panel.update_trace_status(
-                        crate::trace::TraceStatus::Active,
-                        trace_id,
-                        None,
-                    );
-                    info!(
-                        "✅ Script compilation completed successfully for trace_id: {:?}",
-                        trace_id
-                    );
-                }
+            RuntimeStatus::ScriptCompilationCompleted { details } => {
+                // Handle detailed script compilation results
+                let trace_ids = details.trace_ids.clone();
+                self.interactive_command_panel
+                    .handle_script_compilation_details(details);
+                info!(
+                    "✅ Script compilation completed with detailed results for trace_ids: {:?}",
+                    trace_ids
+                );
             }
             // Note: mount details after compilation will be shown via TraceInfo as needed
             RuntimeStatus::TraceInfo {
@@ -1130,7 +1136,7 @@ impl TuiApp {
                 ]));
 
                 // status with emoji + color
-                let emoji = crate::trace::TraceManager::status_emoji_from_str(&status);
+                let emoji = if status == "Active" { "✅" } else { "⏸️" };
                 let status_color = match status.to_ascii_lowercase().as_str() {
                     "active" => Color::Green,
                     "loading" => Color::Yellow,
@@ -1195,24 +1201,26 @@ impl TuiApp {
                 self.interactive_command_panel.cursor_position =
                     self.interactive_command_panel.input_text.len();
             }
-            RuntimeStatus::ScriptCompilationFailed { error, trace_id } => {
+            RuntimeStatus::ScriptCompilationFailed { error, target } => {
                 // Update trace status in the interactive panel
-                self.interactive_command_panel.update_trace_status(
-                    crate::trace::TraceStatus::Failed,
-                    trace_id,
-                    Some(error.clone()),
+                self.interactive_command_panel.add_response(
+                    format!(
+                        "❌ Script compilation failed for target '{}': {}",
+                        target, error
+                    ),
+                    ResponseType::Error,
                 );
 
                 error!(
-                    "💔 Script compilation failed for trace_id: {:?}, error: {}",
-                    trace_id, error
+                    "💔 Script compilation failed for target: {}, error: {}",
+                    target, error
                 );
             }
             RuntimeStatus::TraceEnabled { trace_id } => {
                 // Handle sync response for enable command and update trace status
                 self.interactive_command_panel.handle_command_completed();
                 self.interactive_command_panel.update_trace_status(
-                    crate::trace::TraceStatus::Active,
+                    "Active".to_string(),
                     trace_id,
                     None,
                 );
@@ -1222,7 +1230,7 @@ impl TuiApp {
                 // Handle sync response for disable command and update trace status
                 self.interactive_command_panel.handle_command_completed();
                 self.interactive_command_panel.update_trace_status(
-                    crate::trace::TraceStatus::Disabled,
+                    "Disabled".to_string(),
                     trace_id,
                     None,
                 );
@@ -1251,9 +1259,8 @@ impl TuiApp {
             RuntimeStatus::TraceDeleted { trace_id } => {
                 // Handle sync response for delete command and remove trace from UI
                 self.interactive_command_panel.handle_command_completed();
-                self.interactive_command_panel
-                    .trace_manager
-                    .remove_trace(trace_id);
+                // In the new architecture, trace removal is handled by ghostscope runtime
+                // UI no longer manages trace state directly
                 info!(
                     "Trace {} deleted successfully and removed from UI",
                     trace_id
@@ -1262,9 +1269,8 @@ impl TuiApp {
             RuntimeStatus::AllTracesDeleted { count } => {
                 // Handle sync response for delete all command and clear all traces
                 self.interactive_command_panel.handle_command_completed();
-                self.interactive_command_panel
-                    .trace_manager
-                    .clear_all_traces();
+                // In the new architecture, trace clearing is handled by ghostscope runtime
+                // UI no longer manages trace state directly
                 info!("All traces deleted successfully ({} traces)", count);
             }
             RuntimeStatus::TraceDeleteFailed { trace_id, error } => {
@@ -1280,11 +1286,68 @@ impl TuiApp {
                     .add_response(formatted_info, ResponseType::Success);
             }
             RuntimeStatus::InfoTargetFailed { target, error } => {
-                self.interactive_command_panel.handle_command_completed();
-                self.interactive_command_panel.add_response(
-                    format!("✗ Failed to get debug info for '{}': {}", target, error),
-                    ResponseType::Error,
+                self.interactive_command_panel.handle_command_failed(&error);
+                error!(
+                    "Failed to get debug info for target '{}': {}",
+                    target, error
                 );
+            }
+            RuntimeStatus::TraceInfoFailed { trace_id, error } => {
+                self.interactive_command_panel.handle_command_failed(&error);
+                error!("Failed to get info for trace {}: {}", trace_id, error);
+            }
+            RuntimeStatus::TraceInfoAll { summary, traces } => {
+                // Handle InfoTraceAll response and display trace information
+                self.interactive_command_panel.handle_command_completed();
+
+                // Format and display trace information
+                let mut response = format!(
+                    "📊 Trace Status: Total: {} | Active: {} | Disabled: {}\n",
+                    summary.total, summary.active, summary.disabled
+                );
+
+                if summary.total > 0 {
+                    response.push_str("\nTrace Details:\n");
+                    for trace in traces {
+                        response.push_str(&format!(
+                            "  {} [{}] {} - {} ({})\n",
+                            trace.status_emoji,
+                            trace.trace_id,
+                            trace.target_display,
+                            trace.status,
+                            trace.duration
+                        ));
+
+                        // Add script preview if available
+                        if let Some(script_preview) = &trace.script_preview {
+                            response.push_str(&format!("    Script: {}\n", script_preview));
+                        }
+
+                        // Add mount information
+                        if !trace.mounts.is_empty() {
+                            response.push_str(&format!("    Mounts ({}):\n", trace.mounts.len()));
+                            for (i, mount) in trace.mounts.iter().enumerate() {
+                                response.push_str(&format!(
+                                    "      [{}] PC=0x{:x} program={}\n",
+                                    i, mount.offset, mount.program
+                                ));
+                            }
+                        }
+
+                        // Add error message if available
+                        if let Some(error_msg) = &trace.error_message {
+                            response.push_str(&format!("    Error: {}\n", error_msg));
+                        }
+
+                        response.push('\n');
+                    }
+                } else {
+                    response.push_str("\nNo traces found.\n");
+                }
+
+                self.interactive_command_panel
+                    .add_response(response, ResponseType::Success);
+                info!("Trace info displayed successfully");
             }
             RuntimeStatus::Error(error) => {
                 // Handle sync failure for batch operations that send generic errors

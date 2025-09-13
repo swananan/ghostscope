@@ -2,6 +2,7 @@ use anyhow::Result;
 // use futures::future; // removed unused import
 use ghostscope_loader::GhostScopeLoader;
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 use tracing::{debug, error, info, warn};
 
@@ -46,6 +47,26 @@ impl TraceInstance {
             target_pid,
             is_enabled: false,
         }
+    }
+
+    /// Get trace status as string for display
+    pub fn status_string(&self) -> String {
+        if self.is_enabled {
+            "Active".to_string()
+        } else {
+            "Disabled".to_string()
+        }
+    }
+
+    /// Get script preview (first meaningful line)
+    pub fn script_preview(&self) -> Option<String> {
+        for line in self.script_content.lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && !trimmed.starts_with('{') && !trimmed.starts_with('}') {
+                return Some(trimmed.to_string());
+            }
+        }
+        None
     }
 
     /// Enable this trace instance (attach uprobe)
@@ -217,6 +238,59 @@ pub struct TraceSnapshot {
     pub mounts: Vec<(u64, String)>,
 }
 
+/// Summary statistics for all traces
+#[derive(Debug, Clone)]
+pub struct TraceSummary {
+    pub total: usize,
+    pub active: usize,
+    pub disabled: usize,
+}
+
+impl TraceSummary {
+    pub fn new() -> Self {
+        Self {
+            total: 0,
+            active: 0,
+            disabled: 0,
+        }
+    }
+
+    pub fn format(&self) -> String {
+        format!(
+            "Total: {} | Active: {} | Disabled: {}",
+            self.total, self.active, self.disabled
+        )
+    }
+}
+
+/// Formatted trace information for display
+#[derive(Debug, Clone)]
+pub struct FormattedTraceInfo {
+    pub trace_id: u32,
+    pub target_display: String,
+    pub status_emoji: String,
+    pub status_text: String,
+    pub duration: String,
+    pub script_preview: Option<String>,
+    pub mounts: Vec<(u64, String)>,
+    pub error_message: Option<String>,
+}
+
+impl FormattedTraceInfo {
+    pub fn format_line(&self) -> String {
+        let mut line = format!(
+            "{} [{}] {} - {} ({})",
+            self.status_emoji, self.trace_id, self.target_display, self.status_text, self.duration
+        );
+
+        if let Some(ref error) = self.error_message {
+            line.push_str(&format!(" - Error: {}", error));
+        }
+
+        line
+    }
+}
+
 /// Manager for all active trace instances
 #[derive(Debug)]
 pub struct TraceManager {
@@ -224,6 +298,8 @@ pub struct TraceManager {
     next_trace_id: u32,
     target_to_trace_id: HashMap<String, u32>, // Map target name to trace_id
     no_trace_wait_notify: Notify,             // Notify when first trace is successfully enabled
+    // Track creation timestamps for duration calculation
+    trace_created_times: HashMap<u32, u64>,
 }
 
 impl TraceManager {
@@ -233,6 +309,7 @@ impl TraceManager {
             next_trace_id: 0,
             target_to_trace_id: HashMap::new(),
             no_trace_wait_notify: Notify::new(),
+            trace_created_times: HashMap::new(),
         }
     }
 
@@ -248,6 +325,13 @@ impl TraceManager {
     ) -> u32 {
         let trace_id = self.next_trace_id;
         self.next_trace_id += 1;
+
+        // Record creation time
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.trace_created_times.insert(trace_id, now);
 
         // Create unique target key by combining target with trace_id
         // This allows multiple traces for the same target (e.g., same function/line)
@@ -288,6 +372,8 @@ impl TraceManager {
         if let Some(mut trace) = self.traces.remove(&trace_id) {
             // Remove from target mapping
             self.target_to_trace_id.remove(&trace.target);
+            // Remove creation time
+            self.trace_created_times.remove(&trace_id);
 
             // Disable all mounts if still active
             trace.disable().await?;
@@ -304,6 +390,8 @@ impl TraceManager {
         if let Some(trace) = self.traces.remove(&trace_id) {
             // Remove from target mapping
             self.target_to_trace_id.remove(&trace.target);
+            // Remove creation time
+            self.trace_created_times.remove(&trace_id);
 
             info!("Deleting trace {} and all associated resources", trace_id);
 
@@ -491,6 +579,109 @@ impl TraceManager {
                 .map(|m| (m.uprobe_offset, m.ebpf_function_name.clone()))
                 .collect(),
         })
+    }
+
+    /// Get summary statistics for all traces
+    pub fn get_summary(&self) -> TraceSummary {
+        let mut summary = TraceSummary::new();
+        summary.total = self.traces.len();
+
+        for trace in self.traces.values() {
+            if trace.is_enabled {
+                summary.active += 1;
+            } else {
+                summary.disabled += 1;
+            }
+        }
+
+        summary
+    }
+
+    /// Format duration since creation
+    fn format_duration(&self, trace_id: u32) -> String {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        if let Some(&created_time) = self.trace_created_times.get(&trace_id) {
+            let duration = now.saturating_sub(created_time);
+            if duration < 60 {
+                format!("{}s", duration)
+            } else if duration < 3600 {
+                format!("{}m{}s", duration / 60, duration % 60)
+            } else {
+                format!("{}h{}m", duration / 3600, (duration % 3600) / 60)
+            }
+        } else {
+            "unknown".to_string()
+        }
+    }
+
+    /// Get emoji for status
+    fn status_emoji(is_enabled: bool) -> &'static str {
+        if is_enabled {
+            "✅"
+        } else {
+            "⏸️"
+        }
+    }
+
+    /// Get formatted trace information for display
+    pub fn get_formatted_trace_info(&self, trace_id: u32) -> Option<FormattedTraceInfo> {
+        self.traces.get(&trace_id).map(|trace| {
+            FormattedTraceInfo {
+                trace_id,
+                target_display: trace.target_display.clone(),
+                status_emoji: Self::status_emoji(trace.is_enabled).to_string(),
+                status_text: trace.status_string(),
+                duration: self.format_duration(trace_id),
+                script_preview: trace.script_preview(),
+                mounts: trace
+                    .mounts
+                    .iter()
+                    .map(|m| (m.uprobe_offset, m.ebpf_function_name.clone()))
+                    .collect(),
+                error_message: None, // Currently not tracking errors in TraceManager
+            }
+        })
+    }
+
+    /// Get all formatted trace information
+    pub fn get_all_formatted_traces(&self) -> Vec<FormattedTraceInfo> {
+        let mut traces: Vec<_> = self
+            .traces
+            .keys()
+            .filter_map(|&id| self.get_formatted_trace_info(id))
+            .collect();
+
+        traces.sort_by_key(|t| t.trace_id);
+        traces
+    }
+
+    /// Format complete trace status information as string
+    pub fn format_all_traces_info(&self) -> String {
+        let summary = self.get_summary();
+        let mut output = format!("Trace Status: {}\n", summary.format());
+
+        if summary.total > 0 {
+            output.push_str("\nTrace Details:\n");
+            let traces = self.get_all_formatted_traces();
+            for trace in traces {
+                output.push_str(&format!("  {}\n", trace.format_line()));
+                // Add mount information
+                if !trace.mounts.is_empty() {
+                    output.push_str(&format!("    mounts ({}):\n", trace.mounts.len()));
+                    for (i, (pc, prog)) in trace.mounts.iter().enumerate() {
+                        output.push_str(&format!("      [{}] PC=0x{:x} program={}\n", i, pc, prog));
+                    }
+                }
+            }
+        } else {
+            output.push_str("No traces currently loaded.");
+        }
+
+        output
     }
 }
 

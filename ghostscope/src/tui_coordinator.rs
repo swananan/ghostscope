@@ -170,41 +170,39 @@ async fn run_runtime_coordinator(
             // Handle runtime commands
             Some(command) = runtime_channels.command_receiver.recv() => {
                 match command {
-                    RuntimeCommand::ExecuteScript { command: script, trace_id } => {
-                        info!("Executing script with trace_id {:?}: {}", trace_id, script);
+                    RuntimeCommand::ExecuteScript { command: script } => {
+                        info!("Executing script: {}", script);
 
                         if let Some(ref mut session) = session {
                             // Use the new TUI-specific compilation and loading with detailed results
                             match crate::script_compiler::compile_and_load_script_for_tui(
                                 &script,
-                                trace_id,
                                 session,
                             ).await {
                                 Ok(details) => {
-                                    info!("Script with trace_id {} compiled with detailed results: {:?} successful",
-                                          trace_id, details);
+                                    info!("Script compiled with detailed results: {:?} trace_ids generated, {:?} successful",
+                                          details.trace_ids.len(), details.success_count);
 
                                     // Types are now unified, no conversion needed
                                     let _ = runtime_channels.status_sender.send(RuntimeStatus::ScriptCompilationCompleted {
-                                        trace_id,
-                                        details: Some(details),
+                                        details,
                                     });
                                 }
                                 Err(e) => {
-                                    let _target = crate::script_compiler::extract_target_from_script(&script);
-                                    error!("Script compilation failed for trace_id {}: {}", trace_id, e);
+                                    let target = crate::script_compiler::extract_target_from_script(&script);
+                                    error!("Script compilation failed for target {}: {}", target, e);
                                     let _ = runtime_channels.status_sender.send(RuntimeStatus::ScriptCompilationFailed {
                                         error: e.to_string(),
-                                        trace_id,
+                                        target,
                                     });
                                 }
                             }
                         } else {
-                            let _target = crate::script_compiler::extract_target_from_script(&script);
+                            let target = crate::script_compiler::extract_target_from_script(&script);
                             warn!("No debug session available for script compilation");
                             let _ = runtime_channels.status_sender.send(RuntimeStatus::ScriptCompilationFailed {
                                 error: "No debug session available".to_string(),
-                                trace_id,
+                                target,
                             });
                         }
                     }
@@ -252,10 +250,66 @@ async fn run_runtime_coordinator(
                                     });
                                 } else {
                                     warn!("InfoTrace requested for non-existent trace {}", id);
+                                    // Send error status to UI for specific trace ID requests
+                                    if let Some(specific_id) = trace_id {
+                                        let _ = runtime_channels.status_sender.send(ghostscope_ui::events::RuntimeStatus::TraceInfoFailed {
+                                            trace_id: specific_id,
+                                            error: format!("Trace {} not found", specific_id),
+                                        });
+                                    }
                                 }
                             }
                         } else {
                             warn!("InfoTrace requested but no session available");
+                            // Send error status to UI for specific trace ID requests
+                            if let Some(specific_id) = trace_id {
+                                let _ = runtime_channels.status_sender.send(ghostscope_ui::events::RuntimeStatus::TraceInfoFailed {
+                                    trace_id: specific_id,
+                                    error: "No debug session available".to_string(),
+                                });
+                            }
+                        }
+                    }
+                    RuntimeCommand::InfoTraceAll => {
+                        if let Some(ref session) = session {
+                            let summary_info = session.trace_manager.get_summary();
+                            let trace_details = session.trace_manager.get_all_formatted_traces();
+
+                            let summary = ghostscope_ui::events::TraceSummaryInfo {
+                                total: summary_info.total,
+                                active: summary_info.active,
+                                disabled: summary_info.disabled,
+                            };
+
+                            let traces = trace_details
+                                .into_iter()
+                                .map(|t| ghostscope_ui::events::TraceDetailInfo {
+                                    trace_id: t.trace_id,
+                                    target_display: t.target_display,
+                                    status: t.status_text,
+                                    status_emoji: t.status_emoji,
+                                    duration: t.duration,
+                                    script_preview: t.script_preview,
+                                    mounts: t.mounts.into_iter().map(|(offset, program)| {
+                                        ghostscope_ui::events::TraceMountInfo { offset, program }
+                                    }).collect(),
+                                    error_message: t.error_message,
+                                })
+                                .collect();
+
+                            let _ = runtime_channels.status_sender.send(ghostscope_ui::events::RuntimeStatus::TraceInfoAll {
+                                summary,
+                                traces,
+                            });
+                        } else {
+                            let _ = runtime_channels.status_sender.send(ghostscope_ui::events::RuntimeStatus::TraceInfoAll {
+                                summary: ghostscope_ui::events::TraceSummaryInfo {
+                                    total: 0,
+                                    active: 0,
+                                    disabled: 0,
+                                },
+                                traces: vec![],
+                            });
                         }
                     }
                     RuntimeCommand::AttachToProcess(pid) => {

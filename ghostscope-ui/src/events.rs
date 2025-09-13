@@ -71,7 +71,7 @@ pub struct VariableDebugInfo {
 /// Commands that TUI can send to runtime
 #[derive(Debug, Clone)]
 pub enum RuntimeCommand {
-    ExecuteScript { command: String, trace_id: u32 },
+    ExecuteScript { command: String },
     AttachToProcess(u32),
     DetachFromProcess,
     ReloadBinary(String),
@@ -83,7 +83,8 @@ pub enum RuntimeCommand {
     DeleteTrace(u32),  // Completely delete specific trace and all resources
     DeleteAllTraces,   // Delete all traces and resources
     InfoTarget { target: String }, // Get debug info for a target (function or file:line)
-    InfoTrace { trace_id: Option<u32> }, // Get info for one/all traces
+    InfoTrace { trace_id: Option<u32> }, // Get info for one/all traces (individual messages)
+    InfoTraceAll,
     Shutdown,
 }
 
@@ -106,7 +107,7 @@ pub struct ScriptExecutionResult {
 /// Detailed compilation result for a script with multiple targets
 #[derive(Debug, Clone)]
 pub struct ScriptCompilationDetails {
-    pub trace_id: u32,
+    pub trace_ids: Vec<u32>, // List of generated trace IDs (one per successful compilation)
     pub results: Vec<ScriptExecutionResult>,
     pub total_count: usize,
     pub success_count: usize,
@@ -121,12 +122,11 @@ pub enum RuntimeStatus {
     },
     DwarfLoadingFailed(String),
     ScriptCompilationCompleted {
-        trace_id: u32,
-        details: Option<ScriptCompilationDetails>, // Optional for backward compatibility
+        details: ScriptCompilationDetails, // Now required, contains trace_ids
     },
     ScriptCompilationFailed {
         error: String,
-        trace_id: u32,
+        target: String, // Target instead of trace_id since we don't have trace_ids for failed compilations
     },
     UprobeAttached {
         function: String,
@@ -187,6 +187,16 @@ pub enum RuntimeStatus {
         script_preview: Option<String>,
         mounts: Vec<TraceMountInfo>,
     },
+    /// All trace info with structured data for UI rendering
+    TraceInfoAll {
+        summary: TraceSummaryInfo,
+        traces: Vec<TraceDetailInfo>,
+    },
+    /// Failed to get info for a specific trace
+    TraceInfoFailed {
+        trace_id: u32,
+        error: String,
+    },
     Error(String),
 }
 
@@ -194,6 +204,27 @@ pub enum RuntimeStatus {
 pub struct TraceMountInfo {
     pub offset: u64,
     pub program: String,
+}
+
+/// Summary information for all traces
+#[derive(Debug, Clone)]
+pub struct TraceSummaryInfo {
+    pub total: usize,
+    pub active: usize,
+    pub disabled: usize,
+}
+
+/// Detailed information for a specific trace
+#[derive(Debug, Clone)]
+pub struct TraceDetailInfo {
+    pub trace_id: u32,
+    pub target_display: String,
+    pub status: String,       // "Active", "Disabled", etc.
+    pub status_emoji: String, // "✅", "⏸️", etc.
+    pub duration: String,     // "5m32s", "1h5m", etc.
+    pub script_preview: Option<String>,
+    pub mounts: Vec<TraceMountInfo>,
+    pub error_message: Option<String>,
 }
 
 impl EventRegistry {
