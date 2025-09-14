@@ -35,27 +35,31 @@ pub async fn run_command_line_runtime(parsed_args: ParsedArgs) -> Result<()> {
 
     // Step 4: Validate binary analysis
     if parsed_args.pid.is_some() || parsed_args.binary_path.is_some() {
-        match session.get_debug_info() {
-            Some(debug_info) => {
-                info!("✓ Binary analysis successful");
-                info!("  Path: {}", debug_info.binary_path.display());
-                info!("  Debug info: {:?}", debug_info.debug_path);
-                info!("  Has symbols: {}", debug_info.has_symbols);
-                info!("  Has debug info: {}", debug_info.has_debug_info);
-                info!("  Entry point: {:?}", debug_info.entry_point);
-                info!("  Base address: 0x{:x}", debug_info.base_address);
+        match session.get_module_stats() {
+            Some(stats) => {
+                info!("✓ Process analysis successful");
+                info!("  Total modules: {}", stats.total_modules);
+                info!("  Executable modules: {}", stats.executable_modules);
+                info!("  Library modules: {}", stats.library_modules);
+                info!("  Total symbols: {}", stats.total_symbols);
+                info!(
+                    "  Modules with debug info: {}",
+                    stats.modules_with_debug_info
+                );
 
                 // For source line tracing, we need debug info
-                if !debug_info.has_debug_info {
-                    warn!("Warning: No debug information available. Source line tracing (trace file.c:line) will not work.");
+                if stats.modules_with_debug_info == 0 {
+                    warn!("Warning: No debug information available in any module. Source line tracing (trace file.c:line) will not work.");
                     warn!("To enable source line tracing, compile your target with debug symbols (-g flag).");
+                } else {
+                    info!("✓ Debug information available for source line tracing");
                 }
             }
             None => {
                 return Err(anyhow::anyhow!(
-                    "Binary analysis failed! Cannot proceed without binary information for PID or binary path. \
+                    "Process analysis failed! Cannot proceed without process information. \
                     Possible solutions: 1. Check that PID {} exists: ps -p {}, \
-                    2. Check binary path permissions, 3. Run with sudo if needed for process access",
+                    2. Check process permissions, 3. Run with sudo if needed for /proc access",
                     parsed_args.pid.unwrap_or(0),
                     parsed_args.pid.unwrap_or(0)
                 ));
@@ -66,7 +70,7 @@ pub async fn run_command_line_runtime(parsed_args: ParsedArgs) -> Result<()> {
     }
 
     // Step 5: Show available functions for user reference
-    if let Some(_debug_info) = session.get_debug_info() {
+    if let Some(_stats) = session.get_module_stats() {
         let functions = session.list_functions();
         if !functions.is_empty() {
             info!("Available functions (showing first 10):");
@@ -84,13 +88,17 @@ pub async fn run_command_line_runtime(parsed_args: ParsedArgs) -> Result<()> {
         save_llvm_ir: parsed_args.should_save_llvm_ir,
         save_ast: parsed_args.should_save_ast,
         save_ebpf: parsed_args.should_save_ebpf,
-        binary_path_hint: session.get_debug_info().map(|info| {
-            info.binary_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown")
-                .to_string()
-        }),
+        binary_path_hint: session
+            .process_analyzer
+            .as_ref()
+            .and_then(|analyzer| analyzer.get_main_executable())
+            .map(|main_module| {
+                std::path::Path::new(&main_module.path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+                    .to_string()
+            }),
     };
 
     crate::script_compiler::compile_and_load_script_for_cli(
@@ -249,14 +257,10 @@ pub fn validate_statement(index: usize, stmt: &ghostscope_compiler::ast::Stateme
 
 /// Get binary path for file naming from session
 pub fn binary_path_for_session(session: &GhostSession) -> Option<String> {
-    if let Some(ref analyzer) = session.binary_analyzer {
-        Some(
-            analyzer
-                .debug_info()
-                .binary_path
-                .to_string_lossy()
-                .to_string(),
-        )
+    if let Some(ref analyzer) = session.process_analyzer {
+        analyzer
+            .get_main_executable()
+            .map(|main_module| main_module.path.clone())
     } else {
         session.target_binary.clone()
     }

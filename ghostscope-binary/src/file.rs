@@ -5,7 +5,7 @@ use tracing::debug;
 
 /// Compilation unit information with associated directories and files
 #[derive(Debug, Clone)]
-pub struct CompilationUnit {
+pub(crate) struct CompilationUnit {
     /// Name of the compilation unit (typically the main source file)
     pub name: String,
     /// Base directory for this compilation unit
@@ -18,7 +18,7 @@ pub struct CompilationUnit {
 
 /// Directory information within a compilation unit
 #[derive(Debug, Clone)]
-pub struct Directory {
+pub(crate) struct Directory {
     /// Directory path
     pub path: String,
     /// Files within this directory
@@ -27,7 +27,7 @@ pub struct Directory {
 
 /// Source file information extracted from DWARF debug info
 #[derive(Debug, Clone)]
-pub struct SourceFile {
+pub(crate) struct SourceFile {
     /// File index from DWARF line program
     pub file_index: u64,
     /// Compilation unit this file belongs to
@@ -45,7 +45,7 @@ pub struct SourceFile {
 /// Comprehensive source file manager for DWARF debug information
 /// Properly manages the hierarchy: Compilation Units -> Directories -> Files
 #[derive(Debug)]
-pub struct SourceFileManager {
+pub(crate) struct SourceFileManager {
     /// All compilation units indexed by name
     compilation_units: HashMap<String, CompilationUnit>,
     /// All source files indexed by file_index for fast lookup

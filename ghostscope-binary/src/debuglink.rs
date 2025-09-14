@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
 /// Find debug information file using various methods
-pub fn find_debug_info<P: AsRef<Path>>(binary_path: P) -> Result<Option<PathBuf>> {
+pub(crate) fn find_debug_info<P: AsRef<Path>>(binary_path: P) -> Result<Option<PathBuf>> {
     let binary_path = binary_path.as_ref();
     info!("Searching for debug info for: {}", binary_path.display());
 
@@ -220,7 +220,7 @@ fn try_build_id_path<P: AsRef<Path>>(_binary_path: P) -> Option<PathBuf> {
 
 /// Verify CRC32 checksum of debug file (placeholder)
 /// TODO: Implement actual CRC32 verification
-pub fn _verify_debug_crc(debug_path: &Path, expected_crc: u32) -> Result<bool> {
+pub(crate) fn _verify_debug_crc(debug_path: &Path, expected_crc: u32) -> Result<bool> {
     debug!(
         "TODO: Verify CRC32 {:08x} for {}",
         expected_crc,

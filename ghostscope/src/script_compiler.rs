@@ -10,19 +10,21 @@ pub async fn compile_and_load_script_for_tui(
     script: &str,
     session: &mut GhostSession,
 ) -> Result<ScriptCompilationDetails> {
-    // Step 1: Validate binary analyzer availability
-    let binary_analyzer = session
-        .binary_analyzer
+    // Step 1: Validate process analyzer availability
+    let process_analyzer = session
+        .process_analyzer
         .as_mut()
-        .ok_or_else(|| anyhow::anyhow!("Binary analyzer is required for script compilation"))?;
+        .ok_or_else(|| anyhow::anyhow!("Process analyzer is required for script compilation"))?;
 
     // Step 2: Configure save options (no file saving in TUI mode)
-    let binary_path_hint = binary_analyzer
-        .debug_info()
-        .binary_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .map(|s| s.to_string());
+    let binary_path_hint = if let Some(main_module) = process_analyzer.get_main_executable() {
+        std::path::Path::new(&main_module.path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+    } else {
+        Some("ghostscope".to_string())
+    };
 
     let save_options = ghostscope_compiler::SaveOptions {
         save_llvm_ir: false,
@@ -31,11 +33,11 @@ pub async fn compile_and_load_script_for_tui(
         binary_path_hint,
     };
 
-    // Step 3: Use unified compilation interface
+    // Step 3: Use unified compilation interface with ProcessAnalyzer
     // Handle compilation errors gracefully - some trace points might still succeed
     let compilation_result = match ghostscope_compiler::compile_script(
         script,
-        binary_analyzer,
+        process_analyzer,
         session.target_pid,
         None, // Let the system generate its own trace_id
         &save_options,
@@ -72,11 +74,11 @@ pub async fn compile_and_load_script_for_tui(
     }
 
     // Step 4: Get binary path for trace instances
-    let binary_path = binary_analyzer
-        .debug_info()
-        .binary_path
-        .to_string_lossy()
-        .to_string();
+    let binary_path = if let Some(main_module) = process_analyzer.get_main_executable() {
+        main_module.path.clone()
+    } else {
+        return Err(anyhow::anyhow!("No main executable found in process"));
+    };
 
     // Step 5: Process compilation results at PC level for detailed error reporting
     let mut execution_results: Vec<ScriptExecutionResult> = Vec::new();
@@ -91,18 +93,23 @@ pub async fn compile_and_load_script_for_tui(
         "unknown_target".to_string()
     };
 
+    // Move uprobe_configs out of compilation_result to avoid borrow checker issues
+    let mut uprobe_configs = compilation_result.uprobe_configs;
+
     // Create mapping from PC address to uprobe config for successful compilations
     let mut pc_to_config: std::collections::HashMap<u64, ghostscope_compiler::UProbeConfig> =
         std::collections::HashMap::new();
-    for mut config in compilation_result.uprobe_configs {
+
+    // First collect all configs for later processing and create PC mapping
+    for config in &mut uprobe_configs {
         config.binary_path = binary_path.clone();
         if let Some(pc_address) = config.uprobe_offset {
-            pc_to_config.insert(pc_address, config);
+            pc_to_config.insert(pc_address, config.clone());
         }
     }
 
     // Handle empty PC results (edge case)
-    if compilation_result.pc_results.is_empty() {
+    if uprobe_configs.is_empty() {
         info!("No PC compilation results available, checking if there are any uprobe configs");
         if pc_to_config.is_empty() {
             return Err(anyhow::anyhow!(
@@ -112,18 +119,26 @@ pub async fn compile_and_load_script_for_tui(
     }
 
     // Check if we have multiple PCs to determine naming strategy
-    let has_multiple_pcs = compilation_result.pc_results.len() > 1;
+    let has_multiple_pcs = uprobe_configs.len() > 1;
 
     // Process each PC compilation result
-    for pc_result in compilation_result.pc_results {
-        let pc_address = pc_result.pc_address;
+    for pc_result in uprobe_configs {
+        let pc_address = pc_result.function_address.unwrap_or(0);
         let target_name = if has_multiple_pcs {
-            format!("{} (PC: 0x{:x})", pc_result.target_name, pc_address)
+            format!(
+                "{} (PC: 0x{:x})",
+                pc_result.function_name.as_deref().unwrap_or("unknown"),
+                pc_address
+            )
         } else {
-            pc_result.target_name
+            pc_result
+                .function_name
+                .as_deref()
+                .unwrap_or("unknown")
+                .to_string()
         };
 
-        if pc_result.success {
+        if !pc_result.ebpf_bytecode.is_empty() {
             // Compilation succeeded - try to create eBPF loader and mount
             if let Some(config) = pc_to_config.remove(&pc_address) {
                 info!(
@@ -173,10 +188,8 @@ pub async fn compile_and_load_script_for_tui(
                 failed_count += 1;
             }
         } else {
-            // Compilation failed - use the error message from pc_result
-            let error_msg = pc_result
-                .error_message
-                .unwrap_or_else(|| "Unknown compilation error".to_string());
+            // Compilation failed - eBPF bytecode is empty
+            let error_msg = "eBPF bytecode generation failed".to_string();
             error!(
                 "❌ Failed to compile target '{}' at 0x{:x}: {}",
                 target_name, pc_address, error_msg
@@ -305,22 +318,22 @@ pub async fn compile_and_load_script_for_cli(
 ) -> Result<()> {
     info!("Starting unified script compilation with DWARF integration...");
 
-    // Step 1: Validate binary analyzer
-    let binary_analyzer = session
-        .binary_analyzer
+    // Step 1: Validate process analyzer
+    let process_analyzer = session
+        .process_analyzer
         .as_mut()
-        .ok_or_else(|| anyhow::anyhow!("Binary analyzer is required for script compilation"))?;
+        .ok_or_else(|| anyhow::anyhow!("Process analyzer is required for script compilation"))?;
 
-    let binary_path_string = binary_analyzer
-        .debug_info()
-        .binary_path
-        .to_string_lossy()
-        .to_string();
+    let binary_path_string = if let Some(main_module) = process_analyzer.get_main_executable() {
+        main_module.path.clone()
+    } else {
+        return Err(anyhow::anyhow!("No main executable found in process"));
+    };
 
-    // Step 2: Use unified compilation interface
+    // Step 2: Use unified compilation interface with ProcessAnalyzer
     let compilation_result = ghostscope_compiler::compile_script(
         script,
-        binary_analyzer,
+        process_analyzer,
         session.target_pid,
         None, // Command line mode doesn't have specific trace_id, use default
         save_options,

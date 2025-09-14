@@ -8,7 +8,7 @@ pub mod parser;
 use crate::ast_compiler::AstCompiler;
 use codegen::CodeGenError;
 use parser::ParseError;
-use tracing::info;
+use tracing::{info, warn};
 
 pub fn hello() -> &'static str {
     "Hello from ghostscope-compiler!"
@@ -32,7 +32,7 @@ pub enum CompileError {
 pub type Result<T> = std::result::Result<T, CompileError>;
 
 // Public re-exports from ast_compiler module
-pub use ast_compiler::{CompilationResult, PCCompilationResult, UProbeConfig};
+pub use ast_compiler::{CompilationResult, UProbeConfig};
 
 /// Save options for compilation output
 #[derive(Debug, Clone)]
@@ -54,53 +54,40 @@ impl Default for SaveOptions {
     }
 }
 
-/// Main compilation interface - replaces all the old messy functions
+/// Main compilation interface with ProcessAnalyzer (multi-module support)
 ///
-/// This is the new unified interface that uses AstCompiler internally
-/// to perform single-pass AST traversal with integrated DWARF queries and code generation
+/// This is the new multi-module interface that uses ProcessAnalyzer
+/// to perform compilation across main executable and dynamic libraries
 pub fn compile_script(
     script_source: &str,
-    binary_analyzer: &mut ghostscope_binary::BinaryAnalyzer,
+    process_analyzer: &mut ghostscope_binary::ProcessAnalyzer,
     pid: Option<u32>,
     trace_id: Option<u32>,
     save_options: &SaveOptions,
 ) -> Result<CompilationResult> {
-    info!("Starting unified script compilation with new AstCompiler");
+    info!("Starting unified script compilation with ProcessAnalyzer (multi-module support)");
 
     // Step 1: Parse script to AST
     let program = parser::parse(script_source)?;
     info!("Parsed script with {} statements", program.statements.len());
 
-    // Step 2: Use new AstCompiler for unified compilation
+    // Step 2: Use AstCompiler with full ProcessAnalyzer integration
     let mut compiler = AstCompiler::new(
-        Some(binary_analyzer),
+        Some(process_analyzer),
         save_options.binary_path_hint.clone(),
         trace_id,
     );
 
+    // Step 3: Compile using unified interface
     let result = compiler.compile_program(&program, pid)?;
+
     info!(
-        "Compilation completed: {} uprobe configs generated",
+        "Successfully compiled script: {} trace points, {} uprobe configs",
+        result.trace_count,
         result.uprobe_configs.len()
     );
 
     Ok(result)
-}
-
-/// Legacy interface for backward compatibility - parses source and compiles
-pub fn compile_source_to_ebpf(source: &str) -> Result<Vec<u8>> {
-    let program = parser::parse(source)?;
-
-    let mut compiler = AstCompiler::new(None, None, None);
-    let result = compiler.compile_program(&program, None)?;
-
-    if result.uprobe_configs.is_empty() {
-        return Err(CompileError::LLVM(
-            "No uprobe configurations generated".to_string(),
-        ));
-    }
-
-    Ok(result.uprobe_configs[0].ebpf_bytecode.clone())
 }
 
 /// Print AST for debugging

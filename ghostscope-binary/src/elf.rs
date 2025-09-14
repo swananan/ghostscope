@@ -5,7 +5,7 @@ use tracing::{debug, info, warn};
 
 /// ELF file information
 #[derive(Debug, Clone)]
-pub struct ElfInfo {
+pub(crate) struct ElfInfo {
     pub entry_point: u64,
     pub base_address: u64,
     pub architecture: String,
@@ -15,7 +15,7 @@ pub struct ElfInfo {
 }
 
 /// Parse ELF file and extract basic information
-pub fn parse_elf<P: AsRef<Path>>(path: P) -> Result<ElfInfo> {
+pub(crate) fn parse_elf<P: AsRef<Path>>(path: P) -> Result<ElfInfo> {
     let path = path.as_ref();
     info!("Parsing ELF file: {}", path.display());
 
@@ -84,7 +84,10 @@ fn has_debug_information(object_file: &object::File) -> bool {
 }
 
 /// Extract section data by name
-pub fn get_section_data<P: AsRef<Path>>(path: P, section_name: &str) -> Result<Option<Vec<u8>>> {
+pub(crate) fn get_section_data<P: AsRef<Path>>(
+    path: P,
+    section_name: &str,
+) -> Result<Option<Vec<u8>>> {
     let path = path.as_ref();
     let file_data = std::fs::read(path)?;
     let object_file = object::File::parse(&*file_data)?;
@@ -111,7 +114,7 @@ pub fn get_section_data<P: AsRef<Path>>(path: P, section_name: &str) -> Result<O
 }
 
 /// Get all section names in the ELF file
-pub fn list_sections<P: AsRef<Path>>(path: P) -> Result<Vec<String>> {
+pub(crate) fn list_sections<P: AsRef<Path>>(path: P) -> Result<Vec<String>> {
     let path = path.as_ref();
     let file_data = std::fs::read(path)?;
     let object_file = object::File::parse(&*file_data)?;
@@ -129,7 +132,7 @@ pub fn list_sections<P: AsRef<Path>>(path: P) -> Result<Vec<String>> {
 }
 
 /// Check if ELF file has specific section
-pub fn has_section<P: AsRef<Path>>(path: P, section_name: &str) -> Result<bool> {
+pub(crate) fn has_section<P: AsRef<Path>>(path: P, section_name: &str) -> Result<bool> {
     let path = path.as_ref();
     let file_data = std::fs::read(path)?;
     let object_file = object::File::parse(&*file_data)?;

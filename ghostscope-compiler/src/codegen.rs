@@ -12,7 +12,6 @@ use inkwell::values::{
     BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, IntValue, PointerValue,
 };
 use inkwell::AddressSpace;
-use inkwell::Either;
 use inkwell::OptimizationLevel;
 use std::collections::HashMap;
 use tracing::{debug, error, info, warn};
@@ -20,8 +19,7 @@ use tracing::{debug, error, info, warn};
 use crate::ast::{BinaryOp, Expr, Program, Statement, VarType, VariableContext};
 use crate::debug_logger::DebugLogger;
 use crate::map::MapManager;
-use ghostscope_binary::dwarf::{DwarfEncoding, DwarfType};
-use ghostscope_binary::expression::AccessStep;
+use ghostscope_binary::{AccessStep, DwarfEncoding, DwarfType};
 use ghostscope_protocol::platform;
 use ghostscope_protocol::{consts, MessageType, TypeEncoding};
 
@@ -40,9 +38,9 @@ pub struct CodeGen<'ctx> {
     variable_context: Option<VariableContext>, // Variable scope context for validation
     pending_dwarf_variables: Option<Vec<ghostscope_binary::EnhancedVariableLocation>>, // DWARF variables awaiting population
     debug_logger: DebugLogger<'ctx>,
-    binary_analyzer: Option<*mut ghostscope_binary::BinaryAnalyzer>, // CFI and DWARF information access
+    process_analyzer: Option<*mut ghostscope_binary::ProcessAnalyzer>, // Multi-module process analyzer
     current_trace_id: Option<u32>, // Current trace_id being compiled
-    current_compile_time_pc: Option<u64>, // PC address from source line for DWARF queries
+    current_compile_time_context: Option<CompileTimeContext>, // PC address and module for DWARF queries
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -81,15 +79,22 @@ pub enum CodeGenError {
 
 pub type Result<T> = std::result::Result<T, CodeGenError>;
 
+/// Compile-time context containing PC address and module information for DWARF queries
+#[derive(Debug, Clone)]
+pub struct CompileTimeContext {
+    pub pc_address: u64,
+    pub module_path: String,
+}
+
 impl<'ctx> CodeGen<'ctx> {
     pub fn new(context: &'ctx Context, module_name: &str) -> Self {
-        Self::new_with_binary_analyzer(context, module_name, None)
+        Self::new_with_process_analyzer(context, module_name, None)
     }
 
-    pub fn new_with_binary_analyzer(
+    pub fn new_with_process_analyzer(
         context: &'ctx Context,
         module_name: &str,
-        binary_analyzer: Option<&mut ghostscope_binary::BinaryAnalyzer>,
+        process_analyzer: Option<&mut ghostscope_binary::ProcessAnalyzer>,
     ) -> Self {
         let module = context.create_module(module_name);
         let builder = context.create_builder();
@@ -114,59 +119,47 @@ impl<'ctx> CodeGen<'ctx> {
             )
             .expect("Failed to create target machine");
 
-        // Get data layout from target machine
+        // Set module data layout and triple
         let data_layout = target_machine.get_target_data().get_data_layout();
-
-        // Set module target data layout and triple
         module.set_data_layout(&data_layout);
         module.set_triple(&triple);
 
-        // Set debug info version for BTF compatibility
-        let debug_version = context.i32_type().const_int(3, false); // DWARF version 3 for BTF
-        let debug_version_md = context.metadata_node(&[debug_version.into()]);
-        module.add_metadata_flag(
-            "Debug Info Version",
-            inkwell::module::FlagBehavior::Warning,
-            debug_version_md,
-        );
-
-        // Create debug info builder for BTF/DWARF generation
+        // Initialize debug info
         let (di_builder, compile_unit) = module.create_debug_info_builder(
             true,                                         // allow_unresolved
-            inkwell::debug_info::DWARFSourceLanguage::C,  // Use C language for BPF compatibility
-            "ghostscope_generated",                       // filename
-            "/",                                          // directory
-            "GhostScope Compiler v0.1.0",                 // producer
+            inkwell::debug_info::DWARFSourceLanguage::C,  // language
+            "ghostscope_generated.c",                     // filename
+            ".",                                          // directory
+            "ghostscope-compiler",                        // producer
             false,                                        // is_optimized
-            "-g",                                         // flags - enable debug info generation
-            5,  // runtime_version - use DWARF version 5 for BTF compatibility
-            "", // split_name
+            "",                                           // flags
+            1,                                            // runtime_version
+            "",                                           // split_name
             inkwell::debug_info::DWARFEmissionKind::Full, // kind
-            0,  // dwo_id
-            false, // split_debug_inlining
-            false, // debug_info_for_profiling
-            "", // sys_root
-            "", // sdk
+            0,                                            // dwo_id
+            false,                                        // split_debug_inlining
+            false,                                        // debug_info_for_profiling
+            "",                                           // sysroot
+            "",                                           // sdk
         );
 
-        CodeGen {
+        Self {
             context,
             module,
             builder,
             di_builder,
             compile_unit,
-            // TODO: Remove these legacy fields after migration to runtime access
             variables: HashMap::new(),
             var_types: HashMap::new(),
             optimized_out_vars: HashMap::new(),
             var_pc_addresses: HashMap::new(),
             map_manager,
-            variable_context: None, // Will be set later when trace point context is available
-            pending_dwarf_variables: None, // Will be set when DWARF variables are prepared
+            variable_context: None,
+            pending_dwarf_variables: None,
             debug_logger: DebugLogger::new(context),
-            binary_analyzer: binary_analyzer.map(|ba| ba as *const _ as *mut _),
-            current_trace_id: None,        // Will be set during compilation
-            current_compile_time_pc: None, // Will be set when processing trace statements
+            process_analyzer: process_analyzer.map(|pa| pa as *const _ as *mut _),
+            current_trace_id: None,
+            current_compile_time_context: None,
         }
     }
 
@@ -175,12 +168,12 @@ impl<'ctx> CodeGen<'ctx> {
         self.variable_context = Some(context);
     }
 
-    /// Set the binary analyzer for DWARF and CFI information access
-    pub fn set_binary_analyzer(
+    /// Set the process analyzer for multi-module DWARF and CFI information access
+    pub fn set_process_analyzer(
         &mut self,
-        binary_analyzer: Option<&mut ghostscope_binary::BinaryAnalyzer>,
+        process_analyzer: Option<&mut ghostscope_binary::ProcessAnalyzer>,
     ) {
-        self.binary_analyzer = binary_analyzer.map(|ba| ba as *const _ as *mut _);
+        self.process_analyzer = process_analyzer.map(|pa| pa as *const _ as *mut _);
     }
 
     /// Prepare DWARF variables for later population during compilation
@@ -455,11 +448,20 @@ impl<'ctx> CodeGen<'ctx> {
         target_pid: Option<u32>,
         trace_id: Option<u32>,
         compile_time_pc: Option<u64>, // PC address for compile-time DWARF queries
+        module_path: Option<&str>,    // Module path for compile-time DWARF queries
         save_ir_path: Option<&str>,
     ) -> Result<&Module<'ctx>> {
-        // Set the current trace_id and compile-time PC for code generation
+        // Set the current trace_id and compile-time context for code generation
         self.current_trace_id = trace_id;
-        self.current_compile_time_pc = compile_time_pc;
+        self.current_compile_time_context =
+            if let (Some(pc), Some(path)) = (compile_time_pc, module_path) {
+                Some(CompileTimeContext {
+                    pc_address: pc,
+                    module_path: path.to_string(),
+                })
+            } else {
+                None
+            };
 
         // Declare all external functions
         self.declare_external_functions();
@@ -633,7 +635,8 @@ impl<'ctx> CodeGen<'ctx> {
             &program.statements,
             None,
             None,
-            None,
+            None, // compile_time_pc
+            None, // module_path
             None,
         )
     }
@@ -1094,74 +1097,56 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
-    /// Get compile-time PC address for DWARF queries
+    /// Get compile-time PC address for DWARF queries (legacy method)
     fn get_compile_time_pc_address(&self) -> Result<u64> {
-        self.current_compile_time_pc.ok_or_else(|| {
+        self.current_compile_time_context
+            .as_ref()
+            .map(|ctx| ctx.pc_address)
+            .ok_or_else(|| {
+                CodeGenError::InvalidExpression(
+                    "No compile-time PC address available for DWARF query".to_string(),
+                )
+            })
+    }
+
+    /// Get complete compile-time context for DWARF queries
+    fn get_compile_time_context(&self) -> Result<&CompileTimeContext> {
+        self.current_compile_time_context.as_ref().ok_or_else(|| {
             CodeGenError::InvalidExpression(
-                "No compile-time PC address available for DWARF query".to_string(),
+                "No compile-time context available for DWARF query".to_string(),
             )
         })
     }
 
-    /// Query DWARF for variable location at compile-time PC
+    /// Query DWARF for variable location at compile-time PC using ProcessAnalyzer
     fn query_dwarf_for_variable(
-        &self,
+        &mut self,
+        module_path: &str,
         var_name: &str,
         pc: u64,
-    ) -> Result<ghostscope_binary::dwarf::EnhancedVariableLocation> {
-        if let Some(analyzer_ptr) = self.binary_analyzer {
-            unsafe {
-                let analyzer = &mut *analyzer_ptr;
-                if let Some(dwarf_context) = analyzer.dwarf_context_mut() {
-                    let enhanced_vars = dwarf_context.get_enhanced_variable_locations(pc);
+    ) -> Result<ghostscope_binary::EnhancedVariableLocation> {
+        if let Some(analyzer_ptr) = self.process_analyzer {
+            let process_analyzer = unsafe { &mut *analyzer_ptr };
 
-                    for mut var_info in enhanced_vars {
-                        if var_info.variable.name == var_name {
-                            // Compute new evaluation result on-the-fly
-                            if var_info.evaluation_result.is_none() {
-                                let context = ghostscope_binary::expression::EvaluationContext {
-                                    pc_address: pc,
-                                    address_size: 8,
-                                };
+            let context = ghostscope_binary::EvaluationContext {
+                pc_address: pc,
+                address_size: 8,
+            };
 
-                                match dwarf_context
-                                    .get_expression_evaluator()
-                                    .ok_or_else(|| {
-                                        CodeGenError::InvalidExpression(
-                                            "Expression evaluator not available".to_string(),
-                                        )
-                                    })?
-                                    .evaluate_location_with_enhanced_types(
-                                        &var_info.location_at_address,
-                                        pc,
-                                        &context,
-                                        None, // Pass None to avoid borrowing conflicts
-                                    ) {
-                                    Ok(new_result) => {
-                                        debug!(
-                                            "Computed new evaluation result for '{}': {:?}",
-                                            var_name, new_result
-                                        );
-                                        var_info.evaluation_result = Some(new_result);
-                                    }
-                                    Err(e) => {
-                                        debug!(
-                                            "Failed to compute new evaluation result for '{}': {}",
-                                            var_name, e
-                                        );
-                                    }
-                                }
-                            }
-                            return Ok(var_info);
-                        }
-                    }
+            // Use the new encapsulated method
+            let enhanced_vars =
+                process_analyzer.get_and_evaluate_enhanced_variables(module_path, pc, &context);
+
+            for var_info in enhanced_vars {
+                if var_info.variable.name == var_name {
+                    return Ok(var_info);
                 }
             }
         }
 
         Err(CodeGenError::VariableNotFound(format!(
-            "Variable '{}' not found in DWARF at compile-time PC 0x{:x}",
-            var_name, pc
+            "Variable '{}' not found in DWARF at compile-time PC 0x{:x} in module '{}'",
+            var_name, pc, module_path
         )))
     }
 
@@ -1169,65 +1154,78 @@ impl<'ctx> CodeGen<'ctx> {
     fn send_variable_data(&mut self, var_name: &str) -> Result<()> {
         debug!("Generating LLVM IR for variable: {}", var_name);
 
-        // Get compile-time PC address for DWARF query
-        let compile_time_pc = self.get_compile_time_pc_address()?;
+        // Get complete compile-time context for precise DWARF query
+        let compile_context = self.get_compile_time_context()?.clone();
         debug!(
-            "Using compile-time PC 0x{:x} for DWARF query of '{}'",
-            compile_time_pc, var_name
+            "Using compile-time context: PC 0x{:x}, module '{}' for DWARF query of '{}'",
+            compile_context.pc_address, compile_context.module_path, var_name
         );
 
-        // Query DWARF for complete variable information at compile-time
-        match self.query_dwarf_for_variable(var_name, compile_time_pc) {
+        // Use specific module path for precise variable lookup
+        match self.query_dwarf_for_variable(
+            &compile_context.module_path,
+            var_name,
+            compile_context.pc_address,
+        ) {
             Ok(var_info) => {
                 debug!(
-                    "DWARF query successful for '{}': evaluation_result={:?}, size={:?}",
-                    var_name, var_info.evaluation_result, var_info.size
+                    "Found variable '{}' in module '{}' at PC 0x{:x}",
+                    var_name, compile_context.module_path, compile_context.pc_address
                 );
-
-                // Extract variable size with fallback
-                let ctx_param = self.get_current_function_ctx_param()?;
-
-                // First try to use new evaluation system
-                if let Some(evaluation_result) = var_info.evaluation_result {
-                    let var_type = self
-                        .get_variable_type_from_dwarf(var_name, compile_time_pc)
-                        .ok_or_else(|| {
-                            CodeGenError::InvalidExpression(format!(
-                                "Failed to determine type for variable '{}' at PC 0x{:x}",
-                                var_name, compile_time_pc
-                            ))
-                        })?;
-
-                    // Use new type-safe evaluation system - no runtime type checking needed!
-                    let var_ptr = self.execute_evaluation_result(
-                        ctx_param,
-                        &evaluation_result,
-                        var_name,
-                        compile_time_pc,
-                    )?;
-
-                    self.build_and_send_protocol_message(
-                        var_name,
-                        &var_type,
-                        var_ptr,
-                        compile_time_pc,
-                    )
-                } else {
-                    debug!(
-                        "Variable '{}' has no evaluation result, treating as optimized out",
-                        var_name
-                    );
-                    let var_type = VarType::Int;
-                    self.build_and_send_optimized_out_message(var_name, &var_type, compile_time_pc)
-                }
+                self.process_variable_info(var_name, var_info, compile_context.pc_address)
             }
-            Err(CodeGenError::VariableNotFound(_)) => {
-                Err(CodeGenError::InvalidExpression(format!(
-                    "Variable '{}' not found in DWARF at PC 0x{:x}",
-                    var_name, compile_time_pc
-                )))
+            Err(e) => {
+                debug!(
+                    "Variable '{}' not found in module '{}' at PC 0x{:x}: {}",
+                    var_name, compile_context.module_path, compile_context.pc_address, e
+                );
+                Err(e)
             }
-            Err(e) => Err(e), // Other errors should propagate
+        }
+    }
+
+    /// Process found variable information and generate LLVM IR
+    fn process_variable_info(
+        &mut self,
+        var_name: &str,
+        var_info: ghostscope_binary::EnhancedVariableLocation,
+        compile_time_pc: u64,
+    ) -> Result<()> {
+        debug!(
+            "DWARF query successful for '{}': evaluation_result={:?}, size={:?}",
+            var_name, var_info.evaluation_result, var_info.size
+        );
+
+        // Extract variable size with fallback
+        let ctx_param = self.get_current_function_ctx_param()?;
+
+        // First try to use new evaluation system
+        if let Some(evaluation_result) = var_info.evaluation_result {
+            let var_type = self
+                .get_variable_type_from_dwarf(var_name, compile_time_pc)
+                .ok_or_else(|| {
+                    CodeGenError::InvalidExpression(format!(
+                        "Failed to determine type for variable '{}' at PC 0x{:x}",
+                        var_name, compile_time_pc
+                    ))
+                })?;
+
+            // Use new type-safe evaluation system - no runtime type checking needed!
+            let var_ptr = self.execute_evaluation_result(
+                ctx_param,
+                &evaluation_result,
+                var_name,
+                compile_time_pc,
+            )?;
+
+            self.build_and_send_protocol_message(var_name, &var_type, var_ptr, compile_time_pc)
+        } else {
+            debug!(
+                "Variable '{}' has no evaluation result, treating as optimized out",
+                var_name
+            );
+            let var_type = VarType::Int;
+            self.build_and_send_optimized_out_message(var_name, &var_type, compile_time_pc)
         }
     }
 
@@ -1235,11 +1233,11 @@ impl<'ctx> CodeGen<'ctx> {
     fn execute_computed_access_steps(
         &mut self,
         ctx_param: PointerValue<'ctx>,
-        steps: &[ghostscope_binary::expression::AccessStep],
+        steps: &[ghostscope_binary::AccessStep],
         var_name: &str,
         pc_address: u64,
     ) -> Result<IntValue<'ctx>> {
-        use ghostscope_binary::expression::{AccessStep, ArithOp};
+        use ghostscope_binary::{AccessStep, ArithOp};
 
         // Initialize computation stack
         let mut stack: Vec<IntValue<'ctx>> = Vec::new();
@@ -1292,50 +1290,22 @@ impl<'ctx> CodeGen<'ctx> {
                 AccessStep::LoadCallFrameCFA => {
                     debug!("LoadCallFrameCFA step - using CFA evaluation");
 
-                    // Use our new CFA evaluation from DwarfContext
-                    if let Some(analyzer_ptr) = self.binary_analyzer {
-                        let analyzer = unsafe { &mut *analyzer_ptr };
-                        if let Some(dwarf_context) = analyzer.dwarf_context_mut() {
-                            if let Some(cfa_result) =
-                                dwarf_context.get_cfa_evaluation_result(pc_address)
-                            {
-                                debug!(
-                                    "Successfully got CFA evaluation result in LoadCallFrameCFA"
-                                );
-                                // Execute the CFA result to get the address
-                                match self.execute_evaluation_result(
-                                    ctx_param,
-                                    &cfa_result,
-                                    "cfa_step",
-                                    pc_address,
-                                ) {
-                                    Ok(ptr_val) => {
-                                        // Convert pointer to integer and push to stack
-                                        let cfa_addr = self
-                                            .builder
-                                            .build_ptr_to_int(ptr_val, i64_type, "cfa_addr")
-                                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-                                        stack.push(cfa_addr);
-                                    }
-                                    Err(e) => {
-                                        debug!("Failed to execute CFA evaluation result: {}", e);
-                                        return Err(CodeGenError::DwarfError(format!(
-                                            "CFA evaluation failed: {}",
-                                            e
-                                        )));
-                                    }
-                                }
-                            } else {
-                                debug!("No CFA evaluation result, using fallback");
-                                return Err(CodeGenError::DwarfError(
-                                    "CFA evaluation returned no result".to_string(),
-                                ));
-                            }
-                        } else {
-                            return Err(CodeGenError::DwarfError(
-                                "No DWARF context available for CFA".to_string(),
-                            ));
-                        }
+                    // Use our new CFA evaluation from DwarfContext via ProcessAnalyzer
+                    if let Some(_analyzer_ptr) = self.process_analyzer {
+                        // TODO: Need module_path to use ProcessAnalyzer properly
+                        // For now, use fallback approach
+                        debug!(
+                            "LoadCallFrameCFA: ProcessAnalyzer needs module_path - using fallback"
+                        );
+                        // Fallback: Use frame base as CFA approximation
+                        let compile_time_pc = self.get_compile_time_pc_address()?;
+                        let frame_base =
+                            self.get_frame_base_from_pt_regs(ctx_param, compile_time_pc)?;
+                        let cfa_addr = self
+                            .builder
+                            .build_ptr_to_int(frame_base, i64_type, "cfa_fallback_addr")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        stack.push(cfa_addr);
                     } else {
                         return Err(CodeGenError::DwarfError(
                             "No binary analyzer available for CFA".to_string(),
@@ -1515,7 +1485,7 @@ impl<'ctx> CodeGen<'ctx> {
         // For now, we'll use a simplified approach assuming CFA = RSP + constant
         debug!("CFA-based access not fully implemented, using RSP-based fallback");
 
-        let rsp_reg_access = ghostscope_binary::expression::RegisterAccess {
+        let rsp_reg_access = ghostscope_binary::RegisterAccess {
             register: 7, // RSP
             offset: Some(offset),
             dereference: false,
@@ -1570,7 +1540,7 @@ impl<'ctx> CodeGen<'ctx> {
     fn generate_register_access_ir(
         &mut self,
         ctx_param: PointerValue<'ctx>,
-        reg_access: &ghostscope_binary::expression::RegisterAccess,
+        reg_access: &ghostscope_binary::RegisterAccess,
         var_name: &str,
         var_size: usize,
     ) -> Result<PointerValue<'ctx>> {
@@ -1591,7 +1561,7 @@ impl<'ctx> CodeGen<'ctx> {
     fn compute_register_memory_address(
         &mut self,
         ctx_param: PointerValue<'ctx>,
-        reg_access: &ghostscope_binary::expression::RegisterAccess,
+        reg_access: &ghostscope_binary::RegisterAccess,
         var_name: &str,
     ) -> Result<IntValue<'ctx>> {
         let i64_type = self.context.i64_type();
@@ -2732,403 +2702,6 @@ impl<'ctx> CodeGen<'ctx> {
         }
     }
 
-    /// Send execution failure message
-    fn send_execution_failure(
-        &mut self,
-        function_id: u32,
-        error_code_value: IntValue<'ctx>, // Changed to accept runtime LLVM value
-        message: &str,
-    ) -> Result<()> {
-        let msg_storage = self.create_execution_failure_message_storage();
-        self.build_execution_failure_header(
-            msg_storage,
-            function_id,
-            error_code_value,
-            message.len() as u16,
-        )?;
-        self.write_message_string(
-            msg_storage,
-            message,
-            consts::MESSAGE_HEADER_SIZE + consts::EXECUTION_FAILURE_MESSAGE_SIZE,
-        )?; // After MessageHeader + ExecutionFailureMessage
-        let total_len =
-            consts::MESSAGE_HEADER_SIZE + consts::EXECUTION_FAILURE_MESSAGE_SIZE + message.len(); // Header + ExecutionFailureMessage + message
-        self.create_ringbuf_output(msg_storage, total_len as u64)?;
-        Ok(())
-    }
-
-    /// Create storage area for log message
-    fn create_log_message_storage(&mut self) -> PointerValue<'ctx> {
-        let msg_size =
-            consts::MESSAGE_HEADER_SIZE + consts::LOG_MESSAGE_SIZE + consts::MAX_STRING_LENGTH;
-        let array_type = self.context.i8_type().array_type(msg_size as u32);
-        let msg_storage =
-            self.module
-                .add_global(array_type, Some(AddressSpace::default()), "_log_msg");
-        msg_storage.set_initializer(&array_type.const_zero());
-        msg_storage.as_pointer_value()
-    }
-
-    /// Create storage area for execution failure message
-    fn create_execution_failure_message_storage(&mut self) -> PointerValue<'ctx> {
-        let msg_size = consts::MESSAGE_HEADER_SIZE
-            + consts::EXECUTION_FAILURE_MESSAGE_SIZE
-            + consts::MAX_STRING_LENGTH;
-        let array_type = self.context.i8_type().array_type(msg_size as u32);
-        let msg_storage =
-            self.module
-                .add_global(array_type, Some(AddressSpace::default()), "_failure_msg");
-        msg_storage.set_initializer(&array_type.const_zero());
-        msg_storage.as_pointer_value()
-    }
-
-    /// Build log message header
-    fn build_log_message_header(
-        &mut self,
-        buffer: PointerValue<'ctx>,
-        log_level: u8,
-        message_len: u16,
-    ) -> Result<()> {
-        let i8_type = self.context.i8_type();
-        let i16_type = self.context.i16_type();
-        let i32_type = self.context.i32_type();
-        let i64_type = self.context.i64_type();
-
-        // Build MessageHeader
-        self.write_message_header(
-            buffer,
-            MessageType::Log as u8,
-            (consts::MESSAGE_HEADER_SIZE + consts::LOG_MESSAGE_SIZE + message_len as usize) as u16,
-        )?;
-
-        // Build LogMessage
-        let log_msg_offset = consts::MESSAGE_HEADER_SIZE;
-
-        // trace_id (8 bytes) - use current trace_id or default
-        let trace_id_value = self
-            .current_trace_id
-            .unwrap_or(consts::DEFAULT_TRACE_ID as u32) as u64;
-        let trace_id = i64_type.const_int(trace_id_value, false);
-        self.write_u64_at_offset(buffer, log_msg_offset, trace_id)?;
-
-        // timestamp (8 bytes)
-        let timestamp = self.get_current_timestamp()?;
-        self.write_u64_at_offset(buffer, log_msg_offset + 8, timestamp)?;
-
-        // pid and tid (8 bytes total)
-        let pid_tgid = self.get_current_pid_tgid()?;
-        let tid = self
-            .builder
-            .build_int_truncate(pid_tgid, i32_type, "tid")
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-        let pid = self
-            .builder
-            .build_right_shift(pid_tgid, i64_type.const_int(32, false), false, "pid")
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-        let pid_truncated = self
-            .builder
-            .build_int_truncate(pid, i32_type, "pid_truncated")
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-        self.write_u32_at_offset(buffer, log_msg_offset + 16, pid_truncated)?;
-        self.write_u32_at_offset(buffer, log_msg_offset + 20, tid)?;
-
-        // log_level (1 byte) + reserved (3 bytes)
-        self.write_u8_at_offset(
-            buffer,
-            log_msg_offset + 24,
-            i8_type.const_int(log_level as u64, false),
-        )?;
-
-        // message_len (2 bytes) + reserved2 (2 bytes)
-        self.write_u16_at_offset(
-            buffer,
-            log_msg_offset + 28,
-            i16_type.const_int(message_len as u64, false),
-        )?;
-
-        Ok(())
-    }
-
-    /// Build execution failure message header
-    fn build_execution_failure_header(
-        &mut self,
-        buffer: PointerValue<'ctx>,
-        function_id: u32,
-        error_code_value: IntValue<'ctx>, // Changed to accept runtime LLVM value
-        message_len: u16,
-    ) -> Result<()> {
-        let i16_type = self.context.i16_type();
-        let i32_type = self.context.i32_type();
-        let i64_type = self.context.i64_type();
-
-        // Build MessageHeader
-        self.write_message_header(
-            buffer,
-            MessageType::ExecutionFailure as u8,
-            (consts::MESSAGE_HEADER_SIZE
-                + consts::EXECUTION_FAILURE_MESSAGE_SIZE
-                + message_len as usize) as u16,
-        )?;
-
-        // Build ExecutionFailureMessage
-        let failure_msg_offset = consts::MESSAGE_HEADER_SIZE;
-
-        // trace_id (8 bytes) - use current trace_id or default
-        let trace_id_value = self
-            .current_trace_id
-            .unwrap_or(consts::DEFAULT_TRACE_ID as u32) as u64;
-        let trace_id = i64_type.const_int(trace_id_value, false);
-        self.write_u64_at_offset(buffer, failure_msg_offset, trace_id)?;
-
-        // timestamp (8 bytes)
-        let timestamp = self.get_current_timestamp()?;
-        self.write_u64_at_offset(buffer, failure_msg_offset + 8, timestamp)?;
-
-        // pid and tid (8 bytes total)
-        let pid_tgid = self.get_current_pid_tgid()?;
-        let tid = self
-            .builder
-            .build_int_truncate(pid_tgid, i32_type, "tid")
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-        let pid = self
-            .builder
-            .build_right_shift(pid_tgid, i64_type.const_int(32, false), false, "pid")
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-        let pid_truncated = self
-            .builder
-            .build_int_truncate(pid, i32_type, "pid_truncated")
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-        self.write_u32_at_offset(buffer, failure_msg_offset + 16, pid_truncated)?;
-        self.write_u32_at_offset(buffer, failure_msg_offset + 20, tid)?;
-
-        // function_id (4 bytes)
-        self.write_u32_at_offset(
-            buffer,
-            failure_msg_offset + 24,
-            i32_type.const_int(function_id as u64, false),
-        )?;
-
-        // error_code (8 bytes) - use runtime value
-        self.write_u64_at_offset(buffer, failure_msg_offset + 28, error_code_value)?;
-
-        // message_len (2 bytes) + reserved (2 bytes)
-        self.write_u16_at_offset(
-            buffer,
-            failure_msg_offset + 36,
-            i16_type.const_int(message_len as u64, false),
-        )?;
-
-        Ok(())
-    }
-
-    /// Helper function to write message header
-    fn write_message_header(
-        &mut self,
-        buffer: PointerValue<'ctx>,
-        msg_type: u8,
-        length: u16,
-    ) -> Result<()> {
-        let i8_type = self.context.i8_type();
-        let i16_type = self.context.i16_type();
-        let i32_type = self.context.i32_type();
-
-        // magic (4 bytes) = "GSCP"
-        let magic = i32_type.const_int(consts::MAGIC as u64, false);
-        self.write_u32_at_offset(buffer, 0, magic)?;
-
-        // msg_type (1 byte)
-        self.write_u8_at_offset(buffer, 4, i8_type.const_int(msg_type as u64, false))?;
-
-        // flags (1 byte) = 0
-        self.write_u8_at_offset(buffer, 5, i8_type.const_int(0, false))?;
-
-        // length (2 bytes)
-        self.write_u16_at_offset(buffer, 6, i16_type.const_int(length as u64, false))?;
-
-        Ok(())
-    }
-
-    /// Helper functions for writing different data types at offsets
-    fn write_u8_at_offset(
-        &mut self,
-        buffer: PointerValue<'ctx>,
-        offset: usize,
-        value: IntValue<'ctx>,
-    ) -> Result<()> {
-        let i8_type = self.context.i8_type();
-        let ptr = unsafe {
-            self.builder
-                .build_gep(
-                    i8_type,
-                    buffer,
-                    &[self.context.i32_type().const_int(offset as u64, false)],
-                    &format!("ptr_offset_{}", offset),
-                )
-                .map_err(|e| CodeGenError::Builder(e.to_string()))?
-        };
-
-        // Ensure value is truncated to i8 if necessary
-        let i8_value = if value.get_type() == i8_type {
-            value
-        } else {
-            self.builder
-                .build_int_truncate(value, i8_type, "truncate_to_i8")
-                .map_err(|e| CodeGenError::Builder(e.to_string()))?
-        };
-
-        self.builder
-            .build_store(ptr, i8_value)
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-        Ok(())
-    }
-
-    fn write_u16_at_offset(
-        &mut self,
-        buffer: PointerValue<'ctx>,
-        offset: usize,
-        value: IntValue<'ctx>,
-    ) -> Result<()> {
-        let i8_type = self.context.i8_type();
-        let i16_type = self.context.i16_type();
-        let ptr = unsafe {
-            self.builder
-                .build_gep(
-                    i8_type,
-                    buffer,
-                    &[self.context.i32_type().const_int(offset as u64, false)],
-                    &format!("ptr_offset_{}", offset),
-                )
-                .map_err(|e| CodeGenError::Builder(e.to_string()))?
-        };
-        let ptr_cast = self
-            .builder
-            .build_pointer_cast(
-                ptr,
-                self.context.ptr_type(AddressSpace::default()),
-                "ptr_cast",
-            )
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-        // Ensure value is truncated to i16 if necessary
-        let i16_value = if value.get_type() == i16_type {
-            value
-        } else {
-            self.builder
-                .build_int_truncate(value, i16_type, "truncate_to_i16")
-                .map_err(|e| CodeGenError::Builder(e.to_string()))?
-        };
-
-        self.builder
-            .build_store(ptr_cast, i16_value)
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-        Ok(())
-    }
-
-    fn write_u32_at_offset(
-        &mut self,
-        buffer: PointerValue<'ctx>,
-        offset: usize,
-        value: IntValue<'ctx>,
-    ) -> Result<()> {
-        let i8_type = self.context.i8_type();
-        let i32_type = self.context.i32_type();
-        let ptr = unsafe {
-            self.builder
-                .build_gep(
-                    i8_type,
-                    buffer,
-                    &[self.context.i32_type().const_int(offset as u64, false)],
-                    &format!("ptr_offset_{}", offset),
-                )
-                .map_err(|e| CodeGenError::Builder(e.to_string()))?
-        };
-        let ptr_cast = self
-            .builder
-            .build_pointer_cast(
-                ptr,
-                self.context.ptr_type(AddressSpace::default()),
-                "ptr_cast",
-            )
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-        // Ensure value is truncated to i32 if necessary
-        let i32_value = if value.get_type() == i32_type {
-            value
-        } else {
-            self.builder
-                .build_int_truncate(value, i32_type, "truncate_to_i32")
-                .map_err(|e| CodeGenError::Builder(e.to_string()))?
-        };
-
-        self.builder
-            .build_store(ptr_cast, i32_value)
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-        Ok(())
-    }
-
-    fn write_u64_at_offset(
-        &mut self,
-        buffer: PointerValue<'ctx>,
-        offset: usize,
-        value: IntValue<'ctx>,
-    ) -> Result<()> {
-        let i8_type = self.context.i8_type();
-        let ptr = unsafe {
-            self.builder
-                .build_gep(
-                    i8_type,
-                    buffer,
-                    &[self.context.i32_type().const_int(offset as u64, false)],
-                    &format!("ptr_offset_{}", offset),
-                )
-                .map_err(|e| CodeGenError::Builder(e.to_string()))?
-        };
-        let ptr_cast = self
-            .builder
-            .build_pointer_cast(
-                ptr,
-                self.context.ptr_type(AddressSpace::default()),
-                "ptr_cast",
-            )
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-        self.builder
-            .build_store(ptr_cast, value)
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-        Ok(())
-    }
-
-    /// Write message string at specified offset
-    fn write_message_string(
-        &mut self,
-        buffer: PointerValue<'ctx>,
-        message: &str,
-        offset: usize,
-    ) -> Result<()> {
-        let i8_type = self.context.i8_type();
-        for (i, byte) in message.as_bytes().iter().enumerate() {
-            let char_ptr = unsafe {
-                self.builder
-                    .build_gep(
-                        i8_type,
-                        buffer,
-                        &[self
-                            .context
-                            .i32_type()
-                            .const_int((offset + i) as u64, false)],
-                        &format!("msg_char_{}", i),
-                    )
-                    .map_err(|e| CodeGenError::Builder(e.to_string()))?
-            };
-            let char_val = i8_type.const_int(*byte as u64, false);
-            self.builder
-                .build_store(char_ptr, char_val)
-                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-        }
-        Ok(())
-    }
-
     fn add_pid_filter(&mut self, target_pid: u32) -> Result<()> {
         info!("Adding PID filter for target PID: {}", target_pid);
 
@@ -3191,75 +2764,30 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
-    /// Generate eBPF bpf_trace_printk instruction for RBP debugging
-    /// This directly generates eBPF bytecode without complex borrowing
-    /// Get CFI offset for a specific PC address by querying the binary analyzer
-    /// This delegates all DWARF/CFI logic to the binary crate
-    fn get_cfi_offset_for_pc(&self, pc_address: u64) -> i64 {
-        // Query the binary analyzer for frame base offset
-        if let Some(analyzer_ptr) = self.binary_analyzer {
-            unsafe {
-                let analyzer = &mut *analyzer_ptr;
-                if let Some(offset) = analyzer.get_frame_base_offset(pc_address) {
-                    debug!(
-                        "Binary analyzer returned frame base offset {} for PC 0x{:x}",
-                        offset, pc_address
-                    );
-                    offset
-                } else {
-                    debug!(
-                        "Binary analyzer found no CFI info for PC 0x{:x}: using default RBP + 16",
-                        pc_address
-                    );
-                    16 // Default fallback
-                }
-            }
-        } else {
-            debug!("No binary analyzer available: using default RBP + 16");
-            16 // Default fallback
-        }
-    }
-
-    /// Get variable size from binary analyzer
+    /// Get variable size from binary analyzer or process analyzer
     /// Returns size in bytes for bpf_probe_read_user, defaults to 8 bytes if not found
     fn get_variable_size(&self, pc_address: u64, var_name: &str) -> u64 {
-        if let Some(analyzer_ptr) = self.binary_analyzer {
+        // ProcessAnalyzer virtual address queries removed - use binary analyzer directly
+
+        // Use ProcessAnalyzer for variable size queries
+        if let Some(analyzer_ptr) = self.process_analyzer {
             unsafe {
-                let analyzer = &mut *analyzer_ptr;
-                if let Some(size) = analyzer.get_variable_size(pc_address, var_name) {
-                    debug!(
-                        "Binary analyzer returned size {} bytes for variable '{}' at PC 0x{:x}",
-                        size, var_name, pc_address
-                    );
-                    size
-                } else {
-                    debug!(
-                        "Binary analyzer found no size info for variable '{}' at PC 0x{:x}: using default 8 bytes",
-                        var_name, pc_address
-                    );
-                    8 // Default fallback
-                }
+                let process_analyzer = &*analyzer_ptr;
+                // Need to find which module this PC belongs to
+                // For now, return default size since we don't have module_path here
+                // TODO: This method needs module_path parameter to work properly
+                debug!(
+                    "ProcessAnalyzer variable size query needs module path for variable '{}' at PC 0x{:x}: using default 8 bytes",
+                    var_name, pc_address
+                );
+                8 // Default fallback
             }
         } else {
             debug!(
-                "No binary analyzer available: using default 8 bytes for variable '{}'",
+                "No analyzer available: using default 8 bytes for variable '{}'",
                 var_name
             );
             8 // Default fallback
-        }
-    }
-
-    /// Get LLVM type based on variable size
-    fn get_llvm_type_for_size(&self, size: u64) -> inkwell::types::BasicTypeEnum<'ctx> {
-        match size {
-            1 => self.context.i8_type().into(),
-            2 => self.context.i16_type().into(),
-            4 => self.context.i32_type().into(),
-            8 => self.context.i64_type().into(),
-            _ => {
-                debug!("Unusual variable size {}, using i64", size);
-                self.context.i64_type().into()
-            }
         }
     }
 
@@ -3336,279 +2864,6 @@ impl<'ctx> CodeGen<'ctx> {
 
         debug!("RBP trace_printk call generated successfully");
         Ok(())
-    }
-
-    /// Create computed access from a sequence of access steps
-    fn create_computed_access_from_steps(
-        &mut self,
-        ctx_param: PointerValue<'ctx>,
-        steps: &[AccessStep],
-        var_name: &str,
-        pc_address: u64,
-    ) -> Result<PointerValue<'ctx>> {
-        let i64_type = self.context.i64_type();
-        let ptr_type = self.context.ptr_type(AddressSpace::default());
-
-        let mut current_value: Option<BasicValueEnum<'ctx>> = None;
-
-        for (i, step) in steps.iter().enumerate() {
-            debug!(
-                "Processing step {} for variable '{}': {:?}",
-                i, var_name, step
-            );
-
-            current_value = Some(match step {
-                AccessStep::LoadRegister(reg) => {
-                    let reg_ptr = self.create_register_access(
-                        ctx_param,
-                        *reg,
-                        &format!("{}_step{}", var_name, i),
-                    )?;
-                    self.builder
-                        .build_load(i64_type, reg_ptr, &format!("{}_reg{}_value", var_name, reg))
-                        .map_err(|e| CodeGenError::Builder(e.to_string()))?
-                }
-
-                AccessStep::AddConstant(constant) => {
-                    let base = current_value.ok_or_else(|| {
-                        CodeGenError::InvalidExpression("No base value for AddConstant".to_string())
-                    })?;
-
-                    let base_int = if let BasicValueEnum::IntValue(int_val) = base {
-                        int_val
-                    } else if let BasicValueEnum::PointerValue(ptr_val) = base {
-                        self.builder
-                            .build_ptr_to_int(
-                                ptr_val,
-                                i64_type,
-                                &format!("{}_ptr_to_int", var_name),
-                            )
-                            .map_err(|e| CodeGenError::Builder(e.to_string()))?
-                    } else {
-                        return Err(CodeGenError::InvalidExpression(
-                            "Invalid base type for AddConstant".to_string(),
-                        ));
-                    };
-
-                    let constant_val =
-                        i64_type.const_int(constant.unsigned_abs() as u64, *constant < 0);
-
-                    if *constant >= 0 {
-                        self.builder.build_int_add(
-                            base_int,
-                            constant_val,
-                            &format!("{}_add_const", var_name),
-                        )
-                    } else {
-                        self.builder.build_int_sub(
-                            base_int,
-                            constant_val,
-                            &format!("{}_sub_const", var_name),
-                        )
-                    }
-                    .map_err(|e| CodeGenError::Builder(e.to_string()))?
-                    .into()
-                }
-
-                AccessStep::LoadFrameBase => {
-                    // This would require CFI context to resolve frame base
-                    // For now, fall back to RSP-based frame base estimation
-                    warn!("LoadFrameBase step encountered, using RSP-based fallback for variable '{}'", var_name);
-                    let rsp_index =
-                        i64_type.const_int(platform::pt_regs_indices::RSP as u64, false);
-                    let rsp_ptr = unsafe {
-                        self.builder
-                            .build_gep(i64_type, ctx_param, &[rsp_index], "frame_base_rsp")
-                            .map_err(|e| CodeGenError::Builder(e.to_string()))?
-                    };
-                    self.builder
-                        .build_load(i64_type, rsp_ptr, "frame_base_value")
-                        .map_err(|e| CodeGenError::Builder(e.to_string()))?
-                }
-
-                AccessStep::Dereference { size } => {
-                    let addr = current_value.ok_or_else(|| {
-                        CodeGenError::InvalidExpression(
-                            "No address value for Dereference".to_string(),
-                        )
-                    })?;
-
-                    let addr_int = if let BasicValueEnum::IntValue(int_val) = addr {
-                        int_val
-                    } else if let BasicValueEnum::PointerValue(ptr_val) = addr {
-                        self.builder
-                            .build_ptr_to_int(
-                                ptr_val,
-                                i64_type,
-                                &format!("{}_deref_addr", var_name),
-                            )
-                            .map_err(|e| CodeGenError::Builder(e.to_string()))?
-                    } else {
-                        return Err(CodeGenError::InvalidExpression(
-                            "Invalid address type for Dereference".to_string(),
-                        ));
-                    };
-
-                    // Use bpf_probe_read_user to safely read user memory
-                    let addr_ptr = self
-                        .builder
-                        .build_int_to_ptr(addr_int, ptr_type, &format!("{}_deref_ptr", var_name))
-                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-                    self.create_safe_user_memory_read(
-                        addr_ptr,
-                        *size,
-                        &format!("{}_deref", var_name),
-                    )?
-                    .into()
-                }
-
-                AccessStep::LoadCallFrameCFA => {
-                    debug!("LoadCallFrameCFA step in create_computed_access_from_steps for variable '{}'", var_name);
-
-                    // Use our new CFA evaluation from DwarfContext
-                    if let Some(analyzer_ptr) = self.binary_analyzer {
-                        let analyzer = unsafe { &mut *analyzer_ptr };
-                        if let Some(dwarf_context) = analyzer.dwarf_context_mut() {
-                            if let Some(cfa_result) =
-                                dwarf_context.get_cfa_evaluation_result(pc_address)
-                            {
-                                debug!("Successfully got CFA evaluation result");
-                                // Execute the CFA result to get the address
-                                match self.execute_evaluation_result(
-                                    ctx_param,
-                                    &cfa_result,
-                                    var_name,
-                                    pc_address,
-                                ) {
-                                    Ok(ptr_val) => {
-                                        // Convert pointer to integer value for address computation
-                                        self.builder
-                                            .build_ptr_to_int(ptr_val, i64_type, "cfa_addr_value")
-                                            .map_err(|e| CodeGenError::Builder(e.to_string()))?
-                                            .into()
-                                    }
-                                    Err(e) => {
-                                        warn!("Failed to execute CFA evaluation result: {}, using RSP fallback", e);
-                                        // Fallback to RSP-based approach
-                                        let rsp_index = i64_type.const_int(
-                                            platform::pt_regs_indices::RSP as u64,
-                                            false,
-                                        );
-                                        let rsp_ptr = unsafe {
-                                            self.builder
-                                                .build_gep(
-                                                    i64_type,
-                                                    ctx_param,
-                                                    &[rsp_index],
-                                                    "cfa_rsp_fallback",
-                                                )
-                                                .map_err(|e| CodeGenError::Builder(e.to_string()))?
-                                        };
-                                        self.builder
-                                            .build_load(i64_type, rsp_ptr, "cfa_value_fallback")
-                                            .map_err(|e| CodeGenError::Builder(e.to_string()))?
-                                    }
-                                }
-                            } else {
-                                warn!("No CFA evaluation result for variable '{}', using RSP fallback", var_name);
-                                // Fallback to RSP-based approach
-                                let rsp_index = i64_type
-                                    .const_int(platform::pt_regs_indices::RSP as u64, false);
-                                let rsp_ptr = unsafe {
-                                    self.builder
-                                        .build_gep(
-                                            i64_type,
-                                            ctx_param,
-                                            &[rsp_index],
-                                            "cfa_rsp_fallback",
-                                        )
-                                        .map_err(|e| CodeGenError::Builder(e.to_string()))?
-                                };
-                                self.builder
-                                    .build_load(i64_type, rsp_ptr, "cfa_value_fallback")
-                                    .map_err(|e| CodeGenError::Builder(e.to_string()))?
-                            }
-                        } else {
-                            warn!(
-                                "No DWARF context for CFA in variable '{}', using RSP fallback",
-                                var_name
-                            );
-                            // Fallback to RSP-based approach
-                            let rsp_index =
-                                i64_type.const_int(platform::pt_regs_indices::RSP as u64, false);
-                            let rsp_ptr = unsafe {
-                                self.builder
-                                    .build_gep(
-                                        i64_type,
-                                        ctx_param,
-                                        &[rsp_index],
-                                        "cfa_rsp_fallback",
-                                    )
-                                    .map_err(|e| CodeGenError::Builder(e.to_string()))?
-                            };
-                            self.builder
-                                .build_load(i64_type, rsp_ptr, "cfa_value_fallback")
-                                .map_err(|e| CodeGenError::Builder(e.to_string()))?
-                        }
-                    } else {
-                        warn!(
-                            "No binary analyzer for CFA in variable '{}', using RSP fallback",
-                            var_name
-                        );
-                        // Fallback to RSP-based approach
-                        let rsp_index =
-                            i64_type.const_int(platform::pt_regs_indices::RSP as u64, false);
-                        let rsp_ptr = unsafe {
-                            self.builder
-                                .build_gep(i64_type, ctx_param, &[rsp_index], "cfa_rsp_fallback")
-                                .map_err(|e| CodeGenError::Builder(e.to_string()))?
-                        };
-                        self.builder
-                            .build_load(i64_type, rsp_ptr, "cfa_value_fallback")
-                            .map_err(|e| CodeGenError::Builder(e.to_string()))?
-                    }
-                }
-
-                AccessStep::Conditional { .. } => {
-                    return Err(CodeGenError::UnsupportedOperation(
-                        "Conditional access steps not yet implemented".to_string(),
-                    ));
-                }
-
-                AccessStep::Piece { .. } => {
-                    return Err(CodeGenError::UnsupportedOperation(
-                        "Piece access steps not yet implemented".to_string(),
-                    ));
-                }
-
-                AccessStep::ArithmeticOp(op) => {
-                    // Complex arithmetic operations in computed access - should use the main implementation
-                    return Err(CodeGenError::DwarfError(format!(
-                        "ArithmeticOp {:?} should be handled in the main computed access path",
-                        op
-                    )));
-                }
-            });
-        }
-
-        // Convert final result to pointer
-        let final_value = current_value.ok_or_else(|| {
-            CodeGenError::InvalidExpression("Computed access produced no result".to_string())
-        })?;
-
-        match final_value {
-            BasicValueEnum::IntValue(int_val) => {
-                let ptr_type = self.context.ptr_type(AddressSpace::default());
-                self.builder
-                    .build_int_to_ptr(int_val, ptr_type, &format!("{}_final_ptr", var_name))
-                    .map_err(|e| CodeGenError::Builder(e.to_string()))
-            }
-            BasicValueEnum::PointerValue(ptr_val) => Ok(ptr_val),
-            _ => Err(CodeGenError::InvalidExpression(
-                "Invalid final result type".to_string(),
-            )),
-        }
     }
 
     /// Create access for immediate values by storing them in a global variable
@@ -3777,26 +3032,10 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(pc_address)
     }
 
-    /// DEPRECATED: Create runtime variable access using DWARF expression evaluation
-    /// This function is deprecated and should not be used in the new architecture.
-    /// Use compile-time PC addresses with send_variable_data instead.
-    fn create_runtime_variable_access(
-        &mut self,
-        var_name: &str,
-        _pc_address: IntValue<'ctx>,
-        _ctx_param: PointerValue<'ctx>,
-    ) -> Result<PointerValue<'ctx>> {
-        // This function is deprecated in the new architecture
-        // All variable access should use compile-time DWARF queries
-        Err(CodeGenError::InvalidExpression(
-            format!("DEPRECATED: Runtime DWARF queries are no longer supported. Variable '{}' should be accessed via compile-time PC queries in send_variable_data.", var_name),
-        ))
-    }
-
     /// Create register-based variable access
     fn create_register_variable_access(
         &mut self,
-        reg_access: &ghostscope_binary::expression::RegisterAccess,
+        reg_access: &ghostscope_binary::RegisterAccess,
         var_name: &str,
         ctx_param: PointerValue<'ctx>,
     ) -> Result<PointerValue<'ctx>> {
@@ -3916,11 +3155,11 @@ impl<'ctx> CodeGen<'ctx> {
     /// Create computed access-based variable access
     fn create_computed_variable_access(
         &mut self,
-        steps: &[ghostscope_binary::expression::AccessStep],
+        steps: &[ghostscope_binary::AccessStep],
         var_name: &str,
         ctx_param: PointerValue<'ctx>,
     ) -> Result<PointerValue<'ctx>> {
-        use ghostscope_binary::expression::{AccessStep, ArithOp};
+        use ghostscope_binary::{AccessStep, ArithOp};
 
         let i64_type = self.context.i64_type();
         let ptr_type = self.context.ptr_type(AddressSpace::default());
@@ -4131,11 +3370,11 @@ impl<'ctx> CodeGen<'ctx> {
     fn execute_evaluation_result(
         &mut self,
         ctx_param: PointerValue<'ctx>,
-        evaluation_result: &ghostscope_binary::expression::EvaluationResult,
+        evaluation_result: &ghostscope_binary::EvaluationResult,
         var_name: &str,
         pc_address: u64,
     ) -> Result<inkwell::values::PointerValue<'ctx>> {
-        use ghostscope_binary::expression::{DirectValueResult, EvaluationResult, LocationResult};
+        use ghostscope_binary::{DirectValueResult, EvaluationResult, LocationResult};
 
         debug!(
             "Executing new evaluation result for '{}': {:?}",
@@ -4329,21 +3568,17 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     fn get_variable_type_from_dwarf(&self, var_name: &str, pc_address: u64) -> Option<VarType> {
-        if let Some(analyzer_ptr) = self.binary_analyzer {
+        if let Some(analyzer_ptr) = self.process_analyzer {
             unsafe {
-                let analyzer = &mut *analyzer_ptr;
-                if let Some(dwarf_context) = analyzer.dwarf_context_mut() {
-                    let enhanced_vars = dwarf_context.get_enhanced_variable_locations(pc_address);
-
-                    for var_info in enhanced_vars {
-                        if var_info.variable.name == var_name {
-                            // Use the structured DWARF type information instead of string matching
-                            return Some(
-                                self.determine_var_type_from_dwarf(&var_info.variable.dwarf_type),
-                            );
-                        }
-                    }
-                }
+                let process_analyzer = &*analyzer_ptr;
+                // Need to search through all modules since we don't have module_path
+                // For now, return default type
+                // TODO: This method needs module_path parameter to work properly
+                debug!(
+                    "get_variable_type_from_dwarf: ProcessAnalyzer needs module_path for variable '{}' at PC 0x{:x} - returning default Int type",
+                    var_name, pc_address
+                );
+                return Some(VarType::Int); // Default fallback
             }
         }
         None
@@ -4363,7 +3598,7 @@ impl<'ctx> CodeGen<'ctx> {
         );
 
         // Create a simplified RegisterAccess for direct register value access
-        let reg_access = ghostscope_binary::expression::RegisterAccess {
+        let reg_access = ghostscope_binary::RegisterAccess {
             register,
             offset: None,       // No offset for direct register value
             dereference: false, // Don't dereference, we want the register value itself
@@ -4388,7 +3623,7 @@ impl<'ctx> CodeGen<'ctx> {
         );
 
         // Use existing register offset access which handles address calculation
-        let reg_access = ghostscope_binary::expression::RegisterAccess {
+        let reg_access = ghostscope_binary::RegisterAccess {
             register,
             offset,
             dereference: true, // We need to dereference the computed address
@@ -4403,7 +3638,7 @@ impl<'ctx> CodeGen<'ctx> {
     fn create_computed_value_access(
         &mut self,
         ctx_param: PointerValue<'ctx>,
-        steps: &[ghostscope_binary::expression::AccessStep],
+        steps: &[ghostscope_binary::AccessStep],
         _requires_registers: &[u16],
         _requires_frame_base: &bool,
         _requires_cfa: &bool,

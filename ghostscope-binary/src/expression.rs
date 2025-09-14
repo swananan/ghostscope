@@ -9,7 +9,7 @@ use tracing::{debug, error, warn};
 
 /// DWARF expression evaluation errors
 #[derive(Debug, thiserror::Error)]
-pub enum ExpressionError {
+pub(crate) enum ExpressionError {
     #[error("Stack underflow during operation")]
     StackUnderflow,
 
@@ -40,7 +40,7 @@ pub enum ExpressionError {
 
 /// Complete DWARF operations enum - supports the full DWARF specification
 #[derive(Debug, Clone, PartialEq)]
-pub enum DwarfOperation {
+pub(crate) enum DwarfOperation {
     // Literal operations (DW_OP_lit*, DW_OP_const*)
     Literal(i64),
 

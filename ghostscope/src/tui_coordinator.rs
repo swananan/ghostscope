@@ -5,7 +5,7 @@ use futures::future;
 use ghostscope_protocol::{EventData, MessageType};
 use ghostscope_ui::{
     events::{TargetDebugInfo, TargetType, VariableDebugInfo},
-    run_tui_mode, EventRegistry,
+    run_tui_mode, EventRegistry, RuntimeStatus,
 };
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -85,15 +85,18 @@ async fn initialize_dwarf_processing(
     // Create debug session for DWARF processing
     match GhostSession::new_with_binary(&parsed_args).await {
         Ok(session) => {
-            // Validate that we have debug information
-            match session.get_debug_info() {
-                Some(debug_info) => {
-                    info!("✓ Binary analysis successful in TUI mode");
-                    info!("  Path: {}", debug_info.binary_path.display());
-                    info!("  Debug info: {:?}", debug_info.debug_path);
-                    info!("  Has symbols: {}", debug_info.has_symbols);
-                    info!("  Has debug info: {}", debug_info.has_debug_info);
-                    info!("  Base address: 0x{:x}", debug_info.base_address);
+            // Validate that we have process analysis information
+            match session.get_module_stats() {
+                Some(stats) => {
+                    info!("✓ Process analysis successful in TUI mode");
+                    info!("  Total modules: {}", stats.total_modules);
+                    info!("  Executable modules: {}", stats.executable_modules);
+                    info!("  Library modules: {}", stats.library_modules);
+                    info!("  Total symbols: {}", stats.total_symbols);
+                    info!(
+                        "  Modules with debug info: {}",
+                        stats.modules_with_debug_info
+                    );
 
                     // Count available symbols for status update
                     let functions = session.list_functions();
@@ -103,7 +106,7 @@ async fn initialize_dwarf_processing(
                     let _ =
                         status_sender.send(RuntimeStatus::DwarfLoadingCompleted { symbols_count });
 
-                    if !debug_info.has_debug_info {
+                    if stats.modules_with_debug_info == 0 {
                         let _ = status_sender.send(
                             RuntimeStatus::Error(
                                 "No debug information available. Compile with -g for full functionality".to_string()
@@ -341,7 +344,7 @@ async fn run_runtime_coordinator(
                     }
                     RuntimeCommand::RequestSourceCode => {
                         info!("Source code request received");
-                        handle_source_code_request(&mut session, &runtime_channels.status_sender).await;
+                        handle_source_code_request(&mut session, &runtime_channels.status_sender);
                     }
                     RuntimeCommand::DisableTrace(trace_id) => {
                         info!("Disabling trace: {}", trace_id);
@@ -467,7 +470,7 @@ async fn run_runtime_coordinator(
                     }
                     RuntimeCommand::InfoTarget { target } => {
                         info!("Info target request for: {}", target);
-                        handle_info_target_request(&mut session, &target, &runtime_channels.status_sender).await;
+                        handle_info_target_request(&mut session, &target, &runtime_channels.status_sender);
                     }
                     RuntimeCommand::Shutdown => {
                         info!("Shutdown command received");
@@ -483,13 +486,11 @@ async fn run_runtime_coordinator(
 }
 
 /// Handle source code request from TUI
-async fn handle_source_code_request(
+fn handle_source_code_request(
     session: &mut Option<GhostSession>,
     status_sender: &tokio::sync::mpsc::UnboundedSender<ghostscope_ui::RuntimeStatus>,
 ) {
-    use ghostscope_ui::{events::SourceCodeInfo, RuntimeStatus};
-
-    let result = try_load_source_code(session).await;
+    let result = try_load_source_code(session);
 
     match result {
         Ok(source_info) => {
@@ -507,7 +508,7 @@ async fn handle_source_code_request(
 }
 
 /// Try to load source code, returning detailed error information
-async fn try_load_source_code(
+fn try_load_source_code(
     session: &mut Option<GhostSession>,
 ) -> Result<ghostscope_ui::events::SourceCodeInfo, String> {
     use ghostscope_ui::events::SourceCodeInfo;
@@ -516,22 +517,29 @@ async fn try_load_source_code(
         .as_mut()
         .ok_or_else(|| "No active session available".to_string())?;
 
-    let binary_analyzer = session
-        .binary_analyzer
+    let process_analyzer = session
+        .process_analyzer
         .as_mut()
-        .ok_or_else(|| "Binary analyzer not available. Try reloading the binary.".to_string())?;
+        .ok_or_else(|| "Process analyzer not available. Try reloading the process.".to_string())?;
 
-    let main_symbol = binary_analyzer.find_symbol("main").ok_or_else(|| {
-        "Main function not found in binary. Ensure the binary has debug symbols.".to_string()
+    let (module_path, main_symbol, source_location) = match process_analyzer
+        .find_function_source_location("main")
+    {
+        Some(result) => result,
+        None => return Err(
+            "Main function not found in any loaded module. Ensure the binary has debug symbols."
+                .to_string(),
+        ),
+    };
+
+    info!(
+        "Found main symbol at address: 0x{:x} in module: {}",
+        main_symbol.address, module_path
+    );
+
+    let source_location = source_location.ok_or_else(|| {
+        "No source location found for main function. Compile with -g flag.".to_string()
     })?;
-
-    info!("Found main symbol at address: 0x{:x}", main_symbol.address);
-
-    let source_location = binary_analyzer
-        .get_source_location(main_symbol.address)
-        .ok_or_else(|| {
-            "No source location found for main function. Compile with -g flag.".to_string()
-        })?;
 
     info!(
         "Found source location: {}:{}",
@@ -546,17 +554,12 @@ async fn try_load_source_code(
 }
 
 /// Handle info target request from TUI
-async fn handle_info_target_request(
+fn handle_info_target_request(
     session: &mut Option<GhostSession>,
     target: &str,
     status_sender: &tokio::sync::mpsc::UnboundedSender<ghostscope_ui::RuntimeStatus>,
 ) {
-    use ghostscope_ui::{
-        events::{TargetDebugInfo, TargetType, VariableDebugInfo},
-        RuntimeStatus,
-    };
-
-    let result = try_get_target_debug_info(session, target).await;
+    let result = try_get_target_debug_info(session, target);
 
     match result {
         Ok(debug_info) => {
@@ -580,7 +583,7 @@ async fn handle_info_target_request(
 }
 
 /// Try to get debug info for a target (function name or file:line)
-async fn try_get_target_debug_info(
+fn try_get_target_debug_info(
     session: &mut Option<GhostSession>,
     target: &str,
 ) -> Result<TargetDebugInfo, String> {
@@ -588,159 +591,147 @@ async fn try_get_target_debug_info(
         .as_mut()
         .ok_or_else(|| "No active session available".to_string())?;
 
-    let binary_analyzer = session
-        .binary_analyzer
+    let process_analyzer = session
+        .process_analyzer
         .as_mut()
-        .ok_or_else(|| "Binary analyzer not available. Try reloading the binary.".to_string())?;
+        .ok_or_else(|| "Process analyzer not available. Try reloading the process.".to_string())?;
 
     // Parse the target to determine if it's a function name or file:line
     if target.contains(':') {
         // Parse as file:line
-        handle_source_location_target(binary_analyzer, target).await
+        handle_source_location_target(process_analyzer, target)
     } else {
         // Parse as function name
-        handle_function_target(binary_analyzer, target).await
+        handle_function_target(process_analyzer, target)
     }
 }
 
 /// Handle function name target
-async fn handle_function_target(
-    binary_analyzer: &mut ghostscope_binary::BinaryAnalyzer,
+fn handle_function_target(
+    process_analyzer: &mut ghostscope_binary::ProcessAnalyzer,
     function_name: &str,
 ) -> Result<TargetDebugInfo, String> {
     use ghostscope_ui::events::*;
 
-    // Use DWARF information first, then fall back to symbol table
-    let addresses = binary_analyzer.get_all_function_addresses(function_name);
+    // Use DWARF information across all modules
+    let module_addresses = process_analyzer.get_all_function_addresses(function_name);
 
-    if addresses.is_empty() {
+    if module_addresses.is_empty() {
         return Err(format!(
-            "Function '{}' not found in DWARF info or symbols",
+            "Function '{}' not found in any loaded module",
             function_name
         ));
     }
 
+    let total_addresses: usize = module_addresses.iter().map(|(_, addrs)| addrs.len()).sum();
     info!(
-        "Found function '{}' at {} address(es): [{}]",
+        "Found function '{}' at {} address(es) across {} modules",
         function_name,
-        addresses.len(),
-        addresses
-            .iter()
-            .map(|a| format!("0x{:x}", a))
-            .collect::<Vec<_>>()
-            .join(", ")
+        total_addresses,
+        module_addresses.len()
     );
 
-    // Analyze variables for each address separately
+    // Analyze variables for each module and address separately
     let mut address_mappings = Vec::new();
+    let mut first_address_and_module: Option<(&str, u64)> = None;
 
-    for address in &addresses {
+    for (module_path, addresses) in &module_addresses {
         info!(
-            "Analyzing variables at address 0x{:x} for function '{}'",
-            address, function_name
+            "Processing function '{}' in module '{}' at {} addresses",
+            function_name,
+            module_path,
+            addresses.len()
         );
 
-        // Get enhanced variables at this address using ScopedVariableSystem
-        let mut enhanced_vars = if let Some(dwarf_context) = binary_analyzer.dwarf_context_mut() {
-            info!(
-                "Using scoped variable system for function analysis at 0x{:x}",
-                address
-            );
-            let mut vars = dwarf_context.get_enhanced_variable_locations(*address);
+        for address in addresses {
+            // Remember the first address and module for source location lookup
+            if first_address_and_module.is_none() {
+                first_address_and_module = Some((module_path, *address));
+            }
 
-            // Compute new evaluation results for variables that don't have them
-            for var in vars.iter_mut() {
-                if var.evaluation_result.is_none() {
-                    let context = ghostscope_binary::expression::EvaluationContext {
-                        pc_address: *address,
-                        address_size: 8,
+            info!(
+                "Analyzing variables at address 0x{:x} for function '{}' in module '{}'",
+                address, function_name, module_path
+            );
+
+            // Get enhanced variables at this address using ProcessAnalyzer encapsulated method
+            info!(
+                "Using module '{}' for function analysis at binary offset 0x{:x}",
+                module_path, address
+            );
+
+            let context = ghostscope_binary::EvaluationContext {
+                pc_address: *address, // Use binary offset directly
+                address_size: 8,
+            };
+
+            let enhanced_vars = process_analyzer.get_and_evaluate_enhanced_variables(
+                module_path,
+                *address,
+                &context,
+            );
+
+            // Separate parameters and variables for this address
+            let mut parameters = Vec::new();
+            let mut variables = Vec::new();
+
+            for enhanced_var in enhanced_vars {
+                // NEW: Use the enhanced type-safe evaluation result first, then fall back to legacy result
+                let location_description =
+                    if let Some(evaluation_result) = &enhanced_var.evaluation_result {
+                        format!("{:?}", evaluation_result)
+                    } else {
+                        format!("{:?} (raw)", enhanced_var.variable.location_expr)
                     };
 
-                    match dwarf_context
-                        .get_expression_evaluator()
-                        .ok_or_else(|| "Expression evaluator not available".to_string())?
-                        .evaluate_location_with_enhanced_types(
-                            &var.location_at_address,
-                            *address,
-                            &context,
-                            None, // Pass None to avoid borrowing conflicts
-                        ) {
-                        Ok(new_result) => {
-                            info!(
-                                "Computed new evaluation result for '{}': {:?}",
-                                var.variable.name, new_result
-                            );
-                            var.evaluation_result = Some(new_result);
-                        }
-                        Err(e) => {
-                            info!(
-                                "Failed to compute new evaluation result for '{}': {}",
-                                var.variable.name, e
-                            );
-                        }
-                    }
-                }
-            }
-            vars
-        } else {
-            Vec::new()
-        };
+                let var_info = VariableDebugInfo {
+                    name: enhanced_var.variable.name.clone(),
+                    type_name: enhanced_var.variable.type_name.clone(),
+                    location_description,
+                    size: enhanced_var.size,
+                    scope_start: enhanced_var.variable.scope_ranges.first().map(|r| r.start),
+                    scope_end: enhanced_var.variable.scope_ranges.first().map(|r| r.end),
+                };
 
-        // Separate parameters and variables for this address
-        let mut parameters = Vec::new();
-        let mut variables = Vec::new();
+                // Use the is_parameter field from DWARF parsing (which is based on DW_TAG_formal_parameter)
+                let is_parameter = enhanced_var.variable.is_parameter;
 
-        for enhanced_var in enhanced_vars {
-            // NEW: Use the enhanced type-safe evaluation result first, then fall back to legacy result
-            let location_description =
-                if let Some(evaluation_result) = &enhanced_var.evaluation_result {
+                // Log using enhanced evaluation result if available
+                let log_location = if let Some(evaluation_result) = &enhanced_var.evaluation_result
+                {
                     format!("{:?}", evaluation_result)
                 } else {
                     format!("{:?} (raw)", enhanced_var.variable.location_expr)
                 };
 
-            let var_info = VariableDebugInfo {
-                name: enhanced_var.variable.name.clone(),
-                type_name: enhanced_var.variable.type_name.clone(),
-                location_description,
-                size: enhanced_var.size,
-                scope_start: enhanced_var.variable.scope_ranges.first().map(|r| r.start),
-                scope_end: enhanced_var.variable.scope_ranges.first().map(|r| r.end),
-            };
+                info!(
+                    "Address 0x{:x}: Variable '{}' location: {}, is_parameter: {} (from DWARF)",
+                    *address, enhanced_var.variable.name, log_location, is_parameter
+                );
 
-            // Use the is_parameter field from DWARF parsing (which is based on DW_TAG_formal_parameter)
-            let is_parameter = enhanced_var.variable.is_parameter;
-
-            // Log using enhanced evaluation result if available
-            let log_location = if let Some(evaluation_result) = &enhanced_var.evaluation_result {
-                format!("{:?}", evaluation_result)
-            } else {
-                format!("{:?} (raw)", enhanced_var.variable.location_expr)
-            };
-
-            info!(
-                "Address 0x{:x}: Variable '{}' location: {}, is_parameter: {} (from DWARF)",
-                *address, enhanced_var.variable.name, log_location, is_parameter
-            );
-
-            if is_parameter {
-                parameters.push(var_info);
-            } else {
-                variables.push(var_info);
+                if is_parameter {
+                    parameters.push(var_info);
+                } else {
+                    variables.push(var_info);
+                }
             }
-        }
 
-        address_mappings.push(AddressMapping {
-            address: *address,
-            function_name: Some(function_name.to_string()),
-            variables,
-            parameters,
-        });
+            address_mappings.push(AddressMapping {
+                address: *address,
+                function_name: Some(function_name.to_string()),
+                variables,
+                parameters,
+            });
+        }
     }
 
-    // Try to get source location for the main function address
-    let first_address = addresses[0];
-    let source_location = binary_analyzer.get_source_location(first_address);
+    // Try to get source location for the first function address
+    let source_location = if let Some((first_module_path, first_address)) = first_address_and_module
+    {
+        process_analyzer.get_source_location_for_offset(first_module_path, first_address)
+    } else {
+        None
+    };
 
     Ok(TargetDebugInfo {
         target: function_name.to_string(),
@@ -753,8 +744,8 @@ async fn handle_function_target(
 }
 
 /// Handle source location target (file:line)
-async fn handle_source_location_target(
-    binary_analyzer: &mut ghostscope_binary::BinaryAnalyzer,
+fn handle_source_location_target(
+    process_analyzer: &mut ghostscope_binary::ProcessAnalyzer,
     target: &str,
 ) -> Result<TargetDebugInfo, String> {
     use ghostscope_ui::events::*;
@@ -773,135 +764,142 @@ async fn handle_source_location_target(
         .parse::<u32>()
         .map_err(|_| format!("Invalid line number '{}' in target '{}'", parts[1], target))?;
 
-    // Resolve source line to all addresses
-    let addresses = binary_analyzer.get_all_source_line_addresses(file_path, line_number);
+    // Resolve source line to all addresses across all modules
+    let module_addresses = process_analyzer.get_all_source_line_addresses(file_path, line_number);
 
-    if addresses.is_empty() {
+    if module_addresses.is_empty() {
         return Err(format!(
             "Cannot resolve any address for {}:{}",
             file_path, line_number
         ));
     }
 
+    let total_addresses: usize = module_addresses.iter().map(|(_, addrs)| addrs.len()).sum();
     info!(
-        "Resolved {}:{} to {} address(es): [{}]",
+        "Found source line '{}:{}' at {} address(es) across {} modules",
         file_path,
         line_number,
-        addresses.len(),
-        addresses
-            .iter()
-            .map(|a| format!("0x{:x}", a))
-            .collect::<Vec<_>>()
-            .join(", ")
+        total_addresses,
+        module_addresses.len()
     );
 
-    // Analyze variables for each address separately
+    // Analyze variables for each module and address separately
     let mut address_mappings = Vec::new();
+    let mut first_address_and_module: Option<(&str, u64)> = None;
 
-    for address in &addresses {
-        info!("Analyzing variables at address 0x{:x}", address);
+    for (module_path, addresses) in &module_addresses {
+        info!(
+            "Processing source line '{}:{}' in module '{}' at {} addresses",
+            file_path,
+            line_number,
+            module_path,
+            addresses.len()
+        );
 
-        let mut enhanced_vars = if let Some(dwarf_context) = binary_analyzer.dwarf_context_mut() {
-            let mut vars = dwarf_context.get_enhanced_variable_locations(*address);
+        for address in addresses {
+            // Remember the first address and module for source location lookup
+            if first_address_and_module.is_none() {
+                first_address_and_module = Some((module_path, *address));
+            }
 
-            // Compute new evaluation results for variables that don't have them
-            for var in vars.iter_mut() {
-                if var.evaluation_result.is_none() {
-                    let context = ghostscope_binary::expression::EvaluationContext {
-                        pc_address: *address,
-                        address_size: 8,
+            info!(
+                "Analyzing variables at address 0x{:x} for source line '{}:{}' in module '{}'",
+                address, file_path, line_number, module_path
+            );
+
+            // Get enhanced variables at this address using ProcessAnalyzer encapsulated method
+            info!(
+                "Using module '{}' for source line analysis at binary offset 0x{:x}",
+                module_path, address
+            );
+
+            let context = ghostscope_binary::EvaluationContext {
+                pc_address: *address, // Use binary offset directly
+                address_size: 8,
+            };
+
+            let enhanced_vars = process_analyzer.get_and_evaluate_enhanced_variables(
+                module_path,
+                *address,
+                &context,
+            );
+
+            info!(
+                "Found {} enhanced variables at address 0x{:x} in module '{}'",
+                enhanced_vars.len(),
+                address,
+                module_path
+            );
+
+            // Separate parameters and variables for this address
+            let mut parameters = Vec::new();
+            let mut variables = Vec::new();
+
+            for enhanced_var in enhanced_vars {
+                // NEW: Use the enhanced type-safe evaluation result first, then fall back to legacy result
+                let location_description =
+                    if let Some(evaluation_result) = &enhanced_var.evaluation_result {
+                        format!("{:?}", evaluation_result)
+                    } else {
+                        format!("{:?} (raw)", enhanced_var.variable.location_expr)
                     };
 
-                    match dwarf_context
-                        .get_expression_evaluator()
-                        .ok_or_else(|| "Expression evaluator not available".to_string())?
-                        .evaluate_location_with_enhanced_types(
-                            &var.location_at_address,
-                            *address,
-                            &context,
-                            None, // Pass None to avoid borrowing conflicts
-                        ) {
-                        Ok(new_result) => {
-                            info!(
-                                "Computed new evaluation result for '{}': {:?}",
-                                var.variable.name, new_result
-                            );
-                            var.evaluation_result = Some(new_result);
-                        }
-                        Err(e) => {
-                            info!(
-                                "Failed to compute new evaluation result for '{}': {}",
-                                var.variable.name, e
-                            );
-                        }
-                    }
-                }
-            }
-            vars
-        } else {
-            Vec::new()
-        };
+                let var_info = VariableDebugInfo {
+                    name: enhanced_var.variable.name.clone(),
+                    type_name: enhanced_var.variable.type_name.clone(),
+                    location_description,
+                    size: enhanced_var.size,
+                    scope_start: enhanced_var.variable.scope_ranges.first().map(|r| r.start),
+                    scope_end: enhanced_var.variable.scope_ranges.first().map(|r| r.end),
+                };
 
-        // Separate parameters and variables for this address
-        let mut parameters = Vec::new();
-        let mut variables = Vec::new();
+                let is_parameter = enhanced_var.variable.is_parameter;
 
-        for enhanced_var in enhanced_vars {
-            // NEW: Use the enhanced type-safe evaluation result first, then fall back to legacy result
-            let location_description =
-                if let Some(evaluation_result) = &enhanced_var.evaluation_result {
+                // Log using enhanced evaluation result if available
+                let log_location = if let Some(evaluation_result) = &enhanced_var.evaluation_result
+                {
                     format!("{:?}", evaluation_result)
                 } else {
                     format!("{:?} (raw)", enhanced_var.variable.location_expr)
                 };
 
-            let var_info = VariableDebugInfo {
-                name: enhanced_var.variable.name.clone(),
-                type_name: enhanced_var.variable.type_name.clone(),
-                location_description,
-                size: enhanced_var.size,
-                scope_start: enhanced_var.variable.scope_ranges.first().map(|r| r.start),
-                scope_end: enhanced_var.variable.scope_ranges.first().map(|r| r.end),
-            };
+                info!(
+                    "Address 0x{:x}: Variable '{}' location: {}, is_parameter: {} (from DWARF)",
+                    *address, enhanced_var.variable.name, log_location, is_parameter
+                );
 
-            let is_parameter = enhanced_var.variable.is_parameter;
-
-            // Log using enhanced evaluation result if available
-            let log_location = if let Some(evaluation_result) = &enhanced_var.evaluation_result {
-                format!("{:?}", evaluation_result)
-            } else {
-                format!("{:?} (raw)", enhanced_var.variable.location_expr)
-            };
-
-            info!(
-                "Address 0x{:x}: Variable '{}' location: {}, is_parameter: {} (from DWARF)",
-                *address, enhanced_var.variable.name, log_location, is_parameter
-            );
-
-            if is_parameter {
-                parameters.push(var_info);
-            } else {
-                variables.push(var_info);
+                if is_parameter {
+                    parameters.push(var_info);
+                } else {
+                    variables.push(var_info);
+                }
             }
+
+            // Get function name by finding symbol at this address in the specific module
+            let function_name: Option<String> = process_analyzer
+                .find_symbol_by_address_in_module(module_path, *address)
+                .map(|symbol| symbol.name);
+
+            address_mappings.push(AddressMapping {
+                address: *address,
+                function_name,
+                variables,
+                parameters,
+            });
         }
-
-        // Find containing function for this address
-        let function_symbol = binary_analyzer
-            .symbol_table
-            .find_containing_symbol(*address);
-        let function_name = function_symbol.map(|s| s.name.clone());
-
-        address_mappings.push(AddressMapping {
-            address: *address,
-            function_name,
-            variables,
-            parameters,
-        });
     }
 
-    // Get the actual source location from the first address to get the complete file path
-    let first_address = address_mappings[0].address;
-    let actual_source_location = binary_analyzer.get_source_location(first_address);
+    // Get actual source location from first module that has addresses
+    let actual_source_location: Option<ghostscope_binary::SourceLocation> =
+        if let Some((first_module_path, first_addresses)) = module_addresses.first() {
+            if let Some(first_address) = first_addresses.first() {
+                process_analyzer.get_source_location_for_offset(first_module_path, *first_address)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
     let complete_file_path = actual_source_location
         .as_ref()
         .map(|sl| sl.file_path.clone())
@@ -931,24 +929,21 @@ fn get_source_files_info(
     let mut files = Vec::new();
     let mut seen_files = HashSet::new();
 
-    // Get files from binary analyzer
-    if let Some(ref binary_analyzer) = session.binary_analyzer {
-        if let Some(dwarf_context) = binary_analyzer.dwarf_context() {
-            // Get all file information from DWARF context
-            let file_info_vec = dwarf_context.get_all_file_info()?;
+    // Get files from process analyzer across all modules using encapsulated method
+    if let Some(ref process_analyzer) = session.process_analyzer {
+        let file_info_vec = process_analyzer.get_all_file_info_from_all_modules()?;
 
-            for file_info in file_info_vec {
-                let key = format!("{}:{}", file_info.directory, file_info.basename);
-                if seen_files.contains(&key) {
-                    continue;
-                }
-                seen_files.insert(key);
-
-                files.push(ghostscope_ui::events::SourceFileInfo {
-                    path: file_info.basename,
-                    directory: file_info.directory,
-                });
+        for file_info in file_info_vec {
+            let key = format!("{}:{}", file_info.directory, file_info.basename);
+            if seen_files.contains(&key) {
+                continue;
             }
+            seen_files.insert(key);
+
+            files.push(ghostscope_ui::events::SourceFileInfo {
+                path: file_info.basename,
+                directory: file_info.directory,
+            });
         }
     }
 

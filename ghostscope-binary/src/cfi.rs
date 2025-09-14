@@ -8,7 +8,7 @@ use tracing::{debug, info};
 
 /// CFI context for managing call frame information
 #[derive(Debug)]
-pub struct CFIContext {
+pub(crate) struct CFIContext {
     /// Base addresses for address computations
     base_addresses: BaseAddresses,
     /// Original .eh_frame section data for lazy parsing

@@ -6,8 +6,8 @@ use crate::expression::{DwarfExpressionEvaluator, EvaluationContext, EvaluationR
 use std::collections::{BTreeSet, HashMap, HashSet};
 use tracing::{debug, error, warn};
 
-pub type VariableId = u32;
-pub type ScopeId = u32;
+pub(crate) type VariableId = u32;
+pub(crate) type ScopeId = u32;
 
 /// Address range for scope and variable visibility
 #[derive(Debug, Clone, PartialEq)]
@@ -18,7 +18,7 @@ pub struct AddressRange {
 
 /// Variable information stored once, referenced by ID
 #[derive(Debug, Clone)]
-pub struct VariableInfo {
+pub(crate) struct VariableInfo {
     pub id: VariableId,
     pub name: String,
     pub type_name: String,
@@ -31,7 +31,7 @@ pub struct VariableInfo {
 
 /// Scope hierarchy (lexical scopes)
 #[derive(Debug, Clone)]
-pub struct Scope {
+pub(crate) struct Scope {
     pub id: ScopeId,
     pub parent_scope: Option<ScopeId>,
     pub scope_type: ScopeType,
@@ -42,7 +42,7 @@ pub struct Scope {
 
 /// Types of scopes in the debug information
 #[derive(Debug, Clone)]
-pub enum ScopeType {
+pub(crate) enum ScopeType {
     CompilationUnit,
     Function { name: String, address: u64 },
     LexicalBlock { depth: usize },
@@ -51,7 +51,7 @@ pub enum ScopeType {
 
 /// Variable reference within a scope with location information
 #[derive(Debug, Clone)]
-pub struct VariableRef {
+pub(crate) struct VariableRef {
     pub variable_id: VariableId,
     pub address_ranges: Vec<AddressRange>,
     pub location_at_ranges: Vec<(AddressRange, LocationExpression)>,
@@ -59,14 +59,14 @@ pub struct VariableRef {
 
 /// Address-to-scope mapping entry for fast lookup
 #[derive(Debug, Clone)]
-pub struct AddressScopeEntry {
+pub(crate) struct AddressScopeEntry {
     pub address: u64,
     pub active_scopes: Vec<ScopeId>,
 }
 
 /// Variable lookup result with scoping information
 #[derive(Debug, Clone)]
-pub struct VariableResult {
+pub(crate) struct VariableResult {
     pub variable_info: VariableInfo,
     pub location_at_address: LocationExpression,
     pub scope_depth: usize,
@@ -77,7 +77,7 @@ pub struct VariableResult {
 
 /// Efficient variable storage with proper scoping based on GDB design
 #[derive(Debug)]
-pub struct ScopedVariableMap {
+pub(crate) struct ScopedVariableMap {
     /// All variable information (deduplicated)
     variables: HashMap<VariableId, VariableInfo>,
 
@@ -563,7 +563,6 @@ impl ScopedVariableMap {
 
         // Sort addresses for consistent ordering
         addresses.sort_unstable();
-        addresses.dedup(); // Remove potential duplicates from overlapping ranges
         addresses
     }
 
@@ -580,7 +579,7 @@ impl ScopedVariableMap {
 
 /// Statistics about the scoped variable map
 #[derive(Debug)]
-pub struct ScopedVariableMapStats {
+pub(crate) struct ScopedVariableMapStats {
     pub total_variables: usize,
     pub total_scopes: usize,
     pub total_address_entries: usize,

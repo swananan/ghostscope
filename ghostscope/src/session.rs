@@ -1,14 +1,14 @@
 use crate::args::ParsedArgs;
 use crate::trace_manager::TraceManager;
 use anyhow::{Context, Result};
-use ghostscope_binary::{BinaryAnalyzer, DebugInfo};
+use ghostscope_binary::ProcessAnalyzer;
 use ghostscope_loader::GhostScopeLoader;
 use tracing::{error, info, warn};
 
 /// Ghost session state - manages binary analysis, process tracking, and trace instances
 #[derive(Debug)]
 pub struct GhostSession {
-    pub binary_analyzer: Option<BinaryAnalyzer>,
+    pub process_analyzer: Option<ProcessAnalyzer>,
     pub target_binary: Option<String>,
     pub target_args: Vec<String>,
     pub target_pid: Option<u32>,
@@ -24,7 +24,7 @@ impl GhostSession {
         info!("Creating ghost session");
 
         Self {
-            binary_analyzer: None,
+            process_analyzer: None,
             target_binary: args.binary_path.clone(),
             target_args: args.binary_args.clone(),
             target_pid: args.pid,
@@ -44,18 +44,19 @@ impl GhostSession {
 
         let debug_file_path = self.debug_file.as_deref();
 
-        let binary_analyzer = if let Some(pid) = self.target_pid {
+        let process_analyzer = if let Some(pid) = self.target_pid {
             info!("Loading binary from PID: {}", pid);
-            Some(BinaryAnalyzer::from_pid(pid, debug_file_path)?)
-        } else if let Some(ref binary_path) = self.target_binary {
-            info!("Loading binary from path: {}", binary_path);
-            Some(BinaryAnalyzer::new(binary_path, debug_file_path)?)
+            Some(ProcessAnalyzer::from_pid(pid)?)
+        } else if let Some(ref _binary_path) = self.target_binary {
+            // TODO: Implement ProcessAnalyzer::from_binary_path for static binary analysis
+            warn!("Static binary analysis not yet implemented - need PID for process analysis");
+            None
         } else {
             warn!("No PID or binary path specified - running without binary analysis");
             None
         };
 
-        self.binary_analyzer = binary_analyzer;
+        self.process_analyzer = process_analyzer;
         Ok(())
     }
 
@@ -169,13 +170,13 @@ impl GhostSession {
         let function_name = "main"; // Default function for legacy compatibility
         warn!("Using legacy attach_uprobe with hardcoded 'main' function. Consider migrating to new trace-based approach.");
 
-        // Determine binary path - prefer from binary analyzer if available
-        let binary_path = if let Some(ref analyzer) = self.binary_analyzer {
-            analyzer
-                .debug_info()
-                .binary_path
-                .to_string_lossy()
-                .to_string()
+        // Determine binary path - prefer from process analyzer if available
+        let binary_path = if let Some(ref analyzer) = self.process_analyzer {
+            if let Some(main_module) = analyzer.get_main_executable() {
+                main_module.path.clone()
+            } else {
+                return Err(anyhow::anyhow!("No main executable found in process"));
+            }
         } else if let Some(ref binary_path) = self.target_binary {
             binary_path.clone()
         } else {
@@ -184,45 +185,51 @@ impl GhostSession {
 
         info!("Attaching uprobe to {}:{}", binary_path, function_name);
 
-        // If we have a binary analyzer, verify the function exists and get its offset
-        let function_offset = if let Some(ref analyzer) = self.binary_analyzer {
-            match analyzer.find_symbol(function_name) {
-                Some(symbol) => {
-                    info!(
-                        "Found target function '{}' at address 0x{:x}",
-                        function_name, symbol.address
-                    );
-
-                    // Calculate proper uprobe offset
-                    if let Some(uprobe_offset) = symbol.uprobe_offset() {
+        // If we have a process analyzer, verify the function exists and get its offset
+        let function_offset = if let Some(ref analyzer) = self.process_analyzer {
+            if let Some(main_module) = analyzer.get_main_executable() {
+                match analyzer.find_symbol_by_name_in_module(&main_module.path, function_name) {
+                    Some(symbol) => {
                         info!(
-                            "Calculated uprobe offset: 0x{:x} (raw address: 0x{:x})",
-                            uprobe_offset, symbol.address
+                            "Found target function '{}' at address 0x{:x}",
+                            function_name, symbol.address
                         );
-                        info!(
-                            "  Section: {:?}, VirtAddr: {:?}, FileOffset: {:?}",
-                            symbol.section_name, symbol.section_viraddr, symbol.section_file_offset
-                        );
-                        Some(uprobe_offset)
-                    } else {
-                        warn!("Unable to calculate uprobe offset for function '{}', falling back to raw address", 
-                              function_name);
-                        Some(symbol.address)
-                    }
-                }
-                None => {
-                    warn!("Function '{}' not found in symbol table", function_name);
 
-                    // Show similar function names
-                    let similar = analyzer.symbol_table.find_matching(function_name);
-                    if !similar.is_empty() {
-                        info!("Similar functions found:");
-                        for sym in similar.iter().take(5) {
-                            info!("  {}", sym.name);
+                        // Calculate proper uprobe offset
+                        if let Some(uprobe_offset) = symbol.uprobe_offset() {
+                            info!(
+                                "Calculated uprobe offset: 0x{:x} (raw address: 0x{:x})",
+                                uprobe_offset, symbol.address
+                            );
+                            info!(
+                                "  Section: {:?}, VirtAddr: {:?}, FileOffset: {:?}",
+                                symbol.section_name,
+                                symbol.section_viraddr,
+                                symbol.section_file_offset
+                            );
+                            Some(uprobe_offset)
+                        } else {
+                            warn!("Unable to calculate uprobe offset for function '{}', falling back to raw address", 
+                                  function_name);
+                            Some(symbol.address)
                         }
                     }
-                    None
+                    None => {
+                        warn!("Function '{}' not found in symbol table", function_name);
+
+                        // Show similar function names
+                        let similar = analyzer.find_matching_functions(function_name);
+                        if !similar.is_empty() {
+                            info!("Similar functions found:");
+                            for func_name in similar.iter().take(5) {
+                                info!("  {}", func_name);
+                            }
+                        }
+                        None
+                    }
                 }
+            } else {
+                None
             }
         } else {
             None
@@ -299,19 +306,25 @@ impl GhostSession {
     }
 
     /// Get debug information summary
-    pub fn get_debug_info(&self) -> Option<&DebugInfo> {
-        self.binary_analyzer.as_ref().map(|a| a.debug_info())
+    pub fn get_debug_info(&self) -> Option<String> {
+        self.process_analyzer.as_ref().map(|a| {
+            if let Some(main_module) = a.get_main_executable() {
+                format!("Binary: {}, PID: {}", main_module.path, a.pid)
+            } else {
+                format!("PID: {}", a.pid)
+            }
+        })
+    }
+
+    /// Get module statistics
+    pub fn get_module_stats(&self) -> Option<ghostscope_binary::ModuleStats> {
+        self.process_analyzer.as_ref().map(|a| a.get_module_stats())
     }
 
     /// List available functions
     pub fn list_functions(&self) -> Vec<String> {
-        if let Some(ref analyzer) = self.binary_analyzer {
-            analyzer
-                .symbol_table
-                .get_functions()
-                .iter()
-                .map(|sym| sym.name.clone())
-                .collect()
+        if let Some(ref analyzer) = self.process_analyzer {
+            analyzer.get_all_functions_from_all_modules()
         } else {
             Vec::new()
         }
@@ -319,13 +332,8 @@ impl GhostSession {
 
     /// Find function by name pattern
     pub fn find_functions(&self, pattern: &str) -> Vec<String> {
-        if let Some(ref analyzer) = self.binary_analyzer {
-            analyzer
-                .symbol_table
-                .find_matching(pattern)
-                .iter()
-                .map(|sym| sym.name.clone())
-                .collect()
+        if let Some(ref analyzer) = self.process_analyzer {
+            analyzer.find_matching_functions(pattern)
         } else {
             Vec::new()
         }

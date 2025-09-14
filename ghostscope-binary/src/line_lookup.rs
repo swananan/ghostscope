@@ -7,7 +7,7 @@ use tracing::debug;
 
 /// Location information for a specific address
 #[derive(Debug, Clone)]
-pub struct LineLocation {
+pub(crate) struct LineLocation {
     pub address: u64,
     pub file_path: String,
     pub line_number: u32,
@@ -51,7 +51,7 @@ struct AddressFlags {
 
 /// Parsed line information for efficient lookup
 #[derive(Debug)]
-pub struct LineInfo {
+pub(crate) struct LineInfo {
     files: Box<[String]>,
     sequences: Box<[LineSequence]>,
     /// Cache for line-to-address lookups
@@ -383,7 +383,7 @@ impl LineInfo {
 
 /// Line lookup manager that handles multiple compilation units
 #[derive(Debug)]
-pub struct LineLookup {
+pub(crate) struct LineLookup {
     line_infos: Vec<LineInfo>,
 }
 

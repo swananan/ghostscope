@@ -63,7 +63,7 @@ pub struct FunctionInfo {
 
 /// Parameter information
 #[derive(Debug, Clone)]
-pub struct Parameter {
+pub(crate) struct Parameter {
     pub name: String,
     pub type_name: String,
     pub location: Option<String>, // Register, stack offset, etc.
@@ -115,7 +115,7 @@ pub enum LocationExpression {
 
 /// Location list entry representing a variable location at a specific PC range
 #[derive(Debug, Clone)]
-pub struct LocationListEntry {
+pub(crate) struct LocationListEntry {
     /// Start PC address (inclusive)
     pub start_pc: u64,
     /// End PC address (exclusive)  
@@ -3824,6 +3824,35 @@ impl DwarfContext {
     ) -> Option<crate::expression::EvaluationResult> {
         // Use the new CFI method that returns EvaluationResult directly
         self.cfi_context.as_ref()?.get_cfa_expression(pc)
+    }
+
+    /// Get all source files from the file manager
+    pub fn get_all_source_files(&self) -> Vec<crate::file::SourceFile> {
+        if let Some(ref source_file_manager) = self.source_file_manager {
+            source_file_manager
+                .get_all_files()
+                .into_iter()
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Find variable at PC address by name
+    pub fn find_variable_at_pc(
+        &mut self,
+        pc: u64,
+        var_name: &str,
+    ) -> Option<crate::scoped_variables::VariableResult> {
+        if let Some(ref mut scoped_var_map) = self.scoped_variable_map {
+            let variables = scoped_var_map.get_variables_at_address(pc);
+            variables
+                .into_iter()
+                .find(|var| var.variable_info.name == var_name)
+        } else {
+            None
+        }
     }
 
     /// Check if CFI context is available

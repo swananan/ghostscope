@@ -1,7 +1,7 @@
 use crate::ast::{Program, Statement, TracePattern};
 use crate::codegen::CodeGen;
 use crate::CompileError;
-use ghostscope_binary::BinaryAnalyzer;
+// BinaryAnalyzer is now internal to ghostscope-binary, use ProcessAnalyzer instead
 use inkwell::context::Context;
 use tracing::{debug, error, info, warn};
 
@@ -43,47 +43,31 @@ pub struct UProbeConfig {
     pub ebpf_function_name: String,
 }
 
-/// Result of compiling a single PC address
-#[derive(Debug, Clone)]
-pub struct PCCompilationResult {
-    /// PC address for this compilation attempt
-    pub pc_address: u64,
-    /// Target name (function name or source location)
-    pub target_name: String,
-    /// Whether compilation succeeded
-    pub success: bool,
-    /// Error message if compilation failed
-    pub error_message: Option<String>,
-}
-
-/// Compilation result containing all uprobe configurations and detailed PC results
+/// Compilation result containing all uprobe configurations
 #[derive(Debug)]
 pub struct CompilationResult {
     pub uprobe_configs: Vec<UProbeConfig>,
-    pub pc_results: Vec<PCCompilationResult>,
     pub trace_count: usize,
     pub target_info: String,
 }
 
 /// Unified AST compiler that performs DWARF queries and code generation in single pass
 pub struct AstCompiler<'a> {
-    binary_analyzer: Option<&'a mut BinaryAnalyzer>,
+    process_analyzer: Option<&'a mut ghostscope_binary::ProcessAnalyzer>,
     uprobe_configs: Vec<UProbeConfig>,
-    pc_results: Vec<PCCompilationResult>,
     binary_path_hint: Option<String>,
     trace_id: Option<u32>,
 }
 
 impl<'a> AstCompiler<'a> {
     pub fn new(
-        binary_analyzer: Option<&'a mut BinaryAnalyzer>,
+        process_analyzer: Option<&'a mut ghostscope_binary::ProcessAnalyzer>,
         binary_path_hint: Option<String>,
         trace_id: Option<u32>,
     ) -> Self {
         Self {
-            binary_analyzer,
+            process_analyzer,
             uprobe_configs: Vec::new(),
-            pc_results: Vec::new(),
             binary_path_hint,
             trace_id,
         }
@@ -134,7 +118,6 @@ impl<'a> AstCompiler<'a> {
             }
         }
 
-        // Log summary
         if successful_trace_points > 0 && failed_trace_points == 0 {
             info!(
                 "All {} trace points processed successfully",
@@ -163,7 +146,6 @@ impl<'a> AstCompiler<'a> {
 
         Ok(CompilationResult {
             uprobe_configs: std::mem::take(&mut self.uprobe_configs),
-            pc_results: std::mem::take(&mut self.pc_results),
             trace_count: self.uprobe_configs.len(),
             target_info,
         })
@@ -183,23 +165,13 @@ impl<'a> AstCompiler<'a> {
                 line_number,
             } => {
                 // Obtain addresses first in a separate scope to avoid holding a mutable borrow of self
-                let (addresses, binary_path_string) =
-                    if let Some(analyzer) = &mut self.binary_analyzer {
-                        let addrs = analyzer.get_all_source_line_addresses(file_path, *line_number);
-                        let bin = analyzer
-                            .debug_info()
-                            .binary_path
-                            .to_string_lossy()
-                            .to_string();
-                        (addrs, bin)
-                    } else {
-                        (
-                            Vec::new(),
-                            self.binary_path_hint.clone().unwrap_or_default(),
-                        )
-                    };
+                let module_addresses = if let Some(analyzer) = &mut self.process_analyzer {
+                    analyzer.get_all_source_line_addresses(file_path, *line_number)
+                } else {
+                    Vec::new()
+                };
 
-                if addresses.is_empty() {
+                if module_addresses.is_empty() {
                     warn!(
                         "No addresses resolved for source line {}:{}; skipping",
                         file_path, line_number
@@ -207,68 +179,55 @@ impl<'a> AstCompiler<'a> {
                     return Ok(());
                 }
 
+                let total_addresses: usize =
+                    module_addresses.iter().map(|(_, addrs)| addrs.len()).sum();
                 debug!(
-                    "Resolved {}:{} to {} address(es)",
+                    "Resolved {}:{} to {} address(es) across {} modules",
                     file_path,
                     line_number,
-                    addresses.len()
+                    total_addresses,
+                    module_addresses.len()
                 );
 
-                // Process each address - continue even if some fail
+                // Process each module and its addresses - continue even if some fail
                 let mut successful_addresses = 0;
                 let mut failed_addresses = 0;
 
-                for (pc_idx, address) in addresses.iter().enumerate() {
-                    let target_info = ResolvedTarget {
-                        function_name: Some(format!("{}:{}", file_path, line_number)),
-                        function_address: Some(*address),
-                        binary_path: binary_path_string.clone(),
-                        uprobe_offset: Some(*address), // For line addresses, offset equals address
-                        pattern: pattern.clone(),
-                    };
+                let mut pc_idx = 0;
+                for (module_path, addresses) in &module_addresses {
+                    for address in addresses {
+                        let target_info = ResolvedTarget {
+                            function_name: Some(format!("{}:{}", file_path, line_number)),
+                            function_address: Some(*address),
+                            binary_path: module_path.clone(),
+                            uprobe_offset: Some(*address), // For line addresses, offset equals address
+                            pattern: pattern.clone(),
+                        };
 
-                    let target_name = format!("{}:{}", file_path, line_number);
-                    let result = self.generate_ebpf_for_target(
-                        &target_info,
-                        statements,
-                        pid,
-                        index + pc_idx,
-                    );
-
-                    // Record the result for this PC address
-                    let pc_result = match &result {
-                        Ok(_) => PCCompilationResult {
-                            pc_address: *address,
-                            target_name: target_name.clone(),
-                            success: true,
-                            error_message: None,
-                        },
-                        Err(e) => PCCompilationResult {
-                            pc_address: *address,
-                            target_name: target_name.clone(),
-                            success: false,
-                            error_message: Some(e.to_string()),
-                        },
-                    };
-                    self.pc_results.push(pc_result);
-
-                    match result {
-                        Ok(uprobe_config) => {
-                            self.uprobe_configs.push(uprobe_config);
-                            successful_addresses += 1;
-                            info!(
-                                "✓ Successfully generated eBPF for {}:{} at 0x{:x}",
-                                file_path, line_number, address
-                            );
+                        match self.generate_ebpf_for_target(
+                            &target_info,
+                            statements,
+                            pid,
+                            index + pc_idx,
+                        ) {
+                            Ok(uprobe_config) => {
+                                self.uprobe_configs.push(uprobe_config);
+                                successful_addresses += 1;
+                                info!(
+                                    "✓ Successfully generated eBPF for {}:{} at 0x{:x}",
+                                    file_path, line_number, address
+                                );
+                            }
+                            Err(e) => {
+                                failed_addresses += 1;
+                                error!(
+                                    "❌ Failed to generate eBPF for {}:{} at 0x{:x}: {}",
+                                    file_path, line_number, address, e
+                                );
+                                // Continue processing other addresses
+                            }
                         }
-                        Err(e) => {
-                            failed_addresses += 1;
-                            error!(
-                                "❌ Failed to generate eBPF for {}:{} at 0x{:x}: {}",
-                                file_path, line_number, address, e
-                            );
-                            // Continue processing other addresses
-                        }
+                        pc_idx += 1;
                     }
                 }
 
@@ -294,23 +253,13 @@ impl<'a> AstCompiler<'a> {
             }
             TracePattern::FunctionName(func_name) => {
                 // Resolve all addresses for the function name and generate per-PC programs
-                let (addresses, binary_path_string) = if let Some(analyzer) = &self.binary_analyzer
-                {
-                    let addrs = analyzer.get_all_function_addresses(func_name);
-                    let bin = analyzer
-                        .debug_info()
-                        .binary_path
-                        .to_string_lossy()
-                        .to_string();
-                    (addrs, bin)
+                let module_addresses = if let Some(analyzer) = &mut self.process_analyzer {
+                    analyzer.get_all_function_addresses(func_name)
                 } else {
-                    (
-                        Vec::new(),
-                        self.binary_path_hint.clone().unwrap_or_default(),
-                    )
+                    Vec::new()
                 };
 
-                if addresses.is_empty() {
+                if module_addresses.is_empty() {
                     warn!(
                         "No addresses resolved for function '{}'; skipping",
                         func_name
@@ -318,10 +267,13 @@ impl<'a> AstCompiler<'a> {
                     return Ok(());
                 }
 
+                let total_addresses: usize =
+                    module_addresses.iter().map(|(_, addrs)| addrs.len()).sum();
                 debug!(
-                    "Resolved function '{}' to {} address(es)",
+                    "Resolved function '{}' to {} address(es) across {} modules",
                     func_name,
-                    addresses.len()
+                    total_addresses,
+                    module_addresses.len()
                 );
 
                 // We may need analyzer again to compute precise uprobe offsets
@@ -329,65 +281,44 @@ impl<'a> AstCompiler<'a> {
                 let mut successful_addresses = 0;
                 let mut failed_addresses = 0;
 
-                for (pc_idx, address) in addresses.iter().enumerate() {
-                    let uprobe_offset = if let Some(analyzer) = &self.binary_analyzer {
-                        analyzer
-                            .calculate_uprobe_offset_from_address(*address)
-                            .unwrap_or(*address)
-                    } else {
-                        *address
-                    };
+                let mut pc_idx = 0;
+                for (module_path, addresses) in &module_addresses {
+                    for address in addresses {
+                        // For ProcessAnalyzer, the address is already the binary offset we need for uprobe
+                        let uprobe_offset = *address;
 
-                    let target_info = ResolvedTarget {
-                        function_name: Some(func_name.clone()),
-                        function_address: Some(*address),
-                        binary_path: binary_path_string.clone(),
-                        uprobe_offset: Some(uprobe_offset),
-                        pattern: pattern.clone(),
-                    };
+                        let target_info = ResolvedTarget {
+                            function_name: Some(func_name.clone()),
+                            function_address: Some(*address),
+                            binary_path: module_path.clone(),
+                            uprobe_offset: Some(uprobe_offset),
+                            pattern: pattern.clone(),
+                        };
 
-                    let target_name = func_name.clone();
-                    let result = self.generate_ebpf_for_target(
-                        &target_info,
-                        statements,
-                        pid,
-                        index + pc_idx,
-                    );
-
-                    // Record the result for this PC address
-                    let pc_result = match &result {
-                        Ok(_) => PCCompilationResult {
-                            pc_address: *address,
-                            target_name: target_name.clone(),
-                            success: true,
-                            error_message: None,
-                        },
-                        Err(e) => PCCompilationResult {
-                            pc_address: *address,
-                            target_name: target_name.clone(),
-                            success: false,
-                            error_message: Some(e.to_string()),
-                        },
-                    };
-                    self.pc_results.push(pc_result);
-
-                    match result {
-                        Ok(uprobe_config) => {
-                            self.uprobe_configs.push(uprobe_config);
-                            successful_addresses += 1;
-                            info!(
-                                "✓ Successfully generated eBPF for function '{}' at 0x{:x}",
-                                func_name, address
-                            );
+                        match self.generate_ebpf_for_target(
+                            &target_info,
+                            statements,
+                            pid,
+                            index + pc_idx,
+                        ) {
+                            Ok(uprobe_config) => {
+                                self.uprobe_configs.push(uprobe_config);
+                                successful_addresses += 1;
+                                info!(
+                                    "✓ Successfully generated eBPF for function '{}' at 0x{:x}",
+                                    func_name, address
+                                );
+                            }
+                            Err(e) => {
+                                failed_addresses += 1;
+                                error!(
+                                    "❌ Failed to generate eBPF for function '{}' at 0x{:x}: {}",
+                                    func_name, address, e
+                                );
+                                // Continue processing other addresses
+                            }
                         }
-                        Err(e) => {
-                            failed_addresses += 1;
-                            error!(
-                                "❌ Failed to generate eBPF for function '{}' at 0x{:x}: {}",
-                                func_name, address, e
-                            );
-                            // Continue processing other addresses
-                        }
+                        pc_idx += 1;
                     }
                 }
 
@@ -437,10 +368,10 @@ impl<'a> AstCompiler<'a> {
         );
 
         // Immediate LLVM IR and eBPF generation
-        let mut codegen = CodeGen::new_with_binary_analyzer(
+        let mut codegen = CodeGen::new_with_process_analyzer(
             &context,
             &ebpf_function_name,
-            self.binary_analyzer.as_deref_mut(),
+            self.process_analyzer.as_deref_mut(),
         );
 
         // Use the same function name for actual compilation
@@ -455,8 +386,9 @@ impl<'a> AstCompiler<'a> {
             statements,
             pid,
             self.trace_id,
-            target.function_address, // compile_time_pc
-            None,                    // save_ir_path
+            target.function_address,   // compile_time_pc
+            Some(&target.binary_path), // module_path
+            None,                      // save_ir_path
         )?;
 
         // Generate eBPF bytecode from LLVM module

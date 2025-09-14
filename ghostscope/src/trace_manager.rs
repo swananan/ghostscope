@@ -14,7 +14,7 @@ pub struct TraceInstance {
     pub script_content: String, // Original script content
     pub binary_path: String, // Binary being traced
     pub target_display: String, // Display name for UI (e.g., "main", "file.c:15")
-    pub pc: u64,        // Program counter value for this trace
+    pub pc: u64,        // Program counter value for this trace (file offset for uprobe)
     pub target_pid: Option<u32>, // Target PID if specified
     pub is_enabled: bool, // Whether the uprobe is currently enabled
     pub loader: Option<GhostScopeLoader>, // eBPF loader for this trace
