@@ -124,6 +124,7 @@ pub enum RuntimeCommand {
     InfoTrace { trace_id: Option<u32> }, // Get info for one/all traces (individual messages)
     InfoTraceAll,
     InfoSource, // Get all source files information
+    InfoShare,  // Get shared library information (like GDB's "info share")
     Shutdown,
 }
 
@@ -244,6 +245,14 @@ pub enum RuntimeStatus {
     FileInfoFailed {
         error: String,
     },
+    /// Shared library information response
+    ShareInfo {
+        libraries: Vec<SharedLibraryInfo>,
+    },
+    /// Failed to get shared library information
+    ShareInfoFailed {
+        error: String,
+    },
     Error(String),
 }
 
@@ -269,6 +278,17 @@ pub struct TraceDetailInfo {
 pub struct SourceFileInfo {
     pub path: String,
     pub directory: String,
+}
+
+/// Shared library information (similar to GDB's "info share" output)
+#[derive(Debug, Clone)]
+pub struct SharedLibraryInfo {
+    pub from_address: u64,          // Starting address in memory
+    pub to_address: u64,            // Ending address in memory
+    pub symbols_read: bool,         // Whether symbols were successfully read
+    pub debug_info_available: bool, // Whether debug information is available
+    pub library_path: String,       // Full path to the library file
+    pub size: u64,                  // Size of the library in memory
 }
 
 impl EventRegistry {

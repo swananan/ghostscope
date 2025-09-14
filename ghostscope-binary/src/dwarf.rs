@@ -47,6 +47,9 @@ pub struct DwarfContext {
     source_file_manager: Option<SourceFileManager>,
     // DWARF expression evaluator for CFI and variable location evaluation
     expression_evaluator: DwarfExpressionEvaluator,
+
+    // Flag to indicate if valid debug information is available
+    has_valid_debug_info: bool,
 }
 
 /// Function information from DWARF
@@ -609,6 +612,9 @@ impl DwarfContext {
             None
         };
 
+        // Check if we have valid debug information by examining DWARF sections
+        let has_valid_debug_info = check_debug_sections_exist(&object_file);
+
         let mut context = Self {
             dwarf,
             _file_data: file_data,
@@ -618,6 +624,7 @@ impl DwarfContext {
             scoped_variable_map: None,
             source_file_manager: None,
             expression_evaluator: DwarfExpressionEvaluator::new(),
+            has_valid_debug_info,
         };
 
         // Parse all DWARF debug information in a single pass
@@ -3689,6 +3696,46 @@ fn load_dwarf_sections(
     Ok(dwarf)
 }
 
+/// Check if essential DWARF debug sections exist and contain data
+fn check_debug_sections_exist(object_file: &object::File) -> bool {
+    // Check for the most critical DWARF debug section
+    // .debug_info is the core section that contains compilation unit information
+    let has_debug_info = get_section_data(object_file, ".debug_info")
+        .map(|data| !data.is_empty())
+        .unwrap_or(false);
+
+    if has_debug_info {
+        debug!("Found non-empty .debug_info section");
+        return true;
+    }
+
+    // If no .debug_info, check for other useful debug sections
+    let debug_sections = [
+        ".debug_abbrev", // Abbreviation tables
+        ".debug_str",    // String table
+        ".debug_line",   // Line information
+        ".debug_types",  // Type information
+        ".debug_loc",    // Location lists
+        ".debug_ranges", // Address ranges
+    ];
+
+    for section_name in &debug_sections {
+        if let Some(data) = get_section_data(object_file, section_name) {
+            if !data.is_empty() {
+                debug!(
+                    "Found non-empty debug section: {} ({} bytes)",
+                    section_name,
+                    data.len()
+                );
+                return true;
+            }
+        }
+    }
+
+    info!("No valid DWARF debug sections found");
+    false
+}
+
 /// Get section data from object file
 fn get_section_data<'a>(object_file: &'a object::File, name: &str) -> Option<&'a [u8]> {
     debug!("Looking for section: {}", name);
@@ -3858,6 +3905,12 @@ impl DwarfContext {
     /// Check if CFI context is available
     pub fn has_cfi_context(&self) -> bool {
         self.cfi_context.is_some()
+    }
+
+    /// Check if DWARF debug information is actually valid and contains useful data
+    /// This flag is set during loading based on the presence of essential DWARF sections
+    pub fn has_valid_debug_info(&self) -> bool {
+        self.has_valid_debug_info
     }
 
     /// Try to recover inlined parameter value by analyzing actual DWARF location expressions

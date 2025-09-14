@@ -41,6 +41,7 @@ pub enum CommandType {
     InfoTrace { trace_id: Option<u32> },
     InfoTraceAll,
     InfoSource,
+    InfoShare,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -581,6 +582,13 @@ impl InteractiveCommandPanel {
                 command_type: CommandType::InfoSource,
             };
             Some(CommandAction::InfoSource)
+        } else if cmd == "info share" {
+            self.input_state = InputState::WaitingResponse {
+                command: command.to_string(),
+                sent_time: Instant::now(),
+                command_type: CommandType::InfoShare,
+            };
+            Some(CommandAction::InfoShare)
         } else if cmd == "info trace" {
             self.input_state = InputState::WaitingResponse {
                 command: command.to_string(),
@@ -614,7 +622,7 @@ impl InteractiveCommandPanel {
 
     /// Format general info help message
     fn format_info_help(&self) -> String {
-        "Available commands:\n  info trace - Show current trace status\n  info source - Show all source files\n  disable <id|all> - Disable trace(s)\n  enable <id|all> - Enable trace(s)\n  delete <id|all> - Delete trace(s) and all resources\n  trace <target> - Create new trace".to_string()
+        "Available commands:\n  info trace - Show current trace status\n  info source - Show all source files\n  info share - Show loaded shared libraries (symbols & debug info)\n  disable <id|all> - Disable trace(s)\n  enable <id|all> - Enable trace(s)\n  delete <id|all> - Delete trace(s) and all resources\n  trace <target> - Create new trace".to_string()
     }
 
     pub fn submit_command(&mut self) -> Option<CommandAction> {
@@ -958,6 +966,9 @@ impl InteractiveCommandPanel {
                 CommandType::InfoSource => {
                     format!("❌ Failed to get file information: {}", error)
                 }
+                CommandType::InfoShare => {
+                    format!("❌ Failed to get shared library information: {}", error)
+                }
             };
 
             if let Some(last_item) = self.command_history.last_mut() {
@@ -1065,6 +1076,9 @@ impl InteractiveCommandPanel {
                     "✅ All traces info retrieved successfully".to_string()
                 }
                 CommandType::InfoSource => "✅ File information retrieved successfully".to_string(),
+                CommandType::InfoShare => {
+                    "✅ Shared library information retrieved successfully".to_string()
+                }
             };
 
             if let Some(last_item) = self.command_history.last_mut() {
@@ -3211,4 +3225,5 @@ pub enum CommandAction {
     InfoTarget { target: String },
     InfoTraceAll, // Request all trace information from runtime
     InfoSource,   // Request all source files information from runtime
+    InfoShare,    // Request shared library information from runtime
 }

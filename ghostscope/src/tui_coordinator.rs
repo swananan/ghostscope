@@ -329,6 +329,34 @@ async fn run_runtime_coordinator(
                             });
                         }
                     }
+                    RuntimeCommand::InfoShare => {
+                        if let Some(ref session) = session {
+                            // Get shared library information from ProcessAnalyzer
+                            if let Some(ref analyzer) = session.process_analyzer {
+                                let libraries = analyzer.get_shared_library_info();
+                                let ui_libraries = libraries.into_iter().map(|lib| ghostscope_ui::events::SharedLibraryInfo {
+                                    from_address: lib.from_address,
+                                    to_address: lib.to_address,
+                                    symbols_read: lib.symbols_read,
+                                    debug_info_available: lib.debug_info_available,
+                                    library_path: lib.library_path,
+                                    size: lib.size,
+                                }).collect();
+
+                                let _ = runtime_channels.status_sender.send(ghostscope_ui::events::RuntimeStatus::ShareInfo {
+                                    libraries: ui_libraries,
+                                });
+                            } else {
+                                let _ = runtime_channels.status_sender.send(ghostscope_ui::events::RuntimeStatus::ShareInfoFailed {
+                                    error: "No process analyzer available".to_string(),
+                                });
+                            }
+                        } else {
+                            let _ = runtime_channels.status_sender.send(ghostscope_ui::events::RuntimeStatus::ShareInfoFailed {
+                                error: "No debug session available".to_string(),
+                            });
+                        }
+                    }
                     RuntimeCommand::AttachToProcess(pid) => {
                         info!("Attaching to process: {}", pid);
                         // TODO: Implement process attachment

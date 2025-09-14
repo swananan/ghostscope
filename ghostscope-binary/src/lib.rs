@@ -16,7 +16,7 @@ pub use expression::{
     AccessStep, ArithOp, DirectValueResult, EvaluationContext, EvaluationResult, LocationResult,
     RegisterAccess,
 };
-pub use process::{MemoryMapping, ModuleInfo, ModuleStats, ProcessAnalyzer};
+pub use process::{MemoryMapping, ModuleInfo, ModuleStats, ProcessAnalyzer, SharedLibraryInfo};
 
 use std::path::PathBuf;
 use thiserror::Error;

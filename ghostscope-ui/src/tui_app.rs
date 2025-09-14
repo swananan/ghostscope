@@ -925,6 +925,25 @@ impl TuiApp {
                     );
                 }
             }
+            CommandAction::InfoShare => {
+                info!("Getting shared library information");
+                if let Err(e) = self
+                    .event_registry
+                    .command_sender
+                    .send(RuntimeCommand::InfoShare)
+                {
+                    error!("Failed to send info share command: {}", e);
+                    self.interactive_command_panel.add_response(
+                        format!("✗ Failed to get shared library info: {}", e),
+                        ResponseType::Error,
+                    );
+                } else {
+                    self.interactive_command_panel.add_response(
+                        "⏳ Getting shared library info...".to_string(),
+                        ResponseType::Progress,
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -1354,6 +1373,62 @@ impl TuiApp {
             RuntimeStatus::FileInfoFailed { error } => {
                 self.interactive_command_panel.handle_command_failed(&error);
                 error!("Failed to get file information: {}", error);
+            }
+            RuntimeStatus::ShareInfo { libraries } => {
+                // Handle InfoShare response and display shared library information
+                self.interactive_command_panel.handle_command_completed();
+
+                // Format and display shared library information (similar to GDB's "info share")
+                let mut response = format!("📚 Shared Libraries ({}):\n\n", libraries.len());
+
+                if !libraries.is_empty() {
+                    // Header
+                    response.push_str("From                To                  Syms Read   Debug Read   Shared Object Library\n");
+                    response.push_str("─────────────────────────────────────────────────────────────────────────────────────\n");
+
+                    for lib in libraries {
+                        let from_str = format!("0x{:016x}", lib.from_address);
+                        let to_str = format!("0x{:016x}", lib.to_address);
+
+                        // Use colored text for Yes/No status
+                        let syms_read = if lib.symbols_read {
+                            "✅ Yes".to_string()
+                        } else {
+                            "❌ No ".to_string()
+                        };
+                        let debug_read = if lib.debug_info_available {
+                            "✅ Yes".to_string()
+                        } else {
+                            "❌ No ".to_string()
+                        };
+
+                        response.push_str(&format!(
+                            "{}  {}  {}         {}         {}\n",
+                            from_str, to_str, syms_read, debug_read, lib.library_path
+                        ));
+
+                        // Add warning for libraries without debug info
+                        if !lib.debug_info_available {
+                            response.push_str(&format!(
+                                "⚠️  Warning: {} has no DWARF debug information\n",
+                                lib.library_path
+                                    .split('/')
+                                    .last()
+                                    .unwrap_or(&lib.library_path)
+                            ));
+                        }
+                    }
+                } else {
+                    response.push_str("  No shared libraries found.\n");
+                }
+
+                self.interactive_command_panel
+                    .add_response(response, ResponseType::Success);
+                info!("Shared library info displayed successfully");
+            }
+            RuntimeStatus::ShareInfoFailed { error } => {
+                self.interactive_command_panel.handle_command_failed(&error);
+                error!("Failed to get shared library information: {}", error);
             }
             RuntimeStatus::Error(error) => {
                 // Handle sync failure for batch operations that send generic errors

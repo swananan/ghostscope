@@ -34,6 +34,17 @@ pub struct ModuleInfo {
     pub is_executable: bool, // Main executable vs dynamic library
 }
 
+/// Information about a shared library (similar to GDB's "info share" output)
+#[derive(Debug, Clone)]
+pub struct SharedLibraryInfo {
+    pub from_address: u64,          // Starting address in memory
+    pub to_address: u64,            // Ending address in memory
+    pub symbols_read: bool,         // Whether symbols were successfully read
+    pub debug_info_available: bool, // Whether debug information is available
+    pub library_path: String,       // Full path to the library file
+    pub size: u64,                  // Size of the library in memory
+}
+
 // AddressSpaceManager removed - we only need proc mappings for module discovery
 
 /// Process-level binary analyzer supporting multiple modules
@@ -475,6 +486,37 @@ impl ProcessAnalyzer {
         }
 
         stats
+    }
+
+    /// Get shared library information (similar to GDB's "info share")
+    /// Returns information about loaded dynamic libraries, excluding the main executable
+    pub fn get_shared_library_info(&self) -> Vec<SharedLibraryInfo> {
+        let mut libraries = Vec::new();
+
+        for module in self.modules.values() {
+            // Skip the main executable, only include dynamic libraries
+            if !module.is_executable {
+                let has_symbols = module.binary_analyzer.symbol_table.len() > 0;
+                let has_debug_info = module
+                    .binary_analyzer
+                    .dwarf_context()
+                    .map(|ctx| ctx.has_valid_debug_info())
+                    .unwrap_or(false);
+
+                libraries.push(SharedLibraryInfo {
+                    from_address: module.loaded_address,
+                    to_address: module.loaded_address + module.size - 1,
+                    symbols_read: has_symbols,
+                    debug_info_available: has_debug_info,
+                    library_path: module.path.clone(),
+                    size: module.size,
+                });
+            }
+        }
+
+        // Sort by load address for consistent display
+        libraries.sort_by_key(|lib| lib.from_address);
+        libraries
     }
 
     /// Get enhanced variable locations at a specific address in a module
