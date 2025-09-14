@@ -123,6 +123,7 @@ pub enum RuntimeCommand {
     InfoTarget { target: String }, // Get debug info for a target (function or file:line)
     InfoTrace { trace_id: Option<u32> }, // Get info for one/all traces (individual messages)
     InfoTraceAll,
+    InfoSource, // Get all source files information
     Shutdown,
 }
 
@@ -235,6 +236,14 @@ pub enum RuntimeStatus {
         trace_id: u32,
         error: String,
     },
+    /// Source file information response
+    FileInfo {
+        files: Vec<SourceFileInfo>,
+    },
+    /// Failed to get file information
+    FileInfoFailed {
+        error: String,
+    },
     Error(String),
 }
 
@@ -253,6 +262,13 @@ pub struct TraceDetailInfo {
     pub target_display: String,
     pub status: TraceStatus,
     pub duration: String, // "5m32s", "1h5m", etc.
+}
+
+/// Source file information
+#[derive(Debug, Clone)]
+pub struct SourceFileInfo {
+    pub path: String,
+    pub directory: String,
 }
 
 impl EventRegistry {

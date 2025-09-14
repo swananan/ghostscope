@@ -3,6 +3,7 @@ pub mod debuglink;
 pub mod dwarf;
 pub mod elf;
 pub mod expression;
+pub mod file;
 pub mod line_lookup;
 pub mod scoped_variables;
 pub mod symbol;

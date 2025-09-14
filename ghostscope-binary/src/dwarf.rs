@@ -1,4 +1,5 @@
 use crate::expression::DwarfExpressionEvaluator;
+use crate::file::{SimpleFileInfo, SourceFileManager};
 use crate::line_lookup::LineLookup;
 use crate::scoped_variables::{AddressRange, ScopeId, ScopeType, ScopedVariableMap};
 use crate::Result;
@@ -39,326 +40,13 @@ pub struct DwarfContext {
 
     // New line lookup system (based on addr2line)
     line_lookup: Option<LineLookup>,
-    // Enhanced file information management for fast queries
-    file_registry: Option<FileInfoRegistry>,
 
     // Scoped variable system (GDB-inspired)
     scoped_variable_map: Option<ScopedVariableMap>,
+    // Source file manager for all files in debug info
+    source_file_manager: Option<SourceFileManager>,
     // DWARF expression evaluator for CFI and variable location evaluation
     expression_evaluator: DwarfExpressionEvaluator,
-}
-
-/// Enhanced file information registry for efficient file path queries
-#[derive(Debug)]
-pub struct FileInfoRegistry {
-    /// All unique file paths in the debug info
-    all_files: Vec<FileInfo>,
-    /// Hash map for exact path lookup: full_path -> file_index
-    exact_path_map: std::collections::HashMap<String, usize>,
-    /// Hash map for basename lookup: basename -> Vec<file_index>
-    basename_map: std::collections::HashMap<String, Vec<usize>>,
-    /// Trie for prefix/suffix matching
-    path_trie: PathTrie,
-    /// Cache for recent queries
-    query_cache: std::collections::HashMap<String, Vec<usize>>,
-}
-
-/// File information with metadata
-#[derive(Debug, Clone)]
-pub struct FileInfo {
-    /// Full file path as stored in DWARF
-    pub full_path: String,
-    /// Just the filename (basename)
-    pub basename: String,
-    /// Directory path
-    pub directory: String,
-    /// File extension
-    pub extension: String,
-    /// Whether this file actually exists on disk
-    pub exists_on_disk: bool,
-    /// Alternative paths where this file might be found
-    pub search_paths: Vec<String>,
-}
-
-/// Simple trie structure for efficient path matching
-#[derive(Debug)]
-pub struct PathTrie {
-    nodes: std::collections::HashMap<String, PathTrieNode>,
-}
-
-#[derive(Debug)]
-struct PathTrieNode {
-    file_indices: Vec<usize>,
-    children: std::collections::HashMap<String, PathTrieNode>,
-}
-
-impl FileInfoRegistry {
-    /// Create new file info registry
-    fn new() -> Self {
-        Self {
-            all_files: Vec::new(),
-            exact_path_map: std::collections::HashMap::new(),
-            basename_map: std::collections::HashMap::new(),
-            path_trie: PathTrie::new(),
-            query_cache: std::collections::HashMap::new(),
-        }
-    }
-
-    /// Add a file to the registry
-    fn add_file(&mut self, full_path: String) -> usize {
-        // Check if already exists
-        if let Some(&index) = self.exact_path_map.get(&full_path) {
-            return index;
-        }
-
-        let path = std::path::Path::new(&full_path);
-        let basename = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(&full_path)
-            .to_string();
-        let directory = path
-            .parent()
-            .and_then(|p| p.to_str())
-            .unwrap_or("")
-            .to_string();
-        let extension = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_string();
-
-        // Check if file exists on disk
-        let exists_on_disk = path.exists();
-        let mut search_paths = Vec::new();
-
-        if !exists_on_disk {
-            // Generate possible alternative paths
-            search_paths = self.generate_search_paths(&full_path, &basename);
-        }
-
-        let file_info = FileInfo {
-            full_path: full_path.clone(),
-            basename: basename.clone(),
-            directory,
-            extension,
-            exists_on_disk,
-            search_paths,
-        };
-
-        let index = self.all_files.len();
-        self.all_files.push(file_info);
-
-        // Update indices
-        self.exact_path_map.insert(full_path.clone(), index);
-
-        // Update basename map
-        self.basename_map
-            .entry(basename.clone())
-            .or_insert_with(Vec::new)
-            .push(index);
-
-        // Update trie
-        self.path_trie.insert(&full_path, index);
-
-        index
-    }
-
-    /// Generate possible search paths for a file
-    fn generate_search_paths(&self, full_path: &str, basename: &str) -> Vec<String> {
-        let mut search_paths = Vec::new();
-
-        // Add current working directory + basename
-        if let Ok(current_dir) = std::env::current_dir() {
-            search_paths.push(current_dir.join(basename).to_string_lossy().to_string());
-        }
-
-        // Add common source directories
-        let common_dirs = ["src", "source", "include", "lib", "../", "../../"];
-        for dir in &common_dirs {
-            search_paths.push(format!("{}/{}", dir, basename));
-        }
-
-        search_paths
-    }
-
-    /// Query files with flexible matching
-    /// Supports:
-    /// - Exact path matching
-    /// - Basename matching  
-    /// - Partial path matching
-    /// - Extension-based filtering
-    pub fn query_files(&mut self, query: &str) -> Vec<&FileInfo> {
-        // Check cache first
-        if let Some(cached_indices) = self.query_cache.get(query) {
-            return cached_indices
-                .iter()
-                .filter_map(|&i| self.all_files.get(i))
-                .collect();
-        }
-
-        let mut results = Vec::new();
-
-        // Strategy 1: Exact path match
-        if let Some(&index) = self.exact_path_map.get(query) {
-            if let Some(file_info) = self.all_files.get(index) {
-                results.push(index);
-            }
-        }
-
-        // Strategy 2: Basename match
-        if let Some(indices) = self.basename_map.get(query) {
-            results.extend(indices);
-        }
-
-        // Strategy 3: Partial path matching
-        for (i, file_info) in self.all_files.iter().enumerate() {
-            if file_info.full_path.contains(query) && !results.contains(&i) {
-                results.push(i);
-            }
-        }
-
-        // Strategy 4: Fuzzy matching for typos
-        if results.is_empty() {
-            results.extend(self.fuzzy_match(query));
-        }
-
-        // Cache the result
-        self.query_cache.insert(query.to_string(), results.clone());
-
-        results
-            .into_iter()
-            .filter_map(|i| self.all_files.get(i))
-            .collect()
-    }
-
-    /// Fuzzy matching for typos and similar file names
-    fn fuzzy_match(&self, query: &str) -> Vec<usize> {
-        let mut scored_matches = Vec::new();
-
-        for (i, file_info) in self.all_files.iter().enumerate() {
-            let basename_score = self.calculate_similarity(&file_info.basename, query);
-            let full_path_score = self.calculate_similarity(&file_info.full_path, query);
-            let max_score = basename_score.max(full_path_score);
-
-            if max_score > 0.6 {
-                // Threshold for fuzzy matching
-                scored_matches.push((i, max_score));
-            }
-        }
-
-        // Sort by score descending
-        scored_matches.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        scored_matches
-            .into_iter()
-            .take(10) // Limit to top 10 matches
-            .map(|(i, _)| i)
-            .collect()
-    }
-
-    /// Calculate string similarity (simplified Levenshtein distance)
-    fn calculate_similarity(&self, s1: &str, s2: &str) -> f64 {
-        if s1.is_empty() && s2.is_empty() {
-            return 1.0;
-        }
-        if s1.is_empty() || s2.is_empty() {
-            return 0.0;
-        }
-
-        let len1 = s1.len();
-        let len2 = s2.len();
-        let max_len = len1.max(len2);
-
-        // Simple approach: check for common subsequences
-        let mut common = 0;
-        let s1_lower = s1.to_lowercase();
-        let s2_lower = s2.to_lowercase();
-
-        for char in s2_lower.chars() {
-            if s1_lower.contains(char) {
-                common += 1;
-            }
-        }
-
-        common as f64 / max_len as f64
-    }
-
-    /// Get all files with a specific extension
-    pub fn get_files_by_extension(&self, ext: &str) -> Vec<&FileInfo> {
-        self.all_files
-            .iter()
-            .filter(|file| file.extension == ext)
-            .collect()
-    }
-
-    /// Get files that exist on disk
-    pub fn get_existing_files(&self) -> Vec<&FileInfo> {
-        self.all_files
-            .iter()
-            .filter(|file| file.exists_on_disk)
-            .collect()
-    }
-
-    /// Get statistics about file registry
-    pub fn get_stats(&self) -> FileRegistryStats {
-        let existing_count = self.all_files.iter().filter(|f| f.exists_on_disk).count();
-
-        FileRegistryStats {
-            total_files: self.all_files.len(),
-            existing_files: existing_count,
-            missing_files: self.all_files.len() - existing_count,
-            cache_size: self.query_cache.len(),
-        }
-    }
-}
-
-impl PathTrie {
-    fn new() -> Self {
-        Self {
-            nodes: std::collections::HashMap::new(),
-        }
-    }
-
-    fn insert(&mut self, path: &str, file_index: usize) {
-        let components: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-        PathTrie::insert_components(&components, file_index, &mut self.nodes);
-    }
-
-    fn insert_components(
-        components: &[&str],
-        file_index: usize,
-        nodes: &mut std::collections::HashMap<String, PathTrieNode>,
-    ) {
-        if components.is_empty() {
-            return;
-        }
-
-        let component = components[0].to_string();
-        let node = nodes
-            .entry(component.clone())
-            .or_insert_with(|| PathTrieNode {
-                file_indices: Vec::new(),
-                children: std::collections::HashMap::new(),
-            });
-
-        if components.len() == 1 {
-            // Leaf node
-            node.file_indices.push(file_index);
-        } else {
-            // Continue with remaining components
-            PathTrie::insert_components(&components[1..], file_index, &mut node.children);
-        }
-    }
-}
-
-/// Statistics about the file registry
-#[derive(Debug)]
-pub struct FileRegistryStats {
-    pub total_files: usize,
-    pub existing_files: usize,
-    pub missing_files: usize,
-    pub cache_size: usize,
 }
 
 /// Function information from DWARF
@@ -927,14 +615,14 @@ impl DwarfContext {
             base_addresses,
             cfi_context,
             line_lookup: None,
-            file_registry: None,
             scoped_variable_map: None,
+            source_file_manager: None,
             expression_evaluator: DwarfExpressionEvaluator::new(),
         };
 
-        // Build scoped variable system
-        info!("Building scoped variable system...");
-        context.scoped_variable_map = Some(context.build_scoped_variable_map()?);
+        // Parse all DWARF debug information in a single pass
+        info!("Parsing DWARF debug information (files and variables)...");
+        context.parse_debug_info_unified()?;
 
         // Build line lookup system (based on addr2line)
         info!("Building line lookup system...");
@@ -1137,6 +825,24 @@ impl DwarfContext {
         }
     }
 
+    /// Get all file information from the DWARF debug data
+    pub fn get_all_file_info(&self) -> Result<Vec<SimpleFileInfo>> {
+        // Use SourceFileManager as the primary and only source
+        if let Some(ref source_file_manager) = self.source_file_manager {
+            let file_infos = source_file_manager
+                .get_all_files()
+                .into_iter()
+                .map(|source_file| source_file.into())
+                .collect();
+            Ok(file_infos)
+        } else {
+            // No fallback needed - source file manager should always be available
+            // after parse_debug_info has been called
+            warn!("Source file manager not available - debug info not parsed");
+            Ok(Vec::new())
+        }
+    }
+
     /// Build a comprehensive variable location map for efficient lookups
     pub fn build_variable_location_map(&self) -> VariableLocationMap {
         debug!("Building comprehensive variable location map...");
@@ -1164,57 +870,71 @@ impl DwarfContext {
         }
     }
 
-    /// Build the new scoped variable system from DWARF information  
-    pub fn build_scoped_variable_map(&self) -> Result<ScopedVariableMap> {
-        debug!("Building scoped variable system from DWARF...");
+    /// Parse all DWARF debug information in a single pass (unified entry point)
+    /// This method extracts both file information and scoped variables in one traversal
+    fn parse_debug_info_unified(&mut self) -> Result<()> {
+        info!("Starting comprehensive DWARF debug information parsing...");
 
+        let mut source_file_manager = SourceFileManager::new();
         let mut scoped_map = ScopedVariableMap::new();
         let mut units = self.dwarf.units();
 
+        // Parse all compilation units in a single pass
         while let Ok(Some(header)) = units.next() {
             if let Ok(unit) = self.dwarf.unit(header) {
                 debug!("Processing compilation unit...");
 
-                // Create compilation unit scope
+                // Extract source files from this unit
+                match crate::file::SourceFileManager::extract_files_from_unit(&self.dwarf, &unit) {
+                    Ok(compilation_unit) => {
+                        debug!(
+                            "Extracted {} files from compilation unit: {}",
+                            compilation_unit.files.len(),
+                            compilation_unit.name
+                        );
+                        source_file_manager.add_compilation_unit(compilation_unit);
+                    }
+                    Err(e) => {
+                        warn!("Failed to extract files from compilation unit: {}", e);
+                    }
+                }
+
+                // Create compilation unit scope for variables
                 let cu_scope_id =
                     scoped_map.add_scope(None, ScopeType::CompilationUnit, Vec::new());
 
-                // Process entries in this compilation unit
-                self.build_scopes_from_unit(&unit, &mut scoped_map, cu_scope_id)?;
-            }
-        }
-
-        // Build the address lookup table
-        scoped_map.build_address_lookup();
-
-        let stats = scoped_map.get_statistics();
-        info!(
-            "Built scoped variable system: {} variables, {} scopes, {} address entries",
-            stats.total_variables, stats.total_scopes, stats.total_address_entries
-        );
-
-        // Log detailed scope-variable distribution for debugging
-        debug!("=== SCOPE-VARIABLE DISTRIBUTION SUMMARY ===");
-        for scope_id in 1..=stats.total_scopes as u32 {
-            if let Some(scope) = scoped_map.get_scope(scope_id) {
-                debug!(
-                    "Scope {:?} - Type: {:?}, Variables: {}, Address ranges: {:?}",
-                    scope_id,
-                    scope.scope_type,
-                    scope.variables.len(),
-                    scope.address_ranges
-                );
-                for (i, var_ref) in scope.variables.iter().enumerate() {
-                    debug!(
-                        "  Variable[{}] ID: {:?}, Visibility ranges: {:?}",
-                        i, var_ref.variable_id, var_ref.address_ranges
-                    );
+                // Process variable scopes in this compilation unit
+                if let Err(e) = self.build_scopes_from_unit(&unit, &mut scoped_map, cu_scope_id) {
+                    warn!("Failed to build scopes from compilation unit: {}", e);
                 }
             }
         }
-        debug!("=== END SCOPE-VARIABLE DISTRIBUTION SUMMARY ===");
 
-        Ok(scoped_map)
+        // Build the address lookup table for scoped variables
+        scoped_map.build_address_lookup();
+
+        // Store the results
+        self.source_file_manager = Some(source_file_manager);
+        self.scoped_variable_map = Some(scoped_map);
+
+        // Log statistics
+        if let Some(ref file_manager) = self.source_file_manager {
+            let (total_files, total_compilation_units, unique_basenames) = file_manager.get_stats();
+            info!(
+                "Parsed {} files from {} compilation units ({} unique basenames)",
+                total_files, total_compilation_units, unique_basenames
+            );
+        }
+
+        if let Some(ref scoped_map) = self.scoped_variable_map {
+            let stats = scoped_map.get_statistics();
+            info!(
+                "Parsed {} variables in {} scopes with {} address entries",
+                stats.total_variables, stats.total_scopes, stats.total_address_entries
+            );
+        }
+
+        Ok(())
     }
 
     /// Build scopes from a DWARF compilation unit

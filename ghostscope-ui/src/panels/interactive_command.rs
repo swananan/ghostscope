@@ -40,6 +40,7 @@ pub enum CommandType {
     Info { target: String },
     InfoTrace { trace_id: Option<u32> },
     InfoTraceAll,
+    InfoSource,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -573,7 +574,24 @@ impl InteractiveCommandPanel {
             } else {
                 None // Invalid trace ID
             }
-        } else if cmd.starts_with("info ") && !cmd.starts_with("info trace") {
+        } else if cmd == "info source" {
+            self.input_state = InputState::WaitingResponse {
+                command: command.to_string(),
+                sent_time: Instant::now(),
+                command_type: CommandType::InfoSource,
+            };
+            Some(CommandAction::InfoSource)
+        } else if cmd == "info trace" {
+            self.input_state = InputState::WaitingResponse {
+                command: command.to_string(),
+                sent_time: Instant::now(),
+                command_type: CommandType::InfoTraceAll,
+            };
+            Some(CommandAction::InfoTraceAll)
+        } else if cmd.starts_with("info ")
+            && !cmd.starts_with("info trace")
+            && !cmd.starts_with("info source")
+        {
             // Parse info target command
             let target = cmd.strip_prefix("info ").unwrap().trim().to_string();
             if !target.is_empty() {
@@ -589,13 +607,6 @@ impl InteractiveCommandPanel {
             } else {
                 None // Empty target
             }
-        } else if cmd == "info trace" {
-            self.input_state = InputState::WaitingResponse {
-                command: command.to_string(),
-                sent_time: Instant::now(),
-                command_type: CommandType::InfoTraceAll,
-            };
-            Some(CommandAction::InfoTraceAll)
         } else {
             None
         }
@@ -603,7 +614,7 @@ impl InteractiveCommandPanel {
 
     /// Format general info help message
     fn format_info_help(&self) -> String {
-        "Available commands:\n  info trace - Show current trace status\n  disable <id|all> - Disable trace(s)\n  enable <id|all> - Enable trace(s)\n  delete <id|all> - Delete trace(s) and all resources\n  trace <target> - Create new trace".to_string()
+        "Available commands:\n  info trace - Show current trace status\n  info source - Show all source files\n  disable <id|all> - Disable trace(s)\n  enable <id|all> - Enable trace(s)\n  delete <id|all> - Delete trace(s) and all resources\n  trace <target> - Create new trace".to_string()
     }
 
     pub fn submit_command(&mut self) -> Option<CommandAction> {
@@ -944,6 +955,9 @@ impl InteractiveCommandPanel {
                 CommandType::InfoTraceAll => {
                     format!("❌ Failed to get info for all traces: {}", error)
                 }
+                CommandType::InfoSource => {
+                    format!("❌ Failed to get file information: {}", error)
+                }
             };
 
             if let Some(last_item) = self.command_history.last_mut() {
@@ -1050,6 +1064,7 @@ impl InteractiveCommandPanel {
                 CommandType::InfoTraceAll => {
                     "✅ All traces info retrieved successfully".to_string()
                 }
+                CommandType::InfoSource => "✅ File information retrieved successfully".to_string(),
             };
 
             if let Some(last_item) = self.command_history.last_mut() {
@@ -1083,6 +1098,10 @@ impl InteractiveCommandPanel {
                 }
                 CommandType::InfoTraceAll => {
                     // InfoTraceAll completion handled like other commands
+                    self.add_success_response_and_clear_waiting();
+                }
+                CommandType::InfoSource => {
+                    // InfoSource completion handled like other commands
                     self.add_success_response_and_clear_waiting();
                 }
                 _ => {
@@ -3191,4 +3210,5 @@ pub enum CommandAction {
     DeleteAllTraces,
     InfoTarget { target: String },
     InfoTraceAll, // Request all trace information from runtime
+    InfoSource,   // Request all source files information from runtime
 }

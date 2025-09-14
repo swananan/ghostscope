@@ -906,6 +906,25 @@ impl TuiApp {
                     );
                 }
             }
+            CommandAction::InfoSource => {
+                info!("Getting source files information");
+                if let Err(e) = self
+                    .event_registry
+                    .command_sender
+                    .send(RuntimeCommand::InfoSource)
+                {
+                    error!("Failed to send info source command: {}", e);
+                    self.interactive_command_panel.add_response(
+                        format!("✗ Failed to get source info: {}", e),
+                        ResponseType::Error,
+                    );
+                } else {
+                    self.interactive_command_panel.add_response(
+                        "⏳ Getting source files info...".to_string(),
+                        ResponseType::Progress,
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -1312,6 +1331,29 @@ impl TuiApp {
                 self.interactive_command_panel
                     .add_response(response, ResponseType::Success);
                 info!("Trace info displayed successfully");
+            }
+            RuntimeStatus::FileInfo { files } => {
+                // Handle InfoSource response and display source files information
+                self.interactive_command_panel.handle_command_completed();
+
+                // Format and display file information
+                let mut response = format!("📁 Source Files ({}):\n", files.len());
+
+                if !files.is_empty() {
+                    for file in files {
+                        response.push_str(&format!("  ✓ {} ({})\n", file.path, file.directory));
+                    }
+                } else {
+                    response.push_str("  No source files found.\n");
+                }
+
+                self.interactive_command_panel
+                    .add_response(response, ResponseType::Success);
+                info!("File info displayed successfully");
+            }
+            RuntimeStatus::FileInfoFailed { error } => {
+                self.interactive_command_panel.handle_command_failed(&error);
+                error!("Failed to get file information: {}", error);
             }
             RuntimeStatus::Error(error) => {
                 // Handle sync failure for batch operations that send generic errors

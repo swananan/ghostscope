@@ -305,6 +305,27 @@ async fn run_runtime_coordinator(
                             });
                         }
                     }
+                    RuntimeCommand::InfoSource => {
+                        if let Some(ref session) = session {
+                            // Get source files from DWARF context
+                            match get_source_files_info(session) {
+                                Ok(files) => {
+                                    let _ = runtime_channels.status_sender.send(ghostscope_ui::events::RuntimeStatus::FileInfo {
+                                        files,
+                                    });
+                                }
+                                Err(error) => {
+                                    let _ = runtime_channels.status_sender.send(ghostscope_ui::events::RuntimeStatus::FileInfoFailed {
+                                        error: error.to_string(),
+                                    });
+                                }
+                            }
+                        } else {
+                            let _ = runtime_channels.status_sender.send(ghostscope_ui::events::RuntimeStatus::FileInfoFailed {
+                                error: "No debug session available".to_string(),
+                            });
+                        }
+                    }
                     RuntimeCommand::AttachToProcess(pid) => {
                         info!("Attaching to process: {}", pid);
                         // TODO: Implement process attachment
@@ -899,4 +920,40 @@ async fn handle_source_location_target(
         function_name: overall_function_name,
         address_mappings,
     })
+}
+
+/// Get source files information from DWARF context
+fn get_source_files_info(
+    session: &GhostSession,
+) -> anyhow::Result<Vec<ghostscope_ui::events::SourceFileInfo>> {
+    use std::collections::HashSet;
+
+    let mut files = Vec::new();
+    let mut seen_files = HashSet::new();
+
+    // Get files from binary analyzer
+    if let Some(ref binary_analyzer) = session.binary_analyzer {
+        if let Some(dwarf_context) = binary_analyzer.dwarf_context() {
+            // Get all file information from DWARF context
+            let file_info_vec = dwarf_context.get_all_file_info()?;
+
+            for file_info in file_info_vec {
+                let key = format!("{}:{}", file_info.directory, file_info.basename);
+                if seen_files.contains(&key) {
+                    continue;
+                }
+                seen_files.insert(key);
+
+                files.push(ghostscope_ui::events::SourceFileInfo {
+                    path: file_info.basename,
+                    directory: file_info.directory,
+                });
+            }
+        }
+    }
+
+    // Sort files by path for consistent display
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+
+    Ok(files)
 }
