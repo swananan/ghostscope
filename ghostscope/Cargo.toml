@@ -12,6 +12,7 @@ ghostscope-protocol = { path = "../ghostscope-protocol" }
 dirs = "5.0"
 libc = "0.2"
 clap = { version = "4.0", features = ["derive"] }
+crossterm = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-log = { workspace = true }

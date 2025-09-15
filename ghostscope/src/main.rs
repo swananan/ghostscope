@@ -7,9 +7,48 @@ mod trace_manager;
 mod tui_coordinator;
 
 use anyhow::Result;
+use crossterm::execute;
+use crossterm::terminal::{disable_raw_mode, LeaveAlternateScreen};
+use std::io::{self, Write};
+
+fn setup_panic_hook() {
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        // Attempt to restore terminal state
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+
+        // Print panic information to stderr (which should be visible after terminal restore)
+        eprintln!("\n=== GHOSTSCOPE PANIC ===");
+        eprintln!(
+            "Location: {}",
+            panic_info
+                .location()
+                .unwrap_or_else(|| std::panic::Location::caller())
+        );
+
+        if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
+            eprintln!("Message: {}", s);
+        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
+            eprintln!("Message: {}", s);
+        } else {
+            eprintln!("Message: (no message available)");
+        }
+
+        eprintln!("======================");
+        eprintln!("Terminal state has been restored. You can now see this panic message.");
+        eprintln!("Please report this issue at: https://github.com/anthropics/claude-code/issues");
+
+        // Call the original hook to preserve any additional panic handling
+        original_hook(panic_info);
+    }));
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Setup panic hook before doing anything else
+    setup_panic_hook();
+
     let parsed_args = args::Args::parse_args();
 
     // Initialize logging

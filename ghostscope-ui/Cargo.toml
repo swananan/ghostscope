@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 ghostscope-protocol = { path = "../ghostscope-protocol" }
 ratatui = "0.28"
-crossterm = { version = "0.28", features = ["event-stream"] }
+crossterm = { workspace = true }
 futures-util = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
