@@ -9,5 +9,5 @@ ghostscope-protocol = { path = "../ghostscope-protocol" }
 aya = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
-chrono = { version = "0.4", features = ["serde"] }
-tokio = { workspace = true, features = ["io-util", "mio"] } 
+chrono = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "mio"] }

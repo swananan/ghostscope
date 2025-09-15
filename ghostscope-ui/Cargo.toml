@@ -7,9 +7,9 @@ edition = "2021"
 ghostscope-protocol = { path = "../ghostscope-protocol" }
 ratatui = "0.28"
 crossterm = { version = "0.28", features = ["event-stream"] }
-futures-util = "0.3"
+futures-util = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
-chrono = { version = "0.4", features = ["serde"] } 
+chrono = { workspace = true }
 unicode-width = "0.1"
