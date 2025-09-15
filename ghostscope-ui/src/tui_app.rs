@@ -1297,19 +1297,88 @@ impl TuiApp {
                     .add_response(response, ResponseType::Success);
                 info!("Trace info displayed successfully");
             }
-            RuntimeStatus::FileInfo { files } => {
-                // Handle InfoSource response and display source files information
+            RuntimeStatus::FileInfo { groups } => {
+                // Handle grouped InfoSource response and display module-wise
                 self.interactive_command_panel.handle_command_completed();
 
-                // Format and display file information
-                let mut response = format!("📁 Source Files ({}):\n", files.len());
+                let total_files: usize = groups.iter().map(|g| g.files.len()).sum();
+                let mut response = format!(
+                    "📁 Source Files by Module ({} modules, {} files):\n\n",
+                    groups.len(),
+                    total_files
+                );
 
-                if !files.is_empty() {
-                    for file in files {
-                        response.push_str(&format!("  ✓ {} ({})\n", file.path, file.directory));
-                    }
-                } else {
+                if groups.is_empty() {
                     response.push_str("  No source files found.\n");
+                } else {
+                    for group in groups {
+                        let group_file_count = group.files.len();
+                        response.push_str(&format!(
+                            "📦 {} ({} files)\n",
+                            group.module_path, group_file_count
+                        ));
+
+                        if group.files.is_empty() {
+                            response.push_str("  └─ (no files)\n\n");
+                            continue;
+                        }
+
+                        // Group files by directory
+                        let mut dir_map: std::collections::BTreeMap<
+                            String,
+                            Vec<&crate::events::SourceFileInfo>,
+                        > = std::collections::BTreeMap::new();
+                        for f in &group.files {
+                            dir_map.entry(f.directory.clone()).or_default().push(f);
+                        }
+
+                        let dir_count = dir_map.len();
+                        for (didx, (dir, files)) in dir_map.into_iter().enumerate() {
+                            let last_dir = didx + 1 == dir_count;
+                            let dir_prefix = if last_dir { "  └─" } else { "  ├─" };
+                            response.push_str(&format!(
+                                "{} {} ({} files)\n",
+                                dir_prefix,
+                                dir,
+                                files.len()
+                            ));
+
+                            // Files within directory
+                            for (fidx, file) in files.iter().enumerate() {
+                                let last_file = fidx + 1 == files.len();
+                                let file_prefix = if last_dir {
+                                    if last_file {
+                                        "     └─"
+                                    } else {
+                                        "     ├─"
+                                    }
+                                } else {
+                                    if last_file {
+                                        "  │  └─"
+                                    } else {
+                                        "  │  ├─"
+                                    }
+                                };
+                                // File icon by extension (scheme 3)
+                                let ext = std::path::Path::new(&file.path)
+                                    .extension()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or("")
+                                    .to_ascii_lowercase();
+                                let icon = match ext.as_str() {
+                                    "h" | "hpp" | "hh" | "hxx" => "📑",
+                                    "c" | "cc" | "cpp" | "cxx" => "📝",
+                                    "rs" => "🦀",
+                                    "s" | "asm" => "🛠️",
+                                    _ => "📄",
+                                };
+                                response
+                                    .push_str(&format!("{} {} {}\n", file_prefix, icon, file.path));
+                            }
+                        }
+
+                        response.push('\n');
+                    }
                 }
 
                 self.interactive_command_panel

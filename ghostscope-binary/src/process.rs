@@ -632,6 +632,36 @@ impl ProcessAnalyzer {
         Ok(all_file_info)
     }
 
+    /// Get file info grouped by module for UI display
+    /// Returns Vec of (module_path, Vec<SimpleFileInfo>)
+    pub fn get_grouped_file_info_by_module(
+        &self,
+    ) -> Result<Vec<(String, Vec<crate::file::SimpleFileInfo>)>> {
+        let mut grouped: Vec<(String, Vec<crate::file::SimpleFileInfo>)> = Vec::new();
+
+        for (module_path, module) in &self.modules {
+            if let Some(dwarf_context) = module.binary_analyzer.dwarf_context() {
+                match dwarf_context.get_all_file_info() {
+                    Ok(file_info_vec) => {
+                        if !file_info_vec.is_empty() {
+                            grouped.push((module_path.clone(), file_info_vec));
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to get file info from module '{}': {}",
+                            module_path, e
+                        );
+                    }
+                }
+            }
+        }
+
+        // Sort modules by path for stable UI
+        grouped.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(grouped)
+    }
+
     /// Execute evaluation context operations on enhanced variables in a specific module
     /// This encapsulates the pattern of getting enhanced variables and then evaluating them
     pub fn get_and_evaluate_enhanced_variables(

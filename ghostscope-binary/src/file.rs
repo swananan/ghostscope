@@ -1,7 +1,8 @@
 use crate::Result;
 use gimli::{Dwarf, EndianSlice, LittleEndian};
 use std::collections::HashMap;
-use tracing::debug;
+use std::path::Path;
+use tracing::{debug, warn};
 
 /// Compilation unit information with associated directories and files
 #[derive(Debug, Clone)]
@@ -159,7 +160,7 @@ impl SourceFileManager {
 
         let mut compilation_unit = CompilationUnit {
             name: cu_name.clone(),
-            base_directory: String::new(),
+            base_directory: Self::get_comp_dir(dwarf, unit).unwrap_or_default(),
             include_directories: Vec::new(),
             files: Vec::new(),
         };
@@ -168,14 +169,11 @@ impl SourceFileManager {
         if let Some(line_program) = unit.line_program.clone() {
             let header = line_program.header();
 
-            // Extract include directories
+            // Extract include directories (DWARF: 1-based indices refer to this list)
             for (dir_index, dir_entry) in header.include_directories().into_iter().enumerate() {
                 if let Ok(dir_path) = dwarf.attr_string(unit, *dir_entry) {
                     let dir_str = dir_path.to_string_lossy().into_owned();
-                    debug!("Include directory [{}]: '{}'", dir_index, dir_str);
-                    if dir_index == 0 {
-                        compilation_unit.base_directory = dir_str.clone();
-                    }
+                    debug!("Include directory [{}]: '{}'", dir_index + 1, dir_str);
                     compilation_unit.include_directories.push(dir_str);
                 }
             }
@@ -226,21 +224,20 @@ impl SourceFileManager {
         debug!("File entry directory_index: {}", dir_index);
         debug!("Available include_directories: {:?}", include_directories);
 
-        let directory_path = if dir_index == 0 {
-            // Directory index 0 means the current directory of the compilation unit
-            // We should use the base directory from the compilation unit
-            if let Some(base_dir) = include_directories.first() {
-                debug!("Using base directory for index 0: '{}'", base_dir);
-                base_dir.clone()
-            } else {
-                debug!("No base directory available, using '.'");
-                ".".to_string()
-            }
+        let mut directory_path = if dir_index == 0 {
+            // Directory index 0 means the compilation unit's base directory (DW_AT_comp_dir)
+            let comp_dir = Self::get_comp_dir(dwarf, unit).unwrap_or_else(|| ".".to_string());
+            debug!("Using compilation directory for index 0: '{}'", comp_dir);
+            comp_dir
         } else {
             // Directory index > 0 refers to include_directories array (1-based indexing)
             let actual_index = (dir_index - 1) as usize;
             if let Some(dir_path) = include_directories.get(actual_index) {
-                debug!("Using include directory [{}]: '{}'", actual_index, dir_path);
+                debug!(
+                    "Using include directory [{}]: '{}'",
+                    actual_index + 1,
+                    dir_path
+                );
                 dir_path.clone()
             } else {
                 debug!(
@@ -250,6 +247,13 @@ impl SourceFileManager {
                 ".".to_string()
             }
         };
+
+        // If directory_path is relative, resolve against comp_dir
+        if !directory_path.starts_with('/') {
+            if let Some(comp_dir) = Self::get_comp_dir(dwarf, unit) {
+                directory_path = format!("{}/{}", comp_dir, directory_path);
+            }
+        }
 
         // Get filename
         let filename = dwarf
@@ -269,13 +273,40 @@ impl SourceFileManager {
         );
 
         // Create full path
-        let full_path = if directory_path == "." {
+        let mut full_path = if directory_path == "." {
             filename.clone()
         } else {
             format!("{}/{}", directory_path, filename)
         };
 
         debug!("Final full path: '{}'", full_path);
+
+        // Fallback: if the file does not exist at computed path, try other include dirs
+        // This helps when some toolchains put comp_dir into include_directories[1]
+        if !Path::new(&full_path).exists() {
+            if let Some(comp_dir) = Self::get_comp_dir(dwarf, unit) {
+                for dir in include_directories {
+                    let candidate_dir = if dir.starts_with('/') {
+                        dir.clone()
+                    } else {
+                        format!("{}/{}", comp_dir, dir)
+                    };
+                    let candidate = format!("{}/{}", candidate_dir, filename);
+                    if Path::new(&candidate).exists() {
+                        debug!("Resolved missing path via include dir: '{}'", candidate);
+                        full_path = candidate;
+                        directory_path = candidate_dir;
+                        break;
+                    }
+                }
+            }
+            if !Path::new(&full_path).exists() {
+                warn!(
+                    "File path does not exist on filesystem: '{}'. Keeping DWARF-derived path.",
+                    full_path
+                );
+            }
+        }
 
         Ok(SourceFile {
             file_index,
@@ -285,6 +316,25 @@ impl SourceFileManager {
             filename,
             full_path,
         })
+    }
+
+    /// Get compilation directory (DW_AT_comp_dir)
+    fn get_comp_dir(
+        dwarf: &Dwarf<EndianSlice<LittleEndian>>,
+        unit: &gimli::Unit<EndianSlice<LittleEndian>>,
+    ) -> Option<String> {
+        let mut entries = unit.entries();
+        if let Ok(Some((_, entry))) = entries.next_dfs() {
+            if entry.tag() == gimli::DW_TAG_compile_unit {
+                if let Some(comp_dir_attr) = entry.attr_value(gimli::DW_AT_comp_dir).ok().flatten()
+                {
+                    if let Ok(comp_dir) = dwarf.attr_string(unit, comp_dir_attr) {
+                        return Some(comp_dir.to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Get compilation unit name from DWARF unit

@@ -508,9 +508,9 @@ pub enum RuntimeStatus {
         trace_id: u32,
         error: String,
     },
-    /// Source file information response
+    /// Source file information response (grouped by module)
     FileInfo {
-        files: Vec<SourceFileInfo>,
+        groups: Vec<SourceFileGroup>,
     },
     /// Failed to get file information
     FileInfoFailed {
@@ -573,6 +573,13 @@ impl TraceDetailInfo {
 pub struct SourceFileInfo {
     pub path: String,
     pub directory: String,
+}
+
+/// Group of source files for a specific module
+#[derive(Debug, Clone)]
+pub struct SourceFileGroup {
+    pub module_path: String,
+    pub files: Vec<SourceFileInfo>,
 }
 
 /// Shared library information (similar to GDB's "info share" output)

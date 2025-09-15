@@ -312,11 +312,9 @@ async fn run_runtime_coordinator(
                     RuntimeCommand::InfoSource => {
                         if let Some(ref session) = session {
                             // Get source files from DWARF context
-                            match get_source_files_info(session) {
-                                Ok(files) => {
-                                    let _ = runtime_channels.status_sender.send(ghostscope_ui::events::RuntimeStatus::FileInfo {
-                                        files,
-                                    });
+                            match get_grouped_source_files_info(session) {
+                                Ok(groups) => {
+                                    let _ = runtime_channels.status_sender.send(ghostscope_ui::events::RuntimeStatus::FileInfo { groups });
                                 }
                                 Err(error) => {
                                     let _ = runtime_channels.status_sender.send(ghostscope_ui::events::RuntimeStatus::FileInfoFailed {
@@ -984,34 +982,43 @@ fn handle_source_location_target(
 }
 
 /// Get source files information from DWARF context
-fn get_source_files_info(
+
+/// Get grouped source files information by module for UI
+fn get_grouped_source_files_info(
     session: &GhostSession,
-) -> anyhow::Result<Vec<ghostscope_ui::events::SourceFileInfo>> {
+) -> anyhow::Result<Vec<ghostscope_ui::events::SourceFileGroup>> {
     use std::collections::HashSet;
 
-    let mut files = Vec::new();
-    let mut seen_files = HashSet::new();
+    let mut groups = Vec::new();
 
-    // Get files from process analyzer across all modules using encapsulated method
     if let Some(ref process_analyzer) = session.process_analyzer {
-        let file_info_vec = process_analyzer.get_all_file_info_from_all_modules()?;
+        let grouped = process_analyzer.get_grouped_file_info_by_module()?;
 
-        for file_info in file_info_vec {
-            let key = format!("{}:{}", file_info.directory, file_info.basename);
-            if seen_files.contains(&key) {
-                continue;
+        for (module_path, files) in grouped {
+            // Deduplicate by directory+basename per module
+            let mut seen = HashSet::new();
+            let mut ui_files = Vec::new();
+            for file in files {
+                let key = format!("{}:{}", file.directory, file.basename);
+                if seen.insert(key) {
+                    ui_files.push(ghostscope_ui::events::SourceFileInfo {
+                        path: file.basename,
+                        directory: file.directory,
+                    });
+                }
             }
-            seen_files.insert(key);
 
-            files.push(ghostscope_ui::events::SourceFileInfo {
-                path: file_info.basename,
-                directory: file_info.directory,
+            // Sort files within module by path
+            ui_files.sort_by(|a, b| a.path.cmp(&b.path));
+
+            groups.push(ghostscope_ui::events::SourceFileGroup {
+                module_path,
+                files: ui_files,
             });
         }
     }
 
-    // Sort files by path for consistent display
-    files.sort_by(|a, b| a.path.cmp(&b.path));
-
-    Ok(files)
+    // Sort modules by path for consistent display
+    groups.sort_by(|a, b| a.module_path.cmp(&b.module_path));
+    Ok(groups)
 }
