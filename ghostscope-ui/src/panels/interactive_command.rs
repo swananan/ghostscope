@@ -17,6 +17,19 @@ pub enum InteractionMode {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum JkEscapeState {
+    None, // No escape sequence in progress
+    J,    // 'j' was pressed, waiting for 'k'
+}
+
+#[derive(Debug, PartialEq)]
+enum JkEscapeResult {
+    Continue,        // Normal processing, no action needed
+    InsertPreviousJ, // Insert the previous 'j' that was held
+    SwitchToCommand, // Successfully detected jk sequence
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum InputState {
     Ready, // Normal input state, shows (ghostscope)
     WaitingResponse {
@@ -129,6 +142,10 @@ pub struct InteractiveCommandPanel {
 
     // Backup of unsent input when navigating history (for Ctrl+n restore)
     unsent_input_backup: Option<String>,
+
+    // JK escape sequence state for vim-like mode switching
+    jk_escape_state: JkEscapeState,
+    jk_timer: Option<Instant>,
 }
 
 impl InteractiveCommandPanel {
@@ -149,6 +166,8 @@ impl InteractiveCommandPanel {
             styled_buffer: None,
             styled_at_history_index: None,
             unsent_input_backup: None,
+            jk_escape_state: JkEscapeState::None,
+            jk_timer: None,
         };
         panel.update_static_lines();
         panel
@@ -261,8 +280,37 @@ impl InteractiveCommandPanel {
             return;
         }
 
-        self.input_text.insert(self.cursor_position, c);
-        self.cursor_position += 1;
+        // Handle jk escape sequence detection
+        match self.handle_jk_escape(c) {
+            JkEscapeResult::SwitchToCommand => {
+                // Successfully detected jk sequence, switch to command mode
+                // Save current cursor position before mode switch
+                let input_cursor_pos = self.cursor_position;
+                self.mode = InteractionMode::Command;
+                // Update static lines first so sync can use the correct content
+                self.update_static_lines();
+                // Sync cursor position from input mode to command mode
+                self.sync_cursor_to_command_mode_with_pos(input_cursor_pos);
+                return;
+            }
+            JkEscapeResult::InsertPreviousJ => {
+                // Timeout or invalid sequence, insert the previous 'j'
+                self.input_text.insert(self.cursor_position, 'j');
+                self.cursor_position += 1;
+                // Continue to insert current character
+                self.input_text.insert(self.cursor_position, c);
+                self.cursor_position += 1;
+            }
+            JkEscapeResult::Continue => {
+                // Normal processing or 'j' was just pressed
+                if c != 'j' || self.jk_escape_state != JkEscapeState::J {
+                    // Insert character unless it's 'j' and we just started the sequence
+                    self.input_text.insert(self.cursor_position, c);
+                    self.cursor_position += 1;
+                }
+            }
+        }
+
         self.update_static_lines();
     }
 
@@ -277,6 +325,132 @@ impl InteractiveCommandPanel {
             self.cursor_position -= 1;
             self.update_static_lines();
         }
+
+        // Reset jk escape state on any editing action
+        self.reset_jk_escape_state();
+    }
+
+    /// Handle jk escape sequence detection for vim-like mode switching
+    fn handle_jk_escape(&mut self, c: char) -> JkEscapeResult {
+        const JK_TIMEOUT_MS: u64 = 200;
+
+        match self.jk_escape_state {
+            JkEscapeState::None => {
+                if c == 'j' {
+                    // Start jk escape sequence
+                    self.jk_escape_state = JkEscapeState::J;
+                    self.jk_timer = Some(Instant::now());
+                    JkEscapeResult::Continue
+                } else {
+                    // Normal character, no escape sequence
+                    JkEscapeResult::Continue
+                }
+            }
+            JkEscapeState::J => {
+                // Check if timeout occurred
+                if let Some(timer) = self.jk_timer {
+                    if timer.elapsed().as_millis() > JK_TIMEOUT_MS as u128 {
+                        // Timeout, reset state and insert previous 'j'
+                        self.reset_jk_escape_state();
+                        return JkEscapeResult::InsertPreviousJ;
+                    }
+                }
+
+                if c == 'k' {
+                    // Complete jk sequence, switch to command mode
+                    self.reset_jk_escape_state();
+                    JkEscapeResult::SwitchToCommand
+                } else {
+                    // Invalid sequence, reset and insert previous 'j'
+                    self.reset_jk_escape_state();
+                    JkEscapeResult::InsertPreviousJ
+                }
+            }
+        }
+    }
+
+    /// Reset the jk escape sequence state
+    fn reset_jk_escape_state(&mut self) {
+        self.jk_escape_state = JkEscapeState::None;
+        self.jk_timer = None;
+    }
+
+    /// Check and handle jk timeout (should be called periodically)
+    pub fn check_jk_timeout(&mut self) -> bool {
+        const JK_TIMEOUT_MS: u64 = 200;
+
+        if let JkEscapeState::J = self.jk_escape_state {
+            if let Some(timer) = self.jk_timer {
+                if timer.elapsed().as_millis() > JK_TIMEOUT_MS as u128 {
+                    // Timeout occurred, need to insert pending 'j'
+                    self.reset_jk_escape_state();
+
+                    // Insert the pending 'j' character
+                    if self.should_show_input_prompt() {
+                        self.input_text.insert(self.cursor_position, 'j');
+                        self.cursor_position += 1;
+                        self.update_static_lines();
+                    }
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Sync cursor position from input mode to command mode with explicit position
+    fn sync_cursor_to_command_mode_with_pos(&mut self, input_cursor_pos: usize) {
+        // Find the current input line (should be the last line in static_lines)
+        if let Some(last_line_index) = self.static_lines.len().checked_sub(1) {
+            if let Some(last_line) = self.static_lines.get(last_line_index) {
+                if last_line.line_type == LineType::CurrentInput {
+                    // Set command cursor to the last line
+                    self.command_cursor_line = last_line_index;
+
+                    // Calculate the column position in the command mode
+                    // Current input line format: "{prompt}{input_text}"
+                    let prompt = self.get_prompt();
+                    let prompt_len = prompt.len();
+
+                    // Map input cursor position to command cursor column
+                    // The cursor should be at prompt_len + input_cursor_pos
+                    self.command_cursor_column = prompt_len + input_cursor_pos;
+
+                    // Ensure cursor doesn't exceed line length
+                    if self.command_cursor_column > last_line.content.len() {
+                        self.command_cursor_column = last_line.content.len();
+                    }
+
+                    debug!(
+                        "Synced cursor to command mode: line={}, column={}, prompt_len={}, input_cursor={}",
+                        self.command_cursor_line,
+                        self.command_cursor_column,
+                        prompt_len,
+                        input_cursor_pos
+                    );
+                    return;
+                }
+            }
+        }
+
+        // Fallback: set cursor to end of last line
+        if let Some(last_line_index) = self.static_lines.len().checked_sub(1) {
+            self.command_cursor_line = last_line_index;
+            if let Some(last_line) = self.static_lines.get(last_line_index) {
+                self.command_cursor_column = last_line.content.len();
+            } else {
+                self.command_cursor_column = 0;
+            }
+        } else {
+            // No lines available, set cursor to origin
+            self.command_cursor_line = 0;
+            self.command_cursor_column = 0;
+        }
+    }
+
+    /// Sync cursor position from input mode to command mode (using current cursor position)
+    fn sync_cursor_to_command_mode(&mut self) {
+        self.sync_cursor_to_command_mode_with_pos(self.cursor_position);
     }
 
     pub fn move_cursor_left(&mut self) {
@@ -409,6 +583,7 @@ impl InteractiveCommandPanel {
             self.input_text.truncate(self.cursor_position);
             self.update_static_lines();
         }
+        self.reset_jk_escape_state();
     }
 
     /// Delete from cursor to beginning of line (Ctrl+u)
@@ -422,6 +597,7 @@ impl InteractiveCommandPanel {
             self.cursor_position = 0;
             self.update_static_lines();
         }
+        self.reset_jk_escape_state();
     }
 
     /// Delete previous word (Ctrl+w)

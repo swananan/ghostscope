@@ -119,6 +119,12 @@ impl TuiApp {
                         }
                     }
                 }
+                // Check for jk timeout periodically
+                _ = tokio::time::sleep(tokio::time::Duration::from_millis(50)) => {
+                    if self.interactive_command_panel.check_jk_timeout() {
+                        needs_render = true;
+                    }
+                }
 
                 // Handle runtime status updates
                 Some(status) = self.event_registry.status_receiver.recv() => {
