@@ -274,6 +274,28 @@ impl InteractiveCommandPanel {
         );
     }
 
+    /// Convert character position to byte position (UTF-8 safe)
+    fn char_pos_to_byte_pos(&self, char_pos: usize) -> usize {
+        self.input_text
+            .char_indices()
+            .nth(char_pos)
+            .map(|(byte_pos, _)| byte_pos)
+            .unwrap_or(self.input_text.len())
+    }
+
+    /// Convert byte position to character position (UTF-8 safe)
+    fn byte_pos_to_char_pos(&self, byte_pos: usize) -> usize {
+        self.input_text
+            .char_indices()
+            .take_while(|(i, _)| *i < byte_pos)
+            .count()
+    }
+
+    /// Get the character count of input_text (UTF-8 safe)
+    fn char_count(&self) -> usize {
+        self.input_text.chars().count()
+    }
+
     pub fn insert_char(&mut self, c: char) {
         // Don't accept input when waiting for response
         if !self.should_show_input_prompt() {
@@ -295,17 +317,20 @@ impl InteractiveCommandPanel {
             }
             JkEscapeResult::InsertPreviousJ => {
                 // Timeout or invalid sequence, insert the previous 'j'
-                self.input_text.insert(self.cursor_position, 'j');
+                let byte_pos = self.char_pos_to_byte_pos(self.cursor_position);
+                self.input_text.insert(byte_pos, 'j');
                 self.cursor_position += 1;
                 // Continue to insert current character
-                self.input_text.insert(self.cursor_position, c);
+                let byte_pos = self.char_pos_to_byte_pos(self.cursor_position);
+                self.input_text.insert(byte_pos, c);
                 self.cursor_position += 1;
             }
             JkEscapeResult::Continue => {
                 // Normal processing or 'j' was just pressed
                 if c != 'j' || self.jk_escape_state != JkEscapeState::J {
                     // Insert character unless it's 'j' and we just started the sequence
-                    self.input_text.insert(self.cursor_position, c);
+                    let byte_pos = self.char_pos_to_byte_pos(self.cursor_position);
+                    self.input_text.insert(byte_pos, c);
                     self.cursor_position += 1;
                 }
             }
@@ -321,7 +346,9 @@ impl InteractiveCommandPanel {
         }
 
         if self.cursor_position > 0 {
-            self.input_text.remove(self.cursor_position - 1);
+            // Convert to byte position for removal (UTF-8 safe)
+            let byte_pos = self.char_pos_to_byte_pos(self.cursor_position - 1);
+            self.input_text.remove(byte_pos);
             self.cursor_position -= 1;
             self.update_static_lines();
         }
@@ -387,7 +414,8 @@ impl InteractiveCommandPanel {
 
                     // Insert the pending 'j' character
                     if self.should_show_input_prompt() {
-                        self.input_text.insert(self.cursor_position, 'j');
+                        let byte_pos = self.char_pos_to_byte_pos(self.cursor_position);
+                        self.input_text.insert(byte_pos, 'j');
                         self.cursor_position += 1;
                         self.update_static_lines();
                     }
@@ -473,7 +501,7 @@ impl InteractiveCommandPanel {
                 }
             }
         } else {
-            if self.cursor_position < self.input_text.len() {
+            if self.cursor_position < self.char_count() {
                 self.cursor_position += 1;
             }
         }
@@ -569,7 +597,7 @@ impl InteractiveCommandPanel {
         if !self.should_show_input_prompt() {
             return;
         }
-        self.cursor_position = self.input_text.len();
+        self.cursor_position = self.char_count();
         self.update_static_lines();
     }
 
@@ -579,8 +607,9 @@ impl InteractiveCommandPanel {
         if !self.should_show_input_prompt() {
             return;
         }
-        if self.cursor_position < self.input_text.len() {
-            self.input_text.truncate(self.cursor_position);
+        if self.cursor_position < self.char_count() {
+            let byte_pos = self.char_pos_to_byte_pos(self.cursor_position);
+            self.input_text.truncate(byte_pos);
             self.update_static_lines();
         }
         self.reset_jk_escape_state();
@@ -1892,7 +1921,7 @@ impl InteractiveCommandPanel {
         self.history_index = Some(new_index);
         let item = &self.command_history[new_index];
         self.input_text = item.command.clone();
-        self.cursor_position = self.input_text.len();
+        self.cursor_position = self.char_count();
         self.update_static_lines();
     }
 
@@ -1904,14 +1933,14 @@ impl InteractiveCommandPanel {
                 self.history_index = Some(new_index);
                 let item = &self.command_history[new_index];
                 self.input_text = item.command.clone();
-                self.cursor_position = self.input_text.len();
+                self.cursor_position = self.char_count();
             }
             Some(_) => {
                 // Leaving history navigation; restore unsent input if present
                 self.history_index = None;
                 if let Some(backup) = self.unsent_input_backup.take() {
                     self.input_text = backup;
-                    self.cursor_position = self.input_text.len();
+                    self.cursor_position = self.char_count();
                 } else {
                     // No backup, keep current input unchanged (do nothing)
                 }
