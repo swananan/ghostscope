@@ -1,6 +1,7 @@
 use crossterm::event::{KeyEvent, MouseEvent};
 use ghostscope_protocol::EventData;
 use tokio::sync::mpsc;
+use unicode_width::UnicodeWidthStr;
 
 /// Trace status enumeration for shared use between UI and runtime
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -648,28 +649,39 @@ impl RuntimeStatus {
                 script_preview,
                 pc,
             } => {
+                // Header line
+                let mut result = format!(
+                    "🔎 Trace [{}] {} {}\n",
+                    trace_id,
+                    status.to_emoji(),
+                    status.to_string()
+                );
+
+                // Collect fields for aligned key-value formatting
                 let binary_name = std::path::Path::new(binary)
                     .file_name()
                     .and_then(|name| name.to_str())
                     .unwrap_or(binary);
 
-                let mut result = format!(
-                    "{} Trace ID: {} - {} ({})\n",
-                    status.to_emoji(),
-                    trace_id,
-                    target,
-                    status.to_string()
-                );
-
-                result.push_str(&format!("  Binary: {}\n", binary_name));
-                result.push_str(&format!("  Address: {}+0x{:x}\n", binary_name, pc));
-
+                let mut fields: Vec<(&str, String)> = Vec::new();
+                fields.push(("🎯 Target", target.clone()));
+                fields.push(("📦 Binary", binary.clone()));
+                fields.push(("📍 Address", format!("{}+0x{:x}", binary_name, pc)));
                 if let Some(pid_val) = pid {
-                    result.push_str(&format!("  Process ID: {}\n", pid_val));
+                    fields.push(("🏷️ PID", pid_val.to_string()));
+                }
+                if let Some(ref script) = script_preview {
+                    fields.push(("📝 Script", script.clone()));
                 }
 
-                if let Some(ref script) = script_preview {
-                    result.push_str(&format!("  Script Preview: {}\n", script));
+                // Compute max key width (accounting for emoji display width)
+                let max_key_width = fields.iter().map(|(k, _)| k.width()).max().unwrap_or(0);
+
+                for (key, value) in fields {
+                    let key_width = key.width();
+                    let pad = max_key_width.saturating_sub(key_width);
+                    let spaces = " ".repeat(pad);
+                    result.push_str(&format!("  {}{}: {}\n", key, spaces, value));
                 }
 
                 Some(result)
