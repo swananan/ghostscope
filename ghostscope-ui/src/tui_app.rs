@@ -1452,37 +1452,6 @@ impl TuiApp {
 
 /// Format target debug info for display using enhanced modular format
 fn format_target_debug_info(target: &str, info: &crate::events::TargetDebugInfo) -> String {
-    use crate::events::TargetType;
-
-    let mut result = String::new();
-
-    // Header with icon
-    match info.target_type {
-        TargetType::Function => {
-            result.push_str(&format!("🔧 Function Debug Info\n"));
-        }
-        TargetType::SourceLocation => {
-            result.push_str(&format!("📍 Source Location Debug Info\n"));
-        }
-        TargetType::Address => {
-            result.push_str(&format!("🎯 Address Debug Info\n"));
-        }
-    }
-
-    // Use the enhanced format_for_display method
-    result.push_str(&info.format_for_display());
-
-    // Check if we have any variables or parameters across all modules
-    let has_any_data = info.modules.iter().any(|module| {
-        module
-            .address_mappings
-            .iter()
-            .any(|mapping| !mapping.parameters.is_empty() || !mapping.variables.is_empty())
-    });
-
-    if !has_any_data {
-        result.push_str("\n❌ No variables or parameters found in scope\n");
-    }
-
-    result
+    // Use the enhanced format_for_display method which already includes the appropriate header
+    info.format_for_display()
 }

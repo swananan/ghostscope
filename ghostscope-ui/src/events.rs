@@ -401,6 +401,7 @@ pub enum ExecutionStatus {
 pub struct ScriptExecutionResult {
     pub pc_address: u64,
     pub target_name: String,
+    pub binary_path: String, // Full path to the binary
     pub status: ExecutionStatus,
 }
 

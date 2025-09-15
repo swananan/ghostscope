@@ -49,12 +49,22 @@ pub struct CompilationResult {
     pub uprobe_configs: Vec<UProbeConfig>,
     pub trace_count: usize,
     pub target_info: String,
+    pub failed_targets: Vec<FailedTarget>, // New field for failed compilation info
+}
+
+/// Information about a target that failed to compile
+#[derive(Debug, Clone)]
+pub struct FailedTarget {
+    pub target_name: String,
+    pub pc_address: u64,
+    pub error_message: String,
 }
 
 /// Unified AST compiler that performs DWARF queries and code generation in single pass
 pub struct AstCompiler<'a> {
     process_analyzer: Option<&'a mut ghostscope_binary::ProcessAnalyzer>,
     uprobe_configs: Vec<UProbeConfig>,
+    failed_targets: Vec<FailedTarget>, // Track failed compilation attempts
     binary_path_hint: Option<String>,
     trace_id: Option<u32>,
 }
@@ -68,6 +78,7 @@ impl<'a> AstCompiler<'a> {
         Self {
             process_analyzer,
             uprobe_configs: Vec::new(),
+            failed_targets: Vec::new(),
             binary_path_hint,
             trace_id,
         }
@@ -146,6 +157,7 @@ impl<'a> AstCompiler<'a> {
 
         Ok(CompilationResult {
             uprobe_configs: std::mem::take(&mut self.uprobe_configs),
+            failed_targets: std::mem::take(&mut self.failed_targets),
             trace_count: self.uprobe_configs.len(),
             target_info,
         })
@@ -224,6 +236,14 @@ impl<'a> AstCompiler<'a> {
                                     "❌ Failed to generate eBPF for {}:{} at 0x{:x}: {}",
                                     file_path, line_number, address, e
                                 );
+
+                                // Record this failed target
+                                self.failed_targets.push(FailedTarget {
+                                    target_name: format!("{}:{}", file_path, line_number),
+                                    pc_address: *address,
+                                    error_message: e.to_string(),
+                                });
+
                                 // Continue processing other addresses
                             }
                         }
@@ -315,6 +335,14 @@ impl<'a> AstCompiler<'a> {
                                     "❌ Failed to generate eBPF for function '{}' at 0x{:x}: {}",
                                     func_name, address, e
                                 );
+
+                                // Record this failed target
+                                self.failed_targets.push(FailedTarget {
+                                    target_name: func_name.clone(),
+                                    pc_address: *address,
+                                    error_message: e.to_string(),
+                                });
+
                                 // Continue processing other addresses
                             }
                         }

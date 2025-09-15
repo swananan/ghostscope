@@ -2,7 +2,7 @@ use crate::session::GhostSession;
 use anyhow::Result;
 use ghostscope_loader::GhostScopeLoader;
 use ghostscope_ui::events::{ExecutionStatus, ScriptCompilationDetails, ScriptExecutionResult};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Compile and load script specifically for TUI mode with detailed execution results
 /// This function collects detailed results for each PC/target and returns comprehensive status
@@ -33,24 +33,33 @@ pub async fn compile_and_load_script_for_tui(
         binary_path_hint,
     };
 
-    // Step 3: Use unified compilation interface with ProcessAnalyzer
-    // Handle compilation errors gracefully - some trace points might still succeed
+    // Step 2.5: Get binary path early for error handling
+    let binary_path = if let Some(main_module) = process_analyzer.get_main_executable() {
+        main_module.path.clone()
+    } else {
+        return Err(anyhow::anyhow!("No main executable found in process"));
+    };
+
+    // Step 3: Do a single compilation to get all results
     let compilation_result = match ghostscope_compiler::compile_script(
         script,
         process_analyzer,
         session.target_pid,
-        None, // Let the system generate its own trace_id
+        None, // We'll assign trace IDs after we know how many we need
         &save_options,
     ) {
         Ok(result) => result,
         Err(e) => {
             error!("Script compilation failed: {}", e);
-            // Return a compilation result with no uprobe configs but with error details
             return Ok(ScriptCompilationDetails {
-                trace_ids: vec![], // No traces generated on compilation failure
+                trace_ids: vec![],
                 results: vec![ScriptExecutionResult {
                     pc_address: 0,
                     target_name: "script_compilation".to_string(),
+                    binary_path: process_analyzer
+                        .get_main_executable()
+                        .map(|m| m.path.clone())
+                        .unwrap_or_else(|| "unknown".to_string()),
                     status: ExecutionStatus::Failed(format!("Script compilation failed: {}", e)),
                 }],
                 total_count: 1,
@@ -60,6 +69,13 @@ pub async fn compile_and_load_script_for_tui(
         }
     };
 
+    // Pre-allocate trace IDs based on successful PC count
+    let mut pre_allocated_trace_ids = Vec::new();
+    for _ in &compilation_result.uprobe_configs {
+        let trace_id = session.trace_manager.reserve_next_trace_id();
+        pre_allocated_trace_ids.push(trace_id);
+    }
+
     info!(
         "Script compilation successful: {} trace points found, {} uprobe configs generated, target: {}",
         compilation_result.trace_count,
@@ -68,23 +84,87 @@ pub async fn compile_and_load_script_for_tui(
     );
 
     if compilation_result.uprobe_configs.is_empty() {
-        return Err(anyhow::anyhow!(
-            "No valid uprobe configurations generated from script"
-        ));
+        warn!("No valid uprobe configurations generated from script");
+
+        // Check if we have detailed failure information from the compiler
+        if !compilation_result.failed_targets.is_empty() {
+            info!(
+                "Using detailed failure information from compiler: {} failed targets",
+                compilation_result.failed_targets.len()
+            );
+
+            // Use the detailed failure information instead of generic error
+            let mut execution_results = Vec::new();
+            for failed_target in &compilation_result.failed_targets {
+                execution_results.push(ScriptExecutionResult {
+                    pc_address: failed_target.pc_address,
+                    target_name: failed_target.target_name.clone(),
+                    binary_path: binary_path.clone(),
+                    status: ExecutionStatus::Failed(format!(
+                        "Compilation failed: {}",
+                        failed_target.error_message
+                    )),
+                });
+            }
+
+            let details = ScriptCompilationDetails {
+                trace_ids: vec![],
+                results: execution_results,
+                total_count: compilation_result.failed_targets.len(),
+                success_count: 0,
+                failed_count: compilation_result.failed_targets.len(),
+            };
+
+            info!(
+                "Returning detailed compilation failures for {} targets",
+                compilation_result.failed_targets.len()
+            );
+            return Ok(details);
+        } else {
+            // Fallback to generic error if no detailed failure info available
+            let target_name = extract_target_from_script(script);
+            let execution_results = vec![ScriptExecutionResult {
+                pc_address: 0,
+                target_name: target_name.clone(),
+                binary_path: binary_path.clone(),
+                status: ExecutionStatus::Failed("No valid uprobe configurations generated from script - target not found or compilation failed".to_string()),
+            }];
+
+            let details = ScriptCompilationDetails {
+                trace_ids: vec![],
+                results: execution_results,
+                total_count: 1,
+                success_count: 0,
+                failed_count: 1,
+            };
+
+            info!(
+                "Returning compilation details with generic failed target: {}",
+                target_name
+            );
+            return Ok(details);
+        }
     }
 
-    // Step 4: Get binary path for trace instances
-    let binary_path = if let Some(main_module) = process_analyzer.get_main_executable() {
-        main_module.path.clone()
-    } else {
-        return Err(anyhow::anyhow!("No main executable found in process"));
-    };
-
-    // Step 5: Process compilation results at PC level for detailed error reporting
+    // Step 4: Process compilation results at PC level for detailed error reporting
     let mut execution_results: Vec<ScriptExecutionResult> = Vec::new();
     let mut successful_traces: Vec<(u64, GhostScopeLoader, String)> = Vec::new();
-    let mut success_count = 0;
-    let mut failed_count = 0;
+    let mut success_count: usize = 0;
+    let mut failed_count: usize = 0;
+
+    // First, add all failed targets from compilation
+    for failed_target in &compilation_result.failed_targets {
+        execution_results.push(ScriptExecutionResult {
+            pc_address: failed_target.pc_address,
+            target_name: failed_target.target_name.clone(),
+            binary_path: binary_path.clone(),
+            status: ExecutionStatus::Failed(format!(
+                "Compilation failed: {}",
+                failed_target.error_message
+            )),
+        });
+        failed_count += 1;
+    }
 
     // Use the first uprobe config's pattern as the trace display name (if available)
     let target_display = if !compilation_result.uprobe_configs.is_empty() {
@@ -152,6 +232,7 @@ pub async fn compile_and_load_script_for_tui(
                         execution_results.push(ScriptExecutionResult {
                             pc_address,
                             target_name: target_name.clone(),
+                            binary_path: binary_path.clone(),
                             status: ExecutionStatus::Success,
                         });
 
@@ -169,6 +250,7 @@ pub async fn compile_and_load_script_for_tui(
                         execution_results.push(ScriptExecutionResult {
                             pc_address,
                             target_name,
+                            binary_path: binary_path.clone(),
                             status: ExecutionStatus::Failed(error_msg),
                         });
                         failed_count += 1;
@@ -183,6 +265,7 @@ pub async fn compile_and_load_script_for_tui(
                 execution_results.push(ScriptExecutionResult {
                     pc_address,
                     target_name,
+                    binary_path: binary_path.clone(),
                     status: ExecutionStatus::Failed(error_msg),
                 });
                 failed_count += 1;
@@ -197,6 +280,7 @@ pub async fn compile_and_load_script_for_tui(
             execution_results.push(ScriptExecutionResult {
                 pc_address,
                 target_name,
+                binary_path: binary_path.clone(),
                 status: ExecutionStatus::Failed(format!("Compilation failed: {}", error_msg)),
             });
             failed_count += 1;
@@ -207,9 +291,13 @@ pub async fn compile_and_load_script_for_tui(
     let mut trace_ids = Vec::new();
 
     if !successful_traces.is_empty() {
-        // Create a separate trace for each successful PC
-        for (pc, loader, ebpf_function_name) in successful_traces {
-            let trace_id = session.trace_manager.add_trace(
+        // Create a separate trace for each successful PC using pre-allocated IDs
+        for (index, (pc, loader, ebpf_function_name)) in successful_traces.into_iter().enumerate() {
+            // Use the corresponding pre-allocated trace ID
+            let trace_id = pre_allocated_trace_ids[index];
+
+            let created_trace_id = session.trace_manager.add_trace_with_id(
+                trace_id,
                 compilation_result.target_info.clone(),
                 script.to_string(),
                 pc,
@@ -218,6 +306,12 @@ pub async fn compile_and_load_script_for_tui(
                 session.target_pid,
                 Some(loader),
                 ebpf_function_name,
+            );
+
+            // Verify that the IDs match (safety check)
+            assert_eq!(
+                trace_id, created_trace_id,
+                "Trace ID mismatch during creation"
             );
 
             info!(
@@ -246,6 +340,9 @@ pub async fn compile_and_load_script_for_tui(
                         {
                             result.status =
                                 ExecutionStatus::Failed(format!("Uprobe attachment failed: {}", e));
+                            // Update the counts since we changed Success to Failed
+                            success_count = success_count.saturating_sub(1);
+                            failed_count += 1;
                         }
                     }
                 }
@@ -255,27 +352,55 @@ pub async fn compile_and_load_script_for_tui(
         info!("No successful PCs to create trace instances");
     }
 
-    // Step 8: Return detailed compilation results
-    // If all targets failed, return an error instead of success
-    if success_count == 0 && failed_count > 0 {
-        let error_msg = format!("All {} targets failed to compile", failed_count);
-        error!("{}", error_msg);
-        return Err(anyhow::anyhow!(error_msg));
+    // Step 8: Recalculate final counts based on actual execution results
+    // This ensures accuracy after any trace activation failures
+    let final_success_count = execution_results
+        .iter()
+        .filter(|r| matches!(r.status, ExecutionStatus::Success))
+        .count();
+    let final_failed_count = execution_results
+        .iter()
+        .filter(|r| matches!(r.status, ExecutionStatus::Failed(_)))
+        .count();
+    let final_total_count = execution_results.len();
+
+    // Step 9: Return detailed compilation results
+    // Note: We no longer return an error when all targets fail
+    // Instead, we return the detailed failure information for UI display
+    if final_success_count == 0 && final_failed_count > 0 {
+        warn!(
+            "All {} targets failed to compile or attach, but returning detailed results",
+            final_failed_count
+        );
     }
 
-    let total_count = success_count + failed_count;
+    // Debug: Log all execution results before returning
+    info!("Final execution results summary:");
+    for (i, result) in execution_results.iter().enumerate() {
+        info!(
+            "  Result {}: {} at 0x{:x} in {} - {:?}",
+            i,
+            result.target_name,
+            result.pc_address,
+            std::path::Path::new(&result.binary_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown"),
+            result.status
+        );
+    }
 
     let details = ScriptCompilationDetails {
         trace_ids, // List of generated trace IDs
         results: execution_results,
-        total_count,
-        success_count,
-        failed_count,
+        total_count: final_total_count,
+        success_count: final_success_count,
+        failed_count: final_failed_count,
     };
 
     info!(
         "Script compilation completed: {}/{} PC targets successful, {}/{} failed",
-        success_count, total_count, failed_count, total_count
+        final_success_count, final_total_count, final_failed_count, final_total_count
     );
 
     Ok(details)

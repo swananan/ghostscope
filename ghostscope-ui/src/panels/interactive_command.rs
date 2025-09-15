@@ -998,6 +998,21 @@ impl InteractiveCommandPanel {
             "add_detailed_script_response_and_clear_waiting called with {} results",
             details.results.len()
         );
+
+        // Debug: Log all received results
+        for (i, result) in details.results.iter().enumerate() {
+            debug!(
+                "  UI Received Result {}: {} at 0x{:x} in {} - {:?}",
+                i,
+                result.target_name,
+                result.pc_address,
+                std::path::Path::new(&result.binary_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown"),
+                result.status
+            );
+        }
         let mut messages = Vec::new();
 
         // Overall status message
@@ -1014,13 +1029,22 @@ impl InteractiveCommandPanel {
 
         // Add detailed results for each target
         for result in &details.results {
+            // Extract binary name from full path for cleaner display
+            let binary_name = std::path::Path::new(&result.binary_path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(&result.binary_path);
+
             // Check if target_name already contains PC information
             let display_name = if result.target_name.contains("(PC: 0x") {
-                // target_name already includes PC info, use it as is
-                result.target_name.clone()
+                // target_name already includes PC info, add binary info
+                format!("{}@{}", result.target_name, binary_name)
             } else {
-                // target_name doesn't include PC info, add it
-                format!("{} (PC: 0x{:x})", result.target_name, result.pc_address)
+                // target_name doesn't include PC info, add both PC and binary
+                format!(
+                    "{}@{}+0x{:x}",
+                    result.target_name, binary_name, result.pc_address
+                )
             };
 
             match &result.status {
@@ -1028,7 +1052,17 @@ impl InteractiveCommandPanel {
                     messages.push(format!("  ✅ {} - Success", display_name));
                 }
                 crate::events::ExecutionStatus::Failed(error) => {
-                    messages.push(format!("  ❌ {} - Failed: {}", display_name, error));
+                    // Provide more detailed error context
+                    let error_detail = if error.contains("eBPF loader") {
+                        format!("eBPF Loading Error: {}", error)
+                    } else if error.contains("Uprobe attachment") {
+                        format!("Uprobe Attachment Error: {}", error)
+                    } else if error.contains("Compilation failed") {
+                        format!("Code Generation Error: {}", error)
+                    } else {
+                        error.clone()
+                    };
+                    messages.push(format!("  ❌ {} - {}", display_name, error_detail));
                 }
                 crate::events::ExecutionStatus::Skipped(reason) => {
                     messages.push(format!("  ⏭️ {} - Skipped: {}", display_name, reason));

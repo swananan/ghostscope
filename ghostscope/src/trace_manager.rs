@@ -308,8 +308,18 @@ impl TraceManager {
     }
 
     /// Add a new trace instance
-    pub fn add_trace(
+    /// Reserve and return the next trace ID without creating a trace
+    /// This is used for pre-allocation to ensure ID consistency
+    pub fn reserve_next_trace_id(&mut self) -> u32 {
+        let trace_id = self.next_trace_id;
+        self.next_trace_id += 1;
+        trace_id
+    }
+
+    /// Add a new trace instance with a pre-allocated trace ID
+    pub fn add_trace_with_id(
         &mut self,
+        trace_id: u32,
         target: String,
         script_content: String,
         pc: u64,
@@ -319,8 +329,8 @@ impl TraceManager {
         loader: Option<GhostScopeLoader>,
         ebpf_function_name: String,
     ) -> u32 {
-        let trace_id = self.next_trace_id;
-        self.next_trace_id += 1;
+        // Use the provided trace_id instead of generating a new one
+        // Note: This assumes the trace_id was pre-allocated via reserve_next_trace_id
 
         // Record creation time
         let now = SystemTime::now()
@@ -353,6 +363,32 @@ impl TraceManager {
             trace_id, target
         );
         trace_id
+    }
+
+    /// Add a new trace instance (legacy method - allocates new ID)
+    pub fn add_trace(
+        &mut self,
+        target: String,
+        script_content: String,
+        pc: u64,
+        binary_path: String,
+        target_display: String,
+        target_pid: Option<u32>,
+        loader: Option<GhostScopeLoader>,
+        ebpf_function_name: String,
+    ) -> u32 {
+        let trace_id = self.reserve_next_trace_id();
+        self.add_trace_with_id(
+            trace_id,
+            target,
+            script_content,
+            pc,
+            binary_path,
+            target_display,
+            target_pid,
+            loader,
+            ebpf_function_name,
+        )
     }
 
     /// Enable a trace by ID (duplicate of enable_trace method - keeping for compatibility)
