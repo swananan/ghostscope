@@ -2,6 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 
+pub mod dwarf_types;
+pub use dwarf_types::*;
+
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct MessageHeader {

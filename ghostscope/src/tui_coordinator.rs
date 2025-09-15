@@ -1,14 +1,13 @@
 use crate::args::ParsedArgs;
 use crate::session::GhostSession;
 use anyhow::Result;
-use futures::future;
-use ghostscope_protocol::{EventData, MessageType};
+use ghostscope_protocol::*;
 use ghostscope_ui::{
     events::{TargetDebugInfo, TargetType, VariableDebugInfo},
     run_tui_mode, EventRegistry, RuntimeStatus,
 };
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::*;
+use std::time::*;
 use tracing::{error, info, warn};
 
 /// Run GhostScope in TUI mode with tokio task coordination
@@ -719,8 +718,13 @@ fn handle_function_target(
                 let var_info = VariableDebugInfo {
                     name: enhanced_var.variable.name.clone(),
                     type_name: enhanced_var.variable.type_name.clone(),
+                    type_pretty: enhanced_var
+                        .variable
+                        .dwarf_type
+                        .as_ref()
+                        .map(|t| t.to_human_readable()),
                     location_description,
-                    size: enhanced_var.size,
+                    size: enhanced_var.variable.dwarf_type.as_ref().map(|t| t.size()),
                     scope_start: enhanced_var.variable.scope_ranges.first().map(|r| r.start),
                     scope_end: enhanced_var.variable.scope_ranges.first().map(|r| r.end),
                 };
@@ -887,9 +891,19 @@ fn handle_source_location_target(
 
                 let var_info = VariableDebugInfo {
                     name: enhanced_var.variable.name.clone(),
-                    type_name: enhanced_var.variable.type_name.clone(),
+                    type_name: enhanced_var
+                        .variable
+                        .dwarf_type
+                        .as_ref()
+                        .map(|t| t.to_string())
+                        .unwrap_or_else(|| enhanced_var.variable.type_name.clone()),
+                    type_pretty: enhanced_var
+                        .variable
+                        .dwarf_type
+                        .as_ref()
+                        .map(|t| t.to_human_readable()),
                     location_description,
-                    size: enhanced_var.size,
+                    size: enhanced_var.variable.dwarf_type.as_ref().map(|t| t.size()),
                     scope_start: enhanced_var.variable.scope_ranges.first().map(|r| r.start),
                     scope_end: enhanced_var.variable.scope_ranges.first().map(|r| r.end),
                 };

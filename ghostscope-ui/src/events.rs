@@ -1,5 +1,5 @@
 use crossterm::event::{KeyEvent, MouseEvent};
-use ghostscope_protocol::{EventData, MessageType, TypeEncoding};
+use ghostscope_protocol::EventData;
 use tokio::sync::mpsc;
 
 /// Trace status enumeration for shared use between UI and runtime
@@ -129,7 +129,6 @@ impl ModuleDebugInfo {
         let mut result = String::new();
 
         // Module header with full path and source info
-        let module_prefix = if is_last_module { "└─" } else { "├─" };
         result.push_str(&format!("📦 {}", &self.binary_path));
 
         // Add source information if available
@@ -215,11 +214,7 @@ impl ModuleDebugInfo {
                         }
                     };
 
-                    let param_line = Self::format_variable_with_location(
-                        &param.name,
-                        &param.type_name,
-                        &param.location_description,
-                    );
+                    let param_line = Self::format_variable_line(param);
 
                     result.push_str(&Self::wrap_long_line(
                         &format!("{} {}", item_prefix, param_line),
@@ -279,11 +274,7 @@ impl ModuleDebugInfo {
                         }
                     };
 
-                    let var_line = Self::format_variable_with_location(
-                        &var.name,
-                        &var.type_name,
-                        &var.location_description,
-                    );
+                    let var_line = Self::format_variable_line(var);
 
                     result.push_str(&Self::wrap_long_line(
                         &format!("{} {}", item_prefix, var_line),
@@ -304,6 +295,24 @@ impl ModuleDebugInfo {
             format!("{} ({})", name, type_name)
         } else {
             format!("{} ({}) = {}", name, type_name, location_desc)
+        }
+    }
+
+    /// Overload helper: build from VariableDebugInfo
+    pub fn format_variable_line(var: &VariableDebugInfo) -> String {
+        // Show both semantic (DWARF) type and original type name when available
+        let type_display = match var.type_pretty.as_ref() {
+            Some(pretty) if !pretty.is_empty() => format!("{}, {}", var.type_name, pretty),
+            _ => var.type_name.clone(),
+        };
+
+        if var.location_description.is_empty() || var.location_description == "None" {
+            format!("{} ({})", var.name, type_display)
+        } else {
+            format!(
+                "{} ({}) = {}",
+                var.name, type_display, var.location_description
+            )
         }
     }
 
@@ -360,6 +369,7 @@ pub enum TargetType {
 pub struct VariableDebugInfo {
     pub name: String,
     pub type_name: String,
+    pub type_pretty: Option<String>,
     pub location_description: String,
     pub size: Option<u64>,
     pub scope_start: Option<u64>,

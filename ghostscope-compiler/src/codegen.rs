@@ -19,9 +19,10 @@ use tracing::{debug, error, info, warn};
 use crate::ast::{BinaryOp, Expr, Program, Statement, VarType, VariableContext};
 use crate::debug_logger::DebugLogger;
 use crate::map::MapManager;
-use ghostscope_binary::{AccessStep, DwarfEncoding, DwarfType};
 use ghostscope_protocol::platform;
-use ghostscope_protocol::{consts, MessageType, TypeEncoding};
+use ghostscope_protocol::platform::pt_regs_indices;
+use ghostscope_protocol::DwarfType;
+use ghostscope_protocol::{consts, TypeEncoding};
 
 pub struct CodeGen<'ctx> {
     context: &'ctx Context,
@@ -62,6 +63,9 @@ pub enum CodeGenError {
 
     #[error("Map error: {0}")]
     MapError(String),
+
+    #[error("Type size not available for variable: {0}")]
+    TypeSizeNotAvailable(String),
 
     #[error("DWARF expression error: {0}")]
     DwarfError(String),
@@ -349,77 +353,6 @@ impl<'ctx> CodeGen<'ctx> {
             }
             // Literals don't contain variables
             Expr::Int(_) | Expr::Float(_) | Expr::String(_) => {}
-        }
-    }
-
-    /// Determine VarType from DWARF type information
-    fn determine_var_type_from_dwarf(&self, dwarf_type: &Option<DwarfType>) -> VarType {
-        match dwarf_type {
-            Some(DwarfType::BaseType {
-                encoding,
-                size,
-                name,
-            }) => {
-                match encoding {
-                    DwarfEncoding::Signed | DwarfEncoding::Unsigned => {
-                        // Support different integer sizes
-                        VarType::Int
-                    }
-                    DwarfEncoding::Float => {
-                        // Properly support floating point types
-                        VarType::Float
-                    }
-                    DwarfEncoding::Boolean => VarType::Int, // Treat boolean as int
-                    DwarfEncoding::Address => VarType::Int, // Address as int
-                    DwarfEncoding::Unknown => {
-                        // Fallback: try to infer from type name
-                        if name.contains("char") {
-                            VarType::String
-                        } else {
-                            VarType::Int
-                        }
-                    }
-                }
-            }
-            Some(DwarfType::PointerType { target_type, .. }) => {
-                // Check if it's a pointer to char (string)
-                if let DwarfType::BaseType { name, .. } = target_type.as_ref() {
-                    if name.contains("char") {
-                        VarType::String
-                    } else {
-                        VarType::Int // Pointers to other types as int
-                    }
-                } else {
-                    VarType::Int // Generic pointer as int
-                }
-            }
-            Some(DwarfType::ArrayType { element_type, .. }) => {
-                // Arrays typically treated as addresses
-                if let DwarfType::BaseType { name, .. } = element_type.as_ref() {
-                    if name.contains("char") {
-                        VarType::String // char arrays as strings
-                    } else {
-                        VarType::Int // Other arrays as int (address)
-                    }
-                } else {
-                    VarType::Int
-                }
-            }
-            Some(DwarfType::StructType { .. }) => {
-                // Structs are typically accessed by address
-                VarType::Int
-            }
-            Some(DwarfType::UnknownType { name }) => {
-                // Try to infer from type name as fallback
-                if name.contains("float") || name.contains("double") {
-                    VarType::Float
-                } else if name.contains("char") {
-                    VarType::String
-                } else {
-                    VarType::Int
-                }
-            }
-            None => VarType::Int, // Default to int for missing type info
         }
     }
 
@@ -1192,8 +1125,8 @@ impl<'ctx> CodeGen<'ctx> {
         compile_time_pc: u64,
     ) -> Result<()> {
         debug!(
-            "DWARF query successful for '{}': evaluation_result={:?}, size={:?}",
-            var_name, var_info.evaluation_result, var_info.size
+            "DWARF query successful for '{}': evaluation_result={:?}",
+            var_name, var_info.evaluation_result
         );
 
         // Extract variable size with fallback
@@ -1201,14 +1134,12 @@ impl<'ctx> CodeGen<'ctx> {
 
         // First try to use new evaluation system
         if let Some(evaluation_result) = var_info.evaluation_result {
-            let var_type = self
-                .get_variable_type_from_dwarf(var_name, compile_time_pc)
-                .ok_or_else(|| {
-                    CodeGenError::InvalidExpression(format!(
-                        "Failed to determine type for variable '{}' at PC 0x{:x}",
-                        var_name, compile_time_pc
-                    ))
-                })?;
+            let dwarf_type = var_info.variable.dwarf_type.as_ref().ok_or_else(|| {
+                CodeGenError::InvalidExpression(format!(
+                    "No DWARF type information available for variable '{}' at PC 0x{:x}",
+                    var_name, compile_time_pc
+                ))
+            })?;
 
             // Use new type-safe evaluation system - no runtime type checking needed!
             let var_ptr = self.execute_evaluation_result(
@@ -1218,14 +1149,12 @@ impl<'ctx> CodeGen<'ctx> {
                 compile_time_pc,
             )?;
 
-            self.build_and_send_protocol_message(var_name, &var_type, var_ptr, compile_time_pc)
+            self.build_and_send_protocol_message(var_name, dwarf_type, var_ptr, compile_time_pc)
         } else {
-            debug!(
-                "Variable '{}' has no evaluation result, treating as optimized out",
+            return Err(CodeGenError::InvalidExpression(format!(
+                "Variable '{}' has no evaluation result - cannot determine memory location",
                 var_name
-            );
-            let var_type = VarType::Int;
-            self.build_and_send_optimized_out_message(var_name, &var_type, compile_time_pc)
+            )));
         }
     }
 
@@ -1734,7 +1663,7 @@ impl<'ctx> CodeGen<'ctx> {
     fn build_and_send_protocol_message(
         &mut self,
         var_name: &str,
-        var_type: &VarType,
+        dwarf_type: &ghostscope_protocol::DwarfType,
         var_ptr: PointerValue<'ctx>,
         pc_address: u64,
     ) -> Result<()> {
@@ -1748,10 +1677,10 @@ impl<'ctx> CodeGen<'ctx> {
         self.build_variable_data_header(msg_storage)?;
 
         // Build variable entry (VariableEntry + variable name + data)
-        self.build_variable_entry(msg_storage, var_name, var_type, var_ptr, pc_address)?;
+        self.build_variable_entry(msg_storage, var_name, dwarf_type, var_ptr, pc_address)?;
 
         // Calculate actual message length and update header
-        let total_len = self.calculate_message_length(var_name, var_type, pc_address);
+        let total_len = self.calculate_message_length(var_name, dwarf_type, pc_address)?;
         self.update_message_length(msg_storage, total_len)?;
 
         // Send to ringbuf
@@ -1764,7 +1693,7 @@ impl<'ctx> CodeGen<'ctx> {
     fn build_and_send_optimized_out_message(
         &mut self,
         var_name: &str,
-        var_type: &VarType,
+        dwarf_type: &ghostscope_protocol::DwarfType,
         pc_address: u64,
     ) -> Result<()> {
         // Create protocol message storage area
@@ -1777,10 +1706,10 @@ impl<'ctx> CodeGen<'ctx> {
         self.build_variable_data_header(msg_storage)?;
 
         // Build variable entry for optimized-out variable (no memory read)
-        self.build_optimized_out_variable_entry(msg_storage, var_name, var_type)?;
+        self.build_optimized_out_variable_entry(msg_storage, var_name, dwarf_type)?;
 
         // Calculate actual message length and update header
-        let total_len = self.calculate_message_length(var_name, var_type, pc_address);
+        let total_len = self.calculate_message_length(var_name, dwarf_type, pc_address)?;
         self.update_message_length(msg_storage, total_len)?;
 
         // Send to ringbuf
@@ -2020,20 +1949,19 @@ impl<'ctx> CodeGen<'ctx> {
         &mut self,
         buffer: PointerValue<'ctx>,
         var_name: &str,
-        var_type: &VarType,
+        dwarf_type: &ghostscope_protocol::DwarfType,
         var_ptr: PointerValue<'ctx>,
         pc_address: u64,
     ) -> Result<()> {
         let i8_type = self.context.i8_type();
         let i16_type = self.context.i16_type();
-        let i64_type = self.context.i64_type();
 
         let entry_offset: usize = 36; // MessageHeader(8) + VariableDataMessage(28)
 
         // VariableEntry: [name_len:u8, type_encoding:u8, data_len:u16]
         let name_len = i8_type.const_int(var_name.len() as u64, false);
         let type_encoding = i8_type.const_int(
-            self.get_type_encoding(var_name, var_type, pc_address),
+            self.get_type_encoding(var_name, dwarf_type, pc_address)?,
             false,
         );
         // Set data length based on whether variable is optimized out
@@ -2041,7 +1969,7 @@ impl<'ctx> CodeGen<'ctx> {
             i16_type.const_int(0, false) // Optimized out variables have no data
         } else {
             // Use actual variable size from DWARF information
-            let var_size = self.get_variable_size(pc_address, var_name);
+            let var_size = self.get_variable_size(pc_address, var_name)?;
             i16_type.const_int(var_size, false)
         };
 
@@ -2134,7 +2062,7 @@ impl<'ctx> CodeGen<'ctx> {
         if !*self.optimized_out_vars.get(var_name).unwrap_or(&false) {
             let data_offset: usize = name_offset + var_name.len();
             // Use actual variable size to determine load type
-            let var_size = self.get_variable_size(pc_address, var_name);
+            let var_size = self.get_variable_size(pc_address, var_name)?;
             let load_type: inkwell::types::BasicTypeEnum = match var_size {
                 1 => self.context.i8_type().into(),
                 2 => self.context.i16_type().into(),
@@ -2185,7 +2113,7 @@ impl<'ctx> CodeGen<'ctx> {
         &mut self,
         buffer: PointerValue<'ctx>,
         var_name: &str,
-        _var_type: &VarType,
+        _dwarf_type: &ghostscope_protocol::DwarfType,
     ) -> Result<()> {
         let i8_type = self.context.i8_type();
         let i16_type = self.context.i16_type();
@@ -2288,11 +2216,11 @@ impl<'ctx> CodeGen<'ctx> {
 
     /// Calculate total message length
     fn calculate_message_length(
-        &self,
+        &mut self,
         var_name: &str,
-        _var_type: &VarType,
+        _dwarf_type: &ghostscope_protocol::DwarfType,
         pc_address: u64,
-    ) -> u32 {
+    ) -> Result<u32> {
         let header_len: usize = 8; // MessageHeader
         let msg_body_len: usize = 28; // VariableDataMessage
         let entry_len: usize = 4; // VariableEntry
@@ -2301,10 +2229,10 @@ impl<'ctx> CodeGen<'ctx> {
         let data_len: usize = if *self.optimized_out_vars.get(var_name).unwrap_or(&false) {
             0
         } else {
-            self.get_variable_size(pc_address, var_name) as usize
+            self.get_variable_size(pc_address, var_name)? as usize
         };
 
-        (header_len + msg_body_len + entry_len + name_len + data_len) as u32
+        Ok((header_len + msg_body_len + entry_len + name_len + data_len) as u32)
     }
 
     /// Update message length field
@@ -2339,47 +2267,42 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     /// Get type encoding based on variable size
-    fn get_type_encoding(&self, var_name: &str, var_type: &VarType, pc_address: u64) -> u64 {
-        // Check if this variable is optimized out
-        if *self.optimized_out_vars.get(var_name).unwrap_or(&false) {
-            return TypeEncoding::OptimizedOut as u64;
-        }
+    fn get_type_encoding(
+        &mut self,
+        var_name: &str,
+        dwarf_type: &ghostscope_protocol::DwarfType,
+        pc_address: u64,
+    ) -> Result<u64> {
+        debug!(
+            "get_type_encoding for variable '{}': dwarf_type = {:?}",
+            var_name, dwarf_type
+        );
+        let enc = dwarf_type.to_type_encoding() as u64;
+        let result = match dwarf_type {
+            DwarfType::BaseType { size, .. } => {
+                // Validate known float/int sizes; otherwise mark Unknown
+                match enc as u8 {
+                    x if x == TypeEncoding::F32 as u8 && *size != 4 => TypeEncoding::Unknown as u64,
+                    x if x == TypeEncoding::F64 as u8 && *size != 8 => TypeEncoding::Unknown as u64,
+                    x if x == TypeEncoding::I8 as u8 && *size != 1 => TypeEncoding::Unknown as u64,
+                    x if x == TypeEncoding::I16 as u8 && *size != 2 => TypeEncoding::Unknown as u64,
+                    x if x == TypeEncoding::I32 as u8 && *size != 4 => TypeEncoding::Unknown as u64,
+                    x if x == TypeEncoding::I64 as u8 && *size != 8 => TypeEncoding::Unknown as u64,
+                    x if x == TypeEncoding::U8 as u8 && *size != 1 => TypeEncoding::Unknown as u64,
+                    x if x == TypeEncoding::U16 as u8 && *size != 2 => TypeEncoding::Unknown as u64,
+                    x if x == TypeEncoding::U32 as u8 && *size != 4 => TypeEncoding::Unknown as u64,
+                    x if x == TypeEncoding::U64 as u8 && *size != 8 => TypeEncoding::Unknown as u64,
+                    _ => enc,
+                }
+            }
+            _ => enc,
+        };
 
-        match var_type {
-            VarType::Int => {
-                // Use actual variable size to determine encoding
-                let var_size = self.get_variable_size(pc_address, var_name);
-                match var_size {
-                    1 => TypeEncoding::I8 as u64,
-                    2 => TypeEncoding::I16 as u64,
-                    4 => TypeEncoding::I32 as u64,
-                    8 => TypeEncoding::I64 as u64,
-                    _ => {
-                        debug!(
-                            "Unusual integer size {} for variable '{}', using I64",
-                            var_size, var_name
-                        );
-                        TypeEncoding::I64 as u64
-                    }
-                }
-            }
-            VarType::Float => {
-                // Use actual variable size for float types too
-                let var_size = self.get_variable_size(pc_address, var_name);
-                match var_size {
-                    4 => TypeEncoding::F32 as u64,
-                    8 => TypeEncoding::F64 as u64,
-                    _ => {
-                        debug!(
-                            "Unusual float size {} for variable '{}', using F64",
-                            var_size, var_name
-                        );
-                        TypeEncoding::F64 as u64
-                    }
-                }
-            }
-            VarType::String => TypeEncoding::String as u64,
-        }
+        debug!(
+            "get_type_encoding for variable '{}': result = {}",
+            var_name, result
+        );
+        Ok(result)
     }
 
     /// Send string literal
@@ -2403,9 +2326,12 @@ impl<'ctx> CodeGen<'ctx> {
             .build_store(temp_storage.as_pointer_value(), int_val)
             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
 
+        // Create a DwarfType for anonymous integer
+        let anonymous_dwarf_type = ghostscope_protocol::DwarfType::signed_int(4);
+
         self.build_and_send_protocol_message(
             "<anonymous>",
-            &VarType::Int,
+            &anonymous_dwarf_type,
             temp_storage.as_pointer_value(),
             0, // Anonymous variables don't have PC address
         )
@@ -2425,9 +2351,12 @@ impl<'ctx> CodeGen<'ctx> {
             .build_store(temp_storage.as_pointer_value(), float_val)
             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
 
+        // Create a DwarfType for anonymous float
+        let anonymous_dwarf_type = ghostscope_protocol::DwarfType::float(8);
+
         self.build_and_send_protocol_message(
             "<anonymous>",
-            &VarType::Float,
+            &anonymous_dwarf_type,
             temp_storage.as_pointer_value(),
             0, // Anonymous variables don't have PC address
         )
@@ -2764,31 +2693,42 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
-    /// Get variable size from binary analyzer or process analyzer
-    /// Returns size in bytes for bpf_probe_read_user, defaults to 8 bytes if not found
-    fn get_variable_size(&self, pc_address: u64, var_name: &str) -> u64 {
-        // ProcessAnalyzer virtual address queries removed - use binary analyzer directly
-
-        // Use ProcessAnalyzer for variable size queries
-        if let Some(analyzer_ptr) = self.process_analyzer {
-            unsafe {
-                let process_analyzer = &*analyzer_ptr;
-                // Need to find which module this PC belongs to
-                // For now, return default size since we don't have module_path here
-                // TODO: This method needs module_path parameter to work properly
+    /// Get variable size from EnhancedVariableLocation, using DWARF type information
+    /// Returns size in bytes for bpf_probe_read_user, errors if not available
+    fn get_size_from_var_info(
+        &self,
+        var_info: &ghostscope_binary::EnhancedVariableLocation,
+    ) -> Result<u64> {
+        // Use DWARF type embedded in Variable
+        if let Some(ref dwarf_type) = var_info.variable.dwarf_type {
+            let size = dwarf_type.size();
+            if size > 0 {
                 debug!(
-                    "ProcessAnalyzer variable size query needs module path for variable '{}' at PC 0x{:x}: using default 8 bytes",
-                    var_name, pc_address
+                    "Got variable size {} bytes for '{}' from DwarfType.size()",
+                    size, var_info.variable.name
                 );
-                8 // Default fallback
+                return Ok(size);
             }
-        } else {
-            debug!(
-                "No analyzer available: using default 8 bytes for variable '{}'",
-                var_name
-            );
-            8 // Default fallback
         }
+
+        // If no size information is available, return error instead of defaulting
+        Err(CodeGenError::TypeSizeNotAvailable(
+            var_info.variable.name.clone(),
+        ))
+    }
+
+    /// Get variable size by querying DWARF for variable information
+    /// Returns error if variable or size information is not available
+    fn get_variable_size(&mut self, pc_address: u64, var_name: &str) -> Result<u64> {
+        // Get complete compile-time context for precise DWARF query
+        let compile_context = self.get_compile_time_context()?.clone();
+
+        // Query DWARF for variable information
+        let var_info =
+            self.query_dwarf_for_variable(&compile_context.module_path, var_name, pc_address)?;
+
+        // Use our size extraction method - no fallback
+        self.get_size_from_var_info(&var_info)
     }
 
     fn generate_rbp_trace_printk(
@@ -3016,7 +2956,7 @@ impl<'ctx> CodeGen<'ctx> {
         let rip_index = self
             .context
             .i64_type()
-            .const_int(platform::pt_regs_indices::RIP as u64, false);
+            .const_int(pt_regs_indices::RIP as u64, false);
         let rip_ptr = unsafe {
             self.builder
                 .build_gep(i64_type, ctx_param, &[rip_index], "rip_ptr")
@@ -3484,104 +3424,6 @@ impl<'ctx> CodeGen<'ctx> {
                 Ok(null_ptr)
             }
         }
-    }
-
-    /// Build and send protocol message for direct values (no memory read required)
-    fn build_and_send_direct_value_message(
-        &mut self,
-        var_name: &str,
-        var_type: &VarType,
-        value: IntValue<'ctx>,
-        pc_address: u64,
-    ) -> Result<()> {
-        debug!(
-            "Building direct value message for '{}': {:?}",
-            var_name, var_type
-        );
-
-        // For direct values, we can send them immediately without memory read
-        match var_type {
-            VarType::Int => {
-                self.send_int_variable(var_name, value, pc_address)?;
-            }
-            VarType::Float => {
-                // Convert int to float representation
-                let float_val = self
-                    .builder
-                    .build_bit_cast(
-                        value,
-                        self.context.f64_type(),
-                        &format!("{}_as_float", var_name),
-                    )
-                    .map_err(|e| CodeGenError::Builder(e.to_string()))?
-                    .into_float_value();
-                self.send_float_variable(var_name, float_val, pc_address)?;
-            }
-            VarType::String => {
-                // For string types, treat as int for now
-                self.send_int_variable(var_name, value, pc_address)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Send integer variable data directly (for direct values)
-    fn send_int_variable(
-        &mut self,
-        var_name: &str,
-        value: IntValue<'ctx>,
-        _pc_address: u64,
-    ) -> Result<()> {
-        debug!("Sending direct int value for '{}': {:?}", var_name, value);
-
-        // For direct values, we can build the protocol message with the value directly
-        // This is a simplified implementation - in a real scenario you'd want to
-        // build the actual protocol message structure
-
-        // For now, just log the value - this should be replaced with actual protocol message sending
-        warn!(
-            "Direct value sending not fully implemented yet: {} = {:?}",
-            var_name, value
-        );
-        Ok(())
-    }
-
-    /// Send float variable data directly (for direct values)
-    fn send_float_variable(
-        &mut self,
-        var_name: &str,
-        value: inkwell::values::FloatValue<'ctx>,
-        _pc_address: u64,
-    ) -> Result<()> {
-        debug!("Sending direct float value for '{}': {:?}", var_name, value);
-
-        // For direct values, we can build the protocol message with the value directly
-        // This is a simplified implementation - in a real scenario you'd want to
-        // build the actual protocol message structure
-
-        // For now, just log the value - this should be replaced with actual protocol message sending
-        warn!(
-            "Direct float value sending not fully implemented yet: {} = {:?}",
-            var_name, value
-        );
-        Ok(())
-    }
-
-    fn get_variable_type_from_dwarf(&self, var_name: &str, pc_address: u64) -> Option<VarType> {
-        if let Some(analyzer_ptr) = self.process_analyzer {
-            unsafe {
-                let process_analyzer = &*analyzer_ptr;
-                // Need to search through all modules since we don't have module_path
-                // For now, return default type
-                // TODO: This method needs module_path parameter to work properly
-                debug!(
-                    "get_variable_type_from_dwarf: ProcessAnalyzer needs module_path for variable '{}' at PC 0x{:x} - returning default Int type",
-                    var_name, pc_address
-                );
-                return Some(VarType::Int); // Default fallback
-            }
-        }
-        None
     }
 
     /// Create register value access (register contains the value directly)

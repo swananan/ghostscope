@@ -175,7 +175,7 @@ impl BinaryAnalyzer {
             let enhanced_vars = dwarf_ctx.get_enhanced_variable_locations(pc);
             for var_info in enhanced_vars {
                 if var_info.variable.name == var_name {
-                    return var_info.size;
+                    return var_info.variable.dwarf_type.as_ref().map(|t| t.size());
                 }
             }
         }

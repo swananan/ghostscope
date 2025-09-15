@@ -1,9 +1,7 @@
 use crate::CodeGenError;
-use ghostscope_protocol::{consts, log_levels, MessageType};
+use ghostscope_protocol::{consts, log_levels};
 use inkwell::values::{FunctionValue, GlobalValue, IntValue, PointerValue};
-use inkwell::{
-    builder::Builder, context::Context, module::Module, types::FunctionType, AddressSpace,
-};
+use inkwell::{builder::Builder, context::Context, module::Module, AddressSpace};
 use std::result::Result as StdResult;
 
 pub type Result<T> = StdResult<T, CodeGenError>;
@@ -201,7 +199,7 @@ impl<'ctx> DebugLogger<'ctx> {
         }
 
         // Message type (Log)
-        let msg_type = i8_type.const_int(MessageType::Log as u8 as u64, false);
+        let msg_type = i8_type.const_int(0, false); // Log type is 0
         self.write_field_at_offset(builder, buffer, 4, msg_type)?;
 
         // Reserved byte

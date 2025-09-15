@@ -11,7 +11,7 @@ pub(crate) mod scoped_variables;
 pub(crate) mod symbol;
 
 pub use dwarf::EnhancedVariableLocation;
-pub use dwarf::{DwarfEncoding, DwarfType, SourceLocation};
+pub use dwarf::{DwarfType, SourceLocation};
 pub use expression::{
     AccessStep, ArithOp, DirectValueResult, EvaluationContext, EvaluationResult, LocationResult,
     RegisterAccess,

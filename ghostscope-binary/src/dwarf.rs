@@ -77,7 +77,7 @@ pub(crate) struct Parameter {
 pub struct Variable {
     pub name: String,
     pub type_name: String,
-    pub dwarf_type: Option<DwarfType>,
+    pub dwarf_type: Option<ghostscope_protocol::DwarfType>,
     pub location_expr: Option<LocationExpression>,
     pub scope_ranges: Vec<AddressRange>,
     pub is_parameter: bool,
@@ -217,49 +217,8 @@ pub enum DwarfOp {
 }
 
 /// DWARF type information
-#[derive(Debug, Clone)]
-pub enum DwarfType {
-    BaseType {
-        name: String,
-        size: u64,
-        encoding: DwarfEncoding,
-    },
-    PointerType {
-        target_type: Box<DwarfType>,
-        size: u64,
-    },
-    ArrayType {
-        element_type: Box<DwarfType>,
-        size: Option<u64>,
-    },
-    StructType {
-        name: String,
-        size: u64,
-        members: Vec<StructMember>,
-    },
-    UnknownType {
-        name: String,
-    },
-}
-
-/// DWARF encoding for base types
-#[derive(Debug, Clone)]
-pub enum DwarfEncoding {
-    Signed,
-    Unsigned,
-    Float,
-    Boolean,
-    Address,
-    Unknown,
-}
-
-/// Struct member information
-#[derive(Debug, Clone)]
-pub struct StructMember {
-    pub name: String,
-    pub type_info: DwarfType,
-    pub offset: u64,
-}
+// Re-export DWARF types from protocol crate for compatibility
+pub use ghostscope_protocol::DwarfType;
 
 /// Source location information
 #[derive(Debug, Clone)]
@@ -294,7 +253,6 @@ pub struct EnhancedVariableLocation {
     pub variable: Variable,
     pub location_at_address: LocationExpression,
     pub address: u64,
-    pub size: Option<u64>,
     pub is_optimized_out: bool,
     pub evaluation_result: Option<crate::expression::EvaluationResult>,
 }
@@ -427,7 +385,6 @@ impl VariableLocationMap {
                             variable: var.clone(),
                             location_at_address: location_expr,
                             address: addr,
-                            size: None, // TODO: Extract from dwarf_type
                             is_optimized_out,
                             evaluation_result: None, // Will be computed separately if needed
                         });
@@ -820,7 +777,6 @@ impl DwarfContext {
                         },
                         location_at_address: result.location_at_address,
                         address: addr,
-                        size: result.variable_info.size,
                         is_optimized_out: result.is_optimized_out,
                         evaluation_result,
                     }
@@ -1447,16 +1403,33 @@ impl DwarfContext {
                 }
                 gimli::DW_AT_type => {
                     if let gimli::AttributeValue::UnitRef(type_offset) = attr.value() {
+                        debug!(
+                            "Variable '{}' has type reference at offset {:?}",
+                            name, type_offset
+                        );
                         if let Some((resolved_type_name, resolved_dwarf_type)) =
                             self.resolve_type_info_concrete(unit, type_offset)
                         {
                             type_name = resolved_type_name;
                             dwarf_type = resolved_dwarf_type;
+                            debug!(
+                                "Successfully resolved type for '{}': {} {:?}",
+                                name, type_name, dwarf_type
+                            );
                         } else {
                             type_name = "unresolved_type".to_string();
+                            debug!(
+                                "Failed to resolve type for variable '{}' at offset {:?}",
+                                name, type_offset
+                            );
                         }
                     } else {
                         type_name = "unknown_type".to_string();
+                        debug!(
+                            "Variable '{}' has non-UnitRef type attribute: {:?}",
+                            name,
+                            attr.value()
+                        );
                     }
                 }
                 gimli::DW_AT_location => {
@@ -1563,7 +1536,7 @@ impl DwarfContext {
         Some(Variable {
             name,
             type_name: type_name.clone(),
-            dwarf_type,
+            dwarf_type: dwarf_type.clone(),
             location_expr,
             scope_ranges,
             is_parameter: entry.tag() == gimli::DW_TAG_formal_parameter,
@@ -2521,7 +2494,7 @@ impl DwarfContext {
         Some(Variable {
             name,
             type_name: type_name.clone(),
-            dwarf_type,
+            dwarf_type: dwarf_type.clone(),
             location_expr,
             scope_ranges,
             is_parameter: entry.tag() == gimli::DW_TAG_formal_parameter,
@@ -2866,24 +2839,67 @@ impl DwarfContext {
         // Create UnitRef for string resolution
         let unit_ref = unit.unit_ref(&self.dwarf);
 
-        match type_entry.tag() {
-            gimli::DW_TAG_base_type => self.parse_base_type(unit, &type_entry, &unit_ref),
-            gimli::DW_TAG_pointer_type => self.parse_pointer_type(unit, &type_entry, &unit_ref),
-            gimli::DW_TAG_array_type => self.parse_array_type(unit, &type_entry, &unit_ref),
+        let tag = type_entry.tag();
+        debug!("Resolving type with tag: {:?}", tag);
+
+        match tag {
+            gimli::DW_TAG_base_type => {
+                debug!("Parsing base type");
+                self.parse_base_type(unit, &type_entry, &unit_ref)
+            }
+            gimli::DW_TAG_pointer_type => {
+                debug!("Parsing pointer type");
+                self.parse_pointer_type(unit, &type_entry, &unit_ref)
+            }
+            gimli::DW_TAG_array_type => {
+                debug!("Parsing array type");
+                self.parse_array_type(unit, &type_entry, &unit_ref)
+            }
             gimli::DW_TAG_structure_type | gimli::DW_TAG_class_type => {
+                debug!("Parsing struct/class type");
                 self.parse_struct_type(unit, &type_entry, &unit_ref)
             }
-            gimli::DW_TAG_typedef => self.parse_typedef(unit, &type_entry, &unit_ref),
+            gimli::DW_TAG_typedef => {
+                debug!("Parsing typedef");
+                self.parse_typedef(unit, &type_entry, &unit_ref)
+            }
             gimli::DW_TAG_const_type | gimli::DW_TAG_volatile_type => {
+                debug!("Parsing qualified type (const/volatile)");
+                self.parse_qualified_type(unit, &type_entry, &unit_ref)
+            }
+            gimli::DW_TAG_enumeration_type => {
+                debug!("Parsing enumeration type");
+                self.parse_enum_type(unit, &type_entry, &unit_ref)
+            }
+            gimli::DW_TAG_union_type => {
+                debug!("Parsing union type");
+                self.parse_union_type(unit, &type_entry, &unit_ref)
+            }
+            gimli::DW_TAG_restrict_type => {
+                debug!("Parsing restrict type");
+                self.parse_qualified_type(unit, &type_entry, &unit_ref)
+            }
+            gimli::DW_TAG_atomic_type => {
+                debug!("Parsing atomic type");
                 self.parse_qualified_type(unit, &type_entry, &unit_ref)
             }
             _ => {
-                debug!("Unsupported type tag: {:?}", type_entry.tag());
+                debug!("Unsupported type tag: {:?} (value: {})", tag, tag.0);
+                // Try to extract type name for better error reporting
+                let mut type_name = "unsupported_type".to_string();
+                let mut attrs = type_entry.attrs();
+                while let Ok(Some(attr)) = attrs.next() {
+                    if attr.name() == gimli::DW_AT_name {
+                        if let Ok(name_str) = unit_ref.attr_string(attr.value()) {
+                            type_name = format!("unsupported_{}", name_str.to_string_lossy());
+                            break;
+                        }
+                    }
+                }
+
                 Some((
-                    "unsupported_type".to_string(),
-                    Some(DwarfType::UnknownType {
-                        name: "unsupported_type".to_string(),
-                    }),
+                    type_name.clone(),
+                    Some(DwarfType::UnknownType { name: type_name }),
                 ))
             }
         }
@@ -2899,7 +2915,7 @@ impl DwarfContext {
         let mut attrs = entry.attrs();
         let mut name = String::new();
         let mut byte_size = 0;
-        let mut encoding = DwarfEncoding::Unknown;
+        let mut encoding = gimli::DwAte(0); // Default to unknown encoding
 
         while let Ok(Some(attr)) = attrs.next() {
             match attr.name() {
@@ -2914,26 +2930,23 @@ impl DwarfContext {
                     }
                 }
                 gimli::DW_AT_encoding => {
-                    if let gimli::AttributeValue::Udata(enc) = attr.value() {
-                        encoding = match enc {
-                            1 => DwarfEncoding::Address,
-                            2 => DwarfEncoding::Boolean,
-                            3 => DwarfEncoding::Float,
-                            5 => DwarfEncoding::Signed,
-                            7 => DwarfEncoding::Unsigned,
-                            _ => DwarfEncoding::Unknown,
-                        };
+                    debug!(
+                        "DWARF_ENCODING_DEBUG: Found attr encoding value {:?}",
+                        attr.value()
+                    );
+                    if let gimli::AttributeValue::Encoding(enc) = attr.value() {
+                        debug!(
+                            "DWARF_ENCODING_DEBUG: Found encoding value {:?} (name currently '{}')",
+                            enc, name
+                        );
+                        encoding = enc;
                     }
                 }
                 _ => {}
             }
         }
 
-        let dwarf_type = DwarfType::BaseType {
-            name: name.clone(),
-            size: byte_size,
-            encoding,
-        };
+        let dwarf_type = DwarfType::new_base_type(name.clone(), byte_size, encoding);
 
         Some((name, Some(dwarf_type)))
     }
@@ -3152,6 +3165,84 @@ impl DwarfContext {
                 name: qualifier.to_string(),
             }),
         ))
+    }
+
+    /// Parse enumeration type
+    fn parse_enum_type<'a>(
+        &self,
+        _unit: &gimli::Unit<gimli::EndianSlice<gimli::LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<gimli::EndianSlice<'a, gimli::LittleEndian>>,
+        unit_ref: &gimli::UnitRef<gimli::EndianSlice<'a, gimli::LittleEndian>>,
+    ) -> Option<(String, Option<DwarfType>)> {
+        let mut attrs = entry.attrs();
+        let mut name = String::new();
+        let mut byte_size = 4; // Default enum size
+
+        while let Ok(Some(attr)) = attrs.next() {
+            match attr.name() {
+                gimli::DW_AT_name => {
+                    if let Ok(name_str) = unit_ref.attr_string(attr.value()) {
+                        name = name_str.to_string_lossy().into_owned();
+                    }
+                }
+                gimli::DW_AT_byte_size => {
+                    if let gimli::AttributeValue::Udata(size) = attr.value() {
+                        byte_size = size;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if name.is_empty() {
+            name = "anonymous_enum".to_string();
+        }
+
+        // Treat enums as signed integers
+        let dwarf_type = DwarfType::new_base_type(name.clone(), byte_size, gimli::DW_ATE_signed);
+
+        Some((name, Some(dwarf_type)))
+    }
+
+    /// Parse union type
+    fn parse_union_type<'a>(
+        &self,
+        _unit: &gimli::Unit<gimli::EndianSlice<gimli::LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<gimli::EndianSlice<'a, gimli::LittleEndian>>,
+        unit_ref: &gimli::UnitRef<gimli::EndianSlice<'a, gimli::LittleEndian>>,
+    ) -> Option<(String, Option<DwarfType>)> {
+        let mut attrs = entry.attrs();
+        let mut name = String::new();
+        let mut byte_size = 0;
+
+        while let Ok(Some(attr)) = attrs.next() {
+            match attr.name() {
+                gimli::DW_AT_name => {
+                    if let Ok(name_str) = unit_ref.attr_string(attr.value()) {
+                        name = name_str.to_string_lossy().into_owned();
+                    }
+                }
+                gimli::DW_AT_byte_size => {
+                    if let gimli::AttributeValue::Udata(size) = attr.value() {
+                        byte_size = size;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if name.is_empty() {
+            name = "anonymous_union".to_string();
+        }
+
+        // For now, treat unions as structs
+        let dwarf_type = DwarfType::StructType {
+            name: name.clone(),
+            size: byte_size,
+            members: Vec::new(), // TODO: Parse union members
+        };
+
+        Some((name, Some(dwarf_type)))
     }
 
     /// Parse DWARF location expression
