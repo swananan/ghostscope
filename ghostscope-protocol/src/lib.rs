@@ -120,7 +120,7 @@ pub struct ExecutionFailureMessage {
 }
 
 pub mod consts {
-    pub const MAGIC: u32 = 0x47534350; // "GSCP"
+    pub const MAGIC: u32 = 0x43484C53; // "CHLS" (Chelsea)
     pub const VERSION: u8 = 1;
     pub const MAX_MESSAGE_SIZE: u16 = 4096;
     pub const MAX_VARIABLE_NAME_LEN: u8 = 255;
@@ -132,6 +132,30 @@ pub mod consts {
     pub const EXECUTION_FAILURE_MESSAGE_SIZE: usize =
         std::mem::size_of::<crate::ExecutionFailureMessage>();
     pub const VARIABLE_DATA_MESSAGE_SIZE: usize = std::mem::size_of::<crate::VariableDataMessage>();
+
+    // MessageHeader field offsets
+    pub const MESSAGE_HEADER_MAGIC_OFFSET: usize =
+        core::mem::offset_of!(crate::MessageHeader, magic);
+    pub const MESSAGE_HEADER_MSG_TYPE_OFFSET: usize =
+        core::mem::offset_of!(crate::MessageHeader, msg_type);
+    pub const MESSAGE_HEADER_FLAGS_OFFSET: usize =
+        core::mem::offset_of!(crate::MessageHeader, flags);
+    pub const MESSAGE_HEADER_LENGTH_OFFSET: usize =
+        core::mem::offset_of!(crate::MessageHeader, length);
+
+    // VariableDataMessage field offsets (relative to start of VariableDataMessage)
+    pub const VARIABLE_DATA_TRACE_ID_OFFSET: usize =
+        core::mem::offset_of!(crate::VariableDataMessage, trace_id);
+    pub const VARIABLE_DATA_TIMESTAMP_OFFSET: usize =
+        core::mem::offset_of!(crate::VariableDataMessage, timestamp);
+    pub const VARIABLE_DATA_PID_OFFSET: usize =
+        core::mem::offset_of!(crate::VariableDataMessage, pid);
+    pub const VARIABLE_DATA_TID_OFFSET: usize =
+        core::mem::offset_of!(crate::VariableDataMessage, tid);
+    pub const VARIABLE_DATA_VAR_COUNT_OFFSET: usize =
+        core::mem::offset_of!(crate::VariableDataMessage, var_count);
+    pub const VARIABLE_DATA_RESERVED_OFFSET: usize =
+        core::mem::offset_of!(crate::VariableDataMessage, reserved);
 
     // Default values
     pub const DEFAULT_TRACE_ID: u64 = 1;

@@ -1742,9 +1742,12 @@ impl<'ctx> CodeGen<'ctx> {
         let i16_type = self.context.i16_type();
 
         // MessageHeader structure: [magic:u32, msg_type:u8, flags:u8, length:u16]
-        let magic = i32_type.const_int(0x47534350, false); // "GSCP"
-        let msg_type = i8_type.const_int(0x01, false); // VariableData
-        let flags = i8_type.const_int(0x00, false); // No flags
+        let magic = i32_type.const_int(consts::MAGIC.into(), false);
+        let msg_type = i8_type.const_int(
+            ghostscope_protocol::MessageType::VariableData as u8 as u64,
+            false,
+        );
+        let flags = i8_type.const_int(0, false);
         let _length = i16_type.const_int(0, false); // Update later
 
         // Write magic (offset 0) - cast buffer to u32* for proper alignment
@@ -1799,7 +1802,7 @@ impl<'ctx> CodeGen<'ctx> {
         let i32_type = self.context.i32_type();
         let i16_type = self.context.i16_type();
 
-        let offset = 8; // Message header length
+        let header_size = ghostscope_protocol::consts::MESSAGE_HEADER_SIZE as u64;
 
         // VariableDataMessage: [trace_id:u64, timestamp:u64, pid:u32, tid:u32, var_count:u16, reserved:u16]
         let trace_id_value = self
@@ -1832,7 +1835,7 @@ impl<'ctx> CodeGen<'ctx> {
                 .build_gep(
                     self.context.i8_type(),
                     buffer,
-                    &[self.context.i32_type().const_int(offset, false)],
+                    &[self.context.i32_type().const_int(header_size as u64, false)],
                     "trace_id_ptr",
                 )
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?
@@ -1855,7 +1858,12 @@ impl<'ctx> CodeGen<'ctx> {
                 .build_gep(
                     self.context.i8_type(),
                     buffer,
-                    &[self.context.i32_type().const_int(16, false)],
+                    &[self.context.i32_type().const_int(
+                        (ghostscope_protocol::consts::MESSAGE_HEADER_SIZE
+                            + ghostscope_protocol::consts::VARIABLE_DATA_TIMESTAMP_OFFSET)
+                            as u64,
+                        false,
+                    )],
                     "timestamp_ptr",
                 )
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?
@@ -1878,7 +1886,12 @@ impl<'ctx> CodeGen<'ctx> {
                 .build_gep(
                     self.context.i8_type(),
                     buffer,
-                    &[self.context.i32_type().const_int(24, false)],
+                    &[self.context.i32_type().const_int(
+                        (ghostscope_protocol::consts::MESSAGE_HEADER_SIZE
+                            + ghostscope_protocol::consts::VARIABLE_DATA_PID_OFFSET)
+                            as u64,
+                        false,
+                    )],
                     "pid_ptr",
                 )
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?
@@ -1901,7 +1914,12 @@ impl<'ctx> CodeGen<'ctx> {
                 .build_gep(
                     self.context.i8_type(),
                     buffer,
-                    &[self.context.i32_type().const_int(28, false)],
+                    &[self.context.i32_type().const_int(
+                        (ghostscope_protocol::consts::MESSAGE_HEADER_SIZE
+                            + ghostscope_protocol::consts::VARIABLE_DATA_TID_OFFSET)
+                            as u64,
+                        false,
+                    )],
                     "tid_ptr",
                 )
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?
@@ -1924,7 +1942,12 @@ impl<'ctx> CodeGen<'ctx> {
                 .build_gep(
                     self.context.i8_type(),
                     buffer,
-                    &[self.context.i32_type().const_int(32, false)],
+                    &[self.context.i32_type().const_int(
+                        (ghostscope_protocol::consts::MESSAGE_HEADER_SIZE
+                            + ghostscope_protocol::consts::VARIABLE_DATA_VAR_COUNT_OFFSET)
+                            as u64,
+                        false,
+                    )],
                     "var_count_ptr",
                 )
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?
@@ -1956,7 +1979,8 @@ impl<'ctx> CodeGen<'ctx> {
         let i8_type = self.context.i8_type();
         let i16_type = self.context.i16_type();
 
-        let entry_offset: usize = 36; // MessageHeader(8) + VariableDataMessage(28)
+        let entry_offset: usize = ghostscope_protocol::consts::MESSAGE_HEADER_SIZE
+            + ghostscope_protocol::consts::VARIABLE_DATA_MESSAGE_SIZE;
 
         // VariableEntry: [name_len:u8, type_encoding:u8, data_len:u16]
         let name_len = i8_type.const_int(var_name.len() as u64, false);
@@ -2118,7 +2142,8 @@ impl<'ctx> CodeGen<'ctx> {
         let i8_type = self.context.i8_type();
         let i16_type = self.context.i16_type();
 
-        let entry_offset: usize = 36; // MessageHeader(8) + VariableDataMessage(28)
+        let entry_offset: usize = ghostscope_protocol::consts::MESSAGE_HEADER_SIZE
+            + ghostscope_protocol::consts::VARIABLE_DATA_MESSAGE_SIZE;
 
         // VariableEntry: [name_len:u8, type_encoding:u8, data_len:u16]
         let name_len = i8_type.const_int(var_name.len() as u64, false);
