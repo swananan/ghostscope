@@ -250,6 +250,7 @@ impl TraceSummary {
 pub struct FormattedTraceInfo {
     pub trace_id: u32,
     pub target_display: String,
+    pub binary_path: String,
     pub status: TraceStatus,
     pub duration: String,
     pub script_preview: Option<String>,
@@ -259,11 +260,19 @@ pub struct FormattedTraceInfo {
 
 impl FormattedTraceInfo {
     pub fn format_line(&self) -> String {
+        // Extract binary name from path for cleaner display
+        let binary_name = std::path::Path::new(&self.binary_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&self.binary_path);
+
         let mut line = format!(
-            "{} [{}] {} - {} ({})",
+            "{} [{}] {}@{}+0x{:x} - {} ({})",
             self.status.to_emoji(),
             self.trace_id,
             self.target_display,
+            binary_name,
+            self.pc,
             self.status.to_string(),
             self.duration
         );
@@ -354,8 +363,9 @@ impl TraceManager {
     /// Remove a trace by ID (legacy method, use delete_trace for complete cleanup)
     pub fn remove_trace(&mut self, trace_id: u32) -> Result<()> {
         if let Some(mut trace) = self.traces.remove(&trace_id) {
-            // Remove from target mapping
-            self.target_to_trace_id.remove(&trace.target);
+            // Remove from target mapping using the correct unique target key
+            let unique_target = format!("{}#{}", trace.target, trace_id);
+            self.target_to_trace_id.remove(&unique_target);
             // Remove creation time
             self.trace_created_times.remove(&trace_id);
 
@@ -372,8 +382,9 @@ impl TraceManager {
     /// Completely delete a trace by ID, destroying all associated resources
     pub fn delete_trace(&mut self, trace_id: u32) -> Result<()> {
         if let Some(trace) = self.traces.remove(&trace_id) {
-            // Remove from target mapping
-            self.target_to_trace_id.remove(&trace.target);
+            // Remove from target mapping using the correct unique target key
+            let unique_target = format!("{}#{}", trace.target, trace_id);
+            self.target_to_trace_id.remove(&unique_target);
             // Remove creation time
             self.trace_created_times.remove(&trace_id);
 
@@ -609,6 +620,7 @@ impl TraceManager {
             FormattedTraceInfo {
                 trace_id,
                 target_display: trace.target_display.clone(),
+                binary_path: trace.binary_path.clone(),
                 status: trace.status(),
                 duration: self.format_duration(trace_id),
                 script_preview: trace.script_preview(),

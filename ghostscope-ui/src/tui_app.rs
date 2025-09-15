@@ -1150,75 +1150,23 @@ impl TuiApp {
             } => {
                 // Ensure we end waiting state so input prompt is rendered after the response
                 self.interactive_command_panel.handle_command_completed();
-                use ratatui::style::{Color, Modifier, Style};
-                use ratatui::text::{Line, Span};
 
-                let mut lines: Vec<Line<'static>> = Vec::new();
-
-                // Title
-                lines.push(Line::from(vec![Span::styled(
-                    format!("✓ Trace {}", trace_id),
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                )]));
-
-                // Helper to style label/value
-                let label_style = Style::default().fg(Color::Cyan);
-                let value_style = Style::default();
-
-                // target
-                lines.push(Line::from(vec![
-                    Span::styled("  target : ", label_style),
-                    Span::styled(target, value_style),
-                ]));
-
-                // status with emoji + color
-                let emoji = status.to_emoji();
-                let status_color = match status {
-                    crate::events::TraceStatus::Active => Color::Green,
-                    crate::events::TraceStatus::Disabled => Color::Gray,
-                    crate::events::TraceStatus::Failed => Color::Red,
-                };
-                let mut status_spans = vec![Span::styled("  status : ", label_style)];
-                if !emoji.is_empty() {
-                    status_spans.push(Span::raw(format!("{} ", emoji)));
-                }
-                status_spans.push(Span::styled(
-                    status.to_string(),
-                    Style::default().fg(status_color),
-                ));
-                lines.push(Line::from(status_spans));
-
-                // pid
-                if let Some(p) = pid {
-                    lines.push(Line::from(vec![
-                        Span::styled("  pid    : ", label_style),
-                        Span::styled(p.to_string(), value_style),
-                    ]));
+                // Use the new format_trace_info method for enhanced display
+                if let Some(formatted_info) = (RuntimeStatus::TraceInfo {
+                    trace_id,
+                    target: target.clone(),
+                    status: status.clone(),
+                    pid,
+                    binary: binary.clone(),
+                    script_preview: script_preview.clone(),
+                    pc,
+                })
+                .format_trace_info()
+                {
+                    self.interactive_command_panel
+                        .add_response(formatted_info, ResponseType::Success);
                 }
 
-                // binary
-                lines.push(Line::from(vec![
-                    Span::styled("  binary : ", label_style),
-                    Span::styled(binary, value_style),
-                ]));
-
-                // script preview
-                if let Some(pre) = script_preview {
-                    lines.push(Line::from(vec![
-                        Span::styled("  script : ", label_style),
-                        Span::styled(pre, value_style),
-                    ]));
-                }
-
-                // PC information
-                lines.push(Line::from(vec![
-                    Span::styled("  pc     : ", label_style),
-                    Span::styled(format!("0x{:x}", pc), Style::default().fg(Color::Yellow)),
-                ]));
-
-                self.interactive_command_panel.add_styled_response(lines);
                 // Ensure input mode and reset cursor to the end
                 self.interactive_command_panel.enter_input_mode();
                 self.interactive_command_panel.cursor_position =
@@ -1332,15 +1280,7 @@ impl TuiApp {
                 if summary.total > 0 {
                     response.push_str("\nTrace Details:\n");
                     for trace in traces {
-                        response.push_str(&format!(
-                            "  {} [{}] {} - {} ({})\n",
-                            trace.status.to_emoji(),
-                            trace.trace_id,
-                            trace.target_display,
-                            trace.status.to_string(),
-                            trace.duration
-                        ));
-
+                        response.push_str(&format!("  {}\n", trace.format_line()));
                         response.push('\n');
                     }
                 } else {
@@ -1510,7 +1450,7 @@ impl TuiApp {
     }
 }
 
-/// Format target debug info for display
+/// Format target debug info for display using enhanced modular format
 fn format_target_debug_info(target: &str, info: &crate::events::TargetDebugInfo) -> String {
     use crate::events::TargetType;
 
@@ -1519,187 +1459,26 @@ fn format_target_debug_info(target: &str, info: &crate::events::TargetDebugInfo)
     // Header with icon
     match info.target_type {
         TargetType::Function => {
-            result.push_str(&format!("🔧 Function Debug Info: '{}'\n", target));
+            result.push_str(&format!("🔧 Function Debug Info\n"));
         }
         TargetType::SourceLocation => {
-            result.push_str(&format!("📍 Source Location: '{}'\n", target));
+            result.push_str(&format!("📍 Source Location Debug Info\n"));
         }
         TargetType::Address => {
-            result.push_str(&format!("🎯 Address Debug Info: '{}'\n", target));
+            result.push_str(&format!("🎯 Address Debug Info\n"));
         }
     }
 
-    // Location info section
-    result.push_str("\n📂 Location:\n");
-    if let Some(ref file_path) = info.file_path {
-        result.push_str(&format!("   File: {}\n", file_path));
-    }
-    if let Some(line_number) = info.line_number {
-        result.push_str(&format!("   Line: {}\n", line_number));
-    }
-    if let Some(ref func_name) = info.function_name {
-        result.push_str(&format!("   Function: {}\n", func_name));
-    }
-    // Address mappings section
-    if !info.address_mappings.is_empty() {
-        if info.address_mappings.len() == 1 {
-            // Single address - show inline
-            let mapping = &info.address_mappings[0];
-            result.push_str(&format!("   Address: 0x{:x}", mapping.address));
-            if let Some(ref func_name) = mapping.function_name {
-                result.push_str(&format!(" ({})", func_name));
-            }
-            result.push('\n');
-        } else {
-            // Multiple addresses - show summary first
-            result.push_str(&format!("   Addresses ({}): ", info.address_mappings.len()));
-            for (i, mapping) in info.address_mappings.iter().enumerate() {
-                if i > 0 {
-                    result.push_str(", ");
-                }
-                result.push_str(&format!("[{}] 0x{:x}", i, mapping.address));
-            }
-            result.push('\n');
-        }
-    }
+    // Use the enhanced format_for_display method
+    result.push_str(&info.format_for_display());
 
-    // Variables and parameters section - handle multiple addresses
-    if !info.address_mappings.is_empty() {
-        if info.address_mappings.len() == 1 {
-            // Single address - show parameters and variables normally
-            let mapping = &info.address_mappings[0];
-
-            if !mapping.parameters.is_empty() {
-                result.push_str("\n📥 Parameters:\n");
-                for (i, param) in mapping.parameters.iter().enumerate() {
-                    let prefix = if i == mapping.parameters.len() - 1 {
-                        "   └─"
-                    } else {
-                        "   ├─"
-                    };
-                    result.push_str(&format!("{} {} {}", prefix, param.name, param.type_name));
-
-                    // Add location and size info in a compact format
-                    let mut details = Vec::new();
-                    if !param.location_description.is_empty()
-                        && param.location_description != "None"
-                    {
-                        details.push(format!("loc: {}", param.location_description));
-                    }
-                    if let Some(size) = param.size {
-                        details.push(format!("{} bytes", size));
-                    }
-
-                    if !details.is_empty() {
-                        result.push_str(&format!(" ({})", details.join(", ")));
-                    }
-                    result.push('\n');
-                }
-            }
-
-            if !mapping.variables.is_empty() {
-                result.push_str("\n📦 Local Variables:\n");
-                for (i, var) in mapping.variables.iter().enumerate() {
-                    let prefix = if i == mapping.variables.len() - 1 {
-                        "   └─"
-                    } else {
-                        "   ├─"
-                    };
-                    result.push_str(&format!("{} {} {}", prefix, var.name, var.type_name));
-
-                    // Add location and size info in a compact format
-                    let mut details = Vec::new();
-                    if !var.location_description.is_empty() && var.location_description != "None" {
-                        details.push(format!("loc: {}", var.location_description));
-                    }
-                    if let Some(size) = var.size {
-                        details.push(format!("{} bytes", size));
-                    }
-
-                    if !details.is_empty() {
-                        result.push_str(&format!(" ({})", details.join(", ")));
-                    }
-                    result.push('\n');
-                }
-            }
-        } else {
-            // Multiple addresses - show detailed breakdown
-            result.push_str(&format!(
-                "\n📍 Address Mappings ({}):\n",
-                info.address_mappings.len()
-            ));
-
-            for (i, mapping) in info.address_mappings.iter().enumerate() {
-                result.push_str(&format!("\n[{}] 0x{:x}", i, mapping.address));
-                if let Some(ref func_name) = mapping.function_name {
-                    result.push_str(&format!(" ({})", func_name));
-                }
-                result.push('\n');
-
-                // Parameters for this address
-                if !mapping.parameters.is_empty() {
-                    result.push_str("📥 Parameters:\n");
-                    for (j, param) in mapping.parameters.iter().enumerate() {
-                        let prefix = if j == mapping.parameters.len() - 1 {
-                            "   └─"
-                        } else {
-                            "   ├─"
-                        };
-                        result.push_str(&format!("{} {} {}", prefix, param.name, param.type_name));
-
-                        let mut details = Vec::new();
-                        if !param.location_description.is_empty()
-                            && param.location_description != "None"
-                        {
-                            details.push(format!("loc: {}", param.location_description));
-                        }
-                        if let Some(size) = param.size {
-                            details.push(format!("{} bytes", size));
-                        }
-
-                        if !details.is_empty() {
-                            result.push_str(&format!(" ({})", details.join(", ")));
-                        }
-                        result.push('\n');
-                    }
-                }
-
-                // Variables for this address
-                if !mapping.variables.is_empty() {
-                    result.push_str("📦 Local Variables:\n");
-                    for (j, var) in mapping.variables.iter().enumerate() {
-                        let prefix = if j == mapping.variables.len() - 1 {
-                            "   └─"
-                        } else {
-                            "   ├─"
-                        };
-                        result.push_str(&format!("{} {} {}", prefix, var.name, var.type_name));
-
-                        let mut details = Vec::new();
-                        if !var.location_description.is_empty()
-                            && var.location_description != "None"
-                        {
-                            details.push(format!("loc: {}", var.location_description));
-                        }
-                        if let Some(size) = var.size {
-                            details.push(format!("{} bytes", size));
-                        }
-
-                        if !details.is_empty() {
-                            result.push_str(&format!(" ({})", details.join(", ")));
-                        }
-                        result.push('\n');
-                    }
-                }
-            }
-        }
-    }
-
-    // Check if we have any variables or parameters across all mappings
-    let has_any_data = info
-        .address_mappings
-        .iter()
-        .any(|mapping| !mapping.parameters.is_empty() || !mapping.variables.is_empty());
+    // Check if we have any variables or parameters across all modules
+    let has_any_data = info.modules.iter().any(|module| {
+        module
+            .address_mappings
+            .iter()
+            .any(|mapping| !mapping.parameters.is_empty() || !mapping.variables.is_empty())
+    });
 
     if !has_any_data {
         result.push_str("\n❌ No variables or parameters found in scope\n");

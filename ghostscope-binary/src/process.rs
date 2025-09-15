@@ -185,6 +185,10 @@ impl ProcessAnalyzer {
             is_executable,
         };
 
+        debug!(
+            "Successfully created module: {} (size: {} bytes)",
+            path, module_info.size
+        );
         Ok(module_info)
     }
 

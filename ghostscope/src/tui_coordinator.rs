@@ -288,6 +288,8 @@ async fn run_runtime_coordinator(
                                 .map(|t| ghostscope_ui::events::TraceDetailInfo {
                                     trace_id: t.trace_id,
                                     target_display: t.target_display,
+                                    binary_path: t.binary_path,
+                                    pc: t.pc,
                                     status: t.status,
                                     duration: t.duration,
                                 })
@@ -659,8 +661,8 @@ fn handle_function_target(
         module_addresses.len()
     );
 
-    // Analyze variables for each module and address separately
-    let mut address_mappings = Vec::new();
+    // Analyze variables for each module and address separately - group by module
+    let mut modules = Vec::new();
     let mut first_address_and_module: Option<(&str, u64)> = None;
 
     for (module_path, addresses) in &module_addresses {
@@ -670,6 +672,8 @@ fn handle_function_target(
             module_path,
             addresses.len()
         );
+
+        let mut address_mappings = Vec::new();
 
         for address in addresses {
             // Remember the first address and module for source location lookup
@@ -746,11 +750,18 @@ fn handle_function_target(
 
             address_mappings.push(AddressMapping {
                 address: *address,
+                binary_path: module_path.to_string(),
                 function_name: Some(function_name.to_string()),
                 variables,
                 parameters,
             });
         }
+
+        // Create ModuleDebugInfo for this module
+        modules.push(ModuleDebugInfo {
+            binary_path: module_path.to_string(),
+            address_mappings,
+        });
     }
 
     // Try to get source location for the first function address
@@ -767,7 +778,7 @@ fn handle_function_target(
         file_path: source_location.as_ref().map(|sl| sl.file_path.clone()),
         line_number: source_location.as_ref().map(|sl| sl.line_number),
         function_name: Some(function_name.to_string()),
-        address_mappings,
+        modules,
     })
 }
 
@@ -811,8 +822,8 @@ fn handle_source_location_target(
         module_addresses.len()
     );
 
-    // Analyze variables for each module and address separately
-    let mut address_mappings = Vec::new();
+    // Analyze variables for each module and address separately - group by module
+    let mut modules = Vec::new();
     let mut first_address_and_module: Option<(&str, u64)> = None;
 
     for (module_path, addresses) in &module_addresses {
@@ -823,6 +834,8 @@ fn handle_source_location_target(
             module_path,
             addresses.len()
         );
+
+        let mut address_mappings = Vec::new();
 
         for address in addresses {
             // Remember the first address and module for source location lookup
@@ -910,11 +923,18 @@ fn handle_source_location_target(
 
             address_mappings.push(AddressMapping {
                 address: *address,
+                binary_path: module_path.to_string(),
                 function_name,
                 variables,
                 parameters,
             });
         }
+
+        // Create ModuleDebugInfo for this module
+        modules.push(ModuleDebugInfo {
+            binary_path: module_path.to_string(),
+            address_mappings,
+        });
     }
 
     // Get actual source location from first module that has addresses
@@ -933,10 +953,11 @@ fn handle_source_location_target(
         .map(|sl| sl.file_path.clone())
         .unwrap_or_else(|| file_path.to_string()); // fallback to user input if no location found
 
-    // Try to get overall function name (from first mapping or fallback)
-    let overall_function_name = address_mappings
+    // Try to get overall function name (from first module's first mapping or fallback)
+    let overall_function_name = modules
         .first()
-        .and_then(|m| m.function_name.clone());
+        .and_then(|module| module.address_mappings.first())
+        .and_then(|mapping| mapping.function_name.clone());
 
     Ok(TargetDebugInfo {
         target: target.to_string(),
@@ -944,7 +965,7 @@ fn handle_source_location_target(
         file_path: Some(complete_file_path),
         line_number: Some(line_number),
         function_name: overall_function_name,
-        address_mappings,
+        modules,
     })
 }
 

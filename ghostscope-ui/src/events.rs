@@ -75,13 +75,273 @@ pub struct TargetDebugInfo {
     pub file_path: Option<String>,
     pub line_number: Option<u32>,
     pub function_name: Option<String>,
+    pub modules: Vec<ModuleDebugInfo>, // Grouped by module/binary
+}
+
+impl TargetDebugInfo {
+    /// Format target debug info with tree-style layout for display
+    pub fn format_for_display(&self) -> String {
+        let mut result = String::new();
+
+        // Calculate statistics
+        let module_count = self.modules.len();
+        let total_addresses: usize = self
+            .modules
+            .iter()
+            .map(|module| module.address_mappings.len())
+            .sum();
+
+        // Enhanced header with target name and statistics
+        result.push_str(&format!(
+            "🔧 Function Debug Info: {} ({} modules, {} traceable addresses)\n\n",
+            self.target, module_count, total_addresses
+        ));
+
+        // Format modules with tree structure - modules will show their own paths and source info
+        for (module_idx, module) in self.modules.iter().enumerate() {
+            let is_last_module = module_idx == self.modules.len() - 1;
+            result.push_str(&module.format_for_display(
+                is_last_module,
+                &self.file_path,
+                self.line_number,
+            ));
+        }
+
+        result
+    }
+}
+
+/// Debug information for a module (binary) containing one or more addresses
+#[derive(Debug, Clone)]
+pub struct ModuleDebugInfo {
+    pub binary_path: String,
     pub address_mappings: Vec<AddressMapping>,
 }
 
-/// Debug information for a specific address
+impl ModuleDebugInfo {
+    /// Format module info with tree-style layout for display
+    pub fn format_for_display(
+        &self,
+        is_last_module: bool,
+        source_file: &Option<String>,
+        source_line: Option<u32>,
+    ) -> String {
+        let mut result = String::new();
+
+        // Module header with full path and source info
+        let module_prefix = if is_last_module { "└─" } else { "├─" };
+        result.push_str(&format!("📦 {}", &self.binary_path));
+
+        // Add source information if available
+        if let Some(ref file) = source_file {
+            if let Some(line) = source_line {
+                result.push_str(&format!(" @ {}:{}\n", file, line));
+            } else {
+                result.push_str(&format!(" @ {}\n", file));
+            }
+        } else {
+            result.push('\n');
+        }
+
+        for (addr_idx, mapping) in self.address_mappings.iter().enumerate() {
+            let is_last_addr = addr_idx == self.address_mappings.len() - 1;
+            let addr_prefix = if is_last_module {
+                if is_last_addr {
+                    "   └─"
+                } else {
+                    "   ├─"
+                }
+            } else {
+                if is_last_addr {
+                    "│  └─"
+                } else {
+                    "│  ├─"
+                }
+            };
+
+            // Enhanced PC address display
+            let pc_description = format!("🎯 0x{:x}", mapping.address);
+
+            result.push_str(&format!("{} {}\n", addr_prefix, pc_description));
+
+            // Format parameters
+            if !mapping.parameters.is_empty() {
+                let param_prefix = if is_last_module {
+                    if is_last_addr {
+                        "      ├─"
+                    } else {
+                        "   │  ├─"
+                    }
+                } else {
+                    if is_last_addr {
+                        "│     ├─"
+                    } else {
+                        "│  │  ├─"
+                    }
+                };
+
+                result.push_str(&format!("{} 📥 Parameters\n", param_prefix));
+
+                for (param_idx, param) in mapping.parameters.iter().enumerate() {
+                    let is_last_param =
+                        param_idx == mapping.parameters.len() - 1 && mapping.variables.is_empty();
+                    let item_prefix = if is_last_module {
+                        if is_last_addr {
+                            if is_last_param {
+                                "      │  └─"
+                            } else {
+                                "      │  ├─"
+                            }
+                        } else {
+                            if is_last_param {
+                                "   │  │  └─"
+                            } else {
+                                "   │  │  ├─"
+                            }
+                        }
+                    } else {
+                        if is_last_addr {
+                            if is_last_param {
+                                "│     │  └─"
+                            } else {
+                                "│     │  ├─"
+                            }
+                        } else {
+                            if is_last_param {
+                                "│  │  │  └─"
+                            } else {
+                                "│  │  │  ├─"
+                            }
+                        }
+                    };
+
+                    let param_line = Self::format_variable_with_location(
+                        &param.name,
+                        &param.type_name,
+                        &param.location_description,
+                    );
+
+                    result.push_str(&Self::wrap_long_line(
+                        &format!("{} {}", item_prefix, param_line),
+                        80,
+                        &item_prefix,
+                    ));
+                }
+            }
+
+            // Format variables
+            if !mapping.variables.is_empty() {
+                let var_prefix = if is_last_module {
+                    if is_last_addr {
+                        "      └─"
+                    } else {
+                        "   │  └─"
+                    }
+                } else {
+                    if is_last_addr {
+                        "│     └─"
+                    } else {
+                        "│  │  └─"
+                    }
+                };
+
+                result.push_str(&format!("{} 📦 Variables\n", var_prefix));
+
+                for (var_idx, var) in mapping.variables.iter().enumerate() {
+                    let is_last_var = var_idx == mapping.variables.len() - 1;
+                    let item_prefix = if is_last_module {
+                        if is_last_addr {
+                            if is_last_var {
+                                "         └─"
+                            } else {
+                                "         ├─"
+                            }
+                        } else {
+                            if is_last_var {
+                                "   │     └─"
+                            } else {
+                                "   │     ├─"
+                            }
+                        }
+                    } else {
+                        if is_last_addr {
+                            if is_last_var {
+                                "│        └─"
+                            } else {
+                                "│        ├─"
+                            }
+                        } else {
+                            if is_last_var {
+                                "│  │     └─"
+                            } else {
+                                "│  │     ├─"
+                            }
+                        }
+                    };
+
+                    let var_line = Self::format_variable_with_location(
+                        &var.name,
+                        &var.type_name,
+                        &var.location_description,
+                    );
+
+                    result.push_str(&Self::wrap_long_line(
+                        &format!("{} {}", item_prefix, var_line),
+                        80,
+                        &item_prefix,
+                    ));
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Format a variable with its location/evaluation result
+    fn format_variable_with_location(name: &str, type_name: &str, location_desc: &str) -> String {
+        // Only show variables that have meaningful location descriptions (evaluation results)
+        if location_desc.is_empty() || location_desc == "None" {
+            format!("{} ({})", name, type_name)
+        } else {
+            format!("{} ({}) = {}", name, type_name, location_desc)
+        }
+    }
+
+    /// Wrap long lines with proper indentation
+    fn wrap_long_line(text: &str, max_width: usize, indent: &str) -> String {
+        if text.len() <= max_width {
+            format!("{}\n", text)
+        } else {
+            let mut result = String::new();
+            let mut current_line = text.to_string();
+
+            while current_line.len() > max_width {
+                let break_point = current_line
+                    .rfind(' ')
+                    .unwrap_or(max_width.saturating_sub(10));
+                let (first_part, rest) = current_line.split_at(break_point);
+                result.push_str(&format!("{}\n", first_part));
+
+                // Create continuation line with proper indentation
+                let continuation_indent =
+                    format!("{}   ", indent.replace("├─", "│ ").replace("└─", "  "));
+                current_line = format!("{}{}", continuation_indent, rest.trim());
+            }
+
+            if !current_line.trim().is_empty() {
+                result.push_str(&format!("{}\n", current_line));
+            }
+
+            result
+        }
+    }
+}
+
+/// Debug information for a specific address within a module
 #[derive(Debug, Clone)]
 pub struct AddressMapping {
     pub address: u64,
+    pub binary_path: String, // Full binary path for this address
     pub function_name: Option<String>,
     pub variables: Vec<VariableDebugInfo>,
     pub parameters: Vec<VariableDebugInfo>,
@@ -269,8 +529,32 @@ pub struct TraceSummaryInfo {
 pub struct TraceDetailInfo {
     pub trace_id: u32,
     pub target_display: String,
+    pub binary_path: String,
+    pub pc: u64,
     pub status: TraceStatus,
     pub duration: String, // "5m32s", "1h5m", etc.
+}
+
+impl TraceDetailInfo {
+    /// Format trace info line with binary path and PC information
+    pub fn format_line(&self) -> String {
+        // Extract binary name from path for cleaner display
+        let binary_name = std::path::Path::new(&self.binary_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&self.binary_path);
+
+        format!(
+            "{} [{}] {}@{}+0x{:x} - {} ({})",
+            self.status.to_emoji(),
+            self.trace_id,
+            self.target_display,
+            binary_name,
+            self.pc,
+            self.status.to_string(),
+            self.duration
+        )
+    }
 }
 
 /// Source file information
@@ -330,5 +614,49 @@ impl RuntimeChannels {
     /// Create a trace sender that can be shared with other tasks
     pub fn create_trace_sender(&self) -> mpsc::UnboundedSender<EventData> {
         self.trace_sender.clone()
+    }
+}
+
+impl RuntimeStatus {
+    /// Format TraceInfo for enhanced display
+    pub fn format_trace_info(&self) -> Option<String> {
+        match self {
+            RuntimeStatus::TraceInfo {
+                trace_id,
+                target,
+                status,
+                pid,
+                binary,
+                script_preview,
+                pc,
+            } => {
+                let binary_name = std::path::Path::new(binary)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(binary);
+
+                let mut result = format!(
+                    "{} Trace ID: {} - {} ({})\n",
+                    status.to_emoji(),
+                    trace_id,
+                    target,
+                    status.to_string()
+                );
+
+                result.push_str(&format!("  Binary: {}\n", binary_name));
+                result.push_str(&format!("  Address: {}+0x{:x}\n", binary_name, pc));
+
+                if let Some(pid_val) = pid {
+                    result.push_str(&format!("  Process ID: {}\n", pid_val));
+                }
+
+                if let Some(ref script) = script_preview {
+                    result.push_str(&format!("  Script Preview: {}\n", script));
+                }
+
+                Some(result)
+            }
+            _ => None,
+        }
     }
 }
