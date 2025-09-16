@@ -132,20 +132,70 @@ impl BinaryAnalyzer {
     /// Get all addresses for a function name using DWARF information first
     /// Returns all addresses that correspond to the given function name
     pub(crate) fn get_all_function_addresses(&self, func_name: &str) -> Vec<u64> {
-        // First try DWARF information
-        if let Some(dwarf_context) = &self.dwarf_context {
-            let addresses = dwarf_context.get_function_addresses_by_name(func_name);
-            if !addresses.is_empty() {
-                return addresses;
+        // Check if we have debug information to decide search strategy
+        if self.debug_info.has_debug_info {
+            // Has debug info: only use DWARF, don't fallback to symbol table
+            if let Some(dwarf_context) = &self.dwarf_context {
+                let addresses = dwarf_context.get_function_addresses_by_name(func_name);
+                return addresses; // Return even if empty - no fallback
+            }
+            // No DWARF context available despite has_debug_info flag
+            return Vec::new();
+        } else {
+            // No debug info: fallback to symbol table with validation
+            if let Some(symbol) = self.find_symbol(func_name) {
+                // Check if symbol is a valid function definition (not just declaration)
+                if self.is_valid_function_symbol(symbol) {
+                    vec![symbol.address]
+                } else {
+                    tracing::info!(
+                        "Skipping function symbol declaration (not a definition): '{}' at 0x{:x}",
+                        func_name,
+                        symbol.address
+                    );
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
+    /// Check if a symbol represents a valid function definition (not just declaration)
+    fn is_valid_function_symbol(&self, symbol: &crate::symbol::Symbol) -> bool {
+        // Function must be of function type
+        if symbol.kind != crate::symbol::SymbolType::Function {
+            return false;
+        }
+
+        // Function address must be non-zero (0 usually indicates declaration)
+        if symbol.address == 0 {
+            return false;
+        }
+
+        // Function should have non-zero size (size 0 may indicate declaration)
+        // Note: Some valid functions may have size 0 in symbol table, so this is optional
+        // but we use it as an additional hint
+        if symbol.size == 0 {
+            tracing::debug!(
+                "Function symbol '{}' has zero size, may be declaration or size unknown",
+                symbol.name
+            );
+        }
+
+        // Function should be in an executable section (like .text)
+        if let Some(ref section_name) = symbol.section_name {
+            if !section_name.starts_with(".text") && section_name != ".text" {
+                tracing::debug!(
+                    "Function symbol '{}' not in executable section: {}",
+                    symbol.name,
+                    section_name
+                );
+                return false;
             }
         }
 
-        // Fall back to symbol table (single address)
-        if let Some(symbol) = self.find_symbol(func_name) {
-            vec![symbol.address]
-        } else {
-            Vec::new()
-        }
+        true
     }
 
     /// Get all addresses for a source line

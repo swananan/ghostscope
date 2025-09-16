@@ -2,10 +2,28 @@
 // Provides comprehensive DWARF expression evaluation with structured results for LLVM codegen
 
 use crate::dwarf::{DwarfContext, DwarfOp, LocationExpression};
-use ghostscope_protocol::platform;
+use ghostscope_platform;
 use gimli::{EndianSlice, LittleEndian};
 use std::collections::HashMap;
 use tracing::{debug, error, warn};
+
+/// Convert platform-specific error to expression error
+fn convert_platform_error(err: ghostscope_platform::PlatformError) -> ExpressionError {
+    match err {
+        ghostscope_platform::PlatformError::ParameterOptimized(msg) => {
+            ExpressionError::ParameterOptimized(msg)
+        }
+        ghostscope_platform::PlatformError::EvaluationFailed(msg) => {
+            ExpressionError::EvaluationFailed(msg)
+        }
+        ghostscope_platform::PlatformError::PrologueAnalysisFailed(msg) => {
+            ExpressionError::EvaluationFailed(msg)
+        }
+        ghostscope_platform::PlatformError::UnsupportedArchitecture(msg) => {
+            ExpressionError::EvaluationFailed(msg)
+        }
+    }
+}
 
 /// DWARF expression evaluation errors
 #[derive(Debug, thiserror::Error)]
@@ -36,6 +54,9 @@ pub(crate) enum ExpressionError {
 
     #[error("Invalid bytecode: {0}")]
     InvalidBytecode(String),
+
+    #[error("Parameter optimized: {0}")]
+    ParameterOptimized(String),
 }
 
 /// Complete DWARF operations enum - supports the full DWARF specification
@@ -162,8 +183,6 @@ pub enum ArithOp {
 pub enum AccessStep {
     LoadRegister(u16),
     AddConstant(i64),
-    LoadFrameBase,
-    LoadCallFrameCFA,
     Dereference {
         size: usize,
     },
@@ -248,7 +267,7 @@ pub enum LocationResult {
 
 /// Helper function to get register name for debugging display
 fn get_register_name(reg: u16) -> String {
-    platform::dwarf_reg_to_name(reg)
+    ghostscope_protocol::platform::dwarf_reg_to_name(reg)
         .map(|name| format!("%{}", name))
         .unwrap_or_else(|| format!("%{}", reg))
 }
@@ -335,8 +354,6 @@ impl std::fmt::Debug for DirectValueResult {
                                 write!(f, "{}", val)?;
                             }
                         }
-                        AccessStep::LoadFrameBase => write!(f, "FrameBase")?,
-                        AccessStep::LoadCallFrameCFA => write!(f, "CFA")?,
                         AccessStep::Dereference { size } => {
                             write!(f, "Deref({})", size)?;
                         }
@@ -481,18 +498,6 @@ impl std::fmt::Debug for LocationResult {
             }
         }
     }
-}
-
-/// Optimized expression patterns for fast evaluation
-#[derive(Debug, Clone, PartialEq)]
-pub enum OptimizedPattern {
-    RegisterDirect(u16),              // Direct register access
-    RegisterOffset(u16, i64),         // Register + offset
-    FrameBaseOffset(i64),             // Frame base + offset
-    CFAOffset(i64),                   // CFA + offset
-    TwoStepDereference(u16, i64),     // *(register + offset)
-    ConstantValue(i64),               // Simple constant
-    ComplexComputed(Vec<AccessStep>), // Multi-step computation required
 }
 
 /// Evaluation context - provides runtime environment information
@@ -702,291 +707,6 @@ impl DwarfExpressionEvaluator {
         }
     }
 
-    /// CFI-specific evaluation for stack unwinding
-    pub fn evaluate_for_cfi(
-        &self,
-        operations: &[DwarfOp],
-        context: &CFIContext,
-    ) -> Result<u64, ExpressionError> {
-        debug!(
-            "Evaluating CFI expression with {} operations at PC 0x{:x}",
-            operations.len(),
-            context.pc_address
-        );
-
-        // Try to optimize common CFI patterns first
-        if let Some(optimized_result) = self.try_cfi_pattern_optimization(operations, context)? {
-            debug!("Used CFI pattern optimization");
-            return Ok(optimized_result);
-        }
-
-        // Convert legacy operations and evaluate on stack machine
-        let new_operations: Result<Vec<DwarfOperation>, ExpressionError> = operations
-            .iter()
-            .map(|op| self.convert_legacy_dwarf_op(op))
-            .collect();
-
-        match new_operations {
-            Ok(ops) => {
-                let mut stack = Vec::new();
-                let eval_context = self.cfi_to_eval_context(context);
-
-                for op in &ops {
-                    self.execute_operation(op, &mut stack, &eval_context, 0, None)?;
-                }
-
-                stack
-                    .pop()
-                    .map(|val| val as u64)
-                    .ok_or(ExpressionError::EmptyStack)
-            }
-            Err(e) => {
-                error!("Failed to convert CFI operations: {}", e);
-                Err(e)
-            }
-        }
-    }
-
-    /// Try to optimize common CFI patterns without full evaluation
-    fn try_cfi_pattern_optimization(
-        &self,
-        operations: &[DwarfOp],
-        context: &CFIContext,
-    ) -> Result<Option<u64>, ExpressionError> {
-        match operations {
-            // We don't need CFI optimization branches for this eBPF debugging tool
-            // All patterns will generate symbolic expressions instead
-
-            // Constant value: DW_OP_const
-            [DwarfOp::Const(value)] => {
-                debug!("CFI pattern: Constant value ({})", value);
-                Ok(Some(*value as u64))
-            }
-
-            _ => {
-                debug!(
-                    "CFI pattern: No optimization available for {} operations",
-                    operations.len()
-                );
-                Ok(None)
-            }
-        }
-    }
-
-    /// Enhanced pattern analysis for optimization opportunities (based on LLDB/GDB implementations)
-    pub fn analyze_pattern(&self, ops: &[DwarfOp]) -> OptimizedPattern {
-        debug!("Analyzing expression pattern with {} operations", ops.len());
-
-        if !self.optimize_patterns {
-            return OptimizedPattern::ComplexComputed(self.convert_to_steps(ops));
-        }
-
-        match ops {
-            // === Single Operation Patterns ===
-
-            // Direct register access: DW_OP_reg0, DW_OP_reg1, etc.
-            [DwarfOp::Reg(reg)] => {
-                debug!("Pattern: Direct register access (reg {})", reg);
-                OptimizedPattern::RegisterDirect(*reg)
-            }
-
-            // Register + offset: DW_OP_breg0 <offset>
-            [DwarfOp::Breg(reg, offset)] => {
-                debug!("Pattern: Register + offset (reg {} + {})", reg, offset);
-                OptimizedPattern::RegisterOffset(*reg, *offset)
-            }
-
-            // Frame base + offset: DW_OP_fbreg <offset>
-            [DwarfOp::Fbreg(offset)] => {
-                debug!("Pattern: Frame base + offset (fb + {})", offset);
-                OptimizedPattern::FrameBaseOffset(*offset)
-            }
-
-            // Simple constant: DW_OP_const* <value>
-            [DwarfOp::Const(value)] => {
-                debug!("Pattern: Constant value ({})", value);
-                OptimizedPattern::ConstantValue(*value)
-            }
-
-            // === Two Operation Patterns ===
-
-            // Two-step dereference: DW_OP_breg0 <offset>, DW_OP_deref
-            [DwarfOp::Breg(reg, offset), DwarfOp::Deref] => {
-                debug!(
-                    "Pattern: Two-step dereference (*(reg {} + {}))",
-                    reg, offset
-                );
-                OptimizedPattern::TwoStepDereference(*reg, *offset)
-            }
-
-            // Frame base dereference: DW_OP_fbreg <offset>, DW_OP_deref
-            [DwarfOp::Fbreg(offset), DwarfOp::Deref] => {
-                debug!("Pattern: Frame base dereference (*(fb + {}))", offset);
-                // This needs complex steps but is a common pattern
-                OptimizedPattern::ComplexComputed(vec![
-                    AccessStep::LoadFrameBase,
-                    AccessStep::AddConstant(*offset),
-                    AccessStep::Dereference { size: 8 },
-                ])
-            }
-
-            // Register with constant addition: DW_OP_reg* DW_OP_const* DW_OP_plus
-            [DwarfOp::Reg(reg), DwarfOp::Const(offset), DwarfOp::Plus] => {
-                debug!("Pattern: Register + constant ({} + {})", reg, offset);
-                OptimizedPattern::RegisterOffset(*reg, *offset)
-            }
-
-            // Register + constant via plus_uconst: DW_OP_reg* DW_OP_plus_uconst
-            [DwarfOp::Reg(reg), DwarfOp::PlusUconst(offset)] => {
-                debug!("Pattern: Register + uconst ({} + {})", reg, offset);
-                OptimizedPattern::RegisterOffset(*reg, *offset as i64)
-            }
-
-            // === Three Operation Patterns ===
-
-            // Complex dereference: DW_OP_reg* DW_OP_const* DW_OP_plus DW_OP_deref
-            [DwarfOp::Reg(reg), DwarfOp::Const(offset), DwarfOp::Plus, DwarfOp::Deref] => {
-                debug!(
-                    "Pattern: Register + constant + deref (*(reg {} + {}))",
-                    reg, offset
-                );
-                OptimizedPattern::TwoStepDereference(*reg, *offset)
-            }
-
-            // Stack value patterns: DW_OP_* ... DW_OP_stack_value
-            ops if ops.len() >= 2 && matches!(ops[ops.len() - 1], DwarfOp::StackValue) => {
-                debug!("Pattern: Stack value expression");
-                // Analyze the operations before stack_value
-                let value_ops = &ops[..ops.len() - 1];
-                match self.analyze_value_expression(value_ops) {
-                    Some(pattern) => pattern,
-                    None => OptimizedPattern::ComplexComputed(self.convert_to_steps(ops)),
-                }
-            }
-
-            // === Multi-operation arithmetic patterns ===
-
-            // Frame base with multi-step offset calculation
-            ops if ops.len() >= 3
-                && matches!(ops[0], DwarfOp::Fbreg(_))
-                && self.is_simple_arithmetic_sequence(&ops[1..]) =>
-            {
-                debug!("Pattern: Frame base with arithmetic sequence");
-                // Calculate the effective offset if possible
-                if let Some(total_offset) = self.calculate_constant_offset(&ops[1..]) {
-                    let DwarfOp::Fbreg(base_offset) = ops[0] else {
-                        unreachable!()
-                    };
-                    debug!(
-                        "Optimized frame base offset: {} + {} = {}",
-                        base_offset,
-                        total_offset,
-                        base_offset + total_offset
-                    );
-                    OptimizedPattern::FrameBaseOffset(base_offset + total_offset)
-                } else {
-                    OptimizedPattern::ComplexComputed(self.convert_to_steps(ops))
-                }
-            }
-
-            // Register with multi-step offset calculation
-            ops if ops.len() >= 3
-                && matches!(ops[0], DwarfOp::Breg(_, _))
-                && self.is_simple_arithmetic_sequence(&ops[1..]) =>
-            {
-                debug!("Pattern: Register with arithmetic sequence");
-                if let Some(additional_offset) = self.calculate_constant_offset(&ops[1..]) {
-                    let DwarfOp::Breg(reg, base_offset) = ops[0] else {
-                        unreachable!()
-                    };
-                    debug!(
-                        "Optimized register offset: {} + {} = {}",
-                        base_offset,
-                        additional_offset,
-                        base_offset + additional_offset
-                    );
-                    OptimizedPattern::RegisterOffset(reg, base_offset + additional_offset)
-                } else {
-                    OptimizedPattern::ComplexComputed(self.convert_to_steps(ops))
-                }
-            }
-
-            // === Default: Complex pattern ===
-            _ => {
-                debug!(
-                    "Pattern: Complex expression with {} operations - converting to steps",
-                    ops.len()
-                );
-                OptimizedPattern::ComplexComputed(self.convert_to_steps(ops))
-            }
-        }
-    }
-
-    /// Analyze expression patterns that end with DW_OP_stack_value
-    fn analyze_value_expression(&self, ops: &[DwarfOp]) -> Option<OptimizedPattern> {
-        match ops {
-            [DwarfOp::Const(value)] => Some(OptimizedPattern::ConstantValue(*value)),
-            [DwarfOp::Reg(reg)] => {
-                // Register value (not address)
-                Some(OptimizedPattern::RegisterDirect(*reg))
-            }
-            [DwarfOp::Breg(reg, offset)] => Some(OptimizedPattern::RegisterOffset(*reg, *offset)),
-            [DwarfOp::Fbreg(offset)] => Some(OptimizedPattern::FrameBaseOffset(*offset)),
-            _ => None, // Too complex for simple optimization
-        }
-    }
-
-    /// Check if a sequence of operations is simple arithmetic (constants and basic ops)
-    fn is_simple_arithmetic_sequence(&self, ops: &[DwarfOp]) -> bool {
-        ops.iter().all(|op| match op {
-            DwarfOp::Const(_) | DwarfOp::Plus | DwarfOp::PlusUconst(_) => true,
-            _ => false,
-        })
-    }
-
-    /// Calculate the constant offset from a sequence of arithmetic operations
-    fn calculate_constant_offset(&self, ops: &[DwarfOp]) -> Option<i64> {
-        let mut stack = Vec::new();
-
-        for op in ops {
-            match op {
-                DwarfOp::Const(value) => {
-                    stack.push(*value);
-                }
-                DwarfOp::PlusUconst(value) => {
-                    if let Some(top) = stack.pop() {
-                        stack.push(top + (*value as i64));
-                    } else {
-                        // This operation expects a value on stack, but we don't have one
-                        return None;
-                    }
-                }
-                DwarfOp::Plus => {
-                    if stack.len() >= 2 {
-                        let b = stack.pop().unwrap();
-                        let a = stack.pop().unwrap();
-                        stack.push(a + b);
-                    } else {
-                        return None;
-                    }
-                }
-                _ => {
-                    // Unsupported operation for constant calculation
-                    return None;
-                }
-            }
-        }
-
-        // Should have exactly one value left
-        if stack.len() == 1 {
-            Some(stack[0])
-        } else {
-            None
-        }
-    }
-
-    // Placeholder implementations for core methods - will be implemented in subsequent tasks
-
     fn convert_legacy_dwarf_op(&self, op: &DwarfOp) -> Result<DwarfOperation, ExpressionError> {
         match op {
             DwarfOp::Const(val) => Ok(DwarfOperation::Literal(*val)),
@@ -1025,13 +745,20 @@ impl DwarfExpressionEvaluator {
                     steps.push(AccessStep::AddConstant(*offset));
                 }
 
-                DwarfOperation::FrameBase(offset) => {
-                    steps.push(AccessStep::LoadFrameBase);
-                    steps.push(AccessStep::AddConstant(*offset));
+                DwarfOperation::FrameBase(_offset) => {
+                    // Frame base operations need CFA resolution at evaluation time
+                    // This should not happen in step conversion - the higher level should handle frame base
+                    tracing::error!("FrameBase operation reached step conversion - this should be handled at evaluation level");
+                    // Return error or placeholder - the evaluation should handle this case
+                    return vec![];
                 }
 
                 DwarfOperation::CallFrameCFA => {
-                    steps.push(AccessStep::LoadCallFrameCFA);
+                    // CFA operations need CFI context resolution at evaluation time
+                    // This should not happen in step conversion - the higher level should handle CFA
+                    tracing::error!("CallFrameCFA operation reached step conversion - this should be handled at evaluation level");
+                    // Return error or placeholder - the evaluation should handle this case
+                    return vec![];
                 }
 
                 DwarfOperation::Deref(size) => {
@@ -1068,594 +795,6 @@ impl DwarfExpressionEvaluator {
         }
 
         steps
-    }
-
-    /// Extract required registers from operations
-    fn extract_required_registers(&self, operations: &[DwarfOperation]) -> Vec<u16> {
-        let mut registers = Vec::new();
-        for op in operations {
-            match op {
-                DwarfOperation::Register(reg) | DwarfOperation::RegisterOffset(reg, _) => {
-                    if !registers.contains(reg) {
-                        registers.push(*reg);
-                    }
-                }
-                _ => {}
-            }
-        }
-        registers
-    }
-
-    /// Execute a single DWARF operation on the expression stack
-    fn execute_operation(
-        &self,
-        op: &DwarfOperation,
-        stack: &mut Vec<i64>,
-        context: &EvaluationContext,
-        pc_address: u64,
-        dwarf_context: Option<&DwarfContext>,
-    ) -> Result<(), ExpressionError> {
-        // Check stack depth limit
-        if stack.len() > self.max_stack_depth {
-            return Err(ExpressionError::StackOverflow);
-        }
-
-        debug!("Executing DWARF operation: {:?}", op);
-
-        match op {
-            // === Literal Operations ===
-            DwarfOperation::Literal(value) => {
-                stack.push(*value);
-                debug!("Pushed literal: {}", value);
-            }
-
-            DwarfOperation::Const(value) => stack.push(*value as i64),
-            DwarfOperation::Const1u(value) => stack.push(*value as i64),
-            DwarfOperation::Const1s(value) => stack.push(*value as i64),
-            DwarfOperation::Const2u(value) => stack.push(*value as i64),
-            DwarfOperation::Const2s(value) => stack.push(*value as i64),
-            DwarfOperation::Const4u(value) => stack.push(*value as i64),
-            DwarfOperation::Const4s(value) => stack.push(*value as i64),
-            DwarfOperation::Const8u(value) => stack.push(*value as i64),
-            DwarfOperation::Const8s(value) => stack.push(*value),
-            DwarfOperation::Constu(value) => stack.push(*value as i64),
-            DwarfOperation::Consts(value) => stack.push(*value),
-
-            // === Register Operations ===
-            // These operations should not be used in symbolic expression generation
-            // All register accesses should go through symbolic paths instead
-            DwarfOperation::Register(reg) => {
-                debug!("Register operation: reg {} (should use symbolic path)", reg);
-                return Err(ExpressionError::EvaluationFailed(format!(
-                    "Register {} access requires codegen handling",
-                    reg
-                )));
-            }
-
-            DwarfOperation::RegisterOffset(reg, offset) => {
-                debug!(
-                    "Register offset operation: reg {} + {} (should use symbolic path)",
-                    reg, offset
-                );
-                return Err(ExpressionError::EvaluationFailed(format!(
-                    "Register {} offset {} requires codegen handling",
-                    reg, offset
-                )));
-            }
-
-            // === Stack Manipulation ===
-            DwarfOperation::Dup => {
-                let top = stack
-                    .last()
-                    .copied()
-                    .ok_or(ExpressionError::StackUnderflow)?;
-                stack.push(top);
-                debug!("Duplicated top stack value: {}", top);
-            }
-
-            DwarfOperation::Drop => {
-                stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                debug!("Dropped top stack value");
-            }
-
-            DwarfOperation::Swap => {
-                if stack.len() < 2 {
-                    return Err(ExpressionError::StackUnderflow);
-                }
-                let len = stack.len();
-                stack.swap(len - 1, len - 2);
-                debug!("Swapped top two stack values");
-            }
-
-            DwarfOperation::Rotate => {
-                if stack.len() < 3 {
-                    return Err(ExpressionError::StackUnderflow);
-                }
-                let len = stack.len();
-                // DWARF rotation: [c, b, a] -> [a, c, b]
-                // Top (a) becomes third, Second (b) becomes top, Third (c) becomes second
-                let a = stack[len - 1]; // top element
-                let b = stack[len - 2]; // second element
-                let c = stack[len - 3]; // third element
-                stack[len - 1] = b; // second becomes new top
-                stack[len - 2] = c; // third becomes second
-                stack[len - 3] = a; // top becomes third
-                debug!(
-                    "Rotated top three stack values: [c={}, b={}, a={}] -> [a={}, c={}, b={}]",
-                    c, b, a, a, c, b
-                );
-            }
-
-            DwarfOperation::Pick(index) => {
-                let stack_index = stack
-                    .len()
-                    .checked_sub((*index as usize) + 1)
-                    .ok_or(ExpressionError::StackUnderflow)?;
-                let value = stack[stack_index];
-                stack.push(value);
-                debug!("Picked value from stack index {}: {}", index, value);
-            }
-
-            DwarfOperation::Over => {
-                if stack.len() < 2 {
-                    return Err(ExpressionError::StackUnderflow);
-                }
-                let len = stack.len();
-                let value = stack[len - 2];
-                stack.push(value);
-                debug!("Copied second stack value to top: {}", value);
-            }
-
-            // === Arithmetic Operations ===
-            DwarfOperation::Add => {
-                let b = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                let a = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                let result = a.wrapping_add(b);
-                stack.push(result);
-                debug!("Addition: {} + {} = {}", a, b, result);
-            }
-
-            DwarfOperation::Sub => {
-                let b = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                let a = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                let result = a.wrapping_sub(b);
-                stack.push(result);
-                debug!("Subtraction: {} - {} = {}", a, b, result);
-            }
-
-            DwarfOperation::Mul => {
-                let b = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                let a = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                let result = a.wrapping_mul(b);
-                stack.push(result);
-                debug!("Multiplication: {} * {} = {}", a, b, result);
-            }
-
-            DwarfOperation::Div => {
-                let b = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                let a = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                if b == 0 {
-                    return Err(ExpressionError::DivisionByZero);
-                }
-                let result = a / b;
-                stack.push(result);
-                debug!("Division: {} / {} = {}", a, b, result);
-            }
-
-            DwarfOperation::Mod => {
-                let b = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                let a = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                if b == 0 {
-                    return Err(ExpressionError::DivisionByZero);
-                }
-                let result = a % b;
-                stack.push(result);
-                debug!("Modulo: {} % {} = {}", a, b, result);
-            }
-
-            DwarfOperation::Neg => {
-                let a = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                let result = a.wrapping_neg();
-                stack.push(result);
-                debug!("Negation: -{} = {}", a, result);
-            }
-
-            DwarfOperation::Abs => {
-                let a = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                let result = a.abs();
-                stack.push(result);
-                debug!("Absolute: abs({}) = {}", a, result);
-            }
-
-            // === Bitwise Operations ===
-            DwarfOperation::And => {
-                let b = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                let a = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                let result = a & b;
-                stack.push(result);
-                debug!("Bitwise AND: {} & {} = {}", a, b, result);
-            }
-
-            DwarfOperation::Or => {
-                let b = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                let a = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                let result = a | b;
-                stack.push(result);
-                debug!("Bitwise OR: {} | {} = {}", a, b, result);
-            }
-
-            DwarfOperation::Xor => {
-                let b = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                let a = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                let result = a ^ b;
-                stack.push(result);
-                debug!("Bitwise XOR: {} ^ {} = {}", a, b, result);
-            }
-
-            DwarfOperation::Not => {
-                let a = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                let result = !a;
-                stack.push(result);
-                debug!("Bitwise NOT: ~{} = {}", a, result);
-            }
-
-            DwarfOperation::Shl => {
-                let b = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                let a = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                if b < 0 || b >= 64 {
-                    return Err(ExpressionError::EvaluationFailed(format!(
-                        "Invalid shift amount: {}",
-                        b
-                    )));
-                }
-                let result = a << (b as u32);
-                stack.push(result);
-                debug!("Left shift: {} << {} = {}", a, b, result);
-            }
-
-            DwarfOperation::Shr => {
-                let b = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                let a = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                if b < 0 || b >= 64 {
-                    return Err(ExpressionError::EvaluationFailed(format!(
-                        "Invalid shift amount: {}",
-                        b
-                    )));
-                }
-                let result = ((a as u64) >> (b as u32)) as i64;
-                stack.push(result);
-                debug!("Right shift (logical): {} >> {} = {}", a, b, result);
-            }
-
-            DwarfOperation::Shra => {
-                let b = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                let a = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                if b < 0 || b >= 64 {
-                    return Err(ExpressionError::EvaluationFailed(format!(
-                        "Invalid shift amount: {}",
-                        b
-                    )));
-                }
-                let result = a >> (b as u32);
-                stack.push(result);
-                debug!("Right shift (arithmetic): {} >> {} = {}", a, b, result);
-            }
-
-            // === Comparison Operations ===
-            DwarfOperation::Eq => {
-                let b = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                let a = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                let result = if a == b { 1 } else { 0 };
-                stack.push(result);
-                debug!("Equality: {} == {} = {}", a, b, result);
-            }
-
-            DwarfOperation::Ne => {
-                let b = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                let a = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                let result = if a != b { 1 } else { 0 };
-                stack.push(result);
-                debug!("Not equal: {} != {} = {}", a, b, result);
-            }
-
-            DwarfOperation::Lt => {
-                let b = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                let a = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                let result = if a < b { 1 } else { 0 };
-                stack.push(result);
-                debug!("Less than: {} < {} = {}", a, b, result);
-            }
-
-            DwarfOperation::Gt => {
-                let b = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                let a = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                let result = if a > b { 1 } else { 0 };
-                stack.push(result);
-                debug!("Greater than: {} > {} = {}", a, b, result);
-            }
-
-            DwarfOperation::Le => {
-                let b = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                let a = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                let result = if a <= b { 1 } else { 0 };
-                stack.push(result);
-                debug!("Less or equal: {} <= {} = {}", a, b, result);
-            }
-
-            DwarfOperation::Ge => {
-                let b = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                let a = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                let result = if a >= b { 1 } else { 0 };
-                stack.push(result);
-                debug!("Greater or equal: {} >= {} = {}", a, b, result);
-            }
-
-            // === Frame Base and CFA Operations ===
-            // Recursive CFI parsing for frame base
-            DwarfOperation::FrameBase(offset) => {
-                debug!(
-                    "Frame base operation with offset: {} - attempting CFI resolution",
-                    offset
-                );
-
-                // For now, use the offset directly as a fallback
-                // In a complete implementation, we would need to resolve the frame base
-                // through DWARF DIE attributes or other mechanisms
-                debug!(
-                    "Frame base operation with offset {}, using fallback approach",
-                    offset
-                );
-                stack.push(*offset);
-            }
-
-            DwarfOperation::CallFrameCFA => {
-                debug!("Call frame CFA operation (should use symbolic path)");
-                return Err(ExpressionError::EvaluationFailed(
-                    "CFA requires codegen handling".into(),
-                ));
-            }
-
-            // === Memory Operations ===
-            DwarfOperation::Deref(size) => {
-                let addr = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                debug!("Memory dereference: addr=0x{:x}, size={}", addr, size);
-
-                // In our eBPF context, we cannot actually dereference memory here
-                // This will be handled by LLVM codegen to generate bpf_probe_read_user calls
-                // For now, we keep the address on stack and mark it for deref in codegen
-                stack.push(addr);
-
-                // Return a special marker indicating this needs memory access in codegen
-                return Err(ExpressionError::EvaluationFailed(format!(
-                    "Memory dereference at 0x{:x} requires codegen handling",
-                    addr
-                )));
-            }
-
-            DwarfOperation::DerefSize(size) => {
-                let addr = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                debug!(
-                    "Memory dereference with size: addr=0x{:x}, size={}",
-                    addr, size
-                );
-
-                stack.push(addr);
-                return Err(ExpressionError::EvaluationFailed(format!(
-                    "Memory dereference at 0x{:x} (size {}) requires codegen handling",
-                    addr, size
-                )));
-            }
-
-            // === Special Operations ===
-            DwarfOperation::Address(addr) => {
-                stack.push(*addr as i64);
-                debug!("Pushed address: 0x{:x}", addr);
-            }
-
-            DwarfOperation::StackValue => {
-                debug!("Stack value operation - value remains on stack");
-                // The top of stack is the result value, not an address
-                // This is a marker for the expression evaluator
-            }
-
-            DwarfOperation::ImplicitValue(data) => {
-                debug!("Implicit value operation with {} bytes", data.len());
-                // For implicit values, we need to interpret the data based on context
-                // For now, just push 0 as a placeholder
-                stack.push(0);
-            }
-
-            // === Control Flow Operations (Simplified) ===
-            DwarfOperation::Skip(offset) => {
-                debug!("Skip operation with offset: {}", offset);
-                // In our simplified implementation, we don't support jumps
-                return Err(ExpressionError::UnsupportedOperation(
-                    "Skip operations not supported in this context".into(),
-                ));
-            }
-
-            DwarfOperation::Branch(_offset) => {
-                debug!("Branch operation");
-                // Conditional branch - not supported in our simplified implementation
-                return Err(ExpressionError::UnsupportedOperation(
-                    "Branch operations not supported in this context".into(),
-                ));
-            }
-
-            // === TODO: Advanced Operations ===
-            DwarfOperation::Convert(_) => {
-                return Err(ExpressionError::UnsupportedOperation(
-                    "TODO: DW_OP_convert not yet implemented".into(),
-                ));
-            }
-
-            DwarfOperation::Reinterpret(_) => {
-                return Err(ExpressionError::UnsupportedOperation(
-                    "TODO: DW_OP_reinterpret not yet implemented".into(),
-                ));
-            }
-
-            DwarfOperation::Entry(_) => {
-                return Err(ExpressionError::UnsupportedOperation(
-                    "TODO: DW_OP_entry_value not yet implemented".into(),
-                ));
-            }
-
-            DwarfOperation::ConstType(_, _) => {
-                return Err(ExpressionError::UnsupportedOperation(
-                    "TODO: DW_OP_const_type not yet implemented".into(),
-                ));
-            }
-
-            DwarfOperation::RegvalType(_, _) => {
-                return Err(ExpressionError::UnsupportedOperation(
-                    "TODO: DW_OP_regval_type not yet implemented".into(),
-                ));
-            }
-
-            DwarfOperation::DerefType(_, _) => {
-                return Err(ExpressionError::UnsupportedOperation(
-                    "TODO: DW_OP_deref_type not yet implemented".into(),
-                ));
-            }
-
-            DwarfOperation::XDeref(_)
-            | DwarfOperation::XDerefSize(_, _)
-            | DwarfOperation::XDerefType(_, _, _) => {
-                return Err(ExpressionError::UnsupportedOperation(
-                    "TODO: Extended dereference operations not yet implemented".into(),
-                ));
-            }
-
-            DwarfOperation::Piece(_) | DwarfOperation::BitPiece(_, _) => {
-                return Err(ExpressionError::UnsupportedOperation(
-                    "TODO: Piece operations not yet implemented".into(),
-                ));
-            }
-
-            DwarfOperation::ImplicitPointer(_, _) => {
-                return Err(ExpressionError::UnsupportedOperation(
-                    "TODO: DW_OP_implicit_pointer not yet implemented".into(),
-                ));
-            }
-
-            DwarfOperation::GnuEntryValue(_) => {
-                return Err(ExpressionError::UnsupportedOperation(
-                    "TODO: GNU entry value extension not yet implemented".into(),
-                ));
-            }
-
-            DwarfOperation::GnuConstType(_, _) => {
-                return Err(ExpressionError::UnsupportedOperation(
-                    "TODO: GNU const type extension not yet implemented".into(),
-                ));
-            }
-
-            DwarfOperation::RegisterValue(_) => {
-                return Err(ExpressionError::UnsupportedOperation(
-                    "TODO: DW_OP_regval_type not yet implemented".into(),
-                ));
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Enhanced pattern analysis and optimization (implements task 6)
-    fn convert_to_steps(&self, ops: &[DwarfOp]) -> Vec<AccessStep> {
-        debug!("Converting {} legacy operations to access steps", ops.len());
-
-        let mut steps = Vec::new();
-
-        for op in ops {
-            match op {
-                DwarfOp::Reg(reg) => {
-                    steps.push(AccessStep::LoadRegister(*reg));
-                }
-
-                DwarfOp::Breg(reg, offset) => {
-                    steps.push(AccessStep::LoadRegister(*reg));
-                    if *offset != 0 {
-                        steps.push(AccessStep::AddConstant(*offset));
-                    }
-                }
-
-                DwarfOp::Fbreg(offset) => {
-                    steps.push(AccessStep::LoadFrameBase);
-                    if *offset != 0 {
-                        steps.push(AccessStep::AddConstant(*offset));
-                    }
-                }
-
-                DwarfOp::Deref => {
-                    steps.push(AccessStep::Dereference { size: 8 }); // Default to 8 bytes
-                }
-
-                DwarfOp::Plus => {
-                    steps.push(AccessStep::ArithmeticOp(ArithOp::Add));
-                }
-
-                DwarfOp::Sub => {
-                    steps.push(AccessStep::ArithmeticOp(ArithOp::Sub));
-                }
-
-                DwarfOp::Mul => {
-                    steps.push(AccessStep::ArithmeticOp(ArithOp::Mul));
-                }
-
-                DwarfOp::Div => {
-                    steps.push(AccessStep::ArithmeticOp(ArithOp::Div));
-                }
-
-                DwarfOp::Mod => {
-                    steps.push(AccessStep::ArithmeticOp(ArithOp::Mod));
-                }
-
-                DwarfOp::Neg => {
-                    steps.push(AccessStep::ArithmeticOp(ArithOp::Neg));
-                }
-
-                DwarfOp::PlusUconst(value) => {
-                    steps.push(AccessStep::AddConstant(*value as i64));
-                }
-
-                DwarfOp::Const(value) => {
-                    steps.push(AccessStep::AddConstant(*value));
-                }
-
-                DwarfOp::Dup => {
-                    // Dup doesn't translate directly to access steps
-                    // This would need special handling in complex expressions
-                    debug!("Stack operation DW_OP_dup in access steps - may need special handling");
-                }
-
-                DwarfOp::Drop => {
-                    debug!(
-                        "Stack operation DW_OP_drop in access steps - may need special handling"
-                    );
-                }
-
-                DwarfOp::Swap => {
-                    debug!(
-                        "Stack operation DW_OP_swap in access steps - may need special handling"
-                    );
-                }
-
-                DwarfOp::StackValue => {
-                    // StackValue is a marker that the result is a value, not an address
-                    debug!("DW_OP_stack_value encountered - result is a value");
-                }
-            }
-        }
-
-        steps
-    }
-
-    fn cfi_to_eval_context(&self, cfi_context: &CFIContext) -> EvaluationContext {
-        EvaluationContext {
-            pc_address: cfi_context.pc_address,
-            address_size: cfi_context.address_size,
-        }
     }
 
     /// Evaluate DWARF operations using enhanced type system with clear value vs location semantics
@@ -1752,13 +891,13 @@ impl DwarfExpressionEvaluator {
 
             // Frame base offset: DW_OP_fbreg <offset>
             [DwarfOperation::FrameBase(offset)] => {
-                debug!("Pattern: Frame base offset {}", offset);
-                Ok(Some(EvaluationResult::MemoryLocation(
-                    LocationResult::ComputedLocation {
-                        steps: vec![AccessStep::LoadFrameBase, AccessStep::AddConstant(*offset)],
-                        requires_registers: vec![],
-                    },
-                )))
+                debug!(
+                    "Pattern: Frame base offset {} - cannot optimize, fallback to full evaluation",
+                    offset
+                );
+                // Frame base operations should be resolved at higher evaluation level using CFI context
+                // Don't generate LoadFrameBase steps - return None to trigger full evaluation path
+                Ok(None)
             }
 
             // Absolute address: DW_OP_addr
@@ -1807,26 +946,6 @@ impl DwarfExpressionEvaluator {
         true
     }
 
-    /// Enhanced CFI combination for new type system
-    fn combine_cfi_with_offset_enhanced(
-        &self,
-        _cfi_rule: &str, // TODO: Replace with actual CFI rule type when available
-        offset: i64,
-        _dwarf_ctx: &DwarfContext,
-        _pc_address: u64,
-        _context: &EvaluationContext,
-    ) -> Result<EvaluationResult, ExpressionError> {
-        // For now, fallback to computed location with frame base access
-        // TODO: Implement full CFI integration with enhanced types
-        warn!("CFI integration with enhanced types not fully implemented yet");
-        Ok(EvaluationResult::MemoryLocation(
-            LocationResult::ComputedLocation {
-                steps: vec![AccessStep::LoadFrameBase, AccessStep::AddConstant(offset)],
-                requires_registers: vec![],
-            },
-        ))
-    }
-
     /// Collect registers required by a list of DWARF operations
     fn collect_required_registers_for_ops(&self, operations: &[DwarfOperation]) -> Vec<u16> {
         let mut registers = Vec::new();
@@ -1841,343 +960,6 @@ impl DwarfExpressionEvaluator {
             }
         }
         registers
-    }
-
-    /// Parse and evaluate a CFI DWARF expression recursively
-    fn parse_and_evaluate_cfi_expression(
-        &self,
-        expression_bytes: &[u8],
-        pc_address: u64,
-        context: &EvaluationContext,
-        dwarf_context: Option<&DwarfContext>,
-    ) -> Result<EvaluationResult, ExpressionError> {
-        debug!(
-            "Parsing CFI DWARF expression with {} bytes at PC 0x{:x}",
-            expression_bytes.len(),
-            pc_address
-        );
-
-        // Parse the DWARF expression bytes into operations
-        let operations = self.parse_dwarf_expression(expression_bytes)?;
-
-        debug!("Parsed {} CFI DWARF operations", operations.len());
-
-        // Evaluate the operations to create expression result
-        self.evaluate_cfa_operations(&operations)
-    }
-
-    /// Parse raw DWARF expression bytes into operations
-    fn parse_dwarf_expression(&self, bytes: &[u8]) -> Result<Vec<DwarfOperation>, ExpressionError> {
-        use gimli::{EndianSlice, Expression, LittleEndian};
-
-        let endian = LittleEndian;
-        let data = EndianSlice::new(bytes, endian);
-        let expr = Expression(data);
-
-        let mut operations = Vec::new();
-        let mut pc = expr.0;
-
-        while !pc.is_empty() {
-            use gimli::Reader;
-            let op = match pc.read_u8() {
-                Ok(opcode) => {
-                    debug!("Parsing DWARF opcode: 0x{:02x}", opcode);
-                    self.parse_single_dwarf_operation(opcode, &mut pc)?
-                }
-                Err(e) => {
-                    return Err(ExpressionError::EvaluationFailed(format!(
-                        "Failed to read DWARF opcode: {}",
-                        e
-                    )));
-                }
-            };
-            operations.push(op);
-        }
-
-        Ok(operations)
-    }
-
-    /// Parse a single DWARF operation from opcode and data
-    fn parse_single_dwarf_operation(
-        &self,
-        opcode: u8,
-        pc: &mut EndianSlice<LittleEndian>,
-    ) -> Result<DwarfOperation, ExpressionError> {
-        use gimli::constants;
-        use gimli::Reader;
-
-        match opcode {
-            0x50..=0x6f => {
-                // DW_OP_reg0..=DW_OP_reg31
-                let reg = (opcode - 0x50) as u16;
-                Ok(DwarfOperation::Register(reg))
-            }
-            0x90 => {
-                // DW_OP_regx
-                let reg = pc.read_uleb128()? as u16;
-                Ok(DwarfOperation::Register(reg))
-            }
-            0x70..=0x8f => {
-                // DW_OP_breg0..=DW_OP_breg31
-                let reg = (opcode - 0x70) as u16;
-                let offset = pc.read_sleb128()?;
-                Ok(DwarfOperation::RegisterOffset(reg, offset))
-            }
-            0x92 => {
-                // DW_OP_bregx
-                let reg = pc.read_uleb128()? as u16;
-                let offset = pc.read_sleb128()?;
-                Ok(DwarfOperation::RegisterOffset(reg, offset))
-            }
-            0x91 => {
-                // DW_OP_fbreg
-                let offset = pc.read_sleb128()?;
-                Ok(DwarfOperation::FrameBase(offset))
-            }
-            0x9c => Ok(DwarfOperation::CallFrameCFA), // DW_OP_call_frame_cfa
-            0x08 => {
-                // DW_OP_const1u
-                let val = pc.read_u8()? as u64;
-                Ok(DwarfOperation::Const(val))
-            }
-            0x0a => {
-                // DW_OP_const2u
-                let val = pc.read_u16()? as u64;
-                Ok(DwarfOperation::Const(val))
-            }
-            0x0c => {
-                // DW_OP_const4u
-                let val = pc.read_u32()? as u64;
-                Ok(DwarfOperation::Const(val))
-            }
-            0x0e => {
-                // DW_OP_const8u
-                let val = pc.read_u64()?;
-                Ok(DwarfOperation::Const(val))
-            }
-            0x10 => {
-                // DW_OP_constu
-                let val = pc.read_uleb128()?;
-                Ok(DwarfOperation::Const(val))
-            }
-            0x09 => {
-                // DW_OP_const1s
-                let val = pc.read_i8()? as i64 as u64;
-                Ok(DwarfOperation::Const(val))
-            }
-            0x0b => {
-                // DW_OP_const2s
-                let val = pc.read_i16()? as i64 as u64;
-                Ok(DwarfOperation::Const(val))
-            }
-            0x0d => {
-                // DW_OP_const4s
-                let val = pc.read_i32()? as i64 as u64;
-                Ok(DwarfOperation::Const(val))
-            }
-            0x0f => {
-                // DW_OP_const8s
-                let val = pc.read_i64()? as u64;
-                Ok(DwarfOperation::Const(val))
-            }
-            0x11 => {
-                // DW_OP_consts
-                let val = pc.read_sleb128()? as u64;
-                Ok(DwarfOperation::Const(val))
-            }
-            0x22 => Ok(DwarfOperation::Add), // DW_OP_plus (using Add instead of Plus)
-            0x1c => Ok(DwarfOperation::Sub), // DW_OP_minus (using Sub instead of Minus)
-            0x06 => Ok(DwarfOperation::Deref(8)), // DW_OP_deref - Default to 8 bytes
-            _ => Err(ExpressionError::EvaluationFailed(format!(
-                "Unsupported DWARF operation: 0x{:02x}",
-                opcode
-            ))),
-        }
-    }
-
-    /// Evaluate DWARF operations to produce an address
-    fn evaluate_operations_for_address(
-        &self,
-        operations: &[DwarfOperation],
-        pc_address: u64,
-        context: &EvaluationContext,
-        dwarf_context: Option<&DwarfContext>,
-    ) -> Result<u64, ExpressionError> {
-        let mut stack = Vec::new();
-
-        for operation in operations {
-            match operation {
-                DwarfOperation::Const(val) => {
-                    stack.push(*val);
-                    debug!("Pushed constant: {}", val);
-                }
-
-                DwarfOperation::Register(reg) => {
-                    // For CFI evaluation, register values would come from the current context
-                    debug!("CFI register access: reg{} (context-dependent)", reg);
-                    // For now, we'll push a placeholder value
-                    // In a real implementation, this would read from the execution context
-                    stack.push(0);
-                }
-
-                DwarfOperation::RegisterOffset(reg, offset) => {
-                    debug!("CFI register offset: reg{} + {}", reg, offset);
-                    // In a real implementation, this would read register value and add offset
-                    stack.push(*offset as u64);
-                }
-
-                DwarfOperation::Add => {
-                    let b = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                    let a = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                    let result = a.wrapping_add(b);
-                    stack.push(result);
-                    debug!("Add: {} + {} = {}", a, b, result);
-                }
-
-                DwarfOperation::Sub => {
-                    let b = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                    let a = stack.pop().ok_or(ExpressionError::StackUnderflow)?;
-                    let result = a.wrapping_sub(b);
-                    stack.push(result);
-                    debug!("Sub: {} - {} = {}", a, b, result);
-                }
-
-                DwarfOperation::FrameBase(offset) => {
-                    // Recursive CFI evaluation for nested frame base
-                    debug!("Nested frame base in CFI expression: {}", offset);
-                    return Err(ExpressionError::EvaluationFailed(
-                        "Nested frame base in CFI not supported yet".to_string(),
-                    ));
-                }
-
-                _ => {
-                    debug!("Unsupported CFI operation: {:?}", operation);
-                    return Err(ExpressionError::EvaluationFailed(format!(
-                        "Unsupported CFI operation: {:?}",
-                        operation
-                    )));
-                }
-            }
-        }
-
-        // Result should be a single value on the stack
-        if stack.len() == 1 {
-            let result = stack[0];
-            debug!("CFI expression evaluated to: 0x{:x}", result);
-            Ok(result)
-        } else {
-            Err(ExpressionError::EvaluationFailed(format!(
-                "CFI expression evaluation left {} values on stack, expected 1",
-                stack.len()
-            )))
-        }
-    }
-
-    /// Evaluate CFA operations to create proper evaluation results
-    fn evaluate_cfa_operations(
-        &self,
-        operations: &[DwarfOperation],
-    ) -> Result<EvaluationResult, ExpressionError> {
-        debug!("Evaluating {} CFA operations", operations.len());
-
-        // Handle common CFA patterns directly
-        if operations.len() == 1 {
-            match &operations[0] {
-                DwarfOperation::RegisterOffset(reg, offset) => {
-                    debug!("Simple CFA pattern: reg{} + {}", reg, offset);
-                    return Ok(EvaluationResult::MemoryLocation(
-                        LocationResult::RegisterAddress {
-                            register: *reg,
-                            offset: Some(*offset),
-                            size: Some(8),
-                        },
-                    ));
-                }
-                DwarfOperation::Register(reg) => {
-                    debug!("Simple CFA pattern: reg{}", reg);
-                    return Ok(EvaluationResult::MemoryLocation(
-                        LocationResult::RegisterAddress {
-                            register: *reg,
-                            offset: None,
-                            size: Some(8),
-                        },
-                    ));
-                }
-                _ => {}
-            }
-        }
-
-        // For more complex expressions, create computed location
-        let mut steps = Vec::new();
-        let mut requires_registers = Vec::new();
-
-        for operation in operations {
-            match operation {
-                DwarfOperation::RegisterOffset(reg, offset) => {
-                    steps.push(AccessStep::LoadRegister(*reg));
-                    requires_registers.push(*reg);
-                    if *offset != 0 {
-                        steps.push(AccessStep::AddConstant(*offset));
-                    }
-                }
-                DwarfOperation::Register(reg) => {
-                    steps.push(AccessStep::LoadRegister(*reg));
-                    requires_registers.push(*reg);
-                }
-                DwarfOperation::Const(val) => {
-                    steps.push(AccessStep::AddConstant(*val as i64));
-                }
-                DwarfOperation::Add => {
-                    // Previous steps should have loaded two values
-                    // The add operation is implicit in the step sequence
-                }
-                _ => {
-                    debug!(
-                        "Unsupported CFA operation: {:?}, falling back to legacy",
-                        operation
-                    );
-                    return Err(ExpressionError::EvaluationFailed(format!(
-                        "Unsupported CFA operation: {:?}",
-                        operation
-                    )));
-                }
-            }
-        }
-
-        if steps.is_empty() {
-            return Err(ExpressionError::EvaluationFailed(
-                "No valid CFA operations found".to_string(),
-            ));
-        }
-
-        Ok(EvaluationResult::MemoryLocation(
-            LocationResult::ComputedLocation {
-                steps,
-                requires_registers,
-            },
-        ))
-    }
-
-    /// Evaluate CFA expression using complete DWARF expression parser
-    /// This reuses the existing CFI expression evaluation infrastructure
-    pub fn evaluate_cfa_expression(
-        &self,
-        cfa_bytecode: &[u8],
-        context: &EvaluationContext,
-    ) -> Result<EvaluationResult, ExpressionError> {
-        debug!(
-            "Evaluating CFA expression with {} bytes at PC 0x{:x}",
-            cfa_bytecode.len(),
-            context.pc_address
-        );
-
-        // Use the updated CFI expression parser that returns EvaluationResult
-        self.parse_and_evaluate_cfi_expression(
-            cfa_bytecode,
-            context.pc_address,
-            context,
-            None, // Important: avoid circular dependency
-        )
     }
 
     /// Combine CFA evaluation result with frame base offset
@@ -2246,21 +1028,10 @@ impl DwarfExpressionEvaluator {
             }
             EvaluationResult::DirectValue(_value_result) => {
                 // CFA gave us a direct value, but we can't easily use it for offset calculation
-                // Fall back to CFA + offset computation
-                debug!("CFA result is DirectValue, using CFA + offset computation");
-
-                Ok(EvaluationResult::MemoryLocation(
-                    LocationResult::ComputedLocation {
-                        steps: if offset != 0 {
-                            vec![
-                                AccessStep::LoadCallFrameCFA,
-                                AccessStep::AddConstant(offset),
-                            ]
-                        } else {
-                            vec![AccessStep::LoadCallFrameCFA]
-                        },
-                        requires_registers: vec![],
-                    },
+                // This should not happen with proper CFA evaluation
+                debug!("CFA result is DirectValue, this indicates improper CFA evaluation");
+                Err(ExpressionError::EvaluationFailed(
+                    "CFA evaluation returned DirectValue instead of location - this indicates a CFA implementation error".into()
                 ))
             }
             other => {

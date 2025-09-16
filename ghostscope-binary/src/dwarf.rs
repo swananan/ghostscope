@@ -1,8 +1,11 @@
-use crate::expression::DwarfExpressionEvaluator;
+use crate::expression::{DwarfExpressionEvaluator, EvaluationContext, EvaluationResult};
 use crate::file::{SimpleFileInfo, SourceFileManager};
 use crate::line_lookup::LineLookup;
-use crate::scoped_variables::{AddressRange, ScopeId, ScopeType, ScopedVariableMap};
+use crate::scoped_variables::{
+    AddressRange, ScopeId, ScopeType, ScopedVariableMap, VariableResult,
+};
 use crate::Result;
+use ghostscope_platform::{CallingConvention, CodeReader, X86_64SystemV};
 use gimli::{Dwarf, EndianSlice, LittleEndian, Reader};
 use object::{Object, ObjectSection};
 use std::path::Path;
@@ -677,7 +680,7 @@ impl DwarfContext {
                 .map(|addr| LineMapping {
                     address: addr,
                     file_path: file_path.to_string(),
-                    line_number: line_number,
+                    line_number,
                     function_name: None,
                 })
                 .collect();
@@ -724,8 +727,6 @@ impl DwarfContext {
                 .map(|result| {
                     // Perform real-time CFI-aware expression evaluation using enhanced types
                     let evaluation_result = {
-                        use crate::expression::EvaluationContext;
-
                         // Check if parameter is optimized out and try recovery for inlined functions
                         if result.is_optimized_out && result.variable_info.is_parameter {
                             if let Some(recovered_location) = self.try_recover_inlined_parameter(
@@ -750,6 +751,7 @@ impl DwarfContext {
                                 address_size: 8,
                             };
 
+                            // Use standard DWARF expression evaluation
                             self.expression_evaluator
                                 .evaluate_location_with_enhanced_types(
                                     &result.location_at_address,
@@ -803,33 +805,6 @@ impl DwarfContext {
             // after parse_debug_info has been called
             warn!("Source file manager not available - debug info not parsed");
             Ok(Vec::new())
-        }
-    }
-
-    /// Build a comprehensive variable location map for efficient lookups
-    pub fn build_variable_location_map(&self) -> VariableLocationMap {
-        debug!("Building comprehensive variable location map...");
-
-        let mut address_ranges = Vec::new();
-        let mut units = self.dwarf.units();
-
-        while let Ok(Some(header)) = units.next() {
-            if let Ok(unit) = self.dwarf.unit(header) {
-                self.collect_variable_ranges_from_unit(&unit, &mut address_ranges);
-            }
-        }
-
-        // Sort ranges by start address for efficient lookup
-        address_ranges.sort_by_key(|range| range.start);
-
-        debug!(
-            "Built variable location map with {} address ranges",
-            address_ranges.len()
-        );
-
-        VariableLocationMap {
-            address_ranges,
-            cache: std::collections::HashMap::new(),
         }
     }
 
@@ -1148,8 +1123,8 @@ impl DwarfContext {
                 })
             }
             Ok(_) => {
-                debug!(
-                    "Failed to parse function scope: name='{}', no valid address ranges found",
+                info!(
+                    "Skipping function declaration (no address ranges): '{}'",
                     name
                 );
                 None
@@ -2139,69 +2114,6 @@ impl DwarfContext {
         }
     }
 
-    /// Collect variable address ranges from a compilation unit
-    fn collect_variable_ranges_from_unit(
-        &self,
-        unit: &gimli::Unit<gimli::EndianSlice<gimli::LittleEndian>>,
-        address_ranges: &mut Vec<AddressRangeEntry>,
-    ) {
-        let mut entries = unit.entries();
-        let mut current_function_range: Option<AddressRange> = None;
-        let mut function_variables = Vec::new();
-
-        while let Ok(Some((_, entry))) = entries.next_dfs() {
-            match entry.tag() {
-                gimli::DW_TAG_subprogram => {
-                    // Save previous function's variables if any
-                    if let Some(range) = current_function_range.take() {
-                        if !function_variables.is_empty() {
-                            address_ranges.push(AddressRangeEntry {
-                                start: range.start,
-                                end: range.end,
-                                variables: std::mem::take(&mut function_variables),
-                            });
-                        }
-                    }
-
-                    // Start new function
-                    current_function_range = self.extract_address_range_from_entry(entry);
-                }
-                gimli::DW_TAG_variable | gimli::DW_TAG_formal_parameter => {
-                    if let Some(func_range) = &current_function_range {
-                        // For variables within functions, collect them
-                        let mut all_variables = Vec::new();
-                        self.find_variables_in_unit_concrete(
-                            unit,
-                            func_range.start,
-                            &mut all_variables,
-                        );
-
-                        for var in all_variables {
-                            if !function_variables
-                                .iter()
-                                .any(|v: &Variable| v.name == var.name)
-                            {
-                                function_variables.push(var);
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        // Save the last function's variables
-        if let Some(range) = current_function_range {
-            if !function_variables.is_empty() {
-                address_ranges.push(AddressRangeEntry {
-                    start: range.start,
-                    end: range.end,
-                    variables: function_variables,
-                });
-            }
-        }
-    }
-
     /// Find function in a compilation unit
     fn find_function_in_unit<R: Reader>(
         &self,
@@ -2350,324 +2262,6 @@ impl DwarfContext {
         })
     }
 
-    /// Find variables visible at a specific address in compilation unit (concrete types)
-    fn find_variables_in_unit_concrete(
-        &self,
-        unit: &gimli::Unit<gimli::EndianSlice<gimli::LittleEndian>>,
-        addr: u64,
-        variables: &mut Vec<Variable>,
-    ) {
-        let mut entries = unit.entries();
-
-        while let Ok(Some((_, entry))) = entries.next_dfs() {
-            match entry.tag() {
-                gimli::DW_TAG_variable | gimli::DW_TAG_formal_parameter => {
-                    if let Some(var) = self.parse_variable_entry_concrete(unit, entry, addr) {
-                        variables.push(var);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    /// Parse variable entry from DWARF (concrete types)
-    fn parse_variable_entry_concrete(
-        &self,
-        unit: &gimli::Unit<gimli::EndianSlice<gimli::LittleEndian>>,
-        entry: &gimli::DebuggingInformationEntry<gimli::EndianSlice<gimli::LittleEndian>>,
-        addr: u64,
-    ) -> Option<Variable> {
-        let mut attrs = entry.attrs();
-        let mut name = String::new();
-        let mut type_name = String::new();
-        let mut dwarf_type = None;
-        let mut location = None;
-        let mut location_expr = None;
-        let mut scope_start = None;
-        let mut scope_end = None;
-
-        // Create UnitRef for proper string resolution
-        let unit_ref = unit.unit_ref(&self.dwarf);
-
-        // Parse variable attributes
-        while let Ok(Some(attr)) = attrs.next() {
-            match attr.name() {
-                gimli::DW_AT_name => {
-                    // Properly parse variable name using UnitRef
-                    match unit_ref.attr_string(attr.value()) {
-                        Ok(name_str) => {
-                            name = name_str.to_string_lossy().into_owned();
-                            debug!("Parsed variable name: {}", name);
-                        }
-                        Err(_) => {
-                            debug!("Failed to parse variable name, using fallback");
-                            name = "unknown_var".to_string();
-                        }
-                    }
-                }
-                gimli::DW_AT_type => {
-                    // Parse type reference and resolve type information
-                    if let gimli::AttributeValue::UnitRef(type_offset) = attr.value() {
-                        debug!("Resolving type reference at offset: {:?}", type_offset);
-                        if let Some((resolved_type_name, resolved_dwarf_type)) =
-                            self.resolve_type_info_concrete(unit, type_offset)
-                        {
-                            type_name = resolved_type_name;
-                            dwarf_type = resolved_dwarf_type;
-                            debug!("Resolved type: {}", type_name);
-                        } else {
-                            debug!("Failed to resolve type reference");
-                            type_name = "unresolved_type".to_string();
-                        }
-                    } else {
-                        debug!("DW_AT_type is not a unit reference");
-                        type_name = "unknown_type".to_string();
-                    }
-                }
-                gimli::DW_AT_location => {
-                    debug!("Parsing DW_AT_location attribute");
-                    // Parse DWARF location expression
-                    location_expr = self.parse_location_expression(unit, attr.value());
-                    location = Some("dwarf_location".to_string()); // Legacy field
-                }
-                gimli::DW_AT_low_pc => {
-                    if let gimli::AttributeValue::Addr(pc) = attr.value() {
-                        scope_start = Some(pc);
-                        debug!("Variable scope starts at: 0x{:x}", pc);
-                    }
-                }
-                gimli::DW_AT_high_pc => match attr.value() {
-                    gimli::AttributeValue::Addr(pc) => {
-                        scope_end = Some(pc);
-                        debug!("Variable scope ends at: 0x{:x}", pc);
-                    }
-                    gimli::AttributeValue::Udata(size) => {
-                        if let Some(start) = scope_start {
-                            scope_end = Some(start + size);
-                            debug!(
-                                "Variable scope: 0x{:x} - 0x{:x} (size: {})",
-                                start,
-                                start + size,
-                                size
-                            );
-                        }
-                    }
-                    _ => {}
-                },
-                _ => {}
-            }
-        }
-
-        // Enhanced scope validation
-        let scope_ranges = if let (Some(start), Some(end)) = (scope_start, scope_end) {
-            // Variable has explicit scope bounds
-            if addr < start || addr >= end {
-                debug!(
-                    "Variable '{}' not in scope at 0x{:x} (scope: 0x{:x}-0x{:x})",
-                    name, addr, start, end
-                );
-                return None;
-            }
-            vec![AddressRange { start, end }]
-        } else {
-            // No explicit scope - try to inherit from containing function/lexical block
-            debug!(
-                "Variable '{}' has no explicit scope, checking parent scopes",
-                name
-            );
-            match self.find_variable_parent_scope_fixed(unit, entry) {
-                Some(parent_scopes) => {
-                    debug!("Variable '{}' has parent scopes: {:?}", name, parent_scopes);
-                    parent_scopes
-                }
-                None => {
-                    debug!(
-                        "No parent scope found for variable '{}' at 0x{:x}, using empty scope",
-                        name, addr
-                    );
-                    Vec::new() // Use empty scope instead of excluding
-                }
-            }
-        };
-
-        Some(Variable {
-            name,
-            type_name: type_name.clone(),
-            dwarf_type: dwarf_type.clone(),
-            location_expr,
-            scope_ranges,
-            is_parameter: entry.tag() == gimli::DW_TAG_formal_parameter,
-            is_artificial: false, // TODO: Detect artificial variables
-
-            // Legacy fields for backward compatibility
-            location,
-            scope_start,
-            scope_end,
-        })
-    }
-
-    /// Find parent scope for a variable (from function or lexical block)
-    /// This finds the scope based on the variable's declaration context, not the probe address
-    fn find_variable_parent_scope(
-        &self,
-        unit: &gimli::Unit<gimli::EndianSlice<gimli::LittleEndian>>,
-        variable_entry: &gimli::DebuggingInformationEntry<gimli::EndianSlice<gimli::LittleEndian>>,
-        _addr: u64,
-    ) -> Option<Vec<AddressRange>> {
-        // Get the parent entry offset of this variable
-        let variable_offset = variable_entry.offset();
-
-        // Walk through the DWARF tree to find the containing function/lexical block
-        let mut entries = unit.entries();
-        let mut parent_stack: Vec<(gimli::UnitOffset, Option<AddressRange>)> = Vec::new();
-
-        while let Ok(Some((depth, entry))) = entries.next_dfs() {
-            let current_offset = entry.offset();
-
-            // Maintain parent stack based on depth
-            while parent_stack.len() > depth as usize {
-                parent_stack.pop();
-            }
-
-            // If this is a scope-defining entry, add it to the stack
-            match entry.tag() {
-                gimli::DW_TAG_subprogram | gimli::DW_TAG_lexical_block => {
-                    let range = self.extract_address_range_from_entry(entry);
-                    debug!(
-                        "Found scope entry at offset {:?}: {:?}",
-                        current_offset, range
-                    );
-                    parent_stack.push((current_offset, range));
-                }
-                _ => {}
-            }
-
-            // If we found our variable, look for its parent scope
-            if current_offset == variable_offset {
-                debug!(
-                    "Found variable entry at offset {:?}, checking parent stack (depth={})",
-                    variable_offset, depth
-                );
-                debug!("Parent stack contents: {:?}", parent_stack);
-
-                // Find the most recent scope entry in the parent stack
-                for (parent_offset, parent_range) in parent_stack.iter().rev() {
-                    debug!(
-                        "Checking parent at offset {:?}: {:?}",
-                        parent_offset, parent_range
-                    );
-                    if let Some(range) = parent_range {
-                        debug!(
-                            "Found parent scope for variable: 0x{:x}-0x{:x} (from parent {:?})",
-                            range.start, range.end, parent_offset
-                        );
-                        return Some(vec![range.clone()]);
-                    }
-                }
-                break;
-            }
-        }
-
-        debug!(
-            "No parent scope found for variable at offset {:?}",
-            variable_offset
-        );
-        None
-    }
-
-    /// Fixed version: Find parent scope by analyzing DWARF structure through actual parent traversal
-    fn find_variable_parent_scope_fixed(
-        &self,
-        unit: &gimli::Unit<gimli::EndianSlice<gimli::LittleEndian>>,
-        variable_entry: &gimli::DebuggingInformationEntry<gimli::EndianSlice<gimli::LittleEndian>>,
-    ) -> Option<Vec<AddressRange>> {
-        let variable_offset = variable_entry.offset();
-        debug!(
-            "Looking for parent scope of variable at offset {:?}",
-            variable_offset
-        );
-
-        // Build a parent map by traversing the DWARF tree structure
-        let mut entries = unit.entries();
-        let mut parent_map: std::collections::HashMap<gimli::UnitOffset, gimli::UnitOffset> =
-            std::collections::HashMap::new();
-        let mut entry_info: std::collections::HashMap<
-            gimli::UnitOffset,
-            (gimli::DwTag, Option<AddressRange>),
-        > = std::collections::HashMap::new();
-        let mut parent_stack: Vec<gimli::UnitOffset> = Vec::new();
-
-        // Traverse the tree to build parent relationships
-        while let Ok(Some((depth, entry))) = entries.next_dfs() {
-            let entry_offset = entry.offset();
-            let entry_tag = entry.tag();
-
-            // Adjust parent stack based on depth
-            while parent_stack.len() > (depth.max(0) as usize) {
-                parent_stack.pop();
-            }
-
-            // Record parent relationship if we have a parent
-            if let Some(&parent_offset) = parent_stack.last() {
-                parent_map.insert(entry_offset, parent_offset);
-                debug!(
-                    "Entry {:?} has parent {:?} (depth {})",
-                    entry_offset, parent_offset, depth
-                );
-            }
-
-            // Collect scope information for functions and lexical blocks
-            let address_range = match entry_tag {
-                gimli::DW_TAG_subprogram | gimli::DW_TAG_lexical_block => {
-                    let range = self.extract_address_range_from_entry(entry);
-                    if let Some(ref r) = range {
-                        debug!(
-                            "Collected scope at offset {:?} (depth {}): 0x{:x}-0x{:x}, tag: {:?}",
-                            entry_offset, depth, r.start, r.end, entry_tag
-                        );
-                    }
-                    range
-                }
-                _ => None,
-            };
-
-            entry_info.insert(entry_offset, (entry_tag, address_range));
-
-            // Add to parent stack if this is a scope entry
-            if matches!(
-                entry_tag,
-                gimli::DW_TAG_subprogram | gimli::DW_TAG_lexical_block | gimli::DW_TAG_compile_unit
-            ) {
-                parent_stack.push(entry_offset);
-            }
-        }
-
-        // Traverse up the parent chain to find the first scope with an address range
-        let mut current_offset = variable_offset;
-
-        while let Some(&parent_offset) = parent_map.get(&current_offset) {
-            if let Some((tag, range_opt)) = entry_info.get(&parent_offset) {
-                if matches!(*tag, gimli::DW_TAG_subprogram | gimli::DW_TAG_lexical_block) {
-                    if let Some(range) = range_opt {
-                        debug!(
-                            "Found parent scope for variable at {:?}: scope {:?} with range 0x{:x}-0x{:x}",
-                            variable_offset, parent_offset, range.start, range.end
-                        );
-                        return Some(vec![range.clone()]);
-                    }
-                }
-            }
-            current_offset = parent_offset;
-        }
-
-        debug!(
-            "No parent scope with address range found for variable at offset {:?}",
-            variable_offset
-        );
-        None
-    }
-
     /// Extract address ranges from a DWARF entry (supports both single range and range lists)
     /// Extract raw address ranges from DWARF entry (bottom layer - pure extraction)
     /// Supports DWARF 5 format only, preserves all ranges including zero-length
@@ -2792,7 +2386,7 @@ impl DwarfContext {
         self.extract_raw_address_ranges(entry, unit, &format!("function({})", function_name))
     }
 
-    /// Extract address ranges for inlined subroutines (middle layer)  
+    /// Extract address ranges for inlined subroutines (middle layer)
     fn extract_inlined_ranges(
         &self,
         entry: &gimli::DebuggingInformationEntry<gimli::EndianSlice<gimli::LittleEndian>>,
@@ -2800,25 +2394,6 @@ impl DwarfContext {
         origin_func: &str,
     ) -> Result<Vec<AddressRange>> {
         self.extract_raw_address_ranges(entry, unit, &format!("inlined({})", origin_func))
-    }
-
-    /// Extract single address range from a DWARF entry (legacy method for compatibility)
-    fn extract_address_range_from_entry(
-        &self,
-        entry: &gimli::DebuggingInformationEntry<gimli::EndianSlice<gimli::LittleEndian>>,
-    ) -> Option<AddressRange> {
-        // This is a stub - we'll phase this out in favor of extract_address_ranges_from_entry
-        // For now, extract a dummy unit to maintain compatibility
-        let mut units = self.dwarf.units();
-        if let Ok(Some(header)) = units.next() {
-            if let Ok(unit) = self.dwarf.unit(header) {
-                let ranges = self
-                    .extract_function_ranges(entry, &unit, "legacy")
-                    .unwrap_or_default();
-                return ranges.first().cloned();
-            }
-        }
-        None
     }
 
     /// Resolve DWARF type information from a unit reference
@@ -3619,146 +3194,6 @@ impl DwarfContext {
             _ => None,
         }
     }
-
-    /// Render file path from DWARF file entry using concrete types
-    fn render_file_concrete(
-        &self,
-        unit: &gimli::Unit<gimli::EndianSlice<gimli::LittleEndian>>,
-        file: &gimli::FileEntry<gimli::EndianSlice<gimli::LittleEndian>, usize>,
-        header: &gimli::LineProgramHeader<gimli::EndianSlice<gimli::LittleEndian>, usize>,
-    ) -> std::result::Result<String, gimli::Error> {
-        // Create UnitRef from Unit for string resolution
-        let unit_ref = unit.unit_ref(&self.dwarf);
-
-        let mut path = if let Some(ref comp_dir) = unit_ref.comp_dir {
-            comp_dir.to_string_lossy().into_owned()
-        } else {
-            String::new()
-        };
-
-        // The directory index 0 is defined to correspond to the compilation unit directory.
-        if file.directory_index() != 0 {
-            if let Some(directory) = file.directory(header) {
-                let dir_string = unit_ref.attr_string(directory)?.to_string_lossy();
-                self.path_push(&mut path, dir_string.as_ref());
-            }
-        }
-
-        let file_name = unit_ref.attr_string(file.path_name())?.to_string_lossy();
-        self.path_push(&mut path, file_name.as_ref());
-
-        Ok(path)
-    }
-
-    /// Push path component (similar to addr2line implementation)
-    fn path_push(&self, path: &mut String, p: &str) {
-        if self.has_forward_slash_root(p) || self.has_backward_slash_root(p) {
-            *path = p.to_string();
-        } else {
-            let dir_separator = if self.has_backward_slash_root(path.as_str()) {
-                '\\'
-            } else {
-                '/'
-            };
-
-            if !path.is_empty() && !path.ends_with(dir_separator) {
-                path.push(dir_separator);
-            }
-            *path += p;
-        }
-    }
-
-    /// Check if the path has a unix style root
-    fn has_forward_slash_root(&self, p: &str) -> bool {
-        p.starts_with('/') || p.get(1..3) == Some(":/")
-    }
-
-    /// Check if the path has a windows style root
-    fn has_backward_slash_root(&self, p: &str) -> bool {
-        p.starts_with('\\') || p.get(1..3) == Some(":\\")
-    }
-
-    /// Parse variable location information
-    fn parse_variable_location(&self, variable: &Variable) -> Option<VariableLocation> {
-        // TODO: Parse actual DWARF location expressions
-        // For now, return simplified location info
-        Some(VariableLocation {
-            register: None,
-            stack_offset: None,
-            is_parameter: false,
-            live_range: variable.scope_start.zip(variable.scope_end),
-        })
-    }
-
-    /// Debug dump of line information for troubleshooting
-    fn debug_dump_line_info(&self, target_file: &str, target_line: u32) {
-        debug!("=== DWARF Line Info Debug Dump ===");
-        debug!("Looking for: {}:{}", target_file, target_line);
-
-        let mut units = self.dwarf.units();
-        let mut unit_index = 0;
-
-        while let Ok(Some(header)) = units.next() {
-            if let Ok(unit) = self.dwarf.unit(header) {
-                unit_index += 1;
-                debug!("--- Compilation Unit {} ---", unit_index);
-
-                if let Some(line_program) = unit.line_program.clone() {
-                    let mut rows = line_program.rows();
-                    let mut file_names = std::collections::HashSet::new();
-                    let mut line_count = 0;
-                    let mut relevant_lines = Vec::new();
-
-                    while let Ok(Some((header, row))) = rows.next_row() {
-                        line_count += 1;
-
-                        // Try to get file name using proper resolution
-                        let file_name = if let Some(file) = header.file(row.file_index()) {
-                            match self.render_file_concrete(&unit, file, header) {
-                                Ok(path) => path,
-                                Err(_) => format!("file_{}", row.file_index()),
-                            }
-                        } else {
-                            "unknown_file".to_string()
-                        };
-
-                        file_names.insert(file_name.clone());
-
-                        if let Some(line) = row.line() {
-                            let line_num = line.get() as u32;
-
-                            // Collect lines around target for context
-                            if (line_num as i32 - target_line as i32).abs() <= 5 {
-                                relevant_lines.push(format!(
-                                    "  {}:{} -> 0x{:x}",
-                                    file_name,
-                                    line_num,
-                                    row.address()
-                                ));
-                            }
-                        }
-
-                        // Limit output to first 100 lines per unit
-                        if line_count > 100 {
-                            debug!("  ... truncated after 100 lines");
-                            break;
-                        }
-                    }
-
-                    debug!("  Files in this unit: {:?}", file_names);
-                    debug!("  Total lines processed: {}", line_count);
-                    debug!("  Lines near target line {}:", target_line);
-                    for line in relevant_lines {
-                        debug!("{}", line);
-                    }
-                } else {
-                    debug!("  No line program in this unit");
-                }
-            }
-        }
-
-        debug!("=== End Debug Dump ===");
-    }
 }
 
 /// Load DWARF sections from object file
@@ -3917,15 +3352,35 @@ fn load_debug_frame_section(
 }
 
 impl DwarfContext {
-    /// Get the new CFI context for DWARF expression-only queries
-    pub fn cfi_context(&self) -> Option<&crate::cfi::CFIContext> {
-        self.cfi_context.as_ref()
-    }
-
-    /// Get function addresses by name using scoped variable map
+    /// Get function addresses by name using scoped variable map, with prologue skipping
     pub fn get_function_addresses_by_name(&self, func_name: &str) -> Vec<u64> {
         if let Some(ref scoped_var_map) = self.scoped_variable_map {
-            scoped_var_map.find_function_addresses(func_name)
+            let raw_addresses = scoped_var_map.find_function_addresses(func_name);
+
+            // Apply prologue skipping to each function address
+            let mut processed_addresses = Vec::new();
+            for &function_start in &raw_addresses {
+                match ghostscope_platform::X86_64SystemV::skip_prologue(function_start, self) {
+                    Ok(body_start) => {
+                        tracing::debug!(
+                            "Function '{}' at 0x{:x}: prologue skipped, body starts at 0x{:x}",
+                            func_name,
+                            function_start,
+                            body_start
+                        );
+                        processed_addresses.push(body_start);
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "Failed to skip prologue for function '{}' at 0x{:x}: {:?}, using original address",
+                            func_name, function_start, err
+                        );
+                        processed_addresses.push(function_start);
+                    }
+                }
+            }
+
+            processed_addresses
         } else {
             vec![]
         }
@@ -3934,13 +3389,6 @@ impl DwarfContext {
     /// Get frame base offset at PC (simplified implementation)
     pub fn get_frame_base_offset_at_pc(&self, _pc: u64) -> Option<i64> {
         // TODO: Implement using new CFI context
-        None
-    }
-
-    /// Get CFI rule for PC (placeholder implementation)
-    pub fn get_cfi_rule_for_pc(&self, _pc: u64) -> Option<String> {
-        // TODO: Implement using new CFI context
-        // For now return a placeholder
         None
     }
 
@@ -4508,73 +3956,6 @@ impl DwarfContext {
         }
     }
 
-    /// Check if a variable might be a substitute for an inlined parameter
-    fn might_be_parameter_substitute(
-        &self,
-        variable: &crate::scoped_variables::VariableInfo,
-        param_name: &str,
-    ) -> bool {
-        // Pattern 1: Variable name contains the parameter name (e.g., "a.1" for parameter "a")
-        if variable.name.starts_with(&format!("{}.1", param_name))
-            || variable.name.starts_with(&format!("{}_", param_name))
-        {
-            return true;
-        }
-
-        // Pattern 2: For simple parameters like "a" and "b", look for single-letter variables
-        // in registers that might be compiler-generated substitutes
-        if param_name.len() == 1 && variable.name.len() == 1 {
-            // Check if this is a different single-letter variable that could be the substitute
-            return variable.name != param_name;
-        }
-
-        // Pattern 3: Look for computed values or temporaries
-        if variable.name.starts_with("tmp") || variable.name.starts_with("_") {
-            return true;
-        }
-
-        false
-    }
-
-    /// Create a LocationResult from a LocationExpression for parameter recovery
-    fn create_substitute_location(
-        &self,
-        location_expr: &LocationExpression,
-    ) -> Option<crate::expression::LocationResult> {
-        use crate::expression::LocationResult;
-
-        match location_expr {
-            LocationExpression::Register { reg } => Some(LocationResult::RegisterAddress {
-                register: *reg,
-                offset: None,
-                size: None,
-            }),
-            LocationExpression::FrameBaseOffset { offset } => {
-                // Frame-relative access - would need frame base register
-                // For x86_64, this is typically RBP (register 6)
-                Some(LocationResult::RegisterAddress {
-                    register: 6, // RBP on x86_64
-                    offset: Some(*offset),
-                    size: None,
-                })
-            }
-            LocationExpression::ComputedExpression { .. } => {
-                // Complex expressions would need full evaluation
-                // For now, return None to indicate we can't handle this case
-                debug!("Complex location expression not supported for parameter recovery");
-                None
-            }
-            LocationExpression::OptimizedOut => {
-                debug!("Substitute variable is also optimized out");
-                None
-            }
-            _ => {
-                debug!("Unsupported location expression type for parameter recovery");
-                None
-            }
-        }
-    }
-
     /// Extract DW_AT_name from DIE entry for debugging (priority function)
     /// Should be called first to identify what DIE we're processing
     fn extract_die_name(
@@ -4618,12 +3999,91 @@ impl DwarfContext {
             _ => "DW_TAG_unknown",
         }
     }
+
+    /// Read code bytes from the object file for the given address range
+    pub fn read_code_bytes(&self, address: u64, size: usize) -> Option<Vec<u8>> {
+        debug!("Reading {} bytes from address 0x{:x}", size, address);
+
+        // Re-parse the object file from the stored file data
+        let object_file = match object::File::parse(&*self._file_data) {
+            Ok(file) => file,
+            Err(e) => {
+                debug!("Failed to parse object file: {}", e);
+                return None;
+            }
+        };
+
+        // Find the .text section (or other executable sections)
+        for section in object_file.sections() {
+            if section.kind() == object::SectionKind::Text {
+                if let Ok(section_data) = section.data() {
+                    let section_addr = section.address();
+                    let section_size = section.size();
+
+                    debug!(
+                        "Found .text section: addr=0x{:x}, size=0x{:x}",
+                        section_addr, section_size
+                    );
+
+                    // Check if the requested address is within this section
+                    if address >= section_addr && address < section_addr + section_size {
+                        let offset = (address - section_addr) as usize;
+
+                        // Make sure we don't read beyond the section
+                        let actual_size =
+                            std::cmp::min(size, section_data.len().saturating_sub(offset));
+
+                        if offset + actual_size <= section_data.len() {
+                            let bytes = section_data[offset..offset + actual_size].to_vec();
+                            debug!(
+                                "Successfully read {} bytes from offset 0x{:x}",
+                                bytes.len(),
+                                offset
+                            );
+                            return Some(bytes);
+                        } else {
+                            debug!(
+                                "Requested range exceeds section bounds: offset=0x{:x}, size={}, section_len={}",
+                                offset, actual_size, section_data.len()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        debug!(
+            "Address 0x{:x} not found in any executable section",
+            address
+        );
+        None
+    }
 }
-/// Frame base information for a specific PC location
-#[derive(Debug, Clone)]
-pub struct FrameBaseInfo {
-    pub pc: u64,
-    pub base_register: u16, // Register that holds the base (e.g., RBP = 6)
-    pub base_offset: i64,   // Offset from the base register
-    pub requires_cfa: bool, // Whether CFA calculation is needed
+
+/// Implement CodeReader trait for DwarfContext to work with platform-specific code
+impl CodeReader for DwarfContext {
+    fn read_code_bytes(&self, address: u64, size: usize) -> Option<Vec<u8>> {
+        self.read_code_bytes(address, size)
+    }
+
+    fn get_source_location_slow(
+        &self,
+        address: u64,
+    ) -> Option<ghostscope_platform::SourceLocation> {
+        self.get_source_location_slow(address)
+            .map(|loc| ghostscope_platform::SourceLocation {
+                file_path: loc.file_path,
+                line_number: loc.line_number,
+                column: loc.column,
+            })
+    }
+
+    fn find_next_stmt_address(&self, function_start: u64) -> Option<u64> {
+        if let Some(ref line_lookup) = self.line_lookup {
+            line_lookup.find_next_stmt_address(function_start)
+        } else {
+            tracing::debug!("No line lookup available for next stmt address search");
+            None
+        }
+    }
 }

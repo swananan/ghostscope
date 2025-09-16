@@ -466,6 +466,60 @@ impl LineLookup {
         all_files
     }
 
+    /// Find the next is_stmt=true address after the given function start address
+    /// This is used for prologue detection following GDB's approach
+    pub fn find_next_stmt_address(&self, function_start: u64) -> Option<u64> {
+        debug!(
+            "LineLookup: searching for next is_stmt=true address after 0x{:x}",
+            function_start
+        );
+
+        let mut best_address: Option<u64> = None;
+
+        for line_info in &self.line_infos {
+            for sequence in &line_info.sequences {
+                // Only look in sequences that contain or come after our function start
+                if sequence.end <= function_start {
+                    continue;
+                }
+
+                for row in sequence.rows.iter() {
+                    // Look for the first is_stmt=true address after function_start
+                    if row.address > function_start && row.is_stmt {
+                        debug!(
+                            "LineLookup: found is_stmt=true at 0x{:x} (line {}, file index {})",
+                            row.address, row.line, row.file_index
+                        );
+
+                        match best_address {
+                            None => best_address = Some(row.address),
+                            Some(current_best) => {
+                                if row.address < current_best {
+                                    best_address = Some(row.address);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(addr) = best_address {
+            debug!(
+                "LineLookup: found next is_stmt=true address at 0x{:x} (offset +{})",
+                addr,
+                addr - function_start
+            );
+        } else {
+            debug!(
+                "LineLookup: no is_stmt=true address found after 0x{:x}",
+                function_start
+            );
+        }
+
+        best_address
+    }
+
     /// Clear all internal caches
     pub fn clear_caches(&mut self) {
         for line_info in &mut self.line_infos {

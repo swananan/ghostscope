@@ -9,3 +9,4 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 aya-ebpf-bindings = { workspace = true }
 gimli = { workspace = true }
+ghostscope-platform = { path = "../ghostscope-platform" }

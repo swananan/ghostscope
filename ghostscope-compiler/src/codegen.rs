@@ -1206,41 +1206,6 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(|e| CodeGenError::Builder(e.to_string()))?;
                     stack.push(result);
                 }
-                AccessStep::LoadFrameBase => {
-                    let compile_time_pc = self.get_compile_time_pc_address()?;
-                    let frame_base =
-                        self.get_frame_base_from_pt_regs(ctx_param, compile_time_pc)?;
-                    let frame_base_value = self
-                        .builder
-                        .build_ptr_to_int(frame_base, i64_type, &format!("{}_frame_base", var_name))
-                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-                    stack.push(frame_base_value);
-                }
-                AccessStep::LoadCallFrameCFA => {
-                    debug!("LoadCallFrameCFA step - using CFA evaluation");
-
-                    // Use our new CFA evaluation from DwarfContext via ProcessAnalyzer
-                    if let Some(_analyzer_ptr) = self.process_analyzer {
-                        // TODO: Need module_path to use ProcessAnalyzer properly
-                        // For now, use fallback approach
-                        debug!(
-                            "LoadCallFrameCFA: ProcessAnalyzer needs module_path - using fallback"
-                        );
-                        // Fallback: Use frame base as CFA approximation
-                        let compile_time_pc = self.get_compile_time_pc_address()?;
-                        let frame_base =
-                            self.get_frame_base_from_pt_regs(ctx_param, compile_time_pc)?;
-                        let cfa_addr = self
-                            .builder
-                            .build_ptr_to_int(frame_base, i64_type, "cfa_fallback_addr")
-                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-                        stack.push(cfa_addr);
-                    } else {
-                        return Err(CodeGenError::DwarfError(
-                            "No binary analyzer available for CFA".to_string(),
-                        ));
-                    }
-                }
                 AccessStep::Dereference { size: _ } => {
                     // Dereference step - this doesn't change the address computation,
                     // just marks that the final address should be dereferenced
@@ -1364,299 +1329,6 @@ impl<'ctx> CodeGen<'ctx> {
         }
 
         Ok(stack.pop().unwrap())
-    }
-
-    /// Compute memory address for frame-based access
-    fn compute_frame_based_address(
-        &mut self,
-        ctx_param: PointerValue<'ctx>,
-        offset: i64,
-        var_name: &str,
-    ) -> Result<IntValue<'ctx>> {
-        let compile_time_pc = self.get_compile_time_pc_address()?;
-        let frame_base_ptr = self.get_frame_base_from_pt_regs(ctx_param, compile_time_pc)?;
-
-        // Convert frame base pointer to integer
-        let i64_type = self.context.i64_type();
-        let frame_base_value = self
-            .builder
-            .build_ptr_to_int(frame_base_ptr, i64_type, "frame_base")
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-        // Add offset
-        let offset_const = i64_type.const_int(offset.abs() as u64, offset < 0);
-        let result = if offset >= 0 {
-            self.builder.build_int_add(
-                frame_base_value,
-                offset_const,
-                &format!("{}_frame_addr", var_name),
-            )
-        } else {
-            self.builder.build_int_sub(
-                frame_base_value,
-                offset_const,
-                &format!("{}_frame_addr", var_name),
-            )
-        }
-        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-        Ok(result)
-    }
-
-    /// Compute memory address for CFA-based access
-    fn compute_cfa_based_address(
-        &mut self,
-        ctx_param: PointerValue<'ctx>,
-        offset: i64,
-        var_name: &str,
-    ) -> Result<IntValue<'ctx>> {
-        // CFA computation would require CFI evaluation at compile time
-        // For now, we'll use a simplified approach assuming CFA = RSP + constant
-        debug!("CFA-based access not fully implemented, using RSP-based fallback");
-
-        let rsp_reg_access = ghostscope_binary::RegisterAccess {
-            register: 7, // RSP
-            offset: Some(offset),
-            dereference: false,
-            size: None,
-        };
-        self.compute_register_memory_address(ctx_param, &rsp_reg_access, var_name)
-    }
-
-    /// Generate LLVM IR for frame-based variable access
-    fn generate_frame_based_access_ir(
-        &mut self,
-        ctx_param: PointerValue<'ctx>,
-        offset: i64,
-        var_name: &str,
-    ) -> Result<PointerValue<'ctx>> {
-        debug!(
-            "Generating frame-based access IR for '{}' with offset {}",
-            var_name, offset
-        );
-
-        // Get compile-time PC address for CFI query
-        let compile_time_pc = self.get_compile_time_pc_address()?;
-
-        // Get frame base using CFI information
-        // This generates LLVM IR to calculate frame_base + offset at runtime
-        let frame_base_ptr = self.get_frame_base_from_pt_regs(ctx_param, compile_time_pc)?;
-
-        // Generate address calculation IR
-        let i64_type = self.context.i64_type();
-        let offset_const = i64_type.const_int(offset.abs() as u64, false);
-
-        // frame_base_ptr is already the frame base address value, convert it to integer
-        let frame_base_value = self
-            .builder
-            .build_ptr_to_int(frame_base_ptr, i64_type, "frame_base")
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-        let var_addr = if offset >= 0 {
-            self.builder
-                .build_int_add(frame_base_value, offset_const, "var_addr")
-        } else {
-            self.builder
-                .build_int_sub(frame_base_value, offset_const, "var_addr")
-        }
-        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-        // Step 2: Unified memory read with DWARF type info (8 bytes default for frame access)
-        self.create_variable_memory_read(var_addr, var_name, 8)
-    }
-
-    /// Generate LLVM IR for register-based variable access - unified approach
-    fn generate_register_access_ir(
-        &mut self,
-        ctx_param: PointerValue<'ctx>,
-        reg_access: &ghostscope_binary::RegisterAccess,
-        var_name: &str,
-        var_size: usize,
-    ) -> Result<PointerValue<'ctx>> {
-        debug!(
-            "Generating register access IR for '{}': reg={}, offset={:?}, size={}",
-            var_name, reg_access.register, reg_access.offset, var_size
-        );
-
-        // Step 1: Compute memory address from register + offset
-        let memory_address =
-            self.compute_register_memory_address(ctx_param, reg_access, var_name)?;
-
-        // Step 2: Unified memory read with specified size
-        self.create_variable_memory_read(memory_address, var_name, var_size)
-    }
-
-    /// Compute memory address from register access (register + offset)
-    fn compute_register_memory_address(
-        &mut self,
-        ctx_param: PointerValue<'ctx>,
-        reg_access: &ghostscope_binary::RegisterAccess,
-        var_name: &str,
-    ) -> Result<IntValue<'ctx>> {
-        let i64_type = self.context.i64_type();
-        let i8_type = self.context.i8_type();
-
-        // Convert DWARF register number to pt_regs byte offset
-        let byte_offset = platform::dwarf_reg_to_pt_regs_byte_offset(reg_access.register)
-            .ok_or_else(|| CodeGenError::UnsupportedRegister(reg_access.register))?;
-
-        debug!(
-            "Computing register address: DWARF reg {} -> pt_regs offset {} bytes",
-            reg_access.register, byte_offset
-        );
-
-        // Get register value from pt_regs using platform conversion
-        let ctx_as_i8_ptr = self
-            .builder
-            .build_bit_cast(
-                ctx_param,
-                self.context.ptr_type(AddressSpace::default()),
-                &format!("{}_ctx_bytes", var_name),
-            )
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?
-            .into_pointer_value();
-
-        let byte_offset_const = i64_type.const_int(byte_offset as u64, false);
-        let reg_ptr = unsafe {
-            self.builder
-                .build_gep(
-                    i8_type,
-                    ctx_as_i8_ptr,
-                    &[byte_offset_const],
-                    &format!("reg_{}_ptr", reg_access.register),
-                )
-                .map_err(|e| CodeGenError::Builder(e.to_string()))?
-        };
-
-        let reg_u64_ptr = self
-            .builder
-            .build_bit_cast(
-                reg_ptr,
-                self.context.ptr_type(AddressSpace::default()),
-                &format!("reg_{}_u64_ptr", reg_access.register),
-            )
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?
-            .into_pointer_value();
-
-        let mut reg_value = self
-            .builder
-            .build_load(
-                i64_type,
-                reg_u64_ptr,
-                &format!("reg_{}_value", reg_access.register),
-            )
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?
-            .into_int_value();
-
-        // Apply offset if present
-        if let Some(offset) = reg_access.offset {
-            let offset_const = i64_type.const_int(offset.unsigned_abs(), offset < 0);
-            reg_value = if offset >= 0 {
-                self.builder
-                    .build_int_add(reg_value, offset_const, &format!("{}_addr_add", var_name))
-                    .map_err(|e| CodeGenError::Builder(e.to_string()))?
-            } else {
-                self.builder
-                    .build_int_sub(reg_value, offset_const, &format!("{}_addr_sub", var_name))
-                    .map_err(|e| CodeGenError::Builder(e.to_string()))?
-            };
-        }
-
-        Ok(reg_value)
-    }
-
-    /// Unified memory read with specified size
-    fn create_variable_memory_read(
-        &mut self,
-        memory_address: IntValue<'ctx>,
-        var_name: &str,
-        var_size: usize,
-    ) -> Result<PointerValue<'ctx>> {
-        let ptr_type = self.context.ptr_type(AddressSpace::default());
-
-        // Convert address to pointer
-        let user_ptr = self
-            .builder
-            .build_int_to_ptr(memory_address, ptr_type, &format!("{}_ptr", var_name))
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-        debug!(
-            "Reading variable '{}' from memory: size={} bytes",
-            var_name, var_size
-        );
-
-        // Unified safe memory read
-        self.create_safe_user_memory_read(user_ptr, var_size, var_name)
-    }
-
-    /// Generate LLVM IR for absolute address variable access - unified approach
-    fn generate_absolute_address_access_ir(
-        &mut self,
-        addr: u64,
-        var_name: &str,
-        var_size: usize,
-    ) -> Result<PointerValue<'ctx>> {
-        debug!(
-            "Generating absolute address access IR for '{}' at 0x{:x}, size={}",
-            var_name, addr, var_size
-        );
-
-        // Step 1: Convert absolute address to IntValue
-        let memory_address = self.context.i64_type().const_int(addr, false);
-
-        // Step 2: Unified memory read with specified size
-        self.create_variable_memory_read(memory_address, var_name, var_size)
-    }
-
-    /// Get frame base pointer from pt_regs context based on CFI information
-    fn get_frame_base_from_pt_regs(
-        &mut self,
-        ctx_param: PointerValue<'ctx>,
-        pc_address: u64,
-    ) -> Result<PointerValue<'ctx>> {
-        let i64_type = self.context.i64_type();
-
-        // Simplified frame base calculation using RBP register
-        // TODO: Implement proper CFI-based frame base calculation
-        debug!(
-            "Using simplified frame base calculation for PC 0x{:x}",
-            pc_address
-        );
-
-        // Use RBP register as frame base (DWARF register 6)
-        let rbp_byte_offset = platform::dwarf_reg_to_pt_regs_byte_offset(6).ok_or_else(|| {
-            CodeGenError::InvalidExpression(
-                "RBP register not supported on current platform".to_string(),
-            )
-        })?;
-
-        // Calculate i64 index for GEP (pt_regs is array of i64)
-        let i64_index = rbp_byte_offset / 8;
-        let reg_index_const = i64_type.const_int(i64_index as u64, false);
-
-        let rbp_ptr = unsafe {
-            self.builder
-                .build_gep(
-                    i64_type,
-                    ctx_param,
-                    &[reg_index_const],
-                    "frame_base_rbp_ptr",
-                )
-                .map_err(|e| CodeGenError::Builder(e.to_string()))?
-        };
-
-        // Load RBP value and convert to pointer
-        let rbp_value = self
-            .builder
-            .build_load(i64_type, rbp_ptr, "frame_base_rbp_value")
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?
-            .into_int_value();
-
-        // Convert register value to pointer
-        let ptr_type = self.context.ptr_type(AddressSpace::default());
-        self.builder
-            .build_int_to_ptr(rbp_value, ptr_type, "frame_base_ptr")
-            .map_err(|e| CodeGenError::Builder(e.to_string()))
     }
 
     /// Build and send protocol format message
@@ -3094,8 +2766,16 @@ impl<'ctx> CodeGen<'ctx> {
                 .build_int_to_ptr(reg_value, ptr_type, &format!("{}_reg_ptr", var_name))
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?;
 
-            // Get variable size (default to 8 bytes)
-            let var_size = 8; // Default size, could be enhanced with DWARF type info
+            // Get variable size from RegisterAccess or default to 8 bytes
+            let var_size = reg_access.size.unwrap_or(8);
+
+            debug!(
+                "Reading {} bytes from register {} (DWARF reg {}) for variable '{}'",
+                var_size,
+                platform::dwarf_reg_to_name(reg_access.register).unwrap_or("unknown"),
+                reg_access.register,
+                var_name
+            );
 
             // Use existing safe memory read implementation
             self.create_safe_user_memory_read(user_ptr, var_size, var_name)
@@ -3404,10 +3084,15 @@ impl<'ctx> CodeGen<'ctx> {
                     LocationResult::RegisterAddress {
                         register,
                         offset,
-                        size: _,
+                        size,
                     } => {
-                        debug!("Register-based address: reg{} + {:?}", register, offset);
-                        self.create_register_address_access(ctx_param, *register, *offset, var_name)
+                        debug!(
+                            "Register-based address: reg{} + {:?}, size: {:?}",
+                            register, offset, size
+                        );
+                        self.create_register_address_access(
+                            ctx_param, *register, *offset, *size, var_name,
+                        )
                     }
 
                     LocationResult::ComputedLocation {
@@ -3482,11 +3167,12 @@ impl<'ctx> CodeGen<'ctx> {
         ctx_param: PointerValue<'ctx>,
         register: u16,
         offset: Option<i64>,
+        size: Option<u64>,
         var_name: &str,
     ) -> Result<PointerValue<'ctx>> {
         debug!(
-            "Creating register address access for variable '{}': reg{} + {:?}",
-            var_name, register, offset
+            "Creating register address access for variable '{}': reg{} + {:?}, size: {:?} bytes",
+            var_name, register, offset, size
         );
 
         // Use existing register offset access which handles address calculation
@@ -3494,7 +3180,7 @@ impl<'ctx> CodeGen<'ctx> {
             register,
             offset,
             dereference: true, // We need to dereference the computed address
-            size: Some(8),     // Default to 8 bytes
+            size: size.map(|s| s as usize), // Use actual parameter size
         };
 
         // Reuse existing implementation

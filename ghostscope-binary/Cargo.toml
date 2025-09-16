@@ -19,3 +19,4 @@ memmap2 = "0.9"
 
 # Internal dependencies
 ghostscope-protocol = { path = "../ghostscope-protocol" }
+ghostscope-platform = { path = "../ghostscope-platform" }
