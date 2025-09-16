@@ -22,6 +22,12 @@ pub struct SourceCodePanel {
     pub number_buffer: String, // Buffer for collecting numbers before 'g'
     pub expecting_g: bool,     // Whether we're expecting a 'g' after numbers
     pub g_pressed: bool,       // Whether 'g' was pressed (for 'gg' combination)
+
+    // Search state
+    pub search_mode: bool,
+    pub search_query: String,
+    pub search_matches: Vec<(usize, usize, usize)>, // (line_idx, start, end)
+    pub current_match_index: Option<usize>,
 }
 
 impl SourceCodePanel {
@@ -40,6 +46,10 @@ impl SourceCodePanel {
             number_buffer: String::new(),
             expecting_g: false,
             g_pressed: false,
+            search_mode: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            current_match_index: None,
         }
     }
 
@@ -69,6 +79,7 @@ impl SourceCodePanel {
                 }
                 self.current_column = 0;
                 self.horizontal_scroll_offset = 0;
+                self.clear_search_state();
             }
             Err(e) => {
                 // Show error if file cannot be read
@@ -133,6 +144,7 @@ impl SourceCodePanel {
         self.current_column = 0;
         self.scroll_offset = 0;
         self.horizontal_scroll_offset = 0;
+        self.clear_search_state();
     }
 
     pub fn show_error(&mut self, error_message: String) {
@@ -151,6 +163,7 @@ impl SourceCodePanel {
         self.current_column = 0;
         self.scroll_offset = 0;
         self.horizontal_scroll_offset = 0;
+        self.clear_search_state();
     }
 
     pub fn move_up(&mut self) {
@@ -198,6 +211,120 @@ impl SourceCodePanel {
             self.current_column = 0;
             self.ensure_cursor_visible();
         }
+    }
+
+    // ===== Search features (vim-like) =====
+    pub fn enter_search_mode(&mut self) {
+        self.search_mode = true;
+        self.search_query.clear();
+        self.search_matches.clear();
+        self.current_match_index = None;
+    }
+
+    pub fn exit_search_mode(&mut self) {
+        self.search_mode = false;
+    }
+
+    pub fn clear_search_state(&mut self) {
+        self.search_mode = false;
+        self.search_query.clear();
+        self.search_matches.clear();
+        self.current_match_index = None;
+    }
+
+    pub fn push_search_char(&mut self, ch: char) {
+        self.search_query.push(ch);
+        self.update_search_matches();
+        self.jump_to_first_match_if_any();
+    }
+
+    pub fn backspace_search(&mut self) {
+        self.search_query.pop();
+        self.update_search_matches();
+        self.jump_to_first_match_if_any();
+    }
+
+    pub fn confirm_search(&mut self) {
+        // Leave input mode but keep highlights
+        self.search_mode = false;
+    }
+
+    pub fn next_match(&mut self) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        let next_index = match self.current_match_index {
+            Some(idx) => (idx + 1) % self.search_matches.len(),
+            None => 0,
+        };
+        self.goto_match_index(next_index);
+    }
+
+    pub fn prev_match(&mut self) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        let prev_index = match self.current_match_index {
+            Some(0) | None => self.search_matches.len().saturating_sub(1),
+            Some(idx) => idx - 1,
+        };
+        self.goto_match_index(prev_index);
+    }
+
+    fn goto_match_index(&mut self, index: usize) {
+        if let Some((line, start, _)) = self.search_matches.get(index).cloned() {
+            self.current_line = line;
+            self.current_column = start;
+            self.ensure_cursor_visible();
+            self.current_match_index = Some(index);
+        }
+    }
+
+    fn jump_to_first_match_if_any(&mut self) {
+        if !self.search_matches.is_empty() {
+            self.goto_match_index(0);
+        } else {
+            self.current_match_index = None;
+        }
+    }
+
+    fn update_search_matches(&mut self) {
+        self.search_matches.clear();
+        self.current_match_index = None;
+        if self.search_query.is_empty() {
+            return;
+        }
+        for (li, line) in self.content.iter().enumerate() {
+            let mut start = 0usize;
+            while let Some(pos) = line[start..].find(&self.search_query) {
+                let s = start + pos;
+                let e = s + self.search_query.len();
+                self.search_matches.push((li, s, e));
+                start = e.max(s + 1);
+            }
+        }
+        if !self.search_matches.is_empty() {
+            // Prefer first match at or after current cursor
+            let mut selected = 0usize;
+            for (idx, (li, col_s, _)) in self.search_matches.iter().enumerate() {
+                if *li > self.current_line
+                    || (*li == self.current_line && *col_s >= self.current_column)
+                {
+                    selected = idx;
+                    break;
+                }
+            }
+            self.current_match_index = Some(selected);
+        }
+    }
+
+    fn search_styles(&self) -> (Style, Style, Style) {
+        // Fixed scheme per user request:
+        // '/' purple (magenta), query cyan, highlight: bright pink fg, no bg
+        let slash_style = Style::default().fg(Color::Magenta);
+        let query_style = Style::default().fg(Color::Cyan);
+        let overlay_style = Style::default().fg(Color::LightMagenta);
+        (slash_style, query_style, overlay_style)
     }
 
     /// Handle number input for vim-style number + g navigation
@@ -447,6 +574,10 @@ impl SourceCodePanel {
                 // Apply syntax highlighting to the visible portion
                 let highlighted_spans = self.highlight_line(visible_line);
 
+                // Overlay search highlights on top of syntax highlighting
+                let highlighted_spans =
+                    self.apply_search_overlay(visible_line, highlighted_spans, i);
+
                 let mut spans = vec![Span::styled(format!("{:4} ", line_num), line_number_style)];
                 spans.extend(highlighted_spans);
 
@@ -547,6 +678,24 @@ impl SourceCodePanel {
             }
         }
 
+        // Render search prompt at bottom-left when in search mode
+        if is_focused && self.search_mode {
+            let (slash_style, query_style, _overlay_style) = self.search_styles();
+            let prompt_slash = "/";
+            let prompt_query = &self.search_query;
+            let text = ratatui::text::Text::from(ratatui::text::Line::from(vec![
+                Span::styled(prompt_slash.to_string(), slash_style),
+                Span::styled(prompt_query.to_string(), query_style),
+            ]));
+            let display_x = area.x + 1;
+            let display_y = area.y + area.height.saturating_sub(1);
+            let text_width = (1 + self.search_query.len()) as u16 + 1;
+            frame.render_widget(
+                ratatui::widgets::Paragraph::new(text),
+                Rect::new(display_x, display_y, text_width, 1),
+            );
+        }
+
         if is_focused && !self.content.is_empty() {
             self.ensure_column_bounds();
 
@@ -574,5 +723,90 @@ impl SourceCodePanel {
                 );
             }
         }
+    }
+}
+
+impl SourceCodePanel {
+    // Post-process a line's spans to overlay search highlights for the visible portion
+    fn apply_search_overlay(
+        &self,
+        visible_line_full: &str,
+        spans: Vec<Span>,
+        line_index: usize,
+    ) -> Vec<Span> {
+        if self.search_query.is_empty() || self.search_matches.is_empty() {
+            // Return an owned copy to avoid lifetime issues
+            return spans
+                .into_iter()
+                .map(|s| Span::styled(s.content.to_string(), s.style))
+                .collect();
+        }
+
+        // Collect match ranges for this line in visible coordinates
+        let h_off = self.horizontal_scroll_offset;
+        let ranges: Vec<(usize, usize)> = self
+            .search_matches
+            .iter()
+            .filter_map(|(li, s, e)| {
+                if *li != line_index {
+                    return None;
+                }
+                if *e <= h_off || *s >= h_off + visible_line_full.len() {
+                    return None; // out of visible area
+                }
+                let vis_start = s.saturating_sub(h_off);
+                let vis_end = e.saturating_sub(h_off);
+                Some((vis_start, vis_end))
+            })
+            .collect();
+
+        if ranges.is_empty() {
+            return spans
+                .into_iter()
+                .map(|s| Span::styled(s.content.to_string(), s.style))
+                .collect();
+        }
+
+        // Build a flat string from spans to map positions, then rebuild with background overlay
+        let mut result: Vec<Span> = Vec::new();
+        let mut pos = 0usize;
+        for span in spans {
+            let text = span.content.clone();
+            let base_style = span.style;
+            let mut cursor = 0usize;
+            while cursor < text.len() {
+                // Determine next split point and whether current slice is highlighted
+                let mut next_break = text.len() - cursor;
+                let mut highlight_now = false;
+                for (rs, re) in &ranges {
+                    if pos >= *re || pos + next_break <= *rs {
+                        continue;
+                    }
+                    if pos < *rs {
+                        next_break = (*rs - pos).min(next_break);
+                        highlight_now = false;
+                    } else {
+                        next_break = (*re - pos).min(next_break);
+                        highlight_now = true;
+                    }
+                }
+                let end_cursor = cursor + next_break;
+                let slice = &text[cursor..end_cursor];
+                let style = if highlight_now {
+                    let (_slash_style, _query_style, overlay_style) = self.search_styles();
+                    let mut style = base_style;
+                    style.bg = None; // No background
+                    style.fg = overlay_style.fg; // Bright pink
+                    style
+                } else {
+                    base_style
+                };
+                result.push(Span::styled(slice.to_string(), style));
+                pos += next_break;
+                cursor = end_cursor;
+            }
+        }
+
+        result
     }
 }

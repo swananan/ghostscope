@@ -331,7 +331,7 @@ impl SyntaxHighlighter {
             TokenType::Comment => Style::default().fg(Color::DarkGray),
             TokenType::Number => Style::default().fg(Color::LightYellow),
             TokenType::Function => Style::default().fg(Color::LightCyan),
-            TokenType::Preprocessor => Style::default().fg(Color::LightMagenta),
+            TokenType::Preprocessor => Style::default().fg(Color::LightRed),
             TokenType::Normal => Style::default(),
         }
     }

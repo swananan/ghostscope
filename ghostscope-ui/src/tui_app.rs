@@ -613,48 +613,91 @@ impl TuiApp {
                 }
             }
             FocusedPanel::Source => {
-                match key.code {
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        self.source_panel.clear_number_buffer();
-                        self.source_panel.move_up();
+                // When search mode is active, only handle input-related keys and ignore navigation
+                if self.source_panel.search_mode {
+                    match key.code {
+                        crossterm::event::KeyCode::Char(c) => {
+                            self.source_panel.push_search_char(c);
+                        }
+                        crossterm::event::KeyCode::Backspace => {
+                            self.source_panel.backspace_search();
+                        }
+                        crossterm::event::KeyCode::Enter => {
+                            self.source_panel.confirm_search();
+                        }
+                        crossterm::event::KeyCode::Esc => {
+                            // ESC exits mode and clears highlights
+                            self.source_panel.clear_search_state();
+                        }
+                        _ => {
+                            // Ignore all other keys while searching
+                        }
                     }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        self.source_panel.clear_number_buffer();
-                        self.source_panel.move_down();
+                } else {
+                    match key.code {
+                        // Search mode trigger and input
+                        crossterm::event::KeyCode::Char('/') => {
+                            self.source_panel.enter_search_mode();
+                        }
+                        crossterm::event::KeyCode::Enter => {
+                            // no-op when not in search mode
+                        }
+                        crossterm::event::KeyCode::Backspace => {
+                            // no-op when not in search mode
+                        }
+                        crossterm::event::KeyCode::Char('n') => {
+                            self.source_panel.next_match();
+                        }
+                        crossterm::event::KeyCode::Char('N') => {
+                            self.source_panel.prev_match();
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            self.source_panel.clear_number_buffer();
+                            self.source_panel.move_up();
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            self.source_panel.clear_number_buffer();
+                            self.source_panel.move_down();
+                        }
+                        KeyCode::Left | KeyCode::Char('h') => {
+                            self.source_panel.clear_number_buffer();
+                            self.source_panel.move_left();
+                        }
+                        KeyCode::Right | KeyCode::Char('l') => {
+                            self.source_panel.clear_number_buffer();
+                            self.source_panel.move_right();
+                        }
+                        KeyCode::Char('g') => {
+                            self.source_panel.handle_g_key();
+                        }
+                        KeyCode::Char('G') => {
+                            self.source_panel.handle_uppercase_g_key();
+                        }
+                        KeyCode::Char(digit) if digit.is_ascii_digit() => {
+                            self.source_panel.handle_number_input(digit);
+                        }
+                        KeyCode::Esc => {
+                            self.source_panel.clear_number_buffer();
+                            // ESC in normal mode does nothing for search
+                        }
+                        _ => {}
                     }
-                    KeyCode::Left | KeyCode::Char('h') => {
-                        self.source_panel.clear_number_buffer();
-                        self.source_panel.move_left();
-                    }
-                    KeyCode::Right | KeyCode::Char('l') => {
-                        self.source_panel.clear_number_buffer();
-                        self.source_panel.move_right();
-                    }
-                    KeyCode::Char('g') => {
-                        self.source_panel.handle_g_key();
-                    }
-                    KeyCode::Char('G') => {
-                        self.source_panel.handle_uppercase_g_key();
-                    }
-                    KeyCode::Char(digit) if digit.is_ascii_digit() => {
-                        self.source_panel.handle_number_input(digit);
-                    }
-                    KeyCode::Esc => {
-                        self.source_panel.clear_number_buffer();
-                    }
-                    _ => {}
                 }
 
                 // Handle Ctrl+key combinations
                 if key.modifiers.contains(KeyModifiers::CONTROL) {
                     match key.code {
                         KeyCode::Char('d') => {
-                            self.source_panel.clear_number_buffer();
-                            self.source_panel.move_down_fast();
+                            if !self.source_panel.search_mode {
+                                self.source_panel.clear_number_buffer();
+                                self.source_panel.move_down_fast();
+                            }
                         }
                         KeyCode::Char('u') => {
-                            self.source_panel.clear_number_buffer();
-                            self.source_panel.move_up_fast();
+                            if !self.source_panel.search_mode {
+                                self.source_panel.clear_number_buffer();
+                                self.source_panel.move_up_fast();
+                            }
                         }
                         _ => {}
                     }
