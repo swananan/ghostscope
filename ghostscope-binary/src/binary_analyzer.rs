@@ -200,6 +200,7 @@ impl BinaryAnalyzer {
 
     /// Get all addresses for a source line
     /// Returns all addresses that correspond to the given source line
+    /// DwarfContext now handles GDB-style consecutive address filtering based on line table positions
     pub(crate) fn get_all_source_line_addresses(
         &mut self,
         file_path: &str,
@@ -207,11 +208,7 @@ impl BinaryAnalyzer {
     ) -> Vec<u64> {
         if let Some(dwarf_context) = &mut self.dwarf_context {
             let line_mappings = dwarf_context.get_addresses_for_line(file_path, line_number);
-            let mut addresses: Vec<u64> = line_mappings.into_iter().map(|m| m.address).collect();
-
-            // Sort addresses for consistent display
-            addresses.sort_unstable();
-            addresses.dedup();
+            let addresses: Vec<u64> = line_mappings.into_iter().map(|m| m.address).collect();
             addresses
         } else {
             Vec::new()

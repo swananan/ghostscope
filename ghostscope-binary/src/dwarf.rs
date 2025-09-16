@@ -672,10 +672,11 @@ impl DwarfContext {
         );
 
         // Use LineLookup system if available
-        if let Some(ref mut line_lookup) = self.line_lookup {
-            debug!("Using LineLookup system");
-            let addresses = line_lookup.find_addresses_for_line(file_path, line_number);
-            return addresses
+        if let Some(ref line_lookup) = self.line_lookup {
+            debug!("Using LineLookup system with position-aware filtering");
+            let filtered_addresses =
+                line_lookup.find_addresses_for_line_filtered(file_path, line_number);
+            return filtered_addresses
                 .into_iter()
                 .map(|addr| LineMapping {
                     address: addr,

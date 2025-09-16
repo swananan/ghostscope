@@ -5,6 +5,14 @@ use std::string::{String, ToString};
 use std::vec::Vec;
 use tracing::debug;
 
+/// Address with its position in line table for consecutive instruction detection
+#[derive(Debug, Clone)]
+pub struct AddressWithPosition {
+    pub address: u64,
+    pub sequence_index: usize,
+    pub row_index: usize,
+}
+
 /// Location information for a specific address
 #[derive(Debug, Clone)]
 pub(crate) struct LineLocation {
@@ -238,6 +246,44 @@ impl LineInfo {
         filtered_addresses
     }
 
+    /// Get addresses with their position information for consecutive instruction detection
+    pub fn find_addresses_with_positions(
+        &self,
+        file_path: &str,
+        line_number: u32,
+    ) -> Vec<AddressWithPosition> {
+        let mut address_positions = Vec::new();
+
+        debug!(
+            "LineInfo: searching for {}:{} with positions in {} sequences",
+            file_path,
+            line_number,
+            self.sequences.len()
+        );
+
+        for (seq_idx, sequence) in self.sequences.iter().enumerate() {
+            for (row_idx, row) in sequence.rows.iter().enumerate() {
+                if let Some(file) = self.files.get(row.file_index as usize) {
+                    if self.files_match(file, file_path) && row.line == line_number && row.is_stmt {
+                        address_positions.push(AddressWithPosition {
+                            address: row.address,
+                            sequence_index: seq_idx,
+                            row_index: row_idx,
+                        });
+                        debug!(
+                            "LineInfo: found address 0x{:x} at sequence {} row {} for {}:{}",
+                            row.address, seq_idx, row_idx, file_path, line_number
+                        );
+                    }
+                }
+            }
+        }
+
+        // Sort by address for consistent processing
+        address_positions.sort_by_key(|pos| pos.address);
+        address_positions
+    }
+
     /// Filter addresses using GDB-style logic: prefer statement boundaries
     /// Based on GDB's find_line_common which ignores non-statement entries
     fn filter_addresses_gdb_style(&self, addresses: Vec<u64>) -> Vec<u64> {
@@ -410,39 +456,57 @@ impl LineLookup {
         Ok(())
     }
 
-    /// Find all addresses for a given file and line number
-    pub fn find_addresses_for_line(&mut self, file_path: &str, line_number: u32) -> Vec<u64> {
-        let mut all_addresses = Vec::new();
+    /// Get addresses with their position information for consecutive instruction detection
+    pub fn find_addresses_with_positions(
+        &self,
+        file_path: &str,
+        line_number: u32,
+    ) -> Vec<AddressWithPosition> {
+        let mut all_positions = Vec::new();
 
         debug!(
-            "LineLookup: searching {}:{} across {} units",
+            "LineLookup: searching for {}:{} with positions across {} units",
             file_path,
             line_number,
             self.line_infos.len()
         );
 
-        for (unit_idx, line_info) in self.line_infos.iter_mut().enumerate() {
-            let addresses = line_info.find_addresses_for_line(file_path, line_number);
+        for (unit_idx, line_info) in self.line_infos.iter().enumerate() {
+            let positions = line_info.find_addresses_with_positions(file_path, line_number);
             debug!(
-                "LineLookup: unit {} returned {} addresses",
+                "LineLookup: unit {} returned {} address positions",
                 unit_idx,
-                addresses.len()
+                positions.len()
             );
-            all_addresses.extend(addresses);
+
+            // Adjust sequence index to be global across all units
+            for pos in positions {
+                all_positions.push(AddressWithPosition {
+                    address: pos.address,
+                    sequence_index: pos.sequence_index + unit_idx * 1000, // Make globally unique
+                    row_index: pos.row_index,
+                });
+            }
         }
 
-        // Remove duplicates and sort
-        all_addresses.sort_unstable();
-        all_addresses.dedup();
+        // Sort by address for consistent processing
+        all_positions.sort_by_key(|pos| pos.address);
 
         debug!(
-            "LineLookup: total {} unique addresses found for {}:{}",
-            all_addresses.len(),
+            "LineLookup: total {} address positions found for {}:{}",
+            all_positions.len(),
             file_path,
             line_number
         );
 
-        all_addresses
+        all_positions
+    }
+
+    /// Filter consecutive addresses based on their position in the line table
+    /// Returns addresses with GDB-style consecutive instruction filtering applied
+    pub fn find_addresses_for_line_filtered(&self, file_path: &str, line_number: u32) -> Vec<u64> {
+        let positions = self.find_addresses_with_positions(file_path, line_number);
+        filter_consecutive_line_addresses(positions)
     }
 
     /// Find location information for a specific address
@@ -619,4 +683,63 @@ mod tests {
         assert!(!line_info.files_match("/path/to/mytest.c", "test.c"));
         assert!(line_info.files_match("/path/to/test.c", "test.c"));
     }
+}
+
+/// Filter consecutive addresses based on their position in the line table
+/// This implements GDB-style logic: if addresses are consecutive in the line table,
+/// only keep the first one as a breakpoint location
+pub fn filter_consecutive_line_addresses(positions: Vec<AddressWithPosition>) -> Vec<u64> {
+    if positions.is_empty() {
+        return Vec::new();
+    }
+
+    let mut filtered = Vec::new();
+    let mut i = 0;
+
+    while i < positions.len() {
+        let current = &positions[i];
+        filtered.push(current.address);
+
+        // Check if subsequent addresses are consecutive in the same sequence
+        let mut j = i + 1;
+        while j < positions.len() {
+            let next = &positions[j];
+
+            // Are they in the same sequence and consecutive rows?
+            if next.sequence_index == current.sequence_index
+                && next.row_index == current.row_index + (j - i)
+            {
+                // Consecutive in line table, skip this address
+                debug!(
+                    "Line breakpoint: filtering consecutive address 0x{:x} (row {} after 0x{:x} at row {})",
+                    next.address,
+                    next.row_index,
+                    current.address,
+                    current.row_index
+                );
+                j += 1;
+            } else {
+                // Not consecutive, break the loop
+                break;
+            }
+        }
+
+        if j > i + 1 {
+            debug!(
+                "Line breakpoint: filtered {} consecutive addresses after 0x{:x}, keeping only first",
+                j - i - 1,
+                current.address
+            );
+        }
+
+        i = j; // Move to next non-consecutive address
+    }
+
+    debug!(
+        "Line breakpoint filtering: {} addresses -> {} distinct locations",
+        positions.len(),
+        filtered.len()
+    );
+
+    filtered
 }
