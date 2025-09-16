@@ -300,7 +300,7 @@ impl TraceManager {
     pub fn new() -> Self {
         Self {
             traces: HashMap::new(),
-            next_trace_id: 0,
+            next_trace_id: ghostscope_protocol::consts::DEFAULT_TRACE_ID as u32,
             target_to_trace_id: HashMap::new(),
             no_trace_wait_notify: Notify::new(),
             trace_created_times: HashMap::new(),

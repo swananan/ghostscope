@@ -1,5 +1,6 @@
 use crate::session::GhostSession;
 use anyhow::Result;
+use ghostscope_compiler::ast_compiler::FailedTarget;
 use ghostscope_loader::GhostScopeLoader;
 use ghostscope_ui::events::{ExecutionStatus, ScriptCompilationDetails, ScriptExecutionResult};
 use tracing::{error, info, warn};
@@ -40,12 +41,12 @@ pub async fn compile_and_load_script_for_tui(
         return Err(anyhow::anyhow!("No main executable found in process"));
     };
 
-    // Step 3: Do a single compilation to get all results
-    let compilation_result = match ghostscope_compiler::compile_script(
+    // Step 3: First compilation to determine how many trace points we need
+    let initial_compilation_result = match ghostscope_compiler::compile_script(
         script,
         process_analyzer,
         session.target_pid,
-        None, // We'll assign trace IDs after we know how many we need
+        None, // Initial compilation to count trace points
         &save_options,
     ) {
         Ok(result) => result,
@@ -69,12 +70,60 @@ pub async fn compile_and_load_script_for_tui(
         }
     };
 
-    // Pre-allocate trace IDs based on successful PC count
-    let mut pre_allocated_trace_ids = Vec::new();
-    for _ in &compilation_result.uprobe_configs {
+    // Pre-allocate trace IDs for each uprobe config to maintain consistency with codegen
+    // Each uprobe config gets a unique trace ID, regardless of whether it succeeds or fails
+    let mut uprobe_trace_ids = Vec::new();
+    for _ in &initial_compilation_result.uprobe_configs {
         let trace_id = session.trace_manager.reserve_next_trace_id();
-        pre_allocated_trace_ids.push(trace_id);
+        uprobe_trace_ids.push(trace_id);
     }
+
+    // Step 4: Recompile with specific trace IDs for each uprobe config
+    // We need to compile separately for each trace point to ensure correct trace ID embedding
+    let mut final_uprobe_configs = Vec::new();
+    let mut compilation_failed_targets = initial_compilation_result.failed_targets.clone();
+
+    for (config_index, initial_config) in
+        initial_compilation_result.uprobe_configs.iter().enumerate()
+    {
+        let assigned_trace_id = uprobe_trace_ids[config_index];
+
+        // Recompile for this specific trace ID
+        match ghostscope_compiler::compile_script(
+            script,
+            process_analyzer,
+            session.target_pid,
+            Some(assigned_trace_id),
+            &save_options,
+        ) {
+            Ok(result) => {
+                // Find the config that matches this trace point
+                if let Some(final_config) = result.uprobe_configs.get(config_index) {
+                    final_uprobe_configs.push(final_config.clone());
+                }
+            }
+            Err(e) => {
+                error!(
+                    "Failed to compile script for trace ID {}: {}",
+                    assigned_trace_id, e
+                );
+                // Add this as a failed target
+                compilation_failed_targets.push(FailedTarget {
+                    pc_address: initial_config.uprobe_offset.unwrap_or(0),
+                    target_name: format!("trace_id_{}", assigned_trace_id),
+                    error_message: format!("Recompilation failed: {}", e),
+                });
+            }
+        }
+    }
+
+    // Create final compilation result with correct trace IDs
+    let compilation_result = ghostscope_compiler::CompilationResult {
+        target_info: initial_compilation_result.target_info,
+        trace_count: initial_compilation_result.trace_count,
+        uprobe_configs: final_uprobe_configs,
+        failed_targets: compilation_failed_targets,
+    };
 
     info!(
         "Script compilation successful: {} trace points found, {} uprobe configs generated, target: {}",
@@ -148,7 +197,8 @@ pub async fn compile_and_load_script_for_tui(
 
     // Step 4: Process compilation results at PC level for detailed error reporting
     let mut execution_results: Vec<ScriptExecutionResult> = Vec::new();
-    let mut successful_traces: Vec<(u64, GhostScopeLoader, String)> = Vec::new();
+    // Store successful traces with their config index to maintain trace ID consistency
+    let mut successful_traces: Vec<(usize, u64, GhostScopeLoader, String)> = Vec::new();
     let mut success_count: usize = 0;
     let mut failed_count: usize = 0;
 
@@ -201,8 +251,8 @@ pub async fn compile_and_load_script_for_tui(
     // Check if we have multiple PCs to determine naming strategy
     let has_multiple_pcs = uprobe_configs.len() > 1;
 
-    // Process each PC compilation result
-    for pc_result in uprobe_configs {
+    // Process each PC compilation result with index to maintain trace ID consistency
+    for (config_index, pc_result) in uprobe_configs.into_iter().enumerate() {
         let pc_address = pc_result.function_address.unwrap_or(0);
         let target_name = if has_multiple_pcs {
             format!(
@@ -236,7 +286,12 @@ pub async fn compile_and_load_script_for_tui(
                             status: ExecutionStatus::Success,
                         });
 
-                        successful_traces.push((pc_address, loader, config.ebpf_function_name));
+                        successful_traces.push((
+                            config_index,
+                            pc_address,
+                            loader,
+                            config.ebpf_function_name,
+                        ));
                         success_count += 1;
                         info!(
                             "✓ Successfully prepared target '{}' at 0x{:x}",
@@ -292,9 +347,9 @@ pub async fn compile_and_load_script_for_tui(
 
     if !successful_traces.is_empty() {
         // Create a separate trace for each successful PC using pre-allocated IDs
-        for (index, (pc, loader, ebpf_function_name)) in successful_traces.into_iter().enumerate() {
-            // Use the corresponding pre-allocated trace ID
-            let trace_id = pre_allocated_trace_ids[index];
+        for (config_index, pc, loader, ebpf_function_name) in successful_traces.into_iter() {
+            // Use the trace ID corresponding to this config's original position
+            let trace_id = uprobe_trace_ids[config_index];
 
             let created_trace_id = session.trace_manager.add_trace_with_id(
                 trace_id,
