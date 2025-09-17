@@ -10,12 +10,12 @@ pub mod process;
 pub(crate) mod scoped_variables;
 pub(crate) mod symbol;
 
-pub use dwarf::EnhancedVariableLocation;
-pub use dwarf::{DwarfType, SourceLocation};
+pub use dwarf::{EnhancedVariableLocation, SourceLocation};
 pub use expression::{
-    AccessStep, ArithOp, DirectValueResult, EvaluationContext, EvaluationResult, LocationResult,
-    RegisterAccess,
+    AccessStep, ArithOp, DirectValueResult, EvaluationContext, EvaluationResult,
+    LocationExpression, LocationResult, RegisterAccess,
 };
+pub use ghostscope_protocol::DwarfType;
 pub use process::{MemoryMapping, ModuleInfo, ModuleStats, ProcessAnalyzer, SharedLibraryInfo};
 
 use std::path::PathBuf;

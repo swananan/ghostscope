@@ -1,4 +1,4 @@
-use crate::{BinaryError, Result};
+use crate::Result;
 use object::{Object, ObjectSection, ObjectSymbol, SymbolKind};
 use std::collections::HashMap;
 use std::path::Path;

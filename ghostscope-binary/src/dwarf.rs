@@ -1,11 +1,11 @@
-use crate::expression::{DwarfExpressionEvaluator, EvaluationContext, EvaluationResult};
+use crate::expression::{
+    DwarfExpressionEvaluator, DwarfOp, EvaluationContext, LocationExpression, LocationListEntry,
+};
 use crate::file::{SimpleFileInfo, SourceFileManager};
 use crate::line_lookup::LineLookup;
-use crate::scoped_variables::{
-    AddressRange, ScopeId, ScopeType, ScopedVariableMap, VariableResult,
-};
+use crate::scoped_variables::{AddressRange, ScopeId, ScopeType, ScopedVariableMap};
 use crate::Result;
-use ghostscope_platform::{CallingConvention, CodeReader, X86_64SystemV};
+use ghostscope_platform::{CallingConvention, CodeReader};
 use gimli::{Dwarf, EndianSlice, LittleEndian, Reader};
 use object::{Object, ObjectSection};
 use std::path::Path;
@@ -93,131 +93,6 @@ pub struct Variable {
 }
 
 /// DWARF location expression
-#[derive(Debug, Clone)]
-pub enum LocationExpression {
-    /// Variable is stored in a register
-    Register { reg: u16 },
-    /// Variable is at frame base + offset
-    FrameBaseOffset { offset: i64 },
-    /// Variable is at an absolute address
-    Address { addr: u64 },
-    /// Variable is at stack pointer + offset  
-    StackOffset { offset: i64 },
-    /// Variable is at register + offset (more precise than StackOffset)
-    RegisterOffset { reg: u16, offset: i64 },
-    /// Complex DWARF expression that requires evaluation
-    ComputedExpression {
-        operations: Vec<DwarfOp>,
-        requires_frame_base: bool,
-        requires_registers: Vec<u16>,
-    },
-    /// Legacy: Complex DWARF expression (to be implemented)
-    DwarfExpression { bytecode: Vec<u8> },
-    /// Variable has different locations at different PC ranges (location lists)
-    LocationList { entries: Vec<LocationListEntry> },
-    /// Variable was optimized away
-    OptimizedOut,
-}
-
-/// Location list entry representing a variable location at a specific PC range
-#[derive(Debug, Clone)]
-pub(crate) struct LocationListEntry {
-    /// Start PC address (inclusive)
-    pub start_pc: u64,
-    /// End PC address (exclusive)  
-    pub end_pc: u64,
-    /// Location expression for this PC range
-    pub location_expr: LocationExpression,
-}
-
-impl LocationExpression {
-    /// Get the location expression for a specific PC address
-    /// For location lists, this finds the correct entry for the given PC
-    pub fn resolve_at_pc(&self, pc: u64) -> &LocationExpression {
-        match self {
-            LocationExpression::LocationList { entries } => {
-                for entry in entries {
-                    if pc >= entry.start_pc && pc < entry.end_pc {
-                        debug!(
-                            "Found location at PC 0x{:x} in range 0x{:x}-0x{:x}",
-                            pc, entry.start_pc, entry.end_pc
-                        );
-                        return entry.location_expr.resolve_at_pc(pc);
-                    }
-                }
-                debug!("No location found for PC 0x{:x} in location list", pc);
-                &LocationExpression::OptimizedOut
-            }
-            // For non-location-list expressions, return self
-            _ => self,
-        }
-    }
-
-    /// Check if this location expression represents a function parameter
-    /// Parameters are typically stored in registers or frame-based offsets with specific patterns
-    pub fn is_parameter_location(&self) -> bool {
-        match self {
-            // Simple register locations often indicate parameters
-            LocationExpression::Register { reg: _ } => true,
-            // Frame base offsets with positive values are often parameters (passed arguments)
-            LocationExpression::FrameBaseOffset { offset } => *offset >= 0,
-            // Register + offset patterns for parameter passing
-            LocationExpression::RegisterOffset { reg: _, offset: _ } => true,
-            // For location lists, check the most common entry
-            LocationExpression::LocationList { entries } => {
-                if let Some(first_entry) = entries.first() {
-                    first_entry.location_expr.is_parameter_location()
-                } else {
-                    false
-                }
-            }
-            // Stack offsets and complex expressions are typically local variables
-            LocationExpression::StackOffset { offset: _ } => false,
-            LocationExpression::ComputedExpression { .. } => false,
-            LocationExpression::DwarfExpression { .. } => false,
-            // Address and optimized out locations are neither parameters nor locals
-            LocationExpression::Address { addr: _ } => false,
-            LocationExpression::OptimizedOut => false,
-        }
-    }
-}
-
-/// Simplified DWARF operations for common expression evaluation
-#[derive(Debug, Clone)]
-pub enum DwarfOp {
-    /// Push a constant value onto the stack
-    Const(i64),
-    /// Push register value onto the stack
-    Reg(u16),
-    /// Push frame base + offset onto the stack  
-    Fbreg(i64),
-    /// Push register + offset onto the stack
-    Breg(u16, i64),
-    /// Dereference the top stack value
-    Deref,
-    /// Add two values on stack
-    Plus,
-    /// Subtract two values on stack
-    Sub,
-    /// Multiply two values on stack
-    Mul,
-    /// Divide two values on stack
-    Div,
-    /// Modulo operation on two values on stack
-    Mod,
-    /// Negate the top stack value
-    Neg,
-    /// Add constant to top of stack
-    PlusUconst(u64),
-    /// Duplicate top stack value
-    Dup,
-    /// Pop top stack value
-    Drop,
-    /// Swap top two stack values  
-    Swap,
-    /// Stack has the address, not the value (DW_OP_stack_value)
-    StackValue,
-}
 
 /// DWARF type information
 // Re-export DWARF types from protocol crate for compatibility

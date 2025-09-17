@@ -1,10 +1,11 @@
 // Variable scope system with GDB-style lexical block hierarchy
 // Provides efficient PC -> variable set lookup with proper scoping and shadowing
 
-use crate::dwarf::{DwarfType, LocationExpression};
-use crate::expression::{DwarfExpressionEvaluator, EvaluationContext, EvaluationResult};
+use crate::expression::LocationExpression;
+use crate::expression::{DwarfExpressionEvaluator, EvaluationResult};
+use ghostscope_protocol::DwarfType;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
 pub(crate) type VariableId = u32;
 pub(crate) type ScopeId = u32;

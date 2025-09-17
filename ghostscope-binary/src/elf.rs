@@ -1,5 +1,5 @@
 use crate::{BinaryError, Result};
-use object::{Object, ObjectSection, ObjectSegment, SegmentFlags};
+use object::{Object, ObjectSection, ObjectSegment};
 use std::path::Path;
 use tracing::{debug, info, warn};
 
