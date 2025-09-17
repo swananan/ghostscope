@@ -178,7 +178,7 @@ impl<'a> AstCompiler<'a> {
             } => {
                 // Obtain addresses first in a separate scope to avoid holding a mutable borrow of self
                 let module_addresses = if let Some(analyzer) = &mut self.process_analyzer {
-                    analyzer.get_all_source_line_addresses(file_path, *line_number)
+                    analyzer.lookup_addresses_by_source_line(file_path, *line_number)
                 } else {
                     Vec::new()
                 };
@@ -274,7 +274,7 @@ impl<'a> AstCompiler<'a> {
             TracePattern::FunctionName(func_name) => {
                 // Resolve all addresses for the function name and generate per-PC programs
                 let module_addresses = if let Some(analyzer) = &mut self.process_analyzer {
-                    analyzer.get_all_function_addresses(func_name)
+                    analyzer.lookup_addresses_by_function_name(func_name)
                 } else {
                     Vec::new()
                 };

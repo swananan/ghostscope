@@ -134,22 +134,6 @@ pub enum DwarfOp {
 }
 
 /// Convert platform-specific error to expression error
-fn convert_platform_error(err: ghostscope_platform::PlatformError) -> ExpressionError {
-    match err {
-        ghostscope_platform::PlatformError::ParameterOptimized(msg) => {
-            ExpressionError::ParameterOptimized(msg)
-        }
-        ghostscope_platform::PlatformError::EvaluationFailed(msg) => {
-            ExpressionError::EvaluationFailed(msg)
-        }
-        ghostscope_platform::PlatformError::PrologueAnalysisFailed(msg) => {
-            ExpressionError::EvaluationFailed(msg)
-        }
-        ghostscope_platform::PlatformError::UnsupportedArchitecture(msg) => {
-            ExpressionError::EvaluationFailed(msg)
-        }
-    }
-}
 
 /// DWARF expression evaluation errors
 #[derive(Debug, thiserror::Error)]

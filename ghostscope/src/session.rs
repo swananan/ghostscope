@@ -218,7 +218,7 @@ impl GhostSession {
                         warn!("Function '{}' not found in symbol table", function_name);
 
                         // Show similar function names
-                        let similar = analyzer.find_matching_functions(function_name);
+                        let similar = analyzer.lookup_functions_by_pattern(function_name);
                         if !similar.is_empty() {
                             info!("Similar functions found:");
                             for func_name in similar.iter().take(5) {
@@ -324,7 +324,7 @@ impl GhostSession {
     /// List available functions
     pub fn list_functions(&self) -> Vec<String> {
         if let Some(ref analyzer) = self.process_analyzer {
-            analyzer.get_all_functions_from_all_modules()
+            analyzer.lookup_all_function_names()
         } else {
             Vec::new()
         }
@@ -333,7 +333,7 @@ impl GhostSession {
     /// Find function by name pattern
     pub fn find_functions(&self, pattern: &str) -> Vec<String> {
         if let Some(ref analyzer) = self.process_analyzer {
-            analyzer.find_matching_functions(pattern)
+            analyzer.lookup_functions_by_pattern(pattern)
         } else {
             Vec::new()
         }

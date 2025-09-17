@@ -550,7 +550,7 @@ fn try_load_source_code(
         .ok_or_else(|| "Process analyzer not available. Try reloading the process.".to_string())?;
 
     let (module_path, main_symbol, source_location) = match process_analyzer
-        .find_function_source_location("main")
+        .lookup_function_info_by_name("main")
     {
         Some(result) => result,
         None => return Err(
@@ -641,7 +641,7 @@ fn handle_function_target(
     use ghostscope_ui::events::*;
 
     // Use DWARF information across all modules
-    let module_addresses = process_analyzer.get_all_function_addresses(function_name);
+    let module_addresses = process_analyzer.lookup_addresses_by_function_name(function_name);
 
     if module_addresses.is_empty() {
         return Err(format!(
@@ -769,7 +769,7 @@ fn handle_function_target(
     // Try to get source location for the first function address
     let source_location = if let Some((first_module_path, first_address)) = first_address_and_module
     {
-        process_analyzer.get_source_location_for_offset(first_module_path, first_address)
+        process_analyzer.lookup_source_location_by_address(first_module_path, first_address)
     } else {
         None
     };
@@ -806,7 +806,7 @@ fn handle_source_location_target(
         .map_err(|_| format!("Invalid line number '{}' in target '{}'", parts[1], target))?;
 
     // Resolve source line to all addresses across all modules
-    let module_addresses = process_analyzer.get_all_source_line_addresses(file_path, line_number);
+    let module_addresses = process_analyzer.lookup_addresses_by_source_line(file_path, line_number);
 
     if module_addresses.is_empty() {
         return Err(format!(
@@ -953,7 +953,8 @@ fn handle_source_location_target(
     let actual_source_location: Option<ghostscope_binary::SourceLocation> =
         if let Some((first_module_path, first_addresses)) = module_addresses.first() {
             if let Some(first_address) = first_addresses.first() {
-                process_analyzer.get_source_location_for_offset(first_module_path, *first_address)
+                process_analyzer
+                    .lookup_source_location_by_address(first_module_path, *first_address)
             } else {
                 None
             }

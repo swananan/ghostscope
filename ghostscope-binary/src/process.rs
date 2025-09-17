@@ -238,28 +238,28 @@ impl ProcessAnalyzer {
 
     // ===== Cross-Module Query Methods =====
 
-    /// Find variable at binary offset in specific module
-    pub fn find_variable_at_offset(
+    /// Lookup variable at binary address in specific module
+    pub fn lookup_variable_by_address(
         &mut self,
         module_path: &str,
-        binary_offset: u64,
+        address: u64,
         var_name: &str,
     ) -> Option<VariableResult> {
         if let Some(module) = self.get_module_mut(module_path) {
             debug!(
-                "Looking up variable '{}' at binary offset 0x{:x} in module '{}'",
-                var_name, binary_offset, module_path
+                "Looking up variable '{}' at binary address 0x{:x} in module '{}'",
+                var_name, address, module_path
             );
 
             // Query variable from the module's binary analyzer
             if let Some(dwarf_ctx) = module.binary_analyzer.dwarf_context_mut() {
-                return dwarf_ctx.find_variable_at_pc(binary_offset, var_name);
+                return dwarf_ctx.find_variable_at_pc(address, var_name);
             }
         }
 
         debug!(
-            "Variable '{}' not found at offset 0x{:x} in module '{}'",
-            var_name, binary_offset, module_path
+            "Variable '{}' not found at address 0x{:x} in module '{}'",
+            var_name, address, module_path
         );
         None
     }
@@ -279,43 +279,43 @@ impl ProcessAnalyzer {
         None
     }
 
-    /// Get source location for binary offset in specific module
-    pub fn get_source_location_for_offset(
+    /// Lookup source location for binary address in specific module
+    pub fn lookup_source_location_by_address(
         &mut self,
         module_path: &str,
-        binary_offset: u64,
+        address: u64,
     ) -> Option<SourceLocation> {
         if let Some(module) = self.get_module_mut(module_path) {
             debug!(
-                "Looking up source location for binary offset 0x{:x} in module '{}'",
-                binary_offset, module_path
+                "Looking up source location for binary address 0x{:x} in module '{}'",
+                address, module_path
             );
 
-            return module.binary_analyzer.get_source_location(binary_offset);
+            return module.binary_analyzer.get_source_location(address);
         }
 
         debug!(
-            "Source location not found for offset 0x{:x} in module '{}'",
-            binary_offset, module_path
+            "Source location not found for address 0x{:x} in module '{}'",
+            address, module_path
         );
         None
     }
 
-    /// Get function information at binary offset in specific module
-    pub fn get_function_info_in_module(
+    /// Lookup function information at binary address in specific module
+    pub fn lookup_function_info_by_address(
         &self,
         module_path: &str,
-        binary_offset: u64,
+        address: u64,
     ) -> Option<FunctionInfo> {
         if let Some(module) = self.get_module(module_path) {
-            return module.binary_analyzer.get_function_info(binary_offset);
+            return module.binary_analyzer.get_function_info(address);
         }
         None
     }
 
-    /// Find function source location by name across all modules
+    /// Lookup function information (symbol + source location) by name across all modules
     /// Returns (module_path, symbol, source_location) if found
-    pub fn find_function_source_location(
+    pub fn lookup_function_info_by_name(
         &mut self,
         function_name: &str,
     ) -> Option<(String, crate::symbol::Symbol, Option<SourceLocation>)> {
@@ -369,8 +369,8 @@ impl ProcessAnalyzer {
         None
     }
 
-    /// Get all function addresses (binary offsets) by name across all modules
-    pub fn get_all_function_addresses(&self, func_name: &str) -> Vec<(String, Vec<u64>)> {
+    /// Lookup all function addresses (binary offsets) by name across all modules
+    pub fn lookup_addresses_by_function_name(&self, func_name: &str) -> Vec<(String, Vec<u64>)> {
         let mut results = Vec::new();
 
         for (path, module) in &self.modules {
@@ -390,8 +390,8 @@ impl ProcessAnalyzer {
         results
     }
 
-    /// Get all addresses (binary offsets) for a source line across all modules
-    pub fn get_all_source_line_addresses(
+    /// Lookup all addresses (binary offsets) for a source line across all modules
+    pub fn lookup_addresses_by_source_line(
         &mut self,
         file_path: &str,
         line_number: u32,
@@ -418,8 +418,8 @@ impl ProcessAnalyzer {
         results
     }
 
-    /// Get all source files from all modules
-    pub fn get_all_source_files(&self) -> Vec<(String, Vec<SourceFile>)> {
+    /// Lookup all source files from all modules
+    pub fn lookup_all_source_files(&self) -> Vec<(String, Vec<SourceFile>)> {
         let mut all_files = Vec::new();
 
         for (path, module) in &self.modules {
@@ -434,8 +434,8 @@ impl ProcessAnalyzer {
         all_files
     }
 
-    /// Get aggregated file list (no duplicates by path)
-    pub fn get_unique_source_files(&self) -> Vec<SourceFile> {
+    /// Lookup aggregated file list (no duplicates by path)
+    pub fn lookup_unique_source_files(&self) -> Vec<SourceFile> {
         let mut unique_files = HashMap::new();
 
         for (_, module) in &self.modules {
@@ -524,8 +524,8 @@ impl ProcessAnalyzer {
     }
 
     /// Get enhanced variable locations at a specific address in a module
-    /// Encapsulates access to binary_analyzer.dwarf_context_mut()
-    pub fn get_enhanced_variable_locations_in_module(
+    /// Lookup all variables at binary address in specific module (enhanced information)
+    pub fn lookup_all_variables_by_address(
         &mut self,
         module_path: &str,
         address: u64,
@@ -570,7 +570,7 @@ impl ProcessAnalyzer {
     }
 
     /// Get all functions from all modules
-    pub fn get_all_functions_from_all_modules(&self) -> Vec<String> {
+    pub fn lookup_all_function_names(&self) -> Vec<String> {
         let mut all_functions = Vec::new();
 
         for (_, module) in self.modules.iter() {
@@ -594,7 +594,7 @@ impl ProcessAnalyzer {
     }
 
     /// Find matching functions across all modules
-    pub fn find_matching_functions(&self, pattern: &str) -> Vec<String> {
+    pub fn lookup_functions_by_pattern(&self, pattern: &str) -> Vec<String> {
         let mut matching_functions = Vec::new();
 
         for (_, module) in self.modules.iter() {
@@ -610,7 +610,7 @@ impl ProcessAnalyzer {
 
     /// Get all file info from all modules (for file listing)
     /// Encapsulates access to dwarf_context.get_all_file_info()
-    pub fn get_all_file_info_from_all_modules(&self) -> Result<Vec<crate::file::SimpleFileInfo>> {
+    pub fn lookup_all_file_info(&self) -> Result<Vec<crate::file::SimpleFileInfo>> {
         let mut all_file_info = Vec::new();
 
         for (_module_path, module) in &self.modules {
