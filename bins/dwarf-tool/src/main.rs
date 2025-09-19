@@ -5,7 +5,9 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use ghostscope_dwarf::{DwarfAnalyzer, ModuleAddress};
+use std::path::PathBuf;
 use std::time::Instant;
+use tracing::warn;
 
 #[derive(Parser)]
 #[command(name = "dwarf-tool")]
@@ -14,7 +16,17 @@ use std::time::Instant;
 #[command(author = "swananan")]
 struct Cli {
     /// Process ID to analyze
-    pid: u32,
+    #[arg(short, long)]
+    pid: Option<u32>,
+
+    /// Target file for analysis (executable, shared library, or static library)
+    /// Can be an absolute or relative path. Relative paths are converted to absolute paths
+    /// based on the command execution directory. Search order for relative paths:
+    /// 1. Current working directory
+    /// 2. Same directory as the dwarf-tool command
+    /// Can be used together with -p to filter events for specific PID
+    #[arg(short, long, value_name = "PATH")]
+    target: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -210,16 +222,101 @@ impl CommonOptions for Commands {
     }
 }
 
+/// Resolve target path with fallback search logic, always return absolute path
+fn resolve_target_path(target: &str) -> Option<String> {
+    let target_path = PathBuf::from(target);
+
+    if target_path.is_absolute() {
+        // Already absolute path
+        if target_path.exists() {
+            Some(target.to_string())
+        } else {
+            warn!("Target file not found: {}", target);
+            Some(target.to_string()) // Return anyway for error handling later
+        }
+    } else {
+        // Convert relative path to absolute path
+        // 1. Try current working directory first
+        if let Ok(current_dir) = std::env::current_dir() {
+            let absolute_target = current_dir.join(target);
+            if absolute_target.exists() {
+                return Some(absolute_target.to_string_lossy().to_string());
+            }
+        }
+
+        // 2. Try same directory as the command (executable directory)
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(exe_dir) = exe_path.parent() {
+                let exe_target = exe_dir.join(target);
+                if exe_target.exists() {
+                    return Some(exe_target.to_string_lossy().to_string());
+                }
+            }
+        }
+
+        // 3. If not found, still convert to absolute path based on current directory
+        if let Ok(current_dir) = std::env::current_dir() {
+            let absolute_target = current_dir.join(target);
+            warn!("Target file not found, using absolute path: {}", absolute_target.display());
+            Some(absolute_target.to_string_lossy().to_string())
+        } else {
+            warn!("Cannot determine current directory for target: {}", target);
+            Some(target.to_string())
+        }
+    }
+}
+
+/// Validate command line arguments for consistency and completeness
+fn validate_args(cli: &Cli) -> Result<()> {
+    // Must have either PID or target path for meaningful operation
+    if cli.pid.is_none() && cli.target.is_none() {
+        return Err(anyhow::anyhow!(
+            "Must specify either --pid (-p) or --target (-t). Use --help for more information."
+        ));
+    }
+
+    // Target path validation
+    if let Some(target_path) = &cli.target {
+        let target_file = PathBuf::from(target_path);
+        if !target_file.exists() {
+            return Err(anyhow::anyhow!(
+                "Target file does not exist: {}",
+                target_path
+            ));
+        }
+        if !target_file.is_file() {
+            return Err(anyhow::anyhow!(
+                "Target path is not a file: {}",
+                target_path
+            ));
+        }
+        println!("✓ Target file found: {}", target_path);
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
 
     // Initialize logging
     init_logging(&cli.command);
 
+    // Validate arguments
+    validate_args(&cli)?;
+
+    // Resolve target path if provided
+    if let Some(target) = &cli.target {
+        if let Some(resolved_path) = resolve_target_path(target) {
+            cli.target = Some(resolved_path);
+        }
+    }
+
     // Handle benchmark separately (no need to load modules)
     if let Commands::Benchmark { runs } = &cli.command {
-        return run_benchmark(cli.pid, *runs).await;
+        // For benchmark, we need either PID or target
+        return run_benchmark(cli.pid, cli.target.as_deref(), *runs).await;
     }
 
     // Load analyzer
@@ -263,14 +360,27 @@ async fn load_analyzer_and_execute(cli: Cli) -> Result<std::time::Duration> {
         } else {
             "Sequential"
         };
-        println!("Loading modules... [{}]", mode);
+
+        if cli.pid.is_some() {
+            println!("Loading modules from PID {}... [{}]", cli.pid.unwrap(), mode);
+        } else if let Some(ref target) = cli.target {
+            println!("Loading target file {}... [{}]", target, mode);
+        }
     }
 
     let start = Instant::now();
-    let mut analyzer = if use_parallel {
-        DwarfAnalyzer::from_pid_parallel(cli.pid).await?
+    let mut analyzer = if let Some(pid) = cli.pid {
+        // PID mode: load from running process
+        if use_parallel {
+            DwarfAnalyzer::from_pid_parallel(pid).await?
+        } else {
+            DwarfAnalyzer::from_pid_sequential(pid)?
+        }
+    } else if let Some(ref target_path) = cli.target {
+        // Target path mode: load from executable file
+        DwarfAnalyzer::from_exec_path(target_path)?
     } else {
-        DwarfAnalyzer::from_pid_sequential(cli.pid)?
+        return Err(anyhow::anyhow!("Either PID or target path must be specified"));
     };
     let loading_time = start.elapsed();
 
@@ -575,55 +685,83 @@ fn list_modules(analyzer: &DwarfAnalyzer, options: &Commands) {
     }
 }
 
-async fn run_benchmark(pid: u32, runs: usize) -> Result<()> {
-    println!(
-        "Benchmarking module loading for PID {} ({} runs)...\n",
-        pid, runs
-    );
-
-    print!("Sequential: ");
-    let mut seq_times = Vec::new();
-
-    for _ in 0..runs {
-        print!(".");
-        std::io::Write::flush(&mut std::io::stdout()).unwrap();
-        let start = Instant::now();
-        let _analyzer = DwarfAnalyzer::from_pid_sequential(pid)?;
-        seq_times.push(start.elapsed());
-    }
-    println!();
-
-    print!("Parallel:   ");
-    let mut par_times = Vec::new();
-
-    for _ in 0..runs {
-        print!(".");
-        std::io::Write::flush(&mut std::io::stdout()).unwrap();
-        let start = Instant::now();
-        let _analyzer = DwarfAnalyzer::from_pid_parallel(pid).await?;
-        par_times.push(start.elapsed());
-    }
-    println!();
-
-    let seq_avg = seq_times.iter().sum::<std::time::Duration>() / runs as u32;
-    let par_avg = par_times.iter().sum::<std::time::Duration>() / runs as u32;
-    let speedup = seq_avg.as_secs_f64() / par_avg.as_secs_f64();
-
-    println!("\nResults:");
-    println!("  Sequential: {}ms (avg)", seq_avg.as_millis());
-    println!("  Parallel:   {}ms (avg)", par_avg.as_millis());
-
-    if speedup > 1.0 {
+async fn run_benchmark(pid: Option<u32>, target_path: Option<&str>, runs: usize) -> Result<()> {
+    if let Some(pid) = pid {
         println!(
-            "  Speedup: {:.2}x ({:.0}% faster)",
-            speedup,
-            (speedup - 1.0) * 100.0
+            "Benchmarking module loading for PID {} ({} runs)...\n",
+            pid, runs
         );
+
+        print!("Sequential: ");
+        let mut seq_times = Vec::new();
+
+        for _ in 0..runs {
+            print!(".");
+            std::io::Write::flush(&mut std::io::stdout()).unwrap();
+            let start = Instant::now();
+            let _analyzer = DwarfAnalyzer::from_pid_sequential(pid)?;
+            seq_times.push(start.elapsed());
+        }
+        println!();
+
+        print!("Parallel:   ");
+        let mut par_times = Vec::new();
+
+        for _ in 0..runs {
+            print!(".");
+            std::io::Write::flush(&mut std::io::stdout()).unwrap();
+            let start = Instant::now();
+            let _analyzer = DwarfAnalyzer::from_pid_parallel(pid).await?;
+            par_times.push(start.elapsed());
+        }
+        println!();
+
+        let seq_avg = seq_times.iter().sum::<std::time::Duration>() / runs as u32;
+        let par_avg = par_times.iter().sum::<std::time::Duration>() / runs as u32;
+        let speedup = seq_avg.as_secs_f64() / par_avg.as_secs_f64();
+
+        println!("\nResults:");
+        println!("  Sequential: {}ms (avg)", seq_avg.as_millis());
+        println!("  Parallel:   {}ms (avg)", par_avg.as_millis());
+
+        if speedup > 1.0 {
+            println!(
+                "  Speedup: {:.2}x ({:.0}% faster)",
+                speedup,
+                (speedup - 1.0) * 100.0
+            );
+        } else {
+            println!(
+                "  Sequential is {:.0}% faster",
+                (1.0 / speedup - 1.0) * 100.0
+            );
+        }
+    } else if let Some(target) = target_path {
+        println!(
+            "Benchmarking target file loading for {} ({} runs)...\n",
+            target, runs
+        );
+
+        print!("Loading: ");
+        let mut load_times = Vec::new();
+
+        for _ in 0..runs {
+            print!(".");
+            std::io::Write::flush(&mut std::io::stdout()).unwrap();
+            let start = Instant::now();
+            let _analyzer = DwarfAnalyzer::from_exec_path(target)?;
+            load_times.push(start.elapsed());
+        }
+        println!();
+
+        let avg_time = load_times.iter().sum::<std::time::Duration>() / runs as u32;
+
+        println!("\nResults:");
+        println!("  Average load time: {}ms", avg_time.as_millis());
+        println!("  Min: {}ms", load_times.iter().min().unwrap().as_millis());
+        println!("  Max: {}ms", load_times.iter().max().unwrap().as_millis());
     } else {
-        println!(
-            "  Sequential is {:.0}% faster",
-            (1.0 / speedup - 1.0) * 100.0
-        );
+        return Err(anyhow::anyhow!("Either PID or target path must be specified for benchmark"));
     }
 
     Ok(())
