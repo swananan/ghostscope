@@ -1002,30 +1002,6 @@ impl TuiApp {
 
         if trimmed == "help" {
             self.show_help();
-        } else if trimmed.starts_with("attach ") {
-            // Parse PID from "attach <pid>"
-            if let Some(pid_str) = trimmed.strip_prefix("attach ") {
-                if let Ok(pid) = pid_str.parse::<u32>() {
-                    let _ = self
-                        .event_registry
-                        .command_sender
-                        .send(RuntimeCommand::AttachToProcess(pid));
-                    self.interactive_command_panel.add_response(
-                        format!("⏳ Attaching to process {}", pid),
-                        ResponseType::Progress,
-                    );
-                } else {
-                    self.interactive_command_panel
-                        .add_response(format!("✗ Invalid PID: {}", pid_str), ResponseType::Error);
-                }
-            }
-        } else if trimmed == "detach" {
-            let _ = self
-                .event_registry
-                .command_sender
-                .send(RuntimeCommand::DetachFromProcess);
-            self.interactive_command_panel
-                .add_response("✓ Detached from process".to_string(), ResponseType::Success);
         } else if trimmed == "quit" || trimmed == "exit" {
             let _ = self
                 .event_registry

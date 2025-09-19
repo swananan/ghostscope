@@ -1,0 +1,25 @@
+[package]
+name = "ghostscope-dwarf"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+keywords.workspace = true
+
+[dependencies]
+gimli.workspace = true
+object = "0.36"
+memmap2 = "0.9"
+anyhow.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+ghostscope-platform = { path = "../ghostscope-platform" }
+
+# For parallel loading
+tokio.workspace = true
+futures.workspace = true
+num_cpus = "1.0"
+
+# For proc mapping parsing (temporary, will extract from ghostscope-binary)
+libc = "0.2"
+

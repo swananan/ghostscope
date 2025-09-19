@@ -2,9 +2,6 @@ use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 
-pub mod dwarf_types;
-pub use dwarf_types::*;
-
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct MessageHeader {
@@ -158,7 +155,7 @@ pub mod consts {
         core::mem::offset_of!(crate::VariableDataMessage, reserved);
 
     // Default values
-    pub const DEFAULT_TRACE_ID: u64 = 1;
+    pub const DEFAULT_TRACE_ID: u64 = 0;
     pub const MAX_STRING_LENGTH: usize = 256;
 
     // Type sizes (bytes) for 64-bit architecture

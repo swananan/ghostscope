@@ -494,4 +494,9 @@ impl<'ctx> MapManager<'ctx> {
         );
         Ok(map_struct_type.as_type())
     }
+
+    /// Get ringbuf map by name
+    pub fn get_ringbuf_map(&self, module: &Module<'ctx>, name: &str) -> Result<PointerValue<'ctx>> {
+        self.get_map(module, name)
+    }
 }

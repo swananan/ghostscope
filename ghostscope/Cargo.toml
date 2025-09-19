@@ -7,7 +7,7 @@ edition = "2021"
 ghostscope-compiler = { path = "../ghostscope-compiler" }
 ghostscope-loader = { path = "../ghostscope-loader" }
 ghostscope-ui = { path = "../ghostscope-ui" }
-ghostscope-binary = { path = "../ghostscope-binary" }
+ghostscope-dwarf = { path = "../ghostscope-dwarf" }
 ghostscope-protocol = { path = "../ghostscope-protocol" }
 dirs = "5.0"
 libc = "0.2"

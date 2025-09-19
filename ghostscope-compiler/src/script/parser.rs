@@ -3,10 +3,10 @@ use pest::Parser;
 use pest::RuleType;
 use pest_derive::Parser;
 
-use crate::ast::{infer_type, BinaryOp, Expr, Program, Statement, TracePattern};
+use crate::script::ast::{infer_type, BinaryOp, Expr, Program, Statement, TracePattern};
 
 #[derive(Parser)]
-#[grammar = "grammar.pest"]
+#[grammar = "script/grammar.pest"]
 pub struct GhostScopeParser;
 
 #[derive(Debug, thiserror::Error)]

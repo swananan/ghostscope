@@ -3,10 +3,11 @@ members = [
     "ghostscope-compiler",
     "ghostscope-loader",
     "ghostscope-ui",
-    "ghostscope-binary",
     "ghostscope-protocol",
     "ghostscope-platform",
     "ghostscope",
+    "ghostscope-dwarf",
+    "bins/dwarf-tool",
 ]
 
 [workspace.package]
@@ -31,6 +32,9 @@ futures = "0.3"
 futures-util = "0.3"
 crossterm = { version = "0.28", features = ["event-stream"] }
 gimli = { path = "/mnt/500g/code/gimli" }
+clap = { version = "4.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
 [patch.crates-io]
 aya = { git = "https://github.com/aya-rs/aya", rev = "9261554e3c6ca37e401ec23a287a1ddf9cb1f26d" }

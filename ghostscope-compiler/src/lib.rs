@@ -1,13 +1,13 @@
-pub mod ast;
-pub mod ast_compiler;
-pub mod codegen;
-pub mod debug_logger;
-pub mod map;
-pub mod parser;
+// New modular organization
+pub mod ebpf;
+pub mod script;
+// Legacy codegen - kept for reference, not compiled
+// pub mod codegen_legacy;
+// pub mod codegen_new;
 
-use crate::ast_compiler::AstCompiler;
-use codegen::CodeGenError;
-use parser::ParseError;
+use crate::script::compiler::AstCompiler;
+use ebpf::context::CodeGenError;
+use script::parser::ParseError;
 use tracing::{info, warn};
 
 pub fn hello() -> &'static str {
@@ -31,8 +31,8 @@ pub enum CompileError {
 
 pub type Result<T> = std::result::Result<T, CompileError>;
 
-// Public re-exports from ast_compiler module
-pub use ast_compiler::{CompilationResult, UProbeConfig};
+// Public re-exports from script::compiler module
+pub use script::compiler::{CompilationResult, UProbeConfig};
 
 /// Save options for compilation output
 #[derive(Debug, Clone)]
@@ -54,28 +54,29 @@ impl Default for SaveOptions {
     }
 }
 
-/// Main compilation interface with ProcessAnalyzer (multi-module support)
+/// Main compilation interface with DwarfAnalyzer (multi-module support)
 ///
-/// This is the new multi-module interface that uses ProcessAnalyzer
+/// This is the new multi-module interface that uses DwarfAnalyzer
 /// to perform compilation across main executable and dynamic libraries
 pub fn compile_script(
     script_source: &str,
-    process_analyzer: &mut ghostscope_binary::ProcessAnalyzer,
+    process_analyzer: &mut ghostscope_dwarf::DwarfAnalyzer,
     pid: Option<u32>,
     trace_id: Option<u32>,
     save_options: &SaveOptions,
 ) -> Result<CompilationResult> {
-    info!("Starting unified script compilation with ProcessAnalyzer (multi-module support)");
+    info!("Starting unified script compilation with DwarfAnalyzer (multi-module support)");
 
     // Step 1: Parse script to AST
-    let program = parser::parse(script_source)?;
+    let program = script::parser::parse(script_source)?;
     info!("Parsed script with {} statements", program.statements.len());
 
-    // Step 2: Use AstCompiler with full ProcessAnalyzer integration
+    // Step 2: Use AstCompiler with full DwarfAnalyzer integration
     let mut compiler = AstCompiler::new(
         Some(process_analyzer),
         save_options.binary_path_hint.clone(),
-        trace_id,
+        trace_id.unwrap_or(0), // Default starting trace_id is 0 if not provided
+        save_options.clone(),
     );
 
     // Step 3: Compile using unified interface
@@ -91,13 +92,31 @@ pub fn compile_script(
 }
 
 /// Print AST for debugging
-pub fn print_ast(program: &crate::ast::Program) {
+pub fn print_ast(program: &crate::script::Program) {
     info!("\n=== AST Tree ===");
     info!("Program:");
     for (i, stmt) in program.statements.iter().enumerate() {
         info!("  Statement {}: {:?}", i, stmt);
     }
     info!("=== End AST Tree ===\n");
+}
+
+/// Save AST to file
+pub fn save_ast_to_file(program: &crate::script::Program, filename: &str) -> Result<()> {
+    let mut ast_content = String::new();
+    ast_content.push_str("=== AST Tree ===\n");
+    ast_content.push_str("Program:\n");
+    for (i, stmt) in program.statements.iter().enumerate() {
+        ast_content.push_str(&format!("  Statement {}: {:?}\n", i, stmt));
+    }
+    ast_content.push_str("=== End AST Tree ===\n");
+
+    let file_path = format!("{}.txt", filename);
+    std::fs::write(&file_path, ast_content).map_err(|e| {
+        CompileError::Other(format!("Failed to save AST file '{}': {}", file_path, e))
+    })?;
+
+    Ok(())
 }
 
 /// Format eBPF bytecode as hexadecimal string for inspection

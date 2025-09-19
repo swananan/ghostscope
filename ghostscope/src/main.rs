@@ -1,10 +1,10 @@
 mod args;
-mod command_line;
+mod cli;
+mod core;
 mod logging;
-mod script_compiler;
-mod session;
-mod trace_manager;
-mod tui_coordinator;
+mod runtime;
+mod script;
+mod tracing;
 
 use anyhow::Result;
 use crossterm::execute;
@@ -37,7 +37,7 @@ fn setup_panic_hook() {
 
         eprintln!("======================");
         eprintln!("Terminal state has been restored. You can now see this panic message.");
-        eprintln!("Please report this issue at: https://github.com/anthropics/claude-code/issues");
+        eprintln!("Please report this issue at: https://github.com/swananan/ghostscope/issues");
 
         // Call the original hook to preserve any additional panic handling
         original_hook(panic_info);
@@ -66,8 +66,8 @@ async fn main() -> Result<()> {
 
     // Route to appropriate runtime mode
     if parsed_args.tui_mode {
-        tui_coordinator::run_tui_coordinator(parsed_args).await
+        runtime::run_tui_coordinator(parsed_args).await
     } else {
-        command_line::run_command_line_runtime(parsed_args).await
+        cli::run_command_line_runtime(parsed_args).await
     }
 }

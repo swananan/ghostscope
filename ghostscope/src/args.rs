@@ -21,9 +21,18 @@ pub struct Args {
     /// Binary file to debug (path or name)
     pub binary: Option<String>,
 
-    /// Arguments to pass to the binary (use --args before binary and its arguments)
-    #[arg(long, action = clap::ArgAction::SetTrue)]
-    pub args: bool,
+    /// Target file for analysis (executable, shared library, or static library)
+    /// Can be an absolute or relative path. Relative paths are converted to absolute paths
+    /// based on the command execution directory. Search order for relative paths:
+    /// 1. Current working directory
+    /// 2. Same directory as the ghostscope command
+    /// Can be used together with -p to filter events for specific PID
+    #[arg(long, short = 't', value_name = "PATH")]
+    pub target: Option<String>,
+
+    /// Process ID to attach to
+    #[arg(long, short = 'p', value_name = "PID")]
+    pub pid: Option<u32>,
 
     /// Log file path (default: ./ghostscope.log)
     #[arg(long, value_name = "PATH")]
@@ -51,10 +60,6 @@ pub struct Args {
     /// Start in TUI mode (default behavior when no script provided)
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub tui: bool,
-
-    /// Process ID to attach to
-    #[arg(long, short = 'p', value_name = "PID")]
-    pub pid: Option<u32>,
 
     /// Save LLVM IR files for each trace pattern (debug: true, release: false)
     #[arg(long, action = clap::ArgAction::SetTrue)]
@@ -93,6 +98,7 @@ pub struct Args {
 #[derive(Debug, Clone)]
 pub struct ParsedArgs {
     pub binary_path: Option<String>,
+    pub target_path: Option<String>,
     pub binary_args: Vec<String>,
     pub log_file: Option<PathBuf>,
     pub debug_file: Option<PathBuf>,
@@ -134,9 +140,11 @@ impl Args {
             let should_save_ebpf = Self::should_save_ebpf(&parsed);
             let should_save_ast = Self::should_save_ast(&parsed);
             let tui_mode = Self::determine_tui_mode(&parsed);
+            let target_path = Self::resolve_target_path(&parsed);
 
             ParsedArgs {
                 binary_path,
+                target_path,
                 binary_args,
                 log_file: parsed.log_file,
                 debug_file: parsed.debug_file,
@@ -157,9 +165,11 @@ impl Args {
             let should_save_ebpf = Self::should_save_ebpf(&parsed);
             let should_save_ast = Self::should_save_ast(&parsed);
             let tui_mode = Self::determine_tui_mode(&parsed);
+            let target_path = Self::resolve_target_path(&parsed);
 
             ParsedArgs {
                 binary_path: parsed.binary,
+                target_path,
                 binary_args: Vec::new(),
                 log_file: parsed.log_file,
                 debug_file: parsed.debug_file,
@@ -221,22 +231,84 @@ impl Args {
         // If no script or script file provided, default to TUI mode
         parsed.script.is_none() && parsed.script_file.is_none()
     }
+
+    /// Resolve target path with fallback search logic
+    fn resolve_target_path(parsed: &Args) -> Option<String> {
+        if let Some(target) = &parsed.target {
+            // Check if it's an absolute path
+            let target_path = PathBuf::from(target);
+            if target_path.is_absolute() {
+                if target_path.exists() {
+                    Some(target.clone())
+                } else {
+                    warn!("Target file not found: {}", target);
+                    Some(target.clone()) // Return anyway for error handling later
+                }
+            } else {
+                // Try relative path searches and convert to absolute paths
+                // 1. Current working directory
+                if target_path.exists() {
+                    if let Ok(current_dir) = std::env::current_dir() {
+                        let absolute_target = current_dir.join(target);
+                        return Some(absolute_target.to_string_lossy().to_string());
+                    } else {
+                        return Some(target.clone()); // Fallback if can't get current dir
+                    }
+                }
+
+                // 2. Same directory as the command (executable directory)
+                if let Ok(exe_path) = std::env::current_exe() {
+                    if let Some(exe_dir) = exe_path.parent() {
+                        let exe_target = exe_dir.join(target);
+                        if exe_target.exists() {
+                            return Some(exe_target.to_string_lossy().to_string());
+                        }
+                    }
+                }
+
+                // 3. If not found, still convert to absolute path based on current directory
+                if let Ok(current_dir) = std::env::current_dir() {
+                    let absolute_target = current_dir.join(target);
+                    warn!(
+                        "Target file not found, using absolute path: {}",
+                        absolute_target.display()
+                    );
+                    Some(absolute_target.to_string_lossy().to_string())
+                } else {
+                    warn!("Cannot determine current directory for target: {}", target);
+                    Some(target.clone()) // Last resort fallback
+                }
+            }
+        } else {
+            None
+        }
+    }
 }
 
 impl ParsedArgs {
     /// Validate command line arguments for consistency and completeness
     pub fn validate(&self) -> Result<()> {
-        // Must have either PID or binary path for meaningful operation
-        if self.pid.is_none() && self.binary_path.is_none() {
-            warn!("No target PID or binary path specified - running in standalone mode");
+        // Must have either PID or target path for meaningful operation
+        if self.pid.is_none() && self.target_path.is_none() {
+            warn!("No target PID or target file specified - running in standalone mode");
         }
 
-        // Cannot specify both PID and binary simultaneously
-        if self.pid.is_some() && self.binary_path.is_some() {
-            // TODO: actually we can
-            return Err(anyhow::anyhow!(
-                "Cannot specify both PID (-p) and binary path simultaneously. Choose one target method."
-            ));
+        // Target path validation
+        if let Some(target_path) = &self.target_path {
+            let target_file = PathBuf::from(target_path);
+            if !target_file.exists() {
+                return Err(anyhow::anyhow!(
+                    "Target file does not exist: {}",
+                    target_path
+                ));
+            }
+            if !target_file.is_file() {
+                return Err(anyhow::anyhow!(
+                    "Target path is not a file: {}",
+                    target_path
+                ));
+            }
+            info!("✓ Target file found: {}", target_path);
         }
 
         if let Some(pid) = self.pid {

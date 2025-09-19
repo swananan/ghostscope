@@ -301,11 +301,13 @@ impl ModuleDebugInfo {
 
     /// Overload helper: build from VariableDebugInfo
     pub fn format_variable_line(var: &VariableDebugInfo) -> String {
-        // Show both semantic (DWARF) type and original type name when available
-        let type_display = match var.type_pretty.as_ref() {
-            Some(pretty) if !pretty.is_empty() => format!("{}, {}", var.type_name, pretty),
-            _ => var.type_name.clone(),
-        };
+        // Use enhanced DWARF type display (includes type name and size)
+        let type_display = var
+            .type_pretty
+            .as_ref()
+            .filter(|pretty| !pretty.is_empty())
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
 
         if var.location_description.is_empty() || var.location_description == "None" {
             format!("{} ({})", var.name, type_display)
@@ -381,9 +383,6 @@ pub struct VariableDebugInfo {
 #[derive(Debug, Clone)]
 pub enum RuntimeCommand {
     ExecuteScript { command: String },
-    AttachToProcess(u32),
-    DetachFromProcess,
-    ReloadBinary(String),
     RequestSourceCode, // Request source code for current function/address
     DisableTrace(u32), // Disable specific trace by ID
     EnableTrace(u32),  // Enable specific trace by ID

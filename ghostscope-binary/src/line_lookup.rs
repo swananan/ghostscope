@@ -530,6 +530,96 @@ impl LineLookup {
         all_files
     }
 
+    /// Find the first executable instruction address after function prologue
+    /// Assumes the input address is a real function (not inlined)
+    /// Returns the best breakpoint location for the function
+    pub fn find_first_executable_address(&self, function_start: u64) -> u64 {
+        debug!(
+            "LineLookup: finding first executable address for function at 0x{:x}",
+            function_start
+        );
+
+        // 1. 优先使用 DWARF prologue_end 标记
+        if let Some(addr) = self.find_prologue_end_from_dwarf(function_start) {
+            debug!(
+                "LineLookup: found prologue_end at 0x{:x} (offset +{})",
+                addr,
+                addr - function_start
+            );
+            return addr;
+        }
+
+        // 2. 回退到 is_stmt=true 查找（已有实现）
+        if let Some(addr) = self.find_next_stmt_address(function_start) {
+            debug!(
+                "LineLookup: using is_stmt=true address at 0x{:x} (offset +{})",
+                addr,
+                addr - function_start
+            );
+            return addr;
+        }
+
+        // 3. 无法确定，返回原地址
+        debug!(
+            "LineLookup: no prologue information found, using original address 0x{:x}",
+            function_start
+        );
+        function_start
+    }
+
+    /// Find prologue end using DWARF prologue_end flag
+    fn find_prologue_end_from_dwarf(&self, function_start: u64) -> Option<u64> {
+        debug!(
+            "LineLookup: searching for prologue_end=true after 0x{:x}",
+            function_start
+        );
+
+        let mut best_address: Option<u64> = None;
+
+        for line_info in &self.line_infos {
+            for sequence in &line_info.sequences {
+                // Only look in sequences that contain or come after our function start
+                if sequence.end <= function_start {
+                    continue;
+                }
+
+                for row in sequence.rows.iter() {
+                    // Look for prologue_end=true at or after function_start
+                    if row.address >= function_start && row.prologue_end {
+                        debug!(
+                            "LineLookup: found prologue_end=true at 0x{:x} (line {}, file index {})",
+                            row.address, row.line, row.file_index
+                        );
+
+                        match best_address {
+                            None => best_address = Some(row.address),
+                            Some(current_best) => {
+                                if row.address < current_best {
+                                    best_address = Some(row.address);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(addr) = best_address {
+            debug!(
+                "LineLookup: found prologue_end at 0x{:x} (offset +{})",
+                addr,
+                addr - function_start
+            );
+        } else {
+            debug!(
+                "LineLookup: no prologue_end found after 0x{:x}",
+                function_start
+            );
+        }
+
+        best_address
+    }
+
     /// Find the next is_stmt=true address after the given function start address
     /// This is used for prologue detection following GDB's approach
     pub fn find_next_stmt_address(&self, function_start: u64) -> Option<u64> {
