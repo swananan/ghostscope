@@ -6,6 +6,14 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, List, ListItem},
     Frame,
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourcePanelMode {
+    Normal,
+    TextSearch,
+    FileSearch,
+}
 
 pub struct SourceCodePanel {
     pub content: Vec<String>,
@@ -23,11 +31,19 @@ pub struct SourceCodePanel {
     pub expecting_g: bool,     // Whether we're expecting a 'g' after numbers
     pub g_pressed: bool,       // Whether 'g' was pressed (for 'gg' combination)
 
-    // Search state
-    pub search_mode: bool,
+    // Mode state
+    pub mode: SourcePanelMode,
     pub search_query: String,
     pub search_matches: Vec<(usize, usize, usize)>, // (line_idx, start, end)
     pub current_match_index: Option<usize>,
+
+    // File search (quick open) state
+    pub file_search_query: String,
+    pub file_search_files: Vec<String>,
+    pub file_search_filtered_indices: Vec<usize>,
+    pub file_search_selected: usize,
+    pub file_search_message: Option<String>,
+    pub file_search_scroll: usize,
 }
 
 impl SourceCodePanel {
@@ -46,10 +62,16 @@ impl SourceCodePanel {
             number_buffer: String::new(),
             expecting_g: false,
             g_pressed: false,
-            search_mode: false,
+            mode: SourcePanelMode::Normal,
             search_query: String::new(),
             search_matches: Vec::new(),
             current_match_index: None,
+            file_search_query: String::new(),
+            file_search_files: Vec::new(),
+            file_search_filtered_indices: Vec::new(),
+            file_search_selected: 0,
+            file_search_message: None,
+            file_search_scroll: 0,
         }
     }
 
@@ -148,8 +170,26 @@ impl SourceCodePanel {
     }
 
     pub fn show_error(&mut self, error_message: String) {
+        let (path_display, dir_display) = match &self.file_path {
+            Some(p) if p != "Error" => {
+                let dir = std::path::Path::new(p)
+                    .parent()
+                    .and_then(|d| d.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                (p.clone(), dir)
+            }
+            _ => ("<unknown>".to_string(), "".to_string()),
+        };
         self.content = vec![
             "// Source code loading failed".to_string(),
+            "//".to_string(),
+            format!("// File: {}", path_display),
+            if dir_display.is_empty() {
+                "// Dir: <unknown>".to_string()
+            } else {
+                format!("// Dir: {}", dir_display)
+            },
             "//".to_string(),
             format!("// Error: {}", error_message),
             "//".to_string(),
@@ -215,21 +255,30 @@ impl SourceCodePanel {
 
     // ===== Search features (vim-like) =====
     pub fn enter_search_mode(&mut self) {
-        self.search_mode = true;
+        self.mode = SourcePanelMode::TextSearch;
         self.search_query.clear();
         self.search_matches.clear();
         self.current_match_index = None;
     }
 
     pub fn exit_search_mode(&mut self) {
-        self.search_mode = false;
+        if self.mode == SourcePanelMode::TextSearch {
+            self.mode = SourcePanelMode::Normal;
+        }
     }
 
     pub fn clear_search_state(&mut self) {
-        self.search_mode = false;
+        self.mode = SourcePanelMode::Normal;
         self.search_query.clear();
         self.search_matches.clear();
         self.current_match_index = None;
+        // clear file search transient state too
+        self.file_search_query.clear();
+        self.file_search_filtered_indices.clear();
+        self.file_search_selected = 0;
+        self.file_search_message = None;
+        self.file_search_scroll = 0;
+        self.file_search_files.clear();
     }
 
     pub fn push_search_char(&mut self, ch: char) {
@@ -246,7 +295,7 @@ impl SourceCodePanel {
 
     pub fn confirm_search(&mut self) {
         // Leave input mode but keep highlights
-        self.search_mode = false;
+        self.exit_search_mode();
     }
 
     pub fn next_match(&mut self) {
@@ -325,6 +374,153 @@ impl SourceCodePanel {
         let query_style = Style::default().fg(Color::Cyan);
         let overlay_style = Style::default().fg(Color::LightMagenta);
         (slash_style, query_style, overlay_style)
+    }
+
+    // ===== File Search (quick-open) =====
+    pub fn enter_file_search_mode(&mut self) {
+        self.mode = SourcePanelMode::FileSearch;
+        self.file_search_query.clear();
+        self.file_search_filtered_indices.clear();
+        self.file_search_selected = 0;
+        self.file_search_message = Some("Loading files…".to_string());
+        self.file_search_scroll = 0;
+    }
+
+    pub fn is_in_text_search_mode(&self) -> bool {
+        self.mode == SourcePanelMode::TextSearch
+    }
+    pub fn is_in_file_search_mode(&self) -> bool {
+        self.mode == SourcePanelMode::FileSearch
+    }
+
+    pub fn set_file_search_files(&mut self, files: Vec<String>) {
+        self.file_search_files = files;
+        self.file_search_message = None;
+        self.update_file_search_filter();
+    }
+
+    /// Ingest grouped SourceFileInfo and build a deduplicated full-path list for quick-open
+    pub fn ingest_file_info_groups(&mut self, groups: &[crate::events::SourceFileGroup]) {
+        let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for g in groups {
+            for f in &g.files {
+                let full = std::path::Path::new(&f.directory)
+                    .join(&f.path)
+                    .to_string_lossy()
+                    .to_string();
+                set.insert(full);
+            }
+        }
+        self.set_file_search_files(set.into_iter().collect());
+    }
+
+    pub fn set_file_search_error(&mut self, error: String) {
+        self.file_search_message = Some(format!("✗ {}", error));
+    }
+
+    pub fn push_file_search_char(&mut self, ch: char) {
+        self.file_search_query.push(ch);
+        self.update_file_search_filter();
+        self.file_search_selected = 0;
+        self.ensure_file_search_cursor_visible();
+    }
+
+    pub fn backspace_file_search(&mut self) {
+        self.file_search_query.pop();
+        self.update_file_search_filter();
+        self.file_search_selected = 0;
+        self.ensure_file_search_cursor_visible();
+    }
+
+    pub fn move_file_search_up(&mut self) {
+        if self.file_search_filtered_indices.is_empty() {
+            return;
+        }
+        if self.file_search_selected > 0 {
+            self.file_search_selected -= 1;
+        } else {
+            // At top, wrap to bottom
+            self.file_search_selected = self.file_search_filtered_indices.len() - 1;
+        }
+        self.ensure_file_search_cursor_visible();
+    }
+
+    pub fn move_file_search_down(&mut self) {
+        if self.file_search_filtered_indices.is_empty() {
+            return;
+        }
+        if self.file_search_selected + 1 < self.file_search_filtered_indices.len() {
+            self.file_search_selected += 1;
+        } else {
+            // At bottom, wrap to top
+            self.file_search_selected = 0;
+        }
+        self.ensure_file_search_cursor_visible();
+    }
+
+    pub fn confirm_file_search(&mut self) -> Option<String> {
+        if self.file_search_filtered_indices.is_empty() {
+            return None;
+        }
+        let idx = self.file_search_filtered_indices[self.file_search_selected];
+        self.file_search_files.get(idx).cloned()
+    }
+
+    pub fn exit_file_search_mode(&mut self) {
+        if self.mode == SourcePanelMode::FileSearch {
+            self.mode = SourcePanelMode::Normal;
+        }
+        self.file_search_query.clear();
+        self.file_search_filtered_indices.clear();
+        self.file_search_selected = 0;
+        self.file_search_message = None;
+        self.file_search_scroll = 0;
+        // Also clear the file list to ensure no residual data
+        self.file_search_files.clear();
+    }
+
+    fn update_file_search_filter(&mut self) {
+        self.file_search_filtered_indices.clear();
+        let q = self.file_search_query.to_lowercase();
+        let mut indexed: Vec<(usize, i32, usize)> = Vec::new();
+        for (i, path) in self.file_search_files.iter().enumerate() {
+            let path_lower = path.to_lowercase();
+            if q.is_empty() {
+                // When no query, default to alphabetical by full path
+                indexed.push((i, 0, 0));
+            } else if let Some(pos) = path_lower.find(&q) {
+                let file_name = std::path::Path::new(path)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(path);
+                let file_lower = file_name.to_lowercase();
+                let name_hit = file_lower.find(&q).is_some();
+                let name_len = file_name.len();
+                let score_primary = if name_hit { 0 } else { 1 };
+                indexed.push((i, score_primary * 1_000_000 + pos as i32, name_len));
+            }
+        }
+        indexed.sort_by(|a, b| {
+            a.1.cmp(&b.1)
+                .then(a.2.cmp(&b.2))
+                .then(self.file_search_files[a.0].cmp(&self.file_search_files[b.0]))
+        });
+        for (i, _, _) in indexed.into_iter() {
+            self.file_search_filtered_indices.push(i);
+        }
+        if self.file_search_selected >= self.file_search_filtered_indices.len() {
+            self.file_search_selected = self.file_search_filtered_indices.len().saturating_sub(1);
+        }
+        self.ensure_file_search_cursor_visible();
+    }
+
+    fn ensure_file_search_cursor_visible(&mut self) {
+        let window = 10usize;
+        if self.file_search_selected < self.file_search_scroll {
+            self.file_search_scroll = self.file_search_selected;
+        } else if self.file_search_selected >= self.file_search_scroll + window {
+            self.file_search_scroll = self.file_search_selected + 1 - window;
+        }
     }
 
     /// Handle number input for vim-style number + g navigation
@@ -549,6 +745,162 @@ impl SourceCodePanel {
             self.ensure_cursor_visible();
         }
 
+        // If in file search mode, render only the overlay (mask entire area), then return
+        if self.mode == SourcePanelMode::FileSearch {
+            // Clear the entire source panel area to prevent any interference with other controls
+            frame.render_widget(ratatui::widgets::Clear, area);
+
+            // Render a conservative background that stays within bounds
+            let background = Block::default()
+                .style(Style::default().bg(Color::Rgb(16, 16, 16)))
+                .borders(Borders::NONE); // Remove borders to prevent overflow
+            frame.render_widget(background, area);
+
+            // Centered overlay container
+            let overlay_height = 1u16 + 10u16 + 2u16;
+            let overlay_width = area.width.saturating_sub(10).max(40);
+            let overlay_area = Rect::new(
+                area.x + (area.width.saturating_sub(overlay_width)) / 2,
+                area.y + (area.height.saturating_sub(overlay_height)) / 2,
+                overlay_width,
+                overlay_height.min(area.height),
+            );
+
+            // Clear overlay area to ensure clean drawing
+            frame.render_widget(ratatui::widgets::Clear, overlay_area);
+
+            // Outer block
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Thick)
+                .title("Open File")
+                .border_style(Style::default().fg(Color::Cyan))
+                .style(Style::default().bg(Color::Rgb(20, 20, 20)));
+            frame.render_widget(block, overlay_area);
+
+            if overlay_area.width <= 2 || overlay_area.height <= 2 {
+                return;
+            }
+            let inner = Rect {
+                x: overlay_area.x + 1,
+                y: overlay_area.y + 1,
+                width: overlay_area.width - 2,
+                height: overlay_area.height - 2,
+            };
+
+            // Input line with safe UTF-8 width calculation
+            let prefix = "🔎 ";
+            let prompt = format!("{}{}", prefix, self.file_search_query);
+            let input_para = ratatui::widgets::Paragraph::new(prompt.clone())
+                .style(Style::default().fg(Color::Cyan).bg(Color::Rgb(30, 30, 30)));
+            frame.render_widget(input_para, Rect::new(inner.x, inner.y, inner.width, 1));
+
+            // Calculate cursor position using Unicode width
+            let prefix_width = prefix.width() as u16;
+            let query_width = self.file_search_query.width() as u16;
+            let total_width = prefix_width + query_width;
+
+            // Ensure cursor doesn't go out of bounds
+            if total_width < inner.width {
+                let caret_x = inner.x + total_width;
+                frame.render_widget(
+                    Block::default().style(Style::default().bg(Color::Cyan)),
+                    Rect::new(caret_x, inner.y, 1, 1),
+                );
+            }
+
+            // Body: message or list
+            if let Some(msg) = &self.file_search_message {
+                let msg_para = ratatui::widgets::Paragraph::new(msg.clone()).style(
+                    Style::default()
+                        .fg(if msg.starts_with('✗') {
+                            Color::Red
+                        } else {
+                            Color::DarkGray
+                        })
+                        .bg(Color::Rgb(30, 30, 30)),
+                );
+                if inner.height > 2 {
+                    frame.render_widget(
+                        msg_para,
+                        Rect::new(inner.x, inner.y + 1, inner.width, inner.height - 1),
+                    );
+                }
+            } else {
+                let mut items: Vec<ListItem> = Vec::new();
+                let start = self.file_search_scroll;
+                let end = (start + 10).min(self.file_search_filtered_indices.len());
+                for idx in start..end {
+                    let real_idx = self.file_search_filtered_indices[idx];
+                    let path = &self.file_search_files[real_idx];
+                    let icon = match std::path::Path::new(path)
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.to_ascii_lowercase())
+                    {
+                        Some(ref e) if ["h", "hpp", "hh", "hxx"].contains(&e.as_str()) => "📑",
+                        Some(ref e) if ["c", "cc", "cpp", "cxx"].contains(&e.as_str()) => "📝",
+                        Some(ref e) if e == "rs" => "🦀",
+                        Some(ref e) if ["s", "asm"].contains(&e.as_str()) => "🛠️",
+                        _ => "📄",
+                    };
+                    // Use pink color for selected file, white for others
+                    let is_selected = idx == self.file_search_selected;
+                    let text_color = if is_selected {
+                        Color::LightMagenta
+                    } else {
+                        Color::White
+                    };
+
+                    // Create text with safe UTF-8 truncation instead of wrapping
+                    let full_text = format!("{} {}", icon, path);
+                    let max_width = (inner.width.saturating_sub(4)) as usize; // More conservative margin
+
+                    // Safely truncate text to fit in one line to avoid layout issues
+                    let display_text = if full_text.width() > max_width {
+                        let mut truncated = String::new();
+                        let mut current_width = 0;
+
+                        for ch in full_text.chars() {
+                            let char_width = ch.width().unwrap_or(1);
+                            // Reserve space for "..." ellipsis
+                            if current_width + char_width + 3 > max_width {
+                                break;
+                            }
+                            truncated.push(ch);
+                            current_width += char_width;
+                        }
+
+                        if truncated.len() < full_text.len() {
+                            truncated.push_str("...");
+                        }
+                        truncated
+                    } else {
+                        full_text
+                    };
+
+                    // Create single-line item to prevent overflow into other controls
+                    let line = Line::from(vec![Span::styled(
+                        display_text,
+                        Style::default().fg(text_color),
+                    )]);
+                    items.push(ListItem::new(line));
+                }
+
+                let list = List::new(items)
+                    .block(Block::default().style(Style::default().bg(Color::Rgb(30, 30, 30))));
+                let list_area = Rect::new(
+                    inner.x,
+                    inner.y + 1,
+                    inner.width,
+                    inner.height.saturating_sub(1),
+                );
+                frame.render_widget(list, list_area);
+            }
+
+            return;
+        }
+
         let items: Vec<ListItem> = self
             .content
             .iter()
@@ -564,19 +916,44 @@ impl SourceCodePanel {
                     Style::default().fg(Color::DarkGray)
                 };
 
-                // Apply horizontal scrolling to the line content
-                let visible_line = if self.horizontal_scroll_offset < line.len() {
-                    &line[self.horizontal_scroll_offset..]
+                // Apply horizontal scrolling to the line content - use character-safe slicing
+                let mut visible_line = if self.horizontal_scroll_offset > 0 {
+                    // Use char indices to avoid splitting UTF-8 characters
+                    let chars: Vec<char> = line.chars().collect();
+                    if self.horizontal_scroll_offset < chars.len() {
+                        chars[self.horizontal_scroll_offset..].iter().collect()
+                    } else {
+                        String::new()
+                    }
                 } else {
-                    ""
+                    line.to_string()
                 };
 
+                // Ensure we don't exceed available width to prevent overflow
+                // Be very conservative with the margin to prevent any overflow
+                let max_visible_width = (self.area_width.saturating_sub(15)) as usize; // Very conservative margin
+                let original_width = visible_line.width();
+                if original_width > max_visible_width {
+                    // Truncate to prevent overflow using unicode width
+                    let mut truncated = String::new();
+                    let mut current_width = 0;
+                    for ch in visible_line.chars() {
+                        let char_width = ch.width().unwrap_or(1);
+                        if current_width + char_width > max_visible_width {
+                            break;
+                        }
+                        truncated.push(ch);
+                        current_width += char_width;
+                    }
+                    visible_line = truncated;
+                }
+
                 // Apply syntax highlighting to the visible portion
-                let highlighted_spans = self.highlight_line(visible_line);
+                let highlighted_spans = self.highlight_line(&visible_line);
 
                 // Overlay search highlights on top of syntax highlighting
                 let highlighted_spans =
-                    self.apply_search_overlay(visible_line, highlighted_spans, i);
+                    self.apply_search_overlay(&visible_line, highlighted_spans, i);
 
                 let mut spans = vec![Span::styled(format!("{:4} ", line_num), line_number_style)];
                 spans.extend(highlighted_spans);
@@ -678,8 +1055,8 @@ impl SourceCodePanel {
             }
         }
 
-        // Render search prompt at bottom-left when in search mode
-        if is_focused && self.search_mode {
+        // Render search prompt at bottom-left when in text search mode
+        if is_focused && self.mode == SourcePanelMode::TextSearch {
             let (slash_style, query_style, _overlay_style) = self.search_styles();
             let prompt_slash = "/";
             let prompt_query = &self.search_query;
@@ -696,7 +1073,8 @@ impl SourceCodePanel {
             );
         }
 
-        if is_focused && !self.content.is_empty() {
+        // Render cursor in normal mode
+        if is_focused && !self.content.is_empty() && self.mode == SourcePanelMode::Normal {
             self.ensure_column_bounds();
 
             let cursor_y =

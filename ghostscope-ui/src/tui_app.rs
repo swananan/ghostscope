@@ -37,6 +37,9 @@ pub struct TuiApp {
 
     // Event communication
     event_registry: EventRegistry,
+
+    // Route FileInfo to Source quick-open instead of command panel when active
+    route_file_info_to_file_search: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -53,6 +56,101 @@ pub enum LayoutMode {
 }
 
 impl TuiApp {
+    async fn handle_file_info(&mut self, groups: Vec<crate::events::SourceFileGroup>) {
+        if self.route_file_info_to_file_search {
+            // Let Source panel build a deduplicated set and manage filtering
+            self.source_panel.ingest_file_info_groups(&groups);
+            self.route_file_info_to_file_search = false;
+            return;
+        }
+
+        // Default behavior: render in command panel (existing formatting)
+        self.interactive_command_panel.handle_command_completed();
+
+        let total_files: usize = groups.iter().map(|g| g.files.len()).sum();
+        let mut response = format!(
+            "📁 Source Files by Module ({} modules, {} files):\n\n",
+            groups.len(),
+            total_files
+        );
+
+        if groups.is_empty() {
+            response.push_str("  No source files found.\n");
+        } else {
+            for group in groups {
+                let group_file_count = group.files.len();
+                response.push_str(&format!(
+                    "📦 {} ({} files)\n",
+                    group.module_path, group_file_count
+                ));
+
+                if group.files.is_empty() {
+                    response.push_str("  └─ (no files)\n\n");
+                    continue;
+                }
+
+                let mut dir_map: std::collections::BTreeMap<
+                    String,
+                    Vec<&crate::events::SourceFileInfo>,
+                > = std::collections::BTreeMap::new();
+                for f in &group.files {
+                    dir_map.entry(f.directory.clone()).or_default().push(f);
+                }
+
+                let dir_count = dir_map.len();
+                for (didx, (dir, files)) in dir_map.into_iter().enumerate() {
+                    let last_dir = didx + 1 == dir_count;
+                    let dir_prefix = if last_dir { "  └─" } else { "  ├─" };
+                    response.push_str(&format!("{} {} ({} files)\n", dir_prefix, dir, files.len()));
+
+                    for (fidx, file) in files.iter().enumerate() {
+                        let last_file = fidx + 1 == files.len();
+                        let file_prefix = if last_dir {
+                            if last_file {
+                                "     └─"
+                            } else {
+                                "     ├─"
+                            }
+                        } else if last_file {
+                            "  │  └─"
+                        } else {
+                            "  │  ├─"
+                        };
+                        let ext = std::path::Path::new(&file.path)
+                            .extension()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("")
+                            .to_ascii_lowercase();
+                        let icon = match ext.as_str() {
+                            "h" | "hpp" | "hh" | "hxx" => "📑",
+                            "c" | "cc" | "cpp" | "cxx" => "📝",
+                            "rs" => "🦀",
+                            "s" | "asm" => "🛠️",
+                            _ => "📄",
+                        };
+                        response.push_str(&format!("{} {} {}\n", file_prefix, icon, file.path));
+                    }
+                }
+
+                response.push('\n');
+            }
+        }
+
+        self.interactive_command_panel
+            .add_response(response, ResponseType::Success);
+        info!("File info displayed successfully");
+    }
+
+    async fn handle_file_info_failed(&mut self, error: String) {
+        if self.route_file_info_to_file_search {
+            // Route error into Source panel quick-open message
+            self.source_panel.set_file_search_error(error.clone());
+            self.route_file_info_to_file_search = false;
+        } else {
+            self.interactive_command_panel.handle_command_failed(&error);
+            error!("Failed to get file information: {}", error);
+        }
+    }
     pub async fn new(event_registry: EventRegistry, layout_mode: LayoutMode) -> Result<Self> {
         Ok(Self {
             should_quit: false,
@@ -64,6 +162,7 @@ impl TuiApp {
             expecting_window_nav: false,
             is_fullscreen: false,
             event_registry,
+            route_file_info_to_file_search: false,
         })
     }
 
@@ -267,8 +366,15 @@ impl TuiApp {
                 }
             }
             KeyCode::Tab => {
+                // In file search mode, Tab should move down in file list instead of cycling focus
+                if self.focused_panel == FocusedPanel::Source
+                    && self.source_panel.is_in_file_search_mode()
+                {
+                    debug!("Tab pressed in file search mode, moving down in file list");
+                    self.source_panel.move_file_search_down();
+                }
                 // In Script Editor mode, Tab should insert 4 spaces instead of cycling focus
-                if self.focused_panel == FocusedPanel::InteractiveCommand
+                else if self.focused_panel == FocusedPanel::InteractiveCommand
                     && self.interactive_command_panel.mode
                         == crate::panels::InteractionMode::ScriptEditor
                 {
@@ -280,10 +386,18 @@ impl TuiApp {
                 }
             }
             KeyCode::BackTab => {
-                // Shift+Tab: reverse cycle focus between panels
-                // In Script Editor mode, we still allow reverse cycling for navigation
-                debug!("Shift+Tab pressed, reverse cycling focus");
-                self.cycle_focus_reverse();
+                // In file search mode, Shift+Tab should move up in file list instead of cycling focus
+                if self.focused_panel == FocusedPanel::Source
+                    && self.source_panel.is_in_file_search_mode()
+                {
+                    debug!("Shift+Tab pressed in file search mode, moving up in file list");
+                    self.source_panel.move_file_search_up();
+                } else {
+                    // Shift+Tab: reverse cycle focus between panels
+                    // In Script Editor mode, we still allow reverse cycling for navigation
+                    debug!("Shift+Tab pressed, reverse cycling focus");
+                    self.cycle_focus_reverse();
+                }
             }
             _ => {
                 self.handle_panel_input(key).await?;
@@ -614,7 +728,7 @@ impl TuiApp {
             }
             FocusedPanel::Source => {
                 // When search mode is active, only handle input-related keys and ignore navigation
-                if self.source_panel.search_mode {
+                if self.source_panel.is_in_text_search_mode() {
                     match key.code {
                         crossterm::event::KeyCode::Char(c) => {
                             self.source_panel.push_search_char(c);
@@ -633,11 +747,57 @@ impl TuiApp {
                             // Ignore all other keys while searching
                         }
                     }
+                } else if self.source_panel.is_in_file_search_mode() {
+                    match key.code {
+                        // Handle Ctrl navigation first so it doesn't get swallowed by Char(c)
+                        crossterm::event::KeyCode::Char('n')
+                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            self.source_panel.move_file_search_down();
+                        }
+                        crossterm::event::KeyCode::Char('p')
+                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            self.source_panel.move_file_search_up();
+                        }
+                        crossterm::event::KeyCode::Char(c) => {
+                            self.source_panel.push_file_search_char(c);
+                        }
+                        crossterm::event::KeyCode::Backspace => {
+                            self.source_panel.backspace_file_search();
+                        }
+                        crossterm::event::KeyCode::Up => {
+                            self.source_panel.move_file_search_up();
+                        }
+                        crossterm::event::KeyCode::Down => {
+                            self.source_panel.move_file_search_down();
+                        }
+                        crossterm::event::KeyCode::Enter => {
+                            if let Some(path) = self.source_panel.confirm_file_search() {
+                                // Load file using the path as constructed (dir + path)
+                                self.source_panel.load_source(path, None);
+                                self.source_panel.exit_file_search_mode();
+                            }
+                        }
+                        crossterm::event::KeyCode::Esc => {
+                            self.source_panel.exit_file_search_mode();
+                        }
+                        _ => {}
+                    }
                 } else {
                     match key.code {
                         // Search mode trigger and input
                         crossterm::event::KeyCode::Char('/') => {
                             self.source_panel.enter_search_mode();
+                        }
+                        crossterm::event::KeyCode::Char('o') => {
+                            // Enter file search and request file list
+                            self.source_panel.enter_file_search_mode();
+                            self.route_file_info_to_file_search = true;
+                            let _ = self
+                                .event_registry
+                                .command_sender
+                                .send(RuntimeCommand::InfoSource);
                         }
                         crossterm::event::KeyCode::Enter => {
                             // no-op when not in search mode
@@ -688,13 +848,17 @@ impl TuiApp {
                 if key.modifiers.contains(KeyModifiers::CONTROL) {
                     match key.code {
                         KeyCode::Char('d') => {
-                            if !self.source_panel.search_mode {
+                            if !self.source_panel.is_in_text_search_mode()
+                                && !self.source_panel.is_in_file_search_mode()
+                            {
                                 self.source_panel.clear_number_buffer();
                                 self.source_panel.move_down_fast();
                             }
                         }
                         KeyCode::Char('u') => {
-                            if !self.source_panel.search_mode {
+                            if !self.source_panel.is_in_text_search_mode()
+                                && !self.source_panel.is_in_file_search_mode()
+                            {
                                 self.source_panel.clear_number_buffer();
                                 self.source_panel.move_up_fast();
                             }
@@ -1317,96 +1481,10 @@ impl TuiApp {
                 info!("Trace info displayed successfully");
             }
             RuntimeStatus::FileInfo { groups } => {
-                // Handle grouped InfoSource response and display module-wise
-                self.interactive_command_panel.handle_command_completed();
-
-                let total_files: usize = groups.iter().map(|g| g.files.len()).sum();
-                let mut response = format!(
-                    "📁 Source Files by Module ({} modules, {} files):\n\n",
-                    groups.len(),
-                    total_files
-                );
-
-                if groups.is_empty() {
-                    response.push_str("  No source files found.\n");
-                } else {
-                    for group in groups {
-                        let group_file_count = group.files.len();
-                        response.push_str(&format!(
-                            "📦 {} ({} files)\n",
-                            group.module_path, group_file_count
-                        ));
-
-                        if group.files.is_empty() {
-                            response.push_str("  └─ (no files)\n\n");
-                            continue;
-                        }
-
-                        // Group files by directory
-                        let mut dir_map: std::collections::BTreeMap<
-                            String,
-                            Vec<&crate::events::SourceFileInfo>,
-                        > = std::collections::BTreeMap::new();
-                        for f in &group.files {
-                            dir_map.entry(f.directory.clone()).or_default().push(f);
-                        }
-
-                        let dir_count = dir_map.len();
-                        for (didx, (dir, files)) in dir_map.into_iter().enumerate() {
-                            let last_dir = didx + 1 == dir_count;
-                            let dir_prefix = if last_dir { "  └─" } else { "  ├─" };
-                            response.push_str(&format!(
-                                "{} {} ({} files)\n",
-                                dir_prefix,
-                                dir,
-                                files.len()
-                            ));
-
-                            // Files within directory
-                            for (fidx, file) in files.iter().enumerate() {
-                                let last_file = fidx + 1 == files.len();
-                                let file_prefix = if last_dir {
-                                    if last_file {
-                                        "     └─"
-                                    } else {
-                                        "     ├─"
-                                    }
-                                } else {
-                                    if last_file {
-                                        "  │  └─"
-                                    } else {
-                                        "  │  ├─"
-                                    }
-                                };
-                                // File icon by extension (scheme 3)
-                                let ext = std::path::Path::new(&file.path)
-                                    .extension()
-                                    .and_then(|s| s.to_str())
-                                    .unwrap_or("")
-                                    .to_ascii_lowercase();
-                                let icon = match ext.as_str() {
-                                    "h" | "hpp" | "hh" | "hxx" => "📑",
-                                    "c" | "cc" | "cpp" | "cxx" => "📝",
-                                    "rs" => "🦀",
-                                    "s" | "asm" => "🛠️",
-                                    _ => "📄",
-                                };
-                                response
-                                    .push_str(&format!("{} {} {}\n", file_prefix, icon, file.path));
-                            }
-                        }
-
-                        response.push('\n');
-                    }
-                }
-
-                self.interactive_command_panel
-                    .add_response(response, ResponseType::Success);
-                info!("File info displayed successfully");
+                self.handle_file_info(groups).await;
             }
             RuntimeStatus::FileInfoFailed { error } => {
-                self.interactive_command_panel.handle_command_failed(&error);
-                error!("Failed to get file information: {}", error);
+                self.handle_file_info_failed(error).await;
             }
             RuntimeStatus::ShareInfo { libraries } => {
                 // Handle InfoShare response and display shared library information
