@@ -137,6 +137,9 @@ struct VariableInfo {
 struct AddressInfo {
     module: String,
     address: String,
+    source_file: Option<String>,
+    source_line: Option<u32>,
+    source_column: Option<u32>,
     variables: Vec<VariableInfo>,
 }
 
@@ -257,7 +260,10 @@ fn resolve_target_path(target: &str) -> Option<String> {
         // 3. If not found, still convert to absolute path based on current directory
         if let Ok(current_dir) = std::env::current_dir() {
             let absolute_target = current_dir.join(target);
-            warn!("Target file not found, using absolute path: {}", absolute_target.display());
+            warn!(
+                "Target file not found, using absolute path: {}",
+                absolute_target.display()
+            );
             Some(absolute_target.to_string_lossy().to_string())
         } else {
             warn!("Cannot determine current directory for target: {}", target);
@@ -362,7 +368,11 @@ async fn load_analyzer_and_execute(cli: Cli) -> Result<std::time::Duration> {
         };
 
         if cli.pid.is_some() {
-            println!("Loading modules from PID {}... [{}]", cli.pid.unwrap(), mode);
+            println!(
+                "Loading modules from PID {}... [{}]",
+                cli.pid.unwrap(),
+                mode
+            );
         } else if let Some(ref target) = cli.target {
             println!("Loading target file {}... [{}]", target, mode);
         }
@@ -380,7 +390,9 @@ async fn load_analyzer_and_execute(cli: Cli) -> Result<std::time::Duration> {
         // Target path mode: load from executable file
         DwarfAnalyzer::from_exec_path(target_path)?
     } else {
-        return Err(anyhow::anyhow!("Either PID or target path must be specified"));
+        return Err(anyhow::anyhow!(
+            "Either PID or target path must be specified"
+        ));
     };
     let loading_time = start.elapsed();
 
@@ -440,6 +452,7 @@ async fn analyze_source_location(
     if options.json() {
         for module_address in &addresses {
             let variables = analyzer.get_all_variables_at_address(module_address)?;
+            let source_location = analyzer.lookup_source_location(module_address);
 
             let var_infos: Vec<VariableInfo> = variables
                 .iter()
@@ -457,6 +470,9 @@ async fn analyze_source_location(
             address_infos.push(AddressInfo {
                 module: module_address.module_display().to_string(),
                 address: format!("0x{:x}", module_address.address),
+                source_file: source_location.as_ref().map(|sl| sl.file_path.clone()),
+                source_line: source_location.as_ref().map(|sl| sl.line_number),
+                source_column: source_location.as_ref().and_then(|sl| sl.column),
                 variables: var_infos,
             });
         }
@@ -536,6 +552,7 @@ async fn analyze_function(
             for addr in &addrs {
                 let module_address = ModuleAddress::new(module_path.clone(), *addr);
                 let variables = analyzer.get_all_variables_at_address(&module_address)?;
+                let source_location = analyzer.lookup_source_location(&module_address);
 
                 let var_infos: Vec<VariableInfo> = variables
                     .iter()
@@ -553,6 +570,9 @@ async fn analyze_function(
                 address_infos.push(AddressInfo {
                     module: module_path.display().to_string(),
                     address: format!("0x{:x}", addr),
+                    source_file: source_location.as_ref().map(|sl| sl.file_path.clone()),
+                    source_line: source_location.as_ref().map(|sl| sl.line_number),
+                    source_column: source_location.as_ref().and_then(|sl| sl.column),
                     variables: var_infos,
                 });
             }
@@ -583,6 +603,9 @@ async fn analyze_function(
 
             let variables = analyzer.get_all_variables_at_address(module_address)?;
 
+            // Query source location for this address
+            let source_location = analyzer.lookup_source_location(module_address);
+
             if options.quiet() {
                 for var in &variables {
                     // Use DWARF type if available, otherwise fall back to type name
@@ -596,6 +619,17 @@ async fn analyze_function(
                 }
             } else {
                 println!("  Address: 0x{:x}", module_address.address);
+
+                // Display source location if available
+                if let Some(src_loc) = source_location {
+                    println!("  Source:  {}:{}", src_loc.file_path, src_loc.line_number);
+                    if let Some(column) = src_loc.column {
+                        println!("  Column:  {}", column);
+                    }
+                } else {
+                    println!("  Source:  (no source information available)");
+                }
+
                 if variables.is_empty() {
                     println!("    No variables found");
                 } else {
@@ -632,9 +666,14 @@ async fn analyze_module_address(
                     })
                     .collect();
 
+                let source_location = analyzer.lookup_source_location(&module_address);
+
                 let result = AddressInfo {
                     module: module_path.to_string(),
                     address: format!("0x{:x}", address),
+                    source_file: source_location.as_ref().map(|sl| sl.file_path.clone()),
+                    source_line: source_location.as_ref().map(|sl| sl.line_number),
+                    source_column: source_location.as_ref().and_then(|sl| sl.column),
                     variables: var_infos,
                 };
                 println!("{}", serde_json::to_string_pretty(&result)?);
@@ -761,7 +800,9 @@ async fn run_benchmark(pid: Option<u32>, target_path: Option<&str>, runs: usize)
         println!("  Min: {}ms", load_times.iter().min().unwrap().as_millis());
         println!("  Max: {}ms", load_times.iter().max().unwrap().as_millis());
     } else {
-        return Err(anyhow::anyhow!("Either PID or target path must be specified for benchmark"));
+        return Err(anyhow::anyhow!(
+            "Either PID or target path must be specified for benchmark"
+        ));
     }
 
     Ok(())

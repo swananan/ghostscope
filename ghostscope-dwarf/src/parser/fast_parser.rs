@@ -2,7 +2,10 @@
 
 use crate::{
     core::{IndexEntry, Result},
-    data::{CompilationUnit, LightweightIndex, LineMappingTable, SourceFile, SourceFileManager},
+    data::{
+        CompilationUnit, LightweightFileIndex, LightweightIndex, LineMappingTable,
+        ScopedFileIndexManager, SourceFile, SourceFileManager,
+    },
     parser::RangeExtractor,
 };
 use gimli::{DebugInfoOffset, EndianSlice, LittleEndian};
@@ -14,7 +17,25 @@ pub struct DwarfParseResult {
     pub lightweight_index: LightweightIndex,
     pub line_mapping: LineMappingTable,
     pub source_file_manager: SourceFileManager,
+    pub scoped_file_manager: Option<ScopedFileIndexManager>, // New optimized file index
     pub stats: DwarfParseStats,
+}
+
+/// Result of debug_line parsing only (for parallel processing)
+pub struct DebugLineParseResult {
+    pub line_mapping: LineMappingTable,
+    pub scoped_file_manager: ScopedFileIndexManager,
+    pub line_entries_count: usize,
+    pub files_count: usize,
+    pub compilation_units_count: usize,
+    pub compilation_unit_names: Vec<String>,
+}
+
+/// Result of debug_info parsing only (for parallel processing)
+pub struct DebugInfoParseResult {
+    pub lightweight_index: LightweightIndex,
+    pub functions_count: usize,
+    pub variables_count: usize,
 }
 
 /// Parsing statistics for logging and debugging
@@ -56,6 +77,9 @@ struct ParseResultBuilder {
     total_files: usize,
     total_compilation_units: usize,
 
+    // For ScopedFileIndexManager (optimized)
+    scoped_file_manager: ScopedFileIndexManager,
+
     // For stats
     compilation_unit_names: Vec<String>,
 }
@@ -73,6 +97,7 @@ impl ParseResultBuilder {
             files_by_index: HashMap::new(),
             total_files: 0,
             total_compilation_units: 0,
+            scoped_file_manager: ScopedFileIndexManager::new(),
             compilation_unit_names: Vec::new(),
         }
     }
@@ -82,11 +107,15 @@ impl ParseResultBuilder {
         let lightweight_index =
             LightweightIndex::from_builder_data(self.functions.clone(), self.variables.clone());
 
-        let line_mapping = LineMappingTable::from_entries(self.line_entries.clone());
+        // Post-process line entries to fill in file paths using scoped file manager
+        let processed_line_entries =
+            Self::post_process_line_entries(&self.line_entries, &self.scoped_file_manager);
+
+        let line_mapping = LineMappingTable::from_entries(processed_line_entries);
 
         let source_file_manager = SourceFileManager::from_builder_data(
-            self.compilation_units,
-            self.files_by_index,
+            self.compilation_units.clone(),
+            self.files_by_index.clone(),
             self.total_files,
             self.total_compilation_units,
         );
@@ -107,8 +136,45 @@ impl ParseResultBuilder {
             lightweight_index,
             line_mapping,
             source_file_manager,
+            scoped_file_manager: Some(self.scoped_file_manager), // Use built scoped manager
             stats,
         }
+    }
+
+    /// Post-process line entries to fill in file paths using intelligent file selection
+    fn post_process_line_entries(
+        line_entries: &[crate::core::LineEntry],
+        scoped_manager: &ScopedFileIndexManager,
+    ) -> Vec<crate::core::LineEntry> {
+        line_entries
+            .iter()
+            .map(|entry| {
+                // If file_path is already filled, keep it; otherwise resolve it
+                let file_path = if entry.file_path.is_empty() {
+                    DwarfParser::resolve_file_path_with_smart_selection(
+                        scoped_manager,
+                        &entry.compilation_unit,
+                        entry.file_index,
+                    )
+                } else {
+                    entry.file_path.clone()
+                };
+
+                // Create new entry with resolved file path
+                crate::core::LineEntry {
+                    address: entry.address,
+                    file_path,
+                    file_index: entry.file_index,
+                    compilation_unit: entry.compilation_unit.clone(),
+                    line: entry.line,
+                    column: entry.column,
+                    is_stmt: entry.is_stmt,
+                    prologue_end: entry.prologue_end,
+                    epilogue_begin: entry.epilogue_begin,
+                    end_sequence: entry.end_sequence,
+                }
+            })
+            .collect()
     }
 }
 
@@ -180,53 +246,31 @@ impl<'a> DwarfParser<'a> {
         Ok(result)
     }
 
-    /// Process single compilation unit - extract ALL information in one pass
+    /// Process single compilation unit - decoupled debug_line and debug_info processing
+    /// (Architecture ready for parallelization, currently sequential for simplicity)
     fn process_compilation_unit(
         &self,
         unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
         unit_offset: DebugInfoOffset,
         builder: &mut ParseResultBuilder,
     ) -> Result<()> {
-        // Step 1: Parse line program first (provides file mapping)
-        let file_index_map = self.parse_line_program(unit, builder)?;
-
-        // Step 2: Single DIE traversal (uses file mapping from step 1)
-        self.parse_dies(unit, unit_offset, &file_index_map, builder)?;
-
-        Ok(())
-    }
-
-    /// Parse line program and extract line entries + file information
-    fn parse_line_program(
-        &self,
-        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
-        builder: &mut ParseResultBuilder,
-    ) -> Result<HashMap<u64, String>> {
-        let mut file_index_map = HashMap::new();
-
-        if let Some(line_program) = unit.line_program.clone() {
+        // Phase 1: Process debug_line section (file info + line entries)
+        if let Some(ref line_program) = unit.line_program {
             // Extract file information
             let compilation_unit =
-                self.extract_file_info_from_line_program(&self.dwarf, unit, &line_program)?;
+                self.extract_file_info_from_line_program(&self.dwarf, unit, line_program)?;
 
-            // Build file index map for DIE processing
-            for file in &compilation_unit.files {
-                file_index_map.insert(file.file_index, file.full_path.clone());
-            }
-
-            // Extract line entries with file path mapping (pass compilation unit name for scoped file_index)
-            self.extract_line_entries(
-                &line_program,
-                &file_index_map,
-                &compilation_unit.name,
-                builder,
-            )?;
+            // Extract line entries (file_index only, file_path resolved later via ScopedFileIndexManager)
+            self.extract_line_entries(line_program, &compilation_unit.name, builder)?;
 
             // Add to file manager structures
             self.add_compilation_unit_to_builder(compilation_unit, builder);
         }
 
-        Ok(file_index_map)
+        // Phase 2: Process debug_info section (functions + variables)
+        self.parse_dies(unit, unit_offset, builder)?;
+
+        Ok(())
     }
 
     /// Single DIE traversal - extract functions, variables, etc.
@@ -234,7 +278,6 @@ impl<'a> DwarfParser<'a> {
         &self,
         unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
         unit_offset: DebugInfoOffset,
-        file_index_map: &HashMap<u64, String>,
         builder: &mut ParseResultBuilder,
     ) -> Result<()> {
         let mut entries = unit.entries();
@@ -242,14 +285,7 @@ impl<'a> DwarfParser<'a> {
 
         while let Some((_, entry)) = entries.next_dfs()? {
             die_count += 1;
-            self.process_die_entry(
-                &self.dwarf,
-                unit,
-                entry,
-                unit_offset,
-                file_index_map,
-                builder,
-            )?;
+            self.process_die_entry(&self.dwarf, unit, entry, unit_offset, builder)?;
         }
 
         debug!(
@@ -266,7 +302,6 @@ impl<'a> DwarfParser<'a> {
         unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
         entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
         unit_offset: DebugInfoOffset,
-        _file_index_map: &HashMap<u64, String>,
         builder: &mut ParseResultBuilder,
     ) -> Result<()> {
         match entry.tag() {
@@ -501,14 +536,15 @@ impl<'a> DwarfParser<'a> {
 
         debug!("Extracting files from compilation unit: {}", cu_name);
 
+        let header = line_program.header();
+
         let mut compilation_unit = CompilationUnit {
             name: cu_name.clone(),
             base_directory: Self::get_comp_dir(dwarf, unit).unwrap_or_default(),
             include_directories: Vec::new(),
             files: Vec::new(),
+            dwarf_version: header.version(),
         };
-
-        let header = line_program.header();
 
         // Extract include directories
         for (dir_index, dir_entry) in header.include_directories().into_iter().enumerate() {
@@ -547,11 +583,10 @@ impl<'a> DwarfParser<'a> {
         Ok(compilation_unit)
     }
 
-    /// Extract line entries from line program
+    /// Extract line entries from line program (file_index only, file_path resolved later)
     fn extract_line_entries(
         &self,
         line_program: &gimli::IncompleteLineProgram<EndianSlice<'static, LittleEndian>>,
-        file_index_map: &HashMap<u64, String>,
         compilation_unit_name: &str,
         builder: &mut ParseResultBuilder,
     ) -> Result<()> {
@@ -565,14 +600,12 @@ impl<'a> DwarfParser<'a> {
                     gimli::ColumnType::Column(x) => x.get(),
                 };
 
-                // Get file path from the map, fallback to empty string if not found
-                let file_path = file_index_map
-                    .get(&line_row.file_index())
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        tracing::warn!("File index {} not found in map", line_row.file_index());
-                        String::new()
-                    });
+                // Resolve file path using scoped file manager with intelligent file selection
+                let file_path = Self::resolve_file_path_with_smart_selection(
+                    &builder.scoped_file_manager,
+                    compilation_unit_name,
+                    line_row.file_index(),
+                );
 
                 let line_entry = crate::core::LineEntry {
                     address: line_row.address(),
@@ -606,19 +639,38 @@ impl<'a> DwarfParser<'a> {
             compilation_unit.files.len()
         );
 
+        let cu_name = compilation_unit.name.clone(); // Clone once
+
         // Update file indices for fast lookup (with compilation unit scope)
         for file in &compilation_unit.files {
-            builder.files_by_index.insert(
-                (compilation_unit.name.clone(), file.file_index),
-                file.clone(),
-            );
+            builder
+                .files_by_index
+                .insert((cu_name.clone(), file.file_index), file.clone());
             builder.total_files += 1;
         }
 
+        // Add to optimized ScopedFileIndexManager
+        let mut file_index = LightweightFileIndex::new(
+            Some(compilation_unit.base_directory.clone()),
+            compilation_unit.dwarf_version,
+        );
+
+        // Add directories
+        for directory in &compilation_unit.include_directories {
+            file_index.add_directory(directory.clone());
+        }
+
+        // Add files
+        for file in &compilation_unit.files {
+            file_index.add_file_entry(file.file_index, file.directory_index, file.filename.clone());
+        }
+
         builder
-            .compilation_units
-            .insert(compilation_unit.name.clone(), compilation_unit.clone());
-        builder.compilation_unit_names.push(compilation_unit.name);
+            .scoped_file_manager
+            .add_compilation_unit(cu_name.clone(), file_index);
+
+        builder.compilation_unit_names.push(cu_name.clone());
+        builder.compilation_units.insert(cu_name, compilation_unit);
         builder.total_compilation_units += 1;
     }
 
@@ -754,6 +806,646 @@ impl<'a> DwarfParser<'a> {
                 }
             }
         }
+        None
+    }
+
+    /// Parse debug_line sections only (for parallel processing)
+    pub fn parse_debug_line_only(&self, module_path: &str) -> Result<DebugLineParseResult> {
+        debug!("Starting debug_line-only parsing for: {}", module_path);
+
+        let mut scoped_file_manager = ScopedFileIndexManager::new();
+        let mut line_entries = Vec::new();
+        let mut compilation_unit_names = Vec::new();
+        let mut total_files = 0;
+        let mut total_compilation_units = 0;
+
+        // Parse all compilation units for line information only
+        let mut units = self.dwarf.units();
+        while let Ok(Some(header)) = units.next() {
+            let unit = self.dwarf.unit(header)?;
+
+            if let Some(ref line_program) = unit.line_program {
+                // Get compilation unit name
+                let cu_name = Self::get_compilation_unit_name(&self.dwarf, &unit)
+                    .unwrap_or_else(|| "unknown".to_string());
+                let comp_dir = Self::get_comp_dir(&self.dwarf, &unit);
+
+                // Create lightweight file index for this CU
+                let mut file_index = LightweightFileIndex::new(comp_dir, header.version());
+
+                let header = line_program.header();
+
+                // Add directories from line program
+                for dir_entry in header.include_directories() {
+                    if let Ok(dir_path) = self.dwarf.attr_string(&unit, *dir_entry) {
+                        file_index.add_directory(dir_path.to_string_lossy().into_owned());
+                    }
+                }
+
+                // Add files from line program (minimal storage)
+                for (file_idx, file_entry) in header.file_names().into_iter().enumerate() {
+                    let file_index_value = if header.version() >= 5 {
+                        file_idx as u64 // DWARF 5: 0-based
+                    } else {
+                        (file_idx + 1) as u64 // DWARF 4: 1-based
+                    };
+
+                    if let Ok(filename) = self.dwarf.attr_string(&unit, file_entry.path_name()) {
+                        let dir_index = file_entry.directory_index();
+                        file_index.add_file_entry(
+                            file_index_value,
+                            dir_index,
+                            filename.to_string_lossy().into_owned(),
+                        );
+                    }
+                }
+
+                let (files_count, _) = file_index.get_stats();
+                total_files += files_count;
+                total_compilation_units += 1;
+                compilation_unit_names.push(cu_name.clone());
+
+                // Add to scoped manager
+                scoped_file_manager.add_compilation_unit(cu_name.clone(), file_index);
+
+                // Extract line entries (file_index only, file_path resolved later via ScopedFileIndexManager)
+                let (line_program, sequences) = line_program.clone().sequences()?;
+                for seq in sequences {
+                    let mut rows = line_program.resume_from(&seq);
+                    while let Some((_, line_row)) = rows.next_row()? {
+                        let column = match line_row.column() {
+                            gimli::ColumnType::LeftEdge => 0,
+                            gimli::ColumnType::Column(x) => x.get(),
+                        };
+
+                        // Create LineEntry with file_index only (file_path resolved later via ScopedFileIndexManager)
+                        let line_entry = crate::core::LineEntry {
+                            address: line_row.address(),
+                            file_path: String::new(), // Placeholder, resolved later via ScopedFileIndexManager
+                            file_index: line_row.file_index(),
+                            compilation_unit: cu_name.clone(),
+                            line: line_row.line().map(|l| l.get()).unwrap_or(0),
+                            column,
+                            is_stmt: line_row.is_stmt(),
+                            prologue_end: line_row.prologue_end(),
+                            epilogue_begin: line_row.epilogue_begin(),
+                            end_sequence: line_row.end_sequence(),
+                        };
+
+                        line_entries.push(line_entry);
+                    }
+                }
+            }
+        }
+
+        let line_mapping = LineMappingTable::from_entries(line_entries.clone());
+
+        debug!(
+            "Completed debug_line parsing for {}: {} line entries, {} files, {} compilation units",
+            module_path,
+            line_entries.len(),
+            total_files,
+            total_compilation_units
+        );
+
+        Ok(DebugLineParseResult {
+            line_mapping,
+            scoped_file_manager,
+            line_entries_count: line_entries.len(),
+            files_count: total_files,
+            compilation_units_count: total_compilation_units,
+            compilation_unit_names,
+        })
+    }
+
+    /// Parse debug_info sections only (for parallel processing)
+    pub fn parse_debug_info_only(&self, module_path: &str) -> Result<DebugInfoParseResult> {
+        debug!("Starting debug_info-only parsing for: {}", module_path);
+
+        let mut functions: HashMap<String, Vec<IndexEntry>> = HashMap::new();
+        let mut variables: HashMap<String, Vec<IndexEntry>> = HashMap::new();
+        let mut total_functions = 0;
+
+        // Parse all compilation units for debug info only
+        let mut units = self.dwarf.units();
+        while let Ok(Some(header)) = units.next() {
+            let unit = self.dwarf.unit(header)?;
+
+            let unit_offset = match header.offset() {
+                gimli::UnitSectionOffset::DebugInfoOffset(offset) => offset,
+                _ => continue,
+            };
+
+            // Parse DIEs without file path resolution (will be resolved later)
+            let mut entries = unit.entries();
+            while let Some((_, entry)) = entries.next_dfs()? {
+                match entry.tag() {
+                    gimli::constants::DW_TAG_subprogram => {
+                        if let Some(name) = self.extract_name(&self.dwarf, &unit, entry)? {
+                            let mut flags = crate::core::IndexFlags::default();
+                            flags.is_static = self.is_static_symbol(entry).unwrap_or(false);
+                            flags.is_main = self.is_main_function(entry, &name).unwrap_or(false);
+
+                            let address_ranges =
+                                self.extract_address_ranges(&self.dwarf, &unit, entry)?;
+
+                            let index_entry = IndexEntry {
+                                name: name.clone(),
+                                die_offset: entry.offset(),
+                                unit_offset,
+                                tag: entry.tag(),
+                                flags,
+                                language: self.extract_language(&self.dwarf, &unit, entry),
+                                address_ranges: address_ranges.clone(),
+                            };
+
+                            functions.entry(name).or_default().push(index_entry);
+
+                            if !address_ranges.is_empty() {
+                                total_functions += 1;
+                            }
+                        }
+                    }
+                    gimli::constants::DW_TAG_inlined_subroutine => {
+                        if let Some(name) = self.extract_name(&self.dwarf, &unit, entry)? {
+                            let mut flags = crate::core::IndexFlags::default();
+                            flags.is_inline = true;
+
+                            let address_ranges =
+                                self.extract_address_ranges(&self.dwarf, &unit, entry)?;
+
+                            let index_entry = IndexEntry {
+                                name: name.clone(),
+                                die_offset: entry.offset(),
+                                unit_offset,
+                                tag: entry.tag(),
+                                flags,
+                                language: self.extract_language(&self.dwarf, &unit, entry),
+                                address_ranges: address_ranges.clone(),
+                            };
+
+                            functions.entry(name).or_default().push(index_entry);
+
+                            if !address_ranges.is_empty() {
+                                total_functions += 1;
+                            }
+                        }
+                    }
+                    gimli::constants::DW_TAG_variable => {
+                        if let Some(name) = self.extract_name(&self.dwarf, &unit, entry)? {
+                            let mut flags = crate::core::IndexFlags::default();
+                            flags.is_static = self.is_static_symbol(entry).unwrap_or(false);
+
+                            let address_ranges = if flags.is_static {
+                                self.extract_variable_address(entry)
+                                    .ok()
+                                    .flatten()
+                                    .map(|addr| vec![(addr, addr)])
+                                    .unwrap_or_else(Vec::new)
+                            } else {
+                                Vec::new()
+                            };
+
+                            let index_entry = IndexEntry {
+                                name: name.clone(),
+                                die_offset: entry.offset(),
+                                unit_offset,
+                                tag: entry.tag(),
+                                flags,
+                                language: self.extract_language(&self.dwarf, &unit, entry),
+                                address_ranges,
+                            };
+
+                            variables.entry(name).or_default().push(index_entry);
+                        }
+                    }
+                    _ => {} // Skip other DIE types
+                }
+            }
+        }
+
+        let lightweight_index =
+            LightweightIndex::from_builder_data(functions.clone(), variables.clone());
+
+        debug!(
+            "Completed debug_info parsing for {}: {} functions, {} variables",
+            module_path,
+            functions.len(),
+            variables.len()
+        );
+
+        Ok(DebugInfoParseResult {
+            lightweight_index,
+            functions_count: functions.len(),
+            variables_count: variables.len(),
+        })
+    }
+
+    /// Assemble parallel parse results into unified result
+    pub fn assemble_parallel_results(
+        line_result: DebugLineParseResult,
+        info_result: DebugInfoParseResult,
+        module_path: String,
+    ) -> DwarfParseResult {
+        debug!("Assembling parallel parse results for: {}", module_path);
+
+        // Create SourceFileManager from ScopedFileIndexManager data
+        // We need to reconstruct the compilation units and files_by_index
+        let mut compilation_units = HashMap::new();
+        let mut files_by_index = HashMap::new();
+
+        // Extract compilation unit info from ScopedFileIndexManager
+        // Convert lightweight file manager to old format for compatibility
+        for cu_name in &line_result.compilation_unit_names {
+            // TODO: This is a temporary compatibility layer - eventually we'll use the lightweight index directly
+
+            // Create minimal compilation unit (files managed by ScopedFileIndexManager)
+            let compilation_unit = CompilationUnit {
+                name: cu_name.clone(),
+                base_directory: String::new(),
+                include_directories: Vec::new(),
+                files: Vec::new(), // Files managed by ScopedFileIndexManager now
+                dwarf_version: 4,  // Default for parallel compatibility
+            };
+
+            compilation_units.insert(cu_name.clone(), compilation_unit);
+        }
+
+        let source_file_manager = SourceFileManager::from_builder_data(
+            compilation_units,
+            files_by_index,
+            line_result.files_count,
+            line_result.compilation_units_count,
+        );
+
+        let stats = DwarfParseStats {
+            module_path,
+            total_functions: info_result.functions_count,
+            debug_info_functions: info_result.functions_count,
+            symbol_table_functions: 0,
+            total_variables: info_result.variables_count,
+            total_line_entries: line_result.line_entries_count,
+            total_files: line_result.files_count,
+            total_compilation_units: line_result.compilation_units_count,
+            compilation_unit_names: line_result.compilation_unit_names,
+        };
+
+        DwarfParseResult {
+            lightweight_index: info_result.lightweight_index,
+            line_mapping: line_result.line_mapping,
+            source_file_manager,
+            scoped_file_manager: Some(line_result.scoped_file_manager), // Use optimized scoped file manager
+            stats,
+        }
+    }
+
+    // ===== Static methods for parallel processing =====
+
+    /// Static version of extract_file_info_from_line_program for parallel use
+    fn extract_file_info_from_line_program_static(
+        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
+        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
+        line_program: &gimli::IncompleteLineProgram<EndianSlice<'static, LittleEndian>>,
+    ) -> Result<crate::data::CompilationUnit> {
+        let cu_name = Self::get_compilation_unit_name_static(dwarf, unit)
+            .unwrap_or_else(|| format!("unknown_cu_{:?}", unit.header.offset()));
+
+        debug!("Extracting files from compilation unit: {}", cu_name);
+
+        let header = line_program.header();
+        let mut compilation_unit = crate::data::CompilationUnit {
+            name: cu_name.clone(),
+            base_directory: Self::get_comp_dir_static(dwarf, unit)
+                .unwrap_or_else(|| ".".to_string()),
+            include_directories: Vec::new(),
+            files: Vec::new(),
+            dwarf_version: header.version(),
+        };
+
+        // Extract include directories
+        compilation_unit.include_directories = header
+            .include_directories()
+            .iter()
+            .enumerate()
+            .map(|(i, path)| {
+                let path_str = dwarf
+                    .attr_string(unit, *path)
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| format!("unknown_dir_{}", i));
+                debug!("Include directory [{}]: '{}'", i + 1, path_str);
+                path_str
+            })
+            .collect();
+
+        // Extract file entries
+        for (file_index, file_entry) in header.file_names().iter().enumerate() {
+            match Self::extract_source_file_static(
+                dwarf,
+                unit,
+                file_index as u64,
+                file_entry,
+                &cu_name,
+                &compilation_unit.include_directories,
+            ) {
+                Ok(source_file) => {
+                    compilation_unit.files.push(source_file);
+                }
+                Err(e) => {
+                    debug!("Skipping file entry {}: {}", file_index, e);
+                }
+            }
+        }
+
+        debug!(
+            "Extracted {} files from compilation unit {}",
+            compilation_unit.files.len(),
+            cu_name
+        );
+
+        Ok(compilation_unit)
+    }
+
+    /// Static version of extract_line_entries for parallel use
+    fn extract_line_entries_static(
+        line_program: &gimli::IncompleteLineProgram<EndianSlice<'static, LittleEndian>>,
+        compilation_unit_name: &str,
+    ) -> Result<Vec<crate::core::LineEntry>> {
+        let (line_program, sequences) = line_program.clone().sequences()?;
+        let mut line_entries = Vec::new();
+
+        for seq in sequences {
+            let mut rows = line_program.resume_from(&seq);
+            while let Some((_, line_row)) = rows.next_row()? {
+                let column = match line_row.column() {
+                    gimli::ColumnType::LeftEdge => 0,
+                    gimli::ColumnType::Column(x) => x.get(),
+                };
+
+                // File path will be resolved later in post-processing
+                // (Static method doesn't have access to scoped file manager)
+                let file_path = String::new();
+
+                let line_entry = crate::core::LineEntry {
+                    address: line_row.address(),
+                    file_path,
+                    file_index: line_row.file_index(),
+                    compilation_unit: compilation_unit_name.to_string(),
+                    line: line_row.line().map(|l| l.get()).unwrap_or(0),
+                    column,
+                    is_stmt: line_row.is_stmt(),
+                    prologue_end: line_row.prologue_end(),
+                    epilogue_begin: line_row.epilogue_begin(),
+                    end_sequence: line_row.end_sequence(),
+                };
+
+                line_entries.push(line_entry);
+            }
+        }
+
+        Ok(line_entries)
+    }
+
+    /// Static version of parse_dies for parallel use
+    fn parse_dies_static(
+        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
+        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
+        unit_offset: DebugInfoOffset,
+    ) -> Result<Vec<crate::core::IndexEntry>> {
+        let mut entries = unit.entries();
+        let mut index_entries = Vec::new();
+
+        while let Some((_, entry)) = entries.next_dfs()? {
+            match entry.tag() {
+                gimli::constants::DW_TAG_subprogram => {
+                    if let Some(name) = Self::extract_name_static(dwarf, unit, entry)? {
+                        debug!("Found function: '{}' at offset {:?}", name, entry.offset());
+
+                        let address_ranges =
+                            crate::parser::RangeExtractor::extract_all_ranges(entry, unit, dwarf)?;
+
+                        let index_entry = crate::core::IndexEntry {
+                            name: name.clone(),
+                            die_offset: entry.offset(),
+                            unit_offset,
+                            tag: gimli::constants::DW_TAG_subprogram,
+                            flags: crate::core::IndexFlags::default(),
+                            language: None,
+                            address_ranges,
+                        };
+                        index_entries.push(index_entry);
+                    }
+                }
+                gimli::constants::DW_TAG_variable => {
+                    if let Some(name) = Self::extract_name_static(dwarf, unit, entry)? {
+                        debug!("Found variable: '{}' at offset {:?}", name, entry.offset());
+
+                        let index_entry = crate::core::IndexEntry {
+                            name,
+                            die_offset: entry.offset(),
+                            unit_offset,
+                            tag: gimli::constants::DW_TAG_variable,
+                            flags: crate::core::IndexFlags::default(),
+                            language: None,
+                            address_ranges: Vec::new(), // Variables may not have fixed addresses
+                        };
+                        index_entries.push(index_entry);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(index_entries)
+    }
+
+    /// Static helper methods
+
+    fn get_compilation_unit_name_static(
+        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
+        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
+    ) -> Option<String> {
+        let mut entries = unit.entries();
+        let (_, entry) = entries.next_dfs().ok()??;
+
+        if let Ok(Some(name_attr)) = entry.attr_value(gimli::constants::DW_AT_name) {
+            if let Ok(name) = dwarf.attr_string(unit, name_attr) {
+                return Some(name.to_string_lossy().into_owned());
+            }
+        }
+
+        None
+    }
+
+    fn get_comp_dir_static(
+        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
+        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
+    ) -> Option<String> {
+        let mut entries = unit.entries();
+        let (_, entry) = entries.next_dfs().ok()??;
+
+        if let Ok(Some(comp_dir_attr)) = entry.attr_value(gimli::constants::DW_AT_comp_dir) {
+            if let Ok(comp_dir) = dwarf.attr_string(unit, comp_dir_attr) {
+                return Some(comp_dir.to_string_lossy().into_owned());
+            }
+        }
+
+        None
+    }
+
+    fn extract_name_static(
+        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
+        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
+    ) -> Result<Option<String>> {
+        if let Ok(Some(name_attr)) = entry.attr_value(gimli::constants::DW_AT_name) {
+            if let Ok(name) = dwarf.attr_string(unit, name_attr) {
+                return Ok(Some(name.to_string_lossy().into_owned()));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn extract_source_file_static(
+        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
+        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
+        file_index: u64,
+        file_entry: &gimli::FileEntry<EndianSlice<'static, LittleEndian>>,
+        compilation_unit: &str,
+        include_directories: &[String],
+    ) -> anyhow::Result<crate::data::SourceFile> {
+        // Get directory path
+        let dir_index = file_entry.directory_index();
+        let directory_path = if dir_index == 0 {
+            Self::get_comp_dir_static(dwarf, unit).unwrap_or_else(|| ".".to_string())
+        } else {
+            let actual_index = (dir_index - 1) as usize;
+            include_directories
+                .get(actual_index)
+                .cloned()
+                .unwrap_or_else(|| ".".to_string())
+        };
+
+        // Get filename
+        let filename = dwarf
+            .attr_string(unit, file_entry.path_name())
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "unknown".to_string());
+
+        // Filter out system files
+        if filename == "<built-in>" {
+            return Err(anyhow::anyhow!("Skipping system file"));
+        }
+
+        // Create full path
+        let full_path = if directory_path == "." || directory_path.is_empty() {
+            filename.clone()
+        } else if filename.starts_with('/') {
+            filename.clone()
+        } else {
+            format!("{}/{}", directory_path, filename)
+        };
+
+        debug!(
+            "extract_source_file: file_index={}, dir_index={}, directory_path='{}', filename='{}', full_path='{}'",
+            file_index, dir_index, directory_path, filename, full_path
+        );
+
+        Ok(crate::data::SourceFile {
+            file_index,
+            compilation_unit: compilation_unit.to_string(),
+            directory_index: dir_index,
+            directory_path,
+            filename,
+            full_path,
+        })
+    }
+
+    /// Resolve file path with intelligent file selection
+    /// If the resolved path points to a header file, try to find the main source file
+    fn resolve_file_path_with_smart_selection(
+        scoped_manager: &ScopedFileIndexManager,
+        compilation_unit: &str,
+        file_index: u64,
+    ) -> String {
+        // First, try to resolve the file path normally
+        let resolved_path = scoped_manager
+            .lookup_by_scoped_index(compilation_unit, file_index)
+            .map(|file_info| file_info.full_path)
+            .unwrap_or_else(|| String::new());
+
+        // If the path is empty or points to a header file, try to find a better alternative
+        if resolved_path.is_empty() || Self::is_header_file(&resolved_path) {
+            if let Some(alternative_path) =
+                Self::find_main_source_file_in_cu(scoped_manager, compilation_unit)
+            {
+                tracing::debug!(
+                    "FastParser: replaced header/empty '{}' with main source '{}' in CU '{}'",
+                    resolved_path,
+                    alternative_path,
+                    compilation_unit
+                );
+                return alternative_path;
+            }
+        }
+
+        resolved_path
+    }
+
+    /// Check if a file path is a header file
+    fn is_header_file(file_path: &str) -> bool {
+        file_path.ends_with(".h")
+            || file_path.ends_with(".hpp")
+            || file_path.ends_with(".hxx")
+            || file_path.contains("/include/")
+            || file_path.contains("/usr/include/")
+    }
+
+    /// Find the main source file in the compilation unit
+    fn find_main_source_file_in_cu(
+        scoped_manager: &ScopedFileIndexManager,
+        compilation_unit: &str,
+    ) -> Option<String> {
+        if let Some(cu_file_index) = scoped_manager.get_cu_file_index(compilation_unit) {
+            tracing::debug!(
+                "FastParser: searching for main source file in CU '{}'",
+                compilation_unit
+            );
+
+            // First priority: look for files that match the compilation unit name
+            for file_entry in cu_file_index.file_entries() {
+                if let Some(full_path) = file_entry.get_full_path(cu_file_index) {
+                    if !Self::is_header_file(&full_path) {
+                        // Check if this file matches the compilation unit name
+                        if let Some(cu_stem) = std::path::Path::new(compilation_unit).file_stem() {
+                            if let Some(file_stem) = std::path::Path::new(&full_path).file_stem() {
+                                if cu_stem == file_stem {
+                                    tracing::debug!(
+                                        "FastParser: found matching source file '{}'",
+                                        full_path
+                                    );
+                                    return Some(full_path);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Second priority: any non-header file
+            for file_entry in cu_file_index.file_entries() {
+                if let Some(full_path) = file_entry.get_full_path(cu_file_index) {
+                    if !Self::is_header_file(&full_path) {
+                        tracing::debug!(
+                            "FastParser: found alternative source file '{}'",
+                            full_path
+                        );
+                        return Some(full_path);
+                    }
+                }
+            }
+        }
+
         None
     }
 }

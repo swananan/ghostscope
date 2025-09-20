@@ -16,6 +16,8 @@ pub struct CompilationUnit {
     pub include_directories: Vec<String>,
     /// Files within this compilation unit
     pub files: Vec<SourceFile>,
+    /// DWARF version for proper file index handling
+    pub dwarf_version: u16,
 }
 
 /// Source file information extracted from DWARF debug info
@@ -169,6 +171,7 @@ impl SourceFileManager {
             base_directory: Self::get_comp_dir(dwarf, unit).unwrap_or_default(),
             include_directories: Vec::new(),
             files: Vec::new(),
+            dwarf_version: 4, // Default for file_manager (legacy usage)
         };
 
         // Extract file information from line program

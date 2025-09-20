@@ -1,26 +1,65 @@
 //! Single module DWARF data management (simplified and restructured)
 
+/// Constants for intelligent file selection scoring
+mod file_selection_scoring {
+    /// Search range in bytes when looking for alternative source file entries
+    pub const SEARCH_RANGE_BYTES: u64 = 100;
+
+    /// Strong preference for non-header files (*.c, *.cpp, *.rs vs *.h, *.hpp)
+    pub const NON_HEADER_BONUS: i32 = 1000;
+
+    /// Moderate preference when compilation unit filename matches source filename
+    pub const COMPILATION_UNIT_MATCH_BONUS: i32 = 500;
+
+    /// Preference for non-system paths (not in /usr/, /lib/)
+    pub const NON_SYSTEM_PATH_BONUS: i32 = 200;
+
+    /// Preference for statement boundaries (is_stmt = true)
+    pub const STATEMENT_BOUNDARY_BONUS: i32 = 100;
+
+    /// Heavy penalty for entries without resolvable file paths
+    pub const NO_PATH_PENALTY: i32 = -1000;
+}
+
 use crate::{
-    core::{MappedFile, Result, SourceLocation, VariableInfo},
-    data::{CfiIndex, LightweightIndex, LineMappingTable, OnDemandResolver, SourceFileManager},
+    core::{MappedFile, Result, SourceLocation},
+    data::{
+        CfiIndex, LightweightIndex, LineMappingTable, OnDemandResolver, ScopedFileIndexManager,
+        SourceFileManager,
+    },
     parser::DwarfParser,
     proc_mapping::ModuleMapping,
 };
 use gimli::{EndianSlice, LittleEndian};
 use object::{Object, ObjectSection};
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf};
+
+/// Module loading state for error tracking and UI display
+#[derive(Debug, Clone)]
+pub enum ModuleLoadState {
+    /// Module loaded successfully
+    Success,
+    /// Module loaded with some warnings (e.g., CFI failed but DWARF succeeded)
+    PartialSuccess(Vec<String>),
+    /// Module loading failed completely
+    Failed(String),
+}
 
 /// Complete DWARF data for a single module
 #[derive(Debug)]
 pub(crate) struct ModuleData {
     /// Module mapping info (from proc mapping)
     module_mapping: ModuleMapping,
+    /// Loading state for error tracking
+    load_state: ModuleLoadState,
     /// Lightweight index (startup time)
     lightweight_index: LightweightIndex,
     /// Line mapping table (address→line lookup)
     line_mapping: LineMappingTable,
-    /// File manager for source files
+    /// File manager for source files (legacy compatibility)
     file_manager: SourceFileManager,
+    /// Lightweight scoped file index manager (primary file management)
+    scoped_file_manager: Option<ScopedFileIndexManager>,
     /// CFI index for CFA lookup
     cfi_index: Option<CfiIndex>,
     /// On-demand resolver (for detailed parsing)
@@ -38,8 +77,27 @@ impl ModuleData {
     }
 
     /// Parallel loading: debug_info || debug_line || CFI simultaneously
+    /// Falls back to sequential loading if parallel parsing fails
     pub(crate) async fn load_parallel(module_mapping: ModuleMapping) -> Result<Self> {
-        Self::load_internal_parallel(module_mapping).await
+        match Self::load_internal_parallel(module_mapping.clone()).await {
+            Ok(module_data) => {
+                tracing::info!(
+                    "Parallel loading succeeded for: {}",
+                    module_mapping.path.display()
+                );
+                Ok(module_data)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Parallel loading failed for {}: {}. Falling back to sequential loading.",
+                    module_mapping.path.display(),
+                    e
+                );
+                // Fallback to sequential loading
+                tokio::task::spawn_blocking(move || Self::load_internal_sequential(module_mapping))
+                    .await?
+            }
+        }
     }
 
     /// Sequential internal load implementation
@@ -63,6 +121,7 @@ impl ModuleData {
         let line_mapping = parse_result.line_mapping;
         let file_manager = parse_result.source_file_manager;
 
+        let mut warnings = Vec::new();
         let cfi_index = {
             // SAFETY: We keep the mapped file alive for the lifetime of the module
             // The _mapped_file field ensures the memory remains valid
@@ -77,14 +136,23 @@ impl ModuleData {
                     Some(cfi)
                 }
                 Err(e) => {
+                    let warning = format!("Failed to initialize CFI index: {}", e);
                     tracing::warn!(
                         "Failed to initialize CFI index for {}: {}",
                         module_mapping.path.display(),
                         e
                     );
+                    warnings.push(warning);
                     None
                 }
             }
+        };
+
+        // Determine load state
+        let load_state = if warnings.is_empty() {
+            ModuleLoadState::Success
+        } else {
+            ModuleLoadState::PartialSuccess(warnings)
         };
 
         tracing::debug!("Preparing on-demand resolver...");
@@ -103,9 +171,11 @@ impl ModuleData {
 
         Ok(Self {
             module_mapping,
+            load_state,
             lightweight_index,
             line_mapping,
             file_manager,
+            scoped_file_manager: parse_result.scoped_file_manager, // Use optimized scoped file manager from sequential parsing
             cfi_index,
             resolver,
             stats: parse_result.stats,
@@ -129,17 +199,28 @@ impl ModuleData {
         // Load DWARF sections
         let dwarf = std::sync::Arc::new(Self::load_dwarf_sections(&object)?);
 
-        tracing::debug!("Starting parallel DWARF parsing...");
+        tracing::debug!(
+            "Starting parallel DWARF parsing with true debug_line || debug_info parallelism..."
+        );
 
-        // Parse three components in parallel: debug_info || debug_line || CFI
-        let (parse_result, cfi_index_result) = tokio::try_join!(
-            // Parse debug_info and debug_line together (they share DWARF data)
+        // Parse three components in parallel: debug_line || debug_info || CFI
+        let (line_result, info_result, cfi_index_result) = tokio::try_join!(
+            // Parse debug_line only
             tokio::task::spawn_blocking({
                 let dwarf = std::sync::Arc::clone(&dwarf);
                 let module_path = module_mapping.path.to_string_lossy().to_string();
-                move || -> Result<crate::parser::DwarfParseResult> {
+                move || -> Result<crate::parser::DebugLineParseResult> {
                     let parser = crate::parser::DwarfParser::new(&dwarf);
-                    parser.parse_all(&module_path)
+                    parser.parse_debug_line_only(&module_path)
+                }
+            }),
+            // Parse debug_info only
+            tokio::task::spawn_blocking({
+                let dwarf = std::sync::Arc::clone(&dwarf);
+                let module_path = module_mapping.path.to_string_lossy().to_string();
+                move || -> Result<crate::parser::DebugInfoParseResult> {
+                    let parser = crate::parser::DwarfParser::new(&dwarf);
+                    parser.parse_debug_info_only(&module_path)
                 }
             }),
             // Parse CFI independently (uses raw file data)
@@ -173,8 +254,16 @@ impl ModuleData {
         )?;
 
         // Unwrap the spawn_blocking results
-        let parse_result = parse_result?;
+        let line_result = line_result?;
+        let info_result = info_result?;
         let cfi_index = cfi_index_result?;
+
+        // Assemble parallel results into unified result
+        let parse_result = crate::parser::DwarfParser::assemble_parallel_results(
+            line_result,
+            info_result,
+            module_mapping.path.to_string_lossy().to_string(),
+        );
 
         // Create resolver with parsed data
         let resolver = crate::data::OnDemandResolver::new(
@@ -183,20 +272,35 @@ impl ModuleData {
             gimli::BaseAddresses::default(),
         );
 
+        // Determine load state based on parallel loading results
+        let mut warnings = Vec::new();
+        if cfi_index.is_none() {
+            warnings.push("CFI index failed to initialize".to_string());
+        }
+
+        let load_state = if warnings.is_empty() {
+            ModuleLoadState::Success
+        } else {
+            ModuleLoadState::PartialSuccess(warnings)
+        };
+
         tracing::info!(
-            "Parallel loading completed for {}: {} functions, {} variables, {} line entries, {} files",
+            "True parallel loading completed for {}: {} functions, {} variables, {} line entries, {} files (state: {:?})",
             module_mapping.path.display(),
             parse_result.stats.total_functions,
             parse_result.stats.total_variables,
             parse_result.stats.total_line_entries,
-            parse_result.stats.total_files
+            parse_result.stats.total_files,
+            load_state
         );
 
         Ok(Self {
             module_mapping: module_mapping.clone(),
+            load_state,
             lightweight_index: parse_result.lightweight_index,
             line_mapping: parse_result.line_mapping,
             file_manager: parse_result.source_file_manager,
+            scoped_file_manager: parse_result.scoped_file_manager, // Use optimized scoped file manager from parallel parsing
             cfi_index,
             resolver,
             stats: parse_result.stats,
@@ -355,80 +459,436 @@ impl ModuleData {
 
     /// Lookup source location at address (line mapping + file manager)
     pub(crate) fn lookup_source_location(&self, address: u64) -> Option<SourceLocation> {
-        if let Some(line_entry) = self.line_mapping.lookup_line(address) {
+        // Get all line entries at this exact address to handle overlapping instructions
+        let all_line_entries = self.line_mapping.lookup_all_lines_at_address(address);
+
+        if all_line_entries.is_empty() {
+            // Fallback to closest address lookup
+            if let Some(line_entry) = self.line_mapping.lookup_line(address) {
+                return self.create_source_location_from_entry(line_entry);
+            }
+            return None;
+        }
+
+        // Check if we should use alternative file selection for header files
+        let best_entry = if all_line_entries.len() == 1 {
+            let entry = all_line_entries[0];
+            self.find_alternative_source_file(entry).unwrap_or(entry)
+        } else {
+            // Multiple entries: use smart selection
+            self.select_best_line_entry(&all_line_entries)
+        };
+
+        self.create_source_location_from_entry(best_entry)
+    }
+
+    /// Find alternative source file when current entry points to header file
+    fn find_alternative_source_file<'a>(
+        &'a self,
+        entry: &'a crate::core::LineEntry,
+    ) -> Option<&'a crate::core::LineEntry> {
+        // Get the file path for this entry
+        let current_file_path = self.get_file_path_for_entry(entry)?;
+
+        // Check if current file is a header
+        let is_header = current_file_path.ends_with(".h")
+            || current_file_path.ends_with(".hpp")
+            || current_file_path.ends_with(".hxx")
+            || current_file_path.contains("/include/")
+            || current_file_path.contains("/usr/include/");
+
+        if !is_header {
+            return None; // Current file is already a source file
+        }
+
+        tracing::debug!(
+            "find_alternative_source_file: current entry points to header '{}', looking for main source alternative",
+            current_file_path
+        );
+
+        // Look for entries at nearby addresses that point to main source files
+        let search_range = file_selection_scoring::SEARCH_RANGE_BYTES;
+        let start_addr = entry.address.saturating_sub(search_range);
+        let end_addr = entry.address.saturating_add(search_range);
+
+        // Search through all line entries in the range
+        for (addr, candidate_entry) in self.line_mapping.get_entries_in_range(start_addr, end_addr)
+        {
+            {
+                // Skip if same compilation unit (to avoid circular references)
+                if candidate_entry.compilation_unit != entry.compilation_unit {
+                    continue;
+                }
+
+                // Check if this candidate points to a main source file
+                if let Some(candidate_file_path) = self.get_file_path_for_entry(candidate_entry) {
+                    let is_candidate_header = candidate_file_path.ends_with(".h")
+                        || candidate_file_path.ends_with(".hpp")
+                        || candidate_file_path.ends_with(".hxx")
+                        || candidate_file_path.contains("/include/")
+                        || candidate_file_path.contains("/usr/include/");
+
+                    if !is_candidate_header {
+                        tracing::debug!(
+                            "find_alternative_source_file: found alternative source file '{}' at address 0x{:x}",
+                            candidate_file_path, addr
+                        );
+
+                        // Create a synthetic entry with the source file but original line number
+                        // This is a bit hacky, but it works for our use case
+                        return Some(candidate_entry);
+                    }
+                }
+            }
+        }
+
+        // Fallback: try to find any main source file in the same compilation unit
+        if let Some(ref scoped_manager) = self.scoped_file_manager {
+            if let Some(cu_file_index) = scoped_manager.get_cu_file_index(&entry.compilation_unit) {
+                for file_entry in cu_file_index.file_entries() {
+                    if let Some(full_path) = file_entry.get_full_path(cu_file_index) {
+                        let is_source = full_path.ends_with(".c")
+                            || full_path.ends_with(".cpp")
+                            || full_path.ends_with(".cc")
+                            || full_path.ends_with(".rs")
+                            || (full_path.contains(&entry.compilation_unit)
+                                && !full_path.ends_with(".h"));
+
+                        if is_source {
+                            tracing::debug!(
+                                "find_alternative_source_file: using main source file '{}' from compilation unit",
+                                full_path
+                            );
+
+                            // Return the original entry - we'll modify the file lookup in create_source_location_from_entry
+                            return None; // We'll handle this in the create_source_location_from_entry method
+                        }
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Select the best line entry from multiple candidates
+    fn select_best_line_entry<'a>(
+        &self,
+        entries: &[&'a crate::core::LineEntry],
+    ) -> &'a crate::core::LineEntry {
+        if entries.len() == 1 {
+            return entries[0];
+        }
+
+        tracing::debug!(
+            "select_best_line_entry: {} candidates at address 0x{:x}",
+            entries.len(),
+            entries[0].address
+        );
+
+        // Priority rules for file selection:
+        // 1. Prefer .c/.cpp/.rs files over .h/.hpp files (main source over headers)
+        // 2. Prefer files with compilation_unit name matching filename
+        // 3. Prefer longer paths (more specific)
+        // 4. Prefer entries with is_stmt=true (statement boundaries)
+
+        let mut best = entries[0];
+        let mut best_score = self.score_line_entry(best);
+
+        for &entry in entries.iter().skip(1) {
+            let score = self.score_line_entry(entry);
             tracing::debug!(
-                "lookup_source_location: line_entry.file_path='{}', line_entry.file_index={}, compilation_unit='{}'",
-                line_entry.file_path, line_entry.file_index, line_entry.compilation_unit
+                "  candidate: {}:{} (stmt={}, score={})",
+                self.get_file_path_for_entry(entry)
+                    .unwrap_or("unknown".to_string()),
+                entry.line,
+                entry.is_stmt,
+                score
             );
 
-            // Prefer compilation unit name if it contains path separators and matches the file
-            let preferred_file_path = if line_entry.compilation_unit.contains('/') {
-                let cu_filename = line_entry.compilation_unit.split('/').last().unwrap_or("");
-                let line_filename = line_entry.file_path.split('/').last().unwrap_or("");
+            if score > best_score {
+                best = entry;
+                best_score = score;
+            }
+        }
 
-                if cu_filename == line_filename {
-                    // Get compilation unit to access base_directory
-                    if let Some(compilation_unit) = self
-                        .file_manager
-                        .get_compilation_unit(&line_entry.compilation_unit)
+        tracing::debug!(
+            "select_best_line_entry: selected {} (score={})",
+            self.get_file_path_for_entry(best)
+                .unwrap_or("unknown".to_string()),
+            best_score
+        );
+
+        best
+    }
+
+    /// Score a line entry for smart selection (higher is better)
+    fn score_line_entry(&self, entry: &crate::core::LineEntry) -> i32 {
+        let mut score = 0;
+
+        // Get file path for scoring
+        let file_path = match self.get_file_path_for_entry(entry) {
+            Some(path) => path,
+            None => return file_selection_scoring::NO_PATH_PENALTY,
+        };
+
+        // Rule 1: Prefer main source files over headers
+        let is_header = file_path.ends_with(".h")
+            || file_path.ends_with(".hpp")
+            || file_path.ends_with(".hxx")
+            || file_path.contains("/include/")
+            || file_path.contains("/usr/include/");
+
+        if !is_header {
+            score += file_selection_scoring::NON_HEADER_BONUS;
+        }
+
+        // Rule 2: Prefer files where compilation unit matches filename
+        if let Some(filename) = std::path::Path::new(&file_path).file_stem() {
+            if let Some(cu_stem) = std::path::Path::new(&entry.compilation_unit).file_stem() {
+                if filename == cu_stem {
+                    score += file_selection_scoring::COMPILATION_UNIT_MATCH_BONUS;
+                }
+            }
+        }
+
+        // Rule 3: Prefer longer/more specific paths
+        score += file_path.len() as i32;
+
+        // Rule 4: Prefer statement boundaries
+        if entry.is_stmt {
+            score += file_selection_scoring::STATEMENT_BOUNDARY_BONUS;
+        }
+
+        // Rule 5: Prefer non-system paths
+        if !file_path.starts_with("/usr/") && !file_path.starts_with("/lib/") {
+            score += file_selection_scoring::NON_SYSTEM_PATH_BONUS;
+        }
+
+        score
+    }
+
+    /// Helper to get file path for a line entry
+    fn get_file_path_for_entry(&self, entry: &crate::core::LineEntry) -> Option<String> {
+        if let Some(ref scoped_manager) = self.scoped_file_manager {
+            if let Some(file_info) =
+                scoped_manager.lookup_by_scoped_index(&entry.compilation_unit, entry.file_index)
+            {
+                return Some(file_info.full_path);
+            }
+        }
+
+        if !entry.file_path.is_empty() {
+            return Some(entry.file_path.clone());
+        }
+
+        Some(entry.compilation_unit.clone())
+    }
+
+    /// Create SourceLocation from line entry
+    fn create_source_location_from_entry(
+        &self,
+        line_entry: &crate::core::LineEntry,
+    ) -> Option<SourceLocation> {
+        tracing::debug!(
+            "create_source_location_from_entry: line_entry.file_path='{}', line_entry.file_index={}, compilation_unit='{}'",
+            line_entry.file_path, line_entry.file_index, line_entry.compilation_unit
+        );
+
+        // Check if compilation_unit itself is a file path (contains path separators)
+        // If so, try to resolve it to a full path by combining with base directory
+        if line_entry.compilation_unit.contains('/')
+            && (line_entry.compilation_unit.ends_with(".c")
+                || line_entry.compilation_unit.ends_with(".cpp")
+                || line_entry.compilation_unit.ends_with(".cc")
+                || line_entry.compilation_unit.ends_with(".rs"))
+        {
+            // Try to get base directory from file index resolution
+            let full_path = if let Some(ref scoped_manager) = self.scoped_file_manager {
+                if let Some(file_info) = scoped_manager
+                    .lookup_by_scoped_index(&line_entry.compilation_unit, line_entry.file_index)
+                {
+                    // Extract base directory from the resolved absolute path
+                    let resolved_path = &file_info.full_path;
+                    if let Some(base_dir) =
+                        self.extract_base_directory(resolved_path, &line_entry.compilation_unit)
                     {
-                        let full_path = if compilation_unit.base_directory.is_empty()
-                            || compilation_unit.base_directory == "."
-                        {
-                            line_entry.compilation_unit.clone()
-                        } else {
-                            format!(
-                                "{}/{}",
-                                compilation_unit.base_directory, line_entry.compilation_unit
-                            )
-                        };
-
+                        let full_path = format!("{}/{}", base_dir, line_entry.compilation_unit);
                         tracing::debug!(
-                            "lookup_source_location: using compilation unit name '{}' with base_directory '{}' -> full_path '{}'",
-                            line_entry.compilation_unit,
-                            compilation_unit.base_directory,
-                            full_path
+                            "create_source_location_from_entry: constructed full path '{}' from base_dir='{}' + compilation_unit='{}'",
+                            full_path, base_dir, line_entry.compilation_unit
                         );
-
                         full_path
                     } else {
-                        tracing::debug!(
-                            "lookup_source_location: compilation unit '{}' not found, using as-is",
-                            line_entry.compilation_unit
-                        );
                         line_entry.compilation_unit.clone()
                     }
                 } else {
-                    // Fall back to file manager lookup
-                    self.file_manager
-                        .get_file_path_by_scoped_index(
-                            &line_entry.compilation_unit,
-                            line_entry.file_index,
-                        )
-                        .unwrap_or_else(|| line_entry.file_path.clone())
+                    line_entry.compilation_unit.clone()
                 }
             } else {
-                // Use scoped file_index for efficient lookup and get full structured path info
-                self.file_manager
-                    .get_file_path_by_scoped_index(
-                        &line_entry.compilation_unit,
-                        line_entry.file_index,
-                    )
-                    .unwrap_or_else(|| line_entry.file_path.clone())
+                line_entry.compilation_unit.clone()
             };
 
-            tracing::debug!(
-                "lookup_source_location: final file_path='{}'",
-                preferred_file_path
-            );
-
             return Some(SourceLocation {
-                file_path: preferred_file_path,
+                file_path: full_path,
                 line_number: line_entry.line as u32,
                 column: Some(line_entry.column as u32),
                 address: line_entry.address,
             });
         }
+
+        // Try to find a better file if current one is a header
+        let preferred_file_path = if let Some(ref scoped_manager) = self.scoped_file_manager {
+            if let Some(file_info) = scoped_manager
+                .lookup_by_scoped_index(&line_entry.compilation_unit, line_entry.file_index)
+            {
+                let current_path = &file_info.full_path;
+                tracing::debug!(
+                    "create_source_location_from_entry: found file via ScopedFileIndexManager: '{}'",
+                    current_path
+                );
+
+                // If current file is a header, try to find the main source file
+                if self.is_header_file(current_path) {
+                    if let Some(alternative_path) =
+                        self.find_main_source_file_in_cu(&line_entry.compilation_unit)
+                    {
+                        tracing::debug!(
+                            "create_source_location_from_entry: replaced header '{}' with main source '{}'",
+                            current_path, alternative_path
+                        );
+                        alternative_path
+                    } else {
+                        current_path.clone()
+                    }
+                } else {
+                    current_path.clone()
+                }
+            } else if !line_entry.file_path.is_empty() {
+                tracing::debug!(
+                    "create_source_location_from_entry: using line entry file_path: '{}'",
+                    line_entry.file_path
+                );
+                line_entry.file_path.clone()
+            } else {
+                tracing::debug!(
+                    "create_source_location_from_entry: no file info found via ScopedFileIndexManager, using compilation unit name: '{}'",
+                    line_entry.compilation_unit
+                );
+                line_entry.compilation_unit.clone()
+            }
+        } else if !line_entry.file_path.is_empty() {
+            tracing::debug!(
+                "create_source_location_from_entry: using line entry file_path: '{}'",
+                line_entry.file_path
+            );
+            line_entry.file_path.clone()
+        } else {
+            tracing::debug!(
+                "create_source_location_from_entry: no file info found, using compilation unit name: '{}'",
+                line_entry.compilation_unit
+            );
+            line_entry.compilation_unit.clone()
+        };
+
+        tracing::debug!(
+            "create_source_location_from_entry: final file_path='{}'",
+            preferred_file_path
+        );
+
+        Some(SourceLocation {
+            file_path: preferred_file_path,
+            line_number: line_entry.line as u32,
+            column: Some(line_entry.column as u32),
+            address: line_entry.address,
+        })
+    }
+
+    /// Check if a file path is a header file
+    fn is_header_file(&self, file_path: &str) -> bool {
+        file_path.ends_with(".h")
+            || file_path.ends_with(".hpp")
+            || file_path.ends_with(".hxx")
+            || file_path.contains("/include/")
+            || file_path.contains("/usr/include/")
+    }
+
+    /// Find the main source file in the compilation unit
+    fn find_main_source_file_in_cu(&self, compilation_unit: &str) -> Option<String> {
+        if let Some(ref scoped_manager) = self.scoped_file_manager {
+            if let Some(cu_file_index) = scoped_manager.get_cu_file_index(compilation_unit) {
+                tracing::debug!(
+                    "find_main_source_file_in_cu: searching for main source file in CU '{}'",
+                    compilation_unit
+                );
+
+                // First priority: look for files that match the compilation unit name
+                for file_entry in cu_file_index.file_entries() {
+                    if let Some(full_path) = file_entry.get_full_path(cu_file_index) {
+                        if !self.is_header_file(&full_path) {
+                            // Check if this file matches the compilation unit name
+                            if let Some(cu_stem) =
+                                std::path::Path::new(compilation_unit).file_stem()
+                            {
+                                if let Some(file_stem) =
+                                    std::path::Path::new(&full_path).file_stem()
+                                {
+                                    if cu_stem == file_stem {
+                                        tracing::debug!(
+                                            "find_main_source_file_in_cu: found matching source file '{}'",
+                                            full_path
+                                        );
+                                        return Some(full_path);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Second priority: any non-header file
+                for file_entry in cu_file_index.file_entries() {
+                    if let Some(full_path) = file_entry.get_full_path(cu_file_index) {
+                        if !self.is_header_file(&full_path) {
+                            tracing::debug!(
+                                "find_main_source_file_in_cu: found alternative source file '{}'",
+                                full_path
+                            );
+                            return Some(full_path);
+                        }
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Extract base directory from an absolute path by removing the filename
+    /// For example:
+    /// - absolute_path: "/mnt/500g/code/openresty/openresty-1.27.1.1/build/nginx-1.27.1/nginx.c"
+    /// - compilation_unit: "src/core/nginx.c"
+    /// - returns: "/mnt/500g/code/openresty/openresty-1.27.1.1/build/nginx-1.27.1"
+    /// - final result: "/mnt/500g/code/openresty/openresty-1.27.1.1/build/nginx-1.27.1/src/core/nginx.c"
+    fn extract_base_directory(
+        &self,
+        absolute_path: &str,
+        compilation_unit: &str,
+    ) -> Option<String> {
+        // Extract the directory part from the absolute path (remove filename)
+        if let Some(parent) = std::path::Path::new(absolute_path).parent() {
+            let base_dir = parent.to_string_lossy().to_string();
+            tracing::debug!(
+                "extract_base_directory: absolute_path='{}' -> base_dir='{}' (will append compilation_unit='{}')",
+                absolute_path, base_dir, compilation_unit
+            );
+            return Some(base_dir);
+        }
+
+        tracing::debug!(
+            "extract_base_directory: failed to extract parent directory from absolute_path='{}'",
+            absolute_path
+        );
         None
     }
 
@@ -548,9 +1008,81 @@ impl ModuleData {
         }
     }
 
-    /// Get all source files from file manager (compatibility method)
-    pub(crate) fn get_all_files(&self) -> Vec<&crate::data::SourceFile> {
-        self.file_manager.get_all_files()
+    /// Get all source files from scoped file manager (updated method)
+    pub(crate) fn get_all_files(&self) -> Vec<crate::data::SourceFile> {
+        if let Some(ref scoped_manager) = self.scoped_file_manager {
+            self.extract_source_files_from_scoped_manager(scoped_manager)
+        } else {
+            // Fallback to legacy file manager if scoped manager is not available
+            self.file_manager
+                .get_all_files()
+                .into_iter()
+                .cloned()
+                .collect()
+        }
+    }
+
+    /// Extract source files from scoped file manager
+    fn extract_source_files_from_scoped_manager(
+        &self,
+        scoped_manager: &ScopedFileIndexManager,
+    ) -> Vec<crate::data::SourceFile> {
+        let mut source_files = Vec::new();
+        let mut seen_paths = HashSet::new();
+
+        // Iterate through all compilation units and their files
+        for (cu_name, cu_file_index) in scoped_manager.iter_all_cu_files() {
+            for file_entry in cu_file_index.file_entries() {
+                if let Some(full_path) = file_entry.get_full_path(cu_file_index) {
+                    // Deduplicate by full path
+                    if seen_paths.insert(full_path.clone()) {
+                        // Create SourceFile from file entry information
+                        let directory_path = std::path::Path::new(&full_path)
+                            .parent()
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_else(|| ".".to_string());
+
+                        let filename = file_entry.filename.to_string();
+
+                        source_files.push(crate::data::SourceFile {
+                            file_index: file_entry.file_index,
+                            compilation_unit: cu_name.to_string(),
+                            directory_index: file_entry.directory_index,
+                            directory_path,
+                            filename,
+                            full_path,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Sort by full path for consistent ordering
+        source_files.sort_by(|a, b| a.full_path.cmp(&b.full_path));
+        source_files
+    }
+
+    /// Get module loading state for error tracking and UI display
+    pub(crate) fn get_load_state(&self) -> &ModuleLoadState {
+        &self.load_state
+    }
+
+    /// Check if module loaded successfully (no warnings or errors)
+    pub(crate) fn is_fully_loaded(&self) -> bool {
+        matches!(self.load_state, ModuleLoadState::Success)
+    }
+
+    /// Check if module has any warnings
+    pub(crate) fn has_warnings(&self) -> bool {
+        matches!(self.load_state, ModuleLoadState::PartialSuccess(_))
+    }
+
+    /// Get warning messages if any
+    pub(crate) fn get_warnings(&self) -> Vec<String> {
+        match &self.load_state {
+            ModuleLoadState::PartialSuccess(warnings) => warnings.clone(),
+            _ => Vec::new(),
+        }
     }
 }
 

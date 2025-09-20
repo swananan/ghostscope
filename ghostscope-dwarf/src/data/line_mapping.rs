@@ -156,6 +156,38 @@ impl LineMappingTable {
         result
     }
 
+    /// Find all line entries at exact address (for handling overlapping instructions)
+    pub fn lookup_all_lines_at_address(&self, address: u64) -> Vec<&LineEntry> {
+        let mut matches = Vec::new();
+
+        // Collect all entries with the exact same address
+        for (addr, entry) in &self.address_to_line_map {
+            if *addr == address {
+                matches.push(entry);
+            }
+        }
+
+        tracing::debug!(
+            "LineMapping::lookup_all_lines_at_address: address=0x{:x} -> found {} entries",
+            address,
+            matches.len()
+        );
+
+        // Log all found entries for debugging
+        for (i, entry) in matches.iter().enumerate() {
+            tracing::debug!(
+                "  entry {}: file='{}', line={}, cu='{}', is_stmt={}",
+                i,
+                entry.file_path,
+                entry.line,
+                entry.compilation_unit,
+                entry.is_stmt
+            );
+        }
+
+        matches
+    }
+
     /// Get total line entry count
     pub fn total_entries(&self) -> usize {
         self.total_entries
@@ -464,5 +496,15 @@ impl LineMappingTable {
             function_start
         );
         None
+    }
+
+    /// Get all line entries within an address range
+    /// Returns an iterator over (address, line_entry) pairs in the specified range
+    pub fn get_entries_in_range(
+        &self,
+        start_addr: u64,
+        end_addr: u64,
+    ) -> impl Iterator<Item = (&u64, &LineEntry)> {
+        self.address_to_line_map.range(start_addr..=end_addr)
     }
 }

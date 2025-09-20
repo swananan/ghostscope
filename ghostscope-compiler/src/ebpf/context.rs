@@ -5,6 +5,7 @@
 
 use super::{debug_logger::DebugLogger, maps::MapManager};
 use crate::script::{VarType, VariableContext};
+use aya_ebpf_bindings::bindings::bpf_func_id::BPF_FUNC_get_current_pid_tgid;
 use ghostscope_dwarf::DwarfAnalyzer;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
@@ -15,7 +16,6 @@ use inkwell::types::{BasicTypeEnum, IntType};
 use inkwell::values::{
     BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, IntValue, PointerValue,
 };
-use aya_ebpf_bindings::bindings::bpf_func_id::BPF_FUNC_get_current_pid_tgid;
 use inkwell::AddressSpace;
 use inkwell::OptimizationLevel;
 use std::collections::HashMap;
@@ -431,8 +431,10 @@ impl<'ctx> EbpfContext<'ctx> {
         // Position at continue block for the rest of the function
         self.builder.position_at_end(continue_block);
 
-        info!("PID filter added successfully for target PID: {}", target_pid);
+        info!(
+            "PID filter added successfully for target PID: {}",
+            target_pid
+        );
         Ok(())
     }
-
 }

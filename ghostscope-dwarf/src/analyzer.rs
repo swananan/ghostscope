@@ -506,11 +506,11 @@ impl DwarfAnalyzer {
             let files = module_data.get_all_files();
             if !files.is_empty() {
                 let simple_files: Vec<SimpleFileInfo> = files
-                    .iter()
+                    .into_iter()
                     .map(|source_file| SimpleFileInfo {
-                        full_path: source_file.full_path.clone(),
-                        basename: source_file.filename.clone(),
-                        directory: source_file.directory_path.clone(),
+                        full_path: source_file.full_path,
+                        basename: source_file.filename,
+                        directory: source_file.directory_path,
                     })
                     .collect();
 
