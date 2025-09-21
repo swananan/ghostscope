@@ -2,6 +2,8 @@ use crate::action::{Action, CursorDirection};
 use crate::model::panel_state::{
     CommandPanelState, InputState, InteractionMode, JkEscapeState, LineType,
 };
+use crossterm::event::{KeyCode, KeyModifiers};
+use ratatui::crossterm::event::KeyEvent;
 use std::time::Instant;
 use tracing::debug;
 
@@ -9,6 +11,145 @@ use tracing::debug;
 pub struct InputHandler;
 
 impl InputHandler {
+    /// Handle special key events for history and suggestions (only handles specific keys)
+    pub fn handle_key_event(state: &mut CommandPanelState, key: KeyEvent) -> Vec<Action> {
+        // Priority 1: History search mode handling (handles ALL keys when in search mode)
+        if state.is_in_history_search() {
+            return Self::handle_history_search_keys(state, key);
+        }
+
+        // Priority 2: Input mode special keys (only specific keys)
+        if state.mode == InteractionMode::Input {
+            match (key.code, key.modifiers) {
+                // Ctrl+R: Start history search
+                (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
+                    state.start_history_search();
+                    // Return NoOp action to prevent fallback character processing
+                    return vec![Action::NoOp];
+                }
+                // Tab or Ctrl+E: Accept auto suggestion (only if there's a suggestion)
+                (KeyCode::Tab, KeyModifiers::NONE)
+                | (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
+                    tracing::debug!(
+                        "Tab/Ctrl+E pressed, suggestion available: {}",
+                        state.get_suggestion_text().is_some()
+                    );
+                    if let Some(suggestion_text) = state.get_suggestion_text() {
+                        tracing::debug!("Accepting auto suggestion: '{}'", suggestion_text);
+                        state.accept_auto_suggestion();
+                        // Return NoOp action to prevent fallback processing
+                        return vec![Action::NoOp];
+                    } else {
+                        tracing::debug!("No suggestion available, Tab/Ctrl+E ignored");
+                        // Return NoOp action to prevent fallback processing
+                        return vec![Action::NoOp];
+                    }
+                }
+                // Other keys are not handled by this function
+                _ => {}
+            }
+        }
+
+        // Return empty vector for keys we don't handle
+        Vec::new()
+    }
+
+    /// Handle key events during history search mode
+    fn handle_history_search_keys(state: &mut CommandPanelState, key: KeyEvent) -> Vec<Action> {
+        match (key.code, key.modifiers) {
+            // ESC: Exit search mode, set matched command as new input text
+            (KeyCode::Esc, _) => {
+                // Use the matched command if available, otherwise keep search query
+                let selected_command = if let Some(matched_command) = state
+                    .history_search
+                    .current_match(&state.command_history_manager)
+                {
+                    matched_command.to_string()
+                } else {
+                    state.get_history_search_query().to_string()
+                };
+
+                state.exit_history_search_with_selection(&selected_command);
+                vec![Action::AddResponse {
+                    content: String::new(),
+                    response_type: crate::action::ResponseType::Info,
+                }]
+            }
+            // Ctrl+C: Exit search mode and clear input
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                state.exit_history_search();
+                state.input_text.clear();
+                state.cursor_position = 0;
+                vec![Action::AddResponse {
+                    content: String::new(),
+                    response_type: crate::action::ResponseType::Info,
+                }]
+            }
+            // Enter: Execute the current search result
+            (KeyCode::Enter, _) => {
+                // Get the command to execute (matched command if available, otherwise search query)
+                let command_to_execute = if let Some(matched_command) = state
+                    .history_search
+                    .current_match(&state.command_history_manager)
+                {
+                    matched_command.to_string()
+                } else {
+                    state.get_history_search_query().to_string()
+                };
+
+                state.exit_history_search();
+
+                if !command_to_execute.trim().is_empty() {
+                    vec![Action::SubmitCommandWithText {
+                        command: command_to_execute,
+                    }]
+                } else {
+                    vec![Action::AddResponse {
+                        content: String::new(),
+                        response_type: crate::action::ResponseType::Info,
+                    }]
+                }
+            }
+            // Ctrl+R: Next search result
+            (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
+                state.next_history_match();
+                // No action needed - just move to next match
+                vec![]
+            }
+            // Backspace: Remove character from search query
+            (KeyCode::Backspace, _) => {
+                let mut query = state.get_history_search_query().to_string();
+                if !query.is_empty() {
+                    query.pop();
+                    state.update_history_search(query.clone());
+
+                    // Update input_text to match the search query and cursor position
+                    state.input_text = query.clone();
+                    state.cursor_position = query.len();
+                } else {
+                    state.exit_history_search();
+                }
+                // Return NoOp action to prevent fallback to regular input handling
+                vec![Action::NoOp]
+            }
+            // Regular characters: Add to search query
+            (KeyCode::Char(c), KeyModifiers::NONE) => {
+                let mut query = state.get_history_search_query().to_string();
+                query.push(c);
+                state.update_history_search(query.clone());
+
+                // Update input_text to match the search query and cursor position
+                state.input_text = query.clone();
+                state.cursor_position = query.len();
+
+                // Return NoOp action to prevent fallback to regular input handling
+                vec![Action::NoOp]
+            }
+            // Other keys: Ignore during search but prevent fallback
+            _ => vec![Action::NoOp],
+        }
+    }
+
     /// Insert a character at the current cursor position
     pub fn insert_char(state: &mut CommandPanelState, c: char) -> Vec<Action> {
         let mut actions = Vec::new();
@@ -30,6 +171,10 @@ impl InputHandler {
                             Self::char_pos_to_byte_pos(&state.input_text, state.cursor_position);
                         state.input_text.insert(byte_pos, c);
                         state.cursor_position += 1;
+
+                        // Update auto suggestion after character insertion
+                        state.update_auto_suggestion();
+
                         actions.push(Action::AddResponse {
                             content: String::new(),
                             response_type: crate::action::ResponseType::Info,
@@ -51,6 +196,9 @@ impl InputHandler {
                             Self::char_pos_to_byte_pos(&state.input_text, state.cursor_position);
                         state.input_text.insert(byte_pos, c);
                         state.cursor_position += 1;
+
+                        // Update auto suggestion after character insertion
+                        state.update_auto_suggestion();
                     }
                     JkEscapeResult::SwitchToCommand => {
                         actions.push(Action::EnterCommandMode);
@@ -87,6 +235,8 @@ impl InputHandler {
                         }
                         state.input_text.drain(byte_pos..end_pos);
                     }
+                    // Update auto suggestion after character deletion
+                    state.update_auto_suggestion();
                 }
             }
             InteractionMode::ScriptEditor => {
@@ -164,6 +314,8 @@ impl InputHandler {
                             Self::char_pos_to_byte_pos(&state.input_text, state.cursor_position);
                         state.input_text.insert(byte_pos, 'j');
                         state.cursor_position += 1;
+                        // Update auto suggestion after timeout insertion
+                        state.update_auto_suggestion();
                     }
                     return true;
                 }
@@ -391,6 +543,8 @@ impl InputHandler {
             let end_byte = Self::char_pos_to_byte_pos(&state.input_text, state.cursor_position);
             state.input_text.drain(start_byte..end_byte);
             state.cursor_position = new_cursor;
+            // Update auto suggestion after word deletion
+            state.update_auto_suggestion();
         }
 
         Vec::new()
@@ -404,6 +558,8 @@ impl InputHandler {
 
         let byte_pos = Self::char_pos_to_byte_pos(&state.input_text, state.cursor_position);
         state.input_text.truncate(byte_pos);
+        // Update auto suggestion after deletion to end
+        state.update_auto_suggestion();
 
         Vec::new()
     }
@@ -418,6 +574,8 @@ impl InputHandler {
         let remaining = state.input_text[byte_pos..].to_string();
         state.input_text = remaining;
         state.cursor_position = 0;
+        // Update auto suggestion after deletion to beginning
+        state.update_auto_suggestion();
 
         Vec::new()
     }

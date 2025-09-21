@@ -314,6 +314,11 @@ pub struct CommandPanelState {
 
     // Configuration
     pub max_history_items: usize,
+
+    // New history management
+    pub command_history_manager: crate::components::command_panel::CommandHistory,
+    pub history_search: crate::components::command_panel::HistorySearchState,
+    pub auto_suggestion: crate::components::command_panel::AutoSuggestionState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -430,6 +435,11 @@ impl CommandPanelState {
             jk_escape_state: JkEscapeState::None,
             jk_timer: None,
             max_history_items: 1000,
+
+            // New history management
+            command_history_manager: crate::components::command_panel::CommandHistory::new(),
+            history_search: crate::components::command_panel::HistorySearchState::new(),
+            auto_suggestion: crate::components::command_panel::AutoSuggestionState::new(),
         }
     }
 
@@ -852,5 +862,146 @@ impl CommandPanelState {
             let line_len = lines[self.command_cursor_line].chars().count();
             self.command_cursor_column = self.command_cursor_column.min(line_len);
         }
+    }
+
+    // === History Management Methods ===
+
+    /// Update auto suggestion based on current input
+    pub fn update_auto_suggestion(&mut self) {
+        tracing::debug!("update_auto_suggestion: input_text='{}'", self.input_text);
+
+        self.auto_suggestion
+            .update(&self.input_text, &self.command_history_manager);
+
+        if let Some(suggestion) = self.auto_suggestion.get_full_suggestion() {
+            tracing::debug!("update_auto_suggestion: found suggestion='{}'", suggestion);
+        } else {
+            tracing::debug!("update_auto_suggestion: no suggestion found");
+        }
+    }
+
+    /// Accept the current auto suggestion
+    /// This treats the suggestion as a new command entry, clearing all related state
+    pub fn accept_auto_suggestion(&mut self) {
+        if let Some(suggestion) = self.auto_suggestion.get_full_suggestion() {
+            tracing::debug!(
+                "accept_auto_suggestion: before - input_text='{}', cursor_position={}",
+                self.input_text,
+                self.cursor_position
+            );
+            tracing::debug!(
+                "accept_auto_suggestion: accepting suggestion='{}'",
+                suggestion
+            );
+
+            self.input_text = suggestion.to_string();
+            self.cursor_position = self.input_text.len();
+            self.auto_suggestion.clear();
+
+            // Clear any search state - this is a new command entry
+            self.history_search.clear();
+
+            tracing::debug!(
+                "accept_auto_suggestion: after - input_text='{}', cursor_position={}",
+                self.input_text,
+                self.cursor_position
+            );
+        } else {
+            tracing::debug!("accept_auto_suggestion: no suggestion available");
+        }
+    }
+
+    /// Start history search mode
+    pub fn start_history_search(&mut self) {
+        tracing::debug!("start_history_search: command_history.len()={}", self.command_history.len());
+        self.history_search.start_search();
+        // Clear current input when starting search
+        self.input_text.clear();
+        self.cursor_position = 0;
+        tracing::debug!("start_history_search: after clear - command_history.len()={}", self.command_history.len());
+    }
+
+    /// Update history search query and find matches
+    pub fn update_history_search(&mut self, query: String) {
+        self.history_search
+            .update_query(query, &self.command_history_manager);
+        // Don't modify input_text here - keep it as the actual user input (search query)
+        // The renderer will decide what to display based on search state
+    }
+
+    /// Move to next history search match
+    pub fn next_history_match(&mut self) {
+        // Just update the match, don't modify input_text
+        // The renderer will display the matched command
+        self.history_search
+            .next_match(&self.command_history_manager);
+    }
+
+    /// Exit history search mode
+    pub fn exit_history_search(&mut self) {
+        self.history_search.clear();
+        self.auto_suggestion.clear();
+    }
+
+    /// Exit history search mode and set the selected command as new input
+    pub fn exit_history_search_with_selection(&mut self, selected_command: &str) {
+        self.input_text = selected_command.to_string();
+        self.cursor_position = self.input_text.len();
+        self.history_search.clear();
+        self.auto_suggestion.clear();
+    }
+
+    /// Add command to history when executed
+    pub fn add_command_to_history(&mut self, command: &str) {
+        self.command_history_manager.add_command(command);
+    }
+
+    /// Check if currently in history search mode
+    pub fn is_in_history_search(&self) -> bool {
+        self.history_search.is_active
+    }
+
+    /// Get current history search query
+    pub fn get_history_search_query(&self) -> &str {
+        &self.history_search.query
+    }
+
+    /// Get auto suggestion text for rendering
+    pub fn get_suggestion_text(&self) -> Option<&str> {
+        self.auto_suggestion.get_suggestion_text()
+    }
+
+    /// Get the text that should be displayed in the input line
+    /// In normal mode, this is just the input text (auto-suggestions are handled separately)
+    /// In history search mode, this is the matched command
+    pub fn get_display_text(&self) -> &str {
+        if self.is_in_history_search() {
+            // In history search mode, display the matched command if available
+            if let Some(matched_command) = self
+                .history_search
+                .current_match(&self.command_history_manager)
+            {
+                return matched_command;
+            }
+        }
+        // In normal mode, always display just the actual input text
+        // Auto-suggestions are displayed separately in the renderer
+        &self.input_text
+    }
+
+    /// Get the position where cursor should be displayed
+    /// This is always based on the actual input text, not auto-suggestions
+    pub fn get_display_cursor_position(&self) -> usize {
+        let result = if self.is_in_history_search() {
+            // In history search mode, cursor should be at the end of the search query
+            self.history_search.query.len()
+        } else {
+            // Normal mode, use actual cursor position in the input text
+            self.cursor_position
+        };
+
+        tracing::debug!("get_display_cursor_position: is_in_history_search={}, input_text='{}', cursor_position={}, result={}",
+            self.is_in_history_search(), self.input_text, self.cursor_position, result);
+        result
     }
 }

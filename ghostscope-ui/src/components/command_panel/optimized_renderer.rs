@@ -114,6 +114,10 @@ impl OptimizedRenderer {
     fn rebuild_cache(&mut self, state: &CommandPanelState, width: u16) {
         self.cached_lines.clear();
 
+        // Debug: Log command history state
+        tracing::debug!("rebuild_cache: command_history.len()={}, is_in_history_search={}",
+            state.command_history.len(), state.is_in_history_search());
+
         // Cache command history
         for (_index, item) in state.command_history.iter().enumerate() {
             // Command line - use (ghostscope) prompt for consistency
@@ -348,7 +352,15 @@ impl OptimizedRenderer {
                     crate::model::panel_state::InputState::Ready
                 ) {
                     let prompt = "(ghostscope) ";
-                    let input_content = format!("{}{}", prompt, state.input_text);
+
+                    // Calculate the actual display content including history search prompt
+                    let display_prompt = if state.is_in_history_search() {
+                        format!("(reverse-i-search)`{}': ", state.get_history_search_query())
+                    } else {
+                        prompt.to_string()
+                    };
+                    let display_text = state.get_display_text();
+                    let input_content = format!("{}{}", display_prompt, display_text);
 
                     // Handle long input that needs wrapping
                     if input_content.chars().count() > width as usize {
@@ -356,11 +368,17 @@ impl OptimizedRenderer {
                     } else {
                         // Normal single-line input
                         let input_hash = self.calculate_hash(&input_content);
-                        let input_line = self.create_input_line(
-                            prompt,
-                            &state.input_text,
-                            state.cursor_position,
-                        );
+                        let input_line = if state.is_in_history_search() {
+                            // In history search mode, handle specially
+                            self.create_history_search_input_line(state)
+                        } else {
+                            self.create_input_line(
+                                prompt,
+                                state.get_display_text(),
+                                state.get_display_cursor_position(),
+                                state,
+                            )
+                        };
                         self.cached_lines.push(CachedLine {
                             content_hash: input_hash,
                             rendered_line: input_line,
@@ -408,39 +426,178 @@ impl OptimizedRenderer {
         Line::from(Span::styled(content.to_string(), style))
     }
 
-    /// Create a styled input line with cursor
+    /// Create a history search input line with proper cursor positioning
+    fn create_history_search_input_line(&self, state: &CommandPanelState) -> Line<'static> {
+        let mut spans = Vec::new();
+
+        // History search prompt
+        let search_query = state.get_history_search_query();
+        let prompt_text = format!("(reverse-i-search)`{}': ", search_query);
+
+        tracing::debug!("create_history_search_input_line: search_query='{}', prompt_text='{}'",
+            search_query, prompt_text);
+
+        spans.push(Span::styled(
+            prompt_text,
+            Style::default().fg(Color::Cyan),
+        ));
+
+        // Display matched command or search query
+        if let Some(matched_command) = state.history_search.current_match(&state.command_history_manager) {
+            // Show matched command
+            let cursor_pos = search_query.len();
+            let chars: Vec<char> = matched_command.chars().collect();
+
+            tracing::debug!("create_history_search_input_line: matched_command='{}', cursor_pos={}, chars.len()={}",
+                matched_command, cursor_pos, chars.len());
+
+            if cursor_pos < chars.len() {
+                // Show text before cursor position (should be the matching part)
+                if cursor_pos > 0 {
+                    let before: String = chars[..cursor_pos].iter().collect();
+                    tracing::debug!("create_history_search_input_line: before cursor: '{}'", before);
+                    spans.push(Span::styled(before, Style::default()));
+                }
+
+                // Show cursor character
+                let cursor_char = chars[cursor_pos];
+                tracing::debug!("create_history_search_input_line: cursor char: '{}'", cursor_char);
+                spans.push(Span::styled(
+                    cursor_char.to_string(),
+                    crate::ui::themes::UIThemes::cursor_style(),
+                ));
+
+                // Show text after cursor in gray
+                if cursor_pos + 1 < chars.len() {
+                    let after: String = chars[cursor_pos + 1..].iter().collect();
+                    tracing::debug!("create_history_search_input_line: after cursor: '{}'", after);
+                    spans.push(Span::styled(after, Style::default().fg(Color::DarkGray)));
+                }
+            } else {
+                // Cursor at end, show all text and space cursor
+                tracing::debug!("create_history_search_input_line: cursor at end, showing space cursor");
+                spans.push(Span::styled(matched_command.to_string(), Style::default()));
+                spans.push(Span::styled(
+                    " ".to_string(),
+                    crate::ui::themes::UIThemes::cursor_style(),
+                ));
+            }
+        } else {
+            // No match, just show cursor at end of search query (already included in prompt)
+            tracing::debug!("create_history_search_input_line: no match, showing space cursor");
+            spans.push(Span::styled(
+                " ".to_string(),
+                crate::ui::themes::UIThemes::cursor_style(),
+            ));
+        }
+
+        Line::from(spans)
+    }
+
+    /// Create a styled input line with cursor, auto-suggestion and history search support
     fn create_input_line(
         &self,
         prompt: &str,
         input_text: &str,
         cursor_pos: usize,
+        state: &CommandPanelState,
     ) -> Line<'static> {
         let chars: Vec<char> = input_text.chars().collect();
-        let mut spans = vec![Span::styled(
-            prompt.to_string(),
-            Style::default().fg(Color::Magenta),
-        )];
+        let mut spans = Vec::new();
 
-        if chars.is_empty() {
-            // Empty input, just show blinking underscore cursor
+        // Display history search indicator if in search mode
+        if state.is_in_history_search() {
             spans.push(Span::styled(
-                "_".to_string(),
-                Style::default().add_modifier(Modifier::SLOW_BLINK),
-            ));
-        } else if cursor_pos >= chars.len() {
-            // Cursor at end - show text + blinking underscore
-            spans.push(Span::styled(input_text.to_string(), Style::default()));
-            spans.push(Span::styled(
-                "_".to_string(),
-                Style::default().add_modifier(Modifier::SLOW_BLINK),
+                format!("(reverse-i-search)`{}': ", state.get_history_search_query()),
+                Style::default().fg(Color::Cyan),
             ));
         } else {
-            // Cursor in middle of text - show underlined character at cursor position
+            spans.push(Span::styled(
+                prompt.to_string(),
+                Style::default().fg(Color::Magenta),
+            ));
+        }
+
+        if chars.is_empty() {
+            // Empty input, show auto-suggestion if available
+            if let Some(suggestion_text) = state.get_suggestion_text() {
+                // Show first character of suggestion as block cursor, rest as gray
+                let suggestion_chars: Vec<char> = suggestion_text.chars().collect();
+                if !suggestion_chars.is_empty() {
+                    spans.push(Span::styled(
+                        suggestion_chars[0].to_string(),
+                        crate::ui::themes::UIThemes::cursor_style(),
+                    ));
+                    if suggestion_chars.len() > 1 {
+                        let remaining: String = suggestion_chars[1..].iter().collect();
+                        spans.push(Span::styled(
+                            remaining,
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
+                } else {
+                    spans.push(Span::styled(
+                        " ".to_string(),
+                        crate::ui::themes::UIThemes::cursor_style(),
+                    ));
+                }
+            } else {
+                // No suggestion, show space as block cursor
+                spans.push(Span::styled(
+                    " ".to_string(),
+                    crate::ui::themes::UIThemes::cursor_style(),
+                ));
+            }
+        } else if cursor_pos >= chars.len() {
+            // Cursor at end - check if we have auto-suggestion to merge
+            if let Some(suggestion_text) = state.get_suggestion_text() {
+                // We have auto-suggestion, show merged text with cursor at boundary
+                let full_text = format!("{}{}", input_text, suggestion_text);
+                let full_chars: Vec<char> = full_text.chars().collect();
+
+                // Show input part in normal color
+                if !input_text.is_empty() {
+                    spans.push(Span::styled(input_text.to_string(), Style::default()));
+                }
+
+                // Show the character at cursor position as block cursor
+                if cursor_pos < full_chars.len() {
+                    let cursor_char = full_chars[cursor_pos];
+                    spans.push(Span::styled(
+                        cursor_char.to_string(),
+                        crate::ui::themes::UIThemes::cursor_style(),
+                    ));
+
+                    // Show remaining characters in dark gray
+                    if cursor_pos + 1 < full_chars.len() {
+                        let remaining: String = full_chars[cursor_pos + 1..].iter().collect();
+                        spans.push(Span::styled(
+                            remaining,
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
+                } else {
+                    // Fallback - show space as block cursor
+                    spans.push(Span::styled(
+                        " ".to_string(),
+                        crate::ui::themes::UIThemes::cursor_style(),
+                    ));
+                }
+            } else {
+                // No auto-suggestion, show block cursor at end
+                spans.push(Span::styled(input_text.to_string(), Style::default()));
+                spans.push(Span::styled(
+                    " ".to_string(),
+                    crate::ui::themes::UIThemes::cursor_style(),
+                ));
+            }
+        } else {
+            // Cursor in middle of text - show character as block cursor
             let before_cursor: String = chars[..cursor_pos].iter().collect();
             let at_cursor = if cursor_pos < chars.len() {
                 chars[cursor_pos]
             } else {
-                ' ' // If cursor is at end, show space with underline
+                ' ' // If cursor is at end, show space as block cursor
             };
             let after_cursor: String = if cursor_pos < chars.len() {
                 chars[cursor_pos + 1..].iter().collect()
@@ -453,15 +610,25 @@ impl OptimizedRenderer {
                 spans.push(Span::styled(before_cursor, Style::default()));
             }
 
-            // Character at cursor position with underlined and blinking
+            // Character at cursor position as block cursor
             spans.push(Span::styled(
                 at_cursor.to_string(),
-                Style::default().add_modifier(Modifier::UNDERLINED | Modifier::SLOW_BLINK),
+                crate::ui::themes::UIThemes::cursor_style(),
             ));
 
             // Text after cursor
             if !after_cursor.is_empty() {
                 spans.push(Span::styled(after_cursor, Style::default()));
+            }
+
+            // Add auto-suggestion at the end if cursor is at the end of meaningful text
+            if cursor_pos + 1 >= chars.len() {
+                if let Some(suggestion_text) = state.get_suggestion_text() {
+                    spans.push(Span::styled(
+                        suggestion_text.to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
             }
         }
 
@@ -482,12 +649,10 @@ impl OptimizedRenderer {
         )];
 
         if chars.is_empty() {
-            // Empty line, just show cursor
+            // Empty line, show block cursor
             spans.push(Span::styled(
-                "_".to_string(),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::SLOW_BLINK),
+                " ".to_string(),
+                crate::ui::themes::UIThemes::cursor_style(),
             ));
         } else if cursor_pos >= chars.len() {
             // Cursor at end
@@ -496,10 +661,8 @@ impl OptimizedRenderer {
                 Style::default().fg(Color::White),
             ));
             spans.push(Span::styled(
-                "_".to_string(),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::SLOW_BLINK),
+                " ".to_string(),
+                crate::ui::themes::UIThemes::cursor_style(),
             ));
         } else {
             // Cursor in middle
@@ -513,12 +676,10 @@ impl OptimizedRenderer {
                     Style::default().fg(Color::White),
                 ));
             }
-            // Show character at cursor position with underline (consistent with input mode)
+            // Show character at cursor position as block cursor
             spans.push(Span::styled(
                 at_cursor.to_string(),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::UNDERLINED),
+                crate::ui::themes::UIThemes::cursor_style(),
             ));
             if !after_cursor.is_empty() {
                 spans.push(Span::styled(
@@ -609,12 +770,25 @@ impl OptimizedRenderer {
 
     /// Handle wrapped input that spans multiple lines
     fn handle_wrapped_input(&mut self, state: &CommandPanelState, prompt: &str, width: u16) {
-        let prompt_len = prompt.chars().count();
-        let input_text = &state.input_text;
-        let cursor_pos = state.cursor_position;
+        let prompt_len = if state.is_in_history_search() {
+            format!("(reverse-i-search)`{}': ", state.get_history_search_query())
+                .chars()
+                .count()
+        } else {
+            prompt.chars().count()
+        };
+        let input_text = state.get_display_text();
+        let cursor_pos = state.get_display_cursor_position();
+
+        // Handle history search mode prompt differently
+        let display_prompt = if state.is_in_history_search() {
+            format!("(reverse-i-search)`{}': ", state.get_history_search_query())
+        } else {
+            prompt.to_string()
+        };
 
         // Wrap the full content (prompt + input)
-        let full_content = format!("{}{}", prompt, input_text);
+        let full_content = format!("{}{}", display_prompt, input_text);
         let wrapped_lines = self.wrap_text(&full_content, width);
 
         let mut char_count = 0;
@@ -727,19 +901,29 @@ impl OptimizedRenderer {
     fn add_text_with_cursor(&self, spans: &mut Vec<Span<'static>>, text: &str, cursor_pos: usize) {
         let chars: Vec<char> = text.chars().collect();
 
-        if cursor_pos == 0 && !chars.is_empty() {
-            // Cursor at beginning
+        if chars.is_empty() {
+            // Empty text, show space as block cursor
             spans.push(Span::styled(
-                "_".to_string(),
-                Style::default().add_modifier(Modifier::SLOW_BLINK),
+                " ".to_string(),
+                crate::ui::themes::UIThemes::cursor_style(),
             ));
-            spans.push(Span::styled(text.to_string(), Style::default()));
+        } else if cursor_pos == 0 {
+            // Cursor at beginning - show first character as block cursor
+            let first_char = chars[0];
+            spans.push(Span::styled(
+                first_char.to_string(),
+                crate::ui::themes::UIThemes::cursor_style(),
+            ));
+            if chars.len() > 1 {
+                let remaining: String = chars[1..].iter().collect();
+                spans.push(Span::styled(remaining, Style::default()));
+            }
         } else if cursor_pos >= chars.len() {
             // Cursor at end
             spans.push(Span::styled(text.to_string(), Style::default()));
             spans.push(Span::styled(
-                "_".to_string(),
-                Style::default().add_modifier(Modifier::SLOW_BLINK),
+                " ".to_string(),
+                crate::ui::themes::UIThemes::cursor_style(),
             ));
         } else {
             // Cursor in middle
@@ -753,7 +937,7 @@ impl OptimizedRenderer {
 
             spans.push(Span::styled(
                 at_cursor.to_string(),
-                Style::default().add_modifier(Modifier::UNDERLINED | Modifier::SLOW_BLINK),
+                crate::ui::themes::UIThemes::cursor_style(),
             ));
 
             if !after_cursor.is_empty() {
@@ -839,13 +1023,18 @@ impl OptimizedRenderer {
         let total_lines = self.cached_lines.len();
         let visible_count = inner_area.height as usize;
 
-        // In command mode, adjust viewport to show the cursor line
+        // In command mode or history search mode, adjust viewport to show the cursor line
         let (start_line, cursor_visible_line) = if matches!(
             state.mode,
             crate::model::panel_state::InteractionMode::Command
-        ) {
+        ) || state.is_in_history_search() {
             // Calculate viewport to keep cursor visible
-            let cursor_line = state.command_cursor_line;
+            let cursor_line = if state.is_in_history_search() {
+                // In history search mode, cursor should be on the last line (current input)
+                total_lines.saturating_sub(1)
+            } else {
+                state.command_cursor_line
+            };
             let mut start = if total_lines > visible_count {
                 total_lines - visible_count
             } else {
@@ -908,7 +1097,7 @@ impl OptimizedRenderer {
                             let cursor_char = chars[cursor_pos_in_span];
                             new_spans.push(ratatui::text::Span::styled(
                                 cursor_char.to_string(),
-                                Style::default().bg(Color::White).fg(Color::Black),
+                                crate::ui::themes::UIThemes::cursor_style(),
                             ));
 
                             // Add text after cursor
@@ -921,7 +1110,7 @@ impl OptimizedRenderer {
                             // Cursor at end of span, add space cursor
                             new_spans.push(ratatui::text::Span::styled(
                                 " ".to_string(),
-                                Style::default().bg(Color::White).fg(Color::Black),
+                                crate::ui::themes::UIThemes::cursor_style(),
                             ));
                         }
                     } else {
@@ -936,7 +1125,7 @@ impl OptimizedRenderer {
                 if cursor_col >= current_pos {
                     new_spans.push(ratatui::text::Span::styled(
                         " ".to_string(),
-                        Style::default().bg(Color::White).fg(Color::Black),
+                        crate::ui::themes::UIThemes::cursor_style(),
                     ));
                 }
 

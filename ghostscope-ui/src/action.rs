@@ -33,6 +33,9 @@ pub enum Action {
 
     // Command actions
     SubmitCommand,
+    SubmitCommandWithText {
+        command: String,
+    }, // For history search mode
     HistoryUp,
     HistoryDown,
     HistoryPrevious, // Ctrl+p - go to previous command
@@ -92,6 +95,9 @@ pub enum Action {
 
     // eBPF panel actions
     NavigateEbpf(EbpfNavigation),
+
+    // Internal actions
+    NoOp, // No operation - used to prevent event fallback without side effects
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

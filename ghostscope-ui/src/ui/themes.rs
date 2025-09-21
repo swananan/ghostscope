@@ -57,7 +57,7 @@ impl UIThemes {
 
     // Cursor and selection
     pub fn cursor_style() -> Style {
-        Style::default().bg(Color::White).fg(Color::Black)
+        Style::reset().bg(Color::Blue).add_modifier(Modifier::BOLD)
     }
 
     pub fn selection_style() -> Style {

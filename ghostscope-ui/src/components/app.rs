@@ -225,7 +225,18 @@ impl App {
                                 .modifiers
                                 .contains(crossterm::event::KeyModifiers::CONTROL) =>
                         {
-                            actions_to_process.push(Action::Quit);
+                            // Special handling for command panel history search mode
+                            if self.state.ui.focus.current_panel
+                                == crate::action::PanelType::InteractiveCommand
+                                && self.state.command_panel.is_in_history_search()
+                            {
+                                // Let Ctrl+C go to focused panel handler for history search exit
+                                let panel_actions = self.handle_focused_panel_input(key)?;
+                                actions_to_process.extend(panel_actions);
+                            } else {
+                                // Normal Ctrl+C behavior: quit application
+                                actions_to_process.push(Action::Quit);
+                            }
                         }
                         KeyCode::Char('w')
                             if key
@@ -271,6 +282,14 @@ impl App {
                             {
                                 // Script editor Tab inserts spaces
                                 actions_to_process.push(Action::InsertTab);
+                            } else if self.state.ui.focus.current_panel
+                                == crate::action::PanelType::InteractiveCommand
+                                && self.state.command_panel.mode
+                                    == crate::model::panel_state::InteractionMode::Input
+                            {
+                                // COMMAND INPUT MODE: Let Tab go to focused panel handler for auto-suggestion
+                                let panel_actions = self.handle_focused_panel_input(key)?;
+                                actions_to_process.extend(panel_actions);
                             } else {
                                 // Normal Tab behavior: cycle focus
                                 actions_to_process.push(Action::FocusNext);
@@ -339,7 +358,19 @@ impl App {
 
         match self.state.ui.focus.current_panel {
             PanelType::InteractiveCommand => {
-                // Use optimized input handler for command panel
+                // First, try the new unified key event handler for history and suggestions
+                let unified_actions = self
+                    .state
+                    .command_input_handler
+                    .handle_key_event(&mut self.state.command_panel, key);
+
+                if !unified_actions.is_empty() {
+                    // The unified handler handled the key, mark for updates and return
+                    self.state.command_renderer.mark_pending_updates();
+                    return Ok(unified_actions);
+                }
+
+                // Fall back to existing character-based handling
                 match key.code {
                     KeyCode::Char(c) => {
                         tracing::debug!(
@@ -1009,6 +1040,20 @@ impl App {
                 additional_actions.extend(actions);
                 self.state.command_renderer.mark_pending_updates();
             }
+            Action::SubmitCommandWithText { command } => {
+                // Handle command submission from history search mode
+                // Add to history and process the command
+                self.state.command_panel.add_command_to_history(&command);
+
+                // Set the input text and submit it
+                self.state.command_panel.input_text = command;
+                let actions = self
+                    .state
+                    .command_input_handler
+                    .handle_submit(&mut self.state.command_panel);
+                additional_actions.extend(actions);
+                self.state.command_renderer.mark_pending_updates();
+            }
             Action::HistoryUp => {
                 // Handled by input handler
             }
@@ -1356,6 +1401,9 @@ impl App {
                     &mut self.state.source_panel,
                 );
                 additional_actions.extend(actions);
+            }
+            Action::NoOp => {
+                // No operation - does nothing but prevents event fallback
             }
             _ => {
                 debug!("Action not yet implemented: {:?}", action);

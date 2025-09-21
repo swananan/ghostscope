@@ -30,6 +30,7 @@ gs_*
 output.*
 ghostscope.log
 ghostscope_*
+.ghostscope_*
 
 # Test programs and binaries (not part of Rust project)
 test_*

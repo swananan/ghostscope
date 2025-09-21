@@ -196,7 +196,7 @@ impl SourceRenderer {
         if total_width < inner.width {
             let caret_x = inner.x + total_width;
             f.render_widget(
-                Block::default().style(Style::default().bg(Color::Cyan)),
+                Block::default().style(crate::ui::themes::UIThemes::cursor_style()),
                 Rect::new(caret_x, inner.y, 1, 1),
             );
         }
@@ -365,7 +365,7 @@ impl SourceRenderer {
                 && cursor_x >= content_start_x
             {
                 f.render_widget(
-                    Block::default().style(Style::default().bg(Color::Cyan)),
+                    Block::default().style(crate::ui::themes::UIThemes::cursor_style()),
                     Rect::new(cursor_x, cursor_y, 1, 1),
                 );
             }

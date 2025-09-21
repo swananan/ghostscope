@@ -1,5 +1,7 @@
 use crate::action::{Action, CursorDirection, ResponseType};
 use crate::model::panel_state::{CommandPanelState, InputState, InteractionMode, JkEscapeState};
+use crossterm::event::{KeyCode, KeyModifiers};
+use ratatui::crossterm::event::KeyEvent;
 use std::time::Instant;
 
 /// Optimized input handler with vim-like controls
@@ -18,6 +20,18 @@ impl OptimizedInputHandler {
             jk_timeout_ms: 100,
             last_input_time: Instant::now(),
         }
+    }
+
+    /// Handle key event with priority-based routing (delegates to InputHandler)
+    pub fn handle_key_event(
+        &mut self,
+        state: &mut CommandPanelState,
+        key: KeyEvent,
+    ) -> Vec<Action> {
+        self.last_input_time = Instant::now();
+
+        // Delegate to the main InputHandler for priority-based handling
+        crate::components::command_panel::InputHandler::handle_key_event(state, key)
     }
 
     /// Handle character input in different modes
@@ -240,6 +254,10 @@ impl OptimizedInputHandler {
         let byte_pos = self.char_pos_to_byte_pos(&state.input_text, state.cursor_position);
         state.input_text.insert(byte_pos, ch);
         state.cursor_position += 1;
+
+        // Update auto suggestion after character insertion
+        state.update_auto_suggestion();
+
         tracing::debug!(
             "insert_char_at_cursor: after insertion: '{}', cursor_pos={}",
             state.input_text,
@@ -557,11 +575,15 @@ impl OptimizedInputHandler {
                     state.input_text.clear();
                     state.cursor_position = 0;
 
+                    // Clear auto-suggestion since input is cleared
+                    state.auto_suggestion.clear();
+
                     actions
                 } else {
                     // Even for empty commands, clear the input line
                     state.input_text.clear();
                     state.cursor_position = 0;
+                    state.auto_suggestion.clear();
                     Vec::new()
                 }
             }
@@ -662,6 +684,8 @@ impl OptimizedInputHandler {
                         }
                         state.input_text.drain(byte_pos..end_pos);
                     }
+                    // Update auto suggestion after character deletion
+                    state.update_auto_suggestion();
                 }
             }
             InteractionMode::Command => {
@@ -707,6 +731,10 @@ impl OptimizedInputHandler {
         use crate::model::panel_state::CommandHistoryItem;
         use std::time::Instant;
 
+        // Add to new history manager (persistent)
+        state.add_command_to_history(command);
+
+        // Also add to old command_history for display compatibility
         let item = CommandHistoryItem {
             command: command.to_string(),
             response: None, // Will be filled when response arrives
