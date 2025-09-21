@@ -1,16 +1,21 @@
+// Core modules
+pub mod action;
+pub mod components;
 pub mod events;
-mod panels;
-mod syntax_highlight;
-mod tui_app;
+pub mod handlers;
+pub mod model;
+pub mod ui;
+pub mod utils;
 
+// Public exports
+pub use action::Action;
+pub use components::App;
 pub use events::{EventRegistry, RuntimeChannels, RuntimeCommand, RuntimeStatus, TuiEvent};
-pub use tui_app::{LayoutMode, TuiApp};
+pub use model::ui_state::LayoutMode;
 
 use anyhow::Result;
-use tokio::sync::mpsc;
 
-/// Main entry point for TUI mode
 pub async fn run_tui_mode(event_registry: EventRegistry, layout_mode: LayoutMode) -> Result<()> {
-    let mut tui_app = TuiApp::new(event_registry, layout_mode).await?;
-    tui_app.run().await
+    let mut app = App::new(event_registry, layout_mode).await?;
+    app.run().await
 }

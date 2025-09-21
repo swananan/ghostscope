@@ -425,7 +425,7 @@ pub struct ScriptCompilationDetails {
     pub failed_count: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum RuntimeStatus {
     DwarfLoadingStarted,
     DwarfLoadingCompleted {
@@ -446,8 +446,6 @@ pub enum RuntimeStatus {
     UprobeDetached {
         function: String,
     },
-    ProcessAttached(u32),
-    ProcessDetached,
     SourceCodeLoaded(SourceCodeInfo),
     SourceCodeLoadFailed(String),
     TraceEnabled {

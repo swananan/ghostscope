@@ -1,0 +1,856 @@
+use crate::action::ResponseType;
+use ghostscope_protocol::EventData;
+use std::collections::{HashMap, VecDeque};
+use std::time::Instant;
+
+/// Source panel state
+#[derive(Debug, Clone)]
+pub struct SourcePanelState {
+    pub content: Vec<String>,
+    pub current_line: Option<usize>,
+    pub cursor_line: usize,
+    pub cursor_col: usize,
+    pub scroll_offset: usize,
+    pub horizontal_scroll_offset: usize,
+    pub file_path: Option<String>,
+    pub language: String,
+    pub area_height: u16,
+    pub area_width: u16,
+
+    // Search state
+    pub search_query: String,
+    pub search_matches: Vec<(usize, usize, usize)>, // (line_idx, start, end)
+    pub current_match: Option<usize>,
+    pub is_searching: bool,
+
+    // File search state
+    pub file_search_query: String,
+    pub file_search_results: Vec<String>,
+    pub file_search_filtered_indices: Vec<usize>,
+    pub file_search_selected: usize,
+    pub file_search_scroll: usize,
+    pub file_search_message: Option<String>,
+    pub is_file_searching: bool,
+
+    // Navigation state
+    pub number_buffer: String,
+    pub expecting_g: bool,
+    pub g_pressed: bool,
+
+    // Mode state
+    pub mode: SourcePanelMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourcePanelMode {
+    Normal,
+    TextSearch,
+    FileSearch,
+}
+
+impl SourcePanelState {
+    pub fn new() -> Self {
+        Self {
+            content: vec!["// No source code loaded".to_string()],
+            current_line: None,
+            cursor_line: 0,
+            cursor_col: 0,
+            scroll_offset: 0,
+            horizontal_scroll_offset: 0,
+            file_path: None,
+            language: "c".to_string(),
+            area_height: 10,
+            area_width: 80,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            current_match: None,
+            is_searching: false,
+            file_search_query: String::new(),
+            file_search_results: Vec::new(),
+            file_search_filtered_indices: Vec::new(),
+            file_search_selected: 0,
+            file_search_scroll: 0,
+            file_search_message: None,
+            is_file_searching: false,
+            number_buffer: String::new(),
+            expecting_g: false,
+            g_pressed: false,
+            mode: SourcePanelMode::Normal,
+        }
+    }
+}
+
+/// eBPF panel state
+#[derive(Debug)]
+pub struct EbpfPanelState {
+    pub trace_events: VecDeque<EventData>,
+    pub scroll_offset: usize,
+    pub max_messages: usize,
+    pub auto_scroll: bool,
+    pub cursor_trace_index: usize, // Index of the selected trace (not line)
+    pub show_cursor: bool,         // Whether to show cursor highlighting
+    pub display_mode: DisplayMode, // Current display mode
+    pub next_message_number: u64,  // Next message number to assign
+    // Numeric jump input for N+G
+    pub numeric_prefix: Option<String>,
+    pub g_pressed: bool, // whether first 'g' was pressed (for 'gg')
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DisplayMode {
+    AutoRefresh, // Default mode: always show latest trace, auto-scroll
+    Scroll,      // Manual mode: show cursor, manual navigation
+}
+
+impl EbpfPanelState {
+    pub fn new() -> Self {
+        Self {
+            trace_events: VecDeque::new(),
+            scroll_offset: 0,
+            max_messages: 2000, // TODO: Make this configurable in the future
+            auto_scroll: true,
+            cursor_trace_index: 0,
+            show_cursor: false,
+            display_mode: DisplayMode::AutoRefresh,
+            next_message_number: 1, // Start from 1
+            numeric_prefix: None,
+            g_pressed: false,
+        }
+    }
+
+    pub fn add_trace_event(&mut self, mut trace_event: EventData) {
+        // Assign message number
+        trace_event.message_number = self.next_message_number;
+        self.next_message_number += 1;
+
+        self.trace_events.push_back(trace_event);
+        if self.trace_events.len() > self.max_messages {
+            self.trace_events.pop_front();
+        }
+
+        // Only auto-scroll in auto-refresh mode
+        if self.display_mode == DisplayMode::AutoRefresh {
+            self.scroll_to_bottom();
+        }
+    }
+
+    pub fn scroll_up(&mut self) {
+        if self.scroll_offset > 0 {
+            self.scroll_offset -= 1;
+            self.auto_scroll = false;
+        }
+    }
+
+    pub fn scroll_down(&mut self) {
+        let total_lines = self.trace_events.len();
+        if self.scroll_offset + 1 < total_lines {
+            self.scroll_offset += 1;
+        } else {
+            self.auto_scroll = true;
+        }
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        // For now, just set scroll offset to 0 to show all messages
+        self.scroll_offset = 0;
+        self.auto_scroll = true;
+        self.show_cursor = false;
+    }
+
+    pub fn move_cursor_up(&mut self) {
+        self.enter_scroll_mode();
+        if self.cursor_trace_index > 0 {
+            self.cursor_trace_index -= 1;
+        }
+    }
+
+    pub fn move_cursor_down(&mut self) {
+        self.enter_scroll_mode();
+        if self.cursor_trace_index + 1 < self.trace_events.len() {
+            self.cursor_trace_index += 1;
+        }
+    }
+
+    pub fn move_cursor_up_10(&mut self) {
+        self.enter_scroll_mode();
+        self.cursor_trace_index = self.cursor_trace_index.saturating_sub(10);
+    }
+
+    pub fn move_cursor_down_10(&mut self) {
+        self.enter_scroll_mode();
+        let max_index = self.trace_events.len().saturating_sub(1);
+        self.cursor_trace_index = (self.cursor_trace_index + 10).min(max_index);
+    }
+
+    // Jump to first trace (gg)
+    pub fn jump_to_first(&mut self) {
+        self.enter_scroll_mode();
+        self.cursor_trace_index = 0;
+    }
+
+    // Jump to last trace (G without prefix)
+    pub fn jump_to_last(&mut self) {
+        self.enter_scroll_mode();
+        self.cursor_trace_index = self.trace_events.len().saturating_sub(1);
+    }
+
+    // Start or append numeric prefix for N G
+    pub fn push_numeric_digit(&mut self, ch: char) {
+        if ch.is_ascii_digit() {
+            self.enter_scroll_mode();
+            let s = self.numeric_prefix.get_or_insert_with(String::new);
+            if s.len() < 9 {
+                s.push(ch);
+            }
+            // typing number cancels pending 'g'
+            self.g_pressed = false;
+        }
+    }
+
+    // Confirm 'G' action: if numeric prefix present, jump to that message number; else jump to last
+    pub fn confirm_goto(&mut self) {
+        if let Some(s) = self.numeric_prefix.take() {
+            if let Ok(num) = s.parse::<u64>() {
+                self.jump_to_message_number(num);
+                return;
+            }
+        }
+        self.jump_to_last();
+    }
+
+    // Jump to specific message number (1-based). Clamp to [first,last]
+    pub fn jump_to_message_number(&mut self, message_number: u64) {
+        self.enter_scroll_mode();
+        if self.trace_events.is_empty() {
+            self.cursor_trace_index = 0;
+            return;
+        }
+        let mut target_idx = None;
+        for (idx, ev) in self.trace_events.iter().enumerate() {
+            if ev.message_number >= message_number {
+                target_idx = Some(idx);
+                break;
+            }
+        }
+        let idx = target_idx.unwrap_or_else(|| self.trace_events.len().saturating_sub(1));
+        self.cursor_trace_index = idx;
+    }
+
+    // Exit to auto-refresh (ESC)
+    pub fn exit_to_auto_refresh(&mut self) {
+        self.numeric_prefix = None;
+        self.g_pressed = false;
+        self.hide_cursor();
+        self.scroll_to_bottom();
+    }
+
+    // Handle 'g' key (support 'gg')
+    pub fn handle_g_key(&mut self) {
+        self.enter_scroll_mode();
+        if self.g_pressed {
+            self.g_pressed = false;
+            self.jump_to_first();
+        } else {
+            self.g_pressed = true;
+        }
+    }
+
+    /// Enter scroll mode and set cursor to the last trace
+    fn enter_scroll_mode(&mut self) {
+        if self.display_mode != DisplayMode::Scroll {
+            self.display_mode = DisplayMode::Scroll;
+            self.show_cursor = true;
+            self.auto_scroll = false;
+            // Set cursor to the last trace when entering scroll mode
+            self.cursor_trace_index = self.trace_events.len().saturating_sub(1);
+        }
+    }
+
+    pub fn hide_cursor(&mut self) {
+        self.display_mode = DisplayMode::AutoRefresh;
+        self.show_cursor = false;
+        self.auto_scroll = true;
+    }
+}
+
+/// Command panel state
+#[derive(Debug)]
+pub struct CommandPanelState {
+    // Input state
+    pub input_text: String,
+    pub cursor_position: usize,
+
+    // Mode and interaction state
+    pub mode: InteractionMode,
+    pub input_state: InputState,
+
+    // History
+    pub command_history: Vec<CommandHistoryItem>,
+    pub history_index: Option<usize>,
+    pub unsent_input_backup: Option<String>,
+
+    // Script editing
+    pub script_cache: Option<ScriptCache>,
+
+    // Command mode navigation - cursor in unified line view
+    pub command_cursor_line: usize,
+    pub command_cursor_column: usize,
+    pub cached_panel_width: u16, // Cached panel width for text wrapping calculations
+
+    // Saved cursor states for mode switching
+    pub saved_input_cursor: usize, // Input mode cursor position
+    pub saved_script_cursor: Option<(usize, usize)>, // Script mode (line, col)
+    pub previous_mode: Option<InteractionMode>, // Track mode for 'i' key return
+
+    // Display
+    pub static_lines: Vec<StaticTextLine>,
+    pub scroll_offset: usize,
+    pub styled_buffer: Option<Vec<ratatui::text::Line<'static>>>,
+    pub styled_at_history_index: Option<usize>,
+
+    // Vim-like escape sequence
+    pub jk_escape_state: JkEscapeState,
+    pub jk_timer: Option<Instant>,
+
+    // Configuration
+    pub max_history_items: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InteractionMode {
+    Input,        // Normal input mode
+    Command,      // Command mode (previously VimCommand)
+    ScriptEditor, // Multi-line script editing mode
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum JkEscapeState {
+    None, // No escape sequence in progress
+    J,    // 'j' was pressed, waiting for 'k'
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum InputState {
+    Ready, // Normal input state, shows (ghostscope)
+    WaitingResponse {
+        // Waiting for response, completely hide input
+        command: String,
+        sent_time: Instant,
+        command_type: CommandType,
+    },
+    ScriptEditor, // Script editing mode
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CommandType {
+    Script,
+    Enable { trace_id: u32 },
+    Disable { trace_id: u32 },
+    Delete { trace_id: u32 },
+    EnableAll,
+    DisableAll,
+    DeleteAll,
+    Info { target: String },
+    InfoTrace { trace_id: Option<u32> },
+    InfoTraceAll,
+    InfoSource,
+    InfoShare,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ScriptStatus {
+    Draft,     // Script is being edited
+    Submitted, // Script was submitted successfully
+    Error,     // Script had errors
+}
+
+#[derive(Debug, Clone)]
+pub struct SavedScript {
+    pub content: String,    // Script content
+    pub cursor_line: usize, // Saved cursor line
+    pub cursor_col: usize,  // Saved cursor column
+}
+
+#[derive(Debug, Clone)]
+pub struct ScriptCache {
+    pub target: String,           // Trace target (function name or file:line)
+    pub original_command: String, // Original trace command (e.g., "trace main")
+    pub lines: Vec<String>,       // Script lines
+    pub cursor_line: usize,       // Current cursor line (0-based)
+    pub cursor_col: usize,        // Current cursor column (0-based)
+    pub status: ScriptStatus,     // Current script status
+    pub saved_scripts: HashMap<String, SavedScript>, // target -> complete script cache
+}
+
+#[derive(Debug, Clone)]
+pub struct CommandHistoryItem {
+    pub command: String,
+    pub response: Option<String>,
+    pub timestamp: std::time::Instant,
+    pub prompt: String,
+    pub response_type: Option<ResponseType>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StaticTextLine {
+    pub content: String,
+    pub line_type: LineType,
+    pub history_index: Option<usize>,
+    pub response_type: Option<ResponseType>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LineType {
+    Command,
+    Response,
+    CurrentInput,
+}
+
+impl CommandPanelState {
+    pub fn new() -> Self {
+        Self {
+            input_text: String::new(),
+            cursor_position: 0,
+            mode: InteractionMode::Input,
+            input_state: InputState::Ready,
+            command_history: Vec::new(),
+            history_index: None,
+            unsent_input_backup: None,
+            script_cache: None,
+            command_cursor_line: 0,
+            command_cursor_column: 0,
+            cached_panel_width: 80, // Default width
+            saved_input_cursor: 0,
+            saved_script_cursor: None,
+            previous_mode: None,
+            static_lines: Vec::new(),
+            scroll_offset: 0,
+            styled_buffer: None,
+            styled_at_history_index: None,
+            jk_escape_state: JkEscapeState::None,
+            jk_timer: None,
+            max_history_items: 1000,
+        }
+    }
+
+    /// Update cached panel width for text wrapping calculations
+    pub fn update_panel_width(&mut self, width: u16) {
+        self.cached_panel_width = width;
+    }
+
+    /// Enter command mode from current mode, saving cursor state
+    pub fn enter_command_mode(&mut self, panel_width: u16) {
+        self.cached_panel_width = panel_width;
+        self.previous_mode = Some(self.mode);
+
+        match self.mode {
+            InteractionMode::Input => {
+                self.saved_input_cursor = self.cursor_position;
+                // Set command cursor to the current input line (last line)
+                // Use wrapped lines to handle text that exceeds panel width
+                let wrapped_lines = self.get_command_mode_wrapped_lines(panel_width);
+
+                self.command_cursor_line = wrapped_lines.len().saturating_sub(1);
+                // Calculate column position including prompt prefix
+                let prompt = crate::ui::strings::UIStrings::GHOSTSCOPE_PROMPT;
+                self.command_cursor_column = prompt.chars().count() + self.cursor_position;
+            }
+            InteractionMode::ScriptEditor => {
+                if let Some(ref script_cache) = self.script_cache {
+                    self.saved_script_cursor =
+                        Some((script_cache.cursor_line, script_cache.cursor_col));
+                    // Calculate which line in the unified view corresponds to current script cursor
+                    let lines = self.get_command_mode_lines();
+                    let script_start_line = self.get_script_start_line();
+                    // Add 3 for header lines (target, separator, prompt)
+                    self.command_cursor_line = (script_start_line + 3 + script_cache.cursor_line)
+                        .min(lines.len().saturating_sub(1));
+                    self.command_cursor_column = script_cache.cursor_col;
+                }
+            }
+            InteractionMode::Command => {
+                // Already in command mode, no change needed
+                return;
+            }
+        }
+
+        self.mode = InteractionMode::Command;
+    }
+
+    /// Exit command mode and return to previous mode, restoring cursor state
+    pub fn exit_command_mode(&mut self) {
+        if let Some(previous_mode) = self.previous_mode {
+            match previous_mode {
+                InteractionMode::Input => {
+                    self.cursor_position = self.saved_input_cursor;
+                    self.mode = InteractionMode::Input;
+                }
+                InteractionMode::ScriptEditor => {
+                    if let Some((line, col)) = self.saved_script_cursor {
+                        if let Some(ref mut script_cache) = self.script_cache {
+                            script_cache.cursor_line = line;
+                            script_cache.cursor_col = col;
+                        }
+                    }
+                    self.mode = InteractionMode::ScriptEditor;
+                }
+                InteractionMode::Command => {
+                    // This shouldn't happen, but handle gracefully
+                    self.mode = InteractionMode::Input;
+                }
+            }
+            self.previous_mode = None;
+        } else {
+            // Fallback to input mode if no previous mode
+            self.mode = InteractionMode::Input;
+        }
+    }
+
+    /// Get total number of lines in unified view (for command mode navigation)
+    pub fn get_total_lines(&self) -> usize {
+        let mut total = 0;
+
+        // Count history lines (commands + responses)
+        for item in &self.command_history {
+            total += 1; // Command line
+            if let Some(ref response) = item.response {
+                total += response.lines().count();
+            }
+        }
+
+        // Count current content lines
+        // In command mode, count based on previous_mode
+        let display_mode = if self.mode == InteractionMode::Command {
+            self.previous_mode.unwrap_or(InteractionMode::Input)
+        } else {
+            self.mode
+        };
+
+        match display_mode {
+            InteractionMode::Input => {
+                if matches!(self.input_state, InputState::Ready) {
+                    total += 1; // Current input line
+                }
+            }
+            InteractionMode::ScriptEditor => {
+                if let Some(ref script_cache) = self.script_cache {
+                    total += 3; // Header + separator + prompt
+                    total += script_cache.lines.len(); // Script lines
+                }
+            }
+            InteractionMode::Command => {
+                // This shouldn't happen in normal flow, but handle gracefully
+                if matches!(self.input_state, InputState::Ready) {
+                    total += 1; // Current input line
+                }
+            }
+        }
+
+        total
+    }
+
+    /// Get script start line offset in unified view
+    fn get_script_start_line(&self) -> usize {
+        let mut offset = 0;
+
+        // Count history lines
+        for item in &self.command_history {
+            offset += 1; // Command line
+            if let Some(ref response) = item.response {
+                offset += response.lines().count();
+            }
+        }
+
+        offset += 3; // Header + separator + prompt
+        offset
+    }
+
+    /// Get all lines for command mode (unified view)
+    pub fn get_command_mode_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+
+        // Add history lines
+        for item in &self.command_history {
+            lines.push(format!("(ghostscope) {}", item.command));
+            if let Some(ref response) = item.response {
+                for response_line in response.lines() {
+                    lines.push(response_line.to_string());
+                }
+            }
+        }
+
+        // Add current content based on mode
+        // In command mode, show content based on previous_mode
+        let display_mode = if self.mode == InteractionMode::Command {
+            self.previous_mode.unwrap_or(InteractionMode::Input)
+        } else {
+            self.mode
+        };
+
+        match display_mode {
+            InteractionMode::Input => {
+                if matches!(self.input_state, InputState::Ready) {
+                    lines.push(format!("(ghostscope) {}", self.input_text));
+                }
+            }
+            InteractionMode::ScriptEditor => {
+                if let Some(ref script_cache) = self.script_cache {
+                    lines.push(format!(
+                        "🔨 Entering script mode for target: {}",
+                        script_cache.target
+                    ));
+                    lines.push("─".repeat(50));
+                    lines.push("Script Editor (Ctrl+s to submit, Esc to cancel):".to_string());
+
+                    for (idx, line) in script_cache.lines.iter().enumerate() {
+                        lines.push(format!("{:3} │ {}", idx + 1, line));
+                    }
+                }
+            }
+            InteractionMode::Command => {
+                // This shouldn't happen in normal flow, but handle gracefully
+                if matches!(self.input_state, InputState::Ready) {
+                    lines.push(format!("(ghostscope) {}", self.input_text));
+                }
+            }
+        }
+
+        lines
+    }
+
+    /// Get wrapped lines for command mode navigation (considering text wrapping)
+    pub fn get_command_mode_wrapped_lines(&self, available_width: u16) -> Vec<String> {
+        let logical_lines = self.get_command_mode_lines();
+        let mut wrapped_lines = Vec::new();
+
+        for logical_line in logical_lines {
+            let wrapped = self.wrap_text_unicode(&logical_line, available_width);
+            wrapped_lines.extend(wrapped);
+        }
+
+        // Add current input if not already included (for navigation)
+        if matches!(self.previous_mode, Some(InteractionMode::Input)) {
+            let current_input_line = format!("(ghostscope) {}", self.input_text);
+
+            // Check if it's already included
+            let should_add = if wrapped_lines.is_empty() {
+                true
+            } else {
+                !wrapped_lines.iter().any(|line| line == &current_input_line)
+            };
+
+            if should_add {
+                let wrapped = self.wrap_text_unicode(&current_input_line, available_width);
+                wrapped_lines.extend(wrapped);
+            }
+        }
+
+        wrapped_lines
+    }
+
+    /// Wrap text considering Unicode character widths
+    fn wrap_text_unicode(&self, text: &str, width: u16) -> Vec<String> {
+        use unicode_width::UnicodeWidthChar;
+
+        if width <= 2 {
+            return vec![text.to_string()];
+        }
+
+        let max_width = width as usize;
+        let mut lines = Vec::new();
+
+        for line in text.lines() {
+            // Calculate the actual display width using Unicode width
+            let line_width: usize = line
+                .chars()
+                .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+                .sum();
+
+            if line_width <= max_width {
+                lines.push(line.to_string());
+            } else {
+                // Need to wrap this line
+                let mut current_line = String::new();
+                let mut current_width = 0;
+
+                for ch in line.chars() {
+                    let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+
+                    if current_width + char_width > max_width && !current_line.is_empty() {
+                        // Start a new line
+                        lines.push(current_line);
+                        current_line = ch.to_string();
+                        current_width = char_width;
+                    } else {
+                        current_line.push(ch);
+                        current_width += char_width;
+                    }
+                }
+
+                if !current_line.is_empty() {
+                    lines.push(current_line);
+                }
+            }
+        }
+
+        if lines.is_empty() {
+            lines.push(String::new());
+        }
+
+        lines
+    }
+
+    /// Move command cursor up
+    pub fn move_command_cursor_up(&mut self) {
+        if self.command_cursor_line > 0 {
+            self.command_cursor_line -= 1;
+            // Adjust column to fit new line - use wrapped lines for accurate navigation
+            let lines = self.get_command_mode_wrapped_lines(self.cached_panel_width);
+            if self.command_cursor_line < lines.len() {
+                let line_len = lines[self.command_cursor_line].chars().count();
+                self.command_cursor_column = self.command_cursor_column.min(line_len);
+            }
+        }
+    }
+
+    /// Move command cursor down
+    pub fn move_command_cursor_down(&mut self) {
+        // Use wrapped lines for accurate navigation
+        let lines = self.get_command_mode_wrapped_lines(self.cached_panel_width);
+        if self.command_cursor_line + 1 < lines.len() {
+            self.command_cursor_line += 1;
+            // Adjust column to fit new line
+            if self.command_cursor_line < lines.len() {
+                let line_len = lines[self.command_cursor_line].chars().count();
+                self.command_cursor_column = self.command_cursor_column.min(line_len);
+            }
+        }
+    }
+
+    /// Move command cursor left (supports line wrapping and Unicode)
+    pub fn move_command_cursor_left(&mut self) {
+        if self.command_cursor_column > 0 {
+            // Move left within current line
+            self.command_cursor_column -= 1;
+        } else if self.command_cursor_line > 0 {
+            // At beginning of line, wrap to end of previous line
+            self.command_cursor_line -= 1;
+            let lines = self.get_command_mode_wrapped_lines(self.cached_panel_width);
+            if self.command_cursor_line < lines.len() {
+                // Use Unicode-aware character counting
+                self.command_cursor_column = lines[self.command_cursor_line].chars().count();
+            }
+        }
+    }
+
+    /// Move command cursor right (supports line wrapping and Unicode)
+    pub fn move_command_cursor_right(&mut self) {
+        let lines = self.get_command_mode_wrapped_lines(self.cached_panel_width);
+        if self.command_cursor_line < lines.len() {
+            // Use Unicode-aware character counting
+            let line_len = lines[self.command_cursor_line].chars().count();
+            if self.command_cursor_column < line_len {
+                // Move right within current line
+                self.command_cursor_column += 1;
+            } else if self.command_cursor_line + 1 < lines.len() {
+                // At end of line, wrap to beginning of next line
+                self.command_cursor_line += 1;
+                self.command_cursor_column = 0;
+            }
+        }
+    }
+
+    /// Navigate to previous command in history (Ctrl+p)
+    pub fn history_previous(&mut self) {
+        if self.command_history.is_empty() {
+            return;
+        }
+
+        match self.history_index {
+            None => {
+                // Currently at input line, save current input and go to most recent command
+                self.unsent_input_backup = Some(self.input_text.clone());
+                self.history_index = Some(self.command_history.len() - 1);
+                self.input_text = self.command_history[self.command_history.len() - 1]
+                    .command
+                    .clone();
+                self.cursor_position = self.input_text.len();
+            }
+            Some(current_idx) => {
+                if current_idx > 0 {
+                    // Go to previous command
+                    self.history_index = Some(current_idx - 1);
+                    self.input_text = self.command_history[current_idx - 1].command.clone();
+                    self.cursor_position = self.input_text.len();
+                }
+                // If already at first command (index 0), do nothing
+            }
+        }
+    }
+
+    /// Navigate to next command in history (Ctrl+n)
+    pub fn history_next(&mut self) {
+        if self.command_history.is_empty() {
+            return;
+        }
+
+        match self.history_index {
+            None => {
+                // Already at current input line, do nothing
+            }
+            Some(current_idx) => {
+                if current_idx + 1 < self.command_history.len() {
+                    // Go to next command
+                    self.history_index = Some(current_idx + 1);
+                    self.input_text = self.command_history[current_idx + 1].command.clone();
+                    self.cursor_position = self.input_text.len();
+                } else {
+                    // At last command, go back to current input
+                    self.history_index = None;
+                    if let Some(backup) = self.unsent_input_backup.take() {
+                        self.input_text = backup;
+                    } else {
+                        self.input_text.clear();
+                    }
+                    self.cursor_position = self.input_text.len();
+                }
+            }
+        }
+    }
+
+    /// Move command cursor up by half a page (fast scroll)
+    pub fn move_command_half_page_up(&mut self) {
+        let jump_size = 10; // Half page size
+        if self.command_cursor_line >= jump_size {
+            self.command_cursor_line -= jump_size;
+        } else {
+            self.command_cursor_line = 0;
+        }
+
+        // Adjust column to fit new line
+        let lines = self.get_command_mode_lines();
+        if self.command_cursor_line < lines.len() {
+            let line_len = lines[self.command_cursor_line].chars().count();
+            self.command_cursor_column = self.command_cursor_column.min(line_len);
+        }
+    }
+
+    /// Move command cursor down by half a page (fast scroll)
+    pub fn move_command_half_page_down(&mut self) {
+        let jump_size = 10; // Half page size
+        let total_lines = self.get_total_lines();
+
+        if self.command_cursor_line + jump_size < total_lines {
+            self.command_cursor_line += jump_size;
+        } else {
+            self.command_cursor_line = total_lines.saturating_sub(1);
+        }
+
+        // Adjust column to fit new line
+        let lines = self.get_command_mode_lines();
+        if self.command_cursor_line < lines.len() {
+            let line_len = lines[self.command_cursor_line].chars().count();
+            self.command_cursor_column = self.command_cursor_column.min(line_len);
+        }
+    }
+}

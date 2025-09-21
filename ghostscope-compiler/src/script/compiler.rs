@@ -562,11 +562,14 @@ impl<'a> AstCompiler<'a> {
 
         // Get target triple
         let triple = TargetTriple::create("bpf-pc-linux");
+        info!("Created target triple: bpf-pc-linux for {}", function_name);
 
         // Get BPF target
         let llvm_target = Target::from_triple(&triple).map_err(|e| {
+            error!("Failed to get target for {}: {}", function_name, e);
             CompileError::LLVM(format!("Failed to get target for {}: {}", function_name, e))
         })?;
+        info!("Successfully got LLVM target for {}", function_name);
 
         // Create target machine
         let target_machine = llvm_target
@@ -579,22 +582,62 @@ impl<'a> AstCompiler<'a> {
                 inkwell::targets::CodeModel::Small,
             )
             .ok_or_else(|| {
+                error!("Failed to create target machine for {}", function_name);
                 CompileError::LLVM(format!(
                     "Failed to create target machine for {}",
                     function_name
                 ))
             })?;
+        info!("Successfully created target machine for {}", function_name);
+
+        // Validate module before generating object code
+        info!("Validating LLVM module for {}...", function_name);
+        if let Err(llvm_errors) = module.verify() {
+            error!(
+                "LLVM module validation failed for {}: {}",
+                function_name, llvm_errors
+            );
+            return Err(CompileError::LLVM(format!(
+                "Module validation failed for {}: {}",
+                function_name, llvm_errors
+            )));
+        }
+        info!("Module validation passed for {}", function_name);
 
         // Generate eBPF object file
         info!("Generating eBPF object file for {}...", function_name);
-        let object_code = target_machine
-            .write_to_memory_buffer(module, FileType::Object)
-            .map_err(|e| {
-                CompileError::LLVM(format!(
-                    "Failed to generate object code for {}: {}",
-                    function_name, e
-                ))
-            })?;
+        info!("About to call LLVM write_to_memory_buffer...");
+
+        let object_code = {
+            // Print module for debugging before compilation
+            let module_string = module.print_to_string();
+            debug!(
+                "Module IR before compilation:\n{}",
+                module_string.to_string()
+            );
+
+            // Add a flush to ensure logs are written before potential crash
+            use std::io::Write;
+            let _ = std::io::stderr().flush();
+            let _ = std::io::stdout().flush();
+
+            info!("Calling target_machine.write_to_memory_buffer...");
+            match target_machine.write_to_memory_buffer(module, FileType::Object) {
+                Ok(code) => {
+                    info!("Successfully generated object code for {}", function_name);
+                    code
+                }
+                Err(e) => {
+                    error!("LLVM compilation failed for {}: {}", function_name, e);
+                    error!("This might be due to unsupported eBPF instructions or invalid LLVM IR");
+
+                    return Err(CompileError::LLVM(format!(
+                        "eBPF compilation failed for {}: {}. This often indicates unsupported instructions or invalid IR.",
+                        function_name, e
+                    )));
+                }
+            }
+        };
 
         info!(
             "Successfully generated object code for {}! Size: {}",

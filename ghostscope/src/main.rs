@@ -12,20 +12,30 @@ use crossterm::terminal::{disable_raw_mode, LeaveAlternateScreen};
 use std::io::{self, Write};
 
 fn setup_panic_hook() {
+    // Use existing RUST_BACKTRACE setting from environment
+
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
+        // Flush any pending output before terminal restore
+        let _ = io::stdout().flush();
+        let _ = io::stderr().flush();
+
         // Attempt to restore terminal state
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = io::stdout().flush();
 
-        // Print panic information to stderr (which should be visible after terminal restore)
+        // Print panic information to stderr with immediate flushing
         eprintln!("\n=== GHOSTSCOPE PANIC ===");
+        let _ = io::stderr().flush();
+
         eprintln!(
             "Location: {}",
             panic_info
                 .location()
                 .unwrap_or_else(|| std::panic::Location::caller())
         );
+        let _ = io::stderr().flush();
 
         if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
             eprintln!("Message: {}", s);
@@ -34,10 +44,20 @@ fn setup_panic_hook() {
         } else {
             eprintln!("Message: (no message available)");
         }
+        let _ = io::stderr().flush();
+
+        // Print backtrace if available
+        eprintln!("\nBacktrace:");
+        let _ = io::stderr().flush();
+
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        eprintln!("{}", backtrace);
+        let _ = io::stderr().flush();
 
         eprintln!("======================");
         eprintln!("Terminal state has been restored. You can now see this panic message.");
         eprintln!("Please report this issue at: https://github.com/swananan/ghostscope/issues");
+        let _ = io::stderr().flush();
 
         // Call the original hook to preserve any additional panic handling
         original_hook(panic_info);

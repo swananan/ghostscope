@@ -23,25 +23,40 @@ impl<'ctx> EbpfContext<'ctx> {
             }
         };
 
-        // Create stack allocation for the variable
-        let alloca = match value {
+        // In eBPF, we don't use dynamic stack allocation. Instead, we store variables
+        // directly as values and use them when needed. For simple cases, we can just
+        // track the value directly.
+
+        // For eBPF compatibility, we store variables as direct values rather than
+        // allocating stack space. This works for our current use case where we
+        // mainly read variables and send them via ringbuf.
+
+        // Create a global variable if we need persistent storage
+        let global_name = format!("_var_{}", name);
+        let global_var = match value {
             BasicValueEnum::IntValue(_) => {
                 let i64_type = self.context.i64_type();
-                self.builder
-                    .build_alloca(i64_type, name)
-                    .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                let global =
+                    self.module
+                        .add_global(i64_type, Some(AddressSpace::default()), &global_name);
+                global.set_initializer(&i64_type.const_zero());
+                global.as_pointer_value()
             }
             BasicValueEnum::FloatValue(_) => {
                 let f64_type = self.context.f64_type();
-                self.builder
-                    .build_alloca(f64_type, name)
-                    .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                let global =
+                    self.module
+                        .add_global(f64_type, Some(AddressSpace::default()), &global_name);
+                global.set_initializer(&f64_type.const_zero());
+                global.as_pointer_value()
             }
             BasicValueEnum::PointerValue(_) => {
                 let ptr_type = self.context.ptr_type(AddressSpace::default());
-                self.builder
-                    .build_alloca(ptr_type, name)
-                    .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                let global =
+                    self.module
+                        .add_global(ptr_type, Some(AddressSpace::default()), &global_name);
+                global.set_initializer(&ptr_type.const_null());
+                global.as_pointer_value()
             }
             _ => {
                 return Err(CodeGenError::TypeError(
@@ -50,13 +65,13 @@ impl<'ctx> EbpfContext<'ctx> {
             }
         };
 
-        // Store the value
+        // Store the value in the global variable
         self.builder
-            .build_store(alloca, value)
+            .build_store(global_var, value)
             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
 
         // Track the variable
-        self.variables.insert(name.to_string(), alloca);
+        self.variables.insert(name.to_string(), global_var);
         self.var_types.insert(name.to_string(), var_type.clone());
 
         info!("Stored variable '{}' with type {:?}", name, var_type);

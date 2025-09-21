@@ -221,8 +221,42 @@ impl GhostScopeLoader {
 
         // Load the program
         info!("About to load eBPF program");
-        program.load()?;
-        info!("Program loaded successfully");
+        match program.load() {
+            Ok(()) => {
+                info!("Program loaded successfully");
+            }
+            Err(e) => {
+                error!("eBPF program load failed: {}", e);
+                error!("This typically indicates eBPF verifier rejection");
+
+                // Check for specific verifier errors
+                if let ProgramError::SyscallError(syscall_error) = &e {
+                    error!(
+                        "Syscall '{}' failed: {}",
+                        syscall_error.call, syscall_error.io_error
+                    );
+
+                    // Check for common error codes
+                    if let Some(errno) = syscall_error.io_error.raw_os_error() {
+                        match errno {
+                            22 => error!(
+                                "EINVAL (22): Invalid argument - likely eBPF verifier rejection"
+                            ),
+                            7 => error!("E2BIG (7): Program too large"),
+                            13 => error!("EACCES (13): Permission denied"),
+                            95 => error!("EOPNOTSUPP (95): Operation not supported"),
+                            _ => error!("Unknown errno: {}", errno),
+                        }
+                    }
+                }
+
+                // Log additional debugging info
+                error!("Program name: {}", program_name);
+                error!("Program type: {:?}", program_ref.prog_type());
+
+                return Err(LoaderError::Program(e));
+            }
+        }
 
         // Attach the uprobe using aya API
         // If we have an offset, use it; otherwise fall back to function name

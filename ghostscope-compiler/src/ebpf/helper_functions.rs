@@ -73,13 +73,25 @@ impl<'ctx> EbpfContext<'ctx> {
         let i64_type = self.context.i64_type();
         let ptr_type = self.context.ptr_type(AddressSpace::default());
 
-        // Allocate stack space for the result
+        // Use static global buffer instead of dynamic allocation (eBPF doesn't support alloca)
         let result_size = size.bytes();
-        let array_type = self.context.i8_type().array_type(result_size as u32);
-        let stack_ptr = self
-            .builder
-            .build_alloca(array_type, "read_buffer")
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        // Get or create a static global buffer for temporary reads
+        let buffer_name = format!("_temp_read_buffer_{}", result_size);
+        let global_buffer = match self.module.get_global(&buffer_name) {
+            Some(existing) => existing.as_pointer_value(),
+            None => {
+                // Create new global buffer
+                let array_type = self.context.i8_type().array_type(result_size as u32);
+                let global =
+                    self.module
+                        .add_global(array_type, Some(AddressSpace::default()), &buffer_name);
+                global.set_initializer(&array_type.const_zero());
+                global.as_pointer_value()
+            }
+        };
+
+        let stack_ptr = global_buffer;
 
         // Cast addresses to void pointers
         let dst_ptr = self
@@ -94,6 +106,14 @@ impl<'ctx> EbpfContext<'ctx> {
         // Use eBPF helper calling convention - convert helper ID to function pointer
         let i32_type = self.context.i32_type();
         let helper_id = i64_type.const_int(BPF_FUNC_probe_read_user as u64, false);
+        info!(
+            "Using eBPF helper function BPF_FUNC_probe_read_user with ID: {}",
+            BPF_FUNC_probe_read_user
+        );
+
+        // Log all helper function IDs for debugging
+        info!("Helper function IDs: probe_read_user={}, ringbuf_output={}, get_current_pid_tgid={}, ktime_get_ns={}",
+              BPF_FUNC_probe_read_user, BPF_FUNC_ringbuf_output, BPF_FUNC_get_current_pid_tgid, BPF_FUNC_ktime_get_ns);
         let helper_fn_type = i32_type.fn_type(
             &[
                 ptr_type.into(), // dst

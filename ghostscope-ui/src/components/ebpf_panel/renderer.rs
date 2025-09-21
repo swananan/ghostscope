@@ -1,4 +1,5 @@
-// Removed unused chrono imports
+use crate::model::panel_state::{DisplayMode, EbpfPanelState};
+use crate::ui::themes::UIThemes;
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
@@ -6,280 +7,29 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Paragraph},
     Frame,
 };
-use std::collections::VecDeque;
 
-use ghostscope_protocol::EventData;
+/// Renders the eBPF output panel
+#[derive(Debug)]
+pub struct EbpfPanelRenderer;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum DisplayMode {
-    AutoRefresh, // Default mode: always show latest trace, auto-scroll
-    Scroll,      // Manual mode: show cursor, manual navigation
-}
-
-pub struct EbpfInfoPanel {
-    pub trace_events: VecDeque<EventData>,
-    pub scroll_offset: usize,
-    pub max_messages: usize,
-    pub auto_scroll: bool,
-    pub cursor_trace_index: usize, // Index of the selected trace (not line)
-    pub show_cursor: bool,         // Whether to show cursor highlighting
-    pub display_mode: DisplayMode, // Current display mode
-    pub next_message_number: u64,  // Next message number to assign
-    // Numeric jump input for N+G
-    pub numeric_prefix: Option<String>,
-    pub g_pressed: bool, // whether first 'g' was pressed (for 'gg')
-}
-
-impl EbpfInfoPanel {
+impl EbpfPanelRenderer {
     pub fn new() -> Self {
-        Self {
-            trace_events: VecDeque::new(),
-            scroll_offset: 0,
-            max_messages: 2000, // TODO: Make this configurable in the future
-            auto_scroll: true,
-            cursor_trace_index: 0,
-            show_cursor: false,
-            display_mode: DisplayMode::AutoRefresh,
-            next_message_number: 1, // Start from 1
-            numeric_prefix: None,
-            g_pressed: false,
-        }
+        Self
     }
 
-    pub fn add_trace_event(&mut self, mut trace_event: EventData) {
-        // Assign message number
-        trace_event.message_number = self.next_message_number;
-        self.next_message_number += 1;
-
-        self.trace_events.push_back(trace_event);
-        if self.trace_events.len() > self.max_messages {
-            self.trace_events.pop_front();
-        }
-
-        // Only auto-scroll in auto-refresh mode
-        if self.display_mode == DisplayMode::AutoRefresh {
-            self.scroll_to_bottom();
-        }
-    }
-
-    pub fn scroll_up(&mut self) {
-        if self.scroll_offset > 0 {
-            self.scroll_offset -= 1;
-            self.auto_scroll = false;
-        }
-    }
-
-    pub fn scroll_down(&mut self) {
-        let total_lines = self.trace_events.len();
-        if self.scroll_offset + 1 < total_lines {
-            self.scroll_offset += 1;
-        } else {
-            self.auto_scroll = true;
-        }
-    }
-
-    pub fn scroll_to_bottom(&mut self) {
-        // For now, just set scroll offset to 0 to show all messages
-        self.scroll_offset = 0;
-        self.auto_scroll = true;
-        self.show_cursor = false;
-    }
-
-    pub fn move_cursor_up(&mut self) {
-        self.enter_scroll_mode();
-        if self.cursor_trace_index > 0 {
-            self.cursor_trace_index -= 1;
-        }
-    }
-
-    pub fn move_cursor_down(&mut self) {
-        self.enter_scroll_mode();
-        if self.cursor_trace_index + 1 < self.trace_events.len() {
-            self.cursor_trace_index += 1;
-        }
-    }
-
-    pub fn move_cursor_up_10(&mut self) {
-        self.enter_scroll_mode();
-        self.cursor_trace_index = self.cursor_trace_index.saturating_sub(10);
-    }
-
-    pub fn move_cursor_down_10(&mut self) {
-        self.enter_scroll_mode();
-        let max_index = self.trace_events.len().saturating_sub(1);
-        self.cursor_trace_index = (self.cursor_trace_index + 10).min(max_index);
-    }
-
-    // Jump to first trace (gg)
-    pub fn jump_to_first(&mut self) {
-        self.enter_scroll_mode();
-        self.cursor_trace_index = 0;
-    }
-
-    // Jump to last trace (G without prefix)
-    pub fn jump_to_last(&mut self) {
-        self.enter_scroll_mode();
-        self.cursor_trace_index = self.trace_events.len().saturating_sub(1);
-    }
-
-    // Start or append numeric prefix for N G
-    pub fn push_numeric_digit(&mut self, ch: char) {
-        if ch.is_ascii_digit() {
-            self.enter_scroll_mode();
-            let s = self.numeric_prefix.get_or_insert_with(String::new);
-            if s.len() < 9 {
-                s.push(ch);
-            }
-            // typing number cancels pending 'g'
-            self.g_pressed = false;
-        }
-    }
-
-    // Confirm 'G' action: if numeric prefix present, jump to that message number; else jump to last
-    pub fn confirm_goto(&mut self) {
-        if let Some(s) = self.numeric_prefix.take() {
-            if let Ok(num) = s.parse::<u64>() {
-                self.jump_to_message_number(num);
-                return;
-            }
-        }
-        self.jump_to_last();
-    }
-
-    // Jump to specific message number (1-based). Clamp to [first,last]
-    pub fn jump_to_message_number(&mut self, message_number: u64) {
-        self.enter_scroll_mode();
-        if self.trace_events.is_empty() {
-            self.cursor_trace_index = 0;
-            return;
-        }
-        let mut target_idx = None;
-        for (idx, ev) in self.trace_events.iter().enumerate() {
-            if ev.message_number >= message_number {
-                target_idx = Some(idx);
-                break;
-            }
-        }
-        let idx = target_idx.unwrap_or_else(|| self.trace_events.len().saturating_sub(1));
-        self.cursor_trace_index = idx;
-    }
-
-    // Exit to auto-refresh (ESC)
-    pub fn exit_to_auto_refresh(&mut self) {
-        self.numeric_prefix = None;
-        self.g_pressed = false;
-        self.hide_cursor();
-        self.scroll_to_bottom();
-    }
-
-    // Handle 'g' key (support 'gg')
-    pub fn handle_g_key(&mut self) {
-        self.enter_scroll_mode();
-        if self.g_pressed {
-            self.g_pressed = false;
-            self.jump_to_first();
-        } else {
-            self.g_pressed = true;
-        }
-    }
-
-    /// Enter scroll mode and set cursor to the last trace
-    fn enter_scroll_mode(&mut self) {
-        if self.display_mode != DisplayMode::Scroll {
-            self.display_mode = DisplayMode::Scroll;
-            self.show_cursor = true;
-            self.auto_scroll = false;
-            // Set cursor to the last trace when entering scroll mode
-            self.cursor_trace_index = self.trace_events.len().saturating_sub(1);
-        }
-    }
-
-    pub fn hide_cursor(&mut self) {
-        self.display_mode = DisplayMode::AutoRefresh;
-        self.show_cursor = false;
-        self.auto_scroll = true;
-    }
-
-    /// Ensure the cursor trace is visible by adjusting scroll offset
-    fn ensure_cursor_visible(
+    /// Render the eBPF panel
+    pub fn render(
         &mut self,
-        total_items: usize,
-        available_height: usize,
-        content_width: usize,
+        state: &mut EbpfPanelState,
+        frame: &mut Frame,
+        area: Rect,
+        is_focused: bool,
     ) {
-        if total_items <= available_height {
-            // All items fit, no scrolling needed
-            self.scroll_offset = 0;
-            return;
-        }
-
-        // Calculate the line index of the cursor trace by counting actual lines
-        let mut cursor_line_index = 0;
-        for (trace_index, trace) in self.trace_events.iter().enumerate() {
-            if trace_index == self.cursor_trace_index {
-                break;
-            }
-
-            // Count actual lines for this trace (including wrapped lines)
-            // Use the same content width calculation as in render method
-            let message_type_short = match trace.message_type {
-                ghostscope_protocol::EventMessageType::VariableData => "VAR",
-                ghostscope_protocol::EventMessageType::Log => "LOG",
-                ghostscope_protocol::EventMessageType::ExecutionFailure => "ERR",
-                ghostscope_protocol::EventMessageType::Unknown => "UNK",
-            };
-
-            let mut message_line = format!(
-                "{} [No:{}] TraceID:{} PID:{} TID:{} [{}]",
-                trace.readable_timestamp,
-                trace.message_number,
-                trace.trace_id,
-                trace.pid,
-                trace.tid,
-                message_type_short
-            );
-
-            // Add variable information if available
-            if !trace.variables.is_empty() {
-                let variables_info = trace
-                    .variables
-                    .iter()
-                    .map(|var| format!("{}: {}", var.name, var.formatted_value))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                message_line.push_str(&format!(" | Variables: [{}]", variables_info));
-            }
-
-            // Add log message if available
-            if let Some(log_msg) = &trace.log_message {
-                message_line.push_str(&format!(" | Log: {}", log_msg));
-            }
-
-            // Add failure message if available
-            if let Some(failure_msg) = &trace.failure_message {
-                message_line.push_str(&format!(" | Failure: {}", failure_msg));
-            }
-
-            let wrapped_lines = self.wrap_text(&message_line, content_width);
-            cursor_line_index += wrapped_lines.len();
-        }
-
-        // Ensure cursor is visible
-        if cursor_line_index < self.scroll_offset {
-            // Cursor is above visible area, scroll up to show it at the top
-            self.scroll_offset = cursor_line_index;
-        } else if cursor_line_index >= self.scroll_offset + available_height {
-            // Cursor is below visible area, scroll down to show it at the bottom
-            self.scroll_offset = cursor_line_index.saturating_sub(available_height - 1);
-        }
-    }
-
-    pub fn render(&mut self, frame: &mut Frame, area: Rect, is_focused: bool) {
         // Outer panel block
         let border_style = if is_focused {
-            Style::default().fg(Color::Cyan)
+            UIThemes::panel_focused()
         } else {
-            Style::default()
+            UIThemes::panel_unfocused()
         };
         let panel_block = Block::default()
             .borders(Borders::ALL)
@@ -290,7 +40,7 @@ impl EbpfInfoPanel {
             })
             .title(format!(
                 "eBPF Trace Output ({} events)",
-                self.trace_events.len()
+                state.trace_events.len()
             ))
             .border_style(border_style);
         frame.render_widget(panel_block, area);
@@ -319,8 +69,8 @@ impl EbpfInfoPanel {
         }
         let mut cards: Vec<Card> = Vec::new();
 
-        let total_traces = self.trace_events.len();
-        for (trace_index, trace) in self.trace_events.iter().enumerate() {
+        let total_traces = state.trace_events.len();
+        for (trace_index, trace) in state.trace_events.iter().enumerate() {
             let is_latest = trace_index == total_traces - 1;
             let is_error = matches!(
                 trace.message_type,
@@ -346,7 +96,7 @@ impl EbpfInfoPanel {
                     let name_prefix = format!("{}{}: ", indent, name);
                     let name_prefix_width = name_prefix.len();
                     let wrap_width = content_width.saturating_sub(name_prefix_width);
-                    let wrapped_vals = self.wrap_text(value, wrap_width);
+                    let wrapped_vals = Self::wrap_text(value, wrap_width);
                     for (i, seg) in wrapped_vals.into_iter().enumerate() {
                         if i == 0 {
                             body_lines.push(Line::from(vec![
@@ -382,7 +132,7 @@ impl EbpfInfoPanel {
             if let Some(log_msg) = &trace.log_message {
                 let prefix = "log: ";
                 let wrapped =
-                    self.wrap_text(log_msg, content_width.saturating_sub(2 + prefix.len()));
+                    Self::wrap_text(log_msg, content_width.saturating_sub(2 + prefix.len()));
                 for (i, seg) in wrapped.into_iter().enumerate() {
                     let indent = "  ";
                     if i == 0 {
@@ -417,7 +167,7 @@ impl EbpfInfoPanel {
             if let Some(failure_msg) = &trace.failure_message {
                 let prefix = "failure: ";
                 let wrapped =
-                    self.wrap_text(failure_msg, content_width.saturating_sub(2 + prefix.len()));
+                    Self::wrap_text(failure_msg, content_width.saturating_sub(2 + prefix.len()));
                 for (i, seg) in wrapped.into_iter().enumerate() {
                     let indent = "  ";
                     if i == 0 {
@@ -463,7 +213,7 @@ impl EbpfInfoPanel {
         // Determine starting card index based on mode and cursor visibility
         let mut start_index = 0usize;
         let viewport_height = content_area.height;
-        match self.display_mode {
+        match state.display_mode {
             DisplayMode::AutoRefresh => {
                 // Fit as many cards from the end as possible
                 let mut h: u16 = 0;
@@ -479,7 +229,7 @@ impl EbpfInfoPanel {
             }
             DisplayMode::Scroll => {
                 // Ensure cursor card is fully visible
-                let cursor = self.cursor_trace_index.min(cards.len().saturating_sub(1));
+                let cursor = state.cursor_trace_index.min(cards.len().saturating_sub(1));
                 // Try to place cursor card slightly below center if possible
                 let mut h_below: u16 = 0;
                 let mut end = cursor;
@@ -518,7 +268,7 @@ impl EbpfInfoPanel {
                 break;
             }
 
-            let is_cursor = self.show_cursor && idx == self.cursor_trace_index;
+            let is_cursor = state.show_cursor && idx == state.cursor_trace_index;
             let title_style = Style::default().add_modifier(Modifier::BOLD);
 
             let mut border_style = Style::default();
@@ -592,15 +342,15 @@ impl EbpfInfoPanel {
         }
 
         // Render numeric prefix or 'g' hint (style consistent with SourceCode panel)
-        if self.g_pressed || self.numeric_prefix.is_some() {
-            let input_text = if let Some(ref s) = self.numeric_prefix {
-                format!("{}G", s)
+        if state.g_pressed || state.numeric_prefix.is_some() {
+            let input_text = if let Some(ref s) = state.numeric_prefix {
+                format!("{}", s)
             } else {
                 "g".to_string()
             };
-            let hint_text = if self.g_pressed && self.numeric_prefix.is_none() {
+            let hint_text = if state.g_pressed && state.numeric_prefix.is_none() {
                 " Press 'g' again for top"
-            } else if self.numeric_prefix.is_some() {
+            } else if state.numeric_prefix.is_some() {
                 " Press 'G' to jump to message"
             } else {
                 ""
@@ -638,7 +388,7 @@ impl EbpfInfoPanel {
 
     /// Wrap text to fit within the specified width
     /// Simple character-based wrapping to avoid word breaking issues
-    fn wrap_text(&self, text: &str, width: usize) -> Vec<String> {
+    fn wrap_text(text: &str, width: usize) -> Vec<String> {
         if width == 0 || text.is_empty() {
             return vec![text.to_string()];
         }
