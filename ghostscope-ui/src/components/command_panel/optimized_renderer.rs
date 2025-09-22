@@ -28,9 +28,7 @@ pub struct OptimizedRenderer {
     // Viewport management
     scroll_offset: usize,
     visible_lines: usize,
-
-    // Welcome message styling cache
-    welcome_lines_mapping: std::collections::HashMap<String, Line<'static>>,
+    // Removed welcome_lines_mapping - now using direct styled_content in StaticTextLine
 }
 
 #[derive(Clone, Debug)]
@@ -51,7 +49,7 @@ impl OptimizedRenderer {
             last_height: 0,
             scroll_offset: 0,
             visible_lines: 0,
-            welcome_lines_mapping: std::collections::HashMap::new(),
+            // Removed welcome_lines_mapping initialization
         }
     }
 
@@ -61,21 +59,7 @@ impl OptimizedRenderer {
         // No-op: immediate rendering doesn't need pending flags
     }
 
-    /// Set the welcome lines mapping for styled rendering
-    pub fn set_welcome_lines_mapping(&mut self, styled_lines: Vec<Line<'static>>) {
-        self.welcome_lines_mapping.clear();
-        for line in styled_lines {
-            // Convert line to plain text for mapping key
-            let text_key: String = line
-                .spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect();
-            self.welcome_lines_mapping.insert(text_key, line);
-        }
-        // Force cache rebuild to apply new mapping immediately
-        self.cache_version += 1;
-    }
+    // Removed set_welcome_lines_mapping - no longer needed with direct styled_content
 
     /// Main render function with smart caching (immediate rendering)
     pub fn render(
@@ -140,31 +124,68 @@ impl OptimizedRenderer {
 
         // First, cache static lines (including welcome messages)
         for static_line in &state.static_lines {
-            let wrapped_lines = self.wrap_text(&static_line.content, width);
-            for wrapped_line in wrapped_lines {
-                let line_hash = self.calculate_hash(&wrapped_line);
-                let styled_line = match static_line.line_type {
-                    LineType::Welcome => {
-                        // Format welcome messages with special styling based on content
-                        self.create_welcome_line(&wrapped_line)
+            match static_line.line_type {
+                LineType::Welcome => {
+                    // Handle welcome lines with styled content and proper wrapping
+                    if let Some(ref styled_content) = static_line.styled_content {
+                        let wrapped_styled_lines =
+                            self.wrap_styled_line(styled_content, width as usize);
+                        for wrapped_styled_line in wrapped_styled_lines {
+                            let line_string = self.styled_line_to_string(&wrapped_styled_line);
+                            let line_hash = self.calculate_hash(&line_string);
+                            let cached_line = CachedLine {
+                                content_hash: line_hash,
+                                rendered_line: wrapped_styled_line,
+                                line_type: LineType::Welcome,
+                                response_type: static_line.response_type,
+                                original_content: line_string,
+                            };
+                            self.cached_lines.push(cached_line);
+                        }
+                    } else {
+                        // Fallback for lines without styled content
+                        let wrapped_lines = self.wrap_text(&static_line.content, width);
+                        for wrapped_line in wrapped_lines {
+                            let line_hash = self.calculate_hash(&wrapped_line);
+                            let styled_line = self.create_fallback_welcome_line(&wrapped_line);
+                            let cached_line = CachedLine {
+                                content_hash: line_hash,
+                                rendered_line: styled_line,
+                                line_type: LineType::Welcome,
+                                response_type: static_line.response_type,
+                                original_content: wrapped_line,
+                            };
+                            self.cached_lines.push(cached_line);
+                        }
                     }
-                    LineType::Response => {
-                        self.create_response_line(&wrapped_line, static_line.response_type)
-                    }
-                    LineType::Command => self.create_command_line(&wrapped_line),
-                    LineType::CurrentInput => Line::from(Span::styled(
-                        wrapped_line.clone(),
-                        Style::default().fg(Color::White),
-                    )),
-                };
+                    continue; // Skip the normal processing for welcome lines
+                }
+                _ => {
+                    // Normal processing for non-welcome lines
+                    let wrapped_lines = self.wrap_text(&static_line.content, width);
+                    for wrapped_line in wrapped_lines {
+                        let line_hash = self.calculate_hash(&wrapped_line);
+                        let styled_line = match static_line.line_type {
+                            LineType::Response => {
+                                self.create_response_line(&wrapped_line, static_line.response_type)
+                            }
+                            LineType::Command => self.create_command_line(&wrapped_line),
+                            LineType::CurrentInput => Line::from(Span::styled(
+                                wrapped_line.clone(),
+                                Style::default().fg(Color::White),
+                            )),
+                            _ => unreachable!("Welcome type handled above"),
+                        };
 
-                self.cached_lines.push(CachedLine {
-                    content_hash: line_hash,
-                    rendered_line: styled_line,
-                    line_type: static_line.line_type,
-                    response_type: static_line.response_type,
-                    original_content: wrapped_line,
-                });
+                        self.cached_lines.push(CachedLine {
+                            content_hash: line_hash,
+                            rendered_line: styled_line,
+                            line_type: static_line.line_type,
+                            response_type: static_line.response_type,
+                            original_content: wrapped_line,
+                        });
+                    }
+                }
             }
         }
 
@@ -476,42 +497,140 @@ impl OptimizedRenderer {
         Line::from(Span::styled(content.to_string(), style))
     }
 
-    /// Create a welcome line with content-based styling
-    fn create_welcome_line(&self, content: &str) -> Line<'static> {
-        // Check if we have a pre-styled version in the mapping
-        if let Some(styled_line) = self.welcome_lines_mapping.get(content) {
-            return styled_line.clone();
+    /// Wrap a styled line preserving span styles across line breaks
+    fn wrap_styled_line(
+        &self,
+        styled_line: &ratatui::text::Line<'static>,
+        width: usize,
+    ) -> Vec<ratatui::text::Line<'static>> {
+        use ratatui::text::{Line, Span};
+
+        // Calculate total text length
+        let full_text: String = styled_line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+
+        if full_text.len() <= width {
+            // No wrapping needed
+            return vec![styled_line.clone()];
         }
 
-        // Fallback to content-based styling if not found in mapping
+        let mut result_lines = Vec::new();
+        let mut current_line_spans = Vec::new();
+        let mut current_line_length = 0;
+
+        for span in &styled_line.spans {
+            let span_text = span.content.as_ref();
+            let span_style = span.style;
+
+            if current_line_length + span_text.len() <= width {
+                // Entire span fits on current line
+                current_line_spans.push(span.clone());
+                current_line_length += span_text.len();
+            } else {
+                // Need to split the span
+                let remaining_width = width - current_line_length;
+
+                if remaining_width > 0 {
+                    // Take what fits on current line
+                    let (first_part, remaining_part) =
+                        span_text.split_at(remaining_width.min(span_text.len()));
+                    if !first_part.is_empty() {
+                        current_line_spans.push(Span::styled(first_part.to_string(), span_style));
+                    }
+
+                    // Finish current line
+                    if !current_line_spans.is_empty() {
+                        result_lines.push(Line::from(current_line_spans));
+                        current_line_spans = Vec::new();
+                        current_line_length = 0;
+                    }
+
+                    // Handle remaining part
+                    let mut remaining = remaining_part;
+                    while !remaining.is_empty() {
+                        let chunk_size = width.min(remaining.len());
+                        let (chunk, rest) = remaining.split_at(chunk_size);
+                        result_lines.push(Line::from(vec![Span::styled(
+                            chunk.to_string(),
+                            span_style,
+                        )]));
+                        remaining = rest;
+                    }
+                } else {
+                    // Current line is full, start new line
+                    if !current_line_spans.is_empty() {
+                        result_lines.push(Line::from(current_line_spans));
+                        current_line_spans = Vec::new();
+                        current_line_length = 0;
+                    }
+
+                    // Handle the full span on new line(s)
+                    let mut remaining = span_text;
+                    while !remaining.is_empty() {
+                        let chunk_size = width.min(remaining.len());
+                        let (chunk, rest) = remaining.split_at(chunk_size);
+                        result_lines.push(Line::from(vec![Span::styled(
+                            chunk.to_string(),
+                            span_style,
+                        )]));
+                        remaining = rest;
+                    }
+                }
+            }
+        }
+
+        // Add final line if any spans remain
+        if !current_line_spans.is_empty() {
+            result_lines.push(Line::from(current_line_spans));
+        }
+
+        result_lines
+    }
+
+    /// Convert styled line to string for hashing
+    fn styled_line_to_string(&self, styled_line: &ratatui::text::Line<'static>) -> String {
+        styled_line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    /// Create fallback welcome line for lines without styled content
+    fn create_fallback_welcome_line(&self, content: &str) -> ratatui::text::Line<'static> {
         use ratatui::style::{Color, Modifier, Style};
         use ratatui::text::Span;
 
         // Apply content-based styling for welcome messages
         if content.contains("GhostScope") {
             // Title line
-            Line::from(Span::styled(
+            ratatui::text::Line::from(Span::styled(
                 content.to_string(),
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
             ))
         } else if content.starts_with("•") || content.starts_with("Loading completed in") {
             // Bullet points and timing info
-            Line::from(Span::styled(
+            ratatui::text::Line::from(Span::styled(
                 content.to_string(),
                 Style::default().fg(Color::Cyan),
             ))
         } else if content.starts_with("Attached to process") {
             // Process info
-            Line::from(Span::styled(
+            ratatui::text::Line::from(Span::styled(
                 content.to_string(),
                 Style::default().fg(Color::White),
             ))
         } else if content.trim().is_empty() {
             // Empty lines
-            Line::from("")
+            ratatui::text::Line::from("")
         } else {
             // Default welcome text styling
-            Line::from(Span::styled(
+            ratatui::text::Line::from(Span::styled(
                 content.to_string(),
                 Style::default().fg(Color::White),
             ))

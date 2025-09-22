@@ -1131,15 +1131,15 @@ impl App {
                 );
                 self.state.command_renderer.mark_pending_updates();
             }
-            Action::AddWelcomeMessage {
-                lines,
+            // Removed old AddWelcomeMessage - now using AddStyledWelcomeMessage
+            Action::AddStyledWelcomeMessage {
+                styled_lines,
                 response_type,
             } => {
-                crate::components::command_panel::ResponseFormatter::add_welcome_message(
-                    &mut self.state.command_panel,
-                    lines,
-                    response_type,
-                );
+                // New direct styled approach - no complex mapping needed
+                self.state
+                    .command_panel
+                    .add_styled_welcome_lines(styled_lines, response_type);
                 self.state.command_renderer.mark_pending_updates();
             }
             Action::SendRuntimeCommand(cmd) => {
@@ -1505,25 +1505,11 @@ impl App {
             styled_lines = enhanced_lines;
         }
 
-        // Store the styled lines mapping for the renderer
-        self.state
-            .command_renderer
-            .set_welcome_lines_mapping(styled_lines.clone());
+        // Removed complex mapping - now using direct styled content approach
 
-        // Convert styled lines to strings for the existing pipeline
-        let summary_lines: Vec<String> = styled_lines
-            .into_iter()
-            .map(|line| {
-                line.spans
-                    .into_iter()
-                    .map(|span| span.content.to_string())
-                    .collect::<String>()
-            })
-            .collect();
-
-        // Add all summary lines as welcome message
-        let action = Action::AddWelcomeMessage {
-            lines: summary_lines,
+        // Use new simplified direct styled approach
+        let action = Action::AddStyledWelcomeMessage {
+            styled_lines,
             response_type: crate::action::ResponseType::Info,
         };
         if let Err(e) = self.handle_action(action) {

@@ -65,8 +65,8 @@ pub enum Action {
         content: String,
         response_type: ResponseType,
     },
-    AddWelcomeMessage {
-        lines: Vec<String>,
+    AddStyledWelcomeMessage {
+        styled_lines: Vec<ratatui::text::Line<'static>>,
         response_type: ResponseType,
     },
     CommandCompleted,

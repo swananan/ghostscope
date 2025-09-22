@@ -28,14 +28,7 @@ impl ResponseFormatter {
         // Note: Optimized renderer will handle display updates via cache rebuild
     }
 
-    /// Add welcome message lines directly to static display
-    pub fn add_welcome_message(
-        state: &mut CommandPanelState,
-        lines: Vec<String>,
-        response_type: ResponseType,
-    ) {
-        state.add_welcome_lines(lines, response_type);
-    }
+    // Removed add_welcome_message - now using direct styled approach
 
     /// Update the static lines display from command history
     pub fn update_static_lines(state: &mut CommandPanelState) {
@@ -55,6 +48,7 @@ impl ResponseFormatter {
                 line_type: LineType::Command,
                 history_index: Some(index),
                 response_type: None,
+                styled_content: None,
             });
 
             // Add response lines if they exist
@@ -66,6 +60,7 @@ impl ResponseFormatter {
                         line_type: LineType::Response,
                         history_index: Some(index),
                         response_type: item.response_type,
+                        styled_content: None,
                     });
                 }
             }
@@ -80,6 +75,7 @@ impl ResponseFormatter {
                 line_type: LineType::CurrentInput,
                 history_index: None,
                 response_type: None,
+                styled_content: None,
             });
         }
     }

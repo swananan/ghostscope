@@ -402,6 +402,8 @@ pub struct StaticTextLine {
     pub line_type: LineType,
     pub history_index: Option<usize>,
     pub response_type: Option<ResponseType>,
+    /// Optional pre-styled content (takes precedence over content if present)
+    pub styled_content: Option<ratatui::text::Line<'static>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -942,14 +944,32 @@ impl CommandPanelState {
         &self.history_search.query
     }
 
-    /// Add welcome message lines to static display
-    pub fn add_welcome_lines(&mut self, lines: Vec<String>, response_type: ResponseType) {
-        for line in lines {
+    // Removed old add_welcome_lines - now using add_styled_welcome_lines
+
+    /// Add styled welcome message lines directly (new simplified approach)
+    pub fn add_styled_welcome_lines(
+        &mut self,
+        styled_lines: Vec<ratatui::text::Line<'static>>,
+        response_type: ResponseType,
+    ) {
+        // Clear existing welcome messages to prevent duplicates
+        self.static_lines
+            .retain(|line| !matches!(line.line_type, LineType::Welcome));
+
+        for styled_line in styled_lines {
+            // Extract plain text for content field (for compatibility)
+            let content: String = styled_line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+
             self.static_lines.push(StaticTextLine {
-                content: line,
+                content,
                 line_type: LineType::Welcome,
                 history_index: None,
                 response_type: Some(response_type),
+                styled_content: Some(styled_line),
             });
         }
         // Clear any cached styled buffer since we've added new content
