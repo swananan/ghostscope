@@ -181,25 +181,9 @@ impl SourceRenderer {
             height: overlay_area.height - 2,
         };
 
-        // Input line
+        // Input line with cursor support
         let prefix = "🔎 ";
-        let prompt = format!("{}{}", prefix, state.file_search_query);
-        let input_para = Paragraph::new(prompt.clone())
-            .style(Style::default().fg(Color::Cyan).bg(Color::Rgb(30, 30, 30)));
-        f.render_widget(input_para, Rect::new(inner.x, inner.y, inner.width, 1));
-
-        // Render cursor
-        let prefix_width = prefix.width() as u16;
-        let query_width = state.file_search_query.width() as u16;
-        let total_width = prefix_width + query_width;
-
-        if total_width < inner.width {
-            let caret_x = inner.x + total_width;
-            f.render_widget(
-                Block::default().style(crate::ui::themes::UIThemes::cursor_style()),
-                Rect::new(caret_x, inner.y, 1, 1),
-            );
-        }
+        Self::render_input_with_cursor(f, inner, state, prefix);
 
         // Body: message or file list
         if let Some(msg) = &state.file_search_message {
@@ -807,5 +791,69 @@ impl SourceRenderer {
             }
             truncated
         }
+    }
+
+    /// Render input line with proper cursor positioning
+    fn render_input_with_cursor(
+        f: &mut Frame,
+        area: Rect,
+        state: &SourcePanelState,
+        prefix: &str,
+    ) {
+        let chars: Vec<char> = state.file_search_query.chars().collect();
+        let cursor_pos = state.file_search_cursor_pos;
+
+        // Build the input line with cursor
+        let mut spans = vec![Span::styled(
+            prefix.to_string(),
+            Style::default().fg(Color::Cyan),
+        )];
+
+        if chars.is_empty() {
+            // Empty input, show cursor as a space
+            spans.push(Span::styled(
+                " ".to_string(),
+                UIThemes::cursor_style(),
+            ));
+        } else if cursor_pos >= chars.len() {
+            // Cursor at end
+            spans.push(Span::styled(
+                state.file_search_query.clone(),
+                Style::default().fg(Color::White),
+            ));
+            spans.push(Span::styled(
+                " ".to_string(),
+                UIThemes::cursor_style(),
+            ));
+        } else {
+            // Cursor in middle of text
+            let before_cursor: String = chars[..cursor_pos].iter().collect();
+            let at_cursor = chars[cursor_pos];
+            let after_cursor: String = chars[cursor_pos + 1..].iter().collect();
+
+            if !before_cursor.is_empty() {
+                spans.push(Span::styled(
+                    before_cursor,
+                    Style::default().fg(Color::White),
+                ));
+            }
+
+            spans.push(Span::styled(
+                at_cursor.to_string(),
+                UIThemes::cursor_style(),
+            ));
+
+            if !after_cursor.is_empty() {
+                spans.push(Span::styled(
+                    after_cursor,
+                    Style::default().fg(Color::White),
+                ));
+            }
+        }
+
+        let input_line = Line::from(spans);
+        let input_para = Paragraph::new(input_line)
+            .style(Style::default().bg(Color::Rgb(30, 30, 30)));
+        f.render_widget(input_para, Rect::new(area.x, area.y, area.width, 1));
     }
 }

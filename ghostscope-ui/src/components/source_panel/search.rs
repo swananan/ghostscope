@@ -108,6 +108,7 @@ impl SourceSearch {
     pub fn enter_file_search_mode(state: &mut SourcePanelState) -> Vec<Action> {
         state.mode = SourcePanelMode::FileSearch;
         state.file_search_query.clear();
+        state.file_search_cursor_pos = 0;
         state.file_search_results.clear();
         state.file_search_filtered_indices.clear();
         state.file_search_selected = 0;
@@ -120,6 +121,7 @@ impl SourceSearch {
     pub fn exit_file_search_mode(state: &mut SourcePanelState) -> Vec<Action> {
         state.mode = SourcePanelMode::Normal;
         state.file_search_query.clear();
+        state.file_search_cursor_pos = 0;
         state.file_search_results.clear();
         state.file_search_filtered_indices.clear();
         state.file_search_selected = 0;
@@ -131,7 +133,10 @@ impl SourceSearch {
     /// Add character to file search query
     pub fn push_file_search_char(state: &mut SourcePanelState, ch: char) -> Vec<Action> {
         if state.mode == SourcePanelMode::FileSearch {
-            state.file_search_query.push(ch);
+            let mut chars: Vec<char> = state.file_search_query.chars().collect();
+            chars.insert(state.file_search_cursor_pos, ch);
+            state.file_search_query = chars.into_iter().collect();
+            state.file_search_cursor_pos += 1;
             Self::update_file_search_results(state);
         }
         Vec::new()
@@ -139,9 +144,87 @@ impl SourceSearch {
 
     /// Remove character from file search query
     pub fn backspace_file_search(state: &mut SourcePanelState) -> Vec<Action> {
-        if state.mode == SourcePanelMode::FileSearch {
-            state.file_search_query.pop();
+        if state.mode == SourcePanelMode::FileSearch && state.file_search_cursor_pos > 0 {
+            let mut chars: Vec<char> = state.file_search_query.chars().collect();
+            chars.remove(state.file_search_cursor_pos - 1);
+            state.file_search_query = chars.into_iter().collect();
+            state.file_search_cursor_pos -= 1;
             Self::update_file_search_results(state);
+        }
+        Vec::new()
+    }
+
+    /// Clear entire file search query (Ctrl+U)
+    pub fn clear_file_search_query(state: &mut SourcePanelState) -> Vec<Action> {
+        if state.mode == SourcePanelMode::FileSearch {
+            state.file_search_query.clear();
+            state.file_search_cursor_pos = 0;
+            Self::update_file_search_results(state);
+        }
+        Vec::new()
+    }
+
+    /// Delete previous word from file search query (Ctrl+W)
+    pub fn delete_word_file_search(state: &mut SourcePanelState) -> Vec<Action> {
+        if state.mode == SourcePanelMode::FileSearch && state.file_search_cursor_pos > 0 {
+            let chars: Vec<char> = state.file_search_query.chars().collect();
+            let mut start_pos = state.file_search_cursor_pos;
+
+            // Define word separators for file paths (include whitespace and path separators)
+            let is_separator = |c: char| c.is_whitespace() || c == '/' || c == '\\' || c == '.' || c == '-' || c == '_';
+
+            // Skip trailing separators backwards from cursor
+            while start_pos > 0 && is_separator(chars[start_pos - 1]) {
+                start_pos -= 1;
+            }
+
+            // Delete word characters backwards (until we hit a separator)
+            while start_pos > 0 && !is_separator(chars[start_pos - 1]) {
+                start_pos -= 1;
+            }
+
+            // Create new string by combining before start_pos and after cursor_pos
+            let mut new_chars = chars[..start_pos].to_vec();
+            new_chars.extend_from_slice(&chars[state.file_search_cursor_pos..]);
+
+            state.file_search_query = new_chars.into_iter().collect();
+            state.file_search_cursor_pos = start_pos;
+            Self::update_file_search_results(state);
+        }
+        Vec::new()
+    }
+
+    /// Move cursor to beginning of search query (Ctrl+A)
+    pub fn move_cursor_to_start(state: &mut SourcePanelState) -> Vec<Action> {
+        if state.mode == SourcePanelMode::FileSearch {
+            state.file_search_cursor_pos = 0;
+        }
+        Vec::new()
+    }
+
+    /// Move cursor to end of search query (Ctrl+E)
+    pub fn move_cursor_to_end(state: &mut SourcePanelState) -> Vec<Action> {
+        if state.mode == SourcePanelMode::FileSearch {
+            state.file_search_cursor_pos = state.file_search_query.chars().count();
+        }
+        Vec::new()
+    }
+
+    /// Move cursor left one character (Ctrl+B)
+    pub fn move_cursor_left(state: &mut SourcePanelState) -> Vec<Action> {
+        if state.mode == SourcePanelMode::FileSearch && state.file_search_cursor_pos > 0 {
+            state.file_search_cursor_pos -= 1;
+        }
+        Vec::new()
+    }
+
+    /// Move cursor right one character (Ctrl+F)
+    pub fn move_cursor_right(state: &mut SourcePanelState) -> Vec<Action> {
+        if state.mode == SourcePanelMode::FileSearch {
+            let max_pos = state.file_search_query.chars().count();
+            if state.file_search_cursor_pos < max_pos {
+                state.file_search_cursor_pos += 1;
+            }
         }
         Vec::new()
     }

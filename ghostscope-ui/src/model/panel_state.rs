@@ -25,6 +25,7 @@ pub struct SourcePanelState {
 
     // File search state
     pub file_search_query: String,
+    pub file_search_cursor_pos: usize, // Cursor position in the search query
     pub file_search_results: Vec<String>,
     pub file_search_filtered_indices: Vec<usize>,
     pub file_search_selected: usize,
@@ -66,6 +67,7 @@ impl SourcePanelState {
             current_match: None,
             is_searching: false,
             file_search_query: String::new(),
+            file_search_cursor_pos: 0,
             file_search_results: Vec::new(),
             file_search_filtered_indices: Vec::new(),
             file_search_selected: 0,

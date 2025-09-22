@@ -217,7 +217,7 @@ impl App {
                                 .modifiers
                                 .contains(crossterm::event::KeyModifiers::CONTROL) =>
                         {
-                            // Special handling for command panel history search mode
+                            // Special handling for different panel modes
                             if self.state.ui.focus.current_panel
                                 == crate::action::PanelType::InteractiveCommand
                                 && self.state.command_panel.is_in_history_search()
@@ -225,6 +225,12 @@ impl App {
                                 // Let Ctrl+C go to focused panel handler for history search exit
                                 let panel_actions = self.handle_focused_panel_input(key)?;
                                 actions_to_process.extend(panel_actions);
+                            } else if self.state.ui.focus.current_panel == crate::action::PanelType::Source
+                                && self.state.source_panel.mode
+                                    == crate::model::panel_state::SourcePanelMode::FileSearch
+                            {
+                                // Ctrl+C in file search mode should exit file search, not quit app
+                                actions_to_process.push(Action::ExitFileSearch);
                             } else {
                                 // Normal Ctrl+C behavior: quit application
                                 actions_to_process.push(Action::Quit);
@@ -235,8 +241,17 @@ impl App {
                                 .modifiers
                                 .contains(crossterm::event::KeyModifiers::CONTROL) =>
                         {
-                            // Handle Ctrl+W based on current focus and mode
-                            if self.state.ui.focus.current_panel
+                            // Handle Ctrl+W based on current focus and mode - priority order matters!
+                            if self.state.ui.focus.current_panel == crate::action::PanelType::Source
+                                && self.state.source_panel.mode
+                                    == crate::model::panel_state::SourcePanelMode::FileSearch
+                            {
+                                // HIGHEST PRIORITY: File search delete word
+                                let delete_actions = crate::components::source_panel::SourceSearch::delete_word_file_search(
+                                    &mut self.state.source_panel,
+                                );
+                                actions_to_process.extend(delete_actions);
+                            } else if self.state.ui.focus.current_panel
                                 == crate::action::PanelType::InteractiveCommand
                             {
                                 match self.state.command_panel.mode {
@@ -904,13 +919,50 @@ impl App {
                                         }
                                     }
                                     'u' => {
-                                        // Ctrl+U - page up in file search (move up multiple items)
-                                        for _ in 0..5 {
-                                            let move_actions = crate::components::source_panel::SourceSearch::move_file_search_up(
-                                                &mut self.state.source_panel,
-                                            );
-                                            actions.extend(move_actions);
-                                        }
+                                        // Ctrl+U - clear entire query
+                                        let clear_actions = crate::components::source_panel::SourceSearch::clear_file_search_query(
+                                            &mut self.state.source_panel,
+                                        );
+                                        actions.extend(clear_actions);
+                                    }
+                                    'a' => {
+                                        // Ctrl+A - move cursor to beginning
+                                        let move_actions = crate::components::source_panel::SourceSearch::move_cursor_to_start(
+                                            &mut self.state.source_panel,
+                                        );
+                                        actions.extend(move_actions);
+                                    }
+                                    'e' => {
+                                        // Ctrl+E - move cursor to end
+                                        let move_actions = crate::components::source_panel::SourceSearch::move_cursor_to_end(
+                                            &mut self.state.source_panel,
+                                        );
+                                        actions.extend(move_actions);
+                                    }
+                                    'w' => {
+                                        // Ctrl+W - delete previous word
+                                        let delete_actions = crate::components::source_panel::SourceSearch::delete_word_file_search(
+                                            &mut self.state.source_panel,
+                                        );
+                                        actions.extend(delete_actions);
+                                    }
+                                    'b' => {
+                                        // Ctrl+B - move cursor left
+                                        let move_actions = crate::components::source_panel::SourceSearch::move_cursor_left(
+                                            &mut self.state.source_panel,
+                                        );
+                                        actions.extend(move_actions);
+                                    }
+                                    'f' => {
+                                        // Ctrl+F - move cursor right
+                                        let move_actions = crate::components::source_panel::SourceSearch::move_cursor_right(
+                                            &mut self.state.source_panel,
+                                        );
+                                        actions.extend(move_actions);
+                                    }
+                                    'h' => {
+                                        // Ctrl+H - delete previous character (same as backspace)
+                                        actions.push(Action::SourceFileSearchBackspace);
                                     }
                                     _ => {
                                         // Regular character input
