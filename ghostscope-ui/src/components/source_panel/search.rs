@@ -171,7 +171,9 @@ impl SourceSearch {
             let mut start_pos = state.file_search_cursor_pos;
 
             // Define word separators for file paths (include whitespace and path separators)
-            let is_separator = |c: char| c.is_whitespace() || c == '/' || c == '\\' || c == '.' || c == '-' || c == '_';
+            let is_separator = |c: char| {
+                c.is_whitespace() || c == '/' || c == '\\' || c == '.' || c == '-' || c == '_'
+            };
 
             // Skip trailing separators backwards from cursor
             while start_pos > 0 && is_separator(chars[start_pos - 1]) {

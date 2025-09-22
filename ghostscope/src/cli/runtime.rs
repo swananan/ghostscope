@@ -1,7 +1,7 @@
 use crate::args::ParsedArgs;
 use crate::core::GhostSession;
 use anyhow::Result;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Run GhostScope in command line mode with direct script execution
 pub async fn run_command_line_runtime(parsed_args: ParsedArgs) -> Result<()> {
@@ -101,8 +101,15 @@ pub async fn run_command_line_runtime(parsed_args: ParsedArgs) -> Result<()> {
             }),
     };
 
-    crate::script::compile_and_load_script_for_cli(&script_content, &mut session, &save_options)
-        .await?;
+    // Step 6: Compile and load script with graceful error handling
+    if let Err(e) =
+        crate::script::compile_and_load_script_for_cli(&script_content, &mut session, &save_options)
+            .await
+    {
+        error!("Failed to compile and load script: {}", e);
+        info!("GhostScope encountered an error during script compilation. Exiting gracefully.");
+        return Err(e);
+    }
 
     // Step 7: Start event monitoring loop using trace_manager
     info!(

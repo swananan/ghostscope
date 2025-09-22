@@ -294,13 +294,22 @@ pub async fn compile_and_load_script_for_cli(
 
     // Step 2: Get starting trace ID from trace manager and use unified compilation interface with DwarfAnalyzer
     let starting_trace_id = session.trace_manager.get_next_trace_id();
-    let compilation_result = ghostscope_compiler::compile_script(
+    let compilation_result = match ghostscope_compiler::compile_script(
         script,
         process_analyzer,
         session.target_pid,
         Some(starting_trace_id), // Use trace_manager's next available ID
         save_options,
-    )?;
+    ) {
+        Ok(result) => result,
+        Err(e) => {
+            error!("Script compilation failed: {}", e);
+            return Err(anyhow::anyhow!(
+                "Script compilation failed: {}. Please check your script syntax and try again.",
+                e
+            ));
+        }
+    };
 
     info!(
         "✓ Script compilation successful: {} trace points found, {} uprobe configs generated",

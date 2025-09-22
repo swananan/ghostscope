@@ -4,6 +4,7 @@
 
 use super::context::{CodeGenError, EbpfContext, Result};
 use crate::script::VarType;
+use inkwell::types::BasicTypeEnum;
 use inkwell::values::BasicValueEnum;
 use inkwell::AddressSpace;
 use tracing::{debug, info};
@@ -74,7 +75,20 @@ impl<'ctx> EbpfContext<'ctx> {
         self.variables.insert(name.to_string(), global_var);
         self.var_types.insert(name.to_string(), var_type.clone());
 
-        info!("Stored variable '{}' with type {:?}", name, var_type);
+        info!(
+            "store_variable: Stored variable '{}' with type {:?}",
+            name, var_type
+        );
+        debug!("store_variable: Value type stored: {:?}", value.get_type());
+        match &value {
+            BasicValueEnum::IntValue(iv) => debug!(
+                "store_variable: Stored IntValue with bit width {}",
+                iv.get_type().get_bit_width()
+            ),
+            BasicValueEnum::FloatValue(_) => debug!("store_variable: Stored FloatValue"),
+            BasicValueEnum::PointerValue(_) => debug!("store_variable: Stored PointerValue"),
+            _ => debug!("store_variable: Stored other type"),
+        }
         Ok(())
     }
 
@@ -86,12 +100,38 @@ impl<'ctx> EbpfContext<'ctx> {
                 .get(name)
                 .ok_or_else(|| CodeGenError::VariableNotFound(name.to_string()))?;
 
-            debug!("Loading variable '{}' with type {:?}", name, var_type);
+            debug!(
+                "load_variable: Loading variable '{}' with stored type {:?}",
+                name, var_type
+            );
+
+            // Get the pointed-to type, not the pointer type itself
+            let pointed_type: BasicTypeEnum = match var_type {
+                VarType::Int => self.context.i64_type().into(),
+                VarType::Float => self.context.f64_type().into(),
+                VarType::String => self.context.ptr_type(AddressSpace::default()).into(),
+                VarType::Bool => self.context.bool_type().into(),
+            };
 
             let loaded_value = self
                 .builder
-                .build_load(alloca.get_type(), *alloca, name)
+                .build_load(pointed_type, *alloca, name)
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+            debug!(
+                "load_variable: Loaded variable '{}' with actual type: {:?}",
+                name,
+                loaded_value.get_type()
+            );
+            match &loaded_value {
+                BasicValueEnum::IntValue(iv) => debug!(
+                    "load_variable: Loaded IntValue with bit width {}",
+                    iv.get_type().get_bit_width()
+                ),
+                BasicValueEnum::FloatValue(_) => debug!("load_variable: Loaded FloatValue"),
+                BasicValueEnum::PointerValue(_) => debug!("load_variable: Loaded PointerValue"),
+                _ => debug!("load_variable: Loaded other type"),
+            }
 
             Ok(loaded_value)
         } else {

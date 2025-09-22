@@ -4,6 +4,7 @@ use pest::RuleType;
 use pest_derive::Parser;
 
 use crate::script::ast::{infer_type, BinaryOp, Expr, Program, Statement, TracePattern};
+use tracing::{debug, warn};
 
 #[derive(Parser)]
 #[grammar = "script/grammar.pest"]
@@ -46,10 +47,17 @@ fn chunks_of_two<'a, T: RuleType>(pairs: Pairs<'a, T>) -> Vec<Vec<Pair<'a, T>>> 
 }
 
 pub fn parse(input: &str) -> Result<Program> {
+    debug!("Starting to parse input: {}", input.trim());
+
     let pairs = GhostScopeParser::parse(Rule::program, input)?;
     let mut program = Program::new();
 
     for pair in pairs {
+        debug!(
+            "Parsing top-level rule: {:?} = '{}'",
+            pair.as_rule(),
+            pair.as_str().trim()
+        );
         match pair.as_rule() {
             Rule::statement => {
                 let statement = parse_statement(pair)?;
@@ -60,11 +68,22 @@ pub fn parse(input: &str) -> Result<Program> {
         }
     }
 
+    debug!("Parsing completed successfully");
     Ok(program)
 }
 
 fn parse_statement(pair: Pair<Rule>) -> Result<Statement> {
+    debug!(
+        "parse_statement: {:?} = '{}'",
+        pair.as_rule(),
+        pair.as_str().trim()
+    );
     let inner = pair.into_inner().next().unwrap();
+    debug!(
+        "parse_statement inner: {:?} = '{}'",
+        inner.as_rule(),
+        inner.as_str().trim()
+    );
 
     match inner.as_rule() {
         Rule::trace_stmt => {
@@ -119,6 +138,40 @@ fn parse_statement(pair: Pair<Rule>) -> Result<Statement> {
                 value: parsed_expr,
             })
         }
+        Rule::if_stmt => {
+            debug!("Parsing if_stmt");
+            let mut inner_pairs = inner.into_inner();
+            let condition_pair = inner_pairs.next().unwrap();
+            debug!(
+                "if_stmt condition_pair: {:?} = '{}'",
+                condition_pair.as_rule(),
+                condition_pair.as_str().trim()
+            );
+            let condition = parse_condition(condition_pair)?;
+
+            // Parse then body statements
+            let mut then_body = Vec::new();
+            let mut else_body = None;
+
+            for pair in inner_pairs {
+                match pair.as_rule() {
+                    Rule::statement => {
+                        then_body.push(parse_statement(pair)?);
+                    }
+                    Rule::else_clause => {
+                        else_body = Some(Box::new(parse_else_clause(pair)?));
+                        break;
+                    }
+                    _ => return Err(ParseError::UnexpectedToken(pair.as_rule())),
+                }
+            }
+
+            Ok(Statement::If {
+                condition,
+                then_body,
+                else_body,
+            })
+        }
         _ => Err(ParseError::UnexpectedToken(inner.as_rule())),
     }
 }
@@ -161,6 +214,108 @@ fn parse_expr(pair: Pair<Rule>) -> Result<Expr> {
             Ok(left)
         }
         _ => Err(ParseError::UnexpectedToken(pair.as_rule())),
+    }
+}
+
+fn parse_condition(pair: Pair<Rule>) -> Result<Expr> {
+    debug!(
+        "parse_condition: {:?} = '{}'",
+        pair.as_rule(),
+        pair.as_str().trim()
+    );
+    match pair.as_rule() {
+        Rule::condition => {
+            let mut pairs = pair.into_inner();
+            let left_expr = pairs.next().unwrap();
+            debug!(
+                "condition left_expr: {:?} = '{}'",
+                left_expr.as_rule(),
+                left_expr.as_str().trim()
+            );
+            let left = parse_expr(left_expr)?;
+
+            let op_pair = pairs.next().unwrap();
+            debug!(
+                "condition op_pair: {:?} = '{}'",
+                op_pair.as_rule(),
+                op_pair.as_str().trim()
+            );
+            let op = match op_pair.as_str() {
+                "==" => BinaryOp::Equal,
+                "!=" => BinaryOp::NotEqual,
+                "<" => BinaryOp::LessThan,
+                "<=" => BinaryOp::LessEqual,
+                ">" => BinaryOp::GreaterThan,
+                ">=" => BinaryOp::GreaterEqual,
+                _ => return Err(ParseError::UnexpectedToken(op_pair.as_rule())),
+            };
+
+            let right_expr = pairs.next().unwrap();
+            let right = parse_expr(right_expr)?;
+
+            let expr = Expr::BinaryOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            };
+
+            // Check type consistency for comparison operations
+            if let Err(err) = infer_type(&expr) {
+                return Err(ParseError::TypeError(err));
+            }
+
+            Ok(expr)
+        }
+        _ => Err(ParseError::UnexpectedToken(pair.as_rule())),
+    }
+}
+
+fn parse_else_clause(pair: Pair<Rule>) -> Result<Statement> {
+    let inner = pair.into_inner().next().unwrap();
+    match inner.as_rule() {
+        Rule::if_stmt => {
+            // Directly parse if statement for else if
+            debug!("Parsing else if statement");
+            let mut inner_pairs = inner.into_inner();
+            let condition_pair = inner_pairs.next().unwrap();
+            debug!(
+                "else if condition_pair: {:?} = '{}'",
+                condition_pair.as_rule(),
+                condition_pair.as_str().trim()
+            );
+            let condition = parse_condition(condition_pair)?;
+
+            // Parse then body statements
+            let mut then_body = Vec::new();
+            let mut else_body = None;
+
+            for pair in inner_pairs {
+                match pair.as_rule() {
+                    Rule::statement => {
+                        then_body.push(parse_statement(pair)?);
+                    }
+                    Rule::else_clause => {
+                        else_body = Some(Box::new(parse_else_clause(pair)?));
+                        break;
+                    }
+                    _ => return Err(ParseError::UnexpectedToken(pair.as_rule())),
+                }
+            }
+
+            Ok(Statement::If {
+                condition,
+                then_body,
+                else_body,
+            })
+        }
+        _ => {
+            // Parse else block statements
+            let mut else_body = Vec::new();
+            for stmt_pair in inner.into_inner() {
+                else_body.push(parse_statement(stmt_pair)?);
+            }
+            Ok(Statement::Block(else_body))
+        }
     }
 }
 

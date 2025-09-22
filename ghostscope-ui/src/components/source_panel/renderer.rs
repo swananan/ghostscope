@@ -794,12 +794,7 @@ impl SourceRenderer {
     }
 
     /// Render input line with proper cursor positioning
-    fn render_input_with_cursor(
-        f: &mut Frame,
-        area: Rect,
-        state: &SourcePanelState,
-        prefix: &str,
-    ) {
+    fn render_input_with_cursor(f: &mut Frame, area: Rect, state: &SourcePanelState, prefix: &str) {
         let chars: Vec<char> = state.file_search_query.chars().collect();
         let cursor_pos = state.file_search_cursor_pos;
 
@@ -811,20 +806,14 @@ impl SourceRenderer {
 
         if chars.is_empty() {
             // Empty input, show cursor as a space
-            spans.push(Span::styled(
-                " ".to_string(),
-                UIThemes::cursor_style(),
-            ));
+            spans.push(Span::styled(" ".to_string(), UIThemes::cursor_style()));
         } else if cursor_pos >= chars.len() {
             // Cursor at end
             spans.push(Span::styled(
                 state.file_search_query.clone(),
                 Style::default().fg(Color::White),
             ));
-            spans.push(Span::styled(
-                " ".to_string(),
-                UIThemes::cursor_style(),
-            ));
+            spans.push(Span::styled(" ".to_string(), UIThemes::cursor_style()));
         } else {
             // Cursor in middle of text
             let before_cursor: String = chars[..cursor_pos].iter().collect();
@@ -852,8 +841,8 @@ impl SourceRenderer {
         }
 
         let input_line = Line::from(spans);
-        let input_para = Paragraph::new(input_line)
-            .style(Style::default().bg(Color::Rgb(30, 30, 30)));
+        let input_para =
+            Paragraph::new(input_line).style(Style::default().bg(Color::Rgb(30, 30, 30)));
         f.render_widget(input_para, Rect::new(area.x, area.y, area.width, 1));
     }
 }

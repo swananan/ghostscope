@@ -14,6 +14,11 @@ impl<'ctx> EbpfContext<'ctx> {
         match expr {
             Expr::Int(value) => {
                 let int_value = self.context.i64_type().const_int(*value as u64, false);
+                debug!(
+                    "compile_expr: Int literal {} compiled to IntValue with bit width {}",
+                    value,
+                    int_value.get_type().get_bit_width()
+                );
                 Ok(int_value.into())
             }
             Expr::Float(value) => {
@@ -36,9 +41,39 @@ impl<'ctx> EbpfContext<'ctx> {
                     .into())
             }
             Expr::Variable(var_name) => {
-                // Use the unified evaluation logic for DWARF variables
-                debug!("Compiling variable expression: {}", var_name);
+                debug!("compile_expr: Compiling variable expression: {}", var_name);
 
+                // First check if it's a script-defined variable
+                if self.variable_exists(var_name) {
+                    debug!("compile_expr: Found script variable: {}", var_name);
+                    let loaded_value = self.load_variable(var_name)?;
+                    debug!(
+                        "compile_expr: Loaded variable '{}' with type: {:?}",
+                        var_name,
+                        loaded_value.get_type()
+                    );
+                    match &loaded_value {
+                        BasicValueEnum::IntValue(iv) => debug!(
+                            "compile_expr: Variable '{}' is IntValue with bit width {}",
+                            var_name,
+                            iv.get_type().get_bit_width()
+                        ),
+                        BasicValueEnum::FloatValue(_) => {
+                            debug!("compile_expr: Variable '{}' is FloatValue", var_name)
+                        }
+                        BasicValueEnum::PointerValue(_) => {
+                            debug!("compile_expr: Variable '{}' is PointerValue", var_name)
+                        }
+                        _ => debug!("compile_expr: Variable '{}' is other type", var_name),
+                    }
+                    return Ok(loaded_value);
+                }
+
+                // If not found in script variables, try DWARF variables
+                debug!(
+                    "Variable '{}' not found in script variables, checking DWARF",
+                    var_name
+                );
                 let compile_context = self.get_compile_time_context()?.clone();
                 let variable_with_eval = match self.query_dwarf_for_variable(var_name)? {
                     Some(var) => var,
@@ -122,6 +157,29 @@ impl<'ctx> EbpfContext<'ctx> {
     ) -> Result<BasicValueEnum<'ctx>> {
         use inkwell::values::BasicValueEnum::*;
 
+        // Debug logging to understand the actual types
+        debug!("compile_binary_op: op={:?}", op);
+        debug!("compile_binary_op: left type = {:?}", left.get_type());
+        debug!("compile_binary_op: right type = {:?}", right.get_type());
+        match &left {
+            IntValue(iv) => debug!(
+                "compile_binary_op: left is IntValue with bit width {}",
+                iv.get_type().get_bit_width()
+            ),
+            FloatValue(_) => debug!("compile_binary_op: left is FloatValue"),
+            PointerValue(_) => debug!("compile_binary_op: left is PointerValue"),
+            _ => debug!("compile_binary_op: left is other type"),
+        }
+        match &right {
+            IntValue(iv) => debug!(
+                "compile_binary_op: right is IntValue with bit width {}",
+                iv.get_type().get_bit_width()
+            ),
+            FloatValue(_) => debug!("compile_binary_op: right is FloatValue"),
+            PointerValue(_) => debug!("compile_binary_op: right is PointerValue"),
+            _ => debug!("compile_binary_op: right is other type"),
+        }
+
         match (left, right) {
             (IntValue(left_int), IntValue(right_int)) => {
                 let result = match op {
@@ -141,6 +199,84 @@ impl<'ctx> EbpfContext<'ctx> {
                         .builder
                         .build_int_signed_div(left_int, right_int, "div")
                         .map_err(|e| CodeGenError::Builder(e.to_string()))?,
+                    // Comparison operators
+                    BinaryOp::Equal => {
+                        let result = self
+                            .builder
+                            .build_int_compare(inkwell::IntPredicate::EQ, left_int, right_int, "eq")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        return Ok(result.into());
+                    }
+                    BinaryOp::NotEqual => {
+                        let result = self
+                            .builder
+                            .build_int_compare(inkwell::IntPredicate::NE, left_int, right_int, "ne")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        return Ok(result.into());
+                    }
+                    BinaryOp::LessThan => {
+                        let result = self
+                            .builder
+                            .build_int_compare(
+                                inkwell::IntPredicate::SLT,
+                                left_int,
+                                right_int,
+                                "lt",
+                            )
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        return Ok(result.into());
+                    }
+                    BinaryOp::LessEqual => {
+                        let result = self
+                            .builder
+                            .build_int_compare(
+                                inkwell::IntPredicate::SLE,
+                                left_int,
+                                right_int,
+                                "le",
+                            )
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        return Ok(result.into());
+                    }
+                    BinaryOp::GreaterThan => {
+                        let result = self
+                            .builder
+                            .build_int_compare(
+                                inkwell::IntPredicate::SGT,
+                                left_int,
+                                right_int,
+                                "gt",
+                            )
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        return Ok(result.into());
+                    }
+                    BinaryOp::GreaterEqual => {
+                        let result = self
+                            .builder
+                            .build_int_compare(
+                                inkwell::IntPredicate::SGE,
+                                left_int,
+                                right_int,
+                                "ge",
+                            )
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        return Ok(result.into());
+                    }
+                    // Logical operators (for boolean values represented as i1 or i64)
+                    BinaryOp::LogicalAnd => {
+                        let result = self
+                            .builder
+                            .build_and(left_int, right_int, "and")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        return Ok(result.into());
+                    }
+                    BinaryOp::LogicalOr => {
+                        let result = self
+                            .builder
+                            .build_or(left_int, right_int, "or")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        return Ok(result.into());
+                    }
                 };
                 Ok(result.into())
             }
@@ -173,6 +309,83 @@ impl<'ctx> EbpfContext<'ctx> {
                         .map_err(|e| CodeGenError::Builder(e.to_string()))?;
                     Ok(result.into())
                 }
+                // Float comparison operators
+                BinaryOp::Equal => {
+                    let result = self
+                        .builder
+                        .build_float_compare(
+                            inkwell::FloatPredicate::OEQ,
+                            left_float,
+                            right_float,
+                            "eq",
+                        )
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                    Ok(result.into())
+                }
+                BinaryOp::NotEqual => {
+                    let result = self
+                        .builder
+                        .build_float_compare(
+                            inkwell::FloatPredicate::ONE,
+                            left_float,
+                            right_float,
+                            "ne",
+                        )
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                    Ok(result.into())
+                }
+                BinaryOp::LessThan => {
+                    let result = self
+                        .builder
+                        .build_float_compare(
+                            inkwell::FloatPredicate::OLT,
+                            left_float,
+                            right_float,
+                            "lt",
+                        )
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                    Ok(result.into())
+                }
+                BinaryOp::LessEqual => {
+                    let result = self
+                        .builder
+                        .build_float_compare(
+                            inkwell::FloatPredicate::OLE,
+                            left_float,
+                            right_float,
+                            "le",
+                        )
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                    Ok(result.into())
+                }
+                BinaryOp::GreaterThan => {
+                    let result = self
+                        .builder
+                        .build_float_compare(
+                            inkwell::FloatPredicate::OGT,
+                            left_float,
+                            right_float,
+                            "gt",
+                        )
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                    Ok(result.into())
+                }
+                BinaryOp::GreaterEqual => {
+                    let result = self
+                        .builder
+                        .build_float_compare(
+                            inkwell::FloatPredicate::OGE,
+                            left_float,
+                            right_float,
+                            "ge",
+                        )
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                    Ok(result.into())
+                }
+                _ => Err(CodeGenError::NotImplemented(format!(
+                    "Float binary operation {:?} not implemented",
+                    op
+                ))),
             },
             _ => Err(CodeGenError::TypeError(format!(
                 "Type mismatch in binary operation {:?}",

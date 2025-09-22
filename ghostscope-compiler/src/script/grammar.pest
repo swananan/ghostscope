@@ -7,6 +7,7 @@ statement = {
     trace_stmt |
     print_stmt |
     backtrace_stmt |
+    if_stmt |
     expr_stmt |
     var_decl_stmt
 }
@@ -32,6 +33,15 @@ backtrace_stmt = { ("backtrace" | "bt") ~ ";" }
 expr_stmt = { expr ~ ";" }
 var_decl_stmt = { "let" ~ identifier ~ "=" ~ expr ~ ";" }
 
+// Conditional statements (Rust style)
+if_stmt = { "if" ~ condition ~ "{" ~ statement* ~ "}" ~ else_clause? }
+else_clause = { "else" ~ ( if_stmt | ("{" ~ statement* ~ "}") ) }
+
+// Condition for if statements
+condition = { expr ~ compare_op ~ expr }
+compare_op = { "==" | "!=" | "<=" | ">=" | "<" | ">" }
+
+// Expression system
 expr = { term ~ (add_op ~ term)* }
 term = { factor ~ (mul_op ~ factor)* }
 factor = {
@@ -39,9 +49,9 @@ factor = {
     float |
     int |
     special_var |
-    identifier |
     member_access |
     pointer_deref |
+    identifier |
     "(" ~ expr ~ ")"
 }
 

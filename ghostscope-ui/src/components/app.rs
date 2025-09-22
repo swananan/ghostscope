@@ -225,7 +225,8 @@ impl App {
                                 // Let Ctrl+C go to focused panel handler for history search exit
                                 let panel_actions = self.handle_focused_panel_input(key)?;
                                 actions_to_process.extend(panel_actions);
-                            } else if self.state.ui.focus.current_panel == crate::action::PanelType::Source
+                            } else if self.state.ui.focus.current_panel
+                                == crate::action::PanelType::Source
                                 && self.state.source_panel.mode
                                     == crate::model::panel_state::SourcePanelMode::FileSearch
                             {

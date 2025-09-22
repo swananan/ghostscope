@@ -20,6 +20,16 @@ pub enum BinaryOp {
     Subtract,
     Multiply,
     Divide,
+    // Comparison operators
+    Equal,
+    NotEqual,
+    LessThan,
+    LessEqual,
+    GreaterThan,
+    GreaterEqual,
+    // Logical operators
+    LogicalAnd,
+    LogicalOr,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -27,6 +37,7 @@ pub enum VarType {
     Int,
     Float,
     String,
+    Bool,
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +53,12 @@ pub enum Statement {
         pattern: TracePattern,
         body: Vec<Statement>,
     },
+    If {
+        condition: Expr,
+        then_body: Vec<Statement>,
+        else_body: Option<Box<Statement>>,
+    },
+    Block(Vec<Statement>),
 }
 
 #[derive(Debug, Clone)]
@@ -142,9 +159,34 @@ pub fn infer_type(expr: &Expr) -> Result<VarType, String> {
                     ));
                 }
 
-                // Strings only support addition operation
-                if left_type == VarType::String && *op != BinaryOp::Add {
-                    return Err("String type only supports addition operation".to_string());
+                // Strings only support addition operation and comparison operations
+                if left_type == VarType::String
+                    && !matches!(*op, BinaryOp::Add | BinaryOp::Equal | BinaryOp::NotEqual)
+                {
+                    return Err(
+                        "String type only supports addition and comparison operations".to_string(),
+                    );
+                }
+
+                // Comparison operations return boolean type
+                if matches!(
+                    *op,
+                    BinaryOp::Equal
+                        | BinaryOp::NotEqual
+                        | BinaryOp::LessThan
+                        | BinaryOp::LessEqual
+                        | BinaryOp::GreaterThan
+                        | BinaryOp::GreaterEqual
+                ) {
+                    return Ok(VarType::Bool);
+                }
+
+                // Logical operations expect boolean operands and return boolean
+                if matches!(*op, BinaryOp::LogicalAnd | BinaryOp::LogicalOr) {
+                    if left_type != VarType::Bool || right_type != VarType::Bool {
+                        return Err("Logical operations require boolean operands".to_string());
+                    }
+                    return Ok(VarType::Bool);
                 }
 
                 Ok(left_type)

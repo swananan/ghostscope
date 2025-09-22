@@ -371,7 +371,116 @@ impl<'ctx> EbpfContext<'ctx> {
                 }
                 Ok(())
             }
+            crate::script::Statement::If {
+                condition,
+                then_body,
+                else_body,
+            } => self.compile_if_statement(condition, then_body, else_body),
+            crate::script::Statement::Block(statements) => {
+                for stmt in statements {
+                    self.compile_statement(stmt)?;
+                }
+                Ok(())
+            }
         }
+    }
+
+    /// Compile if statement with optional else clause
+    fn compile_if_statement(
+        &mut self,
+        condition: &crate::script::Expr,
+        then_body: &[crate::script::Statement],
+        else_body: &Option<Box<crate::script::Statement>>,
+    ) -> Result<()> {
+        // Get current function to create basic blocks
+        let current_function = self.get_current_function()?;
+
+        // Create basic blocks for if-else structure
+        let then_block = self.context.append_basic_block(current_function, "if.then");
+        let else_block = self.context.append_basic_block(current_function, "if.else");
+        let merge_block = self.context.append_basic_block(current_function, "if.end");
+
+        // Compile condition expression
+        let condition_val = self.compile_expr(condition)?;
+        let condition_bool = self.convert_to_bool(condition_val)?;
+
+        // Generate conditional branch
+        self.builder
+            .build_conditional_branch(condition_bool, then_block, else_block)
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        // Compile then branch
+        self.builder.position_at_end(then_block);
+        for stmt in then_body {
+            self.compile_statement(stmt)?;
+        }
+        // Jump to merge block after then branch
+        self.builder
+            .build_unconditional_branch(merge_block)
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        // Compile else branch
+        self.builder.position_at_end(else_block);
+        if let Some(else_stmt) = else_body {
+            self.compile_statement(else_stmt)?;
+        }
+        // Jump to merge block after else branch
+        self.builder
+            .build_unconditional_branch(merge_block)
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        // Position at merge block for subsequent code
+        self.builder.position_at_end(merge_block);
+
+        Ok(())
+    }
+
+    /// Convert a value to boolean for conditional branches
+    fn convert_to_bool(
+        &mut self,
+        value: BasicValueEnum<'ctx>,
+    ) -> Result<inkwell::values::IntValue<'ctx>> {
+        match value {
+            BasicValueEnum::IntValue(int_val) => {
+                if int_val.get_type().get_bit_width() == 1 {
+                    // Already a boolean (i1)
+                    Ok(int_val)
+                } else {
+                    // Convert integer to boolean by comparing with 0
+                    let zero = self.context.i64_type().const_int(0, false);
+                    let is_non_zero = self
+                        .builder
+                        .build_int_compare(inkwell::IntPredicate::NE, int_val, zero, "is_non_zero")
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                    Ok(is_non_zero)
+                }
+            }
+            BasicValueEnum::FloatValue(float_val) => {
+                // Convert float to boolean by comparing with 0.0
+                let zero = self.context.f64_type().const_float(0.0);
+                let is_non_zero = self
+                    .builder
+                    .build_float_compare(
+                        inkwell::FloatPredicate::ONE, // Ordered and not equal
+                        float_val,
+                        zero,
+                        "is_non_zero",
+                    )
+                    .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                Ok(is_non_zero)
+            }
+            _ => Err(CodeGenError::TypeError(
+                "Cannot convert value to boolean".to_string(),
+            )),
+        }
+    }
+
+    /// Get the current function being compiled
+    fn get_current_function(&mut self) -> Result<FunctionValue<'ctx>> {
+        self.builder
+            .get_insert_block()
+            .and_then(|block| block.get_parent())
+            .ok_or_else(|| CodeGenError::LLVMError("No current function found".to_string()))
     }
 
     /// Add PID filtering logic to the current function
