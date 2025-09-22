@@ -244,11 +244,7 @@ impl ScopedFileIndexManager {
         compilation_unit: &str,
         file_index: u64,
     ) -> Option<FileInfo> {
-        tracing::debug!(
-            "ScopedFileIndexManager::lookup_by_scoped_index: cu='{}', file_index={}",
-            compilation_unit,
-            file_index
-        );
+        // Removed debug logging to reduce noise in normal operation
 
         let file_index_ref = self.cu_file_indices.get(compilation_unit)?;
 

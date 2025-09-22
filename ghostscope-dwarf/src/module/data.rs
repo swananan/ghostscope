@@ -27,7 +27,6 @@ use crate::{
         CfiIndex, LightweightIndex, LineMappingTable, OnDemandResolver, ScopedFileIndexManager,
         SourceFileManager,
     },
-    parser::DwarfParser,
     proc_mapping::ModuleMapping,
 };
 use gimli::{EndianSlice, LittleEndian};
@@ -71,117 +70,16 @@ pub(crate) struct ModuleData {
 }
 
 impl ModuleData {
-    /// Sequential loading: debug_info -> debug_line -> CFI one by one
-    pub(crate) fn load_sequential(module_mapping: ModuleMapping) -> Result<Self> {
-        Self::load_internal_sequential(module_mapping)
-    }
 
     /// Parallel loading: debug_info || debug_line || CFI simultaneously
-    /// Falls back to sequential loading if parallel parsing fails
     pub(crate) async fn load_parallel(module_mapping: ModuleMapping) -> Result<Self> {
-        match Self::load_internal_parallel(module_mapping.clone()).await {
-            Ok(module_data) => {
-                tracing::info!(
-                    "Parallel loading succeeded for: {}",
-                    module_mapping.path.display()
-                );
-                Ok(module_data)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Parallel loading failed for {}: {}. Falling back to sequential loading.",
-                    module_mapping.path.display(),
-                    e
-                );
-                // Fallback to sequential loading
-                tokio::task::spawn_blocking(move || Self::load_internal_sequential(module_mapping))
-                    .await?
-            }
-        }
-    }
-
-    /// Sequential internal load implementation
-    fn load_internal_sequential(module_mapping: ModuleMapping) -> Result<Self> {
-        tracing::debug!("Loading module: {}", module_mapping.path.display());
-
-        // Memory map the file
-        let mapped_file = Self::map_file(&module_mapping.path)?;
-
-        // Parse object file
-        let object = object::File::parse(&mapped_file.data[..])?;
-
-        // Load DWARF sections
-        let dwarf = Self::load_dwarf_sections(&object)?;
-
-        tracing::debug!("Starting unified DWARF parsing...");
-        let parser = DwarfParser::new(&dwarf);
-        let parse_result = parser.parse_all(&module_mapping.path.to_string_lossy())?;
-
-        let lightweight_index = parse_result.lightweight_index;
-        let line_mapping = parse_result.line_mapping;
-        let file_manager = parse_result.source_file_manager;
-
-        let mut warnings = Vec::new();
-        let cfi_index = {
-            // SAFETY: We keep the mapped file alive for the lifetime of the module
-            // The _mapped_file field ensures the memory remains valid
-            let static_data: &'static [u8] = unsafe { std::mem::transmute(&mapped_file.data[..]) };
-
-            match CfiIndex::from_static_data(static_data) {
-                Ok(cfi) => {
-                    tracing::info!(
-                        "CFI index initialized successfully for {}",
-                        module_mapping.path.display()
-                    );
-                    Some(cfi)
-                }
-                Err(e) => {
-                    let warning = format!("Failed to initialize CFI index: {}", e);
-                    tracing::warn!(
-                        "Failed to initialize CFI index for {}: {}",
-                        module_mapping.path.display(),
-                        e
-                    );
-                    warnings.push(warning);
-                    None
-                }
-            }
-        };
-
-        // Determine load state
-        let load_state = if warnings.is_empty() {
-            ModuleLoadState::Success
-        } else {
-            ModuleLoadState::PartialSuccess(warnings)
-        };
-
-        tracing::debug!("Preparing on-demand resolver...");
-        let base_addresses = gimli::BaseAddresses::default();
-        let resolver = OnDemandResolver::new(dwarf, base_addresses);
-
-        tracing::debug!(
-            "Loaded module {} - Summary: {} functions, {} variables, {} line entries, {} files, {} compilation units",
-            module_mapping.path.display(),
-            parse_result.stats.total_functions,
-            parse_result.stats.total_variables,
-            parse_result.stats.total_line_entries,
-            parse_result.stats.total_files,
-            parse_result.stats.total_compilation_units
+        tracing::info!(
+            "Parallel loading for: {}",
+            module_mapping.path.display()
         );
-
-        Ok(Self {
-            module_mapping,
-            load_state,
-            lightweight_index,
-            line_mapping,
-            file_manager,
-            scoped_file_manager: parse_result.scoped_file_manager, // Use optimized scoped file manager from sequential parsing
-            cfi_index,
-            resolver,
-            stats: parse_result.stats,
-            _mapped_file: mapped_file,
-        })
+        Self::load_internal_parallel(module_mapping).await
     }
+
 
     /// Parallel internal load implementation - true parallelism for debug_info || debug_line || CFI
     async fn load_internal_parallel(module_mapping: ModuleMapping) -> Result<Self> {
@@ -209,18 +107,18 @@ impl ModuleData {
             tokio::task::spawn_blocking({
                 let dwarf = std::sync::Arc::clone(&dwarf);
                 let module_path = module_mapping.path.to_string_lossy().to_string();
-                move || -> Result<crate::parser::DebugLineParseResult> {
+                move || -> Result<crate::parser::LineParseResult> {
                     let parser = crate::parser::DwarfParser::new(&dwarf);
-                    parser.parse_debug_line_only(&module_path)
+                    parser.parse_line_info(&module_path)
                 }
             }),
             // Parse debug_info only
             tokio::task::spawn_blocking({
                 let dwarf = std::sync::Arc::clone(&dwarf);
                 let module_path = module_mapping.path.to_string_lossy().to_string();
-                move || -> Result<crate::parser::DebugInfoParseResult> {
+                move || -> Result<crate::parser::DebugParseResult> {
                     let parser = crate::parser::DwarfParser::new(&dwarf);
-                    parser.parse_debug_info_only(&module_path)
+                    parser.parse_debug_info(&module_path)
                 }
             }),
             // Parse CFI independently (uses raw file data)
@@ -259,7 +157,7 @@ impl ModuleData {
         let cfi_index = cfi_index_result?;
 
         // Assemble parallel results into unified result
-        let parse_result = crate::parser::DwarfParser::assemble_parallel_results(
+        let parse_result = crate::parser::DwarfParser::combine_parallel_results(
             line_result,
             info_result,
             module_mapping.path.to_string_lossy().to_string(),
@@ -670,16 +568,18 @@ impl ModuleData {
 
     /// Helper to get file path for a line entry
     fn get_file_path_for_entry(&self, entry: &crate::core::LineEntry) -> Option<String> {
+        // First check if the entry already has a file path filled in (avoids redundant lookups)
+        if !entry.file_path.is_empty() {
+            return Some(entry.file_path.clone());
+        }
+
+        // Fallback to file index lookup if needed
         if let Some(ref scoped_manager) = self.scoped_file_manager {
             if let Some(file_info) =
                 scoped_manager.lookup_by_scoped_index(&entry.compilation_unit, entry.file_index)
             {
                 return Some(file_info.full_path);
             }
-        }
-
-        if !entry.file_path.is_empty() {
-            return Some(entry.file_path.clone());
         }
 
         Some(entry.compilation_unit.clone())

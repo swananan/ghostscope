@@ -12,8 +12,9 @@ use tracing::warn;
 #[derive(Parser)]
 #[command(name = "dwarf-tool")]
 #[command(version = "0.1.0")]
-#[command(about = "DWARF debug information analysis tool")]
+#[command(about = "DWARF debug information analysis tool with multiple analysis modes")]
 #[command(author = "swananan")]
+#[command(after_help = "SUBCOMMANDS:\n  source-line (s)   Analyze variables at specific source file:line location\n  function (f)      Find function addresses and analyze variables at those addresses\n  module-addr (m)   Analyze variables at specific module:address location\n  modules (ls)      List all loaded modules\n  benchmark         Performance benchmarking")]
 struct Cli {
     /// Process ID to analyze
     #[arg(short, long)]
@@ -39,12 +40,6 @@ enum Commands {
     SourceLine {
         /// Source location (file:line)
         location: String,
-        /// Use parallel loading
-        #[arg(long)]
-        parallel: bool,
-        /// Use sequential loading
-        #[arg(long)]
-        sequential: bool,
         /// Verbose output
         #[arg(short, long)]
         verbose: bool,
@@ -55,17 +50,11 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Analyze variables in function (e.g., calculate_something)
+    /// Find function addresses and analyze variables at those addresses
     #[command(name = "function", alias = "f")]
     Function {
         /// Function name
         name: String,
-        /// Use parallel loading
-        #[arg(long)]
-        parallel: bool,
-        /// Use sequential loading
-        #[arg(long)]
-        sequential: bool,
         /// Verbose output
         #[arg(short, long)]
         verbose: bool,
@@ -83,12 +72,6 @@ enum Commands {
         module: String,
         /// Address (hex format: 0x1234 or decimal)
         address: String,
-        /// Use parallel loading
-        #[arg(long)]
-        parallel: bool,
-        /// Use sequential loading
-        #[arg(long)]
-        sequential: bool,
         /// Verbose output
         #[arg(short, long)]
         verbose: bool,
@@ -102,12 +85,6 @@ enum Commands {
     /// List all loaded modules
     #[command(name = "modules", alias = "ls")]
     ListModules {
-        /// Use parallel loading
-        #[arg(long)]
-        parallel: bool,
-        /// Use sequential loading
-        #[arg(long)]
-        sequential: bool,
         /// Quiet output
         #[arg(short, long)]
         quiet: bool,
@@ -166,34 +143,12 @@ struct FunctionModuleInfo {
 
 // Helper trait to extract common options from commands
 trait CommonOptions {
-    fn parallel(&self) -> bool;
-    fn sequential(&self) -> bool;
     fn verbose(&self) -> bool;
     fn quiet(&self) -> bool;
     fn json(&self) -> bool;
 }
 
 impl CommonOptions for Commands {
-    fn parallel(&self) -> bool {
-        match self {
-            Commands::SourceLine { parallel, .. } => *parallel,
-            Commands::Function { parallel, .. } => *parallel,
-            Commands::ModuleAddr { parallel, .. } => *parallel,
-            Commands::ListModules { parallel, .. } => *parallel,
-            Commands::Benchmark { .. } => false,
-        }
-    }
-
-    fn sequential(&self) -> bool {
-        match self {
-            Commands::SourceLine { sequential, .. } => *sequential,
-            Commands::Function { sequential, .. } => *sequential,
-            Commands::ModuleAddr { sequential, .. } => *sequential,
-            Commands::ListModules { sequential, .. } => *sequential,
-            Commands::Benchmark { .. } => false,
-        }
-    }
-
     fn verbose(&self) -> bool {
         match self {
             Commands::SourceLine { verbose, .. } => *verbose,
@@ -354,41 +309,24 @@ fn init_logging(command: &Commands) {
 }
 
 async fn load_analyzer_and_execute(cli: Cli) -> Result<std::time::Duration> {
-    let use_parallel = if cli.command.sequential() {
-        false
-    } else {
-        true // Default to parallel
-    };
-
     if !cli.command.quiet() {
-        let mode = if use_parallel {
-            "Parallel"
-        } else {
-            "Sequential"
-        };
-
         if cli.pid.is_some() {
             println!(
-                "Loading modules from PID {}... [{}]",
-                cli.pid.unwrap(),
-                mode
+                "Loading modules from PID {}...",
+                cli.pid.unwrap()
             );
         } else if let Some(ref target) = cli.target {
-            println!("Loading target file {}... [{}]", target, mode);
+            println!("Loading target file {}...", target);
         }
     }
 
     let start = Instant::now();
     let mut analyzer = if let Some(pid) = cli.pid {
-        // PID mode: load from running process
-        if use_parallel {
-            DwarfAnalyzer::from_pid_parallel(pid).await?
-        } else {
-            DwarfAnalyzer::from_pid_sequential(pid)?
-        }
+        // PID mode: load from running process (always parallel)
+        DwarfAnalyzer::from_pid_parallel(pid).await?
     } else if let Some(ref target_path) = cli.target {
         // Target path mode: load from executable file
-        DwarfAnalyzer::from_exec_path(target_path)?
+        DwarfAnalyzer::from_exec_path(target_path).await?
     } else {
         return Err(anyhow::anyhow!(
             "Either PID or target path must be specified"
@@ -731,50 +669,24 @@ async fn run_benchmark(pid: Option<u32>, target_path: Option<&str>, runs: usize)
             pid, runs
         );
 
-        print!("Sequential: ");
-        let mut seq_times = Vec::new();
-
-        for _ in 0..runs {
-            print!(".");
-            std::io::Write::flush(&mut std::io::stdout()).unwrap();
-            let start = Instant::now();
-            let _analyzer = DwarfAnalyzer::from_pid_sequential(pid)?;
-            seq_times.push(start.elapsed());
-        }
-        println!();
-
-        print!("Parallel:   ");
-        let mut par_times = Vec::new();
+        print!("Loading: ");
+        let mut load_times = Vec::new();
 
         for _ in 0..runs {
             print!(".");
             std::io::Write::flush(&mut std::io::stdout()).unwrap();
             let start = Instant::now();
             let _analyzer = DwarfAnalyzer::from_pid_parallel(pid).await?;
-            par_times.push(start.elapsed());
+            load_times.push(start.elapsed());
         }
         println!();
 
-        let seq_avg = seq_times.iter().sum::<std::time::Duration>() / runs as u32;
-        let par_avg = par_times.iter().sum::<std::time::Duration>() / runs as u32;
-        let speedup = seq_avg.as_secs_f64() / par_avg.as_secs_f64();
+        let avg_time = load_times.iter().sum::<std::time::Duration>() / runs as u32;
 
         println!("\nResults:");
-        println!("  Sequential: {}ms (avg)", seq_avg.as_millis());
-        println!("  Parallel:   {}ms (avg)", par_avg.as_millis());
-
-        if speedup > 1.0 {
-            println!(
-                "  Speedup: {:.2}x ({:.0}% faster)",
-                speedup,
-                (speedup - 1.0) * 100.0
-            );
-        } else {
-            println!(
-                "  Sequential is {:.0}% faster",
-                (1.0 / speedup - 1.0) * 100.0
-            );
-        }
+        println!("  Average load time: {}ms", avg_time.as_millis());
+        println!("  Min: {}ms", load_times.iter().min().unwrap().as_millis());
+        println!("  Max: {}ms", load_times.iter().max().unwrap().as_millis());
     } else if let Some(target) = target_path {
         println!(
             "Benchmarking target file loading for {} ({} runs)...\n",
@@ -788,7 +700,7 @@ async fn run_benchmark(pid: Option<u32>, target_path: Option<&str>, runs: usize)
             print!(".");
             std::io::Write::flush(&mut std::io::stdout()).unwrap();
             let start = Instant::now();
-            let _analyzer = DwarfAnalyzer::from_exec_path(target)?;
+            let _analyzer = DwarfAnalyzer::from_exec_path(target).await?;
             load_times.push(start.elapsed());
         }
         println!();

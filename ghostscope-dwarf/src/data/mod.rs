@@ -16,4 +16,4 @@ pub(crate) use file_manager::*;
 pub(crate) use lightweight_file_index::*;
 pub(crate) use lightweight_index::*;
 pub(crate) use line_mapping::*;
-pub(crate) use on_demand_resolver::{CachedDIE, OnDemandResolver};
+pub(crate) use on_demand_resolver::OnDemandResolver;

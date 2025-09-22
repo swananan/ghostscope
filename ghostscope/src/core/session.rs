@@ -45,7 +45,7 @@ impl GhostSession {
             Some(DwarfAnalyzer::from_pid_parallel(pid).await?)
         } else if let Some(ref binary_path) = self.target_binary {
             info!("Loading binary from executable path: {}", binary_path);
-            Some(DwarfAnalyzer::from_exec_path(binary_path)?)
+            Some(DwarfAnalyzer::from_exec_path(binary_path).await?)
         } else {
             warn!("No PID or binary path specified - running without binary analysis");
             None
@@ -71,7 +71,7 @@ impl GhostSession {
         } else if let Some(ref binary_path) = self.target_binary {
             info!("Loading binary from executable path: {}", binary_path);
             // Note: from_exec_path doesn't support progress callbacks yet
-            Some(DwarfAnalyzer::from_exec_path(binary_path)?)
+            Some(DwarfAnalyzer::from_exec_path(binary_path).await?)
         } else {
             warn!("No PID or binary path specified - running without binary analysis");
             None
@@ -81,31 +81,13 @@ impl GhostSession {
         Ok(())
     }
 
-    /// Load binary and perform DWARF analysis using sequential loading (CLI mode)
-    pub fn load_binary_sequential(&mut self) -> Result<()> {
-        info!("Loading binary and performing DWARF analysis (sequential mode)");
 
-        let process_analyzer = if let Some(pid) = self.target_pid {
-            info!("Loading binary from PID: {} (sequential)", pid);
-            Some(DwarfAnalyzer::from_pid_sequential(pid)?)
-        } else if let Some(ref binary_path) = self.target_binary {
-            info!("Loading binary from executable path: {}", binary_path);
-            Some(DwarfAnalyzer::from_exec_path(binary_path)?)
-        } else {
-            warn!("No PID or binary path specified - running without binary analysis");
-            None
-        };
-
-        self.process_analyzer = process_analyzer;
-        Ok(())
-    }
-
-    /// Load binary and perform DWARF analysis (backwards compatibility - uses sequential)
+    /// Load binary and perform DWARF analysis (backwards compatibility - now uses parallel)
     pub async fn load_binary(&mut self) -> Result<()> {
-        self.load_binary_sequential()
+        self.load_binary_parallel().await
     }
 
-    /// Create ghost session and load binary in one step (for command line mode)
+    /// Create ghost session and load binary in one step (now uses parallel loading)
     pub async fn new_with_binary(args: &ParsedArgs) -> Result<Self> {
         let mut session = Self::new(args);
         session.load_binary().await?;

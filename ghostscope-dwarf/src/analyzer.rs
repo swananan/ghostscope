@@ -1,7 +1,7 @@
 //! Main DWARF analyzer - unified entry point for all DWARF operations
 
 use crate::{
-    core::{FunctionInfo, ModuleAddress, Result, SourceLocation, VariableInfo},
+    core::{ModuleAddress, Result, SourceLocation},
     module::ModuleData,
     proc_mapping::{ModuleMapping, ProcMappingParser},
 };
@@ -58,50 +58,9 @@ pub struct DwarfAnalyzer {
 }
 
 impl DwarfAnalyzer {
-    /// Create DWARF analyzer from PID (compatibility alias for sequential loading)
-    pub fn from_pid(pid: u32) -> Result<Self> {
-        Self::from_pid_sequential(pid)
-    }
-
-    /// Create DWARF analyzer from PID using sequential loading
-    pub fn from_pid_sequential(pid: u32) -> Result<Self> {
-        tracing::info!("Creating DWARF analyzer for PID {}", pid);
-
-        let mut analyzer = Self {
-            pid,
-            modules: HashMap::new(),
-        };
-
-        // Discover all modules for this process using proc mapping parser
-        let module_mappings = ProcMappingParser::discover_modules(pid)?;
-
-        tracing::info!(
-            "Discovered {} modules for PID {}",
-            module_mappings.len(),
-            pid
-        );
-
-        // Fast load all modules
-        for module_mapping in module_mappings {
-            let module_path = module_mapping.path.clone();
-            match ModuleData::load_sequential(module_mapping) {
-                Ok(module_data) => {
-                    analyzer.modules.insert(module_path, module_data);
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to load module {}: {}", module_path.display(), e);
-                    // Continue with other modules
-                }
-            }
-        }
-
-        tracing::info!(
-            "Created DWARF analyzer for PID {} with {} modules",
-            pid,
-            analyzer.modules.len()
-        );
-
-        Ok(analyzer)
+    /// Create DWARF analyzer from PID (now uses parallel loading)
+    pub async fn from_pid(pid: u32) -> Result<Self> {
+        Self::from_pid_parallel(pid).await
     }
 
     /// Create DWARF analyzer from PID using parallel loading
@@ -150,8 +109,8 @@ impl DwarfAnalyzer {
         Ok(Self::from_modules(pid, modules))
     }
 
-    /// Create DWARF analyzer from executable path (single module mode)
-    pub fn from_exec_path<P: AsRef<std::path::Path>>(exec_path: P) -> Result<Self> {
+    /// Create DWARF analyzer from executable path (single module mode, now async parallel)
+    pub async fn from_exec_path<P: AsRef<std::path::Path>>(exec_path: P) -> Result<Self> {
         let exec_path = exec_path.as_ref().to_path_buf();
         tracing::info!(
             "Creating DWARF analyzer for executable: {}",
@@ -173,8 +132,8 @@ impl DwarfAnalyzer {
             is_executable: true,  // This is the main executable
         };
 
-        // Load the single module
-        match ModuleData::load_sequential(module_mapping) {
+        // Load the single module using parallel loading
+        match ModuleData::load_parallel(module_mapping).await {
             Ok(module_data) => {
                 analyzer.modules.insert(exec_path.clone(), module_data);
                 tracing::info!(

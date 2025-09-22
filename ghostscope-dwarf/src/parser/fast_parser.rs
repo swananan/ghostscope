@@ -10,7 +10,7 @@ use crate::{
 };
 use gimli::{DebugInfoOffset, EndianSlice, LittleEndian};
 use std::collections::HashMap;
-use tracing::{debug, info};
+use tracing::debug;
 
 /// Complete result of DWARF parsing
 pub struct DwarfParseResult {
@@ -21,8 +21,8 @@ pub struct DwarfParseResult {
     pub stats: DwarfParseStats,
 }
 
-/// Result of debug_line parsing only (for parallel processing)
-pub struct DebugLineParseResult {
+/// Result of line information parsing (for parallel processing)
+pub struct LineParseResult {
     pub line_mapping: LineMappingTable,
     pub scoped_file_manager: ScopedFileIndexManager,
     pub line_entries_count: usize,
@@ -31,8 +31,8 @@ pub struct DebugLineParseResult {
     pub compilation_unit_names: Vec<String>,
 }
 
-/// Result of debug_info parsing only (for parallel processing)
-pub struct DebugInfoParseResult {
+/// Result of debug information parsing (for parallel processing)
+pub struct DebugParseResult {
     pub lightweight_index: LightweightIndex,
     pub functions_count: usize,
     pub variables_count: usize,
@@ -183,68 +183,6 @@ impl<'a> DwarfParser<'a> {
         Self { dwarf }
     }
 
-    /// Single-pass parse of all DWARF information
-    pub fn parse_all(&self, module_path: &str) -> Result<DwarfParseResult> {
-        debug!("Starting unified DWARF parsing for: {}", module_path);
-
-        let mut builder = ParseResultBuilder::new();
-
-        // Single pass through all compilation units
-        let mut units = self.dwarf.units();
-        while let Ok(Some(header)) = units.next() {
-            let unit = self.dwarf.unit(header)?;
-
-            let unit_offset = match header.offset() {
-                gimli::UnitSectionOffset::DebugInfoOffset(offset) => offset,
-                _ => continue,
-            };
-
-            // Process this compilation unit (all information in one pass)
-            self.process_compilation_unit(&unit, unit_offset, &mut builder)?;
-        }
-
-        // Create result with stats
-        let result = builder.build(module_path.to_string());
-
-        // Log detailed statistics
-        info!(
-            "Completed unified DWARF parsing for {}: {} functions ({} from debug_info), \
-            {} variables, {} line entries, {} files, {} compilation units",
-            module_path,
-            result.stats.total_functions,
-            result.stats.debug_info_functions,
-            result.stats.total_variables,
-            result.stats.total_line_entries,
-            result.stats.total_files,
-            result.stats.total_compilation_units
-        );
-
-        // Log compilation unit names (first few)
-        if !result.stats.compilation_unit_names.is_empty() {
-            let sample_units: Vec<&str> = result
-                .stats
-                .compilation_unit_names
-                .iter()
-                .take(3)
-                .map(|s| s.as_str())
-                .collect();
-            debug!(
-                "Compilation units in {}: {} (showing first {})",
-                module_path,
-                sample_units.join(", "),
-                sample_units.len()
-            );
-
-            if result.stats.compilation_unit_names.len() > 3 {
-                debug!(
-                    "... and {} more compilation units",
-                    result.stats.compilation_unit_names.len() - 3
-                );
-            }
-        }
-
-        Ok(result)
-    }
 
     /// Process single compilation unit - decoupled debug_line and debug_info processing
     /// (Architecture ready for parallelization, currently sequential for simplicity)
@@ -532,7 +470,7 @@ impl<'a> DwarfParser<'a> {
     ) -> Result<CompilationUnit> {
         // Get compilation unit name
         let cu_name =
-            Self::get_compilation_unit_name(dwarf, unit).unwrap_or_else(|| "unknown".to_string());
+            Self::extract_cu_name(dwarf, unit).unwrap_or_else(|| "unknown".to_string());
 
         debug!("Extracting files from compilation unit: {}", cu_name);
 
@@ -540,7 +478,7 @@ impl<'a> DwarfParser<'a> {
 
         let mut compilation_unit = CompilationUnit {
             name: cu_name.clone(),
-            base_directory: Self::get_comp_dir(dwarf, unit).unwrap_or_default(),
+            base_directory: Self::extract_comp_dir(dwarf, unit).unwrap_or_default(),
             include_directories: Vec::new(),
             files: Vec::new(),
             dwarf_version: header.version(),
@@ -675,7 +613,7 @@ impl<'a> DwarfParser<'a> {
     }
 
     // Helper methods
-    fn get_compilation_unit_name(
+    fn extract_cu_name(
         dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
         unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
     ) -> Option<String> {
@@ -692,7 +630,7 @@ impl<'a> DwarfParser<'a> {
         None
     }
 
-    fn get_comp_dir(
+    fn extract_comp_dir(
         dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
         unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
     ) -> Option<String> {
@@ -721,7 +659,7 @@ impl<'a> DwarfParser<'a> {
         // Get directory path
         let dir_index = file_entry.directory_index();
         let directory_path = if dir_index == 0 {
-            Self::get_comp_dir(dwarf, unit).unwrap_or_else(|| ".".to_string())
+            Self::extract_comp_dir(dwarf, unit).unwrap_or_else(|| ".".to_string())
         } else {
             let actual_index = (dir_index - 1) as usize;
             include_directories
@@ -809,8 +747,8 @@ impl<'a> DwarfParser<'a> {
         None
     }
 
-    /// Parse debug_line sections only (for parallel processing)
-    pub fn parse_debug_line_only(&self, module_path: &str) -> Result<DebugLineParseResult> {
+    /// Parse debug_line sections (for parallel processing)
+    pub fn parse_line_info(&self, module_path: &str) -> Result<LineParseResult> {
         debug!("Starting debug_line-only parsing for: {}", module_path);
 
         let mut scoped_file_manager = ScopedFileIndexManager::new();
@@ -826,9 +764,9 @@ impl<'a> DwarfParser<'a> {
 
             if let Some(ref line_program) = unit.line_program {
                 // Get compilation unit name
-                let cu_name = Self::get_compilation_unit_name(&self.dwarf, &unit)
+                let cu_name = Self::extract_cu_name(&self.dwarf, &unit)
                     .unwrap_or_else(|| "unknown".to_string());
-                let comp_dir = Self::get_comp_dir(&self.dwarf, &unit);
+                let comp_dir = Self::extract_comp_dir(&self.dwarf, &unit);
 
                 // Create lightweight file index for this CU
                 let mut file_index = LightweightFileIndex::new(comp_dir, header.version());
@@ -908,7 +846,7 @@ impl<'a> DwarfParser<'a> {
             total_compilation_units
         );
 
-        Ok(DebugLineParseResult {
+        Ok(LineParseResult {
             line_mapping,
             scoped_file_manager,
             line_entries_count: line_entries.len(),
@@ -918,8 +856,8 @@ impl<'a> DwarfParser<'a> {
         })
     }
 
-    /// Parse debug_info sections only (for parallel processing)
-    pub fn parse_debug_info_only(&self, module_path: &str) -> Result<DebugInfoParseResult> {
+    /// Parse debug_info sections (for parallel processing)
+    pub fn parse_debug_info(&self, module_path: &str) -> Result<DebugParseResult> {
         debug!("Starting debug_info-only parsing for: {}", module_path);
 
         let mut functions: HashMap<String, Vec<IndexEntry>> = HashMap::new();
@@ -1034,17 +972,17 @@ impl<'a> DwarfParser<'a> {
             variables.len()
         );
 
-        Ok(DebugInfoParseResult {
+        Ok(DebugParseResult {
             lightweight_index,
             functions_count: functions.len(),
             variables_count: variables.len(),
         })
     }
 
-    /// Assemble parallel parse results into unified result
-    pub fn assemble_parallel_results(
-        line_result: DebugLineParseResult,
-        info_result: DebugInfoParseResult,
+    /// Combine parallel parse results into unified result
+    pub fn combine_parallel_results(
+        line_result: LineParseResult,
+        info_result: DebugParseResult,
         module_path: String,
     ) -> DwarfParseResult {
         debug!("Assembling parallel parse results for: {}", module_path);
@@ -1107,7 +1045,7 @@ impl<'a> DwarfParser<'a> {
         unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
         line_program: &gimli::IncompleteLineProgram<EndianSlice<'static, LittleEndian>>,
     ) -> Result<crate::data::CompilationUnit> {
-        let cu_name = Self::get_compilation_unit_name_static(dwarf, unit)
+        let cu_name = Self::extract_cu_name_from_dwarf(dwarf, unit)
             .unwrap_or_else(|| format!("unknown_cu_{:?}", unit.header.offset()));
 
         debug!("Extracting files from compilation unit: {}", cu_name);
@@ -1115,7 +1053,7 @@ impl<'a> DwarfParser<'a> {
         let header = line_program.header();
         let mut compilation_unit = crate::data::CompilationUnit {
             name: cu_name.clone(),
-            base_directory: Self::get_comp_dir_static(dwarf, unit)
+            base_directory: Self::extract_comp_dir_from_dwarf(dwarf, unit)
                 .unwrap_or_else(|| ".".to_string()),
             include_directories: Vec::new(),
             files: Vec::new(),
@@ -1260,7 +1198,7 @@ impl<'a> DwarfParser<'a> {
 
     /// Static helper methods
 
-    fn get_compilation_unit_name_static(
+    fn extract_cu_name_from_dwarf(
         dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
         unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
     ) -> Option<String> {
@@ -1276,7 +1214,7 @@ impl<'a> DwarfParser<'a> {
         None
     }
 
-    fn get_comp_dir_static(
+    fn extract_comp_dir_from_dwarf(
         dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
         unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
     ) -> Option<String> {
@@ -1317,7 +1255,7 @@ impl<'a> DwarfParser<'a> {
         // Get directory path
         let dir_index = file_entry.directory_index();
         let directory_path = if dir_index == 0 {
-            Self::get_comp_dir_static(dwarf, unit).unwrap_or_else(|| ".".to_string())
+            Self::extract_comp_dir_from_dwarf(dwarf, unit).unwrap_or_else(|| ".".to_string())
         } else {
             let actual_index = (dir_index - 1) as usize;
             include_directories
