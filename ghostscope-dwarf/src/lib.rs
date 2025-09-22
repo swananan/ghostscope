@@ -18,7 +18,8 @@ pub mod analyzer;
 
 // Re-export main public API only
 pub use analyzer::{
-    DwarfAnalyzer, MainExecutableInfo, ModuleStats, SharedLibraryInfo, SimpleFileInfo,
+    DwarfAnalyzer, MainExecutableInfo, ModuleLoadingEvent, ModuleLoadingStats, ModuleStats,
+    SharedLibraryInfo, SimpleFileInfo,
 };
 
 // Re-export essential core types

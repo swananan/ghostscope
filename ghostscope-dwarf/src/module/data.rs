@@ -912,6 +912,11 @@ impl ModuleData {
         self.lightweight_index.get_variable_names()
     }
 
+    /// Get lightweight index for stats access
+    pub(crate) fn get_lightweight_index(&self) -> &crate::data::LightweightIndex {
+        &self.lightweight_index
+    }
+
     /// Get line header count for debugging (legacy compatibility)
     pub(crate) fn get_line_header_count(&self) -> usize {
         self.file_manager.get_stats().1 // compilation unit count as proxy

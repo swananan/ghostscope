@@ -409,6 +409,7 @@ pub enum LineType {
     Command,
     Response,
     CurrentInput,
+    Welcome,
 }
 
 impl CommandPanelState {
@@ -518,45 +519,9 @@ impl CommandPanelState {
 
     /// Get total number of lines in unified view (for command mode navigation)
     pub fn get_total_lines(&self) -> usize {
-        let mut total = 0;
-
-        // Count history lines (commands + responses)
-        for item in &self.command_history {
-            total += 1; // Command line
-            if let Some(ref response) = item.response {
-                total += response.lines().count();
-            }
-        }
-
-        // Count current content lines
-        // In command mode, count based on previous_mode
-        let display_mode = if self.mode == InteractionMode::Command {
-            self.previous_mode.unwrap_or(InteractionMode::Input)
-        } else {
-            self.mode
-        };
-
-        match display_mode {
-            InteractionMode::Input => {
-                if matches!(self.input_state, InputState::Ready) {
-                    total += 1; // Current input line
-                }
-            }
-            InteractionMode::ScriptEditor => {
-                if let Some(ref script_cache) = self.script_cache {
-                    total += 3; // Header + separator + prompt
-                    total += script_cache.lines.len(); // Script lines
-                }
-            }
-            InteractionMode::Command => {
-                // This shouldn't happen in normal flow, but handle gracefully
-                if matches!(self.input_state, InputState::Ready) {
-                    total += 1; // Current input line
-                }
-            }
-        }
-
-        total
+        // Use wrapped lines to get accurate line count that considers text wrapping
+        let wrapped_lines = self.get_command_mode_wrapped_lines(self.cached_panel_width);
+        wrapped_lines.len()
     }
 
     /// Get script start line offset in unified view
@@ -579,7 +544,12 @@ impl CommandPanelState {
     pub fn get_command_mode_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
 
-        // Add history lines
+        // First, add static lines (including welcome messages)
+        for static_line in &self.static_lines {
+            lines.push(static_line.content.clone());
+        }
+
+        // Then add history lines
         for item in &self.command_history {
             lines.push(format!("(ghostscope) {}", item.command));
             if let Some(ref response) = item.response {
@@ -913,12 +883,18 @@ impl CommandPanelState {
 
     /// Start history search mode
     pub fn start_history_search(&mut self) {
-        tracing::debug!("start_history_search: command_history.len()={}", self.command_history.len());
+        tracing::debug!(
+            "start_history_search: command_history.len()={}",
+            self.command_history.len()
+        );
         self.history_search.start_search();
         // Clear current input when starting search
         self.input_text.clear();
         self.cursor_position = 0;
-        tracing::debug!("start_history_search: after clear - command_history.len()={}", self.command_history.len());
+        tracing::debug!(
+            "start_history_search: after clear - command_history.len()={}",
+            self.command_history.len()
+        );
     }
 
     /// Update history search query and find matches
@@ -964,6 +940,21 @@ impl CommandPanelState {
     /// Get current history search query
     pub fn get_history_search_query(&self) -> &str {
         &self.history_search.query
+    }
+
+    /// Add welcome message lines to static display
+    pub fn add_welcome_lines(&mut self, lines: Vec<String>, response_type: ResponseType) {
+        for line in lines {
+            self.static_lines.push(StaticTextLine {
+                content: line,
+                line_type: LineType::Welcome,
+                history_index: None,
+                response_type: Some(response_type),
+            });
+        }
+        // Clear any cached styled buffer since we've added new content
+        self.styled_buffer = None;
+        self.styled_at_history_index = None;
     }
 
     /// Get auto suggestion text for rendering

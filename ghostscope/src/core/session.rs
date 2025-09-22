@@ -55,6 +55,32 @@ impl GhostSession {
         Ok(())
     }
 
+    /// Load binary and perform DWARF analysis using parallel loading with progress callback
+    pub async fn load_binary_parallel_with_progress<F>(
+        &mut self,
+        progress_callback: F,
+    ) -> Result<()>
+    where
+        F: Fn(ghostscope_dwarf::ModuleLoadingEvent) + Send + Sync + 'static,
+    {
+        info!("Loading binary and performing DWARF analysis (parallel mode with progress)");
+
+        let process_analyzer = if let Some(pid) = self.target_pid {
+            info!("Loading binary from PID: {} (parallel with progress)", pid);
+            Some(DwarfAnalyzer::from_pid_parallel_with_progress(pid, progress_callback).await?)
+        } else if let Some(ref binary_path) = self.target_binary {
+            info!("Loading binary from executable path: {}", binary_path);
+            // Note: from_exec_path doesn't support progress callbacks yet
+            Some(DwarfAnalyzer::from_exec_path(binary_path)?)
+        } else {
+            warn!("No PID or binary path specified - running without binary analysis");
+            None
+        };
+
+        self.process_analyzer = process_analyzer;
+        Ok(())
+    }
+
     /// Load binary and perform DWARF analysis using sequential loading (CLI mode)
     pub fn load_binary_sequential(&mut self) -> Result<()> {
         info!("Loading binary and performing DWARF analysis (sequential mode)");
@@ -90,6 +116,21 @@ impl GhostSession {
     pub async fn new_with_binary_parallel(args: &ParsedArgs) -> Result<Self> {
         let mut session = Self::new(args);
         session.load_binary_parallel().await?;
+        Ok(session)
+    }
+
+    /// Create a new session with binary loading in parallel mode with progress callback
+    pub async fn new_with_binary_parallel_with_progress<F>(
+        args: &ParsedArgs,
+        progress_callback: F,
+    ) -> Result<Self>
+    where
+        F: Fn(ghostscope_dwarf::ModuleLoadingEvent) + Send + Sync + 'static,
+    {
+        let mut session = Self::new(args);
+        session
+            .load_binary_parallel_with_progress(progress_callback)
+            .await?;
         Ok(session)
     }
 

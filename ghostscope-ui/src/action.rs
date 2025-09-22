@@ -65,6 +65,10 @@ pub enum Action {
         content: String,
         response_type: ResponseType,
     },
+    AddWelcomeMessage {
+        lines: Vec<String>,
+        response_type: ResponseType,
+    },
     CommandCompleted,
     CommandFailed(String),
 

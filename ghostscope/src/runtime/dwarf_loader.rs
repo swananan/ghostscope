@@ -1,19 +1,92 @@
 use crate::args::ParsedArgs;
 use crate::core::GhostSession;
 use anyhow::Result;
-use ghostscope_ui::RuntimeStatus;
+use ghostscope_dwarf::ModuleLoadingEvent;
+use ghostscope_ui::{events::ModuleLoadingStats as UIModuleLoadingStats, RuntimeStatus};
 use tracing::info;
+
+/// Convert ModuleLoadingEvent to RuntimeStatus
+fn convert_loading_event_to_runtime_status(event: ModuleLoadingEvent) -> RuntimeStatus {
+    match event {
+        ModuleLoadingEvent::Discovered {
+            module_path,
+            current: _,
+            total,
+        } => RuntimeStatus::DwarfModuleDiscovered {
+            module_path,
+            total_modules: total,
+        },
+        ModuleLoadingEvent::LoadingStarted {
+            module_path,
+            current,
+            total,
+        } => RuntimeStatus::DwarfModuleLoadingStarted {
+            module_path,
+            current,
+            total,
+        },
+        ModuleLoadingEvent::LoadingCompleted {
+            module_path,
+            stats,
+            current,
+            total,
+        } => {
+            let ui_stats = UIModuleLoadingStats {
+                functions: stats.functions,
+                variables: stats.variables,
+                types: stats.types,
+                load_time_ms: stats.load_time_ms,
+            };
+            RuntimeStatus::DwarfModuleLoadingCompleted {
+                module_path,
+                stats: ui_stats,
+                current,
+                total,
+            }
+        }
+        ModuleLoadingEvent::LoadingFailed {
+            module_path,
+            error,
+            current,
+            total,
+        } => RuntimeStatus::DwarfModuleLoadingFailed {
+            module_path,
+            error,
+            current,
+            total,
+        },
+    }
+}
 
 /// Initialize DWARF processing in background
 pub async fn initialize_dwarf_processing(
     parsed_args: ParsedArgs,
     status_sender: tokio::sync::mpsc::UnboundedSender<RuntimeStatus>,
 ) -> Result<GhostSession> {
+    initialize_dwarf_processing_with_progress(parsed_args, status_sender).await
+}
+
+/// Initialize DWARF processing in background with detailed progress reporting
+pub async fn initialize_dwarf_processing_with_progress(
+    parsed_args: ParsedArgs,
+    status_sender: tokio::sync::mpsc::UnboundedSender<RuntimeStatus>,
+) -> Result<GhostSession> {
     // Send status update: starting DWARF loading
     let _ = status_sender.send(RuntimeStatus::DwarfLoadingStarted);
 
-    // Create debug session for DWARF processing with parallel loading
-    match GhostSession::new_with_binary_parallel(&parsed_args).await {
+    // Create progress callback that converts ModuleLoadingEvent to RuntimeStatus
+    let progress_callback = {
+        let sender = status_sender.clone();
+        move |event: ModuleLoadingEvent| {
+            let runtime_status = convert_loading_event_to_runtime_status(event);
+            let _ = sender.send(runtime_status);
+        }
+    };
+
+    // Create debug session for DWARF processing with parallel loading and progress
+    match GhostSession::new_with_binary_parallel_with_progress(&parsed_args, progress_callback)
+        .await
+    {
         Ok(session) => {
             // Validate that we have process analysis information
             match session.get_module_stats() {

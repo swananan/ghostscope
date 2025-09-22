@@ -28,6 +28,9 @@ pub struct OptimizedRenderer {
     // Viewport management
     scroll_offset: usize,
     visible_lines: usize,
+
+    // Welcome message styling cache
+    welcome_lines_mapping: std::collections::HashMap<String, Line<'static>>,
 }
 
 #[derive(Clone, Debug)]
@@ -48,6 +51,7 @@ impl OptimizedRenderer {
             last_height: 0,
             scroll_offset: 0,
             visible_lines: 0,
+            welcome_lines_mapping: std::collections::HashMap::new(),
         }
     }
 
@@ -55,6 +59,22 @@ impl OptimizedRenderer {
     /// Note: With immediate rendering, this is just a placeholder for API compatibility
     pub fn mark_pending_updates(&mut self) {
         // No-op: immediate rendering doesn't need pending flags
+    }
+
+    /// Set the welcome lines mapping for styled rendering
+    pub fn set_welcome_lines_mapping(&mut self, styled_lines: Vec<Line<'static>>) {
+        self.welcome_lines_mapping.clear();
+        for line in styled_lines {
+            // Convert line to plain text for mapping key
+            let text_key: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            self.welcome_lines_mapping.insert(text_key, line);
+        }
+        // Force cache rebuild to apply new mapping immediately
+        self.cache_version += 1;
     }
 
     /// Main render function with smart caching (immediate rendering)
@@ -115,10 +135,40 @@ impl OptimizedRenderer {
         self.cached_lines.clear();
 
         // Debug: Log command history state
-        tracing::debug!("rebuild_cache: command_history.len()={}, is_in_history_search={}",
-            state.command_history.len(), state.is_in_history_search());
+        tracing::debug!("rebuild_cache: command_history.len()={}, static_lines.len()={}, is_in_history_search={}",
+            state.command_history.len(), state.static_lines.len(), state.is_in_history_search());
 
-        // Cache command history
+        // First, cache static lines (including welcome messages)
+        for static_line in &state.static_lines {
+            let wrapped_lines = self.wrap_text(&static_line.content, width);
+            for wrapped_line in wrapped_lines {
+                let line_hash = self.calculate_hash(&wrapped_line);
+                let styled_line = match static_line.line_type {
+                    LineType::Welcome => {
+                        // Format welcome messages with special styling based on content
+                        self.create_welcome_line(&wrapped_line)
+                    }
+                    LineType::Response => {
+                        self.create_response_line(&wrapped_line, static_line.response_type)
+                    }
+                    LineType::Command => self.create_command_line(&wrapped_line),
+                    LineType::CurrentInput => Line::from(Span::styled(
+                        wrapped_line.clone(),
+                        Style::default().fg(Color::White),
+                    )),
+                };
+
+                self.cached_lines.push(CachedLine {
+                    content_hash: line_hash,
+                    rendered_line: styled_line,
+                    line_type: static_line.line_type,
+                    response_type: static_line.response_type,
+                    original_content: wrapped_line,
+                });
+            }
+        }
+
+        // Then, cache command history
         for (_index, item) in state.command_history.iter().enumerate() {
             // Command line - use (ghostscope) prompt for consistency
             let command_content = format!("(ghostscope) {}", item.command);
@@ -426,6 +476,48 @@ impl OptimizedRenderer {
         Line::from(Span::styled(content.to_string(), style))
     }
 
+    /// Create a welcome line with content-based styling
+    fn create_welcome_line(&self, content: &str) -> Line<'static> {
+        // Check if we have a pre-styled version in the mapping
+        if let Some(styled_line) = self.welcome_lines_mapping.get(content) {
+            return styled_line.clone();
+        }
+
+        // Fallback to content-based styling if not found in mapping
+        use ratatui::style::{Color, Modifier, Style};
+        use ratatui::text::Span;
+
+        // Apply content-based styling for welcome messages
+        if content.contains("GhostScope") {
+            // Title line
+            Line::from(Span::styled(
+                content.to_string(),
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ))
+        } else if content.starts_with("•") || content.starts_with("Loading completed in") {
+            // Bullet points and timing info
+            Line::from(Span::styled(
+                content.to_string(),
+                Style::default().fg(Color::Cyan),
+            ))
+        } else if content.starts_with("Attached to process") {
+            // Process info
+            Line::from(Span::styled(
+                content.to_string(),
+                Style::default().fg(Color::White),
+            ))
+        } else if content.trim().is_empty() {
+            // Empty lines
+            Line::from("")
+        } else {
+            // Default welcome text styling
+            Line::from(Span::styled(
+                content.to_string(),
+                Style::default().fg(Color::White),
+            ))
+        }
+    }
+
     /// Create a history search input line with proper cursor positioning
     fn create_history_search_input_line(&self, state: &CommandPanelState) -> Line<'static> {
         let mut spans = Vec::new();
@@ -434,16 +526,19 @@ impl OptimizedRenderer {
         let search_query = state.get_history_search_query();
         let prompt_text = format!("(reverse-i-search)`{}': ", search_query);
 
-        tracing::debug!("create_history_search_input_line: search_query='{}', prompt_text='{}'",
-            search_query, prompt_text);
+        tracing::debug!(
+            "create_history_search_input_line: search_query='{}', prompt_text='{}'",
+            search_query,
+            prompt_text
+        );
 
-        spans.push(Span::styled(
-            prompt_text,
-            Style::default().fg(Color::Cyan),
-        ));
+        spans.push(Span::styled(prompt_text, Style::default().fg(Color::Cyan)));
 
         // Display matched command or search query
-        if let Some(matched_command) = state.history_search.current_match(&state.command_history_manager) {
+        if let Some(matched_command) = state
+            .history_search
+            .current_match(&state.command_history_manager)
+        {
             // Show matched command
             let cursor_pos = search_query.len();
             let chars: Vec<char> = matched_command.chars().collect();
@@ -455,13 +550,19 @@ impl OptimizedRenderer {
                 // Show text before cursor position (should be the matching part)
                 if cursor_pos > 0 {
                     let before: String = chars[..cursor_pos].iter().collect();
-                    tracing::debug!("create_history_search_input_line: before cursor: '{}'", before);
+                    tracing::debug!(
+                        "create_history_search_input_line: before cursor: '{}'",
+                        before
+                    );
                     spans.push(Span::styled(before, Style::default()));
                 }
 
                 // Show cursor character
                 let cursor_char = chars[cursor_pos];
-                tracing::debug!("create_history_search_input_line: cursor char: '{}'", cursor_char);
+                tracing::debug!(
+                    "create_history_search_input_line: cursor char: '{}'",
+                    cursor_char
+                );
                 spans.push(Span::styled(
                     cursor_char.to_string(),
                     crate::ui::themes::UIThemes::cursor_style(),
@@ -470,12 +571,17 @@ impl OptimizedRenderer {
                 // Show text after cursor in gray
                 if cursor_pos + 1 < chars.len() {
                     let after: String = chars[cursor_pos + 1..].iter().collect();
-                    tracing::debug!("create_history_search_input_line: after cursor: '{}'", after);
+                    tracing::debug!(
+                        "create_history_search_input_line: after cursor: '{}'",
+                        after
+                    );
                     spans.push(Span::styled(after, Style::default().fg(Color::DarkGray)));
                 }
             } else {
                 // Cursor at end, show all text and space cursor
-                tracing::debug!("create_history_search_input_line: cursor at end, showing space cursor");
+                tracing::debug!(
+                    "create_history_search_input_line: cursor at end, showing space cursor"
+                );
                 spans.push(Span::styled(matched_command.to_string(), Style::default()));
                 spans.push(Span::styled(
                     " ".to_string(),
@@ -1027,7 +1133,8 @@ impl OptimizedRenderer {
         let (start_line, cursor_visible_line) = if matches!(
             state.mode,
             crate::model::panel_state::InteractionMode::Command
-        ) || state.is_in_history_search() {
+        ) || state.is_in_history_search()
+        {
             // Calculate viewport to keep cursor visible
             let cursor_line = if state.is_in_history_search() {
                 // In history search mode, cursor should be on the last line (current input)

@@ -40,6 +40,9 @@ pub struct AppState {
     // Special routing flags
     pub route_file_info_to_file_search: bool,
 
+    // Process information
+    pub target_pid: Option<u32>,
+
     // UI configuration
     pub emoji_config: EmojiConfig,
 }
@@ -61,6 +64,7 @@ impl AppState {
             command_panel_width: 80, // Default width, will be updated during render
             event_registry,
             route_file_info_to_file_search: false,
+            target_pid: None,
             emoji_config: EmojiConfig::default(),
         }
     }

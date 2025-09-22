@@ -1,5 +1,5 @@
 use crate::action::{Action, PanelType};
-use crate::components::loading::LoadingUI;
+use crate::components::loading::{LoadingState, LoadingUI};
 use crate::events::{EventRegistry, TuiEvent};
 use crate::model::ui_state::LayoutMode;
 use crate::model::AppState;
@@ -111,18 +111,10 @@ impl App {
                     needs_render = true;
                 }
 
-                // Loading timeout - if we're still loading after timeout, go to ready state
+                // Loading timeout - show error in loading UI
                 () = &mut loading_timeout, if !self.state.loading_state.is_ready() && !self.state.loading_state.is_failed() => {
-                    tracing::info!("No runtime response after {} seconds, entering standalone mode", LOADING_TIMEOUT_SECS);
-                    self.state.set_loading_state(crate::components::loading::LoadingState::Ready);
-                    // Add a message to command panel
-                    let action = Action::AddResponse {
-                        content: "No ghostscope runtime detected. Running in standalone mode.".to_string(),
-                        response_type: crate::action::ResponseType::Info,
-                    };
-                    if let Err(e) = self.handle_action(action) {
-                        tracing::error!("Error handling standalone mode action: {}", e);
-                    }
+                    tracing::info!("No runtime response after {} seconds, connection timeout", LOADING_TIMEOUT_SECS);
+                    self.state.set_loading_state(LoadingState::Failed("Connection timeout - no runtime response".to_string()));
                     needs_render = true;
                 }
 
@@ -1139,6 +1131,17 @@ impl App {
                 );
                 self.state.command_renderer.mark_pending_updates();
             }
+            Action::AddWelcomeMessage {
+                lines,
+                response_type,
+            } => {
+                crate::components::command_panel::ResponseFormatter::add_welcome_message(
+                    &mut self.state.command_panel,
+                    lines,
+                    response_type,
+                );
+                self.state.command_renderer.mark_pending_updates();
+            }
             Action::SendRuntimeCommand(cmd) => {
                 // Send command to runtime via event_registry
                 debug!("Sending runtime command: {:?}", cmd);
@@ -1413,18 +1416,144 @@ impl App {
         Ok(additional_actions)
     }
 
+    /// Add a module to the loading progress tracking
+    pub fn add_module_to_loading(&mut self, module_path: String) {
+        self.state.loading_ui.progress.add_module(module_path);
+    }
+
+    /// Start loading a specific module
+    pub fn start_module_loading(&mut self, module_path: &str) {
+        self.state
+            .loading_ui
+            .progress
+            .start_module_loading(module_path);
+    }
+
+    /// Complete loading of a module with stats
+    pub fn complete_module_loading(
+        &mut self,
+        module_path: &str,
+        functions: usize,
+        variables: usize,
+        types: usize,
+    ) {
+        use crate::components::loading::ModuleStats;
+        let stats = ModuleStats {
+            functions,
+            variables,
+            types,
+        };
+        self.state
+            .loading_ui
+            .progress
+            .complete_module(module_path, stats);
+    }
+
+    /// Fail loading of a module
+    pub fn fail_module_loading(&mut self, module_path: &str, error: String) {
+        self.state
+            .loading_ui
+            .progress
+            .fail_module(module_path, error);
+    }
+
+    /// Set target PID for display
+    pub fn set_target_pid(&mut self, pid: u32) {
+        self.state.target_pid = Some(pid);
+    }
+
+    /// Transition to ready state with completion summary (after successful loading)
+    pub fn transition_to_ready_with_completion(&mut self) {
+        self.add_loading_completion_summary();
+        self.state.set_loading_state(LoadingState::Ready);
+    }
+
+    /// Generate and add completion summary to command panel
+    pub fn add_loading_completion_summary(&mut self) {
+        let total_time = self.state.loading_ui.progress.elapsed_time();
+
+        // Get styled welcome message lines
+        let mut styled_lines = self.state.loading_ui.create_welcome_message(total_time);
+
+        // Add process-specific information if available
+        if let Some(pid) = self.state.target_pid {
+            use ratatui::style::{Color, Style};
+            use ratatui::text::{Line, Span};
+
+            // Insert process info after the DWARF statistics line
+            let mut enhanced_lines = Vec::new();
+            let mut found_dwarf_stats = false;
+            for line in styled_lines {
+                enhanced_lines.push(line.clone());
+                // Look for the DWARF statistics line (contains "indexed")
+                let line_text: String = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect();
+                if !found_dwarf_stats && line_text.starts_with("•") && line_text.contains("indexed")
+                {
+                    found_dwarf_stats = true;
+                    enhanced_lines.push(Line::from("")); // Empty line
+                    enhanced_lines.push(Line::from(Span::styled(
+                        format!("Attached to process {}", pid),
+                        Style::default().fg(Color::White),
+                    )));
+                    // TODO: Add process name when available
+                }
+            }
+            styled_lines = enhanced_lines;
+        }
+
+        // Store the styled lines mapping for the renderer
+        self.state
+            .command_renderer
+            .set_welcome_lines_mapping(styled_lines.clone());
+
+        // Convert styled lines to strings for the existing pipeline
+        let summary_lines: Vec<String> = styled_lines
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content.to_string())
+                    .collect::<String>()
+            })
+            .collect();
+
+        // Add all summary lines as welcome message
+        let action = Action::AddWelcomeMessage {
+            lines: summary_lines,
+            response_type: crate::action::ResponseType::Info,
+        };
+        if let Err(e) = self.handle_action(action) {
+            tracing::error!("Failed to add completion summary: {}", e);
+        }
+    }
+
     /// Draw the UI (TEA View)
     fn draw_ui(f: &mut Frame, state: &mut AppState) {
         let size = f.area();
 
         // Show loading screen if still loading
         if state.is_loading() {
-            LoadingUI::render(
-                f,
-                &mut state.loading_ui,
-                state.loading_state.message(),
-                state.loading_state.progress(),
-            );
+            // Use enhanced DWARF loading UI if we're loading symbols
+            if matches!(state.loading_state, LoadingState::LoadingSymbols { .. }) {
+                LoadingUI::render_dwarf_loading(
+                    f,
+                    &mut state.loading_ui,
+                    &state.loading_state,
+                    state.target_pid,
+                );
+            } else {
+                // Use simple loading UI for other states
+                LoadingUI::render_simple(
+                    f,
+                    &mut state.loading_ui,
+                    state.loading_state.message(),
+                    state.loading_state.progress(),
+                );
+            }
             return;
         }
 
@@ -1549,8 +1678,70 @@ impl App {
                 self.state
                     .set_loading_state(LoadingState::Failed(error.clone()));
             }
+            // Module-level progress handling
+            RuntimeStatus::DwarfModuleDiscovered {
+                module_path,
+                total_modules: _,
+            } => {
+                // Add module to progress tracking
+                self.state
+                    .loading_ui
+                    .progress
+                    .add_module(module_path.clone());
+            }
+            RuntimeStatus::DwarfModuleLoadingStarted {
+                module_path,
+                current,
+                total,
+            } => {
+                // Start loading specific module
+                self.state
+                    .loading_ui
+                    .progress
+                    .start_module_loading(module_path);
+                // Update overall progress based on current/total
+                let progress = (*current as f64) / (*total as f64);
+                self.state.set_loading_state(LoadingState::LoadingSymbols {
+                    progress: Some(progress),
+                });
+            }
+            RuntimeStatus::DwarfModuleLoadingCompleted {
+                module_path,
+                stats,
+                current,
+                total,
+            } => {
+                // Complete module loading with stats
+                let module_stats = crate::components::loading::ModuleStats {
+                    functions: stats.functions,
+                    variables: stats.variables,
+                    types: stats.types,
+                };
+                self.state
+                    .loading_ui
+                    .progress
+                    .complete_module(module_path, module_stats);
+                // Update overall progress
+                let progress = (*current as f64) / (*total as f64);
+                self.state.set_loading_state(LoadingState::LoadingSymbols {
+                    progress: Some(progress),
+                });
+            }
+            RuntimeStatus::DwarfModuleLoadingFailed {
+                module_path,
+                error,
+                current: _,
+                total: _,
+            } => {
+                // Mark module as failed
+                self.state
+                    .loading_ui
+                    .progress
+                    .fail_module(module_path, error.clone());
+            }
             RuntimeStatus::SourceCodeLoaded(_) => {
-                self.state.set_loading_state(LoadingState::Ready);
+                // Transition to ready state with completion summary
+                self.transition_to_ready_with_completion();
             }
             RuntimeStatus::SourceCodeLoadFailed(error) => {
                 self.state

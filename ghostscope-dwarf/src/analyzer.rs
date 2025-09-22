@@ -8,6 +8,46 @@ use crate::{
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+/// Events emitted during module loading process
+#[derive(Debug, Clone)]
+pub enum ModuleLoadingEvent {
+    /// Module discovered during process scanning
+    Discovered {
+        module_path: String,
+        current: usize,
+        total: usize,
+    },
+    /// Module loading started
+    LoadingStarted {
+        module_path: String,
+        current: usize,
+        total: usize,
+    },
+    /// Module loading completed successfully
+    LoadingCompleted {
+        module_path: String,
+        stats: ModuleLoadingStats,
+        current: usize,
+        total: usize,
+    },
+    /// Module loading failed
+    LoadingFailed {
+        module_path: String,
+        error: String,
+        current: usize,
+        total: usize,
+    },
+}
+
+/// Statistics for a loaded module
+#[derive(Debug, Clone)]
+pub struct ModuleLoadingStats {
+    pub functions: usize,
+    pub variables: usize,
+    pub types: usize,
+    pub load_time_ms: u64,
+}
+
 /// DWARF analyzer - unified entry point for all DWARF analysis
 #[derive(Debug)]
 pub struct DwarfAnalyzer {
@@ -66,6 +106,14 @@ impl DwarfAnalyzer {
 
     /// Create DWARF analyzer from PID using parallel loading
     pub async fn from_pid_parallel(pid: u32) -> Result<Self> {
+        Self::from_pid_parallel_with_progress(pid, |_event| {}).await
+    }
+
+    /// Create DWARF analyzer from PID using parallel loading with progress callback
+    pub async fn from_pid_parallel_with_progress<F>(pid: u32, progress_callback: F) -> Result<Self>
+    where
+        F: Fn(ModuleLoadingEvent) + Send + Sync + 'static,
+    {
         tracing::info!("Creating DWARF analyzer for PID {} (parallel)", pid);
 
         // Discover all modules for this process using proc mapping parser
@@ -77,9 +125,19 @@ impl DwarfAnalyzer {
             pid
         );
 
-        // Load all modules in parallel
+        // Notify discovery completion
+        for (index, mapping) in module_mappings.iter().enumerate() {
+            progress_callback(ModuleLoadingEvent::Discovered {
+                module_path: mapping.path.to_string_lossy().to_string(),
+                current: index + 1,
+                total: module_mappings.len(),
+            });
+        }
+
+        // Load all modules in parallel with progress tracking
         let modules = crate::loader::ModuleLoader::new(module_mappings)
             .parallel()
+            .with_progress_callback(progress_callback)
             .load()
             .await?;
 

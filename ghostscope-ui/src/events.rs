@@ -522,7 +522,38 @@ pub enum RuntimeStatus {
     ShareInfoFailed {
         error: String,
     },
+    // Module-level loading progress (new)
+    DwarfModuleDiscovered {
+        module_path: String,
+        total_modules: usize,
+    },
+    DwarfModuleLoadingStarted {
+        module_path: String,
+        current: usize,
+        total: usize,
+    },
+    DwarfModuleLoadingCompleted {
+        module_path: String,
+        stats: ModuleLoadingStats,
+        current: usize,
+        total: usize,
+    },
+    DwarfModuleLoadingFailed {
+        module_path: String,
+        error: String,
+        current: usize,
+        total: usize,
+    },
     Error(String),
+}
+
+/// Statistics for a loaded module
+#[derive(Debug, Clone)]
+pub struct ModuleLoadingStats {
+    pub functions: usize,
+    pub variables: usize,
+    pub types: usize,
+    pub load_time_ms: u64,
 }
 
 /// Summary information for all traces
