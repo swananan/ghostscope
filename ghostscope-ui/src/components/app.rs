@@ -1815,10 +1815,10 @@ impl App {
                     self.handle_action(action);
                 }
             }
-            RuntimeStatus::InfoTargetResult { target, info } => {
+            RuntimeStatus::InfoFunctionResult { target, info } => {
                 // Mark command as completed
                 self.clear_waiting_state();
-                // Format and display target debug info
+                // Format and display function debug info
                 let formatted_info = info.format_for_display();
                 let action = Action::AddResponse {
                     content: formatted_info,
@@ -1826,11 +1826,52 @@ impl App {
                 };
                 self.handle_action(action);
             }
-            RuntimeStatus::InfoTargetFailed { target, error } => {
+            RuntimeStatus::InfoFunctionFailed { target, error } => {
                 self.clear_waiting_state();
                 let action = Action::AddResponse {
                     content: format!(
-                        "Failed to get debug info for target '{}': {}",
+                        "Failed to get debug info for function '{}': {}",
+                        target, error
+                    ),
+                    response_type: crate::action::ResponseType::Error,
+                };
+                self.handle_action(action);
+            }
+            RuntimeStatus::InfoLineResult { target, info } => {
+                // Mark command as completed
+                self.clear_waiting_state();
+                // Format and display line debug info
+                let formatted_info = info.format_for_display();
+                let action = Action::AddResponse {
+                    content: formatted_info,
+                    response_type: crate::action::ResponseType::Success,
+                };
+                self.handle_action(action);
+            }
+            RuntimeStatus::InfoLineFailed { target, error } => {
+                self.clear_waiting_state();
+                let action = Action::AddResponse {
+                    content: format!("Failed to get debug info for line '{}': {}", target, error),
+                    response_type: crate::action::ResponseType::Error,
+                };
+                self.handle_action(action);
+            }
+            RuntimeStatus::InfoAddressResult { target, info } => {
+                // Mark command as completed
+                self.clear_waiting_state();
+                // Format and display address debug info
+                let formatted_info = info.format_for_display();
+                let action = Action::AddResponse {
+                    content: formatted_info,
+                    response_type: crate::action::ResponseType::Success,
+                };
+                self.handle_action(action);
+            }
+            RuntimeStatus::InfoAddressFailed { target, error } => {
+                self.clear_waiting_state();
+                let action = Action::AddResponse {
+                    content: format!(
+                        "Failed to get debug info for address '{}': {}",
                         target, error
                     ),
                     response_type: crate::action::ResponseType::Error,

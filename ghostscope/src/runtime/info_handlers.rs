@@ -155,40 +155,40 @@ pub async fn handle_info_share(
         let _ = runtime_channels
             .status_sender
             .send(RuntimeStatus::ShareInfoFailed {
-                error: "No debug session available. Session initialization may have failed."
+                error: "No active debugging session. Target process may not be attached or initialization failed."
                     .to_string(),
             });
     }
 }
 
-/// Handle InfoTarget command
-pub async fn handle_info_target(
+/// Handle InfoFunction command
+pub async fn handle_info_function(
     session: &mut Option<GhostSession>,
     runtime_channels: &mut RuntimeChannels,
     target: String,
 ) {
-    info!("Info target request for: {}", target);
+    info!("Info function request for: {}", target);
 
-    let result = try_get_target_debug_info(session, &target);
+    let result = try_get_function_debug_info(session, &target);
 
     match result {
         Ok(debug_info) => {
-            info!("Successfully retrieved debug info for target: {}", target);
+            info!("Successfully retrieved debug info for function: {}", target);
             let _ = runtime_channels
                 .status_sender
-                .send(RuntimeStatus::InfoTargetResult {
+                .send(RuntimeStatus::InfoFunctionResult {
                     target: target.clone(),
                     info: debug_info,
                 });
         }
         Err(error_msg) => {
             info!(
-                "Failed to get debug info for target {}: {}",
+                "Failed to get debug info for function {}: {}",
                 target, error_msg
             );
             let _ = runtime_channels
                 .status_sender
-                .send(RuntimeStatus::InfoTargetFailed {
+                .send(RuntimeStatus::InfoFunctionFailed {
                     target: target.clone(),
                     error: error_msg,
                 });
@@ -196,28 +196,91 @@ pub async fn handle_info_target(
     }
 }
 
-/// Try to get debug info for a target (function name or file:line)
-fn try_get_target_debug_info(
+/// Handle InfoLine command
+pub async fn handle_info_line(
     session: &mut Option<GhostSession>,
-    target: &str,
+    runtime_channels: &mut RuntimeChannels,
+    target: String,
+) {
+    info!("Info line request for: {}", target);
+
+    let result = try_get_line_debug_info(session, &target);
+
+    match result {
+        Ok(debug_info) => {
+            info!("Successfully retrieved debug info for line: {}", target);
+            let _ = runtime_channels
+                .status_sender
+                .send(RuntimeStatus::InfoLineResult {
+                    target: target.clone(),
+                    info: debug_info,
+                });
+        }
+        Err(error_msg) => {
+            info!(
+                "Failed to get debug info for line {}: {}",
+                target, error_msg
+            );
+            let _ = runtime_channels
+                .status_sender
+                .send(RuntimeStatus::InfoLineFailed {
+                    target: target.clone(),
+                    error: error_msg,
+                });
+        }
+    }
+}
+
+/// Handle InfoAddress command (TODO: not implemented yet)
+pub async fn handle_info_address(
+    _session: &mut Option<GhostSession>,
+    runtime_channels: &mut RuntimeChannels,
+    target: String,
+) {
+    info!("Info address request for: {} (not implemented)", target);
+
+    let _ = runtime_channels
+        .status_sender
+        .send(RuntimeStatus::InfoAddressFailed {
+            target: target.clone(),
+            error: "Info address command not implemented yet".to_string(),
+        });
+}
+
+/// Try to get debug info for a function
+fn try_get_function_debug_info(
+    session: &mut Option<GhostSession>,
+    function_name: &str,
 ) -> Result<TargetDebugInfo, String> {
-    let session = session
-        .as_mut()
-        .ok_or_else(|| "No active session available. Session initialization may have failed. Check that the target file exists and has debug symbols.".to_string())?;
+    let session = session.as_mut().ok_or_else(|| {
+        "No active debugging session. Target process may not be attached or DWARF symbols are unavailable."
+            .to_string()
+    })?;
 
     let process_analyzer = session
         .process_analyzer
         .as_mut()
-        .ok_or_else(|| "Process analyzer not available. Try reloading the process.".to_string())?;
+        .ok_or_else(|| "Debug information not available. DWARF symbols may not be loaded or initialization failed.".to_string())?;
 
-    // Parse the target to determine if it's a function name or file:line
-    if target.contains(':') {
-        // Parse as file:line
-        handle_source_location_target(process_analyzer, target)
-    } else {
-        // Parse as function name
-        handle_function_target(process_analyzer, target)
-    }
+    handle_function_target(process_analyzer, function_name)
+}
+
+/// Try to get debug info for a source line (file:line)
+fn try_get_line_debug_info(
+    session: &mut Option<GhostSession>,
+    target: &str,
+) -> Result<TargetDebugInfo, String> {
+    let session = session.as_mut().ok_or_else(|| {
+        "No active debugging session. Target process may not be attached or DWARF symbols are unavailable."
+            .to_string()
+    })?;
+
+    let process_analyzer = session
+        .process_analyzer
+        .as_mut()
+        .ok_or_else(|| "Debug information not available. DWARF symbols may not be loaded or initialization failed.".to_string())?;
+
+    handle_source_location_target(process_analyzer, target)
 }
 
 /// Process module addresses and extract variable information

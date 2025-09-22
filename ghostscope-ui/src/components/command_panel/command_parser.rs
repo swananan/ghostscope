@@ -30,6 +30,11 @@ impl CommandParser {
             return vec![Action::EnterScriptMode(cmd.to_string())];
         }
 
+        // Handle shortcut commands
+        if let Some(actions) = Self::parse_shortcut_command(state, cmd) {
+            return actions;
+        }
+
         // Handle info commands
         if let Some(actions) = Self::parse_info_command(state, cmd) {
             return actions;
@@ -94,10 +99,12 @@ impl CommandParser {
         [
             "🔍 Information Commands:",
             "  info                 - Show available info commands",
-            "  info trace [id]      - Show trace status (specific or all)",
-            "  info source          - Show all source files",
-            "  info share           - Show loaded shared libraries",
-            "  info <target>        - Show debug info for function/file:line",
+            "  info trace [id]      - Show trace status (i t [id])",
+            "  info source          - Show all source files (i s)",
+            "  info share           - Show loaded shared libraries (i sh)",
+            "  info function <name> - Show debug info for function (i f <name>)",
+            "  info line <file:line>- Show debug info for source line (i l <file:line>)",
+            "  info address <addr>  - Show debug info for address (i a <addr>) [TODO]",
         ]
         .join("\n")
     }
@@ -279,29 +286,159 @@ impl CommandParser {
             }
         }
 
-        if command.starts_with("info ")
-            && !command.starts_with("info trace")
-            && !command.starts_with("info source")
-            && !command.starts_with("info share")
-        {
-            let target = command.strip_prefix("info ").unwrap().trim().to_string();
+        // Handle info function command
+        if command.starts_with("info function ") {
+            let target = command
+                .strip_prefix("info function ")
+                .unwrap()
+                .trim()
+                .to_string();
             if !target.is_empty() {
                 state.input_state = InputState::WaitingResponse {
                     command: command.to_string(),
                     sent_time: Instant::now(),
-                    command_type: CommandType::Info {
+                    command_type: CommandType::InfoFunction {
                         target: target.clone(),
                     },
                 };
                 return Some(vec![Action::SendRuntimeCommand(
-                    RuntimeCommand::InfoTarget { target },
+                    RuntimeCommand::InfoFunction { target },
                 )]);
             } else {
                 return Some(vec![Action::AddResponse {
-                    content: "Usage: info <target>".to_string(),
+                    content: "Usage: info function <function_name>".to_string(),
                     response_type: ResponseType::Error,
                 }]);
             }
+        }
+
+        // Handle info line command
+        if command.starts_with("info line ") {
+            let target = command
+                .strip_prefix("info line ")
+                .unwrap()
+                .trim()
+                .to_string();
+            if !target.is_empty() {
+                state.input_state = InputState::WaitingResponse {
+                    command: command.to_string(),
+                    sent_time: Instant::now(),
+                    command_type: CommandType::InfoLine {
+                        target: target.clone(),
+                    },
+                };
+                return Some(vec![Action::SendRuntimeCommand(RuntimeCommand::InfoLine {
+                    target,
+                })]);
+            } else {
+                return Some(vec![Action::AddResponse {
+                    content: "Usage: info line <file:line>".to_string(),
+                    response_type: ResponseType::Error,
+                }]);
+            }
+        }
+
+        // Handle info address command (TODO)
+        if command.starts_with("info address ") {
+            return Some(vec![Action::AddResponse {
+                content: "TODO: info address command not implemented yet".to_string(),
+                response_type: ResponseType::Error,
+            }]);
+        }
+
+        None
+    }
+
+    /// Parse shortcut commands (i s, i f, i l, i t, etc.)
+    fn parse_shortcut_command(state: &mut CommandPanelState, command: &str) -> Option<Vec<Action>> {
+        // Handle "i s" -> "info source"
+        if command == "i s" {
+            state.input_state = InputState::WaitingResponse {
+                command: "info source".to_string(),
+                sent_time: Instant::now(),
+                command_type: CommandType::InfoSource,
+            };
+            return Some(vec![Action::SendRuntimeCommand(RuntimeCommand::InfoSource)]);
+        }
+
+        // Handle "i sh" -> "info share"
+        if command == "i sh" {
+            state.input_state = InputState::WaitingResponse {
+                command: "info share".to_string(),
+                sent_time: Instant::now(),
+                command_type: CommandType::InfoShare,
+            };
+            return Some(vec![Action::SendRuntimeCommand(RuntimeCommand::InfoShare)]);
+        }
+
+        // Handle "i t" -> "info trace"
+        if command == "i t" {
+            return Some(Self::parse_info_trace_command(state, None));
+        }
+
+        // Handle "i t <id>" -> "info trace <id>"
+        if command.starts_with("i t ") {
+            let id_str = command.strip_prefix("i t ").unwrap().trim();
+            if let Ok(trace_id) = id_str.parse::<u32>() {
+                return Some(Self::parse_info_trace_command(state, Some(trace_id)));
+            } else {
+                return Some(vec![Action::AddResponse {
+                    content: "Usage: i t [trace_id]".to_string(),
+                    response_type: ResponseType::Error,
+                }]);
+            }
+        }
+
+        // Handle "i f <name>" -> "info function <name>"
+        if command.starts_with("i f ") {
+            let target = command.strip_prefix("i f ").unwrap().trim().to_string();
+            if !target.is_empty() {
+                state.input_state = InputState::WaitingResponse {
+                    command: format!("info function {}", target),
+                    sent_time: Instant::now(),
+                    command_type: CommandType::InfoFunction {
+                        target: target.clone(),
+                    },
+                };
+                return Some(vec![Action::SendRuntimeCommand(
+                    RuntimeCommand::InfoFunction { target },
+                )]);
+            } else {
+                return Some(vec![Action::AddResponse {
+                    content: "Usage: i f <function_name>".to_string(),
+                    response_type: ResponseType::Error,
+                }]);
+            }
+        }
+
+        // Handle "i l <target>" -> "info line <target>"
+        if command.starts_with("i l ") {
+            let target = command.strip_prefix("i l ").unwrap().trim().to_string();
+            if !target.is_empty() {
+                state.input_state = InputState::WaitingResponse {
+                    command: format!("info line {}", target),
+                    sent_time: Instant::now(),
+                    command_type: CommandType::InfoLine {
+                        target: target.clone(),
+                    },
+                };
+                return Some(vec![Action::SendRuntimeCommand(RuntimeCommand::InfoLine {
+                    target,
+                })]);
+            } else {
+                return Some(vec![Action::AddResponse {
+                    content: "Usage: i l <file:line>".to_string(),
+                    response_type: ResponseType::Error,
+                }]);
+            }
+        }
+
+        // Handle "i a <target>" -> "info address <target>" (TODO)
+        if command.starts_with("i a ") {
+            return Some(vec![Action::AddResponse {
+                content: "TODO: i a (info address) command not implemented yet".to_string(),
+                response_type: ResponseType::Error,
+            }]);
         }
 
         None
@@ -336,17 +473,27 @@ impl CommandParser {
         [
             "🔍 Info Commands Usage:",
             "",
-            "  info                 - Show this help message",
-            "  info trace [id]      - Show trace status (specific or all)",
-            "  info source          - Show all source files by module",
-            "  info share           - Show loaded shared libraries",
-            "  info <target>        - Show debug info for function/file:line",
+            "  info                  - Show this help message",
+            "  info trace [id]       - Show trace status (i t [id])",
+            "  info source           - Show all source files by module (i s)",
+            "  info share            - Show loaded shared libraries (i sh)",
+            "  info function <name>  - Show debug info for function (i f <name>)",
+            "  info line <file:line> - Show debug info for source line (i l <file:line>)",
+            "  info address <addr>   - Show debug info for address (i a <addr>) [TODO]",
+            "",
+            "💡 Shortcuts:",
+            "  i s                   - Same as 'info source'",
+            "  i sh                  - Same as 'info share'",
+            "  i t [id]              - Same as 'info trace [id]'",
+            "  i f <name>            - Same as 'info function <name>'",
+            "  i l <file:line>       - Same as 'info line <file:line>'",
+            "  i a <addr>            - Same as 'info address <addr>' [TODO]",
             "",
             "Examples:",
-            "  info trace           - Show all traces",
-            "  info trace 1         - Show specific trace info",
-            "  info main            - Show debug info for 'main' function",
-            "  info file.c:42       - Show debug info for source line",
+            "  info trace            - Show all traces",
+            "  i t 1                 - Show specific trace info",
+            "  i f main              - Show debug info for 'main' function",
+            "  i l file.c:42         - Show debug info for source line",
             "",
             "💡 Use 'help' for complete command reference.",
         ]

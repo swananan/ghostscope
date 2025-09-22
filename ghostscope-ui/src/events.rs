@@ -390,7 +390,9 @@ pub enum RuntimeCommand {
     EnableAllTraces,   // Enable all traces
     DeleteTrace(u32),  // Completely delete specific trace and all resources
     DeleteAllTraces,   // Delete all traces and resources
-    InfoTarget { target: String }, // Get debug info for a target (function or file:line)
+    InfoFunction { target: String }, // Get debug info for a function by name
+    InfoLine { target: String }, // Get debug info for a source line (file:line)
+    InfoAddress { target: String }, // Get debug info for a memory address (TODO: not implemented yet)
     InfoTrace { trace_id: Option<u32> }, // Get info for one/all traces (individual messages)
     InfoTraceAll,
     InfoSource, // Get all source files information
@@ -478,11 +480,27 @@ pub enum RuntimeStatus {
         trace_id: u32,
         error: String,
     },
-    InfoTargetResult {
+    InfoFunctionResult {
         target: String,
         info: TargetDebugInfo,
     },
-    InfoTargetFailed {
+    InfoFunctionFailed {
+        target: String,
+        error: String,
+    },
+    InfoLineResult {
+        target: String,
+        info: TargetDebugInfo,
+    },
+    InfoLineFailed {
+        target: String,
+        error: String,
+    },
+    InfoAddressResult {
+        target: String,
+        info: TargetDebugInfo,
+    },
+    InfoAddressFailed {
         target: String,
         error: String,
     },
