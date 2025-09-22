@@ -671,24 +671,72 @@ impl OptimizedRenderer {
                 ));
             }
         } else if cursor_pos >= chars.len() {
-            spans.push(Span::styled(input_text.to_string(), Style::default()));
-            spans.push(Span::styled(
-                " ".to_string(),
-                if show_cursor {
-                    UIThemes::cursor_style()
+            // Cursor at end - check if we have auto-suggestion to merge
+            if let Some(suggestion_text) = state.get_suggestion_text() {
+                // We have auto-suggestion, show merged text with cursor at boundary
+                let full_text = format!("{}{}", input_text, suggestion_text);
+                let full_chars: Vec<char> = full_text.chars().collect();
+
+                // Show input part in normal color
+                if !input_text.is_empty() {
+                    spans.push(Span::styled(input_text.to_string(), Style::default()));
+                }
+
+                // Show the character at cursor position as block cursor
+                if cursor_pos < full_chars.len() {
+                    let cursor_char = full_chars[cursor_pos];
+                    spans.push(Span::styled(
+                        cursor_char.to_string(),
+                        if show_cursor {
+                            UIThemes::cursor_style()
+                        } else {
+                            Style::default().fg(Color::DarkGray)
+                        },
+                    ));
+
+                    // Show remaining characters in dark gray
+                    if cursor_pos + 1 < full_chars.len() {
+                        let remaining: String = full_chars[cursor_pos + 1..].iter().collect();
+                        spans.push(Span::styled(
+                            remaining,
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
                 } else {
-                    Style::default()
-                },
-            ));
+                    // Fallback - show space as block cursor
+                    spans.push(Span::styled(
+                        " ".to_string(),
+                        if show_cursor {
+                            UIThemes::cursor_style()
+                        } else {
+                            Style::default()
+                        },
+                    ));
+                }
+            } else {
+                // No auto-suggestion, show block cursor at end
+                spans.push(Span::styled(input_text.to_string(), Style::default()));
+                spans.push(Span::styled(
+                    " ".to_string(),
+                    if show_cursor {
+                        UIThemes::cursor_style()
+                    } else {
+                        Style::default()
+                    },
+                ));
+            }
         } else {
+            // Cursor in middle of text - show character as block cursor
             let before_cursor: String = chars[..cursor_pos].iter().collect();
             let at_cursor = chars[cursor_pos];
             let after_cursor: String = chars[cursor_pos + 1..].iter().collect();
 
+            // Text before cursor
             if !before_cursor.is_empty() {
                 spans.push(Span::styled(before_cursor, Style::default()));
             }
 
+            // Character at cursor position as block cursor
             spans.push(Span::styled(
                 at_cursor.to_string(),
                 if show_cursor {
@@ -698,8 +746,19 @@ impl OptimizedRenderer {
                 },
             ));
 
+            // Text after cursor
             if !after_cursor.is_empty() {
                 spans.push(Span::styled(after_cursor, Style::default()));
+            }
+
+            // Add auto-suggestion at the end if cursor is at the end of meaningful text
+            if cursor_pos + 1 >= chars.len() {
+                if let Some(suggestion_text) = state.get_suggestion_text() {
+                    spans.push(Span::styled(
+                        suggestion_text.to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
             }
         }
 
