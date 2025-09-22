@@ -261,47 +261,105 @@ impl OptimizedRenderer {
         width: u16,
         lines: &mut Vec<Line<'static>>,
     ) {
-        // Header
+        // Header - make sure it doesn't exceed terminal width
         let header = format!(
             "🔨 Entering script mode for target: {}",
             script_cache.target
         );
+        // Truncate if too long
+        let header_display = if header.len() > width as usize {
+            format!("{}...", &header[..width as usize - 3])
+        } else {
+            header
+        };
         lines.push(Line::from(Span::styled(
-            header,
+            header_display,
             Style::default().fg(Color::Cyan),
         )));
 
-        // Separator
-        let separator = "─".repeat(50);
+        // Separator - adapt to terminal width, but ensure minimum visibility
+        let separator_width = std::cmp::min(width as usize, 60).saturating_sub(4); // Leave some margin
+        let separator = "─".repeat(separator_width);
         lines.push(Line::from(Span::styled(
             separator,
             Style::default().fg(Color::Cyan),
         )));
 
-        // Prompt
-        lines.push(Line::from(Span::styled(
-            "Script Editor (Ctrl+s to submit, Esc to cancel):",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )));
+        // Prompt - wrap if necessary
+        let prompt_text = "Script Editor (Ctrl+s to submit, Esc to cancel):";
+        let wrapped_prompts = self.wrap_text(prompt_text, width);
+        for wrapped_prompt in wrapped_prompts {
+            lines.push(Line::from(Span::styled(
+                wrapped_prompt,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
+
+        // Add empty line for better separation
+        lines.push(Line::from(""));
 
         // Script lines
         for (line_idx, line_content) in script_cache.lines.iter().enumerate() {
             let line_number = format!("{:3} │ ", line_idx + 1);
             let is_cursor_line = line_idx == script_cache.cursor_line;
 
-            if is_cursor_line {
-                lines.push(self.create_script_line_with_cursor(
-                    &line_number,
-                    line_content,
-                    script_cache.cursor_col,
-                ));
+            // Check if line content needs wrapping
+            let line_number_width = line_number.chars().count();
+            let available_width = width as usize - line_number_width;
+
+            if line_content.chars().count() > available_width {
+                // Line needs wrapping
+                let wrapped_lines = self.wrap_text(line_content, width - line_number_width as u16);
+                for (wrap_idx, wrapped_content) in wrapped_lines.iter().enumerate() {
+                    if wrap_idx == 0 {
+                        // First line includes line number
+                        if is_cursor_line {
+                            lines.push(self.create_script_line_with_cursor(
+                                &line_number,
+                                wrapped_content,
+                                script_cache.cursor_col,
+                            ));
+                        } else {
+                            lines.push(Line::from(vec![
+                                Span::styled(line_number.clone(), Style::default().fg(Color::DarkGray)),
+                                Span::styled(wrapped_content.clone(), Style::default().fg(Color::White)),
+                            ]));
+                        }
+                    } else {
+                        // Continuation lines use spaces for alignment
+                        let continuation_prefix = " ".repeat(line_number_width);
+                        if is_cursor_line && script_cache.cursor_col >= wrapped_content.chars().count() {
+                            // Cursor might be on this continuation line
+                            let cursor_in_continuation = script_cache.cursor_col - wrapped_content.chars().count();
+                            lines.push(self.create_script_line_with_cursor(
+                                &continuation_prefix,
+                                wrapped_content,
+                                cursor_in_continuation,
+                            ));
+                        } else {
+                            lines.push(Line::from(vec![
+                                Span::styled(continuation_prefix, Style::default().fg(Color::DarkGray)),
+                                Span::styled(wrapped_content.clone(), Style::default().fg(Color::White)),
+                            ]));
+                        }
+                    }
+                }
             } else {
-                lines.push(Line::from(vec![
-                    Span::styled(line_number, Style::default().fg(Color::DarkGray)),
-                    Span::styled(line_content.clone(), Style::default().fg(Color::White)),
-                ]));
+                // Line fits within width
+                if is_cursor_line {
+                    lines.push(self.create_script_line_with_cursor(
+                        &line_number,
+                        line_content,
+                        script_cache.cursor_col,
+                    ));
+                } else {
+                    lines.push(Line::from(vec![
+                        Span::styled(line_number, Style::default().fg(Color::DarkGray)),
+                        Span::styled(line_content.clone(), Style::default().fg(Color::White)),
+                    ]));
+                }
             }
         }
     }
