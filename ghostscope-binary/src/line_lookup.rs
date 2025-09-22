@@ -539,7 +539,6 @@ impl LineLookup {
             function_start
         );
 
-        // 1. 优先使用 DWARF prologue_end 标记
         if let Some(addr) = self.find_prologue_end_from_dwarf(function_start) {
             debug!(
                 "LineLookup: found prologue_end at 0x{:x} (offset +{})",
@@ -549,7 +548,6 @@ impl LineLookup {
             return addr;
         }
 
-        // 2. 回退到 is_stmt=true 查找（已有实现）
         if let Some(addr) = self.find_next_stmt_address(function_start) {
             debug!(
                 "LineLookup: using is_stmt=true address at 0x{:x} (offset +{})",
@@ -559,7 +557,6 @@ impl LineLookup {
             return addr;
         }
 
-        // 3. 无法确定，返回原地址
         debug!(
             "LineLookup: no prologue information found, using original address 0x{:x}",
             function_start

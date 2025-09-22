@@ -8,60 +8,30 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Paragraph},
     Frame,
 };
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-// Removed Duration, Instant - no longer needed for immediate rendering
 use unicode_width::UnicodeWidthChar;
 
-/// Frame-based optimized renderer for command panel
+/// Direct renderer for command panel (no caching)
 #[derive(Debug)]
 pub struct OptimizedRenderer {
-    // Line-based cache
-    cached_lines: Vec<CachedLine>,
-    cache_version: u64,
-    last_width: u16,
-    last_height: u16,
-
-    // Frame-based rendering
-    // Removed 60fps optimization - immediate rendering is better for TUI
-
-    // Viewport management
+    // Viewport management only
     scroll_offset: usize,
     visible_lines: usize,
-    // Removed welcome_lines_mapping - now using direct styled_content in StaticTextLine
-}
-
-#[derive(Clone, Debug)]
-struct CachedLine {
-    content_hash: u64,
-    rendered_line: Line<'static>,
-    line_type: LineType,
-    response_type: Option<ResponseType>,
-    original_content: String, // Keep for rehashing when width changes
 }
 
 impl OptimizedRenderer {
     pub fn new() -> Self {
         Self {
-            cached_lines: Vec::new(),
-            cache_version: 0,
-            last_width: 0,
-            last_height: 0,
             scroll_offset: 0,
             visible_lines: 0,
-            // Removed welcome_lines_mapping initialization
         }
     }
 
-    /// Mark that updates are pending (called on input changes)
-    /// Note: With immediate rendering, this is just a placeholder for API compatibility
+    /// Mark that updates are pending (placeholder for API compatibility)
     pub fn mark_pending_updates(&mut self) {
-        // No-op: immediate rendering doesn't need pending flags
+        // No-op: direct rendering doesn't need pending flags
     }
 
-    // Removed set_welcome_lines_mapping - no longer needed with direct styled_content
-
-    /// Main render function with smart caching (immediate rendering)
+    /// Main render function with direct rendering
     pub fn render(
         &mut self,
         f: &mut Frame,
@@ -69,405 +39,722 @@ impl OptimizedRenderer {
         state: &CommandPanelState,
         is_focused: bool,
     ) {
-        // Update viewport if area changed
-        let area_changed = self.update_viewport(area);
+        // Update viewport
+        self.update_viewport(area);
 
-        // Rebuild cache if needed (only when content actually changes)
-        if area_changed || self.cache_needs_rebuild(state) {
-            self.rebuild_cache(state, area.width.saturating_sub(2));
-        }
-
-        // Always render - immediate feedback is better for TUI
+        // Always render directly - no caching
         self.render_border(f, area, is_focused, state);
         self.render_content(f, area, state);
     }
 
-    /// Check if cache needs to be rebuilt
-    fn cache_needs_rebuild(&self, state: &CommandPanelState) -> bool {
-        // Simple heuristic: rebuild if command history count changed or input changed
-        // This is conservative but ensures we never miss updates
-        let current_history_len = state.command_history.len();
-        let current_input_len = state.input_text.len();
-        let current_cursor = state.cursor_position;
-
-        // For now, always rebuild - it's simple and TUI rendering is fast
-        // TODO: We could cache a hash of the current state if performance becomes an issue
-        true
-    }
-
     /// Update viewport information
-    fn update_viewport(&mut self, area: Rect) -> bool {
-        let width = area.width.saturating_sub(2);
+    fn update_viewport(&mut self, area: Rect) {
         let height = area.height.saturating_sub(2);
-        let visible_lines = height as usize;
-
-        let changed = self.last_width != width
-            || self.last_height != height
-            || self.visible_lines != visible_lines;
-
-        if changed {
-            self.last_width = width;
-            self.last_height = height;
-            self.visible_lines = visible_lines;
-        }
-
-        changed
+        self.visible_lines = height as usize;
     }
 
-    /// Rebuild the line cache
-    fn rebuild_cache(&mut self, state: &CommandPanelState, width: u16) {
-        self.cached_lines.clear();
+    /// Render border with mode status
+    fn render_border(
+        &self,
+        f: &mut Frame,
+        area: Rect,
+        is_focused: bool,
+        state: &CommandPanelState,
+    ) {
+        let border_style = if !is_focused {
+            Style::default().fg(Color::White)
+        } else {
+            match state.input_state {
+                crate::model::panel_state::InputState::WaitingResponse { .. } => {
+                    Style::default().fg(Color::Yellow)
+                }
+                _ => match state.mode {
+                    InteractionMode::Input => Style::default().fg(Color::Green),
+                    InteractionMode::Command => Style::default().fg(Color::Cyan),
+                    InteractionMode::ScriptEditor => Style::default().fg(Color::Green),
+                },
+            }
+        };
 
-        // Debug: Log command history state
-        tracing::debug!("rebuild_cache: command_history.len()={}, static_lines.len()={}, is_in_history_search={}",
-            state.command_history.len(), state.static_lines.len(), state.is_in_history_search());
+        let title = match state.input_state {
+            crate::model::panel_state::InputState::WaitingResponse { .. } => {
+                "Interactive Command (waiting for response...)".to_string()
+            }
+            _ => match state.mode {
+                InteractionMode::Input => "Interactive Command (input mode)".to_string(),
+                InteractionMode::Command => "Interactive Command (command mode)".to_string(),
+                InteractionMode::ScriptEditor => "Interactive Command (script mode)".to_string(),
+            },
+        };
 
-        // First, cache static lines (including welcome messages)
+        let block = Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_type(if is_focused {
+                BorderType::Thick
+            } else {
+                BorderType::Plain
+            })
+            .border_style(border_style);
+
+        f.render_widget(block, area);
+    }
+
+    /// Render content directly
+    fn render_content(&self, f: &mut Frame, area: Rect, state: &CommandPanelState) {
+        let inner_area = Rect::new(
+            area.x + 1,
+            area.y + 1,
+            area.width.saturating_sub(2),
+            area.height.saturating_sub(2),
+        );
+
+        let width = inner_area.width;
+        let mut lines = Vec::new();
+
+        // Render static lines (welcome messages, etc.)
         for static_line in &state.static_lines {
             match static_line.line_type {
                 LineType::Welcome => {
-                    // Handle welcome lines with styled content and proper wrapping
                     if let Some(ref styled_content) = static_line.styled_content {
-                        let wrapped_styled_lines =
-                            self.wrap_styled_line(styled_content, width as usize);
-                        for wrapped_styled_line in wrapped_styled_lines {
-                            let line_string = self.styled_line_to_string(&wrapped_styled_line);
-                            let line_hash = self.calculate_hash(&line_string);
-                            let cached_line = CachedLine {
-                                content_hash: line_hash,
-                                rendered_line: wrapped_styled_line,
-                                line_type: LineType::Welcome,
-                                response_type: static_line.response_type,
-                                original_content: line_string,
-                            };
-                            self.cached_lines.push(cached_line);
-                        }
+                        let wrapped_lines = self.wrap_styled_line(styled_content, width as usize);
+                        lines.extend(wrapped_lines);
                     } else {
-                        // Fallback for lines without styled content
                         let wrapped_lines = self.wrap_text(&static_line.content, width);
                         for wrapped_line in wrapped_lines {
-                            let line_hash = self.calculate_hash(&wrapped_line);
-                            let styled_line = self.create_fallback_welcome_line(&wrapped_line);
-                            let cached_line = CachedLine {
-                                content_hash: line_hash,
-                                rendered_line: styled_line,
-                                line_type: LineType::Welcome,
-                                response_type: static_line.response_type,
-                                original_content: wrapped_line,
-                            };
-                            self.cached_lines.push(cached_line);
+                            lines.push(self.create_fallback_welcome_line(&wrapped_line));
                         }
                     }
-                    continue; // Skip the normal processing for welcome lines
                 }
                 _ => {
-                    // Normal processing for non-welcome lines
                     let wrapped_lines = self.wrap_text(&static_line.content, width);
                     for wrapped_line in wrapped_lines {
-                        let line_hash = self.calculate_hash(&wrapped_line);
                         let styled_line = match static_line.line_type {
                             LineType::Response => {
                                 self.create_response_line(&wrapped_line, static_line.response_type)
                             }
                             LineType::Command => self.create_command_line(&wrapped_line),
                             LineType::CurrentInput => Line::from(Span::styled(
-                                wrapped_line.clone(),
+                                wrapped_line,
                                 Style::default().fg(Color::White),
                             )),
-                            _ => unreachable!("Welcome type handled above"),
+                            _ => unreachable!(),
                         };
-
-                        self.cached_lines.push(CachedLine {
-                            content_hash: line_hash,
-                            rendered_line: styled_line,
-                            line_type: static_line.line_type,
-                            response_type: static_line.response_type,
-                            original_content: wrapped_line,
-                        });
+                        lines.push(styled_line);
                     }
                 }
             }
         }
 
-        // Then, cache command history
-        for (_index, item) in state.command_history.iter().enumerate() {
-            // Command line - use (ghostscope) prompt for consistency
+        // Render command history
+        for item in &state.command_history {
+            // Command line
             let command_content = format!("(ghostscope) {}", item.command);
-
-            // Wrap command line if it's too long
-            let wrapped_command_lines = self.wrap_text(&command_content, width);
-            for (line_idx, wrapped_line) in wrapped_command_lines.iter().enumerate() {
-                let command_hash = self.calculate_hash(wrapped_line);
+            let wrapped_commands = self.wrap_text(&command_content, width);
+            for (line_idx, wrapped_line) in wrapped_commands.iter().enumerate() {
                 let command_line = if line_idx == 0 {
-                    // First line with full styling
                     self.create_command_line(wrapped_line)
                 } else {
-                    // Continuation lines with simpler styling
                     Line::from(Span::styled(
                         wrapped_line.clone(),
                         Style::default().fg(Color::White),
                     ))
                 };
-
-                self.cached_lines.push(CachedLine {
-                    content_hash: command_hash,
-                    rendered_line: command_line,
-                    line_type: LineType::Command,
-                    response_type: None,
-                    original_content: wrapped_line.clone(),
-                });
+                lines.push(command_line);
             }
 
-            // Response lines (if any)
+            // Response lines
             if let Some(ref response) = item.response {
                 let response_lines = self.split_response_lines(response);
                 for response_line in response_lines {
-                    // Wrap each response line if it's too long
-                    let wrapped_response_lines = self.wrap_text(&response_line, width);
-                    for wrapped_response in wrapped_response_lines {
-                        let response_hash = self.calculate_hash(&wrapped_response);
+                    let wrapped_responses = self.wrap_text(&response_line, width);
+                    for wrapped_response in wrapped_responses {
                         let styled_line =
                             self.create_response_line(&wrapped_response, item.response_type);
-
-                        self.cached_lines.push(CachedLine {
-                            content_hash: response_hash,
-                            rendered_line: styled_line,
-                            line_type: LineType::Response,
-                            response_type: item.response_type,
-                            original_content: wrapped_response,
-                        });
+                        lines.push(styled_line);
                     }
                 }
             }
         }
 
-        // Current input line or script editor content
+        // Render current input
         match state.mode {
-            crate::model::panel_state::InteractionMode::ScriptEditor => {
-                // Render script editor content
+            InteractionMode::ScriptEditor => {
                 if let Some(ref script_cache) = state.script_cache {
-                    // Script header
-                    let header = format!(
-                        "🔨 Entering script mode for target: {}",
-                        script_cache.target
-                    );
-                    let header_hash = self.calculate_hash(&header);
-                    let header_line = Line::from(Span::styled(
-                        header.clone(),
-                        Style::default().fg(Color::Cyan),
-                    ));
-                    self.cached_lines.push(CachedLine {
-                        content_hash: header_hash,
-                        rendered_line: header_line,
-                        line_type: LineType::CurrentInput,
-                        response_type: None,
-                        original_content: header,
-                    });
-
-                    // Separator line
-                    let separator = "─".repeat(50);
-                    let separator_hash = self.calculate_hash(&separator);
-                    let separator_line = Line::from(Span::styled(
-                        separator.clone(),
-                        Style::default().fg(Color::Cyan),
-                    ));
-                    self.cached_lines.push(CachedLine {
-                        content_hash: separator_hash,
-                        rendered_line: separator_line,
-                        line_type: LineType::CurrentInput,
-                        response_type: None,
-                        original_content: separator,
-                    });
-
-                    // Script editor prompt
-                    let script_prompt = "Script Editor (Ctrl+s to submit, Esc to cancel):";
-                    let prompt_hash = self.calculate_hash(script_prompt);
-                    let prompt_line = Line::from(Span::styled(
-                        script_prompt.to_string(),
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(ratatui::style::Modifier::BOLD),
-                    ));
-                    self.cached_lines.push(CachedLine {
-                        content_hash: prompt_hash,
-                        rendered_line: prompt_line,
-                        line_type: LineType::CurrentInput,
-                        response_type: None,
-                        original_content: script_prompt.to_string(),
-                    });
-
-                    // Script lines with automatic wrapping
-                    for (line_idx, line_content) in script_cache.lines.iter().enumerate() {
-                        let line_number = format!("{:3} │ ", line_idx + 1);
-
-                        // Check if this line needs wrapping
-                        let line_number_width = line_number.chars().count();
-                        let available_width = (width as usize).saturating_sub(line_number_width);
-
-                        if line_content.chars().count() > available_width && available_width > 0 {
-                            // Line needs wrapping
-                            let wrapped_lines =
-                                self.wrap_text(line_content, available_width as u16);
-
-                            for (wrap_idx, wrapped_line) in wrapped_lines.iter().enumerate() {
-                                let is_current_line = line_idx == script_cache.cursor_line;
-                                let cursor_pos_in_wrap = if is_current_line {
-                                    // Calculate which wrapped line contains the cursor
-                                    let mut char_count = 0;
-                                    let mut found_wrap = false;
-                                    for (idx, wrap) in wrapped_lines.iter().enumerate() {
-                                        let wrap_char_count = wrap.chars().count();
-                                        if script_cache.cursor_col >= char_count
-                                            && script_cache.cursor_col
-                                                < char_count + wrap_char_count
-                                        {
-                                            if idx == wrap_idx {
-                                                found_wrap = true;
-                                                break;
-                                            }
-                                        }
-                                        char_count += wrap_char_count;
-                                    }
-                                    if found_wrap {
-                                        script_cache.cursor_col.saturating_sub(char_count)
-                                    } else {
-                                        usize::MAX // No cursor on this wrap line
-                                    }
-                                } else {
-                                    usize::MAX // No cursor on this line
-                                };
-
-                                let full_line = format!(
-                                    "{}{}",
-                                    if wrap_idx == 0 {
-                                        line_number.clone()
-                                    } else {
-                                        "    │ ".to_string()
-                                    },
-                                    wrapped_line
-                                );
-                                let line_hash = self.calculate_hash(&full_line);
-
-                                // Create line with cursor if needed
-                                let styled_line = if cursor_pos_in_wrap != usize::MAX {
-                                    self.create_script_line_with_cursor(
-                                        &if wrap_idx == 0 {
-                                            line_number.clone()
-                                        } else {
-                                            "    │ ".to_string()
-                                        },
-                                        wrapped_line,
-                                        cursor_pos_in_wrap,
-                                    )
-                                } else {
-                                    Line::from(vec![
-                                        Span::styled(
-                                            if wrap_idx == 0 {
-                                                line_number.clone()
-                                            } else {
-                                                "    │ ".to_string()
-                                            },
-                                            Style::default().fg(Color::DarkGray),
-                                        ),
-                                        Span::styled(
-                                            wrapped_line.clone(),
-                                            Style::default().fg(Color::White),
-                                        ),
-                                    ])
-                                };
-
-                                self.cached_lines.push(CachedLine {
-                                    content_hash: line_hash,
-                                    rendered_line: styled_line,
-                                    line_type: LineType::CurrentInput,
-                                    response_type: None,
-                                    original_content: full_line,
-                                });
-                            }
-                        } else {
-                            // Line doesn't need wrapping, use original logic
-                            let full_line = format!("{}{}", line_number, line_content);
-                            let line_hash = self.calculate_hash(&full_line);
-
-                            let styled_line = if line_idx == script_cache.cursor_line {
-                                self.create_script_line_with_cursor(
-                                    &line_number,
-                                    line_content,
-                                    script_cache.cursor_col,
-                                )
-                            } else {
-                                Line::from(vec![
-                                    Span::styled(line_number, Style::default().fg(Color::DarkGray)),
-                                    Span::styled(
-                                        line_content.clone(),
-                                        Style::default().fg(Color::White),
-                                    ),
-                                ])
-                            };
-
-                            self.cached_lines.push(CachedLine {
-                                content_hash: line_hash,
-                                rendered_line: styled_line,
-                                line_type: LineType::CurrentInput,
-                                response_type: None,
-                                original_content: full_line,
-                            });
-                        }
-                    }
+                    self.render_script_editor(script_cache, width, &mut lines);
                 }
             }
             _ => {
-                // Normal input mode
                 if matches!(
                     state.input_state,
                     crate::model::panel_state::InputState::Ready
                 ) {
-                    let prompt = "(ghostscope) ";
-
-                    // Calculate the actual display content including history search prompt
-                    let display_prompt = if state.is_in_history_search() {
-                        format!("(reverse-i-search)`{}': ", state.get_history_search_query())
+                    if state.is_in_history_search() {
+                        self.render_history_search(state, width, &mut lines);
                     } else {
-                        prompt.to_string()
-                    };
-                    let display_text = state.get_display_text();
-                    let input_content = format!("{}{}", display_prompt, display_text);
-
-                    // Handle long input that needs wrapping
-                    if input_content.chars().count() > width as usize {
-                        self.handle_wrapped_input(state, prompt, width);
-                    } else {
-                        // Normal single-line input
-                        let input_hash = self.calculate_hash(&input_content);
-                        let input_line = if state.is_in_history_search() {
-                            // In history search mode, handle specially
-                            self.create_history_search_input_line(state)
-                        } else {
-                            self.create_input_line(
-                                prompt,
-                                state.get_display_text(),
-                                state.get_display_cursor_position(),
-                                state,
-                            )
-                        };
-                        self.cached_lines.push(CachedLine {
-                            content_hash: input_hash,
-                            rendered_line: input_line,
-                            line_type: LineType::CurrentInput,
-                            response_type: None,
-                            original_content: input_content,
-                        });
+                        self.render_normal_input(state, width, &mut lines);
                     }
                 }
             }
         }
 
-        self.cache_version += 1;
+        // Apply viewport
+        let total_lines = lines.len();
+        let visible_count = inner_area.height as usize;
+
+        let (start_line, cursor_line_in_viewport) =
+            if matches!(state.mode, InteractionMode::Command) || state.is_in_history_search() {
+                let cursor_line = if state.is_in_history_search() {
+                    total_lines.saturating_sub(1)
+                } else {
+                    state.command_cursor_line
+                };
+
+                let mut start = if total_lines > visible_count {
+                    total_lines - visible_count
+                } else {
+                    0
+                };
+
+                if cursor_line < start {
+                    start = cursor_line;
+                } else if cursor_line >= start + visible_count {
+                    start = cursor_line.saturating_sub(visible_count - 1);
+                }
+
+                (start, Some(cursor_line.saturating_sub(start)))
+            } else {
+                let start = if total_lines > visible_count {
+                    total_lines - visible_count
+                } else {
+                    0
+                };
+                (start, None)
+            };
+
+        let mut visible_lines: Vec<Line> = lines
+            .into_iter()
+            .skip(start_line)
+            .take(visible_count)
+            .collect();
+
+        // Add command mode cursor if needed
+        if let Some(cursor_line_idx) = cursor_line_in_viewport {
+            if cursor_line_idx < visible_lines.len()
+                && matches!(state.mode, InteractionMode::Command)
+            {
+                self.add_command_cursor(
+                    &mut visible_lines[cursor_line_idx],
+                    state.command_cursor_column,
+                );
+            }
+        }
+
+        let paragraph = Paragraph::new(visible_lines);
+        f.render_widget(paragraph, inner_area);
+    }
+
+    /// Render script editor content
+    fn render_script_editor(
+        &self,
+        script_cache: &crate::model::panel_state::ScriptCache,
+        width: u16,
+        lines: &mut Vec<Line<'static>>,
+    ) {
+        // Header
+        let header = format!(
+            "🔨 Entering script mode for target: {}",
+            script_cache.target
+        );
+        lines.push(Line::from(Span::styled(
+            header,
+            Style::default().fg(Color::Cyan),
+        )));
+
+        // Separator
+        let separator = "─".repeat(50);
+        lines.push(Line::from(Span::styled(
+            separator,
+            Style::default().fg(Color::Cyan),
+        )));
+
+        // Prompt
+        lines.push(Line::from(Span::styled(
+            "Script Editor (Ctrl+s to submit, Esc to cancel):",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+
+        // Script lines
+        for (line_idx, line_content) in script_cache.lines.iter().enumerate() {
+            let line_number = format!("{:3} │ ", line_idx + 1);
+            let is_cursor_line = line_idx == script_cache.cursor_line;
+
+            if is_cursor_line {
+                lines.push(self.create_script_line_with_cursor(
+                    &line_number,
+                    line_content,
+                    script_cache.cursor_col,
+                ));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled(line_number, Style::default().fg(Color::DarkGray)),
+                    Span::styled(line_content.clone(), Style::default().fg(Color::White)),
+                ]));
+            }
+        }
+    }
+
+    /// Render history search input
+    fn render_history_search(
+        &self,
+        state: &CommandPanelState,
+        width: u16,
+        lines: &mut Vec<Line<'static>>,
+    ) {
+        let search_query = state.get_history_search_query();
+
+        if let Some(matched_command) = state
+            .history_search
+            .current_match(&state.command_history_manager)
+        {
+            // Success case
+            let prompt_text = format!("(reverse-i-search)`{}': ", search_query);
+            let full_content = format!("{}{}", prompt_text, matched_command);
+
+            if full_content.chars().count() > width as usize {
+                // Wrapped case
+                let wrapped_lines = self.wrap_text(&full_content, width);
+                let cursor_pos = prompt_text.chars().count() + search_query.len();
+
+                let mut char_count = 0;
+                for (line_idx, line) in wrapped_lines.iter().enumerate() {
+                    let line_char_count = line.chars().count();
+                    let line_end = char_count + line_char_count;
+
+                    if cursor_pos >= char_count && cursor_pos < line_end {
+                        // This line contains the cursor
+                        let cursor_in_line = cursor_pos - char_count;
+                        lines.push(self.create_history_search_line_with_cursor(
+                            line,
+                            &prompt_text,
+                            cursor_in_line,
+                        ));
+                    } else {
+                        lines.push(
+                            self.create_history_search_line_without_cursor(line, &prompt_text),
+                        );
+                    }
+                    char_count = line_end;
+                }
+            } else {
+                // Single line case
+                let cursor_pos = search_query.len();
+                lines.push(self.create_simple_history_search_line(
+                    &prompt_text,
+                    matched_command,
+                    cursor_pos,
+                    true,
+                ));
+            }
+        } else if search_query.is_empty() {
+            // Empty search
+            let prompt_text = "(reverse-i-search)`': ";
+
+            if prompt_text.chars().count() > width as usize {
+                // Wrapped empty search
+                let wrapped_lines = self.wrap_text(prompt_text, width);
+                for wrapped_line in wrapped_lines {
+                    lines.push(Line::from(Span::styled(
+                        wrapped_line,
+                        Style::default().fg(Color::Cyan),
+                    )));
+                }
+            } else {
+                // Single line empty search
+                lines.push(Line::from(Span::styled(
+                    prompt_text,
+                    Style::default().fg(Color::Cyan),
+                )));
+            }
+        } else {
+            // Failed search
+            let failed_prompt = format!("(failed reverse-i-search)`{}': ", search_query);
+
+            if failed_prompt.chars().count() > width as usize {
+                // Wrapped failed search
+                let wrapped_lines = self.wrap_text(&failed_prompt, width);
+                for wrapped_line in wrapped_lines {
+                    lines.push(Line::from(Span::styled(
+                        wrapped_line,
+                        Style::default().fg(Color::Red),
+                    )));
+                }
+            } else {
+                // Single line failed search
+                lines.push(Line::from(Span::styled(
+                    failed_prompt,
+                    Style::default().fg(Color::Red),
+                )));
+            }
+        }
+    }
+
+    /// Render normal input
+    fn render_normal_input(
+        &self,
+        state: &CommandPanelState,
+        width: u16,
+        lines: &mut Vec<Line<'static>>,
+    ) {
+        let prompt = "(ghostscope) ";
+        let input_text = state.get_display_text();
+        let cursor_pos = state.get_display_cursor_position();
+        let full_content = format!("{}{}", prompt, input_text);
+
+        if full_content.chars().count() > width as usize {
+            // Handle wrapped input
+            let wrapped_lines = self.wrap_text(&full_content, width);
+            let cursor_pos_with_prompt = cursor_pos + prompt.chars().count();
+
+            let mut char_count = 0;
+            for (line_idx, line) in wrapped_lines.iter().enumerate() {
+                let line_char_count = line.chars().count();
+                let line_end = char_count + line_char_count;
+
+                if cursor_pos_with_prompt >= char_count && cursor_pos_with_prompt < line_end {
+                    let cursor_in_line = cursor_pos_with_prompt - char_count;
+                    lines.push(self.create_input_line_with_cursor(
+                        line,
+                        prompt,
+                        cursor_in_line,
+                        line_idx == 0,
+                    ));
+                } else {
+                    lines.push(self.create_input_line_without_cursor(line, prompt, line_idx == 0));
+                }
+                char_count = line_end;
+            }
+        } else {
+            // Single line input
+            lines.push(self.create_input_line(prompt, input_text, cursor_pos, state));
+        }
+    }
+
+    /// Create simple history search line
+    fn create_simple_history_search_line(
+        &self,
+        prompt_text: &str,
+        matched_command: &str,
+        cursor_pos: usize,
+        show_cursor: bool,
+    ) -> Line<'static> {
+        let mut spans = vec![Span::styled(
+            prompt_text.to_string(),
+            Style::default().fg(Color::Cyan),
+        )];
+
+        if show_cursor {
+            self.add_text_with_cursor(&mut spans, matched_command, cursor_pos);
+        } else {
+            spans.push(Span::styled(matched_command.to_string(), Style::default()));
+        }
+
+        Line::from(spans)
+    }
+
+    /// Create history search line with cursor (wrapped)
+    fn create_history_search_line_with_cursor(
+        &self,
+        line: &str,
+        prompt_text: &str,
+        cursor_pos: usize,
+    ) -> Line<'static> {
+        let chars: Vec<char> = line.chars().collect();
+        let mut spans = Vec::new();
+        let prompt_len = prompt_text.chars().count();
+
+        if prompt_len > 0 && prompt_len <= chars.len() {
+            // Line contains prompt
+            let prompt_part: String = chars[..prompt_len].iter().collect();
+            spans.push(Span::styled(prompt_part, Style::default().fg(Color::Cyan)));
+
+            let text_part: String = chars[prompt_len..].iter().collect();
+            let cursor_in_text = cursor_pos.saturating_sub(prompt_len);
+            self.add_text_with_cursor(&mut spans, &text_part, cursor_in_text);
+        } else {
+            // Continuation line
+            self.add_text_with_cursor(&mut spans, line, cursor_pos);
+        }
+
+        Line::from(spans)
+    }
+
+    /// Create history search line without cursor (wrapped)
+    fn create_history_search_line_without_cursor(
+        &self,
+        line: &str,
+        prompt_text: &str,
+    ) -> Line<'static> {
+        let chars: Vec<char> = line.chars().collect();
+        let mut spans = Vec::new();
+        let prompt_len = prompt_text.chars().count();
+
+        if prompt_len > 0 && prompt_len <= chars.len() {
+            let prompt_part: String = chars[..prompt_len].iter().collect();
+            spans.push(Span::styled(prompt_part, Style::default().fg(Color::Cyan)));
+
+            let text_part: String = chars[prompt_len..].iter().collect();
+            spans.push(Span::styled(text_part, Style::default()));
+        } else {
+            spans.push(Span::styled(line.to_string(), Style::default()));
+        }
+
+        Line::from(spans)
+    }
+
+    /// Create input line with cursor
+    fn create_input_line_with_cursor(
+        &self,
+        line: &str,
+        prompt: &str,
+        cursor_pos: usize,
+        is_first_line: bool,
+    ) -> Line<'static> {
+        let chars: Vec<char> = line.chars().collect();
+        let mut spans = Vec::new();
+        let prompt_len = if is_first_line {
+            prompt.chars().count()
+        } else {
+            0
+        };
+
+        if is_first_line && prompt_len <= chars.len() {
+            let prompt_part: String = chars[..prompt_len].iter().collect();
+            spans.push(Span::styled(
+                prompt_part,
+                Style::default().fg(Color::Magenta),
+            ));
+
+            let text_part: String = chars[prompt_len..].iter().collect();
+            let cursor_in_text = cursor_pos.saturating_sub(prompt_len);
+            self.add_text_with_cursor(&mut spans, &text_part, cursor_in_text);
+        } else {
+            self.add_text_with_cursor(&mut spans, line, cursor_pos);
+        }
+
+        Line::from(spans)
+    }
+
+    /// Create input line without cursor
+    fn create_input_line_without_cursor(
+        &self,
+        line: &str,
+        prompt: &str,
+        is_first_line: bool,
+    ) -> Line<'static> {
+        let chars: Vec<char> = line.chars().collect();
+        let mut spans = Vec::new();
+        let prompt_len = if is_first_line {
+            prompt.chars().count()
+        } else {
+            0
+        };
+
+        if is_first_line && prompt_len <= chars.len() {
+            let prompt_part: String = chars[..prompt_len].iter().collect();
+            spans.push(Span::styled(
+                prompt_part,
+                Style::default().fg(Color::Magenta),
+            ));
+
+            let text_part: String = chars[prompt_len..].iter().collect();
+            spans.push(Span::styled(text_part, Style::default()));
+        } else {
+            spans.push(Span::styled(line.to_string(), Style::default()));
+        }
+
+        Line::from(spans)
+    }
+
+    /// Add command cursor to existing line
+    fn add_command_cursor(&self, line: &mut Line<'static>, cursor_col: usize) {
+        let mut new_spans = Vec::new();
+        let mut current_pos = 0;
+
+        for span in &line.spans {
+            let span_len = span.content.chars().count();
+            let span_end = current_pos + span_len;
+
+            if cursor_col >= current_pos && cursor_col < span_end {
+                let chars: Vec<char> = span.content.chars().collect();
+                let cursor_pos_in_span = cursor_col - current_pos;
+
+                if cursor_pos_in_span > 0 {
+                    let before: String = chars[..cursor_pos_in_span].iter().collect();
+                    new_spans.push(Span::styled(before, span.style));
+                }
+
+                if cursor_pos_in_span < chars.len() {
+                    let cursor_char = chars[cursor_pos_in_span];
+                    new_spans.push(Span::styled(
+                        cursor_char.to_string(),
+                        UIThemes::cursor_style(),
+                    ));
+
+                    if cursor_pos_in_span + 1 < chars.len() {
+                        let after: String = chars[cursor_pos_in_span + 1..].iter().collect();
+                        new_spans.push(Span::styled(after, span.style));
+                    }
+                } else {
+                    new_spans.push(Span::styled(" ".to_string(), UIThemes::cursor_style()));
+                }
+            } else {
+                new_spans.push(span.clone());
+            }
+
+            current_pos = span_end;
+        }
+
+        if cursor_col >= current_pos {
+            new_spans.push(Span::styled(" ".to_string(), UIThemes::cursor_style()));
+        }
+
+        line.spans = new_spans;
+    }
+
+    /// Create a styled input line with cursor
+    fn create_input_line(
+        &self,
+        prompt: &str,
+        input_text: &str,
+        cursor_pos: usize,
+        state: &CommandPanelState,
+    ) -> Line<'static> {
+        let chars: Vec<char> = input_text.chars().collect();
+        let mut spans = vec![Span::styled(
+            prompt.to_string(),
+            Style::default().fg(Color::Magenta),
+        )];
+
+        let show_cursor = matches!(state.mode, InteractionMode::Input);
+
+        if chars.is_empty() {
+            if let Some(suggestion_text) = state.get_suggestion_text() {
+                let suggestion_chars: Vec<char> = suggestion_text.chars().collect();
+                if !suggestion_chars.is_empty() {
+                    spans.push(Span::styled(
+                        suggestion_chars[0].to_string(),
+                        if show_cursor {
+                            UIThemes::cursor_style()
+                        } else {
+                            Style::default().fg(Color::DarkGray)
+                        },
+                    ));
+                    if suggestion_chars.len() > 1 {
+                        let remaining: String = suggestion_chars[1..].iter().collect();
+                        spans.push(Span::styled(
+                            remaining,
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
+                }
+            } else {
+                spans.push(Span::styled(
+                    " ".to_string(),
+                    if show_cursor {
+                        UIThemes::cursor_style()
+                    } else {
+                        Style::default()
+                    },
+                ));
+            }
+        } else if cursor_pos >= chars.len() {
+            spans.push(Span::styled(input_text.to_string(), Style::default()));
+            spans.push(Span::styled(
+                " ".to_string(),
+                if show_cursor {
+                    UIThemes::cursor_style()
+                } else {
+                    Style::default()
+                },
+            ));
+        } else {
+            let before_cursor: String = chars[..cursor_pos].iter().collect();
+            let at_cursor = chars[cursor_pos];
+            let after_cursor: String = chars[cursor_pos + 1..].iter().collect();
+
+            if !before_cursor.is_empty() {
+                spans.push(Span::styled(before_cursor, Style::default()));
+            }
+
+            spans.push(Span::styled(
+                at_cursor.to_string(),
+                if show_cursor {
+                    UIThemes::cursor_style()
+                } else {
+                    Style::default()
+                },
+            ));
+
+            if !after_cursor.is_empty() {
+                spans.push(Span::styled(after_cursor, Style::default()));
+            }
+        }
+
+        Line::from(spans)
+    }
+
+    /// Create a script line with cursor
+    fn create_script_line_with_cursor(
+        &self,
+        line_number: &str,
+        content: &str,
+        cursor_pos: usize,
+    ) -> Line<'static> {
+        let chars: Vec<char> = content.chars().collect();
+        let mut spans = vec![Span::styled(
+            line_number.to_string(),
+            Style::default().fg(Color::DarkGray),
+        )];
+
+        if chars.is_empty() {
+            spans.push(Span::styled(" ".to_string(), UIThemes::cursor_style()));
+        } else if cursor_pos >= chars.len() {
+            spans.push(Span::styled(
+                content.to_string(),
+                Style::default().fg(Color::White),
+            ));
+            spans.push(Span::styled(" ".to_string(), UIThemes::cursor_style()));
+        } else {
+            let before_cursor: String = chars[..cursor_pos].iter().collect();
+            let at_cursor = chars[cursor_pos];
+            let after_cursor: String = chars[cursor_pos + 1..].iter().collect();
+
+            if !before_cursor.is_empty() {
+                spans.push(Span::styled(
+                    before_cursor,
+                    Style::default().fg(Color::White),
+                ));
+            }
+            spans.push(Span::styled(
+                at_cursor.to_string(),
+                UIThemes::cursor_style(),
+            ));
+            if !after_cursor.is_empty() {
+                spans.push(Span::styled(
+                    after_cursor,
+                    Style::default().fg(Color::White),
+                ));
+            }
+        }
+
+        Line::from(spans)
     }
 
     /// Create a styled command line
     fn create_command_line(&self, content: &str) -> Line<'static> {
-        // Handle (ghostscope) prompt specifically
         if content.starts_with("(ghostscope) ") {
             let prompt_part = "(ghostscope) ";
             let command_part = &content[prompt_part.len()..];
@@ -493,433 +780,7 @@ impl OptimizedRenderer {
         content: &str,
         response_type: Option<ResponseType>,
     ) -> Line<'static> {
-        let style = self.get_response_style(response_type);
-        Line::from(Span::styled(content.to_string(), style))
-    }
-
-    /// Wrap a styled line preserving span styles across line breaks
-    fn wrap_styled_line(
-        &self,
-        styled_line: &ratatui::text::Line<'static>,
-        width: usize,
-    ) -> Vec<ratatui::text::Line<'static>> {
-        use ratatui::text::{Line, Span};
-
-        // Calculate total text length
-        let full_text: String = styled_line
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect();
-
-        if full_text.len() <= width {
-            // No wrapping needed
-            return vec![styled_line.clone()];
-        }
-
-        let mut result_lines = Vec::new();
-        let mut current_line_spans = Vec::new();
-        let mut current_line_length = 0;
-
-        for span in &styled_line.spans {
-            let span_text = span.content.as_ref();
-            let span_style = span.style;
-
-            if current_line_length + span_text.len() <= width {
-                // Entire span fits on current line
-                current_line_spans.push(span.clone());
-                current_line_length += span_text.len();
-            } else {
-                // Need to split the span
-                let remaining_width = width - current_line_length;
-
-                if remaining_width > 0 {
-                    // Take what fits on current line
-                    let (first_part, remaining_part) =
-                        span_text.split_at(remaining_width.min(span_text.len()));
-                    if !first_part.is_empty() {
-                        current_line_spans.push(Span::styled(first_part.to_string(), span_style));
-                    }
-
-                    // Finish current line
-                    if !current_line_spans.is_empty() {
-                        result_lines.push(Line::from(current_line_spans));
-                        current_line_spans = Vec::new();
-                        current_line_length = 0;
-                    }
-
-                    // Handle remaining part
-                    let mut remaining = remaining_part;
-                    while !remaining.is_empty() {
-                        let chunk_size = width.min(remaining.len());
-                        let (chunk, rest) = remaining.split_at(chunk_size);
-                        result_lines.push(Line::from(vec![Span::styled(
-                            chunk.to_string(),
-                            span_style,
-                        )]));
-                        remaining = rest;
-                    }
-                } else {
-                    // Current line is full, start new line
-                    if !current_line_spans.is_empty() {
-                        result_lines.push(Line::from(current_line_spans));
-                        current_line_spans = Vec::new();
-                        current_line_length = 0;
-                    }
-
-                    // Handle the full span on new line(s)
-                    let mut remaining = span_text;
-                    while !remaining.is_empty() {
-                        let chunk_size = width.min(remaining.len());
-                        let (chunk, rest) = remaining.split_at(chunk_size);
-                        result_lines.push(Line::from(vec![Span::styled(
-                            chunk.to_string(),
-                            span_style,
-                        )]));
-                        remaining = rest;
-                    }
-                }
-            }
-        }
-
-        // Add final line if any spans remain
-        if !current_line_spans.is_empty() {
-            result_lines.push(Line::from(current_line_spans));
-        }
-
-        result_lines
-    }
-
-    /// Convert styled line to string for hashing
-    fn styled_line_to_string(&self, styled_line: &ratatui::text::Line<'static>) -> String {
-        styled_line
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect()
-    }
-
-    /// Create fallback welcome line for lines without styled content
-    fn create_fallback_welcome_line(&self, content: &str) -> ratatui::text::Line<'static> {
-        use ratatui::style::{Color, Modifier, Style};
-        use ratatui::text::Span;
-
-        // Apply content-based styling for welcome messages
-        if content.contains("GhostScope") {
-            // Title line
-            ratatui::text::Line::from(Span::styled(
-                content.to_string(),
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ))
-        } else if content.starts_with("•") || content.starts_with("Loading completed in") {
-            // Bullet points and timing info
-            ratatui::text::Line::from(Span::styled(
-                content.to_string(),
-                Style::default().fg(Color::Cyan),
-            ))
-        } else if content.starts_with("Attached to process") {
-            // Process info
-            ratatui::text::Line::from(Span::styled(
-                content.to_string(),
-                Style::default().fg(Color::White),
-            ))
-        } else if content.trim().is_empty() {
-            // Empty lines
-            ratatui::text::Line::from("")
-        } else {
-            // Default welcome text styling
-            ratatui::text::Line::from(Span::styled(
-                content.to_string(),
-                Style::default().fg(Color::White),
-            ))
-        }
-    }
-
-    /// Create a history search input line with proper cursor positioning
-    fn create_history_search_input_line(&self, state: &CommandPanelState) -> Line<'static> {
-        let mut spans = Vec::new();
-
-        // History search prompt
-        let search_query = state.get_history_search_query();
-        let prompt_text = format!("(reverse-i-search)`{}': ", search_query);
-
-        tracing::debug!(
-            "create_history_search_input_line: search_query='{}', prompt_text='{}'",
-            search_query,
-            prompt_text
-        );
-
-        spans.push(Span::styled(prompt_text, Style::default().fg(Color::Cyan)));
-
-        // Display matched command or search query
-        if let Some(matched_command) = state
-            .history_search
-            .current_match(&state.command_history_manager)
-        {
-            // Show matched command
-            let cursor_pos = search_query.len();
-            let chars: Vec<char> = matched_command.chars().collect();
-
-            tracing::debug!("create_history_search_input_line: matched_command='{}', cursor_pos={}, chars.len()={}",
-                matched_command, cursor_pos, chars.len());
-
-            if cursor_pos < chars.len() {
-                // Show text before cursor position (should be the matching part)
-                if cursor_pos > 0 {
-                    let before: String = chars[..cursor_pos].iter().collect();
-                    tracing::debug!(
-                        "create_history_search_input_line: before cursor: '{}'",
-                        before
-                    );
-                    spans.push(Span::styled(before, Style::default()));
-                }
-
-                // Show cursor character
-                let cursor_char = chars[cursor_pos];
-                tracing::debug!(
-                    "create_history_search_input_line: cursor char: '{}'",
-                    cursor_char
-                );
-                spans.push(Span::styled(
-                    cursor_char.to_string(),
-                    crate::ui::themes::UIThemes::cursor_style(),
-                ));
-
-                // Show text after cursor in gray
-                if cursor_pos + 1 < chars.len() {
-                    let after: String = chars[cursor_pos + 1..].iter().collect();
-                    tracing::debug!(
-                        "create_history_search_input_line: after cursor: '{}'",
-                        after
-                    );
-                    spans.push(Span::styled(after, Style::default().fg(Color::DarkGray)));
-                }
-            } else {
-                // Cursor at end, show all text and space cursor
-                tracing::debug!(
-                    "create_history_search_input_line: cursor at end, showing space cursor"
-                );
-                spans.push(Span::styled(matched_command.to_string(), Style::default()));
-                spans.push(Span::styled(
-                    " ".to_string(),
-                    crate::ui::themes::UIThemes::cursor_style(),
-                ));
-            }
-        } else {
-            // No match, just show cursor at end of search query (already included in prompt)
-            tracing::debug!("create_history_search_input_line: no match, showing space cursor");
-            spans.push(Span::styled(
-                " ".to_string(),
-                crate::ui::themes::UIThemes::cursor_style(),
-            ));
-        }
-
-        Line::from(spans)
-    }
-
-    /// Create a styled input line with cursor, auto-suggestion and history search support
-    fn create_input_line(
-        &self,
-        prompt: &str,
-        input_text: &str,
-        cursor_pos: usize,
-        state: &CommandPanelState,
-    ) -> Line<'static> {
-        let chars: Vec<char> = input_text.chars().collect();
-        let mut spans = Vec::new();
-
-        // Display history search indicator if in search mode
-        if state.is_in_history_search() {
-            spans.push(Span::styled(
-                format!("(reverse-i-search)`{}': ", state.get_history_search_query()),
-                Style::default().fg(Color::Cyan),
-            ));
-        } else {
-            spans.push(Span::styled(
-                prompt.to_string(),
-                Style::default().fg(Color::Magenta),
-            ));
-        }
-
-        if chars.is_empty() {
-            // Empty input, show auto-suggestion if available
-            if let Some(suggestion_text) = state.get_suggestion_text() {
-                // Show first character of suggestion as block cursor, rest as gray
-                let suggestion_chars: Vec<char> = suggestion_text.chars().collect();
-                if !suggestion_chars.is_empty() {
-                    spans.push(Span::styled(
-                        suggestion_chars[0].to_string(),
-                        crate::ui::themes::UIThemes::cursor_style(),
-                    ));
-                    if suggestion_chars.len() > 1 {
-                        let remaining: String = suggestion_chars[1..].iter().collect();
-                        spans.push(Span::styled(
-                            remaining,
-                            Style::default().fg(Color::DarkGray),
-                        ));
-                    }
-                } else {
-                    spans.push(Span::styled(
-                        " ".to_string(),
-                        crate::ui::themes::UIThemes::cursor_style(),
-                    ));
-                }
-            } else {
-                // No suggestion, show space as block cursor
-                spans.push(Span::styled(
-                    " ".to_string(),
-                    crate::ui::themes::UIThemes::cursor_style(),
-                ));
-            }
-        } else if cursor_pos >= chars.len() {
-            // Cursor at end - check if we have auto-suggestion to merge
-            if let Some(suggestion_text) = state.get_suggestion_text() {
-                // We have auto-suggestion, show merged text with cursor at boundary
-                let full_text = format!("{}{}", input_text, suggestion_text);
-                let full_chars: Vec<char> = full_text.chars().collect();
-
-                // Show input part in normal color
-                if !input_text.is_empty() {
-                    spans.push(Span::styled(input_text.to_string(), Style::default()));
-                }
-
-                // Show the character at cursor position as block cursor
-                if cursor_pos < full_chars.len() {
-                    let cursor_char = full_chars[cursor_pos];
-                    spans.push(Span::styled(
-                        cursor_char.to_string(),
-                        crate::ui::themes::UIThemes::cursor_style(),
-                    ));
-
-                    // Show remaining characters in dark gray
-                    if cursor_pos + 1 < full_chars.len() {
-                        let remaining: String = full_chars[cursor_pos + 1..].iter().collect();
-                        spans.push(Span::styled(
-                            remaining,
-                            Style::default().fg(Color::DarkGray),
-                        ));
-                    }
-                } else {
-                    // Fallback - show space as block cursor
-                    spans.push(Span::styled(
-                        " ".to_string(),
-                        crate::ui::themes::UIThemes::cursor_style(),
-                    ));
-                }
-            } else {
-                // No auto-suggestion, show block cursor at end
-                spans.push(Span::styled(input_text.to_string(), Style::default()));
-                spans.push(Span::styled(
-                    " ".to_string(),
-                    crate::ui::themes::UIThemes::cursor_style(),
-                ));
-            }
-        } else {
-            // Cursor in middle of text - show character as block cursor
-            let before_cursor: String = chars[..cursor_pos].iter().collect();
-            let at_cursor = if cursor_pos < chars.len() {
-                chars[cursor_pos]
-            } else {
-                ' ' // If cursor is at end, show space as block cursor
-            };
-            let after_cursor: String = if cursor_pos < chars.len() {
-                chars[cursor_pos + 1..].iter().collect()
-            } else {
-                String::new()
-            };
-
-            // Text before cursor
-            if !before_cursor.is_empty() {
-                spans.push(Span::styled(before_cursor, Style::default()));
-            }
-
-            // Character at cursor position as block cursor
-            spans.push(Span::styled(
-                at_cursor.to_string(),
-                crate::ui::themes::UIThemes::cursor_style(),
-            ));
-
-            // Text after cursor
-            if !after_cursor.is_empty() {
-                spans.push(Span::styled(after_cursor, Style::default()));
-            }
-
-            // Add auto-suggestion at the end if cursor is at the end of meaningful text
-            if cursor_pos + 1 >= chars.len() {
-                if let Some(suggestion_text) = state.get_suggestion_text() {
-                    spans.push(Span::styled(
-                        suggestion_text.to_string(),
-                        Style::default().fg(Color::DarkGray),
-                    ));
-                }
-            }
-        }
-
-        Line::from(spans)
-    }
-
-    /// Create a script line with cursor visualization
-    fn create_script_line_with_cursor(
-        &self,
-        line_number: &str,
-        content: &str,
-        cursor_pos: usize,
-    ) -> Line<'static> {
-        let chars: Vec<char> = content.chars().collect();
-        let mut spans = vec![Span::styled(
-            line_number.to_string(),
-            Style::default().fg(Color::DarkGray),
-        )];
-
-        if chars.is_empty() {
-            // Empty line, show block cursor
-            spans.push(Span::styled(
-                " ".to_string(),
-                crate::ui::themes::UIThemes::cursor_style(),
-            ));
-        } else if cursor_pos >= chars.len() {
-            // Cursor at end
-            spans.push(Span::styled(
-                content.to_string(),
-                Style::default().fg(Color::White),
-            ));
-            spans.push(Span::styled(
-                " ".to_string(),
-                crate::ui::themes::UIThemes::cursor_style(),
-            ));
-        } else {
-            // Cursor in middle
-            let before_cursor: String = chars[..cursor_pos].iter().collect();
-            let at_cursor = chars[cursor_pos];
-            let after_cursor: String = chars[cursor_pos + 1..].iter().collect();
-
-            if !before_cursor.is_empty() {
-                spans.push(Span::styled(
-                    before_cursor,
-                    Style::default().fg(Color::White),
-                ));
-            }
-            // Show character at cursor position as block cursor
-            spans.push(Span::styled(
-                at_cursor.to_string(),
-                crate::ui::themes::UIThemes::cursor_style(),
-            ));
-            if !after_cursor.is_empty() {
-                spans.push(Span::styled(
-                    after_cursor,
-                    Style::default().fg(Color::White),
-                ));
-            }
-        }
-
-        Line::from(spans)
-    }
-
-    /// Get style for response type
-    fn get_response_style(&self, response_type: Option<ResponseType>) -> Style {
-        match response_type {
+        let style = match response_type {
             Some(ResponseType::Success) => Style::default().fg(Color::Green),
             Some(ResponseType::Error) => Style::default().fg(Color::Red),
             Some(ResponseType::Warning) => Style::default().fg(Color::Yellow),
@@ -927,20 +788,76 @@ impl OptimizedRenderer {
             Some(ResponseType::Progress) => Style::default().fg(Color::Blue),
             Some(ResponseType::ScriptDisplay) => Style::default().fg(Color::Magenta),
             None => Style::default().fg(Color::Gray),
+        };
+        Line::from(Span::styled(content.to_string(), style))
+    }
+
+    /// Create fallback welcome line
+    fn create_fallback_welcome_line(&self, content: &str) -> Line<'static> {
+        if content.contains("GhostScope") {
+            Line::from(Span::styled(
+                content.to_string(),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        } else if content.starts_with("•") || content.starts_with("Loading completed in") {
+            Line::from(Span::styled(
+                content.to_string(),
+                Style::default().fg(Color::Cyan),
+            ))
+        } else if content.starts_with("Attached to process") {
+            Line::from(Span::styled(
+                content.to_string(),
+                Style::default().fg(Color::White),
+            ))
+        } else if content.trim().is_empty() {
+            Line::from("")
+        } else {
+            Line::from(Span::styled(
+                content.to_string(),
+                Style::default().fg(Color::White),
+            ))
         }
     }
 
-    /// Split response into lines
-    fn split_response_lines(&self, response: &str) -> Vec<String> {
-        response.lines().map(String::from).collect()
-    }
+    /// Add text with cursor to spans vector
+    fn add_text_with_cursor(&self, spans: &mut Vec<Span<'static>>, text: &str, cursor_pos: usize) {
+        let chars: Vec<char> = text.chars().collect();
 
-    /// Calculate hash for content
-    fn calculate_hash(&self, content: &str) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        content.hash(&mut hasher);
-        self.last_width.hash(&mut hasher); // Include width in hash
-        hasher.finish()
+        if chars.is_empty() {
+            spans.push(Span::styled(" ".to_string(), UIThemes::cursor_style()));
+        } else if cursor_pos == 0 {
+            let first_char = chars[0];
+            spans.push(Span::styled(
+                first_char.to_string(),
+                UIThemes::cursor_style(),
+            ));
+            if chars.len() > 1 {
+                let remaining: String = chars[1..].iter().collect();
+                spans.push(Span::styled(remaining, Style::default()));
+            }
+        } else if cursor_pos >= chars.len() {
+            spans.push(Span::styled(text.to_string(), Style::default()));
+            spans.push(Span::styled(" ".to_string(), UIThemes::cursor_style()));
+        } else {
+            let before_cursor: String = chars[..cursor_pos].iter().collect();
+            let at_cursor = chars[cursor_pos];
+            let after_cursor: String = chars[cursor_pos + 1..].iter().collect();
+
+            if !before_cursor.is_empty() {
+                spans.push(Span::styled(before_cursor, Style::default()));
+            }
+
+            spans.push(Span::styled(
+                at_cursor.to_string(),
+                UIThemes::cursor_style(),
+            ));
+
+            if !after_cursor.is_empty() {
+                spans.push(Span::styled(after_cursor, Style::default()));
+            }
+        }
     }
 
     /// Wrap text to fit within the specified width
@@ -953,7 +870,6 @@ impl OptimizedRenderer {
         let mut lines = Vec::new();
 
         for line in text.lines() {
-            // Calculate the actual display width using Unicode width
             let line_width: usize = line
                 .chars()
                 .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
@@ -962,7 +878,6 @@ impl OptimizedRenderer {
             if line_width <= max_width {
                 lines.push(line.to_string());
             } else {
-                // Need to wrap this line
                 let mut current_line = String::new();
                 let mut current_width = 0;
 
@@ -970,7 +885,6 @@ impl OptimizedRenderer {
                     let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
 
                     if current_width + char_width > max_width && !current_line.is_empty() {
-                        // Start a new line
                         lines.push(current_line);
                         current_line = ch.to_string();
                         current_width = char_width;
@@ -993,390 +907,97 @@ impl OptimizedRenderer {
         lines
     }
 
-    /// Handle wrapped input that spans multiple lines
-    fn handle_wrapped_input(&mut self, state: &CommandPanelState, prompt: &str, width: u16) {
-        let prompt_len = if state.is_in_history_search() {
-            format!("(reverse-i-search)`{}': ", state.get_history_search_query())
-                .chars()
-                .count()
-        } else {
-            prompt.chars().count()
-        };
-        let input_text = state.get_display_text();
-        let cursor_pos = state.get_display_cursor_position();
-
-        // Handle history search mode prompt differently
-        let display_prompt = if state.is_in_history_search() {
-            format!("(reverse-i-search)`{}': ", state.get_history_search_query())
-        } else {
-            prompt.to_string()
-        };
-
-        // Wrap the full content (prompt + input)
-        let full_content = format!("{}{}", display_prompt, input_text);
-        let wrapped_lines = self.wrap_text(&full_content, width);
-
-        let mut char_count = 0;
-        let mut cursor_line = 0;
-        let mut cursor_col_in_line = 0;
-
-        // Find which line the cursor is on
-        for (line_idx, line) in wrapped_lines.iter().enumerate() {
-            let line_char_count = line.chars().count();
-            let cursor_pos_with_prompt = cursor_pos + prompt_len;
-
-            if char_count + line_char_count >= cursor_pos_with_prompt {
-                cursor_line = line_idx;
-                cursor_col_in_line = cursor_pos_with_prompt - char_count;
-                break;
-            }
-            char_count += line_char_count;
-        }
-
-        // Create cached lines for each wrapped line
-        for (line_idx, line) in wrapped_lines.iter().enumerate() {
-            let line_hash = self.calculate_hash(line);
-
-            let styled_line = if line_idx == 0 {
-                // First line: handle prompt and possible cursor
-                if cursor_line == 0 {
-                    self.create_wrapped_input_line_with_cursor(line, prompt_len, cursor_col_in_line)
-                } else {
-                    // First line without cursor - create input line without cursor
-                    self.create_wrapped_input_line_without_cursor(line, prompt_len)
-                }
-            } else {
-                // Continuation line
-                if line_idx == cursor_line {
-                    self.create_wrapped_input_line_with_cursor(line, 0, cursor_col_in_line)
-                } else {
-                    Line::from(Span::styled(line.clone(), Style::default()))
-                }
-            };
-
-            self.cached_lines.push(CachedLine {
-                content_hash: line_hash,
-                rendered_line: styled_line,
-                line_type: LineType::CurrentInput,
-                response_type: None,
-                original_content: line.clone(),
-            });
-        }
-    }
-
-    /// Create a wrapped input line with cursor
-    fn create_wrapped_input_line_with_cursor(
-        &self,
-        line: &str,
-        prompt_len: usize,
-        cursor_pos: usize,
-    ) -> Line<'static> {
-        let chars: Vec<char> = line.chars().collect();
-        let mut spans = Vec::new();
-
-        if prompt_len > 0 && prompt_len <= chars.len() {
-            // This line contains the prompt
-            let prompt_part: String = chars[..prompt_len].iter().collect();
-            spans.push(Span::styled(
-                prompt_part,
-                Style::default().fg(Color::Magenta),
-            ));
-
-            let text_part: String = chars[prompt_len..].iter().collect();
-            let cursor_in_text = cursor_pos.saturating_sub(prompt_len);
-
-            // Handle cursor in the text part
-            self.add_text_with_cursor(&mut spans, &text_part, cursor_in_text);
-        } else {
-            // This line doesn't contain the prompt
-            self.add_text_with_cursor(&mut spans, line, cursor_pos);
-        }
-
-        Line::from(spans)
-    }
-
-    /// Create a wrapped input line without cursor
-    fn create_wrapped_input_line_without_cursor(
-        &self,
-        line: &str,
-        prompt_len: usize,
-    ) -> Line<'static> {
-        let chars: Vec<char> = line.chars().collect();
-        let mut spans = Vec::new();
-
-        if prompt_len > 0 && prompt_len <= chars.len() {
-            // This line contains the prompt
-            let prompt_part: String = chars[..prompt_len].iter().collect();
-            spans.push(Span::styled(
-                prompt_part,
-                Style::default().fg(Color::Magenta),
-            ));
-
-            let text_part: String = chars[prompt_len..].iter().collect();
-            spans.push(Span::styled(text_part, Style::default()));
-        } else {
-            // This line doesn't contain the prompt
-            spans.push(Span::styled(line.to_string(), Style::default()));
-        }
-
-        Line::from(spans)
-    }
-
-    /// Add text with cursor to spans vector
-    fn add_text_with_cursor(&self, spans: &mut Vec<Span<'static>>, text: &str, cursor_pos: usize) {
-        let chars: Vec<char> = text.chars().collect();
-
-        if chars.is_empty() {
-            // Empty text, show space as block cursor
-            spans.push(Span::styled(
-                " ".to_string(),
-                crate::ui::themes::UIThemes::cursor_style(),
-            ));
-        } else if cursor_pos == 0 {
-            // Cursor at beginning - show first character as block cursor
-            let first_char = chars[0];
-            spans.push(Span::styled(
-                first_char.to_string(),
-                crate::ui::themes::UIThemes::cursor_style(),
-            ));
-            if chars.len() > 1 {
-                let remaining: String = chars[1..].iter().collect();
-                spans.push(Span::styled(remaining, Style::default()));
-            }
-        } else if cursor_pos >= chars.len() {
-            // Cursor at end
-            spans.push(Span::styled(text.to_string(), Style::default()));
-            spans.push(Span::styled(
-                " ".to_string(),
-                crate::ui::themes::UIThemes::cursor_style(),
-            ));
-        } else {
-            // Cursor in middle
-            let before_cursor: String = chars[..cursor_pos].iter().collect();
-            let at_cursor = chars[cursor_pos];
-            let after_cursor: String = chars[cursor_pos + 1..].iter().collect();
-
-            if !before_cursor.is_empty() {
-                spans.push(Span::styled(before_cursor, Style::default()));
-            }
-
-            spans.push(Span::styled(
-                at_cursor.to_string(),
-                crate::ui::themes::UIThemes::cursor_style(),
-            ));
-
-            if !after_cursor.is_empty() {
-                spans.push(Span::styled(after_cursor, Style::default()));
-            }
-        }
-    }
-
-    /// Render border with mode status
-    fn render_border(
-        &self,
-        f: &mut Frame,
-        area: Rect,
-        is_focused: bool,
-        state: &CommandPanelState,
-    ) {
-        let border_style = if !is_focused {
-            // No focus: white border
-            Style::default().fg(Color::White)
-        } else {
-            // Has focus: different colors based on state and mode
-            match state.input_state {
-                crate::model::panel_state::InputState::WaitingResponse { .. } => {
-                    // Waiting for response: yellow border
-                    Style::default().fg(Color::Yellow)
-                }
-                _ => match state.mode {
-                    crate::model::panel_state::InteractionMode::Input => {
-                        // Input mode: green border
-                        Style::default().fg(Color::Green)
-                    }
-                    crate::model::panel_state::InteractionMode::Command => {
-                        // Command mode: cyan border
-                        Style::default().fg(Color::Cyan)
-                    }
-                    crate::model::panel_state::InteractionMode::ScriptEditor => {
-                        Style::default().fg(Color::Green)
-                    }
-                },
-            }
-        };
-
-        let title = match state.input_state {
-            crate::model::panel_state::InputState::WaitingResponse { .. } => {
-                "Interactive Command (waiting for response...)".to_string()
-            }
-            _ => match state.mode {
-                crate::model::panel_state::InteractionMode::Input => {
-                    "Interactive Command (input mode)".to_string()
-                }
-                crate::model::panel_state::InteractionMode::Command => {
-                    "Interactive Command (command mode)".to_string()
-                }
-                crate::model::panel_state::InteractionMode::ScriptEditor => {
-                    "Interactive Command (script mode)".to_string()
-                }
-            },
-        };
-
-        let block = Block::default()
-            .title(title)
-            .borders(Borders::ALL)
-            .border_type(if is_focused {
-                BorderType::Thick
-            } else {
-                BorderType::Plain
-            })
-            .border_style(border_style);
-
-        f.render_widget(block, area);
-    }
-
-    /// Render content with viewport management
-    fn render_content(&self, f: &mut Frame, area: Rect, state: &CommandPanelState) {
-        let inner_area = Rect::new(
-            area.x + 1,
-            area.y + 1,
-            area.width.saturating_sub(2),
-            area.height.saturating_sub(2),
-        );
-
-        // Determine which lines to show (viewport)
-        let total_lines = self.cached_lines.len();
-        let visible_count = inner_area.height as usize;
-
-        // In command mode or history search mode, adjust viewport to show the cursor line
-        let (start_line, cursor_visible_line) = if matches!(
-            state.mode,
-            crate::model::panel_state::InteractionMode::Command
-        ) || state.is_in_history_search()
-        {
-            // Calculate viewport to keep cursor visible
-            let cursor_line = if state.is_in_history_search() {
-                // In history search mode, cursor should be on the last line (current input)
-                total_lines.saturating_sub(1)
-            } else {
-                state.command_cursor_line
-            };
-            let mut start = if total_lines > visible_count {
-                total_lines - visible_count
-            } else {
-                0
-            };
-
-            // Adjust start to make cursor visible
-            if cursor_line < start {
-                start = cursor_line;
-            } else if cursor_line >= start + visible_count {
-                start = cursor_line.saturating_sub(visible_count - 1);
-            }
-
-            (start, Some(cursor_line.saturating_sub(start)))
-        } else {
-            // Normal mode: show most recent lines (bottom-up)
-            let start = if total_lines > visible_count {
-                total_lines - visible_count
-            } else {
-                0
-            };
-            (start, None)
-        };
-
-        let mut visible_lines: Vec<Line> = self
-            .cached_lines
+    /// Wrap styled line preserving spans
+    fn wrap_styled_line(&self, styled_line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
+        let full_text: String = styled_line
+            .spans
             .iter()
-            .skip(start_line)
-            .take(visible_count)
-            .map(|cached| cached.rendered_line.clone())
+            .map(|span| span.content.as_ref())
             .collect();
 
-        // In command mode, show cursor at specific character position
-        if let Some(cursor_line_idx) = cursor_visible_line {
-            if cursor_line_idx < visible_lines.len() {
-                let original_line = &visible_lines[cursor_line_idx];
-                let cursor_col = state.command_cursor_column;
+        if full_text.len() <= width {
+            return vec![styled_line.clone()];
+        }
 
-                // Create new line with cursor character highlighted
-                let mut new_spans = Vec::new();
-                let mut current_pos = 0;
+        let mut result_lines = Vec::new();
+        let mut current_line_spans = Vec::new();
+        let mut current_line_length = 0;
 
-                for span in &original_line.spans {
-                    let span_len = span.content.chars().count();
-                    let span_end = current_pos + span_len;
+        for span in &styled_line.spans {
+            let span_text = span.content.as_ref();
+            let span_style = span.style;
 
-                    if cursor_col >= current_pos && cursor_col < span_end {
-                        // Cursor is within this span
-                        let chars: Vec<char> = span.content.chars().collect();
-                        let cursor_pos_in_span = cursor_col - current_pos;
+            if current_line_length + span_text.len() <= width {
+                current_line_spans.push(span.clone());
+                current_line_length += span_text.len();
+            } else {
+                let remaining_width = width - current_line_length;
 
-                        // Add text before cursor
-                        if cursor_pos_in_span > 0 {
-                            let before: String = chars[..cursor_pos_in_span].iter().collect();
-                            new_spans.push(ratatui::text::Span::styled(before, span.style));
-                        }
-
-                        // Add cursor character with inverted colors
-                        if cursor_pos_in_span < chars.len() {
-                            let cursor_char = chars[cursor_pos_in_span];
-                            new_spans.push(ratatui::text::Span::styled(
-                                cursor_char.to_string(),
-                                crate::ui::themes::UIThemes::cursor_style(),
-                            ));
-
-                            // Add text after cursor
-                            if cursor_pos_in_span + 1 < chars.len() {
-                                let after: String =
-                                    chars[cursor_pos_in_span + 1..].iter().collect();
-                                new_spans.push(ratatui::text::Span::styled(after, span.style));
-                            }
-                        } else {
-                            // Cursor at end of span, add space cursor
-                            new_spans.push(ratatui::text::Span::styled(
-                                " ".to_string(),
-                                crate::ui::themes::UIThemes::cursor_style(),
-                            ));
-                        }
-                    } else {
-                        // Cursor not in this span, keep original
-                        new_spans.push(span.clone());
+                if remaining_width > 0 {
+                    let (first_part, remaining_part) =
+                        span_text.split_at(remaining_width.min(span_text.len()));
+                    if !first_part.is_empty() {
+                        current_line_spans.push(Span::styled(first_part.to_string(), span_style));
                     }
 
-                    current_pos = span_end;
-                }
+                    if !current_line_spans.is_empty() {
+                        result_lines.push(Line::from(current_line_spans));
+                        current_line_spans = Vec::new();
+                        current_line_length = 0;
+                    }
 
-                // If cursor is beyond all text, add a space cursor at the end
-                if cursor_col >= current_pos {
-                    new_spans.push(ratatui::text::Span::styled(
-                        " ".to_string(),
-                        crate::ui::themes::UIThemes::cursor_style(),
-                    ));
-                }
+                    let mut remaining = remaining_part;
+                    while !remaining.is_empty() {
+                        let chunk_size = width.min(remaining.len());
+                        let (chunk, rest) = remaining.split_at(chunk_size);
+                        result_lines.push(Line::from(vec![Span::styled(
+                            chunk.to_string(),
+                            span_style,
+                        )]));
+                        remaining = rest;
+                    }
+                } else {
+                    if !current_line_spans.is_empty() {
+                        result_lines.push(Line::from(current_line_spans));
+                        current_line_spans = Vec::new();
+                        current_line_length = 0;
+                    }
 
-                visible_lines[cursor_line_idx] = Line::from(new_spans);
+                    let mut remaining = span_text;
+                    while !remaining.is_empty() {
+                        let chunk_size = width.min(remaining.len());
+                        let (chunk, rest) = remaining.split_at(chunk_size);
+                        result_lines.push(Line::from(vec![Span::styled(
+                            chunk.to_string(),
+                            span_style,
+                        )]));
+                        remaining = rest;
+                    }
+                }
             }
         }
 
-        let paragraph = Paragraph::new(visible_lines);
-        f.render_widget(paragraph, inner_area);
+        if !current_line_spans.is_empty() {
+            result_lines.push(Line::from(current_line_spans));
+        }
+
+        result_lines
     }
 
-    /// Update scroll offset for history browsing
+    /// Split response into lines
+    fn split_response_lines(&self, response: &str) -> Vec<String> {
+        response.lines().map(String::from).collect()
+    }
+
+    /// Scroll methods for API compatibility
     pub fn scroll_up(&mut self) {
         if self.scroll_offset > 0 {
             self.scroll_offset -= 1;
-            self.mark_pending_updates();
         }
     }
 
     pub fn scroll_down(&mut self) {
-        let max_scroll = self.cached_lines.len().saturating_sub(self.visible_lines);
-        if self.scroll_offset < max_scroll {
-            self.scroll_offset += 1;
-            self.mark_pending_updates();
-        }
+        self.scroll_offset += 1;
     }
 }
 

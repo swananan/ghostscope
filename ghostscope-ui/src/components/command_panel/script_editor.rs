@@ -531,7 +531,6 @@ impl ScriptEditor {
         Self::format_trace_success_response_with_script(target, details, None, emoji_config)
     }
 
-    /// Format trace success response with script content (方案1设计)
     pub fn format_trace_success_response_with_script(
         target: &str,
         details: Option<&TraceDetails>,
@@ -600,7 +599,6 @@ impl ScriptEditor {
         Self::format_trace_error_response_with_script(target, error, details, None, emoji_config)
     }
 
-    /// Format trace error response with script content (优化后的错误格式)
     pub fn format_trace_error_response_with_script(
         target: &str,
         error: &str,
