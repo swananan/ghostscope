@@ -23,8 +23,8 @@ pub struct TraceEventData {
     pub pid: u32,
     pub tid: u32,
     pub variables: Vec<VariableInfo>,
-    pub readable_timestamp: String,      // Human-readable timestamp
-    pub message_type: EventMessageType,  // Type of the event message
+    pub readable_timestamp: String,     // Human-readable timestamp
+    pub message_type: EventMessageType, // Type of the event message
     pub trace_instructions: Option<Vec<ParsedInstruction>>, // For new trace events
 }
 

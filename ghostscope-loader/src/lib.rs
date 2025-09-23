@@ -6,7 +6,7 @@ use aya::{
     },
     Ebpf, EbpfLoader, VerifierLogLevel,
 };
-use ghostscope_protocol::{TraceEventData, StreamingTraceParser, StringTable};
+use ghostscope_protocol::{StreamingTraceParser, StringTable, TraceEventData};
 use std::convert::TryInto;
 use std::os::unix::io::AsRawFd;
 use std::time::{SystemTime, UNIX_EPOCH};

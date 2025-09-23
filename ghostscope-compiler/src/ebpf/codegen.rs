@@ -5,7 +5,6 @@
 
 use super::context::{CodeGenError, EbpfContext, Result};
 use crate::script::{PrintStatement, Program, Statement};
-use ghostscope_dwarf::{DwarfType, ModuleAddress};
 use ghostscope_protocol::trace_event::{
     BacktraceData, InstructionHeader, PrintStringIndexData, PrintVariableErrorData,
     PrintVariableIndexData,
@@ -905,95 +904,37 @@ impl<'ctx> EbpfContext<'ctx> {
             var_name, type_encoding
         );
 
-        // Get current compile context
-        let compile_context = self.current_compile_time_context.as_ref().ok_or_else(|| {
-            CodeGenError::DwarfError(
-                "No compile-time context available for DWARF variable resolution".to_string(),
-            )
-        })?;
+        // Use the existing query_dwarf_for_variable function
+        match self.query_dwarf_for_variable(var_name)? {
+            Some(var_info) => {
+                info!(
+                    "Found DWARF variable: {} = {:?}",
+                    var_name, var_info.evaluation_result
+                );
 
-        // Get DWARF analyzer
-        let analyzer_ptr = self
-            .process_analyzer
-            .ok_or_else(|| CodeGenError::DwarfError("No DWARF analyzer available".to_string()))?;
+                // Require DWARF type information
+                let dwarf_type = var_info.dwarf_type.as_ref().ok_or_else(|| {
+                    CodeGenError::DwarfError(format!(
+                        "Variable '{}' has no type information in DWARF",
+                        var_name
+                    ))
+                })?;
 
-        // SAFETY: This is safe because the analyzer lifetime is managed by the calling code
-        // and the reference is only used during this compilation phase
-        let analyzer = unsafe { &mut *analyzer_ptr };
-
-        // Create module address for DWARF lookup
-        let module_address = ModuleAddress {
-            module_path: compile_context.module_path.clone().into(),
-            address: compile_context.pc_address,
-        };
-
-        // Query DWARF for variables at this address
-        match analyzer.get_all_variables_at_address(&module_address) {
-            Ok(variables) => {
-                // Find the requested variable
-                for var in variables {
-                    if var.name == var_name {
-                        info!(
-                            "Found DWARF variable: {} = {:?}",
-                            var_name, var.evaluation_result
-                        );
-                        // Use DWARF type if available, otherwise create a simple base type for conversion
-                        let default_type = DwarfType::BaseType {
-                            name: format!("{:?}", type_encoding),
-                            size: match type_encoding {
-                                TypeEncoding::U8
-                                | TypeEncoding::I8
-                                | TypeEncoding::Bool
-                                | TypeEncoding::Char => 1,
-                                TypeEncoding::U16 | TypeEncoding::I16 => 2,
-                                TypeEncoding::U32 | TypeEncoding::I32 | TypeEncoding::F32 => 4,
-                                TypeEncoding::U64
-                                | TypeEncoding::I64
-                                | TypeEncoding::F64
-                                | TypeEncoding::Pointer => 8,
-                                _ => 8,
-                            },
-                            encoding: ghostscope_dwarf::DwAte(match type_encoding {
-                                TypeEncoding::U8
-                                | TypeEncoding::U16
-                                | TypeEncoding::U32
-                                | TypeEncoding::U64 => 7, // DW_ATE_unsigned
-                                TypeEncoding::I8
-                                | TypeEncoding::I16
-                                | TypeEncoding::I32
-                                | TypeEncoding::I64 => 5, // DW_ATE_signed
-                                TypeEncoding::F32 | TypeEncoding::F64 => 4, // DW_ATE_float
-                                TypeEncoding::Bool => 2,                    // DW_ATE_boolean
-                                TypeEncoding::Char => 16,                   // DW_ATE_UTF
-                                TypeEncoding::Pointer => 1,                 // DW_ATE_address
-                                _ => 7, // DW_ATE_unsigned (default)
-                            }),
-                        };
-                        let dwarf_type = var.dwarf_type.as_ref().unwrap_or(&default_type);
-
-                        return self.evaluate_result_to_llvm_value(
-                            &var.evaluation_result,
-                            dwarf_type,
-                            var_name,
-                            compile_context.pc_address,
-                        );
-                    }
-                }
-
-                // Variable not found in DWARF - might be optimized out or not in scope
+                let compile_context = self.get_compile_time_context()?;
+                self.evaluate_result_to_llvm_value(
+                    &var_info.evaluation_result,
+                    dwarf_type,
+                    var_name,
+                    compile_context.pc_address,
+                )
+            }
+            None => {
+                let compile_context = self.get_compile_time_context()?;
                 warn!(
                     "Variable '{}' not found in DWARF at address 0x{:x}",
                     var_name, compile_context.pc_address
                 );
                 Err(CodeGenError::VariableNotFound(var_name.to_string()))
-            }
-            Err(e) => {
-                warn!("DWARF variable lookup failed: {}", e);
-                // Fall back to error placeholder for robustness
-                Err(CodeGenError::DwarfError(format!(
-                    "DWARF lookup failed: {}",
-                    e
-                )))
             }
         }
     }

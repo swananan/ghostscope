@@ -157,7 +157,9 @@ impl TraceInstance {
     }
 
     /// Wait for events asynchronously from this trace instance
-    pub async fn wait_for_events_async(&mut self) -> Result<Vec<ghostscope_protocol::TraceEventData>> {
+    pub async fn wait_for_events_async(
+        &mut self,
+    ) -> Result<Vec<ghostscope_protocol::TraceEventData>> {
         if !self.is_enabled {
             return Ok(Vec::new());
         }

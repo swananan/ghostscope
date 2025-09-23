@@ -4,7 +4,7 @@
 //! converting parsed trace events into TraceEventData for the UI to display.
 
 use ghostscope_protocol::{
-    TraceEventData, EventMessageType, ParsedTraceEvent, StreamingTraceParser, StringTable,
+    EventMessageType, ParsedTraceEvent, StreamingTraceParser, StringTable, TraceEventData,
 };
 use std::time::SystemTime;
 use tracing::debug;

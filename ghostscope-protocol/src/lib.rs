@@ -13,7 +13,7 @@ pub mod trace_event;
 
 pub use types::{consts, TypeEncoding};
 
-pub use event::{TraceEventData, EventMessageType, VariableInfo};
+pub use event::{EventMessageType, TraceEventData, VariableInfo};
 
 pub use trace_event::{
     EndInstructionData, InstructionHeader, InstructionType, PrintStringIndexData,
