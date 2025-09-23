@@ -88,9 +88,7 @@ async fn run_runtime_coordinator(
                 }
             }, if session.is_some() => {
                 if let Some(ref session) = session {
-                    // events is Vec<TraceEventData> from traces' loaders
                     for event_data in events {
-                        // Send TraceEventData directly to TUI (ignore errors if channel is closed)
                         let _ = trace_sender.send(event_data);
                     }
                 }

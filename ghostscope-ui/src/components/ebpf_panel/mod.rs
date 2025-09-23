@@ -1,3 +1,4 @@
+pub mod output;
 pub mod panel;
 pub mod renderer;
 

@@ -665,7 +665,6 @@ name = "ghostscope-loader"
 version = "0.1.0"
 dependencies = [
  "aya",
- "chrono",
  "ghostscope-compiler",
  "ghostscope-protocol",
  "thiserror 2.0.12",

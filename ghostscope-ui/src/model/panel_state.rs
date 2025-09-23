@@ -1,7 +1,14 @@
 use crate::action::ResponseType;
-use ghostscope_protocol::TraceEventData;
+use ghostscope_protocol::ParsedTraceEvent;
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
+
+/// Cached trace event with pre-formatted timestamp
+#[derive(Debug, Clone)]
+pub struct CachedTraceEvent {
+    pub event: ParsedTraceEvent,
+    pub formatted_timestamp: String,
+}
 
 /// Source panel state
 #[derive(Debug, Clone)]
@@ -85,14 +92,14 @@ impl SourcePanelState {
 /// eBPF panel state
 #[derive(Debug)]
 pub struct EbpfPanelState {
-    pub trace_events: VecDeque<TraceEventData>,
+    pub trace_events: VecDeque<CachedTraceEvent>,
     pub scroll_offset: usize,
     pub max_messages: usize,
     pub auto_scroll: bool,
     pub cursor_trace_index: usize, // Index of the selected trace (not line)
     pub show_cursor: bool,         // Whether to show cursor highlighting
     pub display_mode: DisplayMode, // Current display mode
-    pub next_message_number: u64,  // Next message number to assign
+    pub next_message_id: u64,      // Simple counter for message numbering
     // Numeric jump input for N+G
     pub numeric_prefix: Option<String>,
     pub g_pressed: bool, // whether first 'g' was pressed (for 'gg')
@@ -114,18 +121,21 @@ impl EbpfPanelState {
             cursor_trace_index: 0,
             show_cursor: false,
             display_mode: DisplayMode::AutoRefresh,
-            next_message_number: 1, // Start from 1
+            next_message_id: 1,
             numeric_prefix: None,
             g_pressed: false,
         }
     }
 
-    pub fn add_trace_event(&mut self, mut trace_event: TraceEventData) {
-        // Assign message number
-        trace_event.message_number = self.next_message_number;
-        self.next_message_number += 1;
+    pub fn add_trace_event(&mut self, trace_event: ParsedTraceEvent) {
+        // Format timestamp once when adding the event
+        let formatted_timestamp = crate::utils::format_timestamp_ns(trace_event.timestamp);
+        let cached_event = CachedTraceEvent {
+            event: trace_event,
+            formatted_timestamp,
+        };
 
-        self.trace_events.push_back(trace_event);
+        self.trace_events.push_back(cached_event);
         if self.trace_events.len() > self.max_messages {
             self.trace_events.pop_front();
         }
@@ -227,15 +237,16 @@ impl EbpfPanelState {
             self.cursor_trace_index = 0;
             return;
         }
-        let mut target_idx = None;
-        for (idx, ev) in self.trace_events.iter().enumerate() {
-            if ev.message_number >= message_number {
-                target_idx = Some(idx);
-                break;
-            }
+
+        // Message numbers are 1-based sequential (1, 2, 3, ...)
+        // Convert to 0-based index
+        if message_number == 0 {
+            self.cursor_trace_index = 0;
+            return;
         }
-        let idx = target_idx.unwrap_or_else(|| self.trace_events.len().saturating_sub(1));
-        self.cursor_trace_index = idx;
+
+        let target_index = (message_number - 1) as usize;
+        self.cursor_trace_index = target_index.min(self.trace_events.len().saturating_sub(1));
     }
 
     // Exit to auto-refresh (ESC)

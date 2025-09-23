@@ -4,7 +4,6 @@ pub mod components;
 pub mod events;
 pub mod handlers;
 pub mod model;
-pub mod streaming_parser_bridge;
 pub mod ui;
 pub mod utils;
 

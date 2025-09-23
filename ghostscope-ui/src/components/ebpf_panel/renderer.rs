@@ -70,123 +70,86 @@ impl EbpfPanelRenderer {
         let mut cards: Vec<Card> = Vec::new();
 
         let total_traces = state.trace_events.len();
-        for (trace_index, trace) in state.trace_events.iter().enumerate() {
+        for (trace_index, cached_trace) in state.trace_events.iter().enumerate() {
+            let trace = &cached_trace.event;
             let is_latest = trace_index == total_traces - 1;
-            let is_error = matches!(
-                trace.message_type,
-                ghostscope_protocol::EventMessageType::ExecutionFailure
-            );
+            // Check execution status from EndInstruction
+            let is_error = trace.instructions.last().map_or(false, |inst| {
+                if let ghostscope_protocol::ParsedInstruction::EndInstruction {
+                    execution_status,
+                    ..
+                } = inst
+                {
+                    *execution_status == 1 || *execution_status == 2
+                } else {
+                    false
+                }
+            });
 
             // Header: remove type tag per request
             // Header parts: only number should be bold -> split into two strings
             let header_no_bold = String::from("[No:");
-            let header_number = format!("{}", trace.message_number);
+            let message_id = (trace_index + 1) as u64; // Simple sequential numbering
+            let formatted_timestamp = &cached_trace.formatted_timestamp; // Use cached timestamp
+            let header_number = format!("{}", message_id);
             let header_rest = format!(
                 "] {} TraceID:{} PID:{} TID:{}",
-                trace.readable_timestamp, trace.trace_id, trace.pid, trace.tid
+                formatted_timestamp, trace.trace_id, trace.pid, trace.tid
             );
 
             let mut body_lines: Vec<Line> = Vec::new();
 
-            // Handle new trace event format with instructions
-            if matches!(
-                trace.message_type,
-                ghostscope_protocol::EventMessageType::TraceEvent
-            ) {
-                if let Some(ref instructions) = trace.trace_instructions {
-                    let indent = "  ";
-                    for instruction in instructions {
-                        let instruction_type = instruction.instruction_type();
+            // Handle trace event format with instructions
+            let instructions = &trace.instructions;
+            let indent = "  ";
+            for instruction in instructions {
+                let instruction_type = instruction.instruction_type();
 
-                        // Skip EndInstruction - don't display it
-                        if instruction_type == "EndInstruction" {
-                            continue;
-                        }
-
-                        // Get optimized display string based on instruction type
-                        let display_string = match instruction {
-                            ghostscope_protocol::ParsedInstruction::PrintString { content } => {
-                                // For print strings, show just the content
-                                content.clone()
-                            }
-                            _ => {
-                                // For variables and other instructions, use normal display
-                                instruction.to_display_string()
-                            }
-                        };
-
-                        // Choose color based on instruction type
-                        let color = match instruction_type.as_str() {
-                            "PrintString" => Color::Cyan,
-                            "PrintVariable" => Color::White,
-                            "PrintVariableError" => Color::Red,
-                            "Backtrace" => Color::Yellow,
-                            _ => Color::Gray,
-                        };
-
-                        // Wrap long instruction output
-                        let wrap_width = content_width.saturating_sub(indent.len());
-                        let wrapped_lines = Self::wrap_text(&display_string, wrap_width);
-
-                        for (i, seg) in wrapped_lines.into_iter().enumerate() {
-                            let line_indent = if i == 0 { indent } else { "    " }; // Extra indent for continuation
-                            body_lines.push(Line::from(vec![
-                                Span::raw(line_indent),
-                                Span::styled(
-                                    seg,
-                                    Style::default().fg(color).add_modifier(
-                                        if instruction_type == "PrintVariable" {
-                                            Modifier::BOLD
-                                        } else {
-                                            Modifier::empty()
-                                        },
-                                    ),
-                                ),
-                            ]));
-                        }
-                    }
+                // Skip EndInstruction - don't display it
+                if instruction_type == "EndInstruction" {
+                    continue;
                 }
-            } else {
-                // Legacy format: Variables as key-value pairs
-                if !trace.variables.is_empty() {
-                    let indent = "  ";
-                    for var in &trace.variables {
-                        let name = &var.name;
-                        let value = &var.formatted_value;
-                        let name_prefix = format!("{}{}: ", indent, name);
-                        let name_prefix_width = name_prefix.len();
-                        let wrap_width = content_width.saturating_sub(name_prefix_width);
-                        let wrapped_vals = Self::wrap_text(value, wrap_width);
-                        for (i, seg) in wrapped_vals.into_iter().enumerate() {
-                            if i == 0 {
-                                body_lines.push(Line::from(vec![
-                                    Span::styled(
-                                        name_prefix.clone(),
-                                        Style::default().fg(Color::DarkGray),
-                                    ),
-                                    Span::styled(
-                                        seg,
-                                        Style::default()
-                                            .fg(Color::White)
-                                            .add_modifier(Modifier::BOLD),
-                                    ),
-                                ]));
-                            } else {
-                                body_lines.push(Line::from(vec![
-                                    Span::styled(
-                                        " ".repeat(name_prefix_width),
-                                        Style::default().fg(Color::DarkGray),
-                                    ),
-                                    Span::styled(
-                                        seg,
-                                        Style::default()
-                                            .fg(Color::White)
-                                            .add_modifier(Modifier::BOLD),
-                                    ),
-                                ]));
-                            }
-                        }
+
+                // Get optimized display string based on instruction type
+                let display_string = match instruction {
+                    ghostscope_protocol::ParsedInstruction::PrintString { content } => {
+                        // For print strings, show just the content
+                        content.clone()
                     }
+                    _ => {
+                        // For variables and other instructions, use normal display
+                        instruction.to_display_string()
+                    }
+                };
+
+                // Choose color based on instruction type
+                let color = match instruction_type.as_str() {
+                    "PrintString" => Color::Cyan,
+                    "PrintVariable" => Color::White,
+                    "PrintVariableError" => Color::Red,
+                    "Backtrace" => Color::Yellow,
+                    _ => Color::Gray,
+                };
+
+                // Wrap long instruction output
+                let wrap_width = content_width.saturating_sub(indent.len());
+                let wrapped_lines = Self::wrap_text(&display_string, wrap_width);
+
+                for (i, seg) in wrapped_lines.into_iter().enumerate() {
+                    let line_indent = if i == 0 { indent } else { "    " }; // Extra indent for continuation
+                    body_lines.push(Line::from(vec![
+                        Span::raw(line_indent),
+                        Span::styled(
+                            seg,
+                            Style::default().fg(color).add_modifier(
+                                if instruction_type == "PrintVariable" {
+                                    Modifier::BOLD
+                                } else {
+                                    Modifier::empty()
+                                },
+                            ),
+                        ),
+                    ]));
                 }
             }
 

@@ -3,7 +3,6 @@
 //! Provides types and functionality for the GhostScope tracing protocol.
 
 // Core modules
-mod event;
 mod types;
 pub(crate) mod utils;
 
@@ -12,8 +11,6 @@ pub mod string_table;
 pub mod trace_event;
 
 pub use types::{consts, TypeEncoding};
-
-pub use event::{EventMessageType, TraceEventData, VariableInfo};
 
 pub use trace_event::{
     EndInstructionData, InstructionHeader, InstructionType, PrintStringIndexData,

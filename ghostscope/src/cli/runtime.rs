@@ -123,7 +123,7 @@ pub async fn run_command_line_runtime(parsed_args: ParsedArgs) -> Result<()> {
             events = session.trace_manager.wait_for_all_events_async() => {
                 for event in events {
                     event_count += 1;
-                    info!("[Event #{}] {}", event_count, event);
+                    info!("[Event #{}] {:?}", event_count, event);
                 }
             }
 

@@ -73,7 +73,7 @@ pub enum Action {
     // Runtime communication
     SendRuntimeCommand(RuntimeCommand),
     HandleRuntimeStatus(RuntimeStatus),
-    HandleTraceEvent(ghostscope_protocol::TraceEventData),
+    HandleTraceEvent(ghostscope_protocol::ParsedTraceEvent),
 
     // Source panel actions
     LoadSource {

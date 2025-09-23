@@ -2132,7 +2132,7 @@ impl App {
     }
 
     /// Handle trace events
-    async fn handle_trace_event(&mut self, trace_event: ghostscope_protocol::TraceEventData) {
+    async fn handle_trace_event(&mut self, trace_event: ghostscope_protocol::ParsedTraceEvent) {
         tracing::debug!("Trace event: {:?}", trace_event);
         self.state.ebpf_panel.add_trace_event(trace_event);
     }

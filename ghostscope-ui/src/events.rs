@@ -1,5 +1,5 @@
 use crossterm::event::{KeyEvent, MouseEvent};
-use ghostscope_protocol::TraceEventData;
+use ghostscope_protocol::ParsedTraceEvent;
 use tokio::sync::mpsc;
 use unicode_width::UnicodeWidthStr;
 
@@ -57,7 +57,7 @@ pub struct EventRegistry {
     pub command_sender: mpsc::UnboundedSender<RuntimeCommand>,
 
     // Runtime -> TUI communication
-    pub trace_receiver: mpsc::UnboundedReceiver<TraceEventData>,
+    pub trace_receiver: mpsc::UnboundedReceiver<ParsedTraceEvent>,
     pub status_receiver: mpsc::UnboundedReceiver<RuntimeStatus>,
 }
 
@@ -643,7 +643,7 @@ pub struct SharedLibraryInfo {
 impl EventRegistry {
     pub fn new() -> (Self, RuntimeChannels) {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
-        let (trace_tx, trace_rx) = mpsc::unbounded_channel::<TraceEventData>();
+        let (trace_tx, trace_rx) = mpsc::unbounded_channel::<ParsedTraceEvent>();
         let (status_tx, status_rx) = mpsc::unbounded_channel();
 
         let registry = EventRegistry {
@@ -666,7 +666,7 @@ impl EventRegistry {
 #[derive(Debug)]
 pub struct RuntimeChannels {
     pub command_receiver: mpsc::UnboundedReceiver<RuntimeCommand>,
-    pub trace_sender: mpsc::UnboundedSender<TraceEventData>,
+    pub trace_sender: mpsc::UnboundedSender<ParsedTraceEvent>,
     pub status_sender: mpsc::UnboundedSender<RuntimeStatus>,
 }
 
@@ -677,7 +677,7 @@ impl RuntimeChannels {
     }
 
     /// Create a trace sender that can be shared with other tasks
-    pub fn create_trace_sender(&self) -> mpsc::UnboundedSender<TraceEventData> {
+    pub fn create_trace_sender(&self) -> mpsc::UnboundedSender<ParsedTraceEvent> {
         self.trace_sender.clone()
     }
 }
