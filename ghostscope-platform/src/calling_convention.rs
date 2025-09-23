@@ -134,7 +134,7 @@ fn analyze_x86_64_prologue_instructions<R: CodeReader>(
 
     // Look for push %rbp (0x55)
     if let Some(bytes) = code_reader.read_code_bytes(pc, 1) {
-        if bytes.len() >= 1 && bytes[0] == 0x55 {
+        if !bytes.is_empty() && bytes[0] == 0x55 {
             debug!("Found push %%rbp at 0x{:x}", pc);
             pc += 1;
 
@@ -245,8 +245,7 @@ pub fn get_parameter_register_in_context<R: CodeReader>(
         } else {
             // Parameter index >= 6, likely optimized away
             Err(PlatformError::ParameterOptimized(format!(
-                "Parameter '{}' (index {}) likely optimized away (>6 parameters)",
-                param_name, param_index
+                "Parameter '{param_name}' (index {param_index}) likely optimized away (>6 parameters)"
             )))
         }
     } else {

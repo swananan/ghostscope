@@ -55,7 +55,6 @@ impl ModuleLoader {
         }
     }
 
-
     /// Set maximum concurrency for module loading
     pub fn max_concurrency(mut self, limit: usize) -> Self {
         self.config.max_module_concurrency = limit;
@@ -67,7 +66,6 @@ impl ModuleLoader {
         self.config = LoadConfig::fast();
         self
     }
-
 
     /// Load modules synchronously (blocking) - now always uses parallel loading
     pub fn load_sync(self) -> Result<Vec<ModuleData>> {
@@ -91,7 +89,8 @@ impl ModuleLoader {
     where
         F: Fn(ModuleLoadingEvent) + Send + Sync + 'static,
     {
-        self.load_modules_parallel_with_progress(progress_callback).await
+        self.load_modules_parallel_with_progress(progress_callback)
+            .await
     }
 
     /// Add progress callback (method chaining convenience)
@@ -104,7 +103,6 @@ impl ModuleLoader {
             callback: progress_callback,
         }
     }
-
 
     /// Load modules in parallel
     async fn load_modules_parallel(self) -> Result<Vec<ModuleData>> {
@@ -130,7 +128,6 @@ impl ModuleLoader {
         let results = futures::future::try_join_all(tasks).await?;
         results.into_iter().collect::<Result<Vec<_>>>()
     }
-
 
     /// Load modules in parallel with progress tracking
     async fn load_modules_parallel_with_progress<F>(
@@ -213,7 +210,6 @@ impl ModuleLoader {
         let modules: Result<Vec<_>> = results.into_iter().collect();
         modules
     }
-
 }
 
 /// ModuleLoader with attached progress callback (for method chaining)

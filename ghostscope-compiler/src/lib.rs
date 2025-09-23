@@ -1,9 +1,9 @@
 // New modular organization
 pub mod ebpf;
-pub mod script;
-// Legacy codegen - kept for reference, not compiled
-// pub mod codegen_legacy;
-// pub mod codegen_new;
+pub mod script; // New instruction generator
+                // Legacy codegen - kept for reference, not compiled
+                // pub mod codegen_legacy;
+                // pub mod codegen_new;
 
 use crate::script::compiler::AstCompiler;
 use ebpf::context::CodeGenError;

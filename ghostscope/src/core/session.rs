@@ -81,7 +81,6 @@ impl GhostSession {
         Ok(())
     }
 
-
     /// Load binary and perform DWARF analysis (backwards compatibility - now uses parallel)
     pub async fn load_binary(&mut self) -> Result<()> {
         self.load_binary_parallel().await

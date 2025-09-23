@@ -6,9 +6,10 @@ use aya::{
     },
     Ebpf, EbpfLoader, VerifierLogLevel,
 };
-use ghostscope_protocol::{EventData, EventParser};
+use ghostscope_protocol::{TraceEventData, StreamingTraceParser, StringTable};
 use std::convert::TryInto;
 use std::os::unix::io::AsRawFd;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::unix::AsyncFd;
 use tracing::{error, info, warn};
 
@@ -39,6 +40,10 @@ pub struct GhostScopeLoader {
     uprobe_link: Option<UProbeLinkId>,
     // Store attachment parameters for re-enabling
     attachment_params: Option<UprobeAttachmentParams>,
+    // Streaming parser for trace events
+    parser: StreamingTraceParser,
+    // String table for parsing trace events
+    string_table: Option<StringTable>,
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +86,8 @@ impl GhostScopeLoader {
                     ringbuf: None,
                     uprobe_link: None,
                     attachment_params: None,
+                    parser: StreamingTraceParser::new(),
+                    string_table: None,
                 })
             }
             Err(e) => {
@@ -522,7 +529,7 @@ impl GhostScopeLoader {
     }
 
     /// Wait for events asynchronously using AsyncFd
-    pub async fn wait_for_events_async(&mut self) -> Result<Vec<EventData>> {
+    pub async fn wait_for_events_async(&mut self) -> Result<Vec<TraceEventData>> {
         let ringbuf = self.ringbuf.as_mut().ok_or_else(|| {
             LoaderError::Generic("Ringbuf not initialized. Call attach_uprobe first.".to_string())
         })?;
@@ -537,15 +544,84 @@ impl GhostScopeLoader {
             .await
             .map_err(|e| LoaderError::Generic(format!("AsyncFd error: {}", e)))?;
 
-        // Read all available events
+        // Read all available events using streaming parser
         let mut events = Vec::new();
-        while let Some(item) = ringbuf.next() {
-            if let Some(event) = EventParser::parse_event(&item) {
-                events.push(event);
+
+        // Check if we have a string table for parsing
+        if let Some(string_table) = &self.string_table {
+            while let Some(item) = ringbuf.next() {
+                // Process segment with string table
+                match self.parser.process_segment(&item, string_table) {
+                    Ok(Some(parsed_event)) => {
+                        // Convert ParsedTraceEvent to TraceEventData
+                        if let Some(event) =
+                            Self::convert_parsed_trace_event_to_event_data(parsed_event)
+                        {
+                            events.push(event);
+                        }
+                    }
+                    Ok(None) => {
+                        // Segment processed but no complete event yet
+                    }
+                    Err(e) => {
+                        warn!("Failed to parse trace event segment: {}", e);
+                    }
+                }
             }
+        } else {
+            return Err(LoaderError::Generic(
+                "No string table available - cannot parse trace events".to_string(),
+            ));
         }
 
         Ok(events)
+    }
+
+    /// Set the string table for parsing trace events
+    pub fn set_string_table(&mut self, string_table: StringTable) {
+        info!("Setting string table for trace event parsing");
+        self.string_table = Some(string_table);
+    }
+
+    /// Convert ParsedTraceEvent to TraceEventData
+    fn convert_parsed_trace_event_to_event_data(
+        parsed_event: ghostscope_protocol::streaming_parser::ParsedTraceEvent,
+    ) -> Option<TraceEventData> {
+        use ghostscope_protocol::{EventMessageType, VariableInfo};
+
+        // Convert timestamp to readable format
+        let readable_timestamp = format_timestamp_ns(parsed_event.timestamp);
+
+        // Extract variables from instructions
+        let mut variables = Vec::new();
+        for instruction in &parsed_event.instructions {
+            if let ghostscope_protocol::streaming_parser::ParsedInstruction::PrintVariable {
+                name,
+                type_encoding,
+                formatted_value,
+                raw_data,
+            } = instruction
+            {
+                variables.push(VariableInfo {
+                    name: name.clone(),
+                    type_encoding: *type_encoding,
+                    raw_data: raw_data.clone(),
+                    formatted_value: formatted_value.clone(),
+                });
+            }
+        }
+
+        Some(TraceEventData {
+            message_number: 0, // Will be assigned by UI
+            trace_id: parsed_event.trace_id,
+            timestamp: parsed_event.timestamp,
+            pid: parsed_event.pid,
+            tid: parsed_event.tid,
+            variables,
+            readable_timestamp,
+            message_type: EventMessageType::TraceEvent,
+            trace_instructions: Some(parsed_event.instructions),
+        })
     }
 
     // Helper functions removed - now using protocol parser
@@ -558,11 +634,56 @@ impl GhostScopeLoader {
             .collect()
     }
 
-    /// Get information about loaded programs  
+    /// Get information about loaded programs
     pub fn get_program_info(&self) -> Vec<String> {
         self.bpf
             .programs()
             .map(|(name, _prog)| format!("Program: {}", name))
             .collect()
     }
+}
+
+/// Format eBPF timestamp (nanoseconds since boot) to human-readable format
+pub fn format_timestamp_ns(ns_timestamp: u64) -> String {
+    // Get current system time and boot time
+    let now = SystemTime::now();
+    let uptime = get_system_uptime_ns();
+
+    if let (Ok(now_since_epoch), Some(boot_ns)) = (now.duration_since(UNIX_EPOCH), uptime) {
+        // Calculate when the system booted
+        let boot_time_ns = now_since_epoch.as_nanos() as u64 - boot_ns;
+
+        // Add eBPF timestamp to boot time to get actual time
+        let actual_time_ns = boot_time_ns + ns_timestamp;
+        let actual_time_secs = actual_time_ns / 1_000_000_000;
+        let actual_time_nanos = actual_time_ns % 1_000_000_000;
+
+        // Convert to chrono DateTime with local timezone
+        if let Some(utc_datetime) =
+            chrono::DateTime::from_timestamp(actual_time_secs as i64, actual_time_nanos as u32)
+        {
+            let local_datetime: chrono::DateTime<chrono::Local> = utc_datetime.into();
+            return format!(
+                "{}.{:03}",
+                local_datetime.format("%Y-%m-%d %H:%M:%S"),
+                actual_time_nanos / 1_000_000
+            );
+        }
+    }
+
+    // Fallback to boot time offset if conversion fails
+    let ms = ns_timestamp / 1_000_000;
+    let seconds = ms / 1000;
+    let ms_remainder = ms % 1000;
+    format!("boot+{}.{:03}s", seconds, ms_remainder)
+}
+
+/// Get system uptime in nanoseconds
+fn get_system_uptime_ns() -> Option<u64> {
+    std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|content| {
+            let uptime_secs: f64 = content.split_whitespace().next()?.parse().ok()?;
+            Some((uptime_secs * 1_000_000_000.0) as u64)
+        })
 }

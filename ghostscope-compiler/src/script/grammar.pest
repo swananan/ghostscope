@@ -28,7 +28,13 @@ function_name = { identifier }
 file_path = @{ (ASCII_ALPHANUMERIC | "_" | "/" | "." | "-")+ }
 line_number = @{ ASCII_DIGIT+ }
 
-print_stmt = { "print" ~ expr ~ ";" }
+print_stmt = { "print" ~ print_content ~ ";" }
+print_content = {
+    string |           // print "hello world"
+    identifier |       // print variable_name
+    format_expr        // print "format {} {}" arg1, arg2 (future)
+}
+format_expr = { string ~ expr ~ ("," ~ expr)* }
 backtrace_stmt = { ("backtrace" | "bt") ~ ";" }
 expr_stmt = { expr ~ ";" }
 var_decl_stmt = { "let" ~ identifier ~ "=" ~ expr ~ ";" }

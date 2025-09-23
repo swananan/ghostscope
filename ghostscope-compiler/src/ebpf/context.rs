@@ -3,7 +3,7 @@
 //! This module provides the main code generation context and basic LLVM
 //! infrastructure for eBPF program generation.
 
-use super::{debug_logger::DebugLogger, maps::MapManager};
+use super::maps::MapManager;
 use crate::script::{VarType, VariableContext};
 use aya_ebpf_bindings::bindings::bpf_func_id::BPF_FUNC_get_current_pid_tgid;
 use ghostscope_dwarf::DwarfAnalyzer;
@@ -74,7 +74,6 @@ pub struct EbpfContext<'ctx> {
     // Debug infrastructure
     pub di_builder: DebugInfoBuilder<'ctx>,
     pub compile_unit: inkwell::debug_info::DICompileUnit<'ctx>,
-    pub debug_logger: DebugLogger<'ctx>,
 
     // Register cache for pt_regs access
     pub register_cache: HashMap<u16, IntValue<'ctx>>,
@@ -88,6 +87,9 @@ pub struct EbpfContext<'ctx> {
     pub process_analyzer: Option<*mut DwarfAnalyzer>,   // Multi-module DWARF analyzer
     pub current_trace_id: Option<u32>,                  // Current trace_id being compiled
     pub current_compile_time_context: Option<CompileTimeContext>, // PC address and module for DWARF queries
+
+    // === New instruction-based compilation system ===
+    pub string_table: ghostscope_protocol::StringTable, // String table for optimized transmission
 }
 
 // Temporary alias for backward compatibility during refactoring
@@ -147,7 +149,6 @@ impl<'ctx> EbpfContext<'ctx> {
         );
 
         let map_manager = MapManager::new(context);
-        let debug_logger = DebugLogger::new(context);
 
         // Declare eBPF helper functions
         let trace_printk_fn = Self::declare_trace_printk(context, &module);
@@ -160,7 +161,6 @@ impl<'ctx> EbpfContext<'ctx> {
             map_manager,
             di_builder,
             compile_unit,
-            debug_logger,
             register_cache: HashMap::new(),
 
             // Initialize variable management system
@@ -172,6 +172,9 @@ impl<'ctx> EbpfContext<'ctx> {
             process_analyzer: None,
             current_trace_id: trace_id,
             current_compile_time_context: None,
+
+            // Initialize new instruction-based compilation system
+            string_table: ghostscope_protocol::StringTable::new(),
         })
     }
 
@@ -243,6 +246,11 @@ impl<'ctx> EbpfContext<'ctx> {
         &self.module
     }
 
+    /// Get the string table after compilation
+    pub fn get_string_table(&self) -> ghostscope_protocol::StringTable {
+        self.string_table.clone()
+    }
+
     /// Get pt_regs parameter from current function
     pub fn get_pt_regs_parameter(&self) -> Result<PointerValue<'ctx>> {
         let current_function = self
@@ -269,7 +277,7 @@ impl<'ctx> EbpfContext<'ctx> {
         target_pid: Option<u32>,
         compile_time_pc: Option<u64>,
         module_path: Option<&str>,
-    ) -> Result<FunctionValue<'ctx>> {
+    ) -> Result<(FunctionValue<'ctx>, ghostscope_protocol::StringTable)> {
         info!(
             "Starting program compilation with function: {}",
             function_name
@@ -308,10 +316,21 @@ impl<'ctx> EbpfContext<'ctx> {
             self.add_pid_filter(pid)?;
         }
 
-        // Compile all statements
-        for statement in trace_statements {
-            self.compile_statement(statement)?;
-        }
+        // Use new staged transmission system for all statements
+        let program = crate::script::ast::Program {
+            statements: trace_statements.to_vec(),
+        };
+
+        // Collect variable types from DWARF analysis
+        let variable_types = std::collections::HashMap::new(); // Empty for now, will be populated by codegen
+
+        // Generate staged transmission code using new architecture
+        let string_table =
+            self.compile_program_with_staged_transmission(&program, variable_types)?;
+        info!(
+            "Generated StringTable with {} strings",
+            string_table.string_count()
+        );
 
         // Return success
         let i32_type = self.context.i32_type();
@@ -321,10 +340,10 @@ impl<'ctx> EbpfContext<'ctx> {
             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
 
         info!(
-            "Successfully compiled program with function: {}",
+            "Successfully compiled program with function: {} and StringTable",
             function_name
         );
-        Ok(main_function)
+        Ok((main_function, string_table))
     }
 
     /// Create the main eBPF function
@@ -345,142 +364,6 @@ impl<'ctx> EbpfContext<'ctx> {
 
         info!("Created main function: {}", function_name);
         Ok(function)
-    }
-
-    /// Compile a single statement
-    fn compile_statement(&mut self, statement: &crate::script::Statement) -> Result<()> {
-        match statement {
-            crate::script::Statement::Print(expr) => self.compile_print(expr),
-            crate::script::Statement::Backtrace => {
-                // For now, generate a simple trace_printk for backtrace
-                self.generate_backtrace()
-            }
-            crate::script::Statement::Expr(expr) => {
-                self.compile_expr(expr)?;
-                Ok(())
-            }
-            crate::script::Statement::VarDeclaration { name, value } => {
-                let value_expr = self.compile_expr(value)?;
-                self.store_variable(name, value_expr)
-            }
-            crate::script::Statement::TracePoint { pattern: _, body } => {
-                // TracePoint should be handled at a higher level
-                warn!("TracePoint statement found during compilation - should be handled at higher level");
-                for stmt in body {
-                    self.compile_statement(stmt)?;
-                }
-                Ok(())
-            }
-            crate::script::Statement::If {
-                condition,
-                then_body,
-                else_body,
-            } => self.compile_if_statement(condition, then_body, else_body),
-            crate::script::Statement::Block(statements) => {
-                for stmt in statements {
-                    self.compile_statement(stmt)?;
-                }
-                Ok(())
-            }
-        }
-    }
-
-    /// Compile if statement with optional else clause
-    fn compile_if_statement(
-        &mut self,
-        condition: &crate::script::Expr,
-        then_body: &[crate::script::Statement],
-        else_body: &Option<Box<crate::script::Statement>>,
-    ) -> Result<()> {
-        // Get current function to create basic blocks
-        let current_function = self.get_current_function()?;
-
-        // Create basic blocks for if-else structure
-        let then_block = self.context.append_basic_block(current_function, "if.then");
-        let else_block = self.context.append_basic_block(current_function, "if.else");
-        let merge_block = self.context.append_basic_block(current_function, "if.end");
-
-        // Compile condition expression
-        let condition_val = self.compile_expr(condition)?;
-        let condition_bool = self.convert_to_bool(condition_val)?;
-
-        // Generate conditional branch
-        self.builder
-            .build_conditional_branch(condition_bool, then_block, else_block)
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-        // Compile then branch
-        self.builder.position_at_end(then_block);
-        for stmt in then_body {
-            self.compile_statement(stmt)?;
-        }
-        // Jump to merge block after then branch
-        self.builder
-            .build_unconditional_branch(merge_block)
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-        // Compile else branch
-        self.builder.position_at_end(else_block);
-        if let Some(else_stmt) = else_body {
-            self.compile_statement(else_stmt)?;
-        }
-        // Jump to merge block after else branch
-        self.builder
-            .build_unconditional_branch(merge_block)
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-        // Position at merge block for subsequent code
-        self.builder.position_at_end(merge_block);
-
-        Ok(())
-    }
-
-    /// Convert a value to boolean for conditional branches
-    fn convert_to_bool(
-        &mut self,
-        value: BasicValueEnum<'ctx>,
-    ) -> Result<inkwell::values::IntValue<'ctx>> {
-        match value {
-            BasicValueEnum::IntValue(int_val) => {
-                if int_val.get_type().get_bit_width() == 1 {
-                    // Already a boolean (i1)
-                    Ok(int_val)
-                } else {
-                    // Convert integer to boolean by comparing with 0
-                    let zero = self.context.i64_type().const_int(0, false);
-                    let is_non_zero = self
-                        .builder
-                        .build_int_compare(inkwell::IntPredicate::NE, int_val, zero, "is_non_zero")
-                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-                    Ok(is_non_zero)
-                }
-            }
-            BasicValueEnum::FloatValue(float_val) => {
-                // Convert float to boolean by comparing with 0.0
-                let zero = self.context.f64_type().const_float(0.0);
-                let is_non_zero = self
-                    .builder
-                    .build_float_compare(
-                        inkwell::FloatPredicate::ONE, // Ordered and not equal
-                        float_val,
-                        zero,
-                        "is_non_zero",
-                    )
-                    .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-                Ok(is_non_zero)
-            }
-            _ => Err(CodeGenError::TypeError(
-                "Cannot convert value to boolean".to_string(),
-            )),
-        }
-    }
-
-    /// Get the current function being compiled
-    fn get_current_function(&mut self) -> Result<FunctionValue<'ctx>> {
-        self.builder
-            .get_insert_block()
-            .and_then(|block| block.get_parent())
-            .ok_or_else(|| CodeGenError::LLVMError("No current function found".to_string()))
     }
 
     /// Add PID filtering logic to the current function

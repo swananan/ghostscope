@@ -3,7 +3,9 @@ use pest::Parser;
 use pest::RuleType;
 use pest_derive::Parser;
 
-use crate::script::ast::{infer_type, BinaryOp, Expr, Program, Statement, TracePattern};
+use crate::script::ast::{
+    infer_type, BinaryOp, Expr, PrintStatement, Program, Statement, TracePattern,
+};
 use tracing::{debug, warn};
 
 #[derive(Parser)]
@@ -100,15 +102,9 @@ fn parse_statement(pair: Pair<Rule>) -> Result<Statement> {
             Ok(Statement::TracePoint { pattern, body })
         }
         Rule::print_stmt => {
-            let expr = inner.into_inner().next().unwrap();
-            let parsed_expr = parse_expr(expr)?;
-
-            // Check expression type to ensure consistent operation types
-            if let Err(err) = infer_type(&parsed_expr) {
-                return Err(ParseError::TypeError(err));
-            }
-
-            Ok(Statement::Print(parsed_expr))
+            let print_content = inner.into_inner().next().unwrap();
+            let print_stmt = parse_print_content(print_content)?;
+            Ok(Statement::Print(print_stmt))
         }
         Rule::backtrace_stmt => Ok(Statement::Backtrace),
         Rule::expr_stmt => {
@@ -446,6 +442,57 @@ fn parse_trace_pattern(pair: Pair<Rule>) -> Result<TracePattern> {
             Ok(TracePattern::SourceLine {
                 file_path,
                 line_number,
+            })
+        }
+        _ => Err(ParseError::UnexpectedToken(inner.as_rule())),
+    }
+}
+
+fn parse_print_content(pair: Pair<Rule>) -> Result<PrintStatement> {
+    debug!(
+        "parse_print_content: {:?} = \"{}\"",
+        pair.as_rule(),
+        pair.as_str().trim()
+    );
+
+    let inner = pair.into_inner().next().unwrap();
+    debug!(
+        "parse_print_content inner: {:?} = \"{}\"",
+        inner.as_rule(),
+        inner.as_str().trim()
+    );
+
+    match inner.as_rule() {
+        Rule::string => {
+            // Extract string content (remove quotes)
+            let content = inner.as_str();
+            let content = &content[1..content.len() - 1]; // Remove surrounding quotes
+            Ok(PrintStatement::String(content.to_string()))
+        }
+        Rule::identifier => {
+            // Variable name
+            let var_name = inner.as_str().to_string();
+            Ok(PrintStatement::Variable(var_name))
+        }
+        Rule::format_expr => {
+            // Format string with arguments (future implementation)
+            let mut inner_pairs = inner.into_inner();
+            let format_string = inner_pairs.next().unwrap();
+
+            // Extract format string content (remove quotes)
+            let format_content = format_string.as_str();
+            let format_content = &format_content[1..format_content.len() - 1];
+
+            // Parse arguments
+            let mut args = Vec::new();
+            for arg_pair in inner_pairs {
+                let arg_expr = parse_expr(arg_pair)?;
+                args.push(arg_expr);
+            }
+
+            Ok(PrintStatement::Formatted {
+                format: format_content.to_string(),
+                args,
             })
         }
         _ => Err(ParseError::UnexpectedToken(inner.as_rule())),

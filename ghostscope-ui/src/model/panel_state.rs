@@ -1,5 +1,5 @@
 use crate::action::ResponseType;
-use ghostscope_protocol::EventData;
+use ghostscope_protocol::TraceEventData;
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
@@ -85,7 +85,7 @@ impl SourcePanelState {
 /// eBPF panel state
 #[derive(Debug)]
 pub struct EbpfPanelState {
-    pub trace_events: VecDeque<EventData>,
+    pub trace_events: VecDeque<TraceEventData>,
     pub scroll_offset: usize,
     pub max_messages: usize,
     pub auto_scroll: bool,
@@ -120,7 +120,7 @@ impl EbpfPanelState {
         }
     }
 
-    pub fn add_trace_event(&mut self, mut trace_event: EventData) {
+    pub fn add_trace_event(&mut self, mut trace_event: TraceEventData) {
         // Assign message number
         trace_event.message_number = self.next_message_number;
         self.next_message_number += 1;

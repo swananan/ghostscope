@@ -14,7 +14,9 @@ use tracing::warn;
 #[command(version = "0.1.0")]
 #[command(about = "DWARF debug information analysis tool with multiple analysis modes")]
 #[command(author = "swananan")]
-#[command(after_help = "SUBCOMMANDS:\n  source-line (s)   Analyze variables at specific source file:line location\n  function (f)      Find function addresses and analyze variables at those addresses\n  module-addr (m)   Analyze variables at specific module:address location\n  modules (ls)      List all loaded modules\n  benchmark         Performance benchmarking")]
+#[command(
+    after_help = "SUBCOMMANDS:\n  source-line (s)   Analyze variables at specific source file:line location\n  function (f)      Find function addresses and analyze variables at those addresses\n  module-addr (m)   Analyze variables at specific module:address location\n  modules (ls)      List all loaded modules\n  benchmark         Performance benchmarking"
+)]
 struct Cli {
     /// Process ID to analyze
     #[arg(short, long)]
@@ -311,10 +313,7 @@ fn init_logging(command: &Commands) {
 async fn load_analyzer_and_execute(cli: Cli) -> Result<std::time::Duration> {
     if !cli.command.quiet() {
         if cli.pid.is_some() {
-            println!(
-                "Loading modules from PID {}...",
-                cli.pid.unwrap()
-            );
+            println!("Loading modules from PID {}...", cli.pid.unwrap());
         } else if let Some(ref target) = cli.target {
             println!("Loading target file {}...", target);
         }

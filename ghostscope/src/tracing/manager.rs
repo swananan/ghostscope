@@ -221,7 +221,7 @@ impl TraceManager {
     }
 
     /// Wait for events from all active traces
-    pub async fn wait_for_all_events_async(&mut self) -> Vec<ghostscope_protocol::EventData> {
+    pub async fn wait_for_all_events_async(&mut self) -> Vec<ghostscope_protocol::TraceEventData> {
         let active_trace_ids = self.get_active_trace_ids();
 
         if active_trace_ids.is_empty() {

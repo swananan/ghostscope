@@ -70,16 +70,11 @@ pub(crate) struct ModuleData {
 }
 
 impl ModuleData {
-
     /// Parallel loading: debug_info || debug_line || CFI simultaneously
     pub(crate) async fn load_parallel(module_mapping: ModuleMapping) -> Result<Self> {
-        tracing::info!(
-            "Parallel loading for: {}",
-            module_mapping.path.display()
-        );
+        tracing::info!("Parallel loading for: {}", module_mapping.path.display());
         Self::load_internal_parallel(module_mapping).await
     }
-
 
     /// Parallel internal load implementation - true parallelism for debug_info || debug_line || CFI
     async fn load_internal_parallel(module_mapping: ModuleMapping) -> Result<Self> {

@@ -19,6 +19,14 @@ async fn create_and_attach_loader(
     let mut loader = GhostScopeLoader::new(&config.ebpf_bytecode)
         .context("Failed to create eBPF loader for uprobe config")?;
 
+    // Set the StringTable for trace event parsing
+    info!(
+        "Setting StringTable for loader: {} strings, {} variables",
+        config.string_table.string_count(),
+        config.string_table.variable_count()
+    );
+    loader.set_string_table(config.string_table.clone());
+
     if let Some(uprobe_offset) = config.uprobe_offset {
         if let Some(ref function_name) = config.function_name {
             // Function-based attachment with calculated offset

@@ -15,12 +15,12 @@ impl std::fmt::Display for PlatformError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PlatformError::PrologueAnalysisFailed(msg) => {
-                write!(f, "Prologue analysis failed: {}", msg)
+                write!(f, "Prologue analysis failed: {msg}")
             }
-            PlatformError::ParameterOptimized(msg) => write!(f, "Parameter optimized: {}", msg),
-            PlatformError::EvaluationFailed(msg) => write!(f, "Evaluation failed: {}", msg),
+            PlatformError::ParameterOptimized(msg) => write!(f, "Parameter optimized: {msg}"),
+            PlatformError::EvaluationFailed(msg) => write!(f, "Evaluation failed: {msg}"),
             PlatformError::UnsupportedArchitecture(msg) => {
-                write!(f, "Unsupported architecture: {}", msg)
+                write!(f, "Unsupported architecture: {msg}")
             }
         }
     }

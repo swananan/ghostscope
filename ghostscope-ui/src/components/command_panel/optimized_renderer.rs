@@ -323,16 +323,25 @@ impl OptimizedRenderer {
                             ));
                         } else {
                             lines.push(Line::from(vec![
-                                Span::styled(line_number.clone(), Style::default().fg(Color::DarkGray)),
-                                Span::styled(wrapped_content.clone(), Style::default().fg(Color::White)),
+                                Span::styled(
+                                    line_number.clone(),
+                                    Style::default().fg(Color::DarkGray),
+                                ),
+                                Span::styled(
+                                    wrapped_content.clone(),
+                                    Style::default().fg(Color::White),
+                                ),
                             ]));
                         }
                     } else {
                         // Continuation lines use spaces for alignment
                         let continuation_prefix = " ".repeat(line_number_width);
-                        if is_cursor_line && script_cache.cursor_col >= wrapped_content.chars().count() {
+                        if is_cursor_line
+                            && script_cache.cursor_col >= wrapped_content.chars().count()
+                        {
                             // Cursor might be on this continuation line
-                            let cursor_in_continuation = script_cache.cursor_col - wrapped_content.chars().count();
+                            let cursor_in_continuation =
+                                script_cache.cursor_col - wrapped_content.chars().count();
                             lines.push(self.create_script_line_with_cursor(
                                 &continuation_prefix,
                                 wrapped_content,
@@ -340,8 +349,14 @@ impl OptimizedRenderer {
                             ));
                         } else {
                             lines.push(Line::from(vec![
-                                Span::styled(continuation_prefix, Style::default().fg(Color::DarkGray)),
-                                Span::styled(wrapped_content.clone(), Style::default().fg(Color::White)),
+                                Span::styled(
+                                    continuation_prefix,
+                                    Style::default().fg(Color::DarkGray),
+                                ),
+                                Span::styled(
+                                    wrapped_content.clone(),
+                                    Style::default().fg(Color::White),
+                                ),
                             ]));
                         }
                     }

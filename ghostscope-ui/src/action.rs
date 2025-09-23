@@ -1,5 +1,3 @@
-use std::time::Instant;
-
 /// Central Action enum for TEA architecture
 /// All possible actions/messages that can modify application state
 #[derive(Debug, Clone)]
@@ -75,7 +73,7 @@ pub enum Action {
     // Runtime communication
     SendRuntimeCommand(RuntimeCommand),
     HandleRuntimeStatus(RuntimeStatus),
-    HandleTraceEvent(ghostscope_protocol::EventData),
+    HandleTraceEvent(ghostscope_protocol::TraceEventData),
 
     // Source panel actions
     LoadSource {

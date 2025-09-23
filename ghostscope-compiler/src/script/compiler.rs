@@ -45,6 +45,9 @@ pub struct UProbeConfig {
 
     /// Trace ID assigned by compiler (starts from starting_trace_id and increments)
     pub assigned_trace_id: u32,
+
+    /// String table containing all strings and variable names used in this uprobe
+    pub string_table: ghostscope_protocol::StringTable,
 }
 
 /// Compilation result containing all uprobe configurations
@@ -429,7 +432,7 @@ impl<'a> AstCompiler<'a> {
         );
 
         // Use full AST compilation
-        let _main_function = codegen_new
+        let (_main_function, string_table) = codegen_new
             .compile_program(
                 &crate::script::ast::Program { statements: vec![] }, // Empty program - statements passed separately
                 &ebpf_function_name,
@@ -440,11 +443,20 @@ impl<'a> AstCompiler<'a> {
             )
             .map_err(|e| CompileError::LLVM(format!("Failed to compile AST program: {}", e)))?;
 
+        info!(
+            "Generated StringTable for '{}' with {} strings and {} variables",
+            ebpf_function_name,
+            string_table.string_count(),
+            string_table.variable_count()
+        );
+
         let module = codegen_new.get_module();
 
         // Generate eBPF bytecode from LLVM module
         let ebpf_bytecode =
             self.generate_ebpf_bytecode(module, &ebpf_function_name, target, assigned_trace_id)?;
+
+        // Use the StringTable returned from compile_program (no need to get it again)
 
         Ok(UProbeConfig {
             trace_pattern: target.pattern.clone(),
@@ -456,6 +468,7 @@ impl<'a> AstCompiler<'a> {
             ebpf_bytecode,
             ebpf_function_name,
             assigned_trace_id,
+            string_table,
         })
     }
 

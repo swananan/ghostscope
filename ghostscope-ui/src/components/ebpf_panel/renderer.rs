@@ -87,110 +87,105 @@ impl EbpfPanelRenderer {
             );
 
             let mut body_lines: Vec<Line> = Vec::new();
-            // Variables: show as key-value pairs, no "vars:" label; values bold
-            if !trace.variables.is_empty() {
-                let indent = "  ";
-                for var in &trace.variables {
-                    let name = &var.name;
-                    let value = &var.formatted_value;
-                    let name_prefix = format!("{}{}: ", indent, name);
-                    let name_prefix_width = name_prefix.len();
-                    let wrap_width = content_width.saturating_sub(name_prefix_width);
-                    let wrapped_vals = Self::wrap_text(value, wrap_width);
-                    for (i, seg) in wrapped_vals.into_iter().enumerate() {
-                        if i == 0 {
+
+            // Handle new trace event format with instructions
+            if matches!(
+                trace.message_type,
+                ghostscope_protocol::EventMessageType::TraceEvent
+            ) {
+                if let Some(ref instructions) = trace.trace_instructions {
+                    let indent = "  ";
+                    for instruction in instructions {
+                        let instruction_type = instruction.instruction_type();
+
+                        // Skip EndInstruction - don't display it
+                        if instruction_type == "EndInstruction" {
+                            continue;
+                        }
+
+                        // Get optimized display string based on instruction type
+                        let display_string = match instruction {
+                            ghostscope_protocol::ParsedInstruction::PrintString { content } => {
+                                // For print strings, show just the content
+                                content.clone()
+                            }
+                            _ => {
+                                // For variables and other instructions, use normal display
+                                instruction.to_display_string()
+                            }
+                        };
+
+                        // Choose color based on instruction type
+                        let color = match instruction_type.as_str() {
+                            "PrintString" => Color::Cyan,
+                            "PrintVariable" => Color::White,
+                            "PrintVariableError" => Color::Red,
+                            "Backtrace" => Color::Yellow,
+                            _ => Color::Gray,
+                        };
+
+                        // Wrap long instruction output
+                        let wrap_width = content_width.saturating_sub(indent.len());
+                        let wrapped_lines = Self::wrap_text(&display_string, wrap_width);
+
+                        for (i, seg) in wrapped_lines.into_iter().enumerate() {
+                            let line_indent = if i == 0 { indent } else { "    " }; // Extra indent for continuation
                             body_lines.push(Line::from(vec![
-                                Span::styled(
-                                    name_prefix.clone(),
-                                    Style::default().fg(Color::DarkGray),
-                                ),
+                                Span::raw(line_indent),
                                 Span::styled(
                                     seg,
-                                    Style::default()
-                                        .fg(Color::White)
-                                        .add_modifier(Modifier::BOLD),
-                                ),
-                            ]));
-                        } else {
-                            body_lines.push(Line::from(vec![
-                                Span::styled(
-                                    " ".repeat(name_prefix_width),
-                                    Style::default().fg(Color::DarkGray),
-                                ),
-                                Span::styled(
-                                    seg,
-                                    Style::default()
-                                        .fg(Color::White)
-                                        .add_modifier(Modifier::BOLD),
+                                    Style::default().fg(color).add_modifier(
+                                        if instruction_type == "PrintVariable" {
+                                            Modifier::BOLD
+                                        } else {
+                                            Modifier::empty()
+                                        },
+                                    ),
                                 ),
                             ]));
                         }
                     }
                 }
-            }
-            // Log
-            if let Some(log_msg) = &trace.log_message {
-                let prefix = "log: ";
-                let wrapped =
-                    Self::wrap_text(log_msg, content_width.saturating_sub(2 + prefix.len()));
-                for (i, seg) in wrapped.into_iter().enumerate() {
+            } else {
+                // Legacy format: Variables as key-value pairs
+                if !trace.variables.is_empty() {
                     let indent = "  ";
-                    if i == 0 {
-                        body_lines.push(Line::from(vec![
-                            Span::raw(indent),
-                            Span::styled(prefix, Style::default().fg(Color::DarkGray)),
-                            Span::styled(
-                                seg,
-                                Style::default()
-                                    .fg(Color::Cyan)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                        ]));
-                    } else {
-                        body_lines.push(Line::from(vec![
-                            Span::raw(indent),
-                            Span::styled(
-                                " ".repeat(prefix.len()),
-                                Style::default().fg(Color::DarkGray),
-                            ),
-                            Span::styled(
-                                seg,
-                                Style::default()
-                                    .fg(Color::Cyan)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                        ]));
-                    }
-                }
-            }
-            // Failure
-            if let Some(failure_msg) = &trace.failure_message {
-                let prefix = "failure: ";
-                let wrapped =
-                    Self::wrap_text(failure_msg, content_width.saturating_sub(2 + prefix.len()));
-                for (i, seg) in wrapped.into_iter().enumerate() {
-                    let indent = "  ";
-                    if i == 0 {
-                        body_lines.push(Line::from(vec![
-                            Span::raw(indent),
-                            Span::styled(prefix, Style::default().fg(Color::DarkGray)),
-                            Span::styled(
-                                seg,
-                                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                            ),
-                        ]));
-                    } else {
-                        body_lines.push(Line::from(vec![
-                            Span::raw(indent),
-                            Span::styled(
-                                " ".repeat(prefix.len()),
-                                Style::default().fg(Color::DarkGray),
-                            ),
-                            Span::styled(
-                                seg,
-                                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                            ),
-                        ]));
+                    for var in &trace.variables {
+                        let name = &var.name;
+                        let value = &var.formatted_value;
+                        let name_prefix = format!("{}{}: ", indent, name);
+                        let name_prefix_width = name_prefix.len();
+                        let wrap_width = content_width.saturating_sub(name_prefix_width);
+                        let wrapped_vals = Self::wrap_text(value, wrap_width);
+                        for (i, seg) in wrapped_vals.into_iter().enumerate() {
+                            if i == 0 {
+                                body_lines.push(Line::from(vec![
+                                    Span::styled(
+                                        name_prefix.clone(),
+                                        Style::default().fg(Color::DarkGray),
+                                    ),
+                                    Span::styled(
+                                        seg,
+                                        Style::default()
+                                            .fg(Color::White)
+                                            .add_modifier(Modifier::BOLD),
+                                    ),
+                                ]));
+                            } else {
+                                body_lines.push(Line::from(vec![
+                                    Span::styled(
+                                        " ".repeat(name_prefix_width),
+                                        Style::default().fg(Color::DarkGray),
+                                    ),
+                                    Span::styled(
+                                        seg,
+                                        Style::default()
+                                            .fg(Color::White)
+                                            .add_modifier(Modifier::BOLD),
+                                    ),
+                                ]));
+                            }
+                        }
                     }
                 }
             }

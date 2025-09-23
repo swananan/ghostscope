@@ -691,6 +691,7 @@ dependencies = [
  "ghostscope-platform",
  "gimli 0.32.2",
  "serde",
+ "serde_json",
  "tracing",
 ]
 

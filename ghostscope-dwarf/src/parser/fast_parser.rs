@@ -183,7 +183,6 @@ impl<'a> DwarfParser<'a> {
         Self { dwarf }
     }
 
-
     /// Process single compilation unit - decoupled debug_line and debug_info processing
     /// (Architecture ready for parallelization, currently sequential for simplicity)
     fn process_compilation_unit(
@@ -469,8 +468,7 @@ impl<'a> DwarfParser<'a> {
         line_program: &gimli::IncompleteLineProgram<EndianSlice<'static, LittleEndian>>,
     ) -> Result<CompilationUnit> {
         // Get compilation unit name
-        let cu_name =
-            Self::extract_cu_name(dwarf, unit).unwrap_or_else(|| "unknown".to_string());
+        let cu_name = Self::extract_cu_name(dwarf, unit).unwrap_or_else(|| "unknown".to_string());
 
         debug!("Extracting files from compilation unit: {}", cu_name);
 

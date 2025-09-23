@@ -42,7 +42,7 @@ pub enum VarType {
 
 #[derive(Debug, Clone)]
 pub enum Statement {
-    Print(Expr),
+    Print(PrintStatement), // Updated to use new PrintStatement
     Backtrace,
     Expr(Expr),
     VarDeclaration {
@@ -59,6 +59,17 @@ pub enum Statement {
         else_body: Option<Box<Statement>>,
     },
     Block(Vec<Statement>),
+}
+
+/// Print statement variants for new instruction system
+#[derive(Debug, Clone)]
+pub enum PrintStatement {
+    /// print "hello world"
+    String(String),
+    /// print variable_name
+    Variable(String),
+    /// print "format {} {}" arg1, arg2 (future)
+    Formatted { format: String, args: Vec<Expr> },
 }
 
 #[derive(Debug, Clone)]
