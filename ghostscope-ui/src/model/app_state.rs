@@ -76,7 +76,7 @@ impl AppState {
             loading_ui: LoadingUI::new(),
             source_panel: SourcePanelState::new(),
             ebpf_panel: EbpfPanelState::new(),
-            command_panel: CommandPanelState::new(),
+            command_panel: CommandPanelState::new_with_config(&ui_config.history),
             command_renderer: OptimizedRenderer::new(),
             command_input_handler: OptimizedInputHandler::new(),
             ebpf_panel_handler: EbpfPanelHandler::new(),

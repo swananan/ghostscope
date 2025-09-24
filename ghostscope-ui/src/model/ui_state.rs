@@ -6,12 +6,31 @@ pub enum LayoutMode {
     Vertical,
 }
 
+/// Command history configuration
+#[derive(Debug, Clone)]
+pub struct HistoryConfig {
+    /// Enable/disable command history file functionality
+    pub enabled: bool,
+    /// Maximum number of history entries to keep
+    pub max_entries: usize,
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_entries: 5000,
+        }
+    }
+}
+
 /// UI configuration passed from the main crate
 #[derive(Debug, Clone)]
 pub struct UiConfig {
     pub layout_mode: LayoutMode,
     pub panel_ratios: [u16; 3], // [Source, EbpfInfo, InteractiveCommand]
     pub default_focus: crate::action::PanelType,
+    pub history: HistoryConfig,
 }
 
 /// UI-specific state management
@@ -37,6 +56,7 @@ impl UIState {
             layout_mode,
             panel_ratios: [4, 3, 3], // Default ratios
             default_focus: crate::action::PanelType::InteractiveCommand,
+            history: HistoryConfig::default(),
         })
     }
 }

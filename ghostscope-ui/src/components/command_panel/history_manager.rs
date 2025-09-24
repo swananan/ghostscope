@@ -26,17 +26,28 @@ pub struct AutoSuggestionState {
 
 impl CommandHistory {
     pub fn new() -> Self {
-        let file_path = std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(".ghostscope_history");
+        Self::new_with_config(&crate::model::ui_state::HistoryConfig::default())
+    }
+
+    pub fn new_with_config(config: &crate::model::ui_state::HistoryConfig) -> Self {
+        let file_path = if config.enabled {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(".ghostscope_history")
+        } else {
+            // Use empty path when disabled - won't save to file
+            PathBuf::new()
+        };
 
         let mut history = Self {
             entries: Vec::new(),
             file_path,
-            max_entries: 1000,
+            max_entries: config.max_entries,
         };
 
-        history.load_from_file();
+        if config.enabled {
+            history.load_from_file();
+        }
         history
     }
 
@@ -52,6 +63,11 @@ impl CommandHistory {
     }
 
     pub fn save_to_file(&self) {
+        // Don't save if path is empty (history disabled)
+        if self.file_path.as_os_str().is_empty() {
+            return;
+        }
+
         if let Ok(mut file) = OpenOptions::new()
             .create(true)
             .write(true)

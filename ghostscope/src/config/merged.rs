@@ -28,6 +28,8 @@ pub struct MergedConfig {
     pub layout_mode: LayoutMode,
     pub default_focus: crate::config::PanelType,
     pub panel_ratios: [u16; 3],
+    pub history_enabled: bool,
+    pub history_max_entries: usize,
 
     // DWARF configuration
     pub dwarf_search_paths: Vec<String>,
@@ -122,6 +124,8 @@ impl MergedConfig {
             layout_mode: args.layout_mode, // Command line takes priority
             default_focus: config.ui.default_focus, // UI config from file
             panel_ratios: config.ui.panel_ratios,   // UI config from file
+            history_enabled: config.ui.history.enabled,
+            history_max_entries: config.ui.history.max_entries,
             dwarf_search_paths: config.dwarf.search_paths,
         }
     }
@@ -155,6 +159,10 @@ impl MergedConfig {
                 crate::config::PanelType::Source => ghostscope_ui::PanelType::Source,
                 crate::config::PanelType::EbpfInfo => ghostscope_ui::PanelType::EbpfInfo,
                 crate::config::PanelType::InteractiveCommand => ghostscope_ui::PanelType::InteractiveCommand,
+            },
+            history: ghostscope_ui::HistoryConfig {
+                enabled: self.history_enabled,
+                max_entries: self.history_max_entries,
             },
         }
     }

@@ -431,6 +431,10 @@ pub enum LineType {
 
 impl CommandPanelState {
     pub fn new() -> Self {
+        Self::new_with_config(&crate::model::ui_state::HistoryConfig::default())
+    }
+
+    pub fn new_with_config(history_config: &crate::model::ui_state::HistoryConfig) -> Self {
         Self {
             input_text: String::new(),
             cursor_position: 0,
@@ -452,10 +456,10 @@ impl CommandPanelState {
             styled_at_history_index: None,
             jk_escape_state: JkEscapeState::None,
             jk_timer: None,
-            max_history_items: 1000,
+            max_history_items: history_config.max_entries,
 
             // New history management
-            command_history_manager: crate::components::command_panel::CommandHistory::new(),
+            command_history_manager: crate::components::command_panel::CommandHistory::new_with_config(history_config),
             history_search: crate::components::command_panel::HistorySearchState::new(),
             auto_suggestion: crate::components::command_panel::AutoSuggestionState::new(),
         }

@@ -142,6 +142,19 @@ pub struct UiConfigToml {
     /// Panel size ratios [Source, EbpfInfo, InteractiveCommand]
     #[serde(default = "default_panel_ratios")]
     pub panel_ratios: [u16; 3],
+    /// Command history configuration
+    #[serde(default)]
+    pub history: HistoryConfigToml,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HistoryConfigToml {
+    /// Enable/disable command history file functionality
+    #[serde(default = "default_history_enabled")]
+    pub enabled: bool,
+    /// Maximum number of history entries to keep
+    #[serde(default = "default_history_max_entries")]
+    pub max_entries: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -197,6 +210,14 @@ fn default_panel_ratios() -> [u16; 3] {
     [4, 3, 3] // Source, EbpfInfo, InteractiveCommand
 }
 
+fn default_history_enabled() -> bool {
+    true
+}
+
+fn default_history_max_entries() -> usize {
+    5000
+}
+
 // Default implementations for each config section
 impl Default for GeneralConfig {
     fn default() -> Self {
@@ -233,6 +254,16 @@ impl Default for UiConfigToml {
             layout: default_layout(),
             default_focus: PanelType::default(),
             panel_ratios: default_panel_ratios(),
+            history: HistoryConfigToml::default(),
+        }
+    }
+}
+
+impl Default for HistoryConfigToml {
+    fn default() -> Self {
+        Self {
+            enabled: default_history_enabled(),
+            max_entries: default_history_max_entries(),
         }
     }
 }

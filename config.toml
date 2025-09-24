@@ -75,3 +75,13 @@ default_focus = "InteractiveCommand"
 # Must be an array of 3 positive numbers
 # Default: [4, 3, 3]
 panel_ratios = [3, 3, 3]
+
+# Command history configuration
+[ui.history]
+# Enable/disable command history file functionality
+# Default: true
+enabled = true
+
+# Maximum number of history entries to keep in .ghostscope_history file
+# Default: 5000
+max_entries = 5000

@@ -46,6 +46,7 @@ pub async fn run_tui_coordinator(parsed_args: ParsedArgs) -> Result<()> {
         },
         default_focus: ghostscope_ui::PanelType::InteractiveCommand, // Default
         panel_ratios: [4, 3, 3], // Default
+        history: ghostscope_ui::HistoryConfig::default(),
     };
 
     run_tui_coordinator_with_ui_config(parsed_args, ui_config).await
