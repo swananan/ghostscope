@@ -1,4 +1,4 @@
-use crate::action::{Action, CursorDirection, ResponseType};
+use crate::action::{Action, CursorDirection};
 use crate::model::panel_state::{CommandPanelState, InputState, InteractionMode, JkEscapeState};
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::crossterm::event::KeyEvent;

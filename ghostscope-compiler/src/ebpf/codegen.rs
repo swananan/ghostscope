@@ -275,7 +275,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     let var_name_index = self.string_table.add_variable_name(&var_name);
 
                     variable_infos.push(FormatVariableInfo {
-                        var_name: var_name,
+                        var_name,
                         var_name_index,
                         type_encoding: TypeEncoding::CString,
                         data_size: s.len() + 1, // +1 for null terminator
@@ -290,7 +290,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     let var_name_index = self.string_table.add_variable_name(&var_name);
 
                     variable_infos.push(FormatVariableInfo {
-                        var_name: var_name,
+                        var_name,
                         var_name_index,
                         type_encoding: TypeEncoding::I64,
                         data_size: 8,
@@ -314,7 +314,6 @@ impl<'ctx> EbpfContext<'ctx> {
 
     /// Get the size in bytes for a given type encoding
     fn get_type_size(&self, type_encoding: TypeEncoding) -> usize {
-        use ghostscope_protocol::consts;
         match type_encoding {
             TypeEncoding::U8 | TypeEncoding::I8 | TypeEncoding::Bool | TypeEncoding::Char => 1,
             TypeEncoding::U16 | TypeEncoding::I16 => 2,

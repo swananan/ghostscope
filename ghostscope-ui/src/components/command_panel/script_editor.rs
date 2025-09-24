@@ -2,8 +2,6 @@ use crate::action::{Action, ResponseType};
 use crate::model::panel_state::{CommandPanelState, InteractionMode, ScriptCache, ScriptStatus};
 use crate::ui::emoji::{EmojiConfig, ScriptStatus as EmojiScriptStatus, TraceElement};
 use crate::ui::strings::UIStrings;
-use std::collections::HashMap;
-use unicode_width::UnicodeWidthStr;
 
 /// Detailed information for successful trace operations
 #[derive(Debug, Clone)]
@@ -75,9 +73,9 @@ impl ScriptEditor {
         state.mode = InteractionMode::ScriptEditor;
 
         let message = if restored_from_cache {
-            format!("📝 Script editor opened for '{}' (restored from cache)\nPress Ctrl+S to submit, ESC to cancel, F3 to clear", target)
+            format!("📝 Script editor opened for '{target}' (restored from cache)\nPress Ctrl+S to submit, ESC to cancel, F3 to clear")
         } else {
-            format!("📝 Script editor opened for '{}'\nPress Ctrl+S to submit, ESC to cancel, F3 to clear", target)
+            format!("📝 Script editor opened for '{target}'\nPress Ctrl+S to submit, ESC to cancel, F3 to clear")
         };
 
         vec![Action::AddResponse {
@@ -119,7 +117,7 @@ impl ScriptEditor {
             while cache
                 .lines
                 .last()
-                .map_or(false, |line| line.trim().is_empty())
+                .is_some_and(|line| line.trim().is_empty())
             {
                 cache.lines.pop();
             }
@@ -134,9 +132,9 @@ impl ScriptEditor {
             let wrapped_script = if script_content.trim().is_empty() {
                 "{}".to_string()
             } else {
-                format!("{{{}}}", script_content)
+                format!("{{{script_content}}}")
             };
-            let full_script = format!("trace {} {}", cache.target, wrapped_script);
+            let full_script = format!("trace {target} {wrapped_script}", target = cache.target);
 
             // Save script to cache with cursor position
             cache.saved_scripts.insert(
@@ -453,7 +451,7 @@ impl ScriptEditor {
         state
             .script_cache
             .as_ref()
-            .map_or(false, |cache| cache.status == ScriptStatus::Submitted)
+            .is_some_and(|cache| cache.status == ScriptStatus::Submitted)
     }
 
     /// Re-enter script editing mode for last submitted script
@@ -472,11 +470,6 @@ impl ScriptEditor {
         Vec::new()
     }
 
-    /// Format script for display with enhanced information
-    fn format_script_display(target: &str, lines: &[String]) -> String {
-        Self::format_script_display_with_config(target, lines, &EmojiConfig::default())
-    }
-
     /// Format script for display with emoji configuration
     pub fn format_script_display_with_config(
         target: &str,
@@ -487,7 +480,6 @@ impl ScriptEditor {
 
         // Header with target info
         let target_emoji = emoji_config.get_trace_element(TraceElement::Target);
-        let script_emoji = emoji_config.get_trace_element(TraceElement::Line);
 
         result.push(format!(
             "{} {} {}",
@@ -508,7 +500,7 @@ impl ScriptEditor {
                 if line.trim().is_empty() {
                     result.push(format!("{:3} │", line_idx + 1));
                 } else {
-                    result.push(format!("{:3} │ {}", line_idx + 1, line));
+                    result.push(format!("{:3} │ {line}", line_idx + 1));
                 }
             }
         }
@@ -517,7 +509,7 @@ impl ScriptEditor {
 
         // Footer with compilation status
         let compile_emoji = emoji_config.get_script_status(EmojiScriptStatus::Compiling);
-        result.push(format!("{} Compiling and loading script...", compile_emoji));
+        result.push(format!("{compile_emoji} Compiling and loading script..."));
 
         result.join("\n")
     }
@@ -547,7 +539,7 @@ impl ScriptEditor {
 
         // 🎯 Target line
         let target_emoji = emoji_config.get_trace_element(crate::ui::emoji::TraceElement::Target);
-        result.push(format!("{} Target: {}", target_emoji, target));
+        result.push(format!("{target_emoji} Target: {target}"));
 
         // Empty line for separation
         result.push("".to_string());
@@ -557,33 +549,27 @@ impl ScriptEditor {
 
         if let Some(details) = details {
             let address_display = if let Some(address) = details.address {
-                format!("(0x{:x})", address)
+                format!("(0x{address:x})")
             } else {
                 "".to_string()
             };
 
             result.push(format!(
-                "{} Trace Results: 1 successful, 0 failed",
-                success_emoji
+                "{success_emoji} Trace Results: 1 successful, 0 failed"
             ));
 
             if let Some(trace_id) = details.trace_id {
                 result.push(format!(
-                    "  • {} {} → trace_id: {}",
-                    target, address_display, trace_id
+                    "  • {target} {address_display} → trace_id: {trace_id}"
                 ));
             } else {
-                result.push(format!(
-                    "  • {} {} → trace attached",
-                    target, address_display
-                ));
+                result.push(format!("  • {target} {address_display} → trace attached"));
             }
         } else {
             result.push(format!(
-                "{} Trace Results: 1 successful, 0 failed",
-                success_emoji
+                "{success_emoji} Trace Results: 1 successful, 0 failed"
             ));
-            result.push(format!("  • {} → trace attached", target));
+            result.push(format!("  • {target} → trace attached"));
         }
 
         result.join("\n")
@@ -602,7 +588,7 @@ impl ScriptEditor {
     pub fn format_trace_error_response_with_script(
         target: &str,
         error: &str,
-        details: Option<&TraceErrorDetails>,
+        _details: Option<&TraceErrorDetails>,
         script_content: Option<&str>,
         emoji_config: &EmojiConfig,
     ) -> String {
@@ -616,7 +602,7 @@ impl ScriptEditor {
 
         // 🎯 Target line
         let target_emoji = emoji_config.get_trace_element(crate::ui::emoji::TraceElement::Target);
-        result.push(format!("{} Target: {}", target_emoji, target));
+        result.push(format!("{target_emoji} Target: {target}"));
 
         // Empty line for separation
         result.push("".to_string());
@@ -624,8 +610,7 @@ impl ScriptEditor {
         // ❌ Error summary
         let error_emoji = emoji_config.get_script_status(crate::ui::emoji::ScriptStatus::Error);
         result.push(format!(
-            "{} Trace Results: 0 successful, 1 failed",
-            error_emoji
+            "{error_emoji} Trace Results: 0 successful, 1 failed"
         ));
 
         // Simplified error message (remove redundant prefixes)
@@ -650,7 +635,7 @@ impl ScriptEditor {
             error.to_string()
         };
 
-        result.push(format!("  • {} → {}", target, clean_error));
+        result.push(format!("  • {target} → {clean_error}"));
 
         result.join("\n")
     }
@@ -661,17 +646,17 @@ impl ScriptEditor {
         let script_emoji = emoji_config.get_trace_element(crate::ui::emoji::TraceElement::Line);
 
         if script.trim().is_empty() {
-            result.push(format!("{} Script: {{}}", script_emoji));
+            result.push(format!("{script_emoji} Script: {{}}"));
         } else {
             let script_lines: Vec<&str> = script.lines().collect();
             if script_lines.len() == 1 {
                 // Single line - compact format
-                result.push(format!("{} Script: {}", script_emoji, script.trim()));
+                result.push(format!("{script_emoji} Script: {}", script.trim()));
             } else {
                 // Multi-line - use block format with line numbers (similar to script mode)
-                result.push(format!("{} Script:", script_emoji));
+                result.push(format!("{script_emoji} Script:"));
                 for (idx, line) in script_lines.iter().enumerate() {
-                    result.push(format!("  {:2} │ {}", idx + 1, line));
+                    result.push(format!("  {:2} │ {line}", idx + 1));
                 }
             }
         }

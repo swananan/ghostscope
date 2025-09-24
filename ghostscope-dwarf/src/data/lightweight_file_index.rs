@@ -152,16 +152,6 @@ impl LightweightFileIndex {
         )
     }
 
-    /// Get statistics
-    pub fn get_stats(&self) -> (usize, usize) {
-        (self.total_files, self.directories.len())
-    }
-
-    /// Check if index is empty
-    pub fn is_empty(&self) -> bool {
-        self.file_entries.is_empty()
-    }
-
     /// Get all file entries (for iteration)
     pub fn file_entries(&self) -> &[LightweightFileEntry] {
         &self.file_entries
@@ -225,7 +215,7 @@ impl ScopedFileIndexManager {
 
         // Debug: list all files in this CU
         tracing::debug!("  Available files in CU '{}':", compilation_unit);
-        for (i, entry) in file_index_ref.file_entries().iter().enumerate() {
+        for (_i, entry) in file_index_ref.file_entries().iter().enumerate() {
             tracing::debug!(
                 "    file_index={}, filename='{}', dir_index={}",
                 entry.file_index,
@@ -273,13 +263,6 @@ impl ScopedFileIndexManager {
             .get(compilation_unit)
             .map(|arc| arc.as_ref())
     }
-
-    /// Iterate over all compilation units and their file indices
-    pub fn iter_all_cu_files(&self) -> impl Iterator<Item = (&str, &LightweightFileIndex)> {
-        self.cu_file_indices
-            .iter()
-            .map(|(cu_name, file_index)| (cu_name.as_ref(), file_index.as_ref()))
-    }
 }
 
 impl Default for ScopedFileIndexManager {
@@ -291,6 +274,7 @@ impl Default for ScopedFileIndexManager {
 /// Compatibility layer: FileInfo struct to maintain API compatibility
 /// This will eventually be phased out in favor of direct LightweightFileEntry usage
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub(crate) struct FileInfo {
     pub file_index: u64,
     pub compilation_unit: String,

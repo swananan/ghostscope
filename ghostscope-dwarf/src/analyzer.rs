@@ -6,7 +6,7 @@ use crate::{
     proc_mapping::{ModuleMapping, ProcMappingParser},
 };
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Events emitted during module loading process
 #[derive(Debug, Clone)]
@@ -309,7 +309,7 @@ impl DwarfAnalyzer {
     /// Get all source files (cross-module)
     pub(crate) fn get_all_source_files(&self) -> Vec<(PathBuf, Vec<crate::parser::SourceFile>)> {
         let mut results = Vec::new();
-        for (module_path, _module_data) in &self.modules {
+        for module_path in self.modules.keys() {
             if let Some(module) = self.get_module(module_path) {
                 let files = module.get_all_files();
                 if !files.is_empty() {
@@ -386,7 +386,7 @@ impl DwarfAnalyzer {
     /// Get main executable module information
     pub fn get_main_executable(&self) -> Option<MainExecutableInfo> {
         // Find the main executable module (usually the first non-library module)
-        for (module_path, _module_data) in &self.modules {
+        for module_path in self.modules.keys() {
             if self.is_main_executable_module(module_path) {
                 return Some(MainExecutableInfo {
                     path: module_path.to_string_lossy().to_string(),
@@ -397,7 +397,7 @@ impl DwarfAnalyzer {
     }
 
     /// Check if a module is the main executable (not a shared library)
-    fn is_main_executable_module(&self, module_path: &PathBuf) -> bool {
+    fn is_main_executable_module(&self, module_path: &Path) -> bool {
         // Heuristic: main executable usually doesn't have .so extension and contains the process name
         let filename = module_path
             .file_name()
@@ -415,7 +415,7 @@ impl DwarfAnalyzer {
     pub fn list_functions(&self) -> Vec<String> {
         let mut all_functions = Vec::new();
 
-        for (_module_path, module_data) in &self.modules {
+        for module_data in self.modules.values() {
             let function_names = module_data.get_function_names();
             for name in function_names {
                 all_functions.push(name.clone());
@@ -492,7 +492,7 @@ impl DwarfAnalyzer {
     }
 
     /// Check if a module is a shared library
-    fn is_shared_library(&self, module_path: &PathBuf) -> bool {
+    fn is_shared_library(&self, module_path: &Path) -> bool {
         let filename = module_path
             .file_name()
             .and_then(|name| name.to_str())

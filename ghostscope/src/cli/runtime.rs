@@ -13,7 +13,7 @@ pub async fn run_command_line_runtime_with_config(config: MergedConfig) -> Resul
     // Step 2: Initialize debug session and DWARF information processing
     info!("Initializing debug session and DWARF information processing...");
 
-    let mut session = GhostSession::new_with_binary_and_config(&config)
+    let session = GhostSession::new_with_binary_and_config(&config)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create debug session: {}", e))?;
 

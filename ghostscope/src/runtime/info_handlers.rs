@@ -1,7 +1,7 @@
 use crate::core::GhostSession;
 use ghostscope_dwarf::ModuleAddress;
 use ghostscope_ui::{events::*, RuntimeChannels, RuntimeStatus};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 /// Handle InfoTrace command
 pub async fn handle_info_trace(

@@ -123,7 +123,7 @@ impl MergedConfig {
             should_save_ast,
             layout_mode: args.layout_mode, // Command line takes priority
             default_focus: config.ui.default_focus, // UI config from file
-            panel_ratios: config.ui.panel_ratios,   // UI config from file
+            panel_ratios: config.ui.panel_ratios, // UI config from file
             history_enabled: config.ui.history.enabled,
             history_max_entries: config.ui.history.max_entries,
             dwarf_search_paths: config.dwarf.search_paths,
@@ -158,7 +158,9 @@ impl MergedConfig {
             default_focus: match self.default_focus {
                 crate::config::PanelType::Source => ghostscope_ui::PanelType::Source,
                 crate::config::PanelType::EbpfInfo => ghostscope_ui::PanelType::EbpfInfo,
-                crate::config::PanelType::InteractiveCommand => ghostscope_ui::PanelType::InteractiveCommand,
+                crate::config::PanelType::InteractiveCommand => {
+                    ghostscope_ui::PanelType::InteractiveCommand
+                }
             },
             history: ghostscope_ui::HistoryConfig {
                 enabled: self.history_enabled,

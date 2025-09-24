@@ -2,8 +2,10 @@ use crate::config::{MergedConfig, ParsedArgs};
 use crate::core::GhostSession;
 use crate::runtime::{dwarf_loader, info_handlers, source_handlers, trace_handlers};
 use anyhow::Result;
-use ghostscope_ui::{run_tui_mode, run_tui_mode_with_config, EventRegistry, RuntimeChannels, RuntimeCommand, RuntimeStatus};
-use tracing::{error, info, warn};
+use ghostscope_ui::{
+    run_tui_mode_with_config, EventRegistry, RuntimeChannels, RuntimeCommand, RuntimeStatus,
+};
+use tracing::{error, info};
 
 /// Run GhostScope in TUI mode with merged configuration
 pub async fn run_tui_coordinator_with_config(config: MergedConfig) -> Result<()> {
@@ -45,7 +47,7 @@ pub async fn run_tui_coordinator(parsed_args: ParsedArgs) -> Result<()> {
             crate::config::LayoutMode::Vertical => ghostscope_ui::LayoutMode::Vertical,
         },
         default_focus: ghostscope_ui::PanelType::InteractiveCommand, // Default
-        panel_ratios: [4, 3, 3], // Default
+        panel_ratios: [4, 3, 3],                                     // Default
         history: ghostscope_ui::HistoryConfig::default(),
     };
 
@@ -131,7 +133,7 @@ async fn run_runtime_coordinator(
                     Vec::new()
                 }
             }, if session.is_some() => {
-                if let Some(ref session) = session {
+                if let Some(ref _session) = session {
                     for event_data in events {
                         let _ = trace_sender.send(event_data);
                     }

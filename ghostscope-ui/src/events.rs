@@ -11,16 +11,17 @@ pub enum TraceStatus {
     Failed,
 }
 
-impl TraceStatus {
-    /// Convert to display string
-    pub fn to_string(&self) -> String {
+impl std::fmt::Display for TraceStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TraceStatus::Active => "Active".to_string(),
-            TraceStatus::Disabled => "Disabled".to_string(),
-            TraceStatus::Failed => "Failed".to_string(),
+            TraceStatus::Active => write!(f, "Active"),
+            TraceStatus::Disabled => write!(f, "Disabled"),
+            TraceStatus::Failed => write!(f, "Failed"),
         }
     }
+}
 
+impl TraceStatus {
     /// Convert to emoji representation
     pub fn to_emoji(&self) -> String {
         match self {
@@ -287,16 +288,6 @@ impl ModuleDebugInfo {
         }
 
         result
-    }
-
-    /// Format a variable with its location/evaluation result
-    fn format_variable_with_location(name: &str, type_name: &str, location_desc: &str) -> String {
-        // Only show variables that have meaningful location descriptions (evaluation results)
-        if location_desc.is_empty() || location_desc == "None" {
-            format!("{} ({})", name, type_name)
-        } else {
-            format!("{} ({}) = {}", name, type_name, location_desc)
-        }
     }
 
     /// Overload helper: build from VariableDebugInfo

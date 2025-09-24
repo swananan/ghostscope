@@ -1068,7 +1068,7 @@ impl<'a> DwarfParser<'a> {
                 let path_str = dwarf
                     .attr_string(unit, *path)
                     .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|_| format!("unknown_dir_{}", i));
+                    .unwrap_or_else(|_| format!("unknown_dir_{i}"));
                 debug!("Include directory [{}]: '{}'", i + 1, path_str);
                 path_str
             })
@@ -1197,7 +1197,6 @@ impl<'a> DwarfParser<'a> {
     }
 
     /// Static helper methods
-
     fn extract_cu_name_from_dwarf(
         dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
         unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,

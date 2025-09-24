@@ -72,7 +72,7 @@ impl ProcMappingParser {
 
     /// Parse /proc/PID/maps file
     fn parse_proc_maps(pid: u32) -> Result<Vec<MemoryMapping>> {
-        let maps_path = format!("/proc/{}/maps", pid);
+        let maps_path = format!("/proc/{pid}/maps");
         tracing::debug!("Reading memory mappings from: {}", maps_path);
 
         let content =

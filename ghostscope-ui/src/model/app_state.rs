@@ -69,7 +69,10 @@ impl AppState {
         }
     }
 
-    pub fn new_with_config(event_registry: EventRegistry, ui_config: crate::model::ui_state::UiConfig) -> Self {
+    pub fn new_with_config(
+        event_registry: EventRegistry,
+        ui_config: crate::model::ui_state::UiConfig,
+    ) -> Self {
         Self {
             should_quit: false,
             loading_state: LoadingState::Initializing, // Start with loading, wait for runtime response

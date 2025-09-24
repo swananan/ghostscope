@@ -152,7 +152,6 @@ impl Instruction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TypeEncoding;
 
     #[test]
     fn test_instruction_types() {

@@ -5,7 +5,6 @@
 
 use super::maps::MapManager;
 use crate::script::{VarType, VariableContext};
-use aya_ebpf_bindings::bindings::bpf_func_id::BPF_FUNC_get_current_pid_tgid;
 use ghostscope_dwarf::DwarfAnalyzer;
 use inkwell::builder::Builder;
 use inkwell::context::Context;

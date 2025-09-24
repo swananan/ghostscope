@@ -459,7 +459,8 @@ impl CommandPanelState {
             max_history_items: history_config.max_entries,
 
             // New history management
-            command_history_manager: crate::components::command_panel::CommandHistory::new_with_config(history_config),
+            command_history_manager:
+                crate::components::command_panel::CommandHistory::new_with_config(history_config),
             history_search: crate::components::command_panel::HistorySearchState::new(),
             auto_suggestion: crate::components::command_panel::AutoSuggestionState::new(),
         }

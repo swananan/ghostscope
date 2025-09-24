@@ -27,7 +27,7 @@ struct Cli {
     /// based on the command execution directory. Search order for relative paths:
     /// 1. Current working directory
     /// 2. Same directory as the dwarf-tool command
-    /// Can be used together with -p to filter events for specific PID
+    ///    Can be used together with -p to filter events for specific PID
     #[arg(short, long, value_name = "PATH")]
     target: Option<String>,
 
@@ -279,7 +279,7 @@ fn validate_args(cli: &Cli) -> Result<()> {
                 target_path
             ));
         }
-        println!("✓ Target file found: {}", target_path);
+        println!("✓ Target file found: {target_path}");
     }
 
     Ok(())
@@ -309,7 +309,7 @@ async fn main() -> Result<()> {
     }
 
     // Load analyzer
-    let loading_time = load_analyzer_and_execute(cli).await?;
+    let _loading_time = load_analyzer_and_execute(cli).await?;
 
     Ok(())
 }
@@ -341,7 +341,7 @@ async fn load_analyzer_and_execute(cli: Cli) -> Result<std::time::Duration> {
         if cli.pid.is_some() {
             println!("Loading modules from PID {}...", cli.pid.unwrap());
         } else if let Some(ref target) = cli.target {
-            println!("Loading target file {}...", target);
+            println!("Loading target file {target}...");
         }
     }
 
@@ -407,7 +407,7 @@ async fn analyze_source_location(
             };
             println!("{}", serde_json::to_string_pretty(&result)?);
         } else if !options.quiet() {
-            println!("No addresses found for {}", source);
+            println!("No addresses found for {source}");
         }
         return Ok(());
     }
@@ -492,7 +492,7 @@ async fn analyze_function(
                 };
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
-                println!("Function '{}' not found", func_name);
+                println!("Function '{func_name}' not found");
             }
         }
         return Ok(());
@@ -508,7 +508,7 @@ async fn analyze_function(
         for module_address in &addresses {
             grouped_by_module
                 .entry(module_address.module_path.clone())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(module_address.address);
         }
 
@@ -535,7 +535,7 @@ async fn analyze_function(
 
                 address_infos.push(AddressInfo {
                     module: module_path.display().to_string(),
-                    address: format!("0x{:x}", addr),
+                    address: format!("0x{addr:x}"),
                     source_file: source_location.as_ref().map(|sl| sl.file_path.clone()),
                     source_line: source_location.as_ref().map(|sl| sl.line_number),
                     source_column: source_location.as_ref().and_then(|sl| sl.column),
@@ -559,7 +559,7 @@ async fn analyze_function(
     } else {
         // Text output
         if !options.quiet() {
-            println!("\n=== Function: {} ===", func_name);
+            println!("\n=== Function: {func_name} ===");
         }
 
         for module_address in &addresses {
@@ -590,7 +590,7 @@ async fn analyze_function(
                 if let Some(src_loc) = source_location {
                     println!("  Source:  {}:{}", src_loc.file_path, src_loc.line_number);
                     if let Some(column) = src_loc.column {
-                        println!("  Column:  {}", column);
+                        println!("  Column:  {column}");
                     }
                 } else {
                     println!("  Source:  (no source information available)");
@@ -636,7 +636,7 @@ async fn analyze_module_address(
 
                 let result = AddressInfo {
                     module: module_path.to_string(),
-                    address: format!("0x{:x}", address),
+                    address: format!("0x{address:x}"),
                     source_file: source_location.as_ref().map(|sl| sl.file_path.clone()),
                     source_line: source_location.as_ref().map(|sl| sl.line_number),
                     source_column: source_location.as_ref().and_then(|sl| sl.column),
@@ -651,7 +651,7 @@ async fn analyze_module_address(
                     );
                 }
             } else {
-                println!("\n=== {} @ 0x{:x} ===", module_path, address);
+                println!("\n=== {module_path} @ 0x{address:x} ===");
                 if variables.is_empty() {
                     println!("No variables found");
                 } else {
@@ -661,7 +661,7 @@ async fn analyze_module_address(
         }
         Err(e) => {
             if !options.quiet() {
-                eprintln!("Failed to get variables: {}", e);
+                eprintln!("Failed to get variables: {e}");
             }
         }
     }
@@ -725,7 +725,7 @@ fn list_source_files(analyzer: &DwarfAnalyzer, options: &Commands) -> Result<()>
             grouped.len()
         );
         for (module, files) in grouped {
-            println!("\n{}", module);
+            println!("\n{module}");
             if files.is_empty() {
                 println!("  (no source files)");
                 continue;
@@ -741,10 +741,7 @@ fn list_source_files(analyzer: &DwarfAnalyzer, options: &Commands) -> Result<()>
 
 async fn run_benchmark(pid: Option<u32>, target_path: Option<&str>, runs: usize) -> Result<()> {
     if let Some(pid) = pid {
-        println!(
-            "Benchmarking module loading for PID {} ({} runs)...\n",
-            pid, runs
-        );
+        println!("Benchmarking module loading for PID {pid} ({runs} runs)...\n");
 
         print!("Loading: ");
         let mut load_times = Vec::new();
@@ -765,10 +762,7 @@ async fn run_benchmark(pid: Option<u32>, target_path: Option<&str>, runs: usize)
         println!("  Min: {}ms", load_times.iter().min().unwrap().as_millis());
         println!("  Max: {}ms", load_times.iter().max().unwrap().as_millis());
     } else if let Some(target) = target_path {
-        println!(
-            "Benchmarking target file loading for {} ({} runs)...\n",
-            target, runs
-        );
+        println!("Benchmarking target file loading for {target} ({runs} runs)...\n");
 
         print!("Loading: ");
         let mut load_times = Vec::new();
@@ -797,61 +791,6 @@ async fn run_benchmark(pid: Option<u32>, target_path: Option<&str>, runs: usize)
     Ok(())
 }
 
-fn print_source_analysis(
-    address_infos: &[AddressInfo],
-    source: &str,
-    total_variables: usize,
-    options: &Commands,
-) {
-    if options.quiet() {
-        for addr_info in address_infos {
-            for var in &addr_info.variables {
-                println!("{}: {} = {}", var.name, var.type_name, var.location);
-            }
-        }
-        return;
-    }
-
-    println!("\n=== {} ===", source);
-
-    if options.verbose() {
-        println!(
-            "Found {} addresses with {} total variables\n",
-            address_infos.len(),
-            total_variables
-        );
-    }
-
-    for (i, addr_info) in address_infos.iter().enumerate() {
-        if address_infos.len() > 1 {
-            println!(
-                "Address {}: {} → {}",
-                i + 1,
-                addr_info.address,
-                addr_info.module
-            );
-        } else {
-            println!("Address: {} → {}", addr_info.address, addr_info.module);
-        }
-
-        if addr_info.variables.is_empty() {
-            println!("  No variables found");
-        } else {
-            for var in &addr_info.variables {
-                let param_marker = if var.is_parameter { " (param)" } else { "" };
-                println!(
-                    "  ├─ {}: {} = {}{}",
-                    var.name, var.type_name, var.location, param_marker
-                );
-            }
-        }
-
-        if i < address_infos.len() - 1 {
-            println!();
-        }
-    }
-}
-
 fn print_variables_with_style(
     variables: &[ghostscope_dwarf::VariableWithEvaluation],
     options: &Commands,
@@ -865,7 +804,7 @@ fn print_variables_with_style(
 
             // Prioritize DWARF type info over simple type name
             if let Some(dwarf_type) = &var.dwarf_type {
-                println!("  Type:          {}", dwarf_type);
+                println!("  Type:          {dwarf_type}");
             } else {
                 println!("  Type:          {} (no DWARF type info)", var.type_name);
             }

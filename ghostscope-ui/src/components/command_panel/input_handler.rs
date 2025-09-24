@@ -1,11 +1,8 @@
 use crate::action::{Action, CursorDirection};
-use crate::model::panel_state::{
-    CommandPanelState, InputState, InteractionMode, JkEscapeState, LineType,
-};
+use crate::model::panel_state::{CommandPanelState, InputState, InteractionMode, JkEscapeState};
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::crossterm::event::KeyEvent;
 use std::time::Instant;
-use tracing::debug;
 
 /// Handles input processing for the command panel
 pub struct InputHandler;

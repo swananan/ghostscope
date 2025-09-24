@@ -1,25 +1,23 @@
 use crate::action::{Action, PanelType};
 use crate::components::loading::{LoadingState, LoadingUI};
-use crate::events::{EventRegistry, TuiEvent};
+use crate::events::EventRegistry;
 use crate::model::ui_state::LayoutMode;
 use crate::model::AppState;
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, EventStream, KeyCode, KeyEventKind},
+    event::{Event, EventStream, KeyCode, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use futures_util::StreamExt;
 use ratatui::{
-    backend::{Backend, CrosstermBackend},
+    backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
     widgets::{Block, BorderType, Borders},
     Frame, Terminal,
 };
 use std::io;
-use tokio::sync::mpsc;
-use tracing::{debug, error};
+use tracing::debug;
 
 /// Modern TUI application using TEA architecture
 pub struct App {
@@ -61,7 +59,10 @@ impl App {
     }
 
     /// Create a new application instance with full UI configuration
-    pub async fn new_with_config(event_registry: EventRegistry, ui_config: crate::model::ui_state::UiConfig) -> Result<Self> {
+    pub async fn new_with_config(
+        event_registry: EventRegistry,
+        ui_config: crate::model::ui_state::UiConfig,
+    ) -> Result<Self> {
         // Setup terminal
         enable_raw_mode()?;
         let mut stdout = io::stdout();
@@ -612,15 +613,6 @@ impl App {
                                             self.state.command_renderer.mark_pending_updates();
                                         }
                                     }
-                                }
-                                'd' => {
-                                    // Ctrl+D - Delete current character
-                                    let handler_actions = self
-                                        .state
-                                        .command_input_handler
-                                        .handle_delete(&mut self.state.command_panel);
-                                    actions.extend(handler_actions);
-                                    self.state.command_renderer.mark_pending_updates();
                                 }
                                 _ => {
                                     // Use optimized input handler for regular character input
@@ -1233,7 +1225,7 @@ impl App {
                     tracing::error!("Failed to send runtime command: {}", e);
                     // Add error response to command panel
                     let error_action = Action::AddResponse {
-                        content: format!("Failed to send command to runtime: {}", e),
+                        content: format!("Failed to send command to runtime: {e}"),
                         response_type: crate::action::ResponseType::Error,
                     };
                     additional_actions.push(error_action);
@@ -1580,7 +1572,7 @@ impl App {
                     found_dwarf_stats = true;
                     enhanced_lines.push(Line::from("")); // Empty line
                     enhanced_lines.push(Line::from(Span::styled(
-                        format!("Attached to process {}", pid),
+                        format!("Attached to process {pid}"),
                         Style::default().fg(Color::White),
                     )));
                     // TODO: Add process name when available
@@ -1839,7 +1831,7 @@ impl App {
                     source_info.current_line,
                 );
                 for action in actions {
-                    self.handle_action(action);
+                    let _ = self.handle_action(action);
                 }
             }
             RuntimeStatus::FileInfo { groups } => {
@@ -1864,7 +1856,7 @@ impl App {
                             files,
                         );
                     for action in actions {
-                        self.handle_action(action);
+                        let _ = self.handle_action(action);
                     }
 
                     // Reset routing flag
@@ -1880,7 +1872,7 @@ impl App {
                         content: response,
                         response_type: crate::action::ResponseType::Info,
                     };
-                    self.handle_action(action);
+                    let _ = self.handle_action(action);
                 }
             }
             RuntimeStatus::FileInfoFailed { error } => {
@@ -1891,19 +1883,19 @@ impl App {
                             error,
                         );
                     for action in actions {
-                        self.handle_action(action);
+                        let _ = self.handle_action(action);
                     }
                     self.state.route_file_info_to_file_search = false;
                 } else {
                     self.clear_waiting_state();
                     let action = Action::AddResponse {
-                        content: format!("Failed to get file information: {}", error),
+                        content: format!("Failed to get file information: {error}"),
                         response_type: crate::action::ResponseType::Error,
                     };
-                    self.handle_action(action);
+                    let _ = self.handle_action(action);
                 }
             }
-            RuntimeStatus::InfoFunctionResult { target, info } => {
+            RuntimeStatus::InfoFunctionResult { target: _, info } => {
                 // Mark command as completed
                 self.clear_waiting_state();
                 // Format and display function debug info
@@ -1912,20 +1904,17 @@ impl App {
                     content: formatted_info,
                     response_type: crate::action::ResponseType::Success,
                 };
-                self.handle_action(action);
+                let _ = self.handle_action(action);
             }
             RuntimeStatus::InfoFunctionFailed { target, error } => {
                 self.clear_waiting_state();
                 let action = Action::AddResponse {
-                    content: format!(
-                        "Failed to get debug info for function '{}': {}",
-                        target, error
-                    ),
+                    content: format!("Failed to get debug info for function '{target}': {error}"),
                     response_type: crate::action::ResponseType::Error,
                 };
-                self.handle_action(action);
+                let _ = self.handle_action(action);
             }
-            RuntimeStatus::InfoLineResult { target, info } => {
+            RuntimeStatus::InfoLineResult { target: _, info } => {
                 // Mark command as completed
                 self.clear_waiting_state();
                 // Format and display line debug info
@@ -1934,17 +1923,17 @@ impl App {
                     content: formatted_info,
                     response_type: crate::action::ResponseType::Success,
                 };
-                self.handle_action(action);
+                let _ = self.handle_action(action);
             }
             RuntimeStatus::InfoLineFailed { target, error } => {
                 self.clear_waiting_state();
                 let action = Action::AddResponse {
-                    content: format!("Failed to get debug info for line '{}': {}", target, error),
+                    content: format!("Failed to get debug info for line '{target}': {error}"),
                     response_type: crate::action::ResponseType::Error,
                 };
-                self.handle_action(action);
+                let _ = self.handle_action(action);
             }
-            RuntimeStatus::InfoAddressResult { target, info } => {
+            RuntimeStatus::InfoAddressResult { target: _, info } => {
                 // Mark command as completed
                 self.clear_waiting_state();
                 // Format and display address debug info
@@ -1953,18 +1942,15 @@ impl App {
                     content: formatted_info,
                     response_type: crate::action::ResponseType::Success,
                 };
-                self.handle_action(action);
+                let _ = self.handle_action(action);
             }
             RuntimeStatus::InfoAddressFailed { target, error } => {
                 self.clear_waiting_state();
                 let action = Action::AddResponse {
-                    content: format!(
-                        "Failed to get debug info for address '{}': {}",
-                        target, error
-                    ),
+                    content: format!("Failed to get debug info for address '{target}': {error}"),
                     response_type: crate::action::ResponseType::Error,
                 };
-                self.handle_action(action);
+                let _ = self.handle_action(action);
             }
             RuntimeStatus::ShareInfo { libraries } => {
                 self.clear_waiting_state();
@@ -1976,15 +1962,15 @@ impl App {
                     content: formatted_info,
                     response_type: crate::action::ResponseType::Success,
                 };
-                self.handle_action(action);
+                let _ = self.handle_action(action);
             }
             RuntimeStatus::ShareInfoFailed { error } => {
                 self.clear_waiting_state();
                 let action = Action::AddResponse {
-                    content: format!("Failed to get shared library information: {}", error),
+                    content: format!("Failed to get shared library information: {error}"),
                     response_type: crate::action::ResponseType::Error,
                 };
-                self.handle_action(action);
+                let _ = self.handle_action(action);
             }
             RuntimeStatus::TraceInfo {
                 trace_id,
@@ -1997,22 +1983,22 @@ impl App {
             } => {
                 self.clear_waiting_state();
                 // Format trace info with enhanced display
-                let mut response = format!("🔍 Trace {} Info:\n", trace_id);
-                response.push_str(&format!("  Target: {}\n", target));
-                response.push_str(&format!("  Status: {}\n", status.to_string()));
-                response.push_str(&format!("  Binary: {}\n", binary));
-                response.push_str(&format!("  PC: 0x{:x}\n", pc));
+                let mut response = format!("🔍 Trace {trace_id} Info:\n");
+                response.push_str(&format!("  Target: {target}\n"));
+                response.push_str(&format!("  Status: {status}\n"));
+                response.push_str(&format!("  Binary: {binary}\n"));
+                response.push_str(&format!("  PC: 0x{pc:x}\n"));
                 if let Some(p) = pid {
-                    response.push_str(&format!("  PID: {}\n", p));
+                    response.push_str(&format!("  PID: {p}\n"));
                 }
                 if let Some(ref preview) = script_preview {
-                    response.push_str(&format!("  Script:\n{}\n", preview));
+                    response.push_str(&format!("  Script:\n{preview}\n"));
                 }
                 let action = Action::AddResponse {
                     content: response,
                     response_type: crate::action::ResponseType::Info,
                 };
-                self.handle_action(action);
+                let _ = self.handle_action(action);
             }
             RuntimeStatus::TraceInfoAll { summary, traces } => {
                 self.clear_waiting_state();
@@ -2023,122 +2009,123 @@ impl App {
                 for trace in &traces {
                     response.push_str(&format!(
                         "  #{} - {} ({})\n",
-                        trace.trace_id,
-                        trace.target_display,
-                        trace.status.to_string()
+                        trace.trace_id, trace.target_display, trace.status
                     ));
                 }
                 let action = Action::AddResponse {
                     content: response,
                     response_type: crate::action::ResponseType::Info,
                 };
-                self.handle_action(action);
+                let _ = self.handle_action(action);
             }
             RuntimeStatus::TraceInfoFailed { trace_id, error } => {
                 self.clear_waiting_state();
                 let action = Action::AddResponse {
-                    content: format!("Failed to get info for trace {}: {}", trace_id, error),
+                    content: format!("Failed to get info for trace {trace_id}: {error}"),
                     response_type: crate::action::ResponseType::Error,
                 };
-                self.handle_action(action);
+                let _ = self.handle_action(action);
             }
             RuntimeStatus::TraceEnabled { trace_id } => {
                 self.clear_waiting_state();
                 let action = Action::AddResponse {
-                    content: format!("✓ Trace {} enabled", trace_id),
+                    content: format!("✓ Trace {trace_id} enabled"),
                     response_type: crate::action::ResponseType::Success,
                 };
-                self.handle_action(action);
+                let _ = self.handle_action(action);
             }
             RuntimeStatus::TraceDisabled { trace_id } => {
                 self.clear_waiting_state();
                 let action = Action::AddResponse {
-                    content: format!("✓ Trace {} disabled", trace_id),
+                    content: format!("✓ Trace {trace_id} disabled"),
                     response_type: crate::action::ResponseType::Success,
                 };
-                self.handle_action(action);
+                let _ = self.handle_action(action);
             }
             RuntimeStatus::AllTracesEnabled { count } => {
                 self.clear_waiting_state();
                 let action = Action::AddResponse {
-                    content: format!("✓ All traces enabled ({} traces)", count),
+                    content: format!("✓ All traces enabled ({count} traces)"),
                     response_type: crate::action::ResponseType::Success,
                 };
-                self.handle_action(action);
+                let _ = self.handle_action(action);
             }
             RuntimeStatus::AllTracesDisabled { count } => {
                 self.clear_waiting_state();
                 let action = Action::AddResponse {
-                    content: format!("✓ All traces disabled ({} traces)", count),
+                    content: format!("✓ All traces disabled ({count} traces)"),
                     response_type: crate::action::ResponseType::Success,
                 };
-                self.handle_action(action);
+                let _ = self.handle_action(action);
             }
             RuntimeStatus::TraceEnableFailed { trace_id, error } => {
                 self.clear_waiting_state();
                 let action = Action::AddResponse {
-                    content: format!("✗ Failed to enable trace {}: {}", trace_id, error),
+                    content: format!("✗ Failed to enable trace {trace_id}: {error}"),
                     response_type: crate::action::ResponseType::Error,
                 };
-                self.handle_action(action);
+                let _ = self.handle_action(action);
             }
             RuntimeStatus::TraceDisableFailed { trace_id, error } => {
                 self.clear_waiting_state();
                 let action = Action::AddResponse {
-                    content: format!("✗ Failed to disable trace {}: {}", trace_id, error),
+                    content: format!("✗ Failed to disable trace {trace_id}: {error}"),
                     response_type: crate::action::ResponseType::Error,
                 };
-                self.handle_action(action);
+                let _ = self.handle_action(action);
             }
             RuntimeStatus::TraceDeleted { trace_id } => {
                 self.clear_waiting_state();
                 let action = Action::AddResponse {
-                    content: format!("✓ Trace {} deleted", trace_id),
+                    content: format!("✓ Trace {trace_id} deleted"),
                     response_type: crate::action::ResponseType::Success,
                 };
-                self.handle_action(action);
+                let _ = self.handle_action(action);
             }
             RuntimeStatus::AllTracesDeleted { count } => {
                 self.clear_waiting_state();
                 let action = Action::AddResponse {
-                    content: format!("✓ All traces deleted ({} traces)", count),
+                    content: format!("✓ All traces deleted ({count} traces)"),
                     response_type: crate::action::ResponseType::Success,
                 };
-                self.handle_action(action);
+                let _ = self.handle_action(action);
             }
             RuntimeStatus::TraceDeleteFailed { trace_id, error } => {
                 self.clear_waiting_state();
                 let action = Action::AddResponse {
-                    content: format!("✗ Failed to delete trace {}: {}", trace_id, error),
+                    content: format!("✗ Failed to delete trace {trace_id}: {error}"),
                     response_type: crate::action::ResponseType::Error,
                 };
-                self.handle_action(action);
+                let _ = self.handle_action(action);
             }
             RuntimeStatus::ScriptCompilationFailed { error, target } => {
                 self.clear_waiting_state();
                 // Provide detailed script compilation failure information
                 let mut formatted_error =
-                    format!("❌ Script compilation failed for target '{}':\n", target);
+                    format!("❌ Script compilation failed for target '{target}':\n");
 
                 // Parse and format the error for better readability
                 if error.contains("error:") && error.contains("line") {
                     // Parse compiler-style errors
-                    formatted_error.push_str(&format!("\n  Compilation Error Details:\n"));
+                    formatted_error.push_str("\n  Compilation Error Details:\n");
                     for line in error.lines() {
                         if line.trim().starts_with("error:")
                             || line.trim().starts_with("warning:")
                             || line.trim().starts_with("note:")
                         {
-                            formatted_error.push_str(&format!("  {}\n", line.trim()));
+                            let trimmed = line.trim();
+                            formatted_error.push_str(&format!("  {trimmed}\n"));
                         } else if line.contains("-->") {
-                            formatted_error.push_str(&format!("  {}\n", line.trim()));
+                            let trimmed = line.trim();
+                            formatted_error.push_str(&format!("  {trimmed}\n"));
                         } else if !line.trim().is_empty() {
-                            formatted_error.push_str(&format!("    {}\n", line.trim()));
+                            let trimmed = line.trim();
+                            formatted_error.push_str(&format!("    {trimmed}\n"));
                         }
                     }
                 } else {
                     // Simple error message
-                    formatted_error.push_str(&format!("\n  Error: {}\n", error));
+                    formatted_error.push_str(&format!("\n  Error: {error}\n"));
                 }
 
                 formatted_error.push_str("\n  Troubleshooting:");
@@ -2150,7 +2137,7 @@ impl App {
                     content: formatted_error,
                     response_type: crate::action::ResponseType::Error,
                 };
-                self.handle_action(action);
+                let _ = self.handle_action(action);
             }
             _ => {
                 // Handle other runtime status messages (delegate to command panel or other components)
@@ -2160,7 +2147,7 @@ impl App {
                         content,
                         response_type: self.get_response_type_for_status(&status),
                     };
-                    self.handle_action(action);
+                    let _ = self.handle_action(action);
                 }
             }
         }

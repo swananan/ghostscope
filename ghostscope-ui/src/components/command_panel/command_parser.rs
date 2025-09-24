@@ -1,7 +1,6 @@
 use crate::action::{Action, ResponseType, RuntimeCommand};
 use crate::model::panel_state::{CommandPanelState, CommandType, InputState};
 use crate::ui::strings::UIStrings;
-use crate::ui::symbols::UISymbols;
 use std::time::Instant;
 
 /// Handles command parsing and built-in command execution
@@ -169,14 +168,14 @@ impl CommandParser {
     fn parse_disable_command(state: &mut CommandPanelState, target: &str) -> Vec<Action> {
         if target == "all" {
             state.input_state = InputState::WaitingResponse {
-                command: format!("disable {}", target),
+                command: format!("disable {target}"),
                 sent_time: Instant::now(),
                 command_type: CommandType::DisableAll,
             };
             vec![Action::SendRuntimeCommand(RuntimeCommand::DisableAllTraces)]
         } else if let Ok(trace_id) = target.parse::<u32>() {
             state.input_state = InputState::WaitingResponse {
-                command: format!("disable {}", target),
+                command: format!("disable {target}"),
                 sent_time: Instant::now(),
                 command_type: CommandType::Disable { trace_id },
             };
@@ -195,14 +194,14 @@ impl CommandParser {
     fn parse_enable_command(state: &mut CommandPanelState, target: &str) -> Vec<Action> {
         if target == "all" {
             state.input_state = InputState::WaitingResponse {
-                command: format!("enable {}", target),
+                command: format!("enable {target}"),
                 sent_time: Instant::now(),
                 command_type: CommandType::EnableAll,
             };
             vec![Action::SendRuntimeCommand(RuntimeCommand::EnableAllTraces)]
         } else if let Ok(trace_id) = target.parse::<u32>() {
             state.input_state = InputState::WaitingResponse {
-                command: format!("enable {}", target),
+                command: format!("enable {target}"),
                 sent_time: Instant::now(),
                 command_type: CommandType::Enable { trace_id },
             };
@@ -221,14 +220,14 @@ impl CommandParser {
     fn parse_delete_command(state: &mut CommandPanelState, target: &str) -> Vec<Action> {
         if target == "all" {
             state.input_state = InputState::WaitingResponse {
-                command: format!("delete {}", target),
+                command: format!("delete {target}"),
                 sent_time: Instant::now(),
                 command_type: CommandType::DeleteAll,
             };
             vec![Action::SendRuntimeCommand(RuntimeCommand::DeleteAllTraces)]
         } else if let Ok(trace_id) = target.parse::<u32>() {
             state.input_state = InputState::WaitingResponse {
-                command: format!("delete {}", target),
+                command: format!("delete {target}"),
                 sent_time: Instant::now(),
                 command_type: CommandType::Delete { trace_id },
             };
@@ -394,7 +393,7 @@ impl CommandParser {
             let target = command.strip_prefix("i f ").unwrap().trim().to_string();
             if !target.is_empty() {
                 state.input_state = InputState::WaitingResponse {
-                    command: format!("info function {}", target),
+                    command: format!("info function {target}"),
                     sent_time: Instant::now(),
                     command_type: CommandType::InfoFunction {
                         target: target.clone(),
@@ -416,7 +415,7 @@ impl CommandParser {
             let target = command.strip_prefix("i l ").unwrap().trim().to_string();
             if !target.is_empty() {
                 state.input_state = InputState::WaitingResponse {
-                    command: format!("info line {}", target),
+                    command: format!("info line {target}"),
                     sent_time: Instant::now(),
                     command_type: CommandType::InfoLine {
                         target: target.clone(),

@@ -1,9 +1,8 @@
 use crate::config::{MergedConfig, ParsedArgs};
 use crate::tracing::TraceManager;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use ghostscope_dwarf::{DwarfAnalyzer, ModuleStats};
-use ghostscope_loader::GhostScopeLoader;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 /// Ghost session state - manages binary analysis, process tracking, and trace instances
 #[derive(Debug)]

@@ -13,4 +13,4 @@ pub mod settings;
 
 pub use args::{Args, LayoutMode, ParsedArgs};
 pub use merged::{CompilerConfiguration, DwarfConfiguration, MergedConfig};
-pub use settings::{Config, LogLevel, PanelType, UiConfigToml};
+pub use settings::{Config, LogLevel, PanelType};

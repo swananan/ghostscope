@@ -103,7 +103,7 @@ impl TypeResolver {
         }
 
         if name.is_empty() {
-            name = format!("unknown_base_type_{}", byte_size);
+            name = format!("unknown_base_type_{byte_size}");
         }
 
         Some(DwarfType::BaseType {
@@ -237,7 +237,7 @@ impl TypeResolver {
         }
 
         if name.is_empty() {
-            name = format!("anonymous_struct_{}", byte_size);
+            name = format!("anonymous_struct_{byte_size}");
         }
 
         // TODO: Parse struct members from child DIEs
@@ -276,7 +276,7 @@ impl TypeResolver {
         }
 
         if name.is_empty() {
-            name = format!("anonymous_union_{}", byte_size);
+            name = format!("anonymous_union_{byte_size}");
         }
 
         Some(DwarfType::UnionType {
@@ -314,7 +314,7 @@ impl TypeResolver {
         }
 
         if name.is_empty() {
-            name = format!("anonymous_enum_{}", byte_size);
+            name = format!("anonymous_enum_{byte_size}");
         }
 
         // Treat enum as signed integer base type

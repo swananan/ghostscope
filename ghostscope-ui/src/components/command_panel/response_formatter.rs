@@ -1,7 +1,6 @@
 use crate::action::ResponseType;
-use crate::model::panel_state::{CommandHistoryItem, CommandPanelState, LineType, StaticTextLine};
+use crate::model::panel_state::{CommandPanelState, LineType, StaticTextLine};
 use crate::ui::{strings::UIStrings, symbols::UISymbols, themes::UIThemes};
-use crate::utils::utf8::UTF8Utils;
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},

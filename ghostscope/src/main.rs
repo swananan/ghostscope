@@ -38,9 +38,9 @@ fn setup_panic_hook() {
         let _ = io::stderr().flush();
 
         if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
-            eprintln!("Message: {}", s);
+            eprintln!("Message: {s}");
         } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
-            eprintln!("Message: {}", s);
+            eprintln!("Message: {s}");
         } else {
             eprintln!("Message: (no message available)");
         }
@@ -51,7 +51,7 @@ fn setup_panic_hook() {
         let _ = io::stderr().flush();
 
         let backtrace = std::backtrace::Backtrace::force_capture();
-        eprintln!("{}", backtrace);
+        eprintln!("{backtrace}");
         let _ = io::stderr().flush();
 
         eprintln!("======================");
@@ -74,17 +74,18 @@ async fn main() -> Result<()> {
 
     // Load and merge configuration
     let config_path = parsed_args.config.clone();
-    let merged_config = match config::MergedConfig::new_with_explicit_config(parsed_args, config_path) {
-        Ok(config) => config,
-        Err(e) => {
-            eprintln!("❌ Configuration Error:\n{}", e);
-            eprintln!("\n💡 Tips:");
-            eprintln!("  • Check the example config.toml in the project root");
-            eprintln!("  • Verify TOML syntax is correct");
-            eprintln!("  • Ensure all values use the correct format");
-            std::process::exit(1);
-        }
-    };
+    let merged_config =
+        match config::MergedConfig::new_with_explicit_config(parsed_args, config_path) {
+            Ok(config) => config,
+            Err(e) => {
+                eprintln!("❌ Configuration Error:\n{e}");
+                eprintln!("\n💡 Tips:");
+                eprintln!("  • Check the example config.toml in the project root");
+                eprintln!("  • Verify TOML syntax is correct");
+                eprintln!("  • Ensure all values use the correct format");
+                std::process::exit(1);
+            }
+        };
 
     // Initialize logging with full configuration
     let log_file_string = merged_config.log_file.to_string_lossy().to_string();
@@ -95,7 +96,7 @@ async fn main() -> Result<()> {
         merged_config.log_level,
         merged_config.tui_mode,
     ) {
-        eprintln!("Failed to initialize logging: {}", e);
+        eprintln!("Failed to initialize logging: {e}");
         return Err(anyhow::anyhow!("Failed to initialize logging: {}", e));
     }
 

@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::config::LayoutMode;
 
@@ -340,7 +340,7 @@ impl Config {
 
                 // Check if it looks like an array with zeros
                 if array_str.starts_with('[') && array_str.ends_with(']') {
-                    let inner = &array_str[1..array_str.len()-1];
+                    let inner = &array_str[1..array_str.len() - 1];
                     let numbers: Vec<&str> = inner.split(',').map(|s| s.trim()).collect();
 
                     if numbers.len() == 3 {
@@ -370,7 +370,11 @@ impl Config {
     }
 
     /// Create a user-friendly error message for TOML parsing errors
-    fn create_friendly_toml_error(file_path: &str, content: &str, error: toml::de::Error) -> anyhow::Error {
+    fn create_friendly_toml_error(
+        file_path: &str,
+        content: &str,
+        error: toml::de::Error,
+    ) -> anyhow::Error {
         let error_msg = format!("Configuration file parsing error in '{}'", file_path);
 
         if let Some(span) = error.span() {
@@ -403,7 +407,8 @@ impl Config {
                 Self::get_error_suggestion(&error.to_string())
             )
         } else {
-            anyhow::anyhow!("{}\n\n{}\n\nSuggestion: {}",
+            anyhow::anyhow!(
+                "{}\n\n{}\n\nSuggestion: {}",
                 error_msg,
                 error,
                 Self::get_error_suggestion(&error.to_string())

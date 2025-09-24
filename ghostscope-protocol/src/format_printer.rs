@@ -29,7 +29,7 @@ impl FormatPrinter {
         let format_string = match string_table.get_string(format_string_index) {
             Some(s) => s,
             None => {
-                return format!("<INVALID_FORMAT_INDEX_{}>", format_string_index);
+                return format!("<INVALID_FORMAT_INDEX_{format_string_index}>");
             }
         };
 
@@ -52,7 +52,7 @@ impl FormatPrinter {
                     } else {
                         // Found a placeholder, skip to '}' and replace with variable value
                         let mut found_closing = false;
-                        while let Some(inner_ch) = chars.next() {
+                        for inner_ch in chars.by_ref() {
                             if inner_ch == '}' {
                                 found_closing = true;
                                 break;
@@ -242,7 +242,7 @@ impl FormatPrinter {
                         variable.data[7],
                     ];
                     let addr = u64::from_le_bytes(bytes);
-                    format!("0x{:x}", addr)
+                    format!("0x{addr:x}")
                 }
             }
             TypeEncoding::NullPointer => "null".to_string(),

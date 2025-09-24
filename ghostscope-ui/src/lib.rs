@@ -25,7 +25,10 @@ pub async fn run_tui_mode(event_registry: EventRegistry, layout_mode: LayoutMode
     run_tui_mode_with_config(event_registry, ui_config).await
 }
 
-pub async fn run_tui_mode_with_config(event_registry: EventRegistry, ui_config: UiConfig) -> Result<()> {
+pub async fn run_tui_mode_with_config(
+    event_registry: EventRegistry,
+    ui_config: UiConfig,
+) -> Result<()> {
     let mut app = App::new_with_config(event_registry, ui_config).await?;
     app.run().await
 }
