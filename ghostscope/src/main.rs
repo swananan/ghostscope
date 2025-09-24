@@ -1,5 +1,5 @@
-mod args;
 mod cli;
+mod config;
 mod core;
 mod logging;
 mod runtime;
@@ -69,25 +69,62 @@ async fn main() -> Result<()> {
     // Setup panic hook before doing anything else
     setup_panic_hook();
 
-    let parsed_args = args::Args::parse_args();
+    // Parse command line arguments
+    let parsed_args = config::Args::parse_args();
 
-    // Initialize logging
-    let log_file_path = parsed_args.log_file.as_ref().and_then(|p| p.to_str());
-    if let Err(e) = logging::initialize_logging(
+    // Load and merge configuration
+    let config_path = parsed_args.config.clone();
+    let merged_config = match config::MergedConfig::new_with_explicit_config(parsed_args, config_path) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("❌ Configuration Error:\n{}", e);
+            eprintln!("\n💡 Tips:");
+            eprintln!("  • Check the example config.toml in the project root");
+            eprintln!("  • Verify TOML syntax is correct");
+            eprintln!("  • Ensure all values use the correct format");
+            std::process::exit(1);
+        }
+    };
+
+    // Initialize logging with full configuration
+    let log_file_string = merged_config.log_file.to_string_lossy().to_string();
+    let log_file_path = Some(log_file_string.as_str());
+    if let Err(e) = logging::initialize_logging_with_config(
         log_file_path,
-        if parsed_args.tui_mode { true } else { false },
+        merged_config.enable_logging,
+        merged_config.log_level,
+        merged_config.tui_mode,
     ) {
         eprintln!("Failed to initialize logging: {}", e);
         return Err(anyhow::anyhow!("Failed to initialize logging: {}", e));
     }
 
-    // Validate arguments
-    parsed_args.validate()?;
+    // Validate core arguments (TODO: move validation to MergedConfig)
+    // For now, create a temporary ParsedArgs for validation
+    let temp_args = config::ParsedArgs {
+        binary_path: merged_config.binary_path.clone(),
+        target_path: merged_config.target_path.clone(),
+        binary_args: merged_config.binary_args.clone(),
+        log_file: Some(merged_config.log_file.clone()),
+        enable_logging: merged_config.enable_logging,
+        log_level: merged_config.log_level,
+        config: None, // Not needed for validation
+        debug_file: merged_config.debug_file.clone(),
+        script: merged_config.script.clone(),
+        script_file: merged_config.script_file.clone(),
+        pid: merged_config.pid,
+        tui_mode: merged_config.tui_mode,
+        should_save_llvm_ir: merged_config.should_save_llvm_ir,
+        should_save_ebpf: merged_config.should_save_ebpf,
+        should_save_ast: merged_config.should_save_ast,
+        layout_mode: merged_config.layout_mode,
+    };
+    temp_args.validate()?;
 
     // Route to appropriate runtime mode
-    if parsed_args.tui_mode {
-        runtime::run_tui_coordinator(parsed_args).await
+    if merged_config.tui_mode {
+        runtime::run_tui_coordinator_with_config(merged_config).await
     } else {
-        cli::run_command_line_runtime(parsed_args).await
+        cli::run_command_line_runtime_with_config(merged_config).await
     }
 }

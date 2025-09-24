@@ -60,6 +60,37 @@ impl App {
         })
     }
 
+    /// Create a new application instance with full UI configuration
+    pub async fn new_with_config(event_registry: EventRegistry, ui_config: crate::model::ui_state::UiConfig) -> Result<Self> {
+        // Setup terminal
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen)?;
+        // Mouse capture disabled to allow standard copy/paste functionality
+        let backend = CrosstermBackend::new(stdout);
+        let terminal = Terminal::new(backend)?;
+
+        let mut state = AppState::new_with_config(event_registry, ui_config);
+
+        // Request initial source code on startup
+        if let Err(e) = state
+            .event_registry
+            .command_sender
+            .send(crate::events::RuntimeCommand::RequestSourceCode)
+        {
+            tracing::warn!("Failed to send initial source code request: {}", e);
+        } else {
+            // Move to connecting state since we've sent the request
+            state.set_loading_state(crate::components::loading::LoadingState::ConnectingToRuntime);
+        }
+
+        Ok(Self {
+            terminal,
+            state,
+            should_quit: false,
+        })
+    }
+
     /// Main application loop
     pub async fn run(&mut self) -> Result<()> {
         debug!("Starting new TEA-based TUI application");
@@ -1611,15 +1642,19 @@ impl App {
             }
         } else {
             // Normal multi-panel layout
+            // Get panel ratios from configuration
+            let ratios = &state.ui.config.panel_ratios;
+            let total_ratio: u32 = ratios.iter().map(|&x| x as u32).sum();
+
             let chunks = match state.ui.layout.mode {
                 LayoutMode::Horizontal => {
                     Layout::default()
                         .direction(Direction::Horizontal)
                         .constraints(
                             [
-                                Constraint::Ratio(4, 10), // Source code panel - 40%
-                                Constraint::Ratio(3, 10), // eBPF info panel - 30%
-                                Constraint::Ratio(3, 10), // Command panel - 30%
+                                Constraint::Ratio(ratios[0] as u32, total_ratio), // Source code panel
+                                Constraint::Ratio(ratios[1] as u32, total_ratio), // eBPF info panel
+                                Constraint::Ratio(ratios[2] as u32, total_ratio), // Command panel
                             ]
                             .as_ref(),
                         )
@@ -1630,9 +1665,9 @@ impl App {
                         .direction(Direction::Vertical)
                         .constraints(
                             [
-                                Constraint::Ratio(4, 10), // Source code panel - 40%
-                                Constraint::Ratio(3, 10), // eBPF info panel - 30%
-                                Constraint::Ratio(3, 10), // Command panel - 30%
+                                Constraint::Ratio(ratios[0] as u32, total_ratio), // Source code panel
+                                Constraint::Ratio(ratios[1] as u32, total_ratio), // eBPF info panel
+                                Constraint::Ratio(ratios[2] as u32, total_ratio), // Command panel
                             ]
                             .as_ref(),
                         )

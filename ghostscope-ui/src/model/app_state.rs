@@ -60,7 +60,28 @@ impl AppState {
             command_input_handler: OptimizedInputHandler::new(),
             ebpf_panel_handler: EbpfPanelHandler::new(),
             ebpf_panel_renderer: EbpfPanelRenderer::new(),
-            ui: UIState::new(layout_mode),
+            ui: UIState::new_with_layout_mode(layout_mode),
+            command_panel_width: 80, // Default width, will be updated during render
+            event_registry,
+            route_file_info_to_file_search: false,
+            target_pid: None,
+            emoji_config: EmojiConfig::default(),
+        }
+    }
+
+    pub fn new_with_config(event_registry: EventRegistry, ui_config: crate::model::ui_state::UiConfig) -> Self {
+        Self {
+            should_quit: false,
+            loading_state: LoadingState::Initializing, // Start with loading, wait for runtime response
+            loading_ui: LoadingUI::new(),
+            source_panel: SourcePanelState::new(),
+            ebpf_panel: EbpfPanelState::new(),
+            command_panel: CommandPanelState::new(),
+            command_renderer: OptimizedRenderer::new(),
+            command_input_handler: OptimizedInputHandler::new(),
+            ebpf_panel_handler: EbpfPanelHandler::new(),
+            ebpf_panel_renderer: EbpfPanelRenderer::new(),
+            ui: UIState::new(ui_config),
             command_panel_width: 80, // Default width, will be updated during render
             event_registry,
             route_file_info_to_file_search: false,

@@ -3,7 +3,7 @@ use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
 use tracing::{info, warn};
 
-#[derive(Debug, Clone, Copy, PartialEq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, ValueEnum, serde::Serialize, serde::Deserialize)]
 pub enum LayoutMode {
     /// Horizontal layout: panels arranged side by side (4:3:3 ratio)
     Horizontal,
@@ -37,6 +37,22 @@ pub struct Args {
     /// Log file path (default: ./ghostscope.log)
     #[arg(long, value_name = "PATH")]
     pub log_file: Option<PathBuf>,
+
+    /// Enable logging (overrides config file)
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub log: bool,
+
+    /// Disable logging (overrides config file)
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub no_log: bool,
+
+    /// Set log level (error, warn, info, debug, trace) (overrides config file)
+    #[arg(long, value_name = "LEVEL")]
+    pub log_level: Option<String>,
+
+    /// Specify custom configuration file path
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
 
     /// Debug information file path (overrides auto-detection)
     /// Auto-detection searches:
@@ -101,6 +117,9 @@ pub struct ParsedArgs {
     pub target_path: Option<String>,
     pub binary_args: Vec<String>,
     pub log_file: Option<PathBuf>,
+    pub enable_logging: bool,
+    pub log_level: crate::config::settings::LogLevel,
+    pub config: Option<PathBuf>,
     pub debug_file: Option<PathBuf>,
     pub script: Option<String>,
     pub script_file: Option<PathBuf>,
@@ -141,12 +160,16 @@ impl Args {
             let should_save_ast = Self::should_save_ast(&parsed);
             let tui_mode = Self::determine_tui_mode(&parsed);
             let target_path = Self::resolve_target_path(&parsed);
+            let (enable_logging, log_level) = Self::determine_logging_config(&parsed);
 
             ParsedArgs {
                 binary_path,
                 target_path,
                 binary_args,
                 log_file: parsed.log_file,
+                enable_logging,
+                log_level,
+                config: parsed.config,
                 debug_file: parsed.debug_file,
                 script: parsed.script,
                 script_file: parsed.script_file,
@@ -166,12 +189,16 @@ impl Args {
             let should_save_ast = Self::should_save_ast(&parsed);
             let tui_mode = Self::determine_tui_mode(&parsed);
             let target_path = Self::resolve_target_path(&parsed);
+            let (enable_logging, log_level) = Self::determine_logging_config(&parsed);
 
             ParsedArgs {
                 binary_path: parsed.binary,
                 target_path,
                 binary_args: Vec::new(),
                 log_file: parsed.log_file,
+                enable_logging,
+                log_level,
+                config: parsed.config,
                 debug_file: parsed.debug_file,
                 script: parsed.script,
                 script_file: parsed.script_file,
@@ -282,6 +309,30 @@ impl Args {
         } else {
             None
         }
+    }
+
+    /// Determine logging configuration from command line arguments
+    fn determine_logging_config(parsed: &Args) -> (bool, crate::config::settings::LogLevel) {
+        // Determine enable_logging
+        let enable_logging = if parsed.no_log {
+            false // --no-log takes precedence
+        } else if parsed.log {
+            true // --log takes precedence
+        } else {
+            true // Default to enabled (will be overridden by config file if needed)
+        };
+
+        // Determine log_level
+        let log_level = if let Some(ref level_str) = parsed.log_level {
+            crate::config::settings::LogLevel::from_str(level_str).unwrap_or_else(|_| {
+                warn!("Invalid log level '{}', using default 'warn'", level_str);
+                crate::config::settings::LogLevel::Warn
+            })
+        } else {
+            crate::config::settings::LogLevel::Warn // Default level
+        };
+
+        (enable_logging, log_level)
     }
 }
 

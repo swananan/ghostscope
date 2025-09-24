@@ -1,4 +1,4 @@
-use crate::args::ParsedArgs;
+use crate::config::{MergedConfig, ParsedArgs};
 use crate::tracing::TraceManager;
 use anyhow::{Context, Result};
 use ghostscope_dwarf::{DwarfAnalyzer, ModuleStats};
@@ -15,9 +15,29 @@ pub struct GhostSession {
     pub debug_file: Option<String>,  // Optional debug file path
     pub trace_manager: TraceManager, // Manages all trace instances with their loaders
     pub is_attached: bool,
+    pub config: Option<MergedConfig>, // Holds the merged configuration
 }
 
 impl GhostSession {
+    /// Create a new ghost session with merged configuration
+    pub fn new_with_config(config: &MergedConfig) -> Self {
+        info!("Creating ghost session with merged configuration");
+
+        Self {
+            process_analyzer: None,
+            target_binary: config.target_path.clone(),
+            target_args: config.binary_args.clone(),
+            target_pid: config.pid,
+            debug_file: config
+                .debug_file
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
+            trace_manager: TraceManager::new(),
+            is_attached: false,
+            config: Some(config.clone()),
+        }
+    }
+
     /// Create a new ghost session (without binary analysis - call load_binary separately)
     pub fn new(args: &ParsedArgs) -> Self {
         info!("Creating ghost session");
@@ -33,6 +53,7 @@ impl GhostSession {
                 .map(|p| p.to_string_lossy().to_string()),
             trace_manager: TraceManager::new(),
             is_attached: false,
+            config: None,
         }
     }
 
@@ -84,6 +105,13 @@ impl GhostSession {
     /// Load binary and perform DWARF analysis (backwards compatibility - now uses parallel)
     pub async fn load_binary(&mut self) -> Result<()> {
         self.load_binary_parallel().await
+    }
+
+    /// Create ghost session with merged config and load binary in one step
+    pub async fn new_with_binary_and_config(config: &MergedConfig) -> Result<Self> {
+        let mut session = Self::new_with_config(config);
+        session.load_binary().await?;
+        Ok(session)
     }
 
     /// Create ghost session and load binary in one step (now uses parallel loading)
@@ -170,5 +198,22 @@ impl GhostSession {
         } else {
             "unknown mode"
         }
+    }
+
+    /// Get UI-related configuration for ghostscope-ui crate
+    pub fn get_ui_config(&self) -> Option<ghostscope_ui::UiConfig> {
+        self.config.as_ref().map(|config| config.get_ui_config())
+    }
+
+    /// Get compiler-related configuration for ghostscope-compiler crate
+    pub fn get_compiler_config(&self) -> Option<crate::config::CompilerConfiguration> {
+        self.config
+            .as_ref()
+            .map(|config| config.get_compiler_config())
+    }
+
+    /// Get DWARF-related configuration for ghostscope-dwarf crate
+    pub fn get_dwarf_config(&self) -> Option<crate::config::DwarfConfiguration> {
+        self.config.as_ref().map(|config| config.get_dwarf_config())
     }
 }

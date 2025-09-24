@@ -9,15 +9,33 @@ const DEFAULT_LOG_FILE: &str = "ghostscope.log";
 
 static INIT_GUARD: OnceLock<()> = OnceLock::new();
 
-pub fn initialize_logging(log_file_path: Option<&str>, tui_mode: bool) -> Result<()> {
+/// Initialize logging with enhanced configuration options
+pub fn initialize_logging_with_config(
+    log_file_path: Option<&str>,
+    enable_logging: bool,
+    log_level: crate::config::LogLevel,
+    tui_mode: bool,
+) -> Result<()> {
     if INIT_GUARD.set(()).is_err() {
         // Already initialized elsewhere; do nothing and succeed
+        return Ok(());
+    }
+
+    // If logging is disabled, set up a minimal subscriber that discards everything
+    if !enable_logging {
+        let init_res = tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::OFF)
+            .try_init();
+        let _ = init_res;
         return Ok(());
     }
 
     // Initialize log to tracing adapter to capture aya's log:: output
     // Initialize LogTracer but ignore 'already set' errors to avoid noisy output
     let _ = tracing_log::LogTracer::init();
+
+    // Convert our LogLevel to tracing LevelFilter
+    let level_filter = log_level.to_tracing_level_filter();
 
     // Determine log file path: use provided path or default to current directory
     let log_path = match log_file_path {
@@ -34,14 +52,14 @@ pub fn initialize_logging(log_file_path: Option<&str>, tui_mode: bool) -> Result
 
     match maybe_log_file {
         Ok(log_file) => {
-            // Configure file output
+            // Configure file output with level filter
             let file_subscriber = tracing_subscriber::fmt::layer()
                 .with_file(true)
                 .with_line_number(true)
                 .with_writer(log_file)
                 .with_target(true)
                 .with_ansi(false)
-                .with_filter(tracing_subscriber::filter::EnvFilter::from_default_env());
+                .with_filter(level_filter);
 
             if tui_mode {
                 // TUI mode: only log to file
@@ -50,15 +68,17 @@ pub fn initialize_logging(log_file_path: Option<&str>, tui_mode: bool) -> Result
                     .try_init();
                 let _ = init_res; // ignore AlreadyInit errors silently
             } else {
-                // Non-TUI mode: dual output to file and stdout
+                // Non-TUI mode: dual output to file and stdout with level filter
+                let stdout_subscriber = tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::stdout)
+                    .with_filter(level_filter);
+
                 let init_res = tracing_subscriber::registry()
                     .with(file_subscriber)
-                    .with(tracing_subscriber::fmt::layer().with_writer(std::io::stdout))
+                    .with(stdout_subscriber)
                     .try_init();
                 let _ = init_res;
             }
-
-            // No additional stdout prints
         }
         Err(_) => {
             // Fallback to stdout only if file creation fails
@@ -66,11 +86,22 @@ pub fn initialize_logging(log_file_path: Option<&str>, tui_mode: bool) -> Result
                 .with_file(true)
                 .with_line_number(true)
                 .with_target(true)
-                .with_env_filter(tracing_subscriber::filter::EnvFilter::from_default_env())
+                .with_max_level(level_filter)
                 .try_init();
             let _ = init_res;
         }
     }
 
     Ok(())
+}
+
+/// Legacy function for backward compatibility
+/// Uses default settings: logging enabled, warn level
+pub fn initialize_logging(log_file_path: Option<&str>, tui_mode: bool) -> Result<()> {
+    initialize_logging_with_config(
+        log_file_path,
+        true,                          // enable_logging: default to true
+        crate::config::LogLevel::Warn, // log_level: default to warn
+        tui_mode,
+    )
 }

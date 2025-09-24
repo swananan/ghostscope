@@ -1,12 +1,61 @@
-use crate::args::ParsedArgs;
+use crate::config::{MergedConfig, ParsedArgs};
 use crate::core::GhostSession;
 use crate::runtime::{dwarf_loader, info_handlers, source_handlers, trace_handlers};
 use anyhow::Result;
-use ghostscope_ui::{run_tui_mode, EventRegistry, RuntimeChannels, RuntimeCommand, RuntimeStatus};
+use ghostscope_ui::{run_tui_mode, run_tui_mode_with_config, EventRegistry, RuntimeChannels, RuntimeCommand, RuntimeStatus};
 use tracing::{error, info, warn};
+
+/// Run GhostScope in TUI mode with merged configuration
+pub async fn run_tui_coordinator_with_config(config: MergedConfig) -> Result<()> {
+    info!("Starting GhostScope in TUI mode with merged configuration");
+
+    // Pass the UI configuration to the TUI system
+    let ui_config = config.get_ui_config();
+
+    // Convert MergedConfig back to ParsedArgs for existing code compatibility
+    // TODO: Refactor to use MergedConfig directly throughout the TUI system
+    let parsed_args = ParsedArgs {
+        binary_path: config.binary_path,
+        target_path: config.target_path,
+        binary_args: config.binary_args,
+        log_file: Some(config.log_file),
+        enable_logging: config.enable_logging,
+        log_level: config.log_level,
+        config: None, // Not needed for runtime conversion
+        debug_file: config.debug_file,
+        script: config.script,
+        script_file: config.script_file,
+        pid: config.pid,
+        tui_mode: config.tui_mode,
+        should_save_llvm_ir: config.should_save_llvm_ir,
+        should_save_ebpf: config.should_save_ebpf,
+        should_save_ast: config.should_save_ast,
+        layout_mode: config.layout_mode,
+    };
+
+    run_tui_coordinator_with_ui_config(parsed_args, ui_config).await
+}
 
 /// Run GhostScope in TUI mode with tokio task coordination
 pub async fn run_tui_coordinator(parsed_args: ParsedArgs) -> Result<()> {
+    // Use default UI configuration when no merged config is available
+    let ui_config = ghostscope_ui::UiConfig {
+        layout_mode: match parsed_args.layout_mode {
+            crate::config::LayoutMode::Horizontal => ghostscope_ui::LayoutMode::Horizontal,
+            crate::config::LayoutMode::Vertical => ghostscope_ui::LayoutMode::Vertical,
+        },
+        default_focus: ghostscope_ui::PanelType::InteractiveCommand, // Default
+        panel_ratios: [4, 3, 3], // Default
+    };
+
+    run_tui_coordinator_with_ui_config(parsed_args, ui_config).await
+}
+
+/// Internal function to run TUI coordinator with UI configuration
+async fn run_tui_coordinator_with_ui_config(
+    parsed_args: ParsedArgs,
+    ui_config: ghostscope_ui::UiConfig,
+) -> Result<()> {
     info!("Starting GhostScope in TUI mode");
 
     // Create event communication channels
@@ -47,14 +96,8 @@ pub async fn run_tui_coordinator(parsed_args: ParsedArgs) -> Result<()> {
         }
     });
 
-    // Start TUI with layout mode configuration
-    let layout_mode = match parsed_args.layout_mode {
-        crate::args::LayoutMode::Horizontal => ghostscope_ui::LayoutMode::Horizontal,
-        crate::args::LayoutMode::Vertical => ghostscope_ui::LayoutMode::Vertical,
-    };
-
     // Run TUI mode and runtime coordination concurrently
-    let tui_result = run_tui_mode(event_registry, layout_mode).await;
+    let tui_result = ghostscope_ui::run_tui_mode_with_config(event_registry, ui_config).await;
     let runtime_result = runtime_task.await.unwrap_or_else(|e| {
         error!("Runtime task failed: {}", e);
         Err(anyhow::anyhow!("Runtime task panicked"))

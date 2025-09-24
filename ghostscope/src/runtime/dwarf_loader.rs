@@ -1,4 +1,4 @@
-use crate::args::ParsedArgs;
+use crate::config::ParsedArgs;
 use crate::core::GhostSession;
 use anyhow::Result;
 use ghostscope_dwarf::ModuleLoadingEvent;

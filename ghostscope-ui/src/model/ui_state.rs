@@ -6,19 +6,38 @@ pub enum LayoutMode {
     Vertical,
 }
 
+/// UI configuration passed from the main crate
+#[derive(Debug, Clone)]
+pub struct UiConfig {
+    pub layout_mode: LayoutMode,
+    pub panel_ratios: [u16; 3], // [Source, EbpfInfo, InteractiveCommand]
+    pub default_focus: crate::action::PanelType,
+}
+
 /// UI-specific state management
 #[derive(Debug)]
 pub struct UIState {
     pub layout: LayoutState,
     pub focus: FocusState,
+    pub config: UiConfig,
 }
 
 impl UIState {
-    pub fn new(layout_mode: LayoutMode) -> Self {
+    pub fn new(ui_config: UiConfig) -> Self {
         Self {
-            layout: LayoutState::new(layout_mode),
-            focus: FocusState::new(),
+            layout: LayoutState::new(ui_config.layout_mode),
+            focus: FocusState::new_with_default(ui_config.default_focus),
+            config: ui_config,
         }
+    }
+
+    // Backward compatibility method
+    pub fn new_with_layout_mode(layout_mode: LayoutMode) -> Self {
+        Self::new(UiConfig {
+            layout_mode,
+            panel_ratios: [4, 3, 3], // Default ratios
+            default_focus: crate::action::PanelType::InteractiveCommand,
+        })
     }
 }
 
@@ -58,6 +77,13 @@ impl FocusState {
     pub fn new() -> Self {
         Self {
             current_panel: PanelType::InteractiveCommand,
+            expecting_window_nav: false,
+        }
+    }
+
+    pub fn new_with_default(default_panel: PanelType) -> Self {
+        Self {
+            current_panel: default_panel,
             expecting_window_nav: false,
         }
     }

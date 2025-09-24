@@ -1,0 +1,77 @@
+# GhostScope Configuration File
+#
+# This is an example configuration file for GhostScope.
+# To use this configuration:
+# 1. Copy this file to ~/.ghostscope/config.toml (user-level config)
+# 2. Or rename to ghostscope.toml in your project directory (project-level config)
+# 3. Or specify with --config flag: ghostscope --config path/to/config.toml
+#
+# Configuration priority (highest to lowest):
+# 1. Command line arguments
+# 2. --config specified file
+# 3. ~/.ghostscope/config.toml
+# 4. ./ghostscope.toml
+#
+# All sections and values are optional - if not specified, built-in defaults are used.
+
+[general]
+# Default log file path (overridden by --log-file)
+# Default: "ghostscope.log"
+log_file = "ghostscope.log"
+
+# Default UI mode when no script is provided (overridden by --tui)
+# Default: true
+default_tui_mode = true
+
+# Enable/disable logging (overridden by --log/--no-log)
+# Default: true
+enable_logging = true
+
+# Log level filter (overridden by --log-level)
+# Options: "error", "warn", "info", "debug", "trace"
+# Default: "warn"
+log_level = "trace"
+
+[dwarf]
+# DWARF debug information search paths (for future --debug-file auto-discovery)
+# Currently not implemented, reserved for future use
+# Default: ["/usr/lib/debug", "/usr/local/lib/debug"]
+search_paths = [
+    "/usr/lib/debug",
+    "/usr/local/lib/debug",
+    "~/.local/lib/debug"
+]
+
+[files]
+# File saving options (overridden by --save-*/--no-save-* flags)
+# Format: { debug = bool, release = bool }
+# These control whether files are saved by default in debug/release builds
+
+# Save LLVM IR files (overridden by --save-llvm-ir/--no-save-llvm-ir)
+# Default: { debug = true, release = false }
+save_llvm_ir = { debug = true, release = false }
+
+# Save eBPF bytecode files (overridden by --save-ebpf/--no-save-ebpf)
+# Default: { debug = true, release = false }
+save_ebpf = { debug = true, release = false }
+
+# Save AST files (overridden by --save-ast/--no-save-ast)
+# Default: { debug = true, release = false }
+save_ast = { debug = true, release = false }
+
+[ui]
+# TUI layout mode (overridden by --layout)
+# Options: "Horizontal", "Vertical"
+# Default: "Horizontal"
+layout = "Horizontal"
+
+# Default focused panel when TUI starts
+# Options: "Source", "EbpfInfo", "InteractiveCommand"
+# Default: "InteractiveCommand"
+default_focus = "InteractiveCommand"
+
+# Panel size ratios [Source, EbpfInfo, InteractiveCommand]
+# These are relative ratios, e.g., [4, 3, 3] means Source gets 40%, others get 30% each
+# Must be an array of 3 positive numbers
+# Default: [4, 3, 3]
+panel_ratios = [3, 3, 3]

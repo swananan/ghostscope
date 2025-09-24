@@ -1,0 +1,10 @@
+# Test config with errors to verify error handling
+
+[general]
+log_file = "ghostscope.log"
+enable_logging = true
+log_level = "warn"
+
+[ui]
+# This should cause an error
+layout = "horizontal"  # Should be "Horizontal"
