@@ -15,7 +15,7 @@ use tracing::warn;
 #[command(about = "DWARF debug information analysis tool with multiple analysis modes")]
 #[command(author = "swananan")]
 #[command(
-    after_help = "SUBCOMMANDS:\n  source-line (s)   Analyze variables at specific source file:line location\n  function (f)      Find function addresses and analyze variables at those addresses\n  module-addr (m)   Analyze variables at specific module:address location\n  modules (ls)      List all loaded modules\n  benchmark         Performance benchmarking"
+    after_help = "SUBCOMMANDS:\n  source-line (s)   Analyze variables at specific source file:line location\n  function (f)      Find function addresses and analyze variables at those addresses\n  module-addr (m)   Analyze variables at specific module:address location\n  modules (ls)      List all loaded modules\n  source-files (sf) List source files grouped by module\n  benchmark         Performance benchmarking"
 )]
 struct Cli {
     /// Process ID to analyze
@@ -94,6 +94,16 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// List source files grouped by module
+    #[command(name = "source-files", alias = "sf")]
+    SourceFiles {
+        /// Quiet output (module and full paths only)
+        #[arg(short, long)]
+        quiet: bool,
+        /// JSON output
+        #[arg(long)]
+        json: bool,
+    },
     /// Performance benchmark
     #[command(name = "benchmark", alias = "bench")]
     Benchmark {
@@ -143,6 +153,19 @@ struct FunctionModuleInfo {
     addresses: Vec<AddressInfo>,
 }
 
+#[derive(Debug, serde::Serialize)]
+struct ModuleFilesOutput {
+    module: String,
+    files: Vec<SourceFileOutput>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct SourceFileOutput {
+    full_path: String,
+    directory: String,
+    basename: String,
+}
+
 // Helper trait to extract common options from commands
 trait CommonOptions {
     fn verbose(&self) -> bool;
@@ -157,6 +180,7 @@ impl CommonOptions for Commands {
             Commands::Function { verbose, .. } => *verbose,
             Commands::ModuleAddr { verbose, .. } => *verbose,
             Commands::ListModules { .. } => false,
+            Commands::SourceFiles { .. } => false,
             Commands::Benchmark { .. } => false,
         }
     }
@@ -167,6 +191,7 @@ impl CommonOptions for Commands {
             Commands::Function { quiet, .. } => *quiet,
             Commands::ModuleAddr { quiet, .. } => *quiet,
             Commands::ListModules { quiet, .. } => *quiet,
+            Commands::SourceFiles { quiet, .. } => *quiet,
             Commands::Benchmark { .. } => false,
         }
     }
@@ -177,6 +202,7 @@ impl CommonOptions for Commands {
             Commands::Function { json, .. } => *json,
             Commands::ModuleAddr { json, .. } => *json,
             Commands::ListModules { json, .. } => *json,
+            Commands::SourceFiles { json, .. } => *json,
             Commands::Benchmark { .. } => false,
         }
     }
@@ -352,6 +378,9 @@ async fn load_analyzer_and_execute(cli: Cli) -> Result<std::time::Duration> {
         }
         Commands::ListModules { .. } => {
             list_modules(&analyzer, &cli.command);
+        }
+        Commands::SourceFiles { .. } => {
+            list_source_files(&analyzer, &cli.command)?;
         }
         Commands::Benchmark { .. } => unreachable!(), // Handled earlier
     }
@@ -659,6 +688,55 @@ fn list_modules(analyzer: &DwarfAnalyzer, options: &Commands) {
             println!("  [{}] {}", i + 1, module.display());
         }
     }
+}
+
+fn list_source_files(analyzer: &DwarfAnalyzer, options: &Commands) -> Result<()> {
+    let mut grouped = analyzer.get_grouped_file_info_by_module()?;
+    grouped.sort_by(|a, b| a.0.cmp(&b.0));
+    for (_, files) in grouped.iter_mut() {
+        files.sort_by(|a, b| a.full_path.cmp(&b.full_path));
+    }
+
+    if options.json() {
+        let output: Vec<ModuleFilesOutput> = grouped
+            .into_iter()
+            .map(|(module, files)| ModuleFilesOutput {
+                module,
+                files: files
+                    .into_iter()
+                    .map(|file| SourceFileOutput {
+                        full_path: file.full_path,
+                        directory: file.directory,
+                        basename: file.basename,
+                    })
+                    .collect(),
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else if options.quiet() {
+        for (module, files) in grouped {
+            for file in files {
+                println!("{}\t{}", module, file.full_path);
+            }
+        }
+    } else {
+        println!(
+            "Source files grouped by module ({} modules):",
+            grouped.len()
+        );
+        for (module, files) in grouped {
+            println!("\n{}", module);
+            if files.is_empty() {
+                println!("  (no source files)");
+                continue;
+            }
+            for file in files {
+                println!("  {}", file.full_path);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 async fn run_benchmark(pid: Option<u32>, target_path: Option<&str>, runs: usize) -> Result<()> {

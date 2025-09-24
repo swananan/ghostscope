@@ -155,7 +155,7 @@ impl DwarfAnalyzer {
     }
 
     /// Create analyzer from pre-loaded modules (for Builder pattern)
-    pub fn from_modules(pid: u32, modules: Vec<ModuleData>) -> Self {
+    pub(crate) fn from_modules(pid: u32, modules: Vec<ModuleData>) -> Self {
         let mut analyzer = Self {
             pid,
             modules: HashMap::new(),
@@ -176,12 +176,12 @@ impl DwarfAnalyzer {
     }
 
     /// Get module by path
-    pub fn get_module(&self, module_path: &PathBuf) -> Option<&ModuleData> {
+    pub(crate) fn get_module(&self, module_path: &PathBuf) -> Option<&ModuleData> {
         self.modules.get(module_path)
     }
 
     /// Get mutable module by path
-    pub fn get_module_mut(&mut self, module_path: &PathBuf) -> Option<&mut ModuleData> {
+    pub(crate) fn get_module_mut(&mut self, module_path: &PathBuf) -> Option<&mut ModuleData> {
         self.modules.get_mut(module_path)
     }
 
@@ -307,15 +307,13 @@ impl DwarfAnalyzer {
     }
 
     /// Get all source files (cross-module)
-    pub fn get_all_source_files(&self) -> Vec<(PathBuf, Vec<crate::data::SourceFile>)> {
+    pub(crate) fn get_all_source_files(&self) -> Vec<(PathBuf, Vec<crate::parser::SourceFile>)> {
         let mut results = Vec::new();
         for (module_path, _module_data) in &self.modules {
             if let Some(module) = self.get_module(module_path) {
-                let debug_line_stats = module.get_debug_line_stats();
-                if !debug_line_stats.file_paths.is_empty() {
-                    // TODO: Return actual SourceFile objects instead of paths
-                    // This requires exposing file_manager through ModuleData
-                    results.push((module_path.clone(), Vec::new()));
+                let files = module.get_all_files();
+                if !files.is_empty() {
+                    results.push((module_path.clone(), files));
                 }
             }
         }

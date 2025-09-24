@@ -129,7 +129,7 @@ impl DwarfType {
             match size {
                 4 => "f32".to_string(),
                 8 => "f64".to_string(),
-                _ => format!("float{}", size),
+                _ => format!("float{size}"),
             }
         } else if encoding == gimli::DW_ATE_signed || encoding == gimli::DW_ATE_signed_char {
             match size {
@@ -199,9 +199,9 @@ impl DwarfType {
                     format!("{}[]", element_type.type_name())
                 }
             }
-            DwarfType::StructType { name, .. } => format!("struct {}", name),
-            DwarfType::UnionType { name, .. } => format!("union {}", name),
-            DwarfType::EnumType { name, .. } => format!("enum {}", name),
+            DwarfType::StructType { name, .. } => format!("struct {name}"),
+            DwarfType::UnionType { name, .. } => format!("union {name}"),
+            DwarfType::EnumType { name, .. } => format!("enum {name}"),
             DwarfType::TypedefType { name, .. } => name.clone(),
             DwarfType::QualifiedType {
                 qualifier,
@@ -226,7 +226,7 @@ impl DwarfType {
                     .map(|p| p.type_name())
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("{} ({})", return_str, param_str)
+                format!("{return_str} ({param_str})")
             }
             DwarfType::UnknownType { name } => name.clone(),
         }
@@ -357,7 +357,7 @@ impl DwarfType {
         let type_name = self.to_human_readable();
         let size = self.size();
         if size > 0 {
-            format!("{} ({}B)", type_name, size)
+            format!("{type_name} ({size}B)")
         } else {
             type_name
         }
@@ -382,28 +382,28 @@ impl DwarfType {
                 element_count,
                 ..
             } => match element_count {
-                Some(n) => format!("[{} x {}]", n, element_type.to_human_readable()),
+                Some(n) => format!("[{n} x {}]", element_type.to_human_readable()),
                 None => format!("[]{}", element_type.to_human_readable()),
             },
             DwarfType::StructType { name, .. } => {
                 if name.is_empty() {
                     "struct".to_string()
                 } else {
-                    format!("struct {}", name)
+                    format!("struct {name}")
                 }
             }
             DwarfType::UnionType { name, .. } => {
                 if name.is_empty() {
                     "union".to_string()
                 } else {
-                    format!("union {}", name)
+                    format!("union {name}")
                 }
             }
             DwarfType::EnumType { name, .. } => {
                 if name.is_empty() {
                     "enum".to_string()
                 } else {
-                    format!("enum {}", name)
+                    format!("enum {name}")
                 }
             }
             DwarfType::TypedefType {
@@ -436,8 +436,8 @@ impl DwarfType {
                     .collect::<Vec<_>>()
                     .join(", ");
                 match return_type {
-                    Some(ret) => format!("fn({}) -> {}", params_str, ret.to_human_readable()),
-                    None => format!("fn({})", params_str),
+                    Some(ret) => format!("fn({params_str}) -> {}", ret.to_human_readable()),
+                    None => format!("fn({params_str})"),
                 }
             }
             DwarfType::UnknownType { name } => {
@@ -460,10 +460,10 @@ impl fmt::Display for DwarfType {
                 encoding,
             } => {
                 let (_, encoding_str) = Self::format_base_type(name, *size, *encoding);
-                write!(f, "{} ({} {}B)", name, encoding_str, size)
+                write!(f, "{name} ({encoding_str} {size}B)")
             }
             DwarfType::PointerType { target_type, size } => {
-                write!(f, "{}* ({}B)", target_type, size)
+                write!(f, "{target_type}* ({size}B)")
             }
             DwarfType::ArrayType {
                 element_type,
@@ -471,12 +471,12 @@ impl fmt::Display for DwarfType {
                 total_size,
             } => {
                 if let Some(count) = element_count {
-                    write!(f, "{}[{}]", element_type, count)?;
+                    write!(f, "{element_type}[{count}]")?;
                 } else {
-                    write!(f, "{}[]", element_type)?;
+                    write!(f, "{element_type}[]")?;
                 }
                 if let Some(size) = total_size {
-                    write!(f, " ({}B)", size)
+                    write!(f, " ({size}B)")
                 } else {
                     Ok(())
                 }
@@ -507,7 +507,7 @@ impl fmt::Display for DwarfType {
                 name,
                 underlying_type,
             } => {
-                write!(f, "{} -> {}", name, underlying_type)
+                write!(f, "{name} -> {underlying_type}")
             }
             DwarfType::QualifiedType {
                 qualifier,
@@ -531,7 +531,7 @@ impl fmt::Display for DwarfType {
                 write!(f, "fn({} params) -> {}", parameters.len(), return_str)
             }
             DwarfType::UnknownType { name } => {
-                write!(f, "unknown({})", name)
+                write!(f, "unknown({name})")
             }
         }
     }

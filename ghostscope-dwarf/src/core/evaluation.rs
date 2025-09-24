@@ -227,9 +227,9 @@ impl DirectValueResult {
                 }
                 ComputeStep::PushConstant(v) => {
                     if *v >= 0 && *v <= 0xFF {
-                        stack.push(format!("{}", v));
+                        stack.push(format!("{v}"));
                     } else {
-                        stack.push(format!("0x{:x}", v));
+                        stack.push(format!("0x{v:x}"));
                     }
                 }
                 ComputeStep::Add => {
@@ -240,9 +240,9 @@ impl DirectValueResult {
                             && b.parse::<i64>().is_ok()
                             && b.parse::<i64>().unwrap().abs() < 1000
                         {
-                            stack.push(format!("{}+{}", a, b));
+                            stack.push(format!("{a}+{b}"));
                         } else {
-                            stack.push(format!("({}+{})", a, b));
+                            stack.push(format!("({a}+{b})"));
                         }
                     } else {
                         stack.push("?+?".to_string());
@@ -250,100 +250,100 @@ impl DirectValueResult {
                 }
                 ComputeStep::Sub => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
-                        stack.push(format!("({}-{})", a, b));
+                        stack.push(format!("({a}-{b})"));
                     } else {
                         stack.push("?-?".to_string());
                     }
                 }
                 ComputeStep::Mul => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
-                        stack.push(format!("{}*{}", a, b));
+                        stack.push(format!("{a}*{b}"));
                     } else {
                         stack.push("?*?".to_string());
                     }
                 }
                 ComputeStep::Div => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
-                        stack.push(format!("({}/{})", a, b));
+                        stack.push(format!("({a}/{b})"));
                     } else {
                         stack.push("?/?".to_string());
                     }
                 }
                 ComputeStep::Mod => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
-                        stack.push(format!("({}%{})", a, b));
+                        stack.push(format!("({a}%{b})"));
                     } else {
                         stack.push("?%?".to_string());
                     }
                 }
                 ComputeStep::And => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
-                        stack.push(format!("({}&{})", a, b));
+                        stack.push(format!("({a}&{b})"));
                     } else {
                         stack.push("?&?".to_string());
                     }
                 }
                 ComputeStep::Or => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
-                        stack.push(format!("({}|{})", a, b));
+                        stack.push(format!("({a}|{b})"));
                     } else {
                         stack.push("?|?".to_string());
                     }
                 }
                 ComputeStep::Xor => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
-                        stack.push(format!("({}^{})", a, b));
+                        stack.push(format!("({a}^{b})"));
                     } else {
                         stack.push("?^?".to_string());
                     }
                 }
                 ComputeStep::Shl => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
-                        stack.push(format!("({}<<{})", a, b));
+                        stack.push(format!("({a}<<{b})"));
                     } else {
                         stack.push("?<<?".to_string());
                     }
                 }
                 ComputeStep::Shr => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
-                        stack.push(format!("({}>>{})", a, b));
+                        stack.push(format!("({a}>>{b})"));
                     } else {
                         stack.push("?>>?".to_string());
                     }
                 }
                 ComputeStep::Shra => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
-                        stack.push(format!("({}>>>{})", a, b));
+                        stack.push(format!("({a}>>>{b})"));
                     } else {
                         stack.push("?>>>?".to_string());
                     }
                 }
                 ComputeStep::Not => {
                     if let Some(a) = stack.pop() {
-                        stack.push(format!("~{}", a));
+                        stack.push(format!("~{a}"));
                     } else {
                         stack.push("~?".to_string());
                     }
                 }
                 ComputeStep::Neg => {
                     if let Some(a) = stack.pop() {
-                        stack.push(format!("-{}", a));
+                        stack.push(format!("-{a}"));
                     } else {
                         stack.push("-?".to_string());
                     }
                 }
                 ComputeStep::Abs => {
                     if let Some(a) = stack.pop() {
-                        stack.push(format!("|{}|", a));
+                        stack.push(format!("|{a}|"));
                     } else {
                         stack.push("|?|".to_string());
                     }
                 }
                 ComputeStep::Dereference { size } => {
                     if let Some(a) = stack.pop() {
-                        stack.push(format!("*({} as {})", a, size));
+                        stack.push(format!("*({a} as {size})"));
                     } else {
-                        stack.push(format!("*(? as {})", size));
+                        stack.push(format!("*(? as {size})"));
                     }
                 }
                 ComputeStep::Dup => {
@@ -378,42 +378,42 @@ impl DirectValueResult {
                 }
                 ComputeStep::Eq => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
-                        stack.push(format!("({}=={})", a, b));
+                        stack.push(format!("({a}=={b})"));
                     } else {
                         stack.push("?==?".to_string());
                     }
                 }
                 ComputeStep::Ne => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
-                        stack.push(format!("({}!={})", a, b));
+                        stack.push(format!("({a}!={b})"));
                     } else {
                         stack.push("?!=?".to_string());
                     }
                 }
                 ComputeStep::Lt => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
-                        stack.push(format!("({}<{})", a, b));
+                        stack.push(format!("({a}<{b})"));
                     } else {
                         stack.push("?<?".to_string());
                     }
                 }
                 ComputeStep::Le => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
-                        stack.push(format!("({}<={})", a, b));
+                        stack.push(format!("({a}<={b})"));
                     } else {
                         stack.push("?<=?".to_string());
                     }
                 }
                 ComputeStep::Gt => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
-                        stack.push(format!("({}>{})", a, b));
+                        stack.push(format!("({a}>{b})"));
                     } else {
                         stack.push("?>?".to_string());
                     }
                 }
                 ComputeStep::Ge => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
-                        stack.push(format!("({}>={})", a, b));
+                        stack.push(format!("({a}>={b})"));
                     } else {
                         stack.push("?>=?".to_string());
                     }
@@ -423,7 +423,7 @@ impl DirectValueResult {
                     else_branch,
                 } => {
                     if let Some(cond) = stack.pop() {
-                        stack.push(format!("if {} then ... else ...", cond));
+                        stack.push(format!("if {cond} then ... else ..."));
                     } else {
                         stack.push("if ? then ... else ...".to_string());
                     }
@@ -457,8 +457,8 @@ impl LocationResult {
 impl fmt::Display for EvaluationResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            EvaluationResult::DirectValue(dv) => write!(f, "[DirectValue] {}", dv),
-            EvaluationResult::MemoryLocation(loc) => write!(f, "[Memory] {}", loc),
+            EvaluationResult::DirectValue(dv) => write!(f, "[DirectValue] {dv}"),
+            EvaluationResult::MemoryLocation(loc) => write!(f, "[Memory] {loc}"),
             EvaluationResult::Optimized => write!(f, "<optimized out>"),
             EvaluationResult::Composite(pieces) => {
                 write!(f, "Composite[{} pieces]", pieces.len())
@@ -474,16 +474,16 @@ impl fmt::Display for DirectValueResult {
         match self {
             DirectValueResult::Constant(c) => {
                 if *c >= 0 && *c <= 0xFF {
-                    write!(f, "{} (0x{:x})", c, c)
+                    write!(f, "{c} (0x{c:x})")
                 } else {
-                    write!(f, "0x{:x}", c)
+                    write!(f, "0x{c:x}")
                 }
             }
             DirectValueResult::RegisterValue(r) => {
                 if let Some(name) = dwarf_reg_to_name(*r) {
-                    write!(f, "{}", name)
+                    write!(f, "{name}")
                 } else {
-                    write!(f, "r{}", r)
+                    write!(f, "r{r}")
                 }
             }
             DirectValueResult::ImplicitValue(bytes) => {
@@ -493,7 +493,7 @@ impl fmt::Display for DirectValueResult {
                         if i > 0 {
                             write!(f, " ")?;
                         }
-                        write!(f, "{:02x}", b)?;
+                        write!(f, "{b:02x}")?;
                     }
                     write!(f, "]")
                 } else {
@@ -509,7 +509,7 @@ impl fmt::Display for DirectValueResult {
 
                 // Simple expression builder for common patterns
                 let expr = Self::steps_to_expression(steps);
-                write!(f, "{}", expr)
+                write!(f, "{expr}")
             }
         }
     }
@@ -520,28 +520,42 @@ impl fmt::Display for LocationResult {
         use ghostscope_platform::register_mapping::dwarf_reg_to_name;
 
         match self {
-            LocationResult::Address(addr) => write!(f, "@0x{:x}", addr),
+            LocationResult::Address(addr) => write!(f, "@0x{addr:x}"),
             LocationResult::RegisterAddress {
                 register,
                 offset,
                 size,
             } => {
-                let reg_name = dwarf_reg_to_name(*register).unwrap_or_else(|| "r?");
+                let reg_name = dwarf_reg_to_name(*register).unwrap_or("r?");
 
                 match (offset, size) {
-                    (Some(o), Some(s)) if *o >= 0 => write!(f, "@[{}+{}]:{}", reg_name, o, s),
-                    (Some(o), Some(s)) => write!(f, "@[{}-{}]:{}", reg_name, -o, s),
-                    (Some(o), None) if *o >= 0 => write!(f, "@[{}+{}]", reg_name, o),
-                    (Some(o), None) => write!(f, "@[{}-{}]", reg_name, -o),
-                    (None, Some(s)) => write!(f, "@[{}]:{}", reg_name, s),
-                    (None, None) => write!(f, "@[{}]", reg_name),
+                    (Some(o), Some(s)) => {
+                        let offset = *o;
+                        if offset >= 0 {
+                            write!(f, "@[{reg_name}+{offset}]:{s}")
+                        } else {
+                            let neg = -offset;
+                            write!(f, "@[{reg_name}-{neg}]:{s}")
+                        }
+                    }
+                    (Some(o), None) => {
+                        let offset = *o;
+                        if offset >= 0 {
+                            write!(f, "@[{reg_name}+{offset}]")
+                        } else {
+                            let neg = -offset;
+                            write!(f, "@[{reg_name}-{neg}]")
+                        }
+                    }
+                    (None, Some(s)) => write!(f, "@[{reg_name}]:{s}"),
+                    (None, None) => write!(f, "@[{reg_name}]"),
                 }
             }
             LocationResult::ComputedLocation { steps } => {
                 // Convert compute steps to a readable expression for the address
                 write!(f, "@[")?;
                 let expr = Self::steps_to_expression(steps);
-                write!(f, "{}]", expr)
+                write!(f, "{expr}]")
             }
         }
     }
@@ -565,13 +579,13 @@ impl fmt::Display for ComputeStep {
         match self {
             ComputeStep::LoadRegister(r) => {
                 if let Some(name) = dwarf_reg_to_name(*r) {
-                    write!(f, "load {}", name)
+                    write!(f, "load {name}")
                 } else {
-                    write!(f, "load r{}", r)
+                    write!(f, "load r{r}")
                 }
             }
-            ComputeStep::PushConstant(v) => write!(f, "push {}", v),
-            ComputeStep::Dereference { size } => write!(f, "deref {}", size),
+            ComputeStep::PushConstant(v) => write!(f, "push {v}"),
+            ComputeStep::Dereference { size } => write!(f, "deref {size}"),
             ComputeStep::Add => write!(f, "add"),
             ComputeStep::Sub => write!(f, "sub"),
             ComputeStep::Mul => write!(f, "mul"),
@@ -590,7 +604,7 @@ impl fmt::Display for ComputeStep {
             ComputeStep::Drop => write!(f, "drop"),
             ComputeStep::Swap => write!(f, "swap"),
             ComputeStep::Rot => write!(f, "rot"),
-            ComputeStep::Pick(n) => write!(f, "pick {}", n),
+            ComputeStep::Pick(n) => write!(f, "pick {n}"),
             ComputeStep::Eq => write!(f, "eq"),
             ComputeStep::Ne => write!(f, "ne"),
             ComputeStep::Lt => write!(f, "lt"),

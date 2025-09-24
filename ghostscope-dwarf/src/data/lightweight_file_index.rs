@@ -5,14 +5,13 @@
 //! - Shared line table support to avoid duplication
 //! - DWARF version-aware file indexing (1-based vs 0-based)
 
+use crate::data::path::resolve_file_path;
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::{Arc, Mutex};
-use tracing::debug;
 
 /// Minimal file entry mimicking GDB's file_entry design
 #[derive(Debug, Clone)]
-pub struct LightweightFileEntry {
+pub(crate) struct LightweightFileEntry {
     /// Original DWARF file index within its compilation unit
     pub file_index: u64,
     /// Directory index from DWARF (0 = comp_dir)
@@ -36,7 +35,7 @@ impl LightweightFileEntry {
 /// - Shared compilation directory to reduce memory
 /// - Support for DWARF 4/5 version differences
 #[derive(Debug)]
-pub struct LightweightFileIndex {
+pub(crate) struct LightweightFileIndex {
     /// Compilation directory from DW_AT_comp_dir (shared across all files)
     comp_dir: Option<Arc<str>>,
 
@@ -142,39 +141,15 @@ impl LightweightFileIndex {
     /// Compute full path from directory_index and filename
     fn compute_full_path(&self, directory_index: u64, filename: &str) -> String {
         // Handle absolute paths
-        if Path::new(filename).is_absolute() {
-            return filename.to_string();
-        }
+        let comp_dir = self.comp_dir.as_deref().unwrap_or("");
 
-        // Get directory path
-        let directory_path = if directory_index == 0 {
-            // index 0 = compilation directory
-            self.comp_dir.as_ref().map(|s| s.as_ref()).unwrap_or(".")
-        } else {
-            // Get from directories table (handle DWARF 4/5 differences)
-            let dir_array_index = if self.dwarf_version >= 5 {
-                // DWARF 5: directory_index=1 maps to directories[0]
-                (directory_index - 1) as usize
-            } else {
-                // DWARF 4: 1-based directory indexing
-                if directory_index == 0 {
-                    return filename.to_string();
-                }
-                (directory_index - 1) as usize
-            };
-
-            self.directories
-                .get(dir_array_index)
-                .map(|s| s.as_ref())
-                .unwrap_or(".")
-        };
-
-        // Combine directory and filename
-        if directory_path == "." || directory_path.is_empty() {
-            filename.to_string()
-        } else {
-            format!("{}/{}", directory_path, filename)
-        }
+        resolve_file_path(
+            self.dwarf_version,
+            comp_dir,
+            &self.directories,
+            directory_index,
+            filename,
+        )
     }
 
     /// Get statistics
@@ -196,7 +171,7 @@ impl LightweightFileIndex {
 /// Scoped file index manager that maintains per-CU file indices
 /// This replaces the heavy FileIndexManager with minimal memory overhead
 #[derive(Debug)]
-pub struct ScopedFileIndexManager {
+pub(crate) struct ScopedFileIndexManager {
     /// Per-compilation-unit file indices: cu_name -> file_index
     /// This is the primary lookup method, avoiding cross-CU conflicts
     cu_file_indices: HashMap<Arc<str>, Arc<LightweightFileIndex>>,
@@ -265,6 +240,11 @@ impl ScopedFileIndexManager {
             .get_full_path(file_index_ref)
             .unwrap_or_else(|| file_entry.filename.to_string());
 
+        let directory_path = std::path::Path::new(&full_path)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
         tracing::debug!(
             "  Resolved file_index={} -> filename='{}', full_path='{}'",
             file_index,
@@ -277,68 +257,14 @@ impl ScopedFileIndexManager {
             file_index: file_entry.file_index,
             compilation_unit: compilation_unit.to_string(),
             directory_index: file_entry.directory_index,
-            directory_path: String::new(), // Computed on-demand
+            directory_path,
             filename: file_entry.filename.to_string(),
             full_path,
         })
     }
-
-    /// Smart path lookup with fallback strategies (compatibility method)
-    pub fn smart_path_lookup(&self, query_path: &str) -> Option<FileInfo> {
-        // Strategy 1: Try to find by basename across all CUs
-        let basename = Path::new(query_path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(query_path);
-
-        for (cu_name, file_index) in &self.cu_file_indices {
-            for file_entry in file_index.file_entries() {
-                if file_entry.filename.as_ref() == basename {
-                    let full_path = file_entry
-                        .get_full_path(file_index)
-                        .unwrap_or_else(|| file_entry.filename.to_string());
-
-                    // Check if this matches our query
-                    if full_path == query_path
-                        || full_path.ends_with(query_path)
-                        || query_path.ends_with(&full_path)
-                    {
-                        debug!(
-                            "Found file via smart lookup: {} -> {}",
-                            query_path, full_path
-                        );
-                        return Some(FileInfo {
-                            file_index: file_entry.file_index,
-                            compilation_unit: cu_name.to_string(),
-                            directory_index: file_entry.directory_index,
-                            directory_path: String::new(),
-                            filename: file_entry.filename.to_string(),
-                            full_path,
-                        });
-                    }
-                }
-            }
-        }
-
-        debug!("No file found for path: {}", query_path);
-        None
-    }
-
     /// Get statistics (total files, total compilation units)
     pub fn get_stats(&self) -> (usize, usize) {
         (self.total_files, self.total_compilation_units)
-    }
-
-    /// Check if manager is empty
-    pub fn is_empty(&self) -> bool {
-        self.cu_file_indices.is_empty()
-    }
-
-    /// Get file entries for a specific compilation unit
-    pub fn get_cu_file_entries(&self, compilation_unit: &str) -> Option<&[LightweightFileEntry]> {
-        self.cu_file_indices
-            .get(compilation_unit)
-            .map(|index| index.file_entries())
     }
 
     /// Get file index for a specific compilation unit
@@ -365,7 +291,7 @@ impl Default for ScopedFileIndexManager {
 /// Compatibility layer: FileInfo struct to maintain API compatibility
 /// This will eventually be phased out in favor of direct LightweightFileEntry usage
 #[derive(Debug, Clone)]
-pub struct FileInfo {
+pub(crate) struct FileInfo {
     pub file_index: u64,
     pub compilation_unit: String,
     pub directory_index: u64,

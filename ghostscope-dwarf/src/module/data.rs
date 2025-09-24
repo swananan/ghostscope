@@ -25,13 +25,16 @@ use crate::{
     core::{MappedFile, Result, SourceLocation},
     data::{
         CfiIndex, LightweightIndex, LineMappingTable, OnDemandResolver, ScopedFileIndexManager,
-        SourceFileManager,
     },
+    parser::{CompilationUnit, SourceFile},
     proc_mapping::ModuleMapping,
 };
 use gimli::{EndianSlice, LittleEndian};
 use object::{Object, ObjectSection};
-use std::{collections::HashSet, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
 /// Module loading state for error tracking and UI display
 #[derive(Debug, Clone)]
@@ -55,10 +58,10 @@ pub(crate) struct ModuleData {
     lightweight_index: LightweightIndex,
     /// Line mapping table (address→line lookup)
     line_mapping: LineMappingTable,
-    /// File manager for source files (legacy compatibility)
-    file_manager: SourceFileManager,
     /// Lightweight scoped file index manager (primary file management)
-    scoped_file_manager: Option<ScopedFileIndexManager>,
+    scoped_file_manager: ScopedFileIndexManager,
+    /// Compilation unit metadata (base dir, include dirs, file list)
+    compilation_units: HashMap<String, CompilationUnit>,
     /// CFI index for CFA lookup
     cfi_index: Option<CfiIndex>,
     /// On-demand resolver (for detailed parsing)
@@ -192,8 +195,8 @@ impl ModuleData {
             load_state,
             lightweight_index: parse_result.lightweight_index,
             line_mapping: parse_result.line_mapping,
-            file_manager: parse_result.source_file_manager,
-            scoped_file_manager: parse_result.scoped_file_manager, // Use optimized scoped file manager from parallel parsing
+            scoped_file_manager: parse_result.scoped_file_manager,
+            compilation_units: parse_result.compilation_units,
             cfi_index,
             resolver,
             stats: parse_result.stats,
@@ -436,26 +439,27 @@ impl ModuleData {
         }
 
         // Fallback: try to find any main source file in the same compilation unit
-        if let Some(ref scoped_manager) = self.scoped_file_manager {
-            if let Some(cu_file_index) = scoped_manager.get_cu_file_index(&entry.compilation_unit) {
-                for file_entry in cu_file_index.file_entries() {
-                    if let Some(full_path) = file_entry.get_full_path(cu_file_index) {
-                        let is_source = full_path.ends_with(".c")
-                            || full_path.ends_with(".cpp")
-                            || full_path.ends_with(".cc")
-                            || full_path.ends_with(".rs")
-                            || (full_path.contains(&entry.compilation_unit)
-                                && !full_path.ends_with(".h"));
+        if let Some(cu_file_index) = self
+            .scoped_file_manager
+            .get_cu_file_index(&entry.compilation_unit)
+        {
+            for file_entry in cu_file_index.file_entries() {
+                if let Some(full_path) = file_entry.get_full_path(cu_file_index) {
+                    let is_source = full_path.ends_with(".c")
+                        || full_path.ends_with(".cpp")
+                        || full_path.ends_with(".cc")
+                        || full_path.ends_with(".rs")
+                        || (full_path.contains(&entry.compilation_unit)
+                            && !full_path.ends_with(".h"));
 
-                        if is_source {
-                            tracing::debug!(
-                                "find_alternative_source_file: using main source file '{}' from compilation unit",
-                                full_path
-                            );
+                    if is_source {
+                        tracing::debug!(
+                            "find_alternative_source_file: using main source file '{}' from compilation unit",
+                            full_path
+                        );
 
-                            // Return the original entry - we'll modify the file lookup in create_source_location_from_entry
-                            return None; // We'll handle this in the create_source_location_from_entry method
-                        }
+                        // Return the original entry - we'll modify the file lookup in create_source_location_from_entry
+                        return None; // We'll handle this in the create_source_location_from_entry method
                     }
                 }
             }
@@ -569,12 +573,11 @@ impl ModuleData {
         }
 
         // Fallback to file index lookup if needed
-        if let Some(ref scoped_manager) = self.scoped_file_manager {
-            if let Some(file_info) =
-                scoped_manager.lookup_by_scoped_index(&entry.compilation_unit, entry.file_index)
-            {
-                return Some(file_info.full_path);
-            }
+        if let Some(file_info) = self
+            .scoped_file_manager
+            .lookup_by_scoped_index(&entry.compilation_unit, entry.file_index)
+        {
+            return Some(file_info.full_path);
         }
 
         Some(entry.compilation_unit.clone())
@@ -599,24 +602,21 @@ impl ModuleData {
                 || line_entry.compilation_unit.ends_with(".rs"))
         {
             // Try to get base directory from file index resolution
-            let full_path = if let Some(ref scoped_manager) = self.scoped_file_manager {
-                if let Some(file_info) = scoped_manager
-                    .lookup_by_scoped_index(&line_entry.compilation_unit, line_entry.file_index)
+            let full_path = if let Some(file_info) = self
+                .scoped_file_manager
+                .lookup_by_scoped_index(&line_entry.compilation_unit, line_entry.file_index)
+            {
+                // Extract base directory from the resolved absolute path
+                let resolved_path = &file_info.full_path;
+                if let Some(base_dir) =
+                    self.extract_base_directory(resolved_path, &line_entry.compilation_unit)
                 {
-                    // Extract base directory from the resolved absolute path
-                    let resolved_path = &file_info.full_path;
-                    if let Some(base_dir) =
-                        self.extract_base_directory(resolved_path, &line_entry.compilation_unit)
-                    {
-                        let full_path = format!("{}/{}", base_dir, line_entry.compilation_unit);
-                        tracing::debug!(
-                            "create_source_location_from_entry: constructed full path '{}' from base_dir='{}' + compilation_unit='{}'",
-                            full_path, base_dir, line_entry.compilation_unit
-                        );
-                        full_path
-                    } else {
-                        line_entry.compilation_unit.clone()
-                    }
+                    let full_path = format!("{}/{}", base_dir, line_entry.compilation_unit);
+                    tracing::debug!(
+                        "create_source_location_from_entry: constructed full path '{}' from base_dir='{}' + compilation_unit='{}'",
+                        full_path, base_dir, line_entry.compilation_unit
+                    );
+                    full_path
                 } else {
                     line_entry.compilation_unit.clone()
                 }
@@ -633,44 +633,31 @@ impl ModuleData {
         }
 
         // Try to find a better file if current one is a header
-        let preferred_file_path = if let Some(ref scoped_manager) = self.scoped_file_manager {
-            if let Some(file_info) = scoped_manager
-                .lookup_by_scoped_index(&line_entry.compilation_unit, line_entry.file_index)
-            {
-                let current_path = &file_info.full_path;
-                tracing::debug!(
-                    "create_source_location_from_entry: found file via ScopedFileIndexManager: '{}'",
-                    current_path
-                );
+        let preferred_file_path = if let Some(file_info) = self
+            .scoped_file_manager
+            .lookup_by_scoped_index(&line_entry.compilation_unit, line_entry.file_index)
+        {
+            let current_path = &file_info.full_path;
+            tracing::debug!(
+                "create_source_location_from_entry: found file via ScopedFileIndexManager: '{}'",
+                current_path
+            );
 
-                // If current file is a header, try to find the main source file
-                if self.is_header_file(current_path) {
-                    if let Some(alternative_path) =
-                        self.find_main_source_file_in_cu(&line_entry.compilation_unit)
-                    {
-                        tracing::debug!(
-                            "create_source_location_from_entry: replaced header '{}' with main source '{}'",
-                            current_path, alternative_path
-                        );
-                        alternative_path
-                    } else {
-                        current_path.clone()
-                    }
+            // If current file is a header, try to find the main source file
+            if self.is_header_file(current_path) {
+                if let Some(alternative_path) =
+                    self.find_main_source_file_in_cu(&line_entry.compilation_unit)
+                {
+                    tracing::debug!(
+                        "create_source_location_from_entry: replaced header '{}' with main source '{}'",
+                        current_path, alternative_path
+                    );
+                    alternative_path
                 } else {
                     current_path.clone()
                 }
-            } else if !line_entry.file_path.is_empty() {
-                tracing::debug!(
-                    "create_source_location_from_entry: using line entry file_path: '{}'",
-                    line_entry.file_path
-                );
-                line_entry.file_path.clone()
             } else {
-                tracing::debug!(
-                    "create_source_location_from_entry: no file info found via ScopedFileIndexManager, using compilation unit name: '{}'",
-                    line_entry.compilation_unit
-                );
-                line_entry.compilation_unit.clone()
+                current_path.clone()
             }
         } else if !line_entry.file_path.is_empty() {
             tracing::debug!(
@@ -710,47 +697,41 @@ impl ModuleData {
 
     /// Find the main source file in the compilation unit
     fn find_main_source_file_in_cu(&self, compilation_unit: &str) -> Option<String> {
-        if let Some(ref scoped_manager) = self.scoped_file_manager {
-            if let Some(cu_file_index) = scoped_manager.get_cu_file_index(compilation_unit) {
-                tracing::debug!(
-                    "find_main_source_file_in_cu: searching for main source file in CU '{}'",
-                    compilation_unit
-                );
+        if let Some(cu_file_index) = self.scoped_file_manager.get_cu_file_index(compilation_unit) {
+            tracing::debug!(
+                "find_main_source_file_in_cu: searching for main source file in CU '{}'",
+                compilation_unit
+            );
 
-                // First priority: look for files that match the compilation unit name
-                for file_entry in cu_file_index.file_entries() {
-                    if let Some(full_path) = file_entry.get_full_path(cu_file_index) {
-                        if !self.is_header_file(&full_path) {
-                            // Check if this file matches the compilation unit name
-                            if let Some(cu_stem) =
-                                std::path::Path::new(compilation_unit).file_stem()
-                            {
-                                if let Some(file_stem) =
-                                    std::path::Path::new(&full_path).file_stem()
-                                {
-                                    if cu_stem == file_stem {
-                                        tracing::debug!(
-                                            "find_main_source_file_in_cu: found matching source file '{}'",
-                                            full_path
-                                        );
-                                        return Some(full_path);
-                                    }
+            // First priority: look for files that match the compilation unit name
+            for file_entry in cu_file_index.file_entries() {
+                if let Some(full_path) = file_entry.get_full_path(cu_file_index) {
+                    if !self.is_header_file(&full_path) {
+                        // Check if this file matches the compilation unit name
+                        if let Some(cu_stem) = std::path::Path::new(compilation_unit).file_stem() {
+                            if let Some(file_stem) = std::path::Path::new(&full_path).file_stem() {
+                                if cu_stem == file_stem {
+                                    tracing::debug!(
+                                        "find_main_source_file_in_cu: found matching source file '{}'",
+                                        full_path
+                                    );
+                                    return Some(full_path);
                                 }
                             }
                         }
                     }
                 }
+            }
 
-                // Second priority: any non-header file
-                for file_entry in cu_file_index.file_entries() {
-                    if let Some(full_path) = file_entry.get_full_path(cu_file_index) {
-                        if !self.is_header_file(&full_path) {
-                            tracing::debug!(
-                                "find_main_source_file_in_cu: found alternative source file '{}'",
-                                full_path
-                            );
-                            return Some(full_path);
-                        }
+            // Second priority: any non-header file
+            for file_entry in cu_file_index.file_entries() {
+                if let Some(full_path) = file_entry.get_full_path(cu_file_index) {
+                    if !self.is_header_file(&full_path) {
+                        tracing::debug!(
+                            "find_main_source_file_in_cu: found alternative source file '{}'",
+                            full_path
+                        );
+                        return Some(full_path);
                     }
                 }
             }
@@ -814,7 +795,7 @@ impl ModuleData {
 
     /// Get line header count for debugging (legacy compatibility)
     pub(crate) fn get_line_header_count(&self) -> usize {
-        self.file_manager.get_stats().1 // compilation unit count as proxy
+        self.scoped_file_manager.get_stats().1
     }
 
     /// Get cache statistics
@@ -850,19 +831,30 @@ impl ModuleData {
 
     /// Get debug_line parsing statistics
     pub(crate) fn get_debug_line_stats(&self) -> DebugLineStats {
-        let (total_files, _total_compilation_units) = self.file_manager.get_stats();
+        let (total_files, _) = self.scoped_file_manager.get_stats();
+
+        let mut seen = HashSet::new();
+        let mut sample_paths = Vec::new();
+
+        for cu in self.compilation_units.values() {
+            for file in &cu.files {
+                if seen.insert(file.full_path.clone()) {
+                    sample_paths.push(PathBuf::from(file.full_path.clone()));
+                    if sample_paths.len() >= 10 {
+                        break;
+                    }
+                }
+            }
+            if sample_paths.len() >= 10 {
+                break;
+            }
+        }
 
         DebugLineStats {
             total_line_entries: self.line_mapping.total_entries(),
             file_count: total_files,
             address_range: self.line_mapping.address_range(),
-            file_paths: self
-                .file_manager
-                .get_all_files()
-                .iter()
-                .take(10)
-                .map(|f| PathBuf::from(&f.full_path))
-                .collect(),
+            file_paths: sample_paths,
         }
     }
 
@@ -908,56 +900,19 @@ impl ModuleData {
         }
     }
 
-    /// Get all source files from scoped file manager (updated method)
-    pub(crate) fn get_all_files(&self) -> Vec<crate::data::SourceFile> {
-        if let Some(ref scoped_manager) = self.scoped_file_manager {
-            self.extract_source_files_from_scoped_manager(scoped_manager)
-        } else {
-            // Fallback to legacy file manager if scoped manager is not available
-            self.file_manager
-                .get_all_files()
-                .into_iter()
-                .cloned()
-                .collect()
-        }
-    }
-
-    /// Extract source files from scoped file manager
-    fn extract_source_files_from_scoped_manager(
-        &self,
-        scoped_manager: &ScopedFileIndexManager,
-    ) -> Vec<crate::data::SourceFile> {
+    /// Get all source files from stored compilation unit metadata
+    pub(crate) fn get_all_files(&self) -> Vec<SourceFile> {
         let mut source_files = Vec::new();
         let mut seen_paths = HashSet::new();
 
-        // Iterate through all compilation units and their files
-        for (cu_name, cu_file_index) in scoped_manager.iter_all_cu_files() {
-            for file_entry in cu_file_index.file_entries() {
-                if let Some(full_path) = file_entry.get_full_path(cu_file_index) {
-                    // Deduplicate by full path
-                    if seen_paths.insert(full_path.clone()) {
-                        // Create SourceFile from file entry information
-                        let directory_path = std::path::Path::new(&full_path)
-                            .parent()
-                            .map(|p| p.to_string_lossy().to_string())
-                            .unwrap_or_else(|| ".".to_string());
-
-                        let filename = file_entry.filename.to_string();
-
-                        source_files.push(crate::data::SourceFile {
-                            file_index: file_entry.file_index,
-                            compilation_unit: cu_name.to_string(),
-                            directory_index: file_entry.directory_index,
-                            directory_path,
-                            filename,
-                            full_path,
-                        });
-                    }
+        for cu in self.compilation_units.values() {
+            for file in &cu.files {
+                if seen_paths.insert(file.full_path.clone()) {
+                    source_files.push(file.clone());
                 }
             }
         }
 
-        // Sort by full path for consistent ordering
         source_files.sort_by(|a, b| a.full_path.cmp(&b.full_path));
         source_files
     }

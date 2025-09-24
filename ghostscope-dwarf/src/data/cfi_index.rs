@@ -307,13 +307,14 @@ impl CfiIndex {
     }
 
     /// Extract required registers from compute steps
-
+    #[allow(dead_code)]
     /// Check if fast lookup is available
     pub fn has_fast_lookup(&self) -> bool {
         self.has_fast_lookup
     }
 
     /// Get statistics about the CFI index
+    #[allow(dead_code)]
     pub fn get_stats(&self) -> CfiStats {
         CfiStats {
             has_eh_frame_hdr: self.eh_frame_hdr.is_some(),
@@ -323,6 +324,7 @@ impl CfiIndex {
 }
 
 /// Statistics about CFI index
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct CfiStats {
     pub has_eh_frame_hdr: bool,
@@ -331,8 +333,6 @@ pub struct CfiStats {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_cfi_index_creation() {
         // This would need a real ELF file for testing

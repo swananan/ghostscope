@@ -94,7 +94,7 @@ pub struct IndexEntry {
 }
 
 /// Index flags (inspired by GDB's cooked_index_flag_enum)
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct IndexFlags {
     /// True if this entry represents a "static" object
     pub is_static: bool,
@@ -108,19 +108,6 @@ pub struct IndexFlags {
     pub is_type_declaration: bool,
     /// True if this entry was synthesized (not directly from DWARF)
     pub is_synthesized: bool,
-}
-
-impl Default for IndexFlags {
-    fn default() -> Self {
-        Self {
-            is_static: false,
-            is_main: false,
-            is_inline: false,
-            is_linkage: false,
-            is_type_declaration: false,
-            is_synthesized: false,
-        }
-    }
 }
 
 /// Line entry with flags (for debug_line parsing)
