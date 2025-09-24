@@ -35,6 +35,38 @@ pub enum TypeEncoding {
     Error = 0x82,
 }
 
+impl TypeEncoding {
+    /// Convert a u8 value to TypeEncoding enum
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            x if x == (Self::U8 as u8) => Some(Self::U8),
+            x if x == (Self::U16 as u8) => Some(Self::U16),
+            x if x == (Self::U32 as u8) => Some(Self::U32),
+            x if x == (Self::U64 as u8) => Some(Self::U64),
+            x if x == (Self::I8 as u8) => Some(Self::I8),
+            x if x == (Self::I16 as u8) => Some(Self::I16),
+            x if x == (Self::I32 as u8) => Some(Self::I32),
+            x if x == (Self::I64 as u8) => Some(Self::I64),
+            x if x == (Self::F32 as u8) => Some(Self::F32),
+            x if x == (Self::F64 as u8) => Some(Self::F64),
+            x if x == (Self::Bool as u8) => Some(Self::Bool),
+            x if x == (Self::Char as u8) => Some(Self::Char),
+            x if x == (Self::Pointer as u8) => Some(Self::Pointer),
+            x if x == (Self::NullPointer as u8) => Some(Self::NullPointer),
+            x if x == (Self::Struct as u8) => Some(Self::Struct),
+            x if x == (Self::Array as u8) => Some(Self::Array),
+            x if x == (Self::Union as u8) => Some(Self::Union),
+            x if x == (Self::Enum as u8) => Some(Self::Enum),
+            x if x == (Self::CString as u8) => Some(Self::CString),
+            x if x == (Self::String as u8) => Some(Self::String),
+            x if x == (Self::Unknown as u8) => Some(Self::Unknown),
+            x if x == (Self::OptimizedOut as u8) => Some(Self::OptimizedOut),
+            x if x == (Self::Error as u8) => Some(Self::Error),
+            _ => None,
+        }
+    }
+}
+
 /// Protocol constants
 pub mod consts {
     pub const MAGIC: u32 = 0x43484C53; // "CHLS" (Chelsea)
@@ -73,4 +105,20 @@ pub mod consts {
     /// Instruction header size
     pub const INSTRUCTION_HEADER_SIZE: usize =
         std::mem::size_of::<crate::trace_event::InstructionHeader>();
+
+    // TraceEventMessage field offsets
+    pub const TRACE_EVENT_MESSAGE_TRACE_ID_OFFSET: usize = 0;
+    pub const TRACE_EVENT_MESSAGE_TIMESTAMP_OFFSET: usize = 8;
+    pub const TRACE_EVENT_MESSAGE_PID_OFFSET: usize = 16;
+    pub const TRACE_EVENT_MESSAGE_TID_OFFSET: usize = 20;
+
+    // InstructionHeader field offsets
+    pub const INSTRUCTION_HEADER_INST_TYPE_OFFSET: usize = 0;
+    pub const INSTRUCTION_HEADER_DATA_LENGTH_OFFSET: usize = 1;
+    pub const INSTRUCTION_HEADER_RESERVED_OFFSET: usize = 3;
+
+    // EndInstructionData relative offset from InstructionHeader start
+    pub const END_INSTRUCTION_DATA_OFFSET: usize = 4;
+    pub const END_INSTRUCTION_TOTAL_INSTRUCTIONS_OFFSET: usize = 0; // Within EndInstructionData
+    pub const END_INSTRUCTION_EXECUTION_STATUS_OFFSET: usize = 2; // Within EndInstructionData
 }

@@ -99,41 +99,23 @@ impl EbpfPanelRenderer {
 
             let mut body_lines: Vec<Line> = Vec::new();
 
-            // Handle trace event format with instructions
-            let instructions = &trace.instructions;
+            // Use formatted output for better display (same as CLI)
+            let formatted_output = trace.to_formatted_output();
             let indent = "  ";
-            for instruction in instructions {
-                let instruction_type = instruction.instruction_type();
 
-                // Skip EndInstruction - don't display it
-                if instruction_type == "EndInstruction" {
-                    continue;
-                }
-
-                // Get optimized display string based on instruction type
-                let display_string = match instruction {
-                    ghostscope_protocol::ParsedInstruction::PrintString { content } => {
-                        // For print strings, show just the content
-                        content.clone()
-                    }
-                    _ => {
-                        // For variables and other instructions, use normal display
-                        instruction.to_display_string()
-                    }
+            // Display formatted output lines using to_formatted_output()
+            for output_line in formatted_output {
+                let color = if output_line.contains("ERROR") || output_line.contains("Error") {
+                    Color::Red
+                } else if output_line.contains("WARN") || output_line.contains("Warning") {
+                    Color::Yellow
+                } else {
+                    Color::Cyan
                 };
 
-                // Choose color based on instruction type
-                let color = match instruction_type.as_str() {
-                    "PrintString" => Color::Cyan,
-                    "PrintVariable" => Color::White,
-                    "PrintVariableError" => Color::Red,
-                    "Backtrace" => Color::Yellow,
-                    _ => Color::Gray,
-                };
-
-                // Wrap long instruction output
+                // Wrap long output lines
                 let wrap_width = content_width.saturating_sub(indent.len());
-                let wrapped_lines = Self::wrap_text(&display_string, wrap_width);
+                let wrapped_lines = Self::wrap_text(&output_line, wrap_width);
 
                 for (i, seg) in wrapped_lines.into_iter().enumerate() {
                     let line_indent = if i == 0 { indent } else { "    " }; // Extra indent for continuation
@@ -141,13 +123,7 @@ impl EbpfPanelRenderer {
                         Span::raw(line_indent),
                         Span::styled(
                             seg,
-                            Style::default().fg(color).add_modifier(
-                                if instruction_type == "PrintVariable" {
-                                    Modifier::BOLD
-                                } else {
-                                    Modifier::empty()
-                                },
-                            ),
+                            Style::default().fg(color).add_modifier(Modifier::empty()),
                         ),
                     ]));
                 }

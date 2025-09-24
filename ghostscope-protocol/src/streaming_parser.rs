@@ -15,6 +15,9 @@ pub enum ParsedInstruction {
         formatted_value: String,
         raw_data: Vec<u8>,
     },
+    PrintFormat {
+        formatted_output: String,
+    },
     PrintVariableError {
         name: String,
         error_code: u8,
@@ -37,6 +40,86 @@ pub struct ParsedTraceEvent {
     pub pid: u32,
     pub tid: u32,
     pub instructions: Vec<ParsedInstruction>,
+}
+
+impl ParsedTraceEvent {
+    /// Generate a formatted display output by combining format strings with variables
+    /// This handles the pattern: PrintString + PrintVariable sequence
+    pub fn to_formatted_output(&self) -> Vec<String> {
+        let mut output = Vec::new();
+        let mut i = 0;
+
+        while i < self.instructions.len() {
+            match &self.instructions[i] {
+                ParsedInstruction::PrintString { content } => {
+                    // Check if this looks like a format string (contains {})
+                    if content.contains("{}") {
+                        // Try to find corresponding variables
+                        let (formatted, consumed) =
+                            self.format_string_with_variables(content, i + 1);
+                        output.push(formatted);
+                        i += consumed; // Skip the variables we consumed
+                    } else {
+                        // Regular string, just add it
+                        output.push(content.clone());
+                        i += 1;
+                    }
+                }
+                ParsedInstruction::PrintFormat { formatted_output } => {
+                    // Already formatted, just add it
+                    output.push(formatted_output.clone());
+                    i += 1;
+                }
+                ParsedInstruction::EndInstruction { .. } => {
+                    // Skip EndInstruction - it's for protocol control, not user output
+                    i += 1;
+                }
+                instruction => {
+                    // Other instructions (variables without format string, etc.)
+                    output.push(instruction.to_display_string());
+                    i += 1;
+                }
+            }
+        }
+
+        output
+    }
+
+    /// Format a format string with following variable instructions
+    fn format_string_with_variables(
+        &self,
+        format_string: &str,
+        start_index: usize,
+    ) -> (String, usize) {
+        // Count placeholders in format string
+        let placeholder_count = format_string.matches("{}").count();
+
+        // Collect variable values
+        let mut variables = Vec::new();
+        let mut consumed = 1; // At least consume the format string itself
+
+        for i in start_index..(start_index + placeholder_count).min(self.instructions.len()) {
+            if let ParsedInstruction::PrintVariable {
+                formatted_value, ..
+            } = &self.instructions[i]
+            {
+                variables.push(formatted_value.clone());
+                consumed += 1;
+            } else {
+                break; // Not a variable, stop collecting
+            }
+        }
+
+        // Apply formatting
+        let mut result = format_string.to_string();
+        for value in variables {
+            if let Some(pos) = result.find("{}") {
+                result.replace_range(pos..pos + 2, &value);
+            }
+        }
+
+        (result, consumed)
+    }
 }
 
 /// State of ongoing trace event parsing
@@ -255,24 +338,8 @@ impl StreamingTraceParser {
                 let var_data =
                     &inst_data[var_data_offset..var_data_offset + data_struct.data_len as usize];
 
-                let type_encoding = match data_struct.type_encoding {
-                    0x01 => TypeEncoding::U8,
-                    0x02 => TypeEncoding::U16,
-                    0x03 => TypeEncoding::U32,
-                    0x04 => TypeEncoding::U64,
-                    0x05 => TypeEncoding::I8,
-                    0x06 => TypeEncoding::I16,
-                    0x07 => TypeEncoding::I32,
-                    0x08 => TypeEncoding::I64,
-                    0x09 => TypeEncoding::F32,
-                    0x0A => TypeEncoding::F64,
-                    0x0B => TypeEncoding::Bool,
-                    0x0C => TypeEncoding::Char,
-                    0x20 => TypeEncoding::Pointer,
-                    0x50 => TypeEncoding::CString,
-                    0x51 => TypeEncoding::String,
-                    _ => TypeEncoding::Unknown,
-                };
+                let type_encoding = TypeEncoding::from_u8(data_struct.type_encoding)
+                    .unwrap_or(TypeEncoding::Unknown);
 
                 let formatted_value =
                     crate::utils::MessageParser::format_variable_value(type_encoding, var_data)
@@ -312,6 +379,61 @@ impl StreamingTraceParser {
                     error_code: data_struct.error_code,
                     error_message: error_message.to_string(),
                 })
+            }
+
+            t if t == InstructionType::PrintFormat as u8 => {
+                if inst_data.len() < std::mem::size_of::<PrintFormatData>() {
+                    return Err("Invalid PrintFormat data".to_string());
+                }
+
+                let format_data = unsafe {
+                    std::ptr::read_unaligned(inst_data.as_ptr() as *const PrintFormatData)
+                };
+
+                // Parse variable data
+                let mut variables = Vec::new();
+                let mut offset = std::mem::size_of::<PrintFormatData>();
+
+                for _ in 0..format_data.arg_count {
+                    if offset + 5 > inst_data.len() {
+                        return Err("Invalid PrintFormat variable header".to_string());
+                    }
+
+                    // Read variable header: var_name_index:u16, type_encoding:u8, data_len:u16
+                    let var_name_index =
+                        u16::from_le_bytes([inst_data[offset], inst_data[offset + 1]]);
+                    let type_encoding_byte = inst_data[offset + 2];
+                    let data_len =
+                        u16::from_le_bytes([inst_data[offset + 3], inst_data[offset + 4]]);
+
+                    offset += 5;
+
+                    if offset + data_len as usize > inst_data.len() {
+                        return Err("Invalid PrintFormat variable data".to_string());
+                    }
+
+                    let var_data = inst_data[offset..offset + data_len as usize].to_vec();
+                    offset += data_len as usize;
+
+                    // Convert type encoding byte to enum
+                    let type_encoding =
+                        TypeEncoding::from_u8(type_encoding_byte).unwrap_or(TypeEncoding::Unknown);
+
+                    variables.push(crate::format_printer::ParsedVariable {
+                        var_name_index,
+                        type_encoding,
+                        data: var_data,
+                    });
+                }
+
+                // Use FormatPrinter to generate formatted output
+                let formatted_output = crate::format_printer::FormatPrinter::format_print_data(
+                    format_data.format_string_index,
+                    &variables,
+                    string_table,
+                );
+
+                Ok(ParsedInstruction::PrintFormat { formatted_output })
             }
 
             t if t == InstructionType::Backtrace as u8 => {
@@ -372,6 +494,7 @@ impl ParsedInstruction {
             } => {
                 format!("{name} ({type_encoding:?}): {formatted_value}")
             }
+            ParsedInstruction::PrintFormat { formatted_output } => formatted_output.clone(),
             ParsedInstruction::PrintVariableError {
                 name,
                 error_code: _,
@@ -402,6 +525,7 @@ impl ParsedInstruction {
         match self {
             ParsedInstruction::PrintString { .. } => "PrintString".to_string(),
             ParsedInstruction::PrintVariable { .. } => "PrintVariable".to_string(),
+            ParsedInstruction::PrintFormat { .. } => "PrintFormat".to_string(),
             ParsedInstruction::PrintVariableError { .. } => "PrintVariableError".to_string(),
             ParsedInstruction::Backtrace { .. } => "Backtrace".to_string(),
             ParsedInstruction::EndInstruction { .. } => "EndInstruction".to_string(),

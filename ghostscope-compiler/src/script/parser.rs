@@ -6,6 +6,7 @@ use pest_derive::Parser;
 use crate::script::ast::{
     infer_type, BinaryOp, Expr, PrintStatement, Program, Statement, TracePattern,
 };
+use crate::script::format_validator::FormatValidator;
 use tracing::{debug, warn};
 
 #[derive(Parser)]
@@ -475,7 +476,7 @@ fn parse_print_content(pair: Pair<Rule>) -> Result<PrintStatement> {
             Ok(PrintStatement::Variable(var_name))
         }
         Rule::format_expr => {
-            // Format string with arguments (future implementation)
+            // Format string with arguments
             let mut inner_pairs = inner.into_inner();
             let format_string = inner_pairs.next().unwrap();
 
@@ -489,6 +490,9 @@ fn parse_print_content(pair: Pair<Rule>) -> Result<PrintStatement> {
                 let arg_expr = parse_expr(arg_pair)?;
                 args.push(arg_expr);
             }
+
+            // Validate format string and arguments match
+            FormatValidator::validate_format_arguments(format_content, &args)?;
 
             Ok(PrintStatement::Formatted {
                 format: format_content.to_string(),

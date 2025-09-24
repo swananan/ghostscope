@@ -6,14 +6,32 @@
 use super::context::{CodeGenError, EbpfContext, Result};
 use crate::script::{PrintStatement, Program, Statement};
 use ghostscope_protocol::trace_event::{
-    BacktraceData, InstructionHeader, PrintStringIndexData, PrintVariableErrorData,
-    PrintVariableIndexData,
+    BacktraceData, InstructionHeader, PrintFormatData, PrintStringIndexData,
+    PrintVariableErrorData, PrintVariableIndexData,
 };
 use ghostscope_protocol::{InstructionType, StringTable, TypeEncoding};
 use inkwell::values::{BasicValueEnum, IntValue, PointerValue};
 use inkwell::AddressSpace;
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
+
+/// Information about a variable in formatted print
+#[derive(Debug, Clone)]
+struct FormatVariableInfo {
+    var_name: String,
+    var_name_index: u16,
+    type_encoding: TypeEncoding,
+    data_size: usize,
+    value_source: FormatValueSource,
+}
+
+/// Source of the value for a format variable
+#[derive(Debug, Clone)]
+enum FormatValueSource {
+    Variable,              // Read from DWARF/register
+    StringLiteral(String), // String literal value
+    IntegerLiteral(i64),   // Integer literal value
+}
 
 impl<'ctx> EbpfContext<'ctx> {
     /// Main entry point: compile program with staged transmission system
@@ -196,11 +214,116 @@ impl<'ctx> EbpfContext<'ctx> {
                 self.generate_print_variable_index(var_name_index, type_encoding, var_name)?;
                 Ok(1) // Generated 1 instruction
             }
-            PrintStatement::Formatted { format: _, args: _ } => {
-                warn!("Formatted print statements not yet implemented");
-                Err(CodeGenError::LLVMError(
-                    "Formatted print not implemented".to_string(),
-                ))
+            PrintStatement::Formatted { format, args } => {
+                info!(
+                    "Processing formatted print: '{}' with {} args",
+                    format,
+                    args.len()
+                );
+                self.compile_formatted_print(format, args)
+            }
+        }
+    }
+
+    /// Compile formatted print statement: collect all variable data and send as PrintFormat instruction
+    fn compile_formatted_print(
+        &mut self,
+        format: &str,
+        args: &[crate::script::ast::Expr],
+    ) -> Result<u16> {
+        info!(
+            "Compiling formatted print: '{}' with {} arguments",
+            format,
+            args.len()
+        );
+
+        // 1. Add format string to StringTable
+        let format_string_index = self.string_table.add_string(format);
+        info!(
+            "Added format string to StringTable at index {}",
+            format_string_index
+        );
+
+        // 2. Process each argument and collect variable data information
+        let mut variable_infos = Vec::new();
+
+        for (i, arg) in args.iter().enumerate() {
+            match arg {
+                crate::script::ast::Expr::Variable(var_name) => {
+                    info!("Processing argument {}: variable '{}'", i, var_name);
+
+                    // Resolve variable to get type and name index
+                    let (var_name_index, type_encoding) =
+                        self.resolve_variable_with_priority(var_name)?;
+
+                    // Determine data size based on type
+                    let data_size = self.get_type_size(type_encoding);
+
+                    variable_infos.push(FormatVariableInfo {
+                        var_name: var_name.clone(),
+                        var_name_index,
+                        type_encoding,
+                        data_size,
+                        value_source: FormatValueSource::Variable,
+                    });
+                }
+                crate::script::ast::Expr::String(s) => {
+                    info!("Processing argument {}: string literal '{}'", i, s);
+
+                    // Add string literal to variable names with a unique identifier
+                    let var_name = format!("__str_literal_{}", i);
+                    let var_name_index = self.string_table.add_variable_name(&var_name);
+
+                    variable_infos.push(FormatVariableInfo {
+                        var_name: var_name,
+                        var_name_index,
+                        type_encoding: TypeEncoding::CString,
+                        data_size: s.len() + 1, // +1 for null terminator
+                        value_source: FormatValueSource::StringLiteral(s.clone()),
+                    });
+                }
+                crate::script::ast::Expr::Int(value) => {
+                    info!("Processing argument {}: integer literal {}", i, value);
+
+                    // Add integer literal to variable names
+                    let var_name = format!("__int_literal_{}", i);
+                    let var_name_index = self.string_table.add_variable_name(&var_name);
+
+                    variable_infos.push(FormatVariableInfo {
+                        var_name: var_name,
+                        var_name_index,
+                        type_encoding: TypeEncoding::I64,
+                        data_size: 8,
+                        value_source: FormatValueSource::IntegerLiteral(*value),
+                    });
+                }
+                _ => {
+                    return Err(CodeGenError::NotImplemented(format!(
+                        "Expression type {:?} not supported in formatted print",
+                        arg
+                    )));
+                }
+            }
+        }
+
+        // 3. Generate PrintFormat instruction in LLVM IR
+        self.generate_print_format_instruction(format_string_index, &variable_infos)?;
+
+        Ok(1) // Generated 1 PrintFormat instruction
+    }
+
+    /// Get the size in bytes for a given type encoding
+    fn get_type_size(&self, type_encoding: TypeEncoding) -> usize {
+        use ghostscope_protocol::consts;
+        match type_encoding {
+            TypeEncoding::U8 | TypeEncoding::I8 | TypeEncoding::Bool | TypeEncoding::Char => 1,
+            TypeEncoding::U16 | TypeEncoding::I16 => 2,
+            TypeEncoding::U32 | TypeEncoding::I32 | TypeEncoding::F32 => 4,
+            TypeEncoding::U64 | TypeEncoding::I64 | TypeEncoding::F64 | TypeEncoding::Pointer => 8,
+            TypeEncoding::CString | TypeEncoding::String => 256, // Default string buffer size
+            _ => {
+                warn!("Unknown type size for {:?}, using 8 bytes", type_encoding);
+                8
             }
         }
     }
@@ -285,6 +408,690 @@ impl<'ctx> EbpfContext<'ctx> {
             BasicValueEnum::PointerValue(_) => TypeEncoding::Pointer,
             _ => TypeEncoding::I64, // Conservative default
         }
+    }
+
+    /// Generate eBPF code for PrintFormat instruction (true single instruction implementation)
+    fn generate_print_format_instruction(
+        &mut self,
+        format_string_index: u16,
+        variable_infos: &[FormatVariableInfo],
+    ) -> Result<()> {
+        info!(
+            "Generating true single PrintFormat instruction: format_index={}, {} variables",
+            format_string_index,
+            variable_infos.len()
+        );
+
+        // Calculate total instruction size:
+        // InstructionHeader + PrintFormatData + variable data
+        let mut total_variable_data_size = 0;
+        for var_info in variable_infos {
+            if let FormatValueSource::Variable = &var_info.value_source {
+                // Each variable: var_name_index(2) + type_encoding(1) + data_len(2) + data
+                total_variable_data_size += 5 + var_info.data_size;
+            }
+        }
+
+        let instruction_data_size =
+            std::mem::size_of::<PrintFormatData>() + total_variable_data_size;
+        let total_instruction_size =
+            std::mem::size_of::<InstructionHeader>() + instruction_data_size;
+
+        info!(
+            "PrintFormat instruction size: {} bytes (header: {}, data: {}, variables: {})",
+            total_instruction_size,
+            std::mem::size_of::<InstructionHeader>(),
+            std::mem::size_of::<PrintFormatData>(),
+            total_variable_data_size
+        );
+
+        // Allocate buffer using existing method
+        let buffer = self.create_instruction_buffer();
+
+        // Clear the buffer
+        let buffer_size = self
+            .context
+            .i64_type()
+            .const_int(total_instruction_size as u64, false);
+        self.builder
+            .build_memset(
+                buffer,
+                std::mem::align_of::<InstructionHeader>() as u32,
+                self.context.i8_type().const_zero(),
+                buffer_size,
+            )
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to clear buffer: {}", e)))?;
+
+        // Write InstructionHeader
+        let inst_type_val = self
+            .context
+            .i8_type()
+            .const_int(InstructionType::PrintFormat as u64, false);
+        self.builder
+            .build_store(buffer, inst_type_val)
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store inst_type: {}", e)))?;
+
+        // data_length at offset 1
+        let data_length_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    buffer,
+                    &[self.context.i32_type().const_int(1, false)],
+                    "data_length_ptr",
+                )
+                .map_err(|e| {
+                    CodeGenError::LLVMError(format!("Failed to get data_length GEP: {}", e))
+                })?
+        };
+        let data_length_i16_ptr = self
+            .builder
+            .build_pointer_cast(
+                data_length_ptr,
+                self.context.ptr_type(inkwell::AddressSpace::default()),
+                "data_length_i16_ptr",
+            )
+            .map_err(|e| {
+                CodeGenError::LLVMError(format!("Failed to cast data_length pointer: {}", e))
+            })?;
+        let data_length_val = self
+            .context
+            .i16_type()
+            .const_int(instruction_data_size as u64, false);
+        self.builder
+            .build_store(data_length_i16_ptr, data_length_val)
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_length: {}", e)))?;
+
+        // Write PrintFormatData at offset 4 (after InstructionHeader)
+        let format_data_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    buffer,
+                    &[self.context.i32_type().const_int(4, false)],
+                    "format_data_ptr",
+                )
+                .map_err(|e| {
+                    CodeGenError::LLVMError(format!("Failed to get format_data GEP: {}", e))
+                })?
+        };
+
+        // format_string_index at offset 0 within PrintFormatData
+        let format_string_index_ptr = self
+            .builder
+            .build_pointer_cast(
+                format_data_ptr,
+                self.context.ptr_type(inkwell::AddressSpace::default()),
+                "format_string_index_ptr",
+            )
+            .map_err(|e| {
+                CodeGenError::LLVMError(format!(
+                    "Failed to cast format_string_index pointer: {}",
+                    e
+                ))
+            })?;
+        let format_index_val = self
+            .context
+            .i16_type()
+            .const_int(format_string_index as u64, false);
+        self.builder
+            .build_store(format_string_index_ptr, format_index_val)
+            .map_err(|e| {
+                CodeGenError::LLVMError(format!("Failed to store format_string_index: {}", e))
+            })?;
+
+        // arg_count at offset 2 within PrintFormatData
+        let arg_count_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    format_data_ptr,
+                    &[self.context.i32_type().const_int(2, false)],
+                    "arg_count_ptr",
+                )
+                .map_err(|e| {
+                    CodeGenError::LLVMError(format!("Failed to get arg_count GEP: {}", e))
+                })?
+        };
+
+        // Only count actual variables, not string/integer literals
+        let actual_var_count = variable_infos
+            .iter()
+            .filter(|vi| matches!(vi.value_source, FormatValueSource::Variable))
+            .count();
+        let arg_count_val = self
+            .context
+            .i8_type()
+            .const_int(actual_var_count as u64, false);
+        self.builder
+            .build_store(arg_count_ptr, arg_count_val)
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store arg_count: {}", e)))?;
+
+        // reserved field at offset 3 (set to 0)
+        let reserved_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    format_data_ptr,
+                    &[self.context.i32_type().const_int(3, false)],
+                    "reserved_ptr",
+                )
+                .map_err(|e| {
+                    CodeGenError::LLVMError(format!("Failed to get reserved GEP: {}", e))
+                })?
+        };
+        let reserved_val = self.context.i8_type().const_int(0, false);
+        self.builder
+            .build_store(reserved_ptr, reserved_val)
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store reserved: {}", e)))?;
+
+        // Write variable data starting after PrintFormatData
+        let mut current_offset = 4 + std::mem::size_of::<PrintFormatData>();
+        for var_info in variable_infos {
+            if let FormatValueSource::Variable = &var_info.value_source {
+                info!(
+                    "Writing variable '{}' at offset {}",
+                    var_info.var_name, current_offset
+                );
+
+                // Write variable header: [var_name_index:u16, type_encoding:u8, data_len:u16]
+                let var_header_ptr = unsafe {
+                    self.builder
+                        .build_gep(
+                            self.context.i8_type(),
+                            buffer,
+                            &[self
+                                .context
+                                .i32_type()
+                                .const_int(current_offset as u64, false)],
+                            "var_header_ptr",
+                        )
+                        .map_err(|e| {
+                            CodeGenError::LLVMError(format!("Failed to get var_header GEP: {}", e))
+                        })?
+                };
+
+                // var_name_index at offset 0
+                let var_name_index_ptr = self
+                    .builder
+                    .build_pointer_cast(
+                        var_header_ptr,
+                        self.context.ptr_type(inkwell::AddressSpace::default()),
+                        "var_name_index_ptr",
+                    )
+                    .map_err(|e| {
+                        CodeGenError::LLVMError(format!(
+                            "Failed to cast var_name_index pointer: {}",
+                            e
+                        ))
+                    })?;
+                let var_name_index_val = self
+                    .context
+                    .i16_type()
+                    .const_int(var_info.var_name_index as u64, false);
+                self.builder
+                    .build_store(var_name_index_ptr, var_name_index_val)
+                    .map_err(|e| {
+                        CodeGenError::LLVMError(format!("Failed to store var_name_index: {}", e))
+                    })?;
+
+                // type_encoding at offset 2
+                let type_encoding_ptr = unsafe {
+                    self.builder
+                        .build_gep(
+                            self.context.i8_type(),
+                            var_header_ptr,
+                            &[self.context.i32_type().const_int(2, false)],
+                            "type_encoding_ptr",
+                        )
+                        .map_err(|e| {
+                            CodeGenError::LLVMError(format!(
+                                "Failed to get type_encoding GEP: {}",
+                                e
+                            ))
+                        })?
+                };
+                let type_encoding_val = self
+                    .context
+                    .i8_type()
+                    .const_int(var_info.type_encoding as u8 as u64, false);
+                self.builder
+                    .build_store(type_encoding_ptr, type_encoding_val)
+                    .map_err(|e| {
+                        CodeGenError::LLVMError(format!("Failed to store type_encoding: {}", e))
+                    })?;
+
+                // data_len at offset 3
+                let data_len_ptr = unsafe {
+                    self.builder
+                        .build_gep(
+                            self.context.i8_type(),
+                            var_header_ptr,
+                            &[self.context.i32_type().const_int(3, false)],
+                            "data_len_ptr",
+                        )
+                        .map_err(|e| {
+                            CodeGenError::LLVMError(format!("Failed to get data_len GEP: {}", e))
+                        })?
+                };
+                let data_len_i16_ptr = self
+                    .builder
+                    .build_pointer_cast(
+                        data_len_ptr,
+                        self.context.ptr_type(inkwell::AddressSpace::default()),
+                        "data_len_i16_ptr",
+                    )
+                    .map_err(|e| {
+                        CodeGenError::LLVMError(format!("Failed to cast data_len pointer: {}", e))
+                    })?;
+                let data_len_val = self
+                    .context
+                    .i16_type()
+                    .const_int(var_info.data_size as u64, false);
+                self.builder
+                    .build_store(data_len_i16_ptr, data_len_val)
+                    .map_err(|e| {
+                        CodeGenError::LLVMError(format!("Failed to store data_len: {}", e))
+                    })?;
+
+                // Generate variable data reading at offset 5
+                let var_data_ptr = unsafe {
+                    self.builder
+                        .build_gep(
+                            self.context.i8_type(),
+                            var_header_ptr,
+                            &[self.context.i32_type().const_int(5, false)],
+                            "var_data_ptr",
+                        )
+                        .map_err(|e| {
+                            CodeGenError::LLVMError(format!("Failed to get var_data GEP: {}", e))
+                        })?
+                };
+
+                // Read variable data using existing DWARF resolution logic
+                match self.resolve_variable_value(&var_info.var_name, var_info.type_encoding) {
+                    Ok(var_data) => {
+                        // Store the resolved variable data
+                        self.store_variable_data(
+                            var_data_ptr,
+                            var_data,
+                            var_info.type_encoding,
+                            var_info.data_size,
+                        )?;
+                    }
+                    Err(e) => {
+                        info!(
+                            "Variable '{}' read failed: {}, skipping data",
+                            var_info.var_name, e
+                        );
+                        // For failed reads, we could either skip or fill with error marker
+                        // For now, we'll fill with zeros
+                        let zero_size = self
+                            .context
+                            .i64_type()
+                            .const_int(var_info.data_size as u64, false);
+                        self.builder
+                            .build_memset(
+                                var_data_ptr,
+                                1,
+                                self.context.i8_type().const_zero(),
+                                zero_size,
+                            )
+                            .map_err(|e| {
+                                CodeGenError::LLVMError(format!(
+                                    "Failed to zero variable data: {}",
+                                    e
+                                ))
+                            })?;
+                    }
+                }
+
+                current_offset += 5 + var_info.data_size;
+            }
+        }
+
+        // Send the complete instruction via ringbuf using existing method
+        self.create_ringbuf_output(buffer, total_instruction_size as u64)?;
+
+        info!(
+            "Successfully generated true single PrintFormat instruction with {} variables",
+            actual_var_count
+        );
+        Ok(())
+    }
+
+    /// Store variable data at the specified pointer location
+    fn store_variable_data(
+        &mut self,
+        var_data_ptr: PointerValue<'ctx>,
+        var_data: BasicValueEnum<'ctx>,
+        type_encoding: TypeEncoding,
+        data_size: usize,
+    ) -> Result<()> {
+        match data_size {
+            1 => {
+                // Store as i8
+                let truncated = match var_data {
+                    BasicValueEnum::IntValue(int_val) => self
+                        .builder
+                        .build_int_truncate(int_val, self.context.i8_type(), "truncated_i8")
+                        .map_err(|e| {
+                            CodeGenError::LLVMError(format!("Failed to truncate to i8: {}", e))
+                        })?,
+                    _ => {
+                        return Err(CodeGenError::LLVMError(
+                            "Expected integer value for integer type".to_string(),
+                        ));
+                    }
+                };
+                self.builder
+                    .build_store(var_data_ptr, truncated)
+                    .map_err(|e| {
+                        CodeGenError::LLVMError(format!("Failed to store i8 data: {}", e))
+                    })?;
+            }
+            2 => {
+                // Store as i16
+                let truncated = match var_data {
+                    BasicValueEnum::IntValue(int_val) => self
+                        .builder
+                        .build_int_truncate(int_val, self.context.i16_type(), "truncated_i16")
+                        .map_err(|e| {
+                            CodeGenError::LLVMError(format!("Failed to truncate to i16: {}", e))
+                        })?,
+                    _ => {
+                        return Err(CodeGenError::LLVMError(
+                            "Expected integer value for integer type".to_string(),
+                        ));
+                    }
+                };
+                let i16_ptr = self
+                    .builder
+                    .build_pointer_cast(
+                        var_data_ptr,
+                        self.context.ptr_type(AddressSpace::default()),
+                        "i16_ptr",
+                    )
+                    .map_err(|e| {
+                        CodeGenError::LLVMError(format!("Failed to cast to i16 ptr: {}", e))
+                    })?;
+                self.builder.build_store(i16_ptr, truncated).map_err(|e| {
+                    CodeGenError::LLVMError(format!("Failed to store i16 data: {}", e))
+                })?;
+            }
+            4 => {
+                // Store as i32 or f32
+                match var_data {
+                    BasicValueEnum::IntValue(int_val) => {
+                        let truncated = self
+                            .builder
+                            .build_int_truncate(int_val, self.context.i32_type(), "truncated_i32")
+                            .map_err(|e| {
+                                CodeGenError::LLVMError(format!("Failed to truncate to i32: {}", e))
+                            })?;
+                        let i32_ptr = self
+                            .builder
+                            .build_pointer_cast(
+                                var_data_ptr,
+                                self.context.ptr_type(AddressSpace::default()),
+                                "i32_ptr",
+                            )
+                            .map_err(|e| {
+                                CodeGenError::LLVMError(format!("Failed to cast to i32 ptr: {}", e))
+                            })?;
+                        self.builder.build_store(i32_ptr, truncated).map_err(|e| {
+                            CodeGenError::LLVMError(format!("Failed to store i32 data: {}", e))
+                        })?;
+                    }
+                    BasicValueEnum::FloatValue(float_val) => {
+                        let f32_ptr = self
+                            .builder
+                            .build_pointer_cast(
+                                var_data_ptr,
+                                self.context.ptr_type(AddressSpace::default()),
+                                "f32_ptr",
+                            )
+                            .map_err(|e| {
+                                CodeGenError::LLVMError(format!("Failed to cast to f32 ptr: {}", e))
+                            })?;
+                        self.builder.build_store(f32_ptr, float_val).map_err(|e| {
+                            CodeGenError::LLVMError(format!("Failed to store f32 data: {}", e))
+                        })?;
+                    }
+                    _ => {
+                        return Err(CodeGenError::LLVMError(
+                            "Expected integer or float value for 4-byte type".to_string(),
+                        ));
+                    }
+                }
+            }
+            8 => {
+                // Store as i64, f64, or pointer
+                match var_data {
+                    BasicValueEnum::IntValue(int_val) => {
+                        let i64_ptr = self
+                            .builder
+                            .build_pointer_cast(
+                                var_data_ptr,
+                                self.context.ptr_type(AddressSpace::default()),
+                                "i64_ptr",
+                            )
+                            .map_err(|e| {
+                                CodeGenError::LLVMError(format!("Failed to cast to i64 ptr: {}", e))
+                            })?;
+                        self.builder.build_store(i64_ptr, int_val).map_err(|e| {
+                            CodeGenError::LLVMError(format!("Failed to store i64 data: {}", e))
+                        })?;
+                    }
+                    BasicValueEnum::FloatValue(float_val) => {
+                        let f64_ptr = self
+                            .builder
+                            .build_pointer_cast(
+                                var_data_ptr,
+                                self.context.ptr_type(AddressSpace::default()),
+                                "f64_ptr",
+                            )
+                            .map_err(|e| {
+                                CodeGenError::LLVMError(format!("Failed to cast to f64 ptr: {}", e))
+                            })?;
+                        self.builder.build_store(f64_ptr, float_val).map_err(|e| {
+                            CodeGenError::LLVMError(format!("Failed to store f64 data: {}", e))
+                        })?;
+                    }
+                    BasicValueEnum::PointerValue(ptr_val) => {
+                        // Store pointer as u64
+                        let ptr_int = self
+                            .builder
+                            .build_ptr_to_int(ptr_val, self.context.i64_type(), "ptr_as_int")
+                            .map_err(|e| {
+                                CodeGenError::LLVMError(format!(
+                                    "Failed to convert ptr to int: {}",
+                                    e
+                                ))
+                            })?;
+                        let i64_ptr = self
+                            .builder
+                            .build_pointer_cast(
+                                var_data_ptr,
+                                self.context.ptr_type(AddressSpace::default()),
+                                "i64_ptr",
+                            )
+                            .map_err(|e| {
+                                CodeGenError::LLVMError(format!("Failed to cast to i64 ptr: {}", e))
+                            })?;
+                        self.builder.build_store(i64_ptr, ptr_int).map_err(|e| {
+                            CodeGenError::LLVMError(format!("Failed to store pointer data: {}", e))
+                        })?;
+                    }
+                    _ => {
+                        return Err(CodeGenError::LLVMError(
+                            "Expected integer, float, or pointer value for 8-byte type".to_string(),
+                        ));
+                    }
+                }
+            }
+            _ => {
+                // Handle string or other variable-length data
+                match var_data {
+                    BasicValueEnum::PointerValue(str_ptr) => {
+                        // Copy string data byte by byte (simple loop for eBPF compatibility)
+                        let i8_type = self.context.i8_type();
+                        let i32_type = self.context.i32_type();
+                        let i64_type = self.context.i64_type();
+
+                        let loop_counter = self
+                            .builder
+                            .build_alloca(i32_type, "loop_counter")
+                            .map_err(|e| {
+                                CodeGenError::LLVMError(format!(
+                                    "Failed to alloca loop counter: {}",
+                                    e
+                                ))
+                            })?;
+                        self.builder
+                            .build_store(loop_counter, i32_type.const_zero())
+                            .map_err(|e| {
+                                CodeGenError::LLVMError(format!(
+                                    "Failed to init loop counter: {}",
+                                    e
+                                ))
+                            })?;
+
+                        // Get current function from builder
+                        let current_function = self
+                            .builder
+                            .get_insert_block()
+                            .ok_or_else(|| {
+                                CodeGenError::LLVMError("No current basic block".to_string())
+                            })?
+                            .get_parent()
+                            .ok_or_else(|| {
+                                CodeGenError::LLVMError("No parent function".to_string())
+                            })?;
+
+                        let loop_block = self
+                            .context
+                            .append_basic_block(current_function, "copy_loop");
+                        let check_block = self
+                            .context
+                            .append_basic_block(current_function, "copy_check");
+                        let end_block = self
+                            .context
+                            .append_basic_block(current_function, "copy_end");
+
+                        self.builder
+                            .build_unconditional_branch(check_block)
+                            .map_err(|e| {
+                                CodeGenError::LLVMError(format!("Failed to branch to check: {}", e))
+                            })?;
+
+                        // Check block: test if counter < data_size
+                        self.builder.position_at_end(check_block);
+                        let counter_val = self
+                            .builder
+                            .build_load(i32_type, loop_counter, "counter_val")
+                            .map_err(|e| {
+                                CodeGenError::LLVMError(format!("Failed to load counter: {}", e))
+                            })?;
+                        let counter_i32 = counter_val.into_int_value();
+                        let size_limit = i32_type.const_int(data_size as u64, false);
+                        let condition = self
+                            .builder
+                            .build_int_compare(
+                                inkwell::IntPredicate::ULT,
+                                counter_i32,
+                                size_limit,
+                                "copy_condition",
+                            )
+                            .map_err(|e| {
+                                CodeGenError::LLVMError(format!("Failed to build condition: {}", e))
+                            })?;
+
+                        self.builder
+                            .build_conditional_branch(condition, loop_block, end_block)
+                            .map_err(|e| {
+                                CodeGenError::LLVMError(format!(
+                                    "Failed to build conditional branch: {}",
+                                    e
+                                ))
+                            })?;
+
+                        // Loop block: copy one byte
+                        self.builder.position_at_end(loop_block);
+                        let counter_val = self
+                            .builder
+                            .build_load(i32_type, loop_counter, "counter_val2")
+                            .map_err(|e| {
+                                CodeGenError::LLVMError(format!("Failed to load counter: {}", e))
+                            })?;
+                        let counter_i32 = counter_val.into_int_value();
+
+                        let src_byte_ptr = unsafe {
+                            self.builder
+                                .build_gep(i8_type, str_ptr, &[counter_i32], "src_byte_ptr")
+                                .map_err(|e| {
+                                    CodeGenError::LLVMError(format!("Failed to get src GEP: {}", e))
+                                })?
+                        };
+                        let dst_byte_ptr = unsafe {
+                            self.builder
+                                .build_gep(i8_type, var_data_ptr, &[counter_i32], "dst_byte_ptr")
+                                .map_err(|e| {
+                                    CodeGenError::LLVMError(format!("Failed to get dst GEP: {}", e))
+                                })?
+                        };
+
+                        let byte_val = self
+                            .builder
+                            .build_load(i8_type, src_byte_ptr, "byte_val")
+                            .map_err(|e| {
+                            CodeGenError::LLVMError(format!("Failed to load byte: {}", e))
+                        })?;
+                        self.builder
+                            .build_store(dst_byte_ptr, byte_val)
+                            .map_err(|e| {
+                                CodeGenError::LLVMError(format!("Failed to store byte: {}", e))
+                            })?;
+
+                        // Increment counter
+                        let next_counter = self
+                            .builder
+                            .build_int_add(
+                                counter_i32,
+                                i32_type.const_int(1, false),
+                                "next_counter",
+                            )
+                            .map_err(|e| {
+                                CodeGenError::LLVMError(format!(
+                                    "Failed to increment counter: {}",
+                                    e
+                                ))
+                            })?;
+                        self.builder
+                            .build_store(loop_counter, next_counter)
+                            .map_err(|e| {
+                                CodeGenError::LLVMError(format!("Failed to store counter: {}", e))
+                            })?;
+
+                        self.builder
+                            .build_unconditional_branch(check_block)
+                            .map_err(|e| {
+                                CodeGenError::LLVMError(format!("Failed to branch back: {}", e))
+                            })?;
+
+                        // End block: continue after loop
+                        self.builder.position_at_end(end_block);
+                    }
+                    _ => {
+                        return Err(CodeGenError::LLVMError(format!(
+                            "Unsupported variable data type for size {}: {:?}",
+                            data_size, type_encoding
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Generate eBPF code for PrintStringIndex instruction

@@ -24,7 +24,7 @@ pub struct TraceEventMessage {
 pub enum InstructionType {
     PrintStringIndex = 0x01,   // print "string" (using string table index)
     PrintVariableIndex = 0x02, // print variable (using variable name index)
-    PrintVariable = 0x03,      // print variable (full name, for compatibility)
+    PrintFormat = 0x04,        // print "format {} {}", var1, var2 (formatted print)
     PrintVariableError = 0x12, // variable read error (using variable name index)
     Backtrace = 0x10,          // backtrace instruction
 
@@ -59,15 +59,14 @@ pub struct PrintVariableIndexData {
     // Followed by variable data
 }
 
-/// Print variable instruction data (full name for compatibility)
+/// Format print instruction data
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
-pub(crate) struct PrintVariableData {
-    pub var_name_len: u8,  // Length of variable name
-    pub type_encoding: u8, // TypeEncoding
-    pub data_len: u16,     // Length of variable data
-                           // Followed by: variable name + variable data
+pub struct PrintFormatData {
+    pub format_string_index: u16, // Index into string table for format string
+    pub arg_count: u8,            // Number of arguments
+    pub reserved: u8,             // Padding for alignment
+                                  // Followed by argument data: [var_name_index:u16, type_encoding:u8, data_len:u16, data:bytes] * arg_count
 }
 
 /// Variable read error instruction data
@@ -109,10 +108,9 @@ pub enum Instruction {
         type_encoding: TypeEncoding,
         data: Vec<u8>,
     },
-    PrintVariable {
-        var_name: String,
-        type_encoding: TypeEncoding,
-        data: Vec<u8>,
+    PrintFormat {
+        format_string_index: u16,
+        variables: Vec<VariableData>,
     },
     PrintVariableError {
         var_name_index: u16,
@@ -129,33 +127,21 @@ pub enum Instruction {
     },
 }
 
-impl Instruction {
-    /// Calculate the encoded size of this instruction (header + data)
-    pub fn encoded_size(&self) -> usize {
-        let header_size = std::mem::size_of::<InstructionHeader>();
-        let data_size = match self {
-            Instruction::PrintStringIndex { .. } => std::mem::size_of::<PrintStringIndexData>(),
-            Instruction::PrintVariableIndex { data, .. } => {
-                std::mem::size_of::<PrintVariableIndexData>() + data.len()
-            }
-            Instruction::PrintVariable { var_name, data, .. } => {
-                std::mem::size_of::<PrintVariableData>() + var_name.len() + data.len()
-            }
-            Instruction::PrintVariableError { .. } => std::mem::size_of::<PrintVariableErrorData>(),
-            Instruction::Backtrace { frames, .. } => {
-                std::mem::size_of::<BacktraceData>() + frames.len() * 8
-            }
-            Instruction::EndInstruction { .. } => std::mem::size_of::<EndInstructionData>(),
-        };
-        header_size + data_size
-    }
+/// Variable data for PrintFormat instruction
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VariableData {
+    pub var_name_index: u16,
+    pub type_encoding: TypeEncoding,
+    pub data: Vec<u8>,
+}
 
+impl Instruction {
     /// Get the instruction type
     pub fn instruction_type(&self) -> InstructionType {
         match self {
             Instruction::PrintStringIndex { .. } => InstructionType::PrintStringIndex,
             Instruction::PrintVariableIndex { .. } => InstructionType::PrintVariableIndex,
-            Instruction::PrintVariable { .. } => InstructionType::PrintVariable,
+            Instruction::PrintFormat { .. } => InstructionType::PrintFormat,
             Instruction::PrintVariableError { .. } => InstructionType::PrintVariableError,
             Instruction::Backtrace { .. } => InstructionType::Backtrace,
             Instruction::EndInstruction { .. } => InstructionType::EndInstruction,
@@ -169,23 +155,19 @@ mod tests {
     use crate::TypeEncoding;
 
     #[test]
-    fn test_instruction_sizes() {
+    fn test_instruction_types() {
         let inst1 = Instruction::PrintStringIndex { string_index: 0 };
-        assert_eq!(inst1.encoded_size(), 4 + 2); // header + u16
+        assert_eq!(inst1.instruction_type(), InstructionType::PrintStringIndex);
 
-        let inst2 = Instruction::PrintVariableIndex {
-            var_name_index: 0,
-            type_encoding: TypeEncoding::U32,
-            data: vec![1, 2, 3, 4],
+        let inst2 = Instruction::PrintFormat {
+            format_string_index: 0,
+            variables: vec![],
         };
-        assert_eq!(inst2.encoded_size(), 4 + 6 + 4); // header + data struct + payload
+        assert_eq!(inst2.instruction_type(), InstructionType::PrintFormat);
     }
 
     #[test]
-    fn test_instruction_types() {
-        let inst = Instruction::PrintStringIndex { string_index: 0 };
-        assert_eq!(inst.instruction_type(), InstructionType::PrintStringIndex);
-
+    fn test_instruction_types_basic() {
         let inst = Instruction::EndInstruction {
             total_instructions: 5,
             execution_status: 0,

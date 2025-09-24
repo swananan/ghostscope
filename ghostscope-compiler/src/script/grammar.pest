@@ -30,11 +30,11 @@ line_number = @{ ASCII_DIGIT+ }
 
 print_stmt = { "print" ~ print_content ~ ";" }
 print_content = {
+    format_expr |      // print "format {} {}", arg1, arg2 (must be first to match)
     string |           // print "hello world"
-    identifier |       // print variable_name
-    format_expr        // print "format {} {}" arg1, arg2 (future)
+    identifier         // print variable_name
 }
-format_expr = { string ~ expr ~ ("," ~ expr)* }
+format_expr = { string ~ "," ~ expr ~ ("," ~ expr)* }
 backtrace_stmt = { ("backtrace" | "bt") ~ ";" }
 expr_stmt = { expr ~ ";" }
 var_decl_stmt = { "let" ~ identifier ~ "=" ~ expr ~ ";" }

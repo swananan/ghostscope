@@ -5,7 +5,7 @@
 
 use super::context::{CodeGenError, EbpfContext, Result};
 use ghostscope_protocol::trace_event::{EndInstructionData, TraceEventHeader, TraceEventMessage};
-use ghostscope_protocol::InstructionType;
+use ghostscope_protocol::{consts, InstructionType};
 use inkwell::values::PointerValue;
 use inkwell::AddressSpace;
 use tracing::info;
@@ -100,7 +100,10 @@ impl<'ctx> EbpfContext<'ctx> {
                 .build_gep(
                     self.context.i8_type(),
                     message_buffer,
-                    &[self.context.i32_type().const_int(8, false)],
+                    &[self
+                        .context
+                        .i32_type()
+                        .const_int(consts::TRACE_EVENT_MESSAGE_TIMESTAMP_OFFSET as u64, false)],
                     "timestamp_ptr",
                 )
                 .map_err(|e| {
@@ -142,7 +145,10 @@ impl<'ctx> EbpfContext<'ctx> {
                 .build_gep(
                     self.context.i8_type(),
                     message_buffer,
-                    &[self.context.i32_type().const_int(16, false)],
+                    &[self
+                        .context
+                        .i32_type()
+                        .const_int(consts::TRACE_EVENT_MESSAGE_PID_OFFSET as u64, false)],
                     "pid_ptr",
                 )
                 .map_err(|e| CodeGenError::LLVMError(format!("Failed to get pid GEP: {}", e)))?
@@ -165,7 +171,10 @@ impl<'ctx> EbpfContext<'ctx> {
                 .build_gep(
                     self.context.i8_type(),
                     message_buffer,
-                    &[self.context.i32_type().const_int(20, false)],
+                    &[self
+                        .context
+                        .i32_type()
+                        .const_int(consts::TRACE_EVENT_MESSAGE_TID_OFFSET as u64, false)],
                     "tid_ptr",
                 )
                 .map_err(|e| CodeGenError::LLVMError(format!("Failed to get tid GEP: {}", e)))?
@@ -227,7 +236,10 @@ impl<'ctx> EbpfContext<'ctx> {
                 .build_gep(
                     self.context.i8_type(),
                     end_buffer,
-                    &[self.context.i32_type().const_int(1, false)],
+                    &[self
+                        .context
+                        .i32_type()
+                        .const_int(consts::INSTRUCTION_HEADER_DATA_LENGTH_OFFSET as u64, false)],
                     "data_length_ptr",
                 )
                 .map_err(|e| {
@@ -259,7 +271,10 @@ impl<'ctx> EbpfContext<'ctx> {
                 .build_gep(
                     self.context.i8_type(),
                     end_buffer,
-                    &[self.context.i32_type().const_int(4, false)],
+                    &[self
+                        .context
+                        .i32_type()
+                        .const_int(consts::END_INSTRUCTION_DATA_OFFSET as u64, false)],
                     "total_instructions_ptr",
                 )
                 .map_err(|e| {
@@ -292,7 +307,12 @@ impl<'ctx> EbpfContext<'ctx> {
                 .build_gep(
                     self.context.i8_type(),
                     end_buffer,
-                    &[self.context.i32_type().const_int(6, false)],
+                    &[self.context.i32_type().const_int(
+                        (consts::END_INSTRUCTION_DATA_OFFSET
+                            + consts::END_INSTRUCTION_EXECUTION_STATUS_OFFSET)
+                            as u64,
+                        false,
+                    )],
                     "status_ptr",
                 )
                 .map_err(|e| CodeGenError::LLVMError(format!("Failed to get status GEP: {}", e)))?

@@ -1,7 +1,7 @@
 use crate::args::ParsedArgs;
 use crate::core::GhostSession;
 use anyhow::Result;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Run GhostScope in command line mode with direct script execution
 pub async fn run_command_line_runtime(parsed_args: ParsedArgs) -> Result<()> {
@@ -123,7 +123,18 @@ pub async fn run_command_line_runtime(parsed_args: ParsedArgs) -> Result<()> {
             events = session.trace_manager.wait_for_all_events_async() => {
                 for event in events {
                     event_count += 1;
-                    info!("[Event #{}] {:?}", event_count, event);
+
+                    // Generate formatted output for better display
+                    let formatted_output = event.to_formatted_output();
+                    if !formatted_output.is_empty() {
+                        info!("[Event #{}] Output:", event_count);
+                        for line in formatted_output {
+                            info!("  {}", line);
+                        }
+                    }
+
+                    // Also show raw debug info if needed (can be removed later)
+                    debug!("[Event #{}] Raw: {:?}", event_count, event);
                 }
             }
 
