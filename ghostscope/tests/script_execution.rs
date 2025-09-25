@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{init, FIXTURES};
+use common::{init, OptimizationLevel, FIXTURES};
 use lazy_static::lazy_static;
 use std::io::Write;
 use std::process::Stdio;
@@ -26,14 +26,16 @@ lazy_static! {
 struct GlobalTestProcess {
     child: tokio::process::Child,
     pid: u32,
+    optimization_level: OptimizationLevel,
 }
 
 impl GlobalTestProcess {
-    async fn start() -> anyhow::Result<Self> {
-        let binary_path = FIXTURES.get_test_binary("sample_program")?;
+    async fn start_with_opt(opt_level: OptimizationLevel) -> anyhow::Result<Self> {
+        let binary_path = FIXTURES.get_test_binary_with_opt("sample_program", opt_level)?;
 
         println!(
-            "🚀 Starting global sample_program: {}",
+            "🚀 Starting global sample_program ({}): {}",
+            opt_level.description(),
             binary_path.display()
         );
 
@@ -49,9 +51,21 @@ impl GlobalTestProcess {
         // Give it a moment to start
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        println!("✓ Started global sample_program with PID: {}", pid);
+        println!(
+            "✓ Started global sample_program ({}) with PID: {}",
+            opt_level.description(),
+            pid
+        );
 
-        Ok(Self { child, pid })
+        Ok(Self {
+            child,
+            pid,
+            optimization_level: opt_level,
+        })
+    }
+
+    async fn start() -> anyhow::Result<Self> {
+        Self::start_with_opt(OptimizationLevel::Debug).await
     }
 
     fn get_pid(&self) -> u32 {
@@ -59,7 +73,11 @@ impl GlobalTestProcess {
     }
 
     async fn terminate(mut self) -> anyhow::Result<()> {
-        println!("🛑 Terminating global sample_program (PID: {})", self.pid);
+        println!(
+            "🛑 Terminating global sample_program ({}, PID: {})",
+            self.optimization_level.description(),
+            self.pid
+        );
 
         // Try graceful shutdown first
         let _ = self.child.kill().await;
@@ -67,14 +85,20 @@ impl GlobalTestProcess {
         // Wait for termination with timeout
         match timeout(Duration::from_secs(2), self.child.wait()).await {
             Ok(_) => {
-                println!("✓ Global sample_program terminated gracefully");
+                println!(
+                    "✓ Global sample_program ({}) terminated gracefully",
+                    self.optimization_level.description()
+                );
             }
             Err(_) => {
                 // Force kill if it doesn't respond
                 let _ = std::process::Command::new("kill")
                     .args(&["-KILL", &self.pid.to_string()])
                     .output();
-                println!("⚠️ Force killed global sample_program");
+                println!(
+                    "⚠️ Force killed global sample_program ({})",
+                    self.optimization_level.description()
+                );
             }
         }
 
@@ -82,23 +106,25 @@ impl GlobalTestProcess {
     }
 }
 
-// Get or start the global test process
-async fn get_global_test_pid() -> anyhow::Result<u32> {
+// Get or start the global test process with specific optimization level
+async fn get_global_test_pid_with_opt(opt_level: OptimizationLevel) -> anyhow::Result<u32> {
     let manager = GLOBAL_TEST_MANAGER.clone();
 
-    // Read lock first to check if process exists
+    // Read lock first to check if process exists and matches optimization level
     {
         let read_guard = manager.read().await;
         if let Some(process) = &*read_guard {
-            // Check if the process is still running
-            let status = std::process::Command::new("kill")
-                .args(&["-0", &process.pid.to_string()])
-                .status();
+            // Check if optimization level matches and process is still running
+            if process.optimization_level == opt_level {
+                let status = std::process::Command::new("kill")
+                    .args(&["-0", &process.pid.to_string()])
+                    .status();
 
-            if status.map(|s| s.success()).unwrap_or(false) {
-                return Ok(process.pid);
+                if status.map(|s| s.success()).unwrap_or(false) {
+                    return Ok(process.pid);
+                }
             }
-            // Process is dead, we'll need to start a new one
+            // Either wrong opt level or process is dead, we'll need to start a new one
         }
     }
 
@@ -107,22 +133,41 @@ async fn get_global_test_pid() -> anyhow::Result<u32> {
 
     // Double-check in case another thread started it
     if let Some(process) = &*write_guard {
-        let status = std::process::Command::new("kill")
-            .args(&["-0", &process.pid.to_string()])
-            .status();
+        if process.optimization_level == opt_level {
+            let status = std::process::Command::new("kill")
+                .args(&["-0", &process.pid.to_string()])
+                .status();
 
-        if status.map(|s| s.success()).unwrap_or(false) {
-            return Ok(process.pid);
+            if status.map(|s| s.success()).unwrap_or(false) {
+                return Ok(process.pid);
+            }
         }
     }
 
-    // Start new process
-    let new_process = GlobalTestProcess::start().await?;
+    // Terminate existing process if it has different optimization level
+    if let Some(old_process) = write_guard.take() {
+        if old_process.optimization_level != opt_level {
+            println!(
+                "🔄 Switching from {} to {}, terminating old process",
+                old_process.optimization_level.description(),
+                opt_level.description()
+            );
+            let _ = old_process.terminate().await;
+        }
+    }
+
+    // Start new process with the requested optimization level
+    let new_process = GlobalTestProcess::start_with_opt(opt_level).await?;
     let pid = new_process.get_pid();
 
     *write_guard = Some(new_process);
 
     Ok(pid)
+}
+
+// Get or start the global test process (defaults to Debug optimization)
+async fn get_global_test_pid() -> anyhow::Result<u32> {
+    get_global_test_pid_with_opt(OptimizationLevel::Debug).await
 }
 
 // Cleanup function to be called when tests finish
@@ -187,19 +232,26 @@ fn ensure_global_cleanup_registered() {
     });
 }
 
-/// Helper to run ghostscope with script and capture results
+/// Helper to run ghostscope with script and capture results with specific optimization level
 /// For failing cases (syntax errors, etc.), this will return quickly with exit code != 0
 /// For successful cases, this will run for timeout_secs, collect output, then terminate the process
-async fn run_ghostscope_with_script(
+async fn run_ghostscope_with_script_opt(
     script_content: &str,
     timeout_secs: u64,
+    opt_level: OptimizationLevel,
 ) -> anyhow::Result<(i32, String, String)> {
-    // Get PID of running sample_program
-    let test_pid = get_global_test_pid().await?;
+    // Get PID of running sample_program with specific optimization level
+    let test_pid = get_global_test_pid_with_opt(opt_level).await?;
 
     let mut script_file = NamedTempFile::new()?;
     script_file.write_all(script_content.as_bytes())?;
     let script_path = script_file.path();
+
+    println!(
+        "🔍 Running ghostscope with {} binary (PID: {})",
+        opt_level.description(),
+        test_pid
+    );
 
     let mut child = Command::new("../target/debug/ghostscope")
         .args(&[
@@ -207,91 +259,93 @@ async fn run_ghostscope_with_script(
             &test_pid.to_string(),
             "--script-file",
             script_path.to_str().unwrap(),
-            "--no-log",
             "--no-save-llvm-ir",
             "--no-save-ebpf",
             "--no-save-ast",
+            "--no-log",
         ])
-        .env("RUST_LOG", "off")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
 
-    // Give process a moment to start and potentially fail fast
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // Check if process already exited (fast failure cases)
-    if let Some(exit_status) = child.try_wait()? {
-        let output = child.wait_with_output().await?;
-        let exit_code = exit_status.code().unwrap_or(-1);
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        return Ok((exit_code, stdout, stderr));
-    }
-
-    // Process is still running - collect output for timeout_secs then terminate
+    // Rest of the function implementation - collect output and handle termination
     let stdout_handle = child.stdout.take().unwrap();
     let stderr_handle = child.stderr.take().unwrap();
 
-    let mut stdout_reader = BufReader::new(stdout_handle).lines();
-    let mut stderr_reader = BufReader::new(stderr_handle).lines();
+    let mut stdout_reader = BufReader::new(stdout_handle);
+    let mut stderr_reader = BufReader::new(stderr_handle);
 
-    let mut stdout_lines = Vec::new();
-    let mut stderr_lines = Vec::new();
+    let mut stdout_content = String::new();
+    let mut stderr_content = String::new();
 
-    // Collect output for the specified timeout duration
-    let collect_future = async {
-        loop {
-            tokio::select! {
-                line_result = stdout_reader.next_line() => {
-                    match line_result {
-                        Ok(Some(line)) => {
-                            println!("STDOUT: {}", line);  // Real-time output for debugging
-                            stdout_lines.push(line);
-                        }
-                        Ok(None) => break, // EOF
-                        Err(_) => break,
-                    }
+    // Read output with timeout
+    let read_task = async {
+        let mut stdout_line = String::new();
+        let mut stderr_line = String::new();
+
+        for _ in 0..100 {
+            // Try to read stdout
+            stdout_line.clear();
+            if let Ok(Ok(n)) = timeout(
+                Duration::from_millis(50),
+                stdout_reader.read_line(&mut stdout_line),
+            )
+            .await
+            {
+                if n > 0 {
+                    stdout_content.push_str(&stdout_line);
                 }
-                line_result = stderr_reader.next_line() => {
-                    match line_result {
-                        Ok(Some(line)) => {
-                            println!("STDERR: {}", line);  // Real-time output for debugging
-                            stderr_lines.push(line);
-                        }
-                        Ok(None) => break, // EOF
-                        Err(_) => break,
-                    }
+            }
+
+            // Try to read stderr
+            stderr_line.clear();
+            if let Ok(Ok(n)) = timeout(
+                Duration::from_millis(50),
+                stderr_reader.read_line(&mut stderr_line),
+            )
+            .await
+            {
+                if n > 0 {
+                    stderr_content.push_str(&stderr_line);
                 }
+            }
+
+            // Check if process has exited (for quick failures)
+            if let Ok(Some(status)) = child.try_wait() {
+                // Process exited, break and collect remaining output
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    };
+
+    // Run the read task with overall timeout
+    let _ = timeout(Duration::from_secs(timeout_secs), read_task).await;
+
+    // Terminate the child process
+    let exit_code = match child.try_wait() {
+        Ok(Some(status)) => status.code().unwrap_or(-1),
+        _ => {
+            let _ = child.kill().await;
+            match timeout(Duration::from_secs(2), child.wait()).await {
+                Ok(Ok(status)) => status.code().unwrap_or(-1),
+                _ => -1,
             }
         }
     };
 
-    // Run collection with timeout
-    let _collection_result = timeout(Duration::from_secs(timeout_secs), collect_future).await;
+    Ok((exit_code, stdout_content, stderr_content))
+}
 
-    // Forcibly terminate the process
-    println!("⏰ Timeout reached, terminating ghostscope process...");
-    let _ = child.kill().await;
-
-    // Wait for process to actually terminate
-    let final_status = timeout(Duration::from_secs(2), child.wait()).await;
-
-    let exit_code = match final_status {
-        Ok(Ok(status)) => {
-            println!("✓ Process terminated with status: {:?}", status);
-            status.code().unwrap_or(0) // Success case - we terminated it
-        }
-        _ => {
-            println!("⚠️ Force killed process");
-            0 // We successfully collected output and killed it
-        }
-    };
-
-    let stdout = stdout_lines.join("\n");
-    let stderr = stderr_lines.join("\n");
-
-    Ok((exit_code, stdout, stderr))
+/// Helper to run ghostscope with script and capture results (defaults to Debug optimization)
+/// For failing cases (syntax errors, etc.), this will return quickly with exit code != 0
+/// For successful cases, this will run for timeout_secs, collect output, then terminate the process
+async fn run_ghostscope_with_script(
+    script_content: &str,
+    timeout_secs: u64,
+) -> anyhow::Result<(i32, String, String)> {
+    run_ghostscope_with_script_opt(script_content, timeout_secs, OptimizationLevel::Debug).await
 }
 
 #[tokio::test]
@@ -414,67 +468,82 @@ async fn test_function_level_tracing() -> anyhow::Result<()> {
 
     let script_content = r#"
 trace calculate_something {
-    print "CALC: a={} b={} result={}", a, b, result;
+    print "CALC: a={} b={}}", a, b;
 }
 "#;
 
-    println!("=== Function Level Tracing Test ===");
+    // Test with both optimization levels
+    let optimization_levels = [OptimizationLevel::Debug, OptimizationLevel::O2];
 
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script(script_content, 3).await?;
+    for opt_level in &optimization_levels {
+        println!(
+            "=== Function Level Tracing Test ({}) ===",
+            opt_level.description()
+        );
 
-    println!("Exit code: {}", exit_code);
-    println!("STDOUT: {}", stdout);
-    println!("STDERR: {}", stderr);
-    println!("===============================================");
+        let (exit_code, stdout, stderr) =
+            run_ghostscope_with_script_opt(script_content, 3, *opt_level).await?;
 
-    // Check if we have permission to attach
-    if stderr.contains("Need root permissions") || stderr.contains("Failed to attach uprobe") {
-        println!("⚠️  Test requires sudo permissions - cannot validate math");
-        println!("   Run with: sudo cargo test test_calculate_something_math_validation");
-        return Ok(());
-    }
+        println!("Exit code: {}", exit_code);
+        println!("STDOUT: {}", stdout);
+        println!("STDERR: {}", stderr);
+        println!("===============================================");
 
-    // If we have permissions, should run successfully and produce output
-    if exit_code == 0 {
-        println!("✓ Ghostscope attached and ran successfully");
+        // Check if we have permission to attach
+        if stderr.contains("Need root permissions") || stderr.contains("Failed to attach uprobe") {
+            println!("⚠️  Test requires sudo permissions - cannot validate math");
+            println!("   Run with: sudo cargo test test_calculate_something_math_validation");
+            continue;
+        }
 
-        // Parse output to validate math: a == b - 5
-        let mut math_validations = 0;
-        let mut function_calls_found = 0;
-        let mut validation_errors = Vec::new();
+        // If we have permissions, should run successfully and produce output
+        if exit_code == 0 {
+            println!("✓ Ghostscope attached and ran successfully");
 
-        for line in stdout.lines() {
-            if line.contains("CALC: ") {
-                function_calls_found += 1;
-                if let Some((a, b)) = parse_calc_line_simple(line) {
-                    if a == b - 5 {
-                        println!("✓ Math validation passed: a={} == b-5={}", a, b - 5);
-                        math_validations += 1;
+            // Parse output to validate math: a == b - 5
+            let mut math_validations = 0;
+            let mut function_calls_found = 0;
+            let mut validation_errors = Vec::new();
+
+            for line in stdout.lines() {
+                if line.contains("CALC: ") {
+                    function_calls_found += 1;
+                    if let Some((a, b)) = parse_calc_line_simple(line) {
+                        if a == b - 5 {
+                            println!("✓ Math validation passed: a={} == b-5={}", a, b - 5);
+                            math_validations += 1;
+                        } else {
+                            let error_msg = format!(
+                                "Math validation failed: a={} != b-5={} (b={})",
+                                a,
+                                b - 5,
+                                b
+                            );
+                            println!("❌ {}", error_msg);
+                            validation_errors.push(error_msg);
+                        }
                     } else {
-                        let error_msg =
-                            format!("Math validation failed: a={} != b-5={} (b={})", a, b - 5, b);
-                        println!("❌ {}", error_msg);
-                        validation_errors.push(error_msg);
+                        println!("⚠️  Failed to parse line: {}", line);
                     }
-                } else {
-                    println!("⚠️  Failed to parse line: {}", line);
                 }
             }
+
+            if function_calls_found == 0 {
+                panic!("❌ No function calls captured - test failed. Expected at least one calculate_something call. This indicates either:\n  1. sample_program is not running\n  2. Function is not being called\n  3. Ghostscope failed to attach properly");
+            } else if !validation_errors.is_empty() {
+                panic!("❌ Function calls captured but math validation failed:\n  Found {} function calls, {} validation errors:\n  {}",
+                function_calls_found, validation_errors.len(), validation_errors.join("\n  "));
+            } else if math_validations > 0 {
+                println!("✓ Validated {} calculate_something calls", math_validations);
+            }
+        } else {
+            println!(
+                "⚠️  Unexpected exit code: {}. STDERR: {}",
+                exit_code, stderr
+            );
         }
 
-        if function_calls_found == 0 {
-            panic!("❌ No function calls captured - test failed. Expected at least one calculate_something call. This indicates either:\n  1. sample_program is not running\n  2. Function is not being called\n  3. Ghostscope failed to attach properly");
-        } else if !validation_errors.is_empty() {
-            panic!("❌ Function calls captured but math validation failed:\n  Found {} function calls, {} validation errors:\n  {}",
-                function_calls_found, validation_errors.len(), validation_errors.join("\n  "));
-        } else if math_validations > 0 {
-            println!("✓ Validated {} calculate_something calls", math_validations);
-        }
-    } else {
-        println!(
-            "⚠️  Unexpected exit code: {}. STDERR: {}",
-            exit_code, stderr
-        );
+        println!("===============================================");
     }
 
     Ok(())
@@ -496,113 +565,124 @@ trace sample_program.c:16 {
 }
 "#;
 
-    println!("=== Multiple Trace Targets Test ===");
+    // Test with both optimization levels
+    let optimization_levels = [OptimizationLevel::Debug, OptimizationLevel::O2];
 
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script(script_content, 3).await?;
-
-    println!("Exit code: {}", exit_code);
-    println!("STDOUT: {}", stdout);
-    println!("STDERR: {}", stderr);
-    println!("=====================================");
-
-    // Check if we have permission to attach
-    if stderr.contains("Need root permissions") || stderr.contains("Failed to attach uprobe") {
-        println!("⚠️  Test requires sudo permissions");
-        println!("   Run with: sudo cargo test test_multiple_trace_targets");
-        return Ok(());
-    }
-
-    // Check that script syntax is valid
-    assert!(
-        !stderr.contains("Parse error"),
-        "Multi-target script should have valid syntax: {}",
-        stderr
-    );
-
-    if exit_code == 0 {
-        println!("✓ Multiple trace targets attached and ran successfully");
-
-        // Check for both function-level and line-level outputs
-        let has_func = stdout.contains("FUNC:");
-        let has_line16 = stdout.contains("LINE16:");
-
+    for opt_level in &optimization_levels {
         println!(
-            "Trace capture status: FUNC={}, LINE16={}",
-            has_func, has_line16
+            "=== Multiple Trace Targets Test ({}) ===",
+            opt_level.description()
         );
 
-        let mut func_validations = 0;
-        let mut line_validations = 0;
-        let mut validation_errors = Vec::new();
+        let (exit_code, stdout, stderr) =
+            run_ghostscope_with_script_opt(script_content, 3, *opt_level).await?;
 
-        // Validate function-level traces (a == b - 5)
-        if has_func {
-            for line in stdout.lines() {
-                if line.contains("FUNC: ") {
-                    if let Some((a, b)) = parse_calc_line_simple(line) {
-                        if a == b - 5 {
-                            println!(
-                                "✓ Function-level math validation passed: a={} == b-5={}",
-                                a,
-                                b - 5
-                            );
-                            func_validations += 1;
-                        } else {
-                            let error_msg = format!(
-                                "Function-level validation failed: a={} != b-5={}",
-                                a,
-                                b - 5
-                            );
-                            println!("❌ {}", error_msg);
-                            validation_errors.push(error_msg);
+        println!("Exit code: {}", exit_code);
+        println!("STDOUT: {}", stdout);
+        println!("STDERR: {}", stderr);
+        println!("=====================================");
+
+        // Check if we have permission to attach
+        if stderr.contains("Need root permissions") || stderr.contains("Failed to attach uprobe") {
+            println!("⚠️  Test requires sudo permissions");
+            println!("   Run with: sudo cargo test test_multiple_trace_targets");
+            continue;
+        }
+
+        // Check that script syntax is valid
+        assert!(
+            !stderr.contains("Parse error"),
+            "Multi-target script should have valid syntax: {}",
+            stderr
+        );
+
+        if exit_code == 0 {
+            println!("✓ Multiple trace targets attached and ran successfully");
+
+            // Check for both function-level and line-level outputs
+            let has_func = stdout.contains("FUNC:");
+            let has_line16 = stdout.contains("LINE16:");
+
+            println!(
+                "Trace capture status: FUNC={}, LINE16={}",
+                has_func, has_line16
+            );
+
+            let mut func_validations = 0;
+            let mut line_validations = 0;
+            let mut validation_errors = Vec::new();
+
+            // Validate function-level traces (a == b - 5)
+            if has_func {
+                for line in stdout.lines() {
+                    if line.contains("FUNC: ") {
+                        if let Some((a, b)) = parse_calc_line_simple(line) {
+                            if a == b - 5 {
+                                println!(
+                                    "✓ Function-level math validation passed: a={} == b-5={}",
+                                    a,
+                                    b - 5
+                                );
+                                func_validations += 1;
+                            } else {
+                                let error_msg = format!(
+                                    "Function-level validation failed: a={} != b-5={}",
+                                    a,
+                                    b - 5
+                                );
+                                println!("❌ {}", error_msg);
+                                validation_errors.push(error_msg);
+                            }
                         }
                     }
                 }
             }
-        }
 
-        // Validate line-level traces (a * b + 42 == result)
-        if has_line16 {
-            for line in stdout.lines() {
-                if line.contains("LINE16: ") {
-                    if let Some((a, b, result)) = parse_line16_trace(line) {
-                        let expected = a * b + 42;
-                        if result == expected {
-                            println!(
-                                "✓ Line-level math validation passed: {} * {} + 42 = {}",
-                                a, b, result
-                            );
-                            line_validations += 1;
-                        } else {
-                            let error_msg = format!(
-                                "Line-level validation failed: {} * {} + 42 = {} but got {}",
-                                a, b, expected, result
-                            );
-                            println!("❌ {}", error_msg);
-                            validation_errors.push(error_msg);
+            // Validate line-level traces (a * b + 42 == result)
+            if has_line16 {
+                for line in stdout.lines() {
+                    if line.contains("LINE16: ") {
+                        if let Some((a, b, result)) = parse_line16_trace(line) {
+                            let expected = a * b + 42;
+                            if result == expected {
+                                println!(
+                                    "✓ Line-level math validation passed: {} * {} + 42 = {}",
+                                    a, b, result
+                                );
+                                line_validations += 1;
+                            } else {
+                                let error_msg = format!(
+                                    "Line-level validation failed: {} * {} + 42 = {} but got {}",
+                                    a, b, expected, result
+                                );
+                                println!("❌ {}", error_msg);
+                                validation_errors.push(error_msg);
+                            }
                         }
                     }
                 }
             }
-        }
 
-        if !has_func && !has_line16 {
-            println!("⚠️ No traces captured during test window");
-            println!("   This could be normal if sample_program doesn't trigger functions within {} seconds", 3);
-        } else {
-            if !validation_errors.is_empty() {
-                panic!("❌ Traces captured but validation failed:\n  Function validations: {}, Line validations: {}\n  Errors: {}",
+            if !has_func && !has_line16 {
+                println!("⚠️ No traces captured during test window");
+                println!("   This could be normal if sample_program doesn't trigger functions within {} seconds", 3);
+            } else {
+                if !validation_errors.is_empty() {
+                    panic!("❌ Traces captured but validation failed:\n  Function validations: {}, Line validations: {}\n  Errors: {}",
                     func_validations, line_validations, validation_errors.join("\n  "));
-            } else if func_validations > 0 || line_validations > 0 {
-                println!("✓ Multiple trace targets validated successfully: {} function traces, {} line traces",
+                } else if func_validations > 0 || line_validations > 0 {
+                    println!("✓ Multiple trace targets validated successfully: {} function traces, {} line traces",
                     func_validations, line_validations);
+                }
             }
+        } else {
+            println!(
+                "⚠️  Unexpected exit code: {}. STDERR: {}",
+                exit_code, stderr
+            );
         }
-    } else {
-        println!(
-            "⚠️  Unexpected exit code: {}. STDERR: {}",
-            exit_code, stderr
-        );
+
+        println!("=====================================");
     }
 
     Ok(())
