@@ -72,13 +72,25 @@ mod tests {
         let mut bridge = StreamingParserBridge::new();
         let string_table = StringTable::new();
 
-        // Create test segment data (this would come from ringbuf in real usage)
-        let test_segment = vec![0u8; 32]; // Placeholder
+        // Create test segment data with valid TraceEventHeader
+        use ghostscope_protocol::{TraceEventHeader, consts};
+        let test_header = TraceEventHeader {
+            magic: consts::MAGIC,
+        };
 
-        // Process segment
-        let result = bridge.process_ringbuf_segment(&test_segment, &string_table);
+        // Convert header to bytes
+        let header_bytes = unsafe {
+            std::slice::from_raw_parts(
+                &test_header as *const _ as *const u8,
+                std::mem::size_of::<TraceEventHeader>(),
+            )
+        };
 
-        // Should not fail even with placeholder data
+        // Process valid header segment
+        let result = bridge.process_ringbuf_segment(header_bytes, &string_table);
+
+        // Should succeed with valid header but return None (incomplete event)
         assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
     }
 }

@@ -177,7 +177,7 @@ fn default_tui_mode() -> bool {
 }
 
 fn default_enable_logging() -> bool {
-    true
+    false // Changed: script mode should default to no logging
 }
 
 fn default_debug_search_paths() -> Vec<String> {

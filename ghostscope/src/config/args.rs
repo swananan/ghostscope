@@ -119,6 +119,7 @@ pub struct ParsedArgs {
     pub log_file: Option<PathBuf>,
     pub enable_logging: bool,
     pub log_level: crate::config::settings::LogLevel,
+    pub has_explicit_log_flag: bool, // Track if --log/--no-log was explicitly provided
     pub config: Option<PathBuf>,
     pub debug_file: Option<PathBuf>,
     pub script: Option<String>,
@@ -160,7 +161,8 @@ impl Args {
             let should_save_ast = Self::should_save_ast(&parsed);
             let tui_mode = Self::determine_tui_mode(&parsed);
             let target_path = Self::resolve_target_path(&parsed);
-            let (enable_logging, log_level) = Self::determine_logging_config(&parsed);
+            let (enable_logging, log_level, has_explicit_log_flag) =
+                Self::determine_logging_config(&parsed);
 
             ParsedArgs {
                 binary_path,
@@ -169,6 +171,7 @@ impl Args {
                 log_file: parsed.log_file,
                 enable_logging,
                 log_level,
+                has_explicit_log_flag,
                 config: parsed.config,
                 debug_file: parsed.debug_file,
                 script: parsed.script,
@@ -189,7 +192,8 @@ impl Args {
             let should_save_ast = Self::should_save_ast(&parsed);
             let tui_mode = Self::determine_tui_mode(&parsed);
             let target_path = Self::resolve_target_path(&parsed);
-            let (enable_logging, log_level) = Self::determine_logging_config(&parsed);
+            let (enable_logging, log_level, has_explicit_log_flag) =
+                Self::determine_logging_config(&parsed);
 
             ParsedArgs {
                 binary_path: parsed.binary,
@@ -198,6 +202,7 @@ impl Args {
                 log_file: parsed.log_file,
                 enable_logging,
                 log_level,
+                has_explicit_log_flag,
                 config: parsed.config,
                 debug_file: parsed.debug_file,
                 script: parsed.script,
@@ -312,27 +317,41 @@ impl Args {
     }
 
     /// Determine logging configuration from command line arguments
-    fn determine_logging_config(parsed: &Args) -> (bool, crate::config::settings::LogLevel) {
+    fn determine_logging_config(parsed: &Args) -> (bool, crate::config::settings::LogLevel, bool) {
+        // Check if we're in script mode (script provided via --script or --script-file)
+        let is_script_mode = parsed.script.is_some() || parsed.script_file.is_some();
+
+        // Check if explicit log flags were provided
+        let has_explicit_log_flag = parsed.log || parsed.no_log;
+
         // Determine enable_logging
         let enable_logging = if parsed.no_log {
             false // --no-log takes precedence
         } else if parsed.log {
             true // --log takes precedence
+        } else if is_script_mode {
+            false // Script mode defaults to no logging
         } else {
-            true // Default to enabled (will be overridden by config file if needed)
+            true // TUI mode defaults to logging enabled
         };
 
-        // Determine log_level
+        // Determine log_level - check RUST_LOG first, then command line args
         let log_level = if let Some(ref level_str) = parsed.log_level {
+            // --log-level takes precedence
             crate::config::settings::LogLevel::from_str(level_str).unwrap_or_else(|_| {
                 warn!("Invalid log level '{}', using default 'warn'", level_str);
                 crate::config::settings::LogLevel::Warn
+            })
+        } else if let Ok(rust_log) = std::env::var("RUST_LOG") {
+            // RUST_LOG environment variable as fallback
+            crate::config::settings::LogLevel::from_str(&rust_log).unwrap_or_else(|_| {
+                crate::config::settings::LogLevel::Warn // Default level if RUST_LOG is invalid
             })
         } else {
             crate::config::settings::LogLevel::Warn // Default level
         };
 
-        (enable_logging, log_level)
+        (enable_logging, log_level, has_explicit_log_flag)
     }
 }
 

@@ -145,9 +145,9 @@ pub async fn run_command_line_runtime(parsed_args: ParsedArgs) -> Result<()> {
                     // Generate formatted output for better display
                     let formatted_output = event.to_formatted_output();
                     if !formatted_output.is_empty() {
-                        info!("[Event #{}] Output:", event_count);
+                        println!("[Event #{}] Output:", event_count);
                         for line in formatted_output {
-                            info!("  {}", line);
+                            println!("  {}", line);
                         }
                     }
 
@@ -282,9 +282,9 @@ async fn run_cli_with_session(
                     // Generate formatted output for better display
                     let formatted_output = event.to_formatted_output();
                     if !formatted_output.is_empty() {
-                        info!("[Event #{}] Output:", event_count);
+                        println!("[Event #{}] Output:", event_count);
                         for line in formatted_output {
-                            info!("  {}", line);
+                            println!("  {}", line);
                         }
                     }
 

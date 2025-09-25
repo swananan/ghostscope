@@ -33,6 +33,7 @@ pub async fn run_tui_coordinator_with_config(config: MergedConfig) -> Result<()>
         should_save_ebpf: config.should_save_ebpf,
         should_save_ast: config.should_save_ast,
         layout_mode: config.layout_mode,
+        has_explicit_log_flag: false, // Not relevant for TUI conversion
     };
 
     run_tui_coordinator_with_ui_config(parsed_args, ui_config).await

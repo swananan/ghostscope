@@ -119,6 +119,7 @@ async fn main() -> Result<()> {
         should_save_ebpf: merged_config.should_save_ebpf,
         should_save_ast: merged_config.should_save_ast,
         layout_mode: merged_config.layout_mode,
+        has_explicit_log_flag: false, // Not needed for validation
     };
     temp_args.validate()?;
 

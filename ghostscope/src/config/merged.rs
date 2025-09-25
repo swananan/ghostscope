@@ -43,13 +43,26 @@ impl MergedConfig {
             .log_file
             .unwrap_or_else(|| PathBuf::from(&config.general.log_file));
 
-        // Logging configuration: command line overrides config file
-        let enable_logging = if args.enable_logging != true {
-            // Command line explicitly set logging (--log or --no-log)
+        // Logging configuration priority:
+        // 1. Command line flags (--log/--no-log)
+        // 2. Config file setting
+        // 3. Default behavior (script mode: false, TUI mode: true)
+
+        // Check if script mode was detected (args already processed this logic)
+        let is_script_mode = args.script.is_some() || args.script_file.is_some();
+
+        let enable_logging = if args.has_explicit_log_flag {
+            // Command line explicitly set logging (--log or --no-log takes precedence)
             args.enable_logging
         } else {
-            // Use config file setting
-            config.general.enable_logging
+            // Use config file setting, fallback to script mode behavior
+            if config.general.enable_logging != default_enable_logging_for_mode(is_script_mode) {
+                // Config file has non-default setting, use it
+                config.general.enable_logging
+            } else {
+                // Config file has default, use args decision (which considers script mode)
+                args.enable_logging
+            }
         };
 
         let log_level = if args.log_level != crate::config::settings::LogLevel::Warn {
@@ -142,6 +155,15 @@ impl MergedConfig {
         };
 
         Ok(Self::new(args, config))
+    }
+}
+
+/// Get default logging behavior for the given mode
+fn default_enable_logging_for_mode(is_script_mode: bool) -> bool {
+    if is_script_mode {
+        false // Script mode defaults to no logging
+    } else {
+        true // TUI mode defaults to logging enabled
     }
 }
 

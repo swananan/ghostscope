@@ -307,9 +307,10 @@ mod tests {
 
         let file2 = index.get_file_entry(2).unwrap();
         assert_eq!(file2.filename.as_ref(), "header.h");
+        // In DWARF4, directory_index=1 refers to directories[0]="include", combined with comp_dir="/src"
         assert_eq!(
             file2.get_full_path(&index),
-            Some("include/header.h".to_string())
+            Some("/src/include/header.h".to_string())
         );
     }
 
@@ -317,13 +318,13 @@ mod tests {
     fn test_lightweight_file_index_dwarf5() {
         let mut index = LightweightFileIndex::new(Some("/src".to_string()), 5);
 
-        // Add directories
-        index.add_directory("include".to_string());
-        index.add_directory("lib".to_string());
+        // Add directories - in DWARF5, directories[0] should be comp_dir for this test to work
+        index.add_directory("/src".to_string()); // directories[0] = comp_dir
+        index.add_directory("include".to_string()); // directories[1] = include
 
         // Add files (DWARF 5: 0-based indexing)
-        index.add_file_entry(0, 0, "main.c".to_string()); // comp_dir + main.c
-        index.add_file_entry(1, 1, "header.h".to_string()); // include/ + header.h
+        index.add_file_entry(0, 0, "main.c".to_string()); // directories[0] + main.c = /src/main.c
+        index.add_file_entry(1, 1, "header.h".to_string()); // directories[1] + header.h
 
         // Test file lookup
         let file0 = index.get_file_entry(0).unwrap();
@@ -332,9 +333,10 @@ mod tests {
 
         let file1 = index.get_file_entry(1).unwrap();
         assert_eq!(file1.filename.as_ref(), "header.h");
+        // In DWARF5, directory_index=1 refers to directories[1]="include", combined with comp_dir="/src"
         assert_eq!(
             file1.get_full_path(&index),
-            Some("include/header.h".to_string())
+            Some("/src/include/header.h".to_string())
         );
     }
 
