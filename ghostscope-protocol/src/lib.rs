@@ -4,7 +4,6 @@
 
 // Core modules
 mod types;
-pub(crate) mod utils;
 
 pub mod format_printer;
 pub mod streaming_parser;

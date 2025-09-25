@@ -91,7 +91,7 @@ impl FormatPrinter {
     }
 
     /// Format a single variable value as a string based on its type
-    fn format_variable_value(variable: &ParsedVariable) -> String {
+    pub(crate) fn format_variable_value(variable: &ParsedVariable) -> String {
         match variable.type_encoding {
             TypeEncoding::U8 => {
                 if variable.data.is_empty() {

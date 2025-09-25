@@ -341,9 +341,13 @@ impl StreamingTraceParser {
                 let type_encoding = TypeEncoding::from_u8(data_struct.type_encoding)
                     .unwrap_or(TypeEncoding::Unknown);
 
-                let formatted_value =
-                    crate::utils::MessageParser::format_variable_value(type_encoding, var_data)
-                        .unwrap_or_else(|e| format!("<format error: {e}>"));
+                // Use FormatPrinter for consistent formatting
+                let parsed_variable = crate::format_printer::ParsedVariable {
+                    var_name_index: data_struct.var_name_index,
+                    type_encoding,
+                    data: var_data.to_vec(),
+                };
+                let formatted_value = crate::format_printer::FormatPrinter::format_variable_value(&parsed_variable);
 
                 Ok(ParsedInstruction::PrintVariable {
                     name: var_name.to_string(),
