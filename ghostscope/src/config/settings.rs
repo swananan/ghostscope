@@ -7,34 +7,24 @@ use tracing::{debug, info};
 use crate::config::LayoutMode;
 
 /// Panel type enumeration for configuration
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize, Default)]
 pub enum PanelType {
     Source,
     EbpfInfo,
+    #[default]
     InteractiveCommand,
 }
 
-impl Default for PanelType {
-    fn default() -> Self {
-        PanelType::InteractiveCommand
-    }
-}
-
 /// Log level enumeration for configuration
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
     Error,
+    #[default]
     Warn,
     Info,
     Debug,
     Trace,
-}
-
-impl Default for LogLevel {
-    fn default() -> Self {
-        LogLevel::Warn
-    }
 }
 
 impl std::fmt::Display for LogLevel {
@@ -51,7 +41,7 @@ impl std::fmt::Display for LogLevel {
 
 impl LogLevel {
     /// Convert to tracing level filter
-    pub fn to_tracing_level_filter(&self) -> tracing::level_filters::LevelFilter {
+    pub fn to_tracing_level_filter(self) -> tracing::level_filters::LevelFilter {
         match self {
             LogLevel::Error => tracing::level_filters::LevelFilter::ERROR,
             LogLevel::Warn => tracing::level_filters::LevelFilter::WARN,
@@ -75,15 +65,10 @@ impl LogLevel {
             )),
         }
     }
-
-    /// Get all valid log level strings
-    pub fn all_levels() -> Vec<&'static str> {
-        vec!["error", "warn", "info", "debug", "trace"]
-    }
 }
 
 /// Main configuration structure loaded from TOML files
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default)]
     pub general: GeneralConfig,
@@ -277,17 +262,6 @@ impl Default for SaveOption {
     }
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            general: GeneralConfig::default(),
-            dwarf: DwarfConfig::default(),
-            files: FilesConfig::default(),
-            ui: UiConfigToml::default(),
-        }
-    }
-}
-
 impl Config {
     /// Load configuration from files with fallback search
     pub fn load() -> Result<Self> {
@@ -309,7 +283,7 @@ impl Config {
     /// Load configuration from a specific file path
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
-        let content = fs::read_to_string(&path).map_err(|e| {
+        let content = fs::read_to_string(path).map_err(|e| {
             anyhow::anyhow!(
                 "Failed to read configuration file '{}': {}",
                 path.display(),

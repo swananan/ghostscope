@@ -1,3 +1,6 @@
+#![allow(clippy::uninlined_format_args)]
+#![allow(clippy::needless_borrows_for_generic_args)]
+
 //! DWARF parsing integration tests using dwarf-tool
 //!
 //! Tests for DWARF parsing and analysis functionality using dwarf-tool binary.
@@ -347,7 +350,7 @@ async fn test_dwarf_tool_error_handling() -> anyhow::Result<()> {
 
     // Test with non-existent file
     let result = AsyncCommand::new(&dwarf_tool_path)
-        .args(&["function", "/nonexistent/file"])
+        .args(["function", "/nonexistent/file"])
         .output()
         .await?;
 
@@ -361,8 +364,8 @@ async fn test_dwarf_tool_error_handling() -> anyhow::Result<()> {
 
     // Test with invalid address for module-addr
     let binary_path = FIXTURES.get_test_binary("sample_program")?;
-    let result = AsyncCommand::new(&dwarf_tool_path)
-        .args(&["module-addr", "0xdeadbeef", binary_path.to_str().unwrap()])
+    let _result = AsyncCommand::new(&dwarf_tool_path)
+        .args(["module-addr", "0xdeadbeef", binary_path.to_str().unwrap()])
         .output()
         .await?;
 

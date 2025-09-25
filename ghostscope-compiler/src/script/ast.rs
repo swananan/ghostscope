@@ -119,6 +119,12 @@ impl VariableContext {
     }
 }
 
+impl Default for VariableContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Program {
     pub statements: Vec<Statement>,
@@ -133,6 +139,12 @@ impl Program {
 
     pub fn add_statement(&mut self, statement: Statement) {
         self.statements.push(statement);
+    }
+}
+
+impl Default for Program {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

@@ -1,3 +1,5 @@
+#![allow(clippy::uninlined_format_args)]
+
 // New modular organization
 pub mod ebpf;
 pub mod script; // New instruction generator
@@ -8,7 +10,7 @@ pub mod script; // New instruction generator
 use crate::script::compiler::AstCompiler;
 use ebpf::context::CodeGenError;
 use script::parser::ParseError;
-use tracing::{info, warn};
+use tracing::info;
 
 pub fn hello() -> &'static str {
     "Hello from ghostscope-compiler!"
@@ -17,7 +19,7 @@ pub fn hello() -> &'static str {
 #[derive(Debug, thiserror::Error)]
 pub enum CompileError {
     #[error("Parse error: {0}")]
-    Parse(#[from] ParseError),
+    Parse(#[from] Box<ParseError>),
 
     #[error("Code generation error: {0}")]
     CodeGen(#[from] CodeGenError),
@@ -31,27 +33,22 @@ pub enum CompileError {
 
 pub type Result<T> = std::result::Result<T, CompileError>;
 
+impl From<ParseError> for CompileError {
+    fn from(err: ParseError) -> Self {
+        CompileError::Parse(Box::new(err))
+    }
+}
+
 // Public re-exports from script::compiler module
 pub use script::compiler::{CompilationResult, UProbeConfig};
 
 /// Save options for compilation output
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SaveOptions {
     pub save_llvm_ir: bool,
     pub save_ebpf: bool,
     pub save_ast: bool,
     pub binary_path_hint: Option<String>,
-}
-
-impl Default for SaveOptions {
-    fn default() -> Self {
-        Self {
-            save_llvm_ir: false,
-            save_ebpf: false,
-            save_ast: false,
-            binary_path_hint: None,
-        }
-    }
 }
 
 /// Main compilation interface with DwarfAnalyzer (multi-module support)
@@ -107,14 +104,13 @@ pub fn save_ast_to_file(program: &crate::script::Program, filename: &str) -> Res
     ast_content.push_str("=== AST Tree ===\n");
     ast_content.push_str("Program:\n");
     for (i, stmt) in program.statements.iter().enumerate() {
-        ast_content.push_str(&format!("  Statement {}: {:?}\n", i, stmt));
+        ast_content.push_str(&format!("  Statement {i}: {stmt:?}\n"));
     }
     ast_content.push_str("=== End AST Tree ===\n");
 
-    let file_path = format!("{}.txt", filename);
-    std::fs::write(&file_path, ast_content).map_err(|e| {
-        CompileError::Other(format!("Failed to save AST file '{}': {}", file_path, e))
-    })?;
+    let file_path = format!("{filename}.txt");
+    std::fs::write(&file_path, ast_content)
+        .map_err(|e| CompileError::Other(format!("Failed to save AST file '{file_path}': {e}")))?;
 
     Ok(())
 }
@@ -123,7 +119,7 @@ pub fn save_ast_to_file(program: &crate::script::Program, filename: &str) -> Res
 pub fn format_ebpf_bytecode(bytecode: &[u8]) -> String {
     bytecode
         .iter()
-        .map(|byte| format!("{:02x}", byte))
+        .map(|byte| format!("{byte:02x}"))
         .collect::<Vec<String>>()
         .join(" ")
 }
@@ -138,5 +134,5 @@ pub fn generate_file_name_for_ast(pid: Option<u32>, binary_path: Option<&str>) -
         .and_then(|name| name.to_str())
         .unwrap_or("unknown");
 
-    format!("gs_{}_{}_{}", pid_part, exec_part, "ast")
+    format!("gs_{pid_part}_{exec_part}_ast")
 }

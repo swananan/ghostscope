@@ -9,7 +9,6 @@ use aya::{
 use ghostscope_protocol::{ParsedTraceEvent, StreamingTraceParser, StringTable};
 use std::convert::TryInto;
 use std::os::unix::io::AsRawFd;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::unix::AsyncFd;
 use tracing::{error, info, warn};
 
@@ -163,8 +162,7 @@ impl GhostScopeLoader {
                 name.to_string()
             } else {
                 return Err(LoaderError::Generic(format!(
-                    "Specified program '{}' not found in eBPF object",
-                    name
+                    "Specified program '{name}' not found in eBPF object"
                 )));
             }
         } else {
@@ -201,7 +199,7 @@ impl GhostScopeLoader {
         let program_ref = self
             .bpf
             .program_mut(&program_name)
-            .ok_or_else(|| LoaderError::Generic(format!("Program '{}' not found", program_name)))?;
+            .ok_or_else(|| LoaderError::Generic(format!("Program '{program_name}' not found")))?;
 
         info!("Found program, attempting to convert to UProbe");
         info!("Program type: {:?}", program_ref.prog_type());
@@ -220,10 +218,7 @@ impl GhostScopeLoader {
         }
 
         let program: &mut UProbe = program_ref.try_into().map_err(|e| {
-            LoaderError::Generic(format!(
-                "Program '{}' is not a UProbe: {:?}",
-                program_name, e
-            ))
+            LoaderError::Generic(format!("Program '{program_name}' is not a UProbe: {e:?}"))
         })?;
 
         // Load the program
@@ -341,7 +336,7 @@ impl GhostScopeLoader {
             .take_map("ringbuf")
             .ok_or_else(|| LoaderError::MapNotFound("ringbuf".to_string()))?
             .try_into()
-            .map_err(|e| LoaderError::Generic(format!("Failed to convert ringbuf map: {}", e)))?;
+            .map_err(|e| LoaderError::Generic(format!("Failed to convert ringbuf map: {e}")))?;
 
         self.ringbuf = Some(ringbuf);
         info!("Ringbuf map initialized");
@@ -358,20 +353,17 @@ impl GhostScopeLoader {
 
                 // Get the program to detach the link
                 let program_ref = self.bpf.program_mut(&params.program_name).ok_or_else(|| {
-                    LoaderError::Generic(format!("Program '{}' not found", params.program_name))
+                    let program_name = &params.program_name;
+                    LoaderError::Generic(format!("Program '{program_name}' not found"))
                 })?;
 
                 let program: &mut UProbe = program_ref.try_into().map_err(|e| {
-                    LoaderError::Generic(format!(
-                        "Program '{}' is not a UProbe: {:?}",
-                        params.program_name, e
-                    ))
+                    let program_name = &params.program_name;
+                    LoaderError::Generic(format!("Program '{program_name}' is not a UProbe: {e:?}"))
                 })?;
 
                 // Detach the uprobe using the link ID
-                program
-                    .detach(link_id)
-                    .map_err(|e| LoaderError::Program(e))?;
+                program.detach(link_id).map_err(LoaderError::Program)?;
 
                 info!("Uprobe detached successfully");
                 Ok(())
@@ -536,13 +528,13 @@ impl GhostScopeLoader {
 
         // Create AsyncFd from the ringbuf's file descriptor
         let async_fd = AsyncFd::new(ringbuf.as_raw_fd())
-            .map_err(|e| LoaderError::Generic(format!("Failed to create AsyncFd: {}", e)))?;
+            .map_err(|e| LoaderError::Generic(format!("Failed to create AsyncFd: {e}")))?;
 
         // Wait for the file descriptor to become readable (events available)
         let _guard = async_fd
             .readable()
             .await
-            .map_err(|e| LoaderError::Generic(format!("AsyncFd error: {}", e)))?;
+            .map_err(|e| LoaderError::Generic(format!("AsyncFd error: {e}")))?;
 
         // Read all available events using streaming parser
         let mut events = Vec::new();
@@ -585,7 +577,7 @@ impl GhostScopeLoader {
     pub fn get_map_info(&self) -> Vec<String> {
         self.bpf
             .maps()
-            .map(|(name, _map)| format!("Map: {}", name))
+            .map(|(name, _map)| format!("Map: {name}"))
             .collect()
     }
 
@@ -593,7 +585,7 @@ impl GhostScopeLoader {
     pub fn get_program_info(&self) -> Vec<String> {
         self.bpf
             .programs()
-            .map(|(name, _prog)| format!("Program: {}", name))
+            .map(|(name, _prog)| format!("Program: {name}"))
             .collect()
     }
 }

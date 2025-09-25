@@ -7,4 +7,4 @@ pub mod source_handlers;
 pub mod trace_handlers;
 
 // Re-export main function for convenience
-pub use coordinator::{run_tui_coordinator, run_tui_coordinator_with_config};
+pub use coordinator::run_tui_coordinator_with_config;

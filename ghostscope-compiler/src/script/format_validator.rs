@@ -14,11 +14,9 @@ impl FormatValidator {
         let placeholder_count = Self::count_placeholders(format)?;
 
         if placeholder_count != args.len() {
+            let args_len = args.len();
             return Err(ParseError::TypeError(format!(
-                "Format string '{}' has {} placeholders {{}} but {} arguments provided",
-                format,
-                placeholder_count,
-                args.len()
+                "Format string '{format}' expects {placeholder_count} placeholder(s) but received {args_len} argument(s)"
             )));
         }
 
@@ -44,7 +42,7 @@ impl FormatValidator {
                         let mut found_closing = false;
                         let mut placeholder_content = String::new();
 
-                        while let Some(inner_ch) = chars.next() {
+                        for inner_ch in chars.by_ref() {
                             if inner_ch == '}' {
                                 found_closing = true;
                                 break;
@@ -60,8 +58,7 @@ impl FormatValidator {
                         // For now, we only support empty placeholders: {}
                         if !placeholder_content.is_empty() {
                             return Err(ParseError::TypeError(format!(
-                                "Complex format specifiers not yet supported: {{{}}}",
-                                placeholder_content
+                                "Complex format specifiers not yet supported: {{{placeholder_content}}}"
                             )));
                         }
 

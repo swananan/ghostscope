@@ -11,9 +11,12 @@ pub struct GhostSession {
     pub target_binary: Option<String>,
     pub target_args: Vec<String>,
     pub target_pid: Option<u32>,
-    pub debug_file: Option<String>,  // Optional debug file path
     pub trace_manager: TraceManager, // Manages all trace instances with their loaders
+    #[allow(dead_code)]
+    pub debug_file: Option<String>, // Optional debug file path
+    #[allow(dead_code)]
     pub is_attached: bool,
+    #[allow(dead_code)]
     pub config: Option<MergedConfig>, // Holds the merged configuration
 }
 
@@ -120,13 +123,6 @@ impl GhostSession {
         Ok(session)
     }
 
-    /// Create ghost session and load binary with parallel loading (for TUI mode)
-    pub async fn new_with_binary_parallel(args: &ParsedArgs) -> Result<Self> {
-        let mut session = Self::new(args);
-        session.load_binary_parallel().await?;
-        Ok(session)
-    }
-
     /// Create a new session with binary loading in parallel mode with progress callback
     pub async fn new_with_binary_parallel_with_progress<F>(
         args: &ParsedArgs,
@@ -149,17 +145,6 @@ impl GhostSession {
             .map(|analyzer| analyzer.get_module_stats())
     }
 
-    /// Get debug information summary
-    pub fn get_debug_info(&self) -> Option<String> {
-        self.process_analyzer.as_ref().map(|a| {
-            if let Some(main_module) = a.get_main_executable() {
-                format!("Binary: {}, PID: {}", main_module.path, a.get_pid())
-            } else {
-                format!("PID: {}", a.get_pid())
-            }
-        })
-    }
-
     /// List available functions
     pub fn list_functions(&self) -> Vec<String> {
         if let Some(ref analyzer) = self.process_analyzer {
@@ -169,50 +154,8 @@ impl GhostSession {
         }
     }
 
-    /// Find function by name pattern
-    pub fn find_functions(&self, pattern: &str) -> Vec<String> {
-        if let Some(ref analyzer) = self.process_analyzer {
-            analyzer.lookup_functions_by_pattern(pattern)
-        } else {
-            Vec::new()
-        }
-    }
-
-    /// Check if session was started with PID (process mode)
-    pub fn is_process_mode(&self) -> bool {
-        self.target_pid.is_some()
-    }
-
     /// Check if session was started with target path (target file mode)
     pub fn is_target_mode(&self) -> bool {
         self.target_pid.is_none() && self.target_binary.is_some()
-    }
-
-    /// Get startup mode description for user messages
-    pub fn get_startup_mode_description(&self) -> &'static str {
-        if self.is_process_mode() {
-            "process analysis mode (PID-based)"
-        } else if self.is_target_mode() {
-            "target file mode (path-based)"
-        } else {
-            "unknown mode"
-        }
-    }
-
-    /// Get UI-related configuration for ghostscope-ui crate
-    pub fn get_ui_config(&self) -> Option<ghostscope_ui::UiConfig> {
-        self.config.as_ref().map(|config| config.get_ui_config())
-    }
-
-    /// Get compiler-related configuration for ghostscope-compiler crate
-    pub fn get_compiler_config(&self) -> Option<crate::config::CompilerConfiguration> {
-        self.config
-            .as_ref()
-            .map(|config| config.get_compiler_config())
-    }
-
-    /// Get DWARF-related configuration for ghostscope-dwarf crate
-    pub fn get_dwarf_config(&self) -> Option<crate::config::DwarfConfiguration> {
-        self.config.as_ref().map(|config| config.get_dwarf_config())
     }
 }

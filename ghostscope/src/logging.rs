@@ -94,14 +94,3 @@ pub fn initialize_logging_with_config(
 
     Ok(())
 }
-
-/// Legacy function for backward compatibility
-/// Uses default settings: logging enabled, warn level
-pub fn initialize_logging(log_file_path: Option<&str>, tui_mode: bool) -> Result<()> {
-    initialize_logging_with_config(
-        log_file_path,
-        true,                          // enable_logging: default to true
-        crate::config::LogLevel::Warn, // log_level: default to warn
-        tui_mode,
-    )
-}

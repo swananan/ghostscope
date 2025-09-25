@@ -11,15 +11,12 @@ use inkwell::context::Context;
 use inkwell::debug_info::DebugInfoBuilder;
 use inkwell::module::Module;
 use inkwell::targets::{Target, TargetTriple};
-use inkwell::types::{BasicTypeEnum, IntType};
-use inkwell::values::{
-    BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, IntValue, PointerValue,
-};
+use inkwell::values::{FunctionValue, IntValue, PointerValue};
 use inkwell::AddressSpace;
 use inkwell::OptimizationLevel;
 use std::collections::HashMap;
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::info;
 
 /// Compile-time context containing PC address and module information for DWARF queries
 #[derive(Debug, Clone)]
@@ -108,7 +105,7 @@ impl<'ctx> EbpfContext<'ctx> {
 
         // Get target and create target machine
         let target = Target::from_triple(&triple).map_err(|e| {
-            CodeGenError::LLVMError(format!("Failed to get target from triple: {}", e))
+            CodeGenError::LLVMError(format!("Failed to get target from triple: {e}"))
         })?;
         let target_machine = target
             .create_target_machine(
@@ -270,7 +267,7 @@ impl<'ctx> EbpfContext<'ctx> {
     /// Compile a complete program with statements
     pub fn compile_program(
         &mut self,
-        program: &crate::script::Program,
+        _program: &crate::script::Program,
         function_name: &str,
         trace_statements: &[crate::script::Statement],
         target_pid: Option<u32>,
@@ -302,7 +299,7 @@ impl<'ctx> EbpfContext<'ctx> {
                 "ringbuf",
                 8,
             )
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to create ringbuf map: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to create ringbuf map: {e}")))?;
 
         // Variables are now queried on-demand when accessed in expressions
         // No need to pre-populate DWARF variables

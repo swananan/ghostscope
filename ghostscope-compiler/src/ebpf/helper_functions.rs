@@ -6,15 +6,14 @@
 use super::context::{CodeGenError, EbpfContext, Result};
 use aya_ebpf_bindings::bindings::bpf_func_id::{
     BPF_FUNC_get_current_pid_tgid, BPF_FUNC_ktime_get_ns, BPF_FUNC_probe_read_user,
-    BPF_FUNC_ringbuf_output, BPF_FUNC_trace_printk,
+    BPF_FUNC_ringbuf_output,
 };
 use ghostscope_dwarf::MemoryAccessSize;
 use ghostscope_platform::register_mapping;
 use inkwell::types::{BasicType, BasicTypeEnum};
-use inkwell::values::{BasicMetadataValueEnum, BasicValue, BasicValueEnum, IntValue, PointerValue};
-use inkwell::{AddressSpace, IntPredicate};
-use std::collections::HashMap;
-use tracing::{debug, info, warn};
+use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, IntValue, PointerValue};
+use inkwell::AddressSpace;
+use tracing::info;
 
 impl<'ctx> EbpfContext<'ctx> {
     /// Load a register value from pt_regs
@@ -41,7 +40,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     i64_type,
                     pt_regs_ptr,
                     &[offset_value],
-                    &format!("reg_{}_ptr", reg_num),
+                    &format!("reg_{reg_num}_ptr"),
                 )
                 .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
         };
@@ -49,7 +48,7 @@ impl<'ctx> EbpfContext<'ctx> {
         // Load the register value
         let reg_value = self
             .builder
-            .build_load(i64_type, reg_ptr, &format!("reg_{}", reg_num))
+            .build_load(i64_type, reg_ptr, &format!("reg_{reg_num}"))
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
         if let BasicValueEnum::IntValue(int_val) = reg_value {
@@ -77,7 +76,7 @@ impl<'ctx> EbpfContext<'ctx> {
         let result_size = size.bytes();
 
         // Get or create a static global buffer for temporary reads
-        let buffer_name = format!("_temp_read_buffer_{}", result_size);
+        let buffer_name = format!("_temp_read_buffer_{result_size}");
         let global_buffer = match self.module.get_global(&buffer_name) {
             Some(existing) => existing.as_pointer_value(),
             None => {
@@ -156,7 +155,7 @@ impl<'ctx> EbpfContext<'ctx> {
             .builder
             .build_bit_cast(
                 stack_ptr,
-                result_type.ptr_type(AddressSpace::default()),
+                self.context.ptr_type(AddressSpace::default()),
                 "typed_ptr",
             )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
@@ -298,7 +297,7 @@ impl<'ctx> EbpfContext<'ctx> {
             .map_manager
             .get_ringbuf_map(&self.module, "ringbuf")
             .map_err(|e| {
-                CodeGenError::MemoryAccessError(format!("Failed to get ringbuf map: {}", e))
+                CodeGenError::MemoryAccessError(format!("Failed to get ringbuf map: {e}"))
             })?;
 
         // Arguments: map, data, size, flags

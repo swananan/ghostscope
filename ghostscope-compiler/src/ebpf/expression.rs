@@ -34,11 +34,11 @@ impl<'ctx> EbpfContext<'ctx> {
                 global.set_initializer(&string_value);
 
                 let ptr_type = self.context.ptr_type(AddressSpace::default());
-                Ok(self
+                let cast_ptr = self
                     .builder
                     .build_bit_cast(global.as_pointer_value(), ptr_type, "str_ptr")
-                    .map_err(|e| CodeGenError::Builder(e.to_string()))?
-                    .into())
+                    .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                Ok(cast_ptr)
             }
             Expr::Variable(var_name) => {
                 debug!("compile_expr: Compiling variable expression: {}", var_name);

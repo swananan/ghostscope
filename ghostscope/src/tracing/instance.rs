@@ -1,6 +1,5 @@
 use anyhow::Result;
 use ghostscope_loader::GhostScopeLoader;
-use ghostscope_ui::events::TraceStatus;
 use tracing::{error, info, warn};
 
 /// Individual trace instance with single PC value
@@ -19,6 +18,7 @@ pub struct TraceInstance {
 }
 
 impl TraceInstance {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         trace_id: u32,
         target: String,
@@ -45,6 +45,7 @@ impl TraceInstance {
     }
 
     /// Enable this trace instance
+    #[allow(clippy::needless_return)]
     pub fn enable(&mut self) -> Result<()> {
         if self.is_enabled {
             info!("Trace {} is already enabled", self.trace_id);

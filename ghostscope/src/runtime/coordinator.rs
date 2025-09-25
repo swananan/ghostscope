@@ -2,9 +2,7 @@ use crate::config::{MergedConfig, ParsedArgs};
 use crate::core::GhostSession;
 use crate::runtime::{dwarf_loader, info_handlers, source_handlers, trace_handlers};
 use anyhow::Result;
-use ghostscope_ui::{
-    run_tui_mode_with_config, EventRegistry, RuntimeChannels, RuntimeCommand, RuntimeStatus,
-};
+use ghostscope_ui::{EventRegistry, RuntimeChannels, RuntimeCommand, RuntimeStatus};
 use tracing::{error, info};
 
 /// Run GhostScope in TUI mode with merged configuration
@@ -40,6 +38,7 @@ pub async fn run_tui_coordinator_with_config(config: MergedConfig) -> Result<()>
 }
 
 /// Run GhostScope in TUI mode with tokio task coordination
+#[allow(dead_code)]
 pub async fn run_tui_coordinator(parsed_args: ParsedArgs) -> Result<()> {
     // Use default UI configuration when no merged config is available
     let ui_config = ghostscope_ui::UiConfig {

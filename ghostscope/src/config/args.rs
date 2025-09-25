@@ -26,7 +26,8 @@ pub struct Args {
     /// based on the command execution directory. Search order for relative paths:
     /// 1. Current working directory
     /// 2. Same directory as the ghostscope command
-    /// Can be used together with -p to filter events for specific PID
+    ///
+    /// - Can be used together with -p to filter events for a specific PID
     #[arg(long, short = 't', value_name = "PATH")]
     pub target: Option<String>,
 
@@ -344,9 +345,8 @@ impl Args {
             })
         } else if let Ok(rust_log) = std::env::var("RUST_LOG") {
             // RUST_LOG environment variable as fallback
-            crate::config::settings::LogLevel::from_str(&rust_log).unwrap_or_else(|_| {
-                crate::config::settings::LogLevel::Warn // Default level if RUST_LOG is invalid
-            })
+            crate::config::settings::LogLevel::from_str(&rust_log)
+                .unwrap_or(crate::config::settings::LogLevel::Warn)
         } else {
             crate::config::settings::LogLevel::Warn // Default level
         };

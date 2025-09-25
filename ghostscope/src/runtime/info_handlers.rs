@@ -299,7 +299,7 @@ fn process_module_addresses_for_variables(
     for module_address in module_addresses {
         grouped_by_module
             .entry(module_address.module_path.clone())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(module_address);
 
         // Remember the first module address for source location lookup

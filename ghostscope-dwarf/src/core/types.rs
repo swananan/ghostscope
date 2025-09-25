@@ -21,7 +21,7 @@ impl ModuleAddress {
     }
 
     /// Get module path as string for logging
-    pub fn module_display(&self) -> std::path::Display {
+    pub fn module_display(&self) -> std::path::Display<'_> {
         self.module_path.display()
     }
 }

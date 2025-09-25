@@ -1,10 +1,12 @@
+#![allow(clippy::uninlined_format_args)]
+#![allow(dead_code)]
+
 //! Common test utilities shared across integration tests
 
 use lazy_static::lazy_static;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Once;
-use tracing_subscriber;
 
 static INIT: Once = Once::new();
 static COMPILE: Once = Once::new();
@@ -25,9 +27,11 @@ static COMPILE_OPTIMIZED: Once = Once::new();
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OptimizationLevel {
     Debug, // -O0 (default)
-    O1,    // -O1
+    #[allow(dead_code)]
+    O1, // -O1
     O2,    // -O2
-    O3,    // -O3
+    #[allow(dead_code)]
+    O3, // -O3
 }
 
 impl OptimizationLevel {

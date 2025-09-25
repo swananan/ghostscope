@@ -1,11 +1,11 @@
 use crate::tracing::instance::TraceInstance;
-use crate::tracing::snapshot::{FormattedTraceInfo, TraceSnapshot, TraceSummary};
+use crate::tracing::snapshot::{TraceSnapshot, TraceSummary};
 use anyhow::Result;
 use ghostscope_loader::GhostScopeLoader;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// Manager for all active trace instances
 #[derive(Debug)]
@@ -36,6 +36,7 @@ impl TraceManager {
     }
 
     /// Add a new trace instance with a pre-allocated trace ID
+    #[allow(clippy::too_many_arguments)]
     pub fn add_trace_with_id(
         &mut self,
         trace_id: u32,

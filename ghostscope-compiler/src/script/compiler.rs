@@ -2,6 +2,7 @@ use crate::script::ast::{Program, Statement, TracePattern};
 use crate::CompileError;
 // BinaryAnalyzer is now internal to ghostscope-binary, use DwarfAnalyzer instead
 use inkwell::context::Context;
+use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use tracing::{debug, error, info, warn};
@@ -74,8 +75,7 @@ pub struct AstCompiler<'a> {
     uprobe_configs: Vec<UProbeConfig>,
     failed_targets: Vec<FailedTarget>, // Track failed compilation attempts
     binary_path_hint: Option<String>,
-    starting_trace_id: u32, // Starting trace_id passed from trace_manager
-    current_trace_id: u32,  // Current trace_id counter (increments for each uprobe)
+    current_trace_id: u32, // Current trace_id counter (increments for each uprobe)
     save_options: Option<crate::SaveOptions>, // Save options for file output
 }
 
@@ -91,7 +91,6 @@ impl<'a> AstCompiler<'a> {
             uprobe_configs: Vec::new(),
             failed_targets: Vec::new(),
             binary_path_hint,
-            starting_trace_id,
             current_trace_id: starting_trace_id,
             save_options: Some(save_options),
         }
@@ -201,27 +200,27 @@ impl<'a> AstCompiler<'a> {
 
                 if module_addresses.is_empty() {
                     warn!(
-                        "No addresses resolved for source line {}:{}; skipping",
-                        file_path, line_number
+                        "No addresses resolved for source line {}:{} at trace point {}; skipping",
+                        file_path, line_number, index
                     );
                     return Ok(());
                 }
 
                 debug!(
-                    "Resolved {}:{} to {} address(es)",
+                    "Resolved {}:{} to {} address(es) for trace point {}",
                     file_path,
                     line_number,
-                    module_addresses.len()
+                    module_addresses.len(),
+                    index
                 );
 
                 // Process each module and its addresses - continue even if some fail
                 let mut successful_addresses = 0;
                 let mut failed_addresses = 0;
 
-                let mut pc_idx = 0;
                 for module_address in &module_addresses {
                     let target_info = ResolvedTarget {
-                        function_name: Some(format!("{}:{}", file_path, line_number)),
+                        function_name: Some(format!("{file_path}:{line_number}")),
                         function_address: Some(module_address.address),
                         binary_path: module_address.module_path.to_string_lossy().to_string(),
                         uprobe_offset: Some(module_address.address), // For line addresses, offset equals address
@@ -246,7 +245,7 @@ impl<'a> AstCompiler<'a> {
 
                             // Record this failed target
                             self.failed_targets.push(FailedTarget {
-                                target_name: format!("{}:{}", file_path, line_number),
+                                target_name: format!("{file_path}:{line_number}"),
                                 pc_address: module_address.address,
                                 error_message: e.to_string(),
                             });
@@ -254,7 +253,6 @@ impl<'a> AstCompiler<'a> {
                             // Continue processing other addresses
                         }
                     }
-                    pc_idx += 1;
                 }
 
                 // Log summary for this trace point
@@ -306,7 +304,6 @@ impl<'a> AstCompiler<'a> {
                 let mut successful_addresses = 0;
                 let mut failed_addresses = 0;
 
-                let mut pc_idx = 0;
                 for module_address in &module_addresses {
                     // For DwarfAnalyzer, the address is already the binary offset we need for uprobe
                     let uprobe_offset = module_address.address;
@@ -345,7 +342,6 @@ impl<'a> AstCompiler<'a> {
                             // Continue processing other addresses
                         }
                     }
-                    pc_idx += 1;
                 }
 
                 // Log summary for this trace point
@@ -419,7 +415,7 @@ impl<'a> AstCompiler<'a> {
             self.process_analyzer.as_deref_mut(),
             Some(assigned_trace_id),
         )
-        .map_err(|e| CompileError::LLVM(format!("Failed to create new codegen: {}", e)))?;
+        .map_err(|e| CompileError::LLVM(format!("Failed to create new codegen: {e}")))?;
 
         // Set compile-time context for DWARF queries
         if let Some(function_address) = target.function_address {
@@ -441,7 +437,7 @@ impl<'a> AstCompiler<'a> {
                 target.function_address,
                 Some(&target.binary_path),
             )
-            .map_err(|e| CompileError::LLVM(format!("Failed to compile AST program: {}", e)))?;
+            .map_err(|e| CompileError::LLVM(format!("Failed to compile AST program: {e}")))?;
 
         info!(
             "Generated StringTable for '{}' with {} strings and {} variables",
@@ -491,31 +487,31 @@ impl<'a> AstCompiler<'a> {
     /// All other naming logic should use this method to ensure consistency.
     /// Calculate 8-digit hex hash for module path with logging
     fn calculate_module_hash(&self, module_path: &str) -> String {
+        let effective_path = self.effective_binary_path(module_path);
         let mut hasher = DefaultHasher::new();
-        module_path.hash(&mut hasher);
+        effective_path.hash(&mut hasher);
         let hash = hasher.finish();
-        let hash_hex = format!("{:08x}", (hash & 0xFFFFFFFF) as u32);
+        let truncated = (hash & 0xFFFF_FFFF) as u32;
+        let hash_hex = format!("{truncated:08x}");
 
-        info!("Module hash calculated: {} -> {}", module_path, hash_hex);
+        info!("Module hash calculated: {} -> {}", effective_path, hash_hex);
         hash_hex
     }
 
     /// Generate unified function name with format: ghostscope_{module_hash}_{address_hex}_{trace_id}
     fn generate_unified_function_name(&self, target: &ResolvedTarget, trace_id: u32) -> String {
         let module_hash = self.calculate_module_hash(&target.binary_path);
+        let effective_path = self.effective_binary_path(&target.binary_path);
         let address_hex = if let Some(addr) = target.function_address {
-            format!("{:x}", addr)
+            format!("{addr:x}")
         } else {
             "unknown".to_string()
         };
 
-        let function_name = format!(
-            "ghostscope_{}_{}_trace{}",
-            module_hash, address_hex, trace_id
-        );
+        let function_name = format!("ghostscope_{module_hash}_{address_hex}_trace{trace_id}");
         info!(
             "Generated eBPF function name: {} (module: {}, address: 0x{}, trace_id: {})",
-            function_name, target.binary_path, address_hex, trace_id
+            function_name, effective_path, address_hex, trace_id
         );
 
         function_name
@@ -526,19 +522,29 @@ impl<'a> AstCompiler<'a> {
         self.save_options.as_ref()
     }
 
+    /// Pick a binary path, falling back to compiler hint when the resolved target is empty
+    fn effective_binary_path<'b>(&'b self, target_path: &'b str) -> Cow<'b, str> {
+        if target_path.is_empty() {
+            if let Some(hint) = &self.binary_path_hint {
+                Cow::Owned(hint.clone())
+            } else {
+                Cow::Borrowed("unknown")
+            }
+        } else {
+            Cow::Borrowed(target_path)
+        }
+    }
+
     /// Generate filename for output files
     fn generate_filename(&self, target: &ResolvedTarget, trace_id: u32, extension: &str) -> String {
         let module_hash = self.calculate_module_hash(&target.binary_path);
         let address_hex = if let Some(addr) = target.function_address {
-            format!("{:x}", addr)
+            format!("{addr:x}")
         } else {
             "unknown".to_string()
         };
 
-        format!(
-            "gs_{}_{}_trace{}.{}",
-            module_hash, address_hex, trace_id, extension
-        )
+        format!("gs_{module_hash}_{address_hex}_trace{trace_id}.{extension}")
     }
 
     /// Generate eBPF bytecode from LLVM module
@@ -580,7 +586,7 @@ impl<'a> AstCompiler<'a> {
         // Get BPF target
         let llvm_target = Target::from_triple(&triple).map_err(|e| {
             error!("Failed to get target for {}: {}", function_name, e);
-            CompileError::LLVM(format!("Failed to get target for {}: {}", function_name, e))
+            CompileError::LLVM(format!("Failed to get target for {function_name}: {e}"))
         })?;
         info!("Successfully got LLVM target for {}", function_name);
 
@@ -597,8 +603,7 @@ impl<'a> AstCompiler<'a> {
             .ok_or_else(|| {
                 error!("Failed to create target machine for {}", function_name);
                 CompileError::LLVM(format!(
-                    "Failed to create target machine for {}",
-                    function_name
+                    "Failed to create target machine for {function_name}"
                 ))
             })?;
         info!("Successfully created target machine for {}", function_name);
@@ -645,8 +650,7 @@ impl<'a> AstCompiler<'a> {
                     error!("This might be due to unsupported eBPF instructions or invalid LLVM IR");
 
                     return Err(CompileError::LLVM(format!(
-                        "eBPF compilation failed for {}: {}. This often indicates unsupported instructions or invalid IR.",
-                        function_name, e
+                        "eBPF compilation failed for {function_name}: {e}. This often indicates unsupported instructions or invalid IR."
                     )));
                 }
             }
@@ -688,12 +692,12 @@ impl<'a> AstCompiler<'a> {
         ast_content.push_str("=== AST Tree ===\n");
         ast_content.push_str("Program:\n");
         for (i, stmt) in program.statements.iter().enumerate() {
-            ast_content.push_str(&format!("  Statement {}: {:?}\n", i, stmt));
+            ast_content.push_str(&format!("  Statement {i}: {stmt:?}\n"));
         }
         ast_content.push_str("=== End AST Tree ===\n");
 
         std::fs::write(filename, ast_content).map_err(|e| {
-            CompileError::Other(format!("Failed to save AST file '{}': {}", filename, e))
+            CompileError::Other(format!("Failed to save AST file '{filename}': {e}"))
         })?;
 
         Ok(())

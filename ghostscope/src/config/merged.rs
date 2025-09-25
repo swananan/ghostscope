@@ -32,6 +32,7 @@ pub struct MergedConfig {
     pub history_max_entries: usize,
 
     // DWARF configuration
+    #[allow(dead_code)]
     pub dwarf_search_paths: Vec<String>,
 }
 
@@ -101,22 +102,18 @@ impl MergedConfig {
 
         let should_save_ebpf = if args.should_save_ebpf != cfg!(debug_assertions) {
             args.should_save_ebpf
+        } else if cfg!(debug_assertions) {
+            config.files.save_ebpf.debug
         } else {
-            if cfg!(debug_assertions) {
-                config.files.save_ebpf.debug
-            } else {
-                config.files.save_ebpf.release
-            }
+            config.files.save_ebpf.release
         };
 
         let should_save_ast = if args.should_save_ast != cfg!(debug_assertions) {
             args.should_save_ast
+        } else if cfg!(debug_assertions) {
+            config.files.save_ast.debug
         } else {
-            if cfg!(debug_assertions) {
-                config.files.save_ast.debug
-            } else {
-                config.files.save_ast.release
-            }
+            config.files.save_ast.release
         };
 
         Self {
@@ -190,36 +187,4 @@ impl MergedConfig {
             },
         }
     }
-
-    /// Extract compilation-related configuration for ghostscope-compiler crate
-    pub fn get_compiler_config(&self) -> CompilerConfiguration {
-        CompilerConfiguration {
-            should_save_llvm_ir: self.should_save_llvm_ir,
-            should_save_ebpf: self.should_save_ebpf,
-            should_save_ast: self.should_save_ast,
-        }
-    }
-
-    /// Extract DWARF-related configuration for ghostscope-dwarf crate
-    pub fn get_dwarf_config(&self) -> DwarfConfiguration {
-        DwarfConfiguration {
-            search_paths: self.dwarf_search_paths.clone(),
-            debug_file: self.debug_file.clone(),
-        }
-    }
-}
-
-/// Configuration subset for compiler components
-#[derive(Debug, Clone)]
-pub struct CompilerConfiguration {
-    pub should_save_llvm_ir: bool,
-    pub should_save_ebpf: bool,
-    pub should_save_ast: bool,
-}
-
-/// Configuration subset for DWARF processing components
-#[derive(Debug, Clone)]
-pub struct DwarfConfiguration {
-    pub search_paths: Vec<String>,
-    pub debug_file: Option<PathBuf>,
 }

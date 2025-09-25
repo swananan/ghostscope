@@ -28,9 +28,9 @@ struct FormatVariableInfo {
 /// Source of the value for a format variable
 #[derive(Debug, Clone)]
 enum FormatValueSource {
-    Variable,              // Read from DWARF/register
-    StringLiteral(String), // String literal value
-    IntegerLiteral(i64),   // Integer literal value
+    Variable,       // Read from DWARF/register
+    StringLiteral,  // String literal value handled via string table
+    IntegerLiteral, // Integer literal value serialized directly
 }
 
 impl<'ctx> EbpfContext<'ctx> {
@@ -279,7 +279,7 @@ impl<'ctx> EbpfContext<'ctx> {
                         var_name_index,
                         type_encoding: TypeEncoding::CString,
                         data_size: s.len() + 1, // +1 for null terminator
-                        value_source: FormatValueSource::StringLiteral(s.clone()),
+                        value_source: FormatValueSource::StringLiteral,
                     });
                 }
                 crate::script::ast::Expr::Int(value) => {
@@ -294,7 +294,7 @@ impl<'ctx> EbpfContext<'ctx> {
                         var_name_index,
                         type_encoding: TypeEncoding::I64,
                         data_size: 8,
-                        value_source: FormatValueSource::IntegerLiteral(*value),
+                        value_source: FormatValueSource::IntegerLiteral,
                     });
                 }
                 _ => {
@@ -936,7 +936,6 @@ impl<'ctx> EbpfContext<'ctx> {
                         // Copy string data byte by byte (simple loop for eBPF compatibility)
                         let i8_type = self.context.i8_type();
                         let i32_type = self.context.i32_type();
-                        let i64_type = self.context.i64_type();
 
                         let loop_counter = self
                             .builder

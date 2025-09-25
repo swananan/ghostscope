@@ -25,6 +25,7 @@ impl<'ctx> EbpfContext<'ctx> {
             "Converting EvaluationResult to LLVM value for variable: {}",
             var_name
         );
+        debug!("Evaluation context PC address: 0x{:x}", pc_address);
 
         // Get pt_regs parameter
         let pt_regs_ptr = self.get_pt_regs_parameter()?;
@@ -155,14 +156,12 @@ impl<'ctx> EbpfContext<'ctx> {
                             "Register value is not integer".to_string(),
                         ));
                     }
+                } else if let BasicValueEnum::IntValue(reg_int) = reg_value {
+                    reg_int
                 } else {
-                    if let BasicValueEnum::IntValue(reg_int) = reg_value {
-                        reg_int
-                    } else {
-                        return Err(CodeGenError::RegisterMappingError(
-                            "Register value is not integer".to_string(),
-                        ));
-                    }
+                    return Err(CodeGenError::RegisterMappingError(
+                        "Register value is not integer".to_string(),
+                    ));
                 };
 
                 // Determine memory access size - prefer LocationResult size if available, otherwise use DWARF type
@@ -213,8 +212,7 @@ impl<'ctx> EbpfContext<'ctx> {
                         stack.push(int_val);
                     } else {
                         return Err(CodeGenError::RegisterMappingError(format!(
-                            "Register {} did not return integer value",
-                            reg_num
+                            "Register {reg_num} did not return integer value"
                         )));
                     }
                 }
@@ -439,6 +437,7 @@ impl<'ctx> EbpfContext<'ctx> {
     }
 
     /// Convert DWARF type to protocol encoding
+    #[allow(clippy::only_used_in_recursion)]
     pub fn dwarf_type_to_protocol_encoding(&self, dwarf_type: &DwarfType) -> TypeEncoding {
         match dwarf_type {
             DwarfType::BaseType { size, encoding, .. } => {
@@ -491,6 +490,7 @@ impl<'ctx> EbpfContext<'ctx> {
     }
 
     /// Get DWARF type size in bytes
+    #[allow(clippy::only_used_in_recursion)]
     pub fn get_dwarf_type_size(&self, dwarf_type: &DwarfType) -> u64 {
         match dwarf_type {
             DwarfType::BaseType { size, .. } => *size,

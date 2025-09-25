@@ -22,6 +22,7 @@ pub async fn run_command_line_runtime_with_config(config: MergedConfig) -> Resul
 }
 
 /// Run GhostScope in command line mode with direct script execution
+#[allow(dead_code)]
 pub async fn run_command_line_runtime(parsed_args: ParsedArgs) -> Result<()> {
     info!("Starting GhostScope in command line mode");
 

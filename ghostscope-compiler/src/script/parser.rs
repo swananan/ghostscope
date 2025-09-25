@@ -7,7 +7,7 @@ use crate::script::ast::{
     infer_type, BinaryOp, Expr, PrintStatement, Program, Statement, TracePattern,
 };
 use crate::script::format_validator::FormatValidator;
-use tracing::{debug, warn};
+use tracing::debug;
 
 #[derive(Parser)]
 #[grammar = "script/grammar.pest"]
@@ -16,7 +16,7 @@ pub struct GhostScopeParser;
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
     #[error("Pest parser error: {0}")]
-    Pest(#[from] pest::error::Error<Rule>),
+    Pest(#[from] Box<pest::error::Error<Rule>>),
 
     #[error("Unexpected token: {0:?}")]
     UnexpectedToken(Rule),
@@ -26,6 +26,12 @@ pub enum ParseError {
 
     #[error("Type error: {0}")]
     TypeError(String),
+}
+
+impl From<pest::error::Error<Rule>> for ParseError {
+    fn from(err: pest::error::Error<Rule>) -> Self {
+        ParseError::Pest(Box::new(err))
+    }
 }
 
 pub type Result<T> = std::result::Result<T, ParseError>;

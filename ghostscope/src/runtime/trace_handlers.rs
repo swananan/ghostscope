@@ -1,6 +1,6 @@
 use crate::core::GhostSession;
-use ghostscope_ui::{events::*, RuntimeChannels, RuntimeStatus};
-use tracing::{error, info, warn};
+use ghostscope_ui::{RuntimeChannels, RuntimeStatus};
+use tracing::{error, info};
 
 /// Handle DisableTrace command
 pub async fn handle_disable_trace(

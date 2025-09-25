@@ -1,13 +1,12 @@
 use aya_ebpf_bindings::bindings::bpf_map_type;
 use inkwell::context::Context;
-use inkwell::debug_info::{AsDIScope, DIType, DebugInfoBuilder};
+use inkwell::debug_info::{AsDIScope, DebugInfoBuilder};
 use inkwell::module::Linkage;
 use inkwell::module::Module;
-use inkwell::types::{BasicTypeEnum, StructType};
-use inkwell::values::{GlobalValue, PointerValue};
+use inkwell::values::PointerValue;
 use inkwell::AddressSpace;
 use std::collections::HashMap;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info};
 
 #[derive(Debug, Clone, Copy)]
 pub enum BpfMapType {
@@ -18,7 +17,7 @@ pub enum BpfMapType {
 }
 
 impl BpfMapType {
-    fn to_aya_map_type(&self) -> u32 {
+    fn to_aya_map_type(self) -> u32 {
         match self {
             BpfMapType::Ringbuf => bpf_map_type::BPF_MAP_TYPE_RINGBUF,
             BpfMapType::Array => bpf_map_type::BPF_MAP_TYPE_ARRAY,
@@ -83,6 +82,7 @@ impl<'ctx> MapManager<'ctx> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn create_map_definition(
         &mut self,
         module: &Module<'ctx>,
@@ -122,6 +122,7 @@ impl<'ctx> MapManager<'ctx> {
         } else {
             (value_type.size / 8) as u32
         };
+        let max_entries_u32 = max_entries.min(u32::MAX as u64) as u32;
 
         // Create a simple struct with basic map definition layout
         // Use the standard 4-field layout that most eBPF maps use
@@ -131,14 +132,13 @@ impl<'ctx> MapManager<'ctx> {
             i32_type.into(), // value_size
             i32_type.into(), // max_entries
         ];
-        let (struct_elements, initializer) = {
-            let struct_type = self.context.struct_type(&elements, false);
-            // Use zero-initialization - values will come from BTF
-            let init = struct_type.const_zero();
-            (elements, init)
-        };
-
-        let struct_type = self.context.struct_type(&struct_elements, false);
+        let struct_type = self.context.struct_type(&elements, false);
+        let initializer = struct_type.const_named_struct(&[
+            i32_type.const_int(map_type_id as u64, false).into(),
+            i32_type.const_int(key_size as u64, false).into(),
+            i32_type.const_int(value_size as u64, false).into(),
+            i32_type.const_int(max_entries_u32 as u64, false).into(),
+        ]);
 
         // Create BTF type information for the map
         // This is critical for aya to understand the map structure
@@ -266,6 +266,7 @@ impl<'ctx> MapManager<'ctx> {
 
     /// Create BTF type information for a BPF map matching clang's output format
     /// This allows aya to understand the map's key and value types
+    #[allow(clippy::too_many_arguments)]
     fn create_map_btf_info(
         &self,
         di_builder: &DebugInfoBuilder<'ctx>,
@@ -293,11 +294,12 @@ impl<'ctx> MapManager<'ctx> {
 
         // Create array type with nr_elems = map_type_id (this is how aya encodes map types)
         // Use Range<i64> directly to encode the map type
+        let map_type_range = 0..map_type_id as i64;
         let array_type = di_builder.create_array_type(
-            i32_type.as_type(),       // element_type
-            64,                       // size_in_bits
-            32,                       // align_in_bits
-            &[0..map_type_id as i64], // Range with map_type_id as count
+            i32_type.as_type(), // element_type
+            64,                 // size_in_bits
+            32,                 // align_in_bits
+            std::slice::from_ref(&map_type_range),
         );
 
         // Create pointer to this array for the 'type' field
@@ -316,11 +318,12 @@ impl<'ctx> MapManager<'ctx> {
                 info!("Creating ringbuf BTF with 2 fields (type, max_entries)");
 
                 // Create max_entries array type with proper range
+                let max_entries_range = 0..max_entries as i64;
                 let max_entries_array = di_builder.create_array_type(
                     i32_type.as_type(),
                     64,
                     32,
-                    &[0..max_entries as i64], // Range with max_entries as count
+                    std::slice::from_ref(&max_entries_range),
                 );
                 let max_entries_ptr = di_builder.create_pointer_type(
                     "max_entries",
@@ -365,11 +368,12 @@ impl<'ctx> MapManager<'ctx> {
                 } else {
                     (key_type.size / 8) as i64
                 };
+                let key_size_range = 0..key_size_value;
                 let key_size_array = di_builder.create_array_type(
                     i32_type.as_type(),
                     64,
                     32,
-                    &[0..key_size_value], // Range with key_size as count
+                    std::slice::from_ref(&key_size_range),
                 );
                 let key_size_ptr = di_builder.create_pointer_type(
                     "key_size",
@@ -385,11 +389,12 @@ impl<'ctx> MapManager<'ctx> {
                 } else {
                     (value_type.size / 8) as i64
                 };
+                let value_size_range = 0..value_size_value;
                 let value_size_array = di_builder.create_array_type(
                     i32_type.as_type(),
                     64,
                     32,
-                    &[0..value_size_value], // Range with value_size as count
+                    std::slice::from_ref(&value_size_range),
                 );
                 let value_size_ptr = di_builder.create_pointer_type(
                     "value_size",
@@ -400,11 +405,12 @@ impl<'ctx> MapManager<'ctx> {
                 );
 
                 // Create max_entries array
+                let max_entries_range = 0..max_entries as i64;
                 let max_entries_array = di_builder.create_array_type(
                     i32_type.as_type(),
                     64,
                     32,
-                    &[0..max_entries as i64], // Range with max_entries as count
+                    std::slice::from_ref(&max_entries_range),
                 );
                 let max_entries_ptr = di_builder.create_pointer_type(
                     "max_entries",
