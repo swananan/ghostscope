@@ -2109,17 +2109,14 @@ impl App {
                     // Parse compiler-style errors
                     formatted_error.push_str("\n  Compilation Error Details:\n");
                     for line in error.lines() {
-                        if line.trim().starts_with("error:")
-                            || line.trim().starts_with("warning:")
-                            || line.trim().starts_with("note:")
+                        let trimmed = line.trim();
+                        if trimmed.starts_with("error:")
+                            || trimmed.starts_with("warning:")
+                            || trimmed.starts_with("note:")
+                            || line.contains("-->")
                         {
-                            let trimmed = line.trim();
                             formatted_error.push_str(&format!("  {trimmed}\n"));
-                        } else if line.contains("-->") {
-                            let trimmed = line.trim();
-                            formatted_error.push_str(&format!("  {trimmed}\n"));
-                        } else if !line.trim().is_empty() {
-                            let trimmed = line.trim();
+                        } else if !trimmed.is_empty() {
                             formatted_error.push_str(&format!("    {trimmed}\n"));
                         }
                     }
@@ -2277,21 +2274,21 @@ impl App {
                     .state
                     .emoji_config
                     .get_script_status(crate::ui::emoji::ScriptStatus::Error);
-                Some(format!("{} Error: {}", error_emoji, msg))
+                Some(format!("{error_emoji} Error: {msg}"))
             }
             RuntimeStatus::TraceEnabled { trace_id } => {
                 let success_emoji = self
                     .state
                     .emoji_config
                     .get_trace_status(crate::ui::emoji::TraceStatusType::Active);
-                Some(format!("{} Trace {} enabled", success_emoji, trace_id))
+                Some(format!("{success_emoji} Trace {trace_id} enabled"))
             }
             RuntimeStatus::TraceDisabled { trace_id } => {
                 let disabled_emoji = self
                     .state
                     .emoji_config
                     .get_trace_status(crate::ui::emoji::TraceStatusType::Disabled);
-                Some(format!("{} Trace {} disabled", disabled_emoji, trace_id))
+                Some(format!("{disabled_emoji} Trace {trace_id} disabled"))
             }
             _ => None, // Don't display other status types in command panel
         }

@@ -5,7 +5,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
     Frame,
 };
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use super::{LoadingProgress, LoadingState, ProgressRenderer};
 
@@ -44,13 +44,13 @@ impl LoadingUI {
     /// Get formatted elapsed time
     fn elapsed_time(&self) -> String {
         let elapsed = self.start_time.elapsed();
-        let seconds = elapsed.as_secs();
-        if seconds < 60 {
-            format!("{:.1}s", elapsed.as_secs_f64())
+        let total_seconds = elapsed.as_secs_f64();
+        if total_seconds < 60.0 {
+            format!("{total_seconds:.1}s")
         } else {
-            let minutes = seconds / 60;
-            let remaining_seconds = seconds % 60;
-            format!("{}m{:.1}s", minutes, remaining_seconds)
+            let minutes = (total_seconds / 60.0).floor() as u64;
+            let remaining_seconds = total_seconds - (minutes as f64) * 60.0;
+            format!("{minutes}m{remaining_seconds:.1}s")
         }
     }
 
@@ -152,7 +152,7 @@ impl LoadingUI {
 
         // Loading status with PID
         let status_message = if let Some(pid) = pid {
-            format!("Loading debug information for PID {}...", pid)
+            format!("Loading debug information for PID {pid}...")
         } else {
             loading_state.message().to_string()
         };
@@ -194,58 +194,49 @@ impl LoadingUI {
         let failed_count = self.progress.failed_count;
         let successful_modules = total_modules - failed_count;
 
-        let mut lines = Vec::new();
-
-        // Header with cyan color and bold
-        lines.push(Line::from(Span::styled(
-            "🔍 Ghostscope v0.1.0",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )));
-
-        // License in gray
-        lines.push(Line::from(Span::styled(
-            "Licensed under GPL",
-            Style::default().fg(Color::Gray),
-        )));
-
-        // Empty line
-        lines.push(Line::from(""));
-
-        // Debug information section with green checkmark
-        lines.push(Line::from(Span::styled(
-            "✅ Debug Information Loaded:",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        )));
+        let mut lines = vec![
+            Line::from(Span::styled(
+                "🔍 Ghostscope v0.1.0",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                "Licensed under GPL",
+                Style::default().fg(Color::Gray),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "✅ Debug Information Loaded:",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )),
+        ];
 
         // Module loading stats in white
         if failed_count > 0 {
             lines.push(Line::from(Span::styled(
                 format!(
-                    "• {} modules loaded successfully ({} failed) in {:.1} seconds",
-                    successful_modules, failed_count, total_time
+                    "• {successful_modules} modules loaded successfully ({failed_count} failed) in {total_time:.1} seconds"
                 ),
                 Style::default().fg(Color::White),
             )));
         } else {
             lines.push(Line::from(Span::styled(
                 format!(
-                    "• {} modules loaded successfully in {:.1} seconds",
-                    successful_modules, total_time
+                    "• {successful_modules} modules loaded successfully in {total_time:.1} seconds"
                 ),
                 Style::default().fg(Color::White),
             )));
         }
 
         // DWARF statistics in yellow
+        let functions = total_stats.functions;
+        let variables = total_stats.variables;
+        let types = total_stats.types;
         lines.push(Line::from(Span::styled(
-            format!(
-                "• {} functions, {} variables, {} types indexed",
-                total_stats.functions, total_stats.variables, total_stats.types
-            ),
+            format!("• {functions} functions, {variables} variables, {types} types indexed"),
             Style::default().fg(Color::Yellow),
         )));
 

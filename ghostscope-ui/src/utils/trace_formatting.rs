@@ -34,7 +34,7 @@ pub fn format_timestamp_ns(ns_timestamp: u64) -> String {
     let ms = ns_timestamp / 1_000_000;
     let seconds = ms / 1000;
     let ms_remainder = ms % 1000;
-    format!("boot+{}.{:03}s", seconds, ms_remainder)
+    format!("boot+{seconds}.{ms_remainder:03}s")
 }
 
 /// Get system uptime in nanoseconds

@@ -185,3 +185,9 @@ impl FocusState {
         }
     }
 }
+
+impl Default for FocusState {
+    fn default() -> Self {
+        Self::new()
+    }
+}

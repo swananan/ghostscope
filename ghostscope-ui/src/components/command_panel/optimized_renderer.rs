@@ -210,11 +210,7 @@ impl OptimizedRenderer {
                     state.command_cursor_line
                 };
 
-                let mut start = if total_lines > visible_count {
-                    total_lines - visible_count
-                } else {
-                    0
-                };
+                let mut start = total_lines.saturating_sub(visible_count);
 
                 if cursor_line < start {
                     start = cursor_line;
@@ -224,11 +220,7 @@ impl OptimizedRenderer {
 
                 (start, Some(cursor_line.saturating_sub(start)))
             } else {
-                let start = if total_lines > visible_count {
-                    total_lines - visible_count
-                } else {
-                    0
-                };
+                let start = total_lines.saturating_sub(visible_count);
                 (start, None)
             };
 
@@ -393,8 +385,8 @@ impl OptimizedRenderer {
             .current_match(&state.command_history_manager)
         {
             // Success case
-            let prompt_text = format!("(reverse-i-search)`{}': ", search_query);
-            let full_content = format!("{}{}", prompt_text, matched_command);
+            let prompt_text = format!("(reverse-i-search)`{search_query}': ");
+            let full_content = format!("{prompt_text}{matched_command}");
 
             if full_content.chars().count() > width as usize {
                 // Wrapped case
@@ -402,7 +394,7 @@ impl OptimizedRenderer {
                 let cursor_pos = prompt_text.chars().count() + search_query.len();
 
                 let mut char_count = 0;
-                for (line_idx, line) in wrapped_lines.iter().enumerate() {
+                for line in wrapped_lines.iter() {
                     let line_char_count = line.chars().count();
                     let line_end = char_count + line_char_count;
 
@@ -453,7 +445,7 @@ impl OptimizedRenderer {
             }
         } else {
             // Failed search
-            let failed_prompt = format!("(failed reverse-i-search)`{}': ", search_query);
+            let failed_prompt = format!("(failed reverse-i-search)`{search_query}': ");
 
             if failed_prompt.chars().count() > width as usize {
                 // Wrapped failed search
@@ -484,7 +476,7 @@ impl OptimizedRenderer {
         let prompt = "(ghostscope) ";
         let input_text = state.get_display_text();
         let cursor_pos = state.get_display_cursor_position();
-        let full_content = format!("{}{}", prompt, input_text);
+        let full_content = format!("{prompt}{input_text}");
 
         if full_content.chars().count() > width as usize {
             // Handle wrapped input
@@ -747,7 +739,7 @@ impl OptimizedRenderer {
             // Cursor at end - check if we have auto-suggestion to merge
             if let Some(suggestion_text) = state.get_suggestion_text() {
                 // We have auto-suggestion, show merged text with cursor at boundary
-                let full_text = format!("{}{}", input_text, suggestion_text);
+                let full_text = format!("{input_text}{suggestion_text}");
                 let full_chars: Vec<char> = full_text.chars().collect();
 
                 // Show input part in normal color

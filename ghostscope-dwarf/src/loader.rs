@@ -31,13 +31,6 @@ impl LoadConfig {
             max_module_concurrency: num_cpus::get(),
         }
     }
-
-    /// Conservative loading with limited concurrency
-    pub fn conservative(concurrency: usize) -> Self {
-        Self {
-            max_module_concurrency: concurrency.max(1),
-        }
-    }
 }
 
 /// Builder for loading modules with flexible parallelism options
@@ -55,33 +48,10 @@ impl ModuleLoader {
         }
     }
 
-    /// Set maximum concurrency for module loading
-    pub fn max_concurrency(mut self, limit: usize) -> Self {
-        self.config.max_module_concurrency = limit;
-        self
-    }
-
     /// Use predefined parallel configuration
     pub fn parallel(mut self) -> Self {
         self.config = LoadConfig::fast();
         self
-    }
-
-    /// Load modules synchronously (blocking) - now always uses parallel loading
-    pub fn load_sync(self) -> Result<Vec<ModuleData>> {
-        // Always use async runtime for parallel loading
-        let rt = tokio::runtime::Runtime::new()?;
-        rt.block_on(self.load_async())
-    }
-
-    /// Load modules asynchronously - always parallel
-    pub async fn load_async(self) -> Result<Vec<ModuleData>> {
-        self.load_modules_parallel().await
-    }
-
-    /// Unified load method - automatically chooses sync/async based on configuration
-    pub async fn load(self) -> Result<Vec<ModuleData>> {
-        self.load_async().await
     }
 
     /// Load with progress callback - always parallel
@@ -102,31 +72,6 @@ impl ModuleLoader {
             loader: self,
             callback: progress_callback,
         }
-    }
-
-    /// Load modules in parallel
-    async fn load_modules_parallel(self) -> Result<Vec<ModuleData>> {
-        // Use semaphore to limit concurrency
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(
-            self.config.max_module_concurrency,
-        ));
-
-        let tasks: Vec<_> = self
-            .mappings
-            .into_iter()
-            .map(|mapping| {
-                let semaphore = Arc::clone(&semaphore);
-
-                task::spawn(async move {
-                    let _permit = semaphore.acquire().await?;
-
-                    ModuleData::load_parallel(mapping).await
-                })
-            })
-            .collect();
-
-        let results = futures::future::try_join_all(tasks).await?;
-        results.into_iter().collect::<Result<Vec<_>>>()
     }
 
     /// Load modules in parallel with progress tracking

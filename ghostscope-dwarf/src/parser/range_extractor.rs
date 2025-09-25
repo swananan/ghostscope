@@ -141,26 +141,4 @@ impl RangeExtractor {
             Ok(Some(ranges))
         }
     }
-
-    /// Check if an address falls within any of the given ranges
-    pub fn address_in_ranges(address: u64, ranges: &[(u64, u64)]) -> bool {
-        ranges
-            .iter()
-            .any(|(low, high)| address >= *low && address < *high)
-    }
-
-    /// Extract just the low_pc address (useful for function entry points)
-    pub fn extract_low_pc(
-        entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
-    ) -> Result<Option<u64>> {
-        let mut attrs = entry.attrs();
-        while let Some(attr) = attrs.next()? {
-            if attr.name() == gimli::constants::DW_AT_low_pc {
-                if let gimli::AttributeValue::Addr(addr) = attr.value() {
-                    return Ok(Some(addr));
-                }
-            }
-        }
-        Ok(None)
-    }
 }

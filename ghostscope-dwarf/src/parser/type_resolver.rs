@@ -440,9 +440,4 @@ impl TypeResolver {
     pub fn get_cache_stats(&self) -> usize {
         self.type_cache.len()
     }
-
-    /// Clear cache
-    pub fn clear_cache(&mut self) {
-        self.type_cache.clear();
-    }
 }

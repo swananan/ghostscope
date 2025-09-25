@@ -8,7 +8,6 @@
 
 use crate::core::IndexEntry;
 use std::collections::{BTreeMap, HashMap};
-use std::ops::Bound::{Included, Unbounded};
 use tracing::debug;
 
 /// Cooked index - inspired by GDB's cooked_index design
@@ -105,34 +104,6 @@ impl LightweightIndex {
         }
     }
 
-    /// Get function entries by name (GDB-style lookup)
-    pub fn get_function_entries(&self, name: &str) -> Option<Vec<&IndexEntry>> {
-        if let Some(indices) = self.function_map.get(name) {
-            let entries: Vec<&IndexEntry> = indices
-                .iter()
-                .filter_map(|&idx| self.entries.get(idx))
-                .collect();
-            if !entries.is_empty() {
-                return Some(entries);
-            }
-        }
-        None
-    }
-
-    /// Get variable entries by name (GDB-style lookup)
-    pub fn get_variable_entries(&self, name: &str) -> Option<Vec<&IndexEntry>> {
-        if let Some(indices) = self.variable_map.get(name) {
-            let entries: Vec<&IndexEntry> = indices
-                .iter()
-                .filter_map(|&idx| self.entries.get(idx))
-                .collect();
-            if !entries.is_empty() {
-                return Some(entries);
-            }
-        }
-        None
-    }
-
     /// Get all function names for debugging
     pub fn get_function_names(&self) -> Vec<&String> {
         self.function_map.keys().collect()
@@ -150,101 +121,6 @@ impl LightweightIndex {
             self.total_variables,
             self.entries.len(),
         )
-    }
-
-    /// Find entries by name
-    pub fn find_entries_by_name(&self, name: &str) -> Vec<&IndexEntry> {
-        // Since entries are not sorted, do a linear search
-        // This is OK because we also have function_map and variable_map for O(1) lookup
-        self.entries
-            .iter()
-            .filter(|entry| entry.name == name)
-            .collect()
-    }
-
-    /// Find entries by name prefix (for completion)
-    pub fn find_entries_by_prefix(&self, prefix: &str) -> Vec<&IndexEntry> {
-        let mut result = Vec::new();
-
-        // Find the first entry that starts with prefix
-        let start_idx = self
-            .entries
-            .binary_search_by(|entry| {
-                if entry.name.starts_with(prefix) {
-                    std::cmp::Ordering::Equal
-                } else {
-                    entry.name.as_str().cmp(prefix)
-                }
-            })
-            .unwrap_or_else(|idx| idx);
-
-        // Collect all entries with this prefix
-        for entry in &self.entries[start_idx..] {
-            if entry.name.starts_with(prefix) {
-                result.push(entry);
-            } else {
-                break; // Entries are sorted, so we can stop
-            }
-        }
-
-        result
-    }
-
-    /// Find entry containing the given address (GDB-style address lookup)
-    /// This is the core mechanism for address -> DIE resolution
-    pub fn find_entry_by_address(&self, address: u64) -> Option<&IndexEntry> {
-        // Use BTreeMap's range query to find the entry with the largest
-        // start address that is <= the query address
-        let range_result = self
-            .address_map
-            .range((Unbounded, Included(address)))
-            .next_back();
-
-        if let Some((&_start_addr, &idx)) = range_result {
-            if let Some(entry) = self.entries.get(idx) {
-                // Check if the address falls within any of the entry's ranges
-                for (start, end) in &entry.address_ranges {
-                    if address >= *start && address < *end {
-                        return Some(entry);
-                    }
-                }
-            }
-        }
-
-        None
-    }
-
-    /// Find all entries that overlap with the given address range
-    pub fn find_entries_in_range(&self, start_addr: u64, end_addr: u64) -> Vec<&IndexEntry> {
-        let mut result = Vec::new();
-
-        // Find all entries whose start address is < end_addr
-        for (&_entry_start, &idx) in self.address_map.range((Unbounded, Included(end_addr))) {
-            if let Some(entry) = self.entries.get(idx) {
-                // Check if any of the entry's ranges overlap with the query range
-                for (start, end) in &entry.address_ranges {
-                    if *start < end_addr && *end > start_addr {
-                        result.push(entry);
-                        break; // Only add entry once even if multiple ranges overlap
-                    }
-                }
-            }
-        }
-
-        result
-    }
-
-    /// Get statistics about address coverage
-    pub fn get_address_coverage_stats(&self) -> (usize, Option<u64>, Option<u64>) {
-        let entries_with_addr = self.address_map.len();
-        let min_addr = self.address_map.keys().next().copied();
-        let max_addr = self
-            .entries
-            .iter()
-            .flat_map(|e| e.address_ranges.iter().map(|(_, end)| *end))
-            .max();
-
-        (entries_with_addr, min_addr, max_addr)
     }
 
     /// Find DIE entry by address - returns the DIE containing this address
@@ -313,39 +189,6 @@ impl LightweightIndex {
             tracing::info!("  No entries found for function '{}'", name);
             vec![]
         }
-    }
-
-    /// Get function addresses by name (convenience method for compatibility)
-    pub fn lookup_function_addresses(&self, name: &str) -> Vec<u64> {
-        self.find_dies_by_function_name(name)
-            .iter()
-            .flat_map(|entry| entry.address_ranges.iter().map(|(start, _)| *start))
-            .collect()
-    }
-
-    /// Get entries containing an address
-    pub fn get_entries_at_address(&self, address: u64) -> Vec<&IndexEntry> {
-        // Use binary search to find potential entries
-        let mut result = Vec::new();
-
-        // Find all entries that might contain this address
-        for (_addr, &idx) in self.address_map.range(..=address).rev().take(10) {
-            let entry = &self.entries[idx];
-            // Check all ranges for this entry
-            for (start, end) in &entry.address_ranges {
-                if address >= *start && address < *end {
-                    result.push(entry);
-                    break; // Only add entry once
-                }
-            }
-        }
-
-        result
-    }
-
-    /// Get all entries (for internal use)
-    pub fn entries(&self) -> &[IndexEntry] {
-        &self.entries
     }
 }
 

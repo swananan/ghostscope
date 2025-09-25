@@ -282,7 +282,7 @@ impl SourceSearch {
 
     /// Set file search error
     pub fn set_file_search_error(state: &mut SourcePanelState, error: String) -> Vec<Action> {
-        state.file_search_message = Some(format!("✗ {}", error));
+        state.file_search_message = Some(format!("✗ {error}"));
         state.file_search_results.clear();
         state.file_search_filtered_indices.clear();
         Vec::new()

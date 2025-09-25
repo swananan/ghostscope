@@ -36,24 +36,11 @@ use std::{
     path::PathBuf,
 };
 
-/// Module loading state for error tracking and UI display
-#[derive(Debug, Clone)]
-pub enum ModuleLoadState {
-    /// Module loaded successfully
-    Success,
-    /// Module loaded with some warnings (e.g., CFI failed but DWARF succeeded)
-    PartialSuccess(Vec<String>),
-    /// Module loading failed completely
-    Failed(String),
-}
-
 /// Complete DWARF data for a single module
 #[derive(Debug)]
 pub(crate) struct ModuleData {
     /// Module mapping info (from proc mapping)
     module_mapping: ModuleMapping,
-    /// Loading state for error tracking
-    load_state: ModuleLoadState,
     /// Lightweight index (startup time)
     lightweight_index: LightweightIndex,
     /// Line mapping table (address→line lookup)
@@ -66,8 +53,6 @@ pub(crate) struct ModuleData {
     cfi_index: Option<CfiIndex>,
     /// On-demand resolver (for detailed parsing)
     resolver: OnDemandResolver,
-    /// Parsing statistics
-    stats: crate::parser::DwarfParseStats,
     /// Memory mapped file (keep alive)
     _mapped_file: MappedFile,
 }
@@ -165,7 +150,6 @@ impl ModuleData {
         let resolver = crate::data::OnDemandResolver::new(
             std::sync::Arc::try_unwrap(dwarf)
                 .map_err(|_| anyhow::anyhow!("Failed to unwrap DWARF Arc"))?,
-            gimli::BaseAddresses::default(),
         );
 
         // Determine load state based on parallel loading results
@@ -174,10 +158,20 @@ impl ModuleData {
             warnings.push("CFI index failed to initialize".to_string());
         }
 
-        let load_state = if warnings.is_empty() {
-            ModuleLoadState::Success
+        if !warnings.is_empty() {
+            for warning in &warnings {
+                tracing::warn!(
+                    "Module {} loaded with warning: {}",
+                    module_mapping.path.display(),
+                    warning
+                );
+            }
+        }
+
+        let state_label = if warnings.is_empty() {
+            "Success"
         } else {
-            ModuleLoadState::PartialSuccess(warnings)
+            "PartialSuccess"
         };
 
         tracing::info!(
@@ -187,19 +181,17 @@ impl ModuleData {
             parse_result.stats.total_variables,
             parse_result.stats.total_line_entries,
             parse_result.stats.total_files,
-            load_state
+            state_label
         );
 
         Ok(Self {
             module_mapping: module_mapping.clone(),
-            load_state,
             lightweight_index: parse_result.lightweight_index,
             line_mapping: parse_result.line_mapping,
             scoped_file_manager: parse_result.scoped_file_manager,
             compilation_units: parse_result.compilation_units,
             cfi_index,
             resolver,
-            stats: parse_result.stats,
             _mapped_file: std::sync::Arc::try_unwrap(mapped_file)
                 .map_err(|_| anyhow::anyhow!("Failed to unwrap MappedFile Arc"))?,
         })
@@ -226,7 +218,7 @@ impl ModuleData {
             let data = object
                 .section_by_name(id.name())
                 .and_then(|section| section.uncompressed_data().ok())
-                .unwrap_or_else(|| std::borrow::Cow::Borrowed(&[]));
+                .unwrap_or(std::borrow::Cow::Borrowed(&[]));
 
             // SAFETY: We keep the mapped file alive for the lifetime of the module
             let data: &'static [u8] = unsafe { std::mem::transmute(data.as_ref()) };
@@ -573,11 +565,11 @@ impl ModuleData {
         }
 
         // Fallback to file index lookup if needed
-        if let Some(file_info) = self
+        if let Some(full_path) = self
             .scoped_file_manager
             .lookup_by_scoped_index(&entry.compilation_unit, entry.file_index)
         {
-            return Some(file_info.full_path);
+            return Some(full_path);
         }
 
         Some(entry.compilation_unit.clone())
@@ -602,12 +594,12 @@ impl ModuleData {
                 || line_entry.compilation_unit.ends_with(".rs"))
         {
             // Try to get base directory from file index resolution
-            let full_path = if let Some(file_info) = self
+            let full_path = if let Some(full_path) = self
                 .scoped_file_manager
                 .lookup_by_scoped_index(&line_entry.compilation_unit, line_entry.file_index)
             {
                 // Extract base directory from the resolved absolute path
-                let resolved_path = &file_info.full_path;
+                let resolved_path = &full_path;
                 if let Some(base_dir) =
                     self.extract_base_directory(resolved_path, &line_entry.compilation_unit)
                 {
@@ -633,18 +625,17 @@ impl ModuleData {
         }
 
         // Try to find a better file if current one is a header
-        let preferred_file_path = if let Some(file_info) = self
+        let preferred_file_path = if let Some(current_path) = self
             .scoped_file_manager
             .lookup_by_scoped_index(&line_entry.compilation_unit, line_entry.file_index)
         {
-            let current_path = &file_info.full_path;
             tracing::debug!(
                 "create_source_location_from_entry: found file via ScopedFileIndexManager: '{}'",
                 current_path
             );
 
             // If current file is a header, try to find the main source file
-            if self.is_header_file(current_path) {
+            if self.is_header_file(&current_path) {
                 if let Some(alternative_path) =
                     self.find_main_source_file_in_cu(&line_entry.compilation_unit)
                 {
@@ -654,10 +645,10 @@ impl ModuleData {
                     );
                     alternative_path
                 } else {
-                    current_path.clone()
+                    current_path
                 }
             } else {
-                current_path.clone()
+                current_path
             }
         } else if !line_entry.file_path.is_empty() {
             tracing::debug!(
@@ -803,58 +794,11 @@ impl ModuleData {
         self.resolver.get_cache_stats()
     }
 
-    /// Get module mapping info
-    pub(crate) fn get_mapping(&self) -> &ModuleMapping {
-        &self.module_mapping
-    }
-
     /// Get CFA result at given PC
     pub(crate) fn get_cfa_result(&self, pc: u64) -> Result<Option<crate::core::CfaResult>> {
         match &self.cfi_index {
             Some(cfi) => Ok(Some(cfi.get_cfa_result(pc)?)),
             None => Ok(None),
-        }
-    }
-
-    /// Check if CFI fast lookup is available
-    pub(crate) fn has_cfi_fast_lookup(&self) -> bool {
-        self.cfi_index
-            .as_ref()
-            .map(|cfi| cfi.has_fast_lookup())
-            .unwrap_or(false)
-    }
-
-    /// Get DWARF parsing statistics
-    pub(crate) fn get_parse_stats(&self) -> &crate::parser::DwarfParseStats {
-        &self.stats
-    }
-
-    /// Get debug_line parsing statistics
-    pub(crate) fn get_debug_line_stats(&self) -> DebugLineStats {
-        let (total_files, _) = self.scoped_file_manager.get_stats();
-
-        let mut seen = HashSet::new();
-        let mut sample_paths = Vec::new();
-
-        for cu in self.compilation_units.values() {
-            for file in &cu.files {
-                if seen.insert(file.full_path.clone()) {
-                    sample_paths.push(PathBuf::from(file.full_path.clone()));
-                    if sample_paths.len() >= 10 {
-                        break;
-                    }
-                }
-            }
-            if sample_paths.len() >= 10 {
-                break;
-            }
-        }
-
-        DebugLineStats {
-            total_line_entries: self.line_mapping.total_entries(),
-            file_count: total_files,
-            address_range: self.line_mapping.address_range(),
-            file_paths: sample_paths,
         }
     }
 
@@ -892,12 +836,9 @@ impl ModuleData {
 
     /// Find symbol name by address (compatibility method)
     pub(crate) fn find_symbol_by_address(&self, address: u64) -> Option<String> {
-        // Find the DIE containing this address
-        if let Some(entry) = self.lightweight_index.find_die_at_address(address) {
-            Some(entry.name.clone())
-        } else {
-            None
-        }
+        self.lightweight_index
+            .find_die_at_address(address)
+            .map(|entry| entry.name.clone())
     }
 
     /// Get all source files from stored compilation unit metadata
@@ -916,36 +857,4 @@ impl ModuleData {
         source_files.sort_by(|a, b| a.full_path.cmp(&b.full_path));
         source_files
     }
-
-    /// Get module loading state for error tracking and UI display
-    pub(crate) fn get_load_state(&self) -> &ModuleLoadState {
-        &self.load_state
-    }
-
-    /// Check if module loaded successfully (no warnings or errors)
-    pub(crate) fn is_fully_loaded(&self) -> bool {
-        matches!(self.load_state, ModuleLoadState::Success)
-    }
-
-    /// Check if module has any warnings
-    pub(crate) fn has_warnings(&self) -> bool {
-        matches!(self.load_state, ModuleLoadState::PartialSuccess(_))
-    }
-
-    /// Get warning messages if any
-    pub(crate) fn get_warnings(&self) -> Vec<String> {
-        match &self.load_state {
-            ModuleLoadState::PartialSuccess(warnings) => warnings.clone(),
-            _ => Vec::new(),
-        }
-    }
-}
-
-/// Debug line statistics for verification
-#[derive(Debug, Clone)]
-pub struct DebugLineStats {
-    pub total_line_entries: usize,
-    pub file_count: usize,
-    pub address_range: Option<(u64, u64)>,
-    pub file_paths: Vec<PathBuf>,
 }

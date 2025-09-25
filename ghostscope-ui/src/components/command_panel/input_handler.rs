@@ -269,8 +269,6 @@ impl InputHandler {
 
     /// Handle jk escape sequence for vim-like mode switching
     fn handle_jk_escape_sequence(state: &mut CommandPanelState, c: char) -> JkEscapeResult {
-        const JK_TIMEOUT_MS: u64 = 100;
-
         match state.jk_escape_state {
             JkEscapeState::None => {
                 if c == 'j' {
@@ -365,7 +363,7 @@ impl InputHandler {
 
     fn history_down(state: &mut CommandPanelState) {
         match state.history_index {
-            None => return, // Not in history mode
+            None => (), // Not in history mode
             Some(current_index) => {
                 let max_index = state.command_history.len() - 1;
                 if current_index < max_index {

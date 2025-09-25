@@ -74,7 +74,7 @@ impl EbpfPanelRenderer {
             let trace = &cached_trace.event;
             let is_latest = trace_index == total_traces - 1;
             // Check execution status from EndInstruction
-            let is_error = trace.instructions.last().map_or(false, |inst| {
+            let is_error = trace.instructions.last().is_some_and(|inst| {
                 if let ghostscope_protocol::ParsedInstruction::EndInstruction {
                     execution_status,
                     ..
@@ -91,7 +91,7 @@ impl EbpfPanelRenderer {
             let header_no_bold = String::from("[No:");
             let message_id = (trace_index + 1) as u64; // Simple sequential numbering
             let formatted_timestamp = &cached_trace.formatted_timestamp; // Use cached timestamp
-            let header_number = format!("{}", message_id);
+            let header_number = message_id.to_string();
             let header_rest = format!(
                 "] {} TraceID:{} PID:{} TID:{}",
                 formatted_timestamp, trace.trace_id, trace.pid, trace.tid
@@ -145,49 +145,47 @@ impl EbpfPanelRenderer {
         }
 
         // Determine starting card index based on mode and cursor visibility
-        let mut start_index = 0usize;
         let viewport_height = content_area.height;
-        match state.display_mode {
+        let start_index = match state.display_mode {
             DisplayMode::AutoRefresh => {
-                // Fit as many cards from the end as possible
-                let mut h: u16 = 0;
-                start_index = cards.len();
-                while start_index > 0 {
-                    let next_h = h.saturating_add(cards[start_index - 1].total_height);
-                    if next_h > viewport_height {
+                let mut accumulated: u16 = 0;
+                let mut idx = cards.len();
+                while idx > 0 {
+                    let next_height = accumulated.saturating_add(cards[idx - 1].total_height);
+                    if next_height > viewport_height {
                         break;
                     }
-                    h = next_h;
-                    start_index -= 1;
+                    accumulated = next_height;
+                    idx -= 1;
                 }
+                idx
             }
             DisplayMode::Scroll => {
-                // Ensure cursor card is fully visible
                 let cursor = state.cursor_trace_index.min(cards.len().saturating_sub(1));
-                // Try to place cursor card slightly below center if possible
-                let mut h_below: u16 = 0;
+                let mut height_below: u16 = 0;
                 let mut end = cursor;
                 while end < cards.len() {
-                    let ch = cards[end].total_height;
-                    if h_below + ch > viewport_height {
+                    let card_height = cards[end].total_height;
+                    if height_below + card_height > viewport_height {
                         break;
                     }
-                    h_below += ch;
+                    height_below += card_height;
                     end += 1;
                 }
-                let mut h_above: u16 = 0;
-                let mut i = cursor;
-                while i > 0 {
-                    let ch = cards[i - 1].total_height;
-                    if h_above + h_below + ch > viewport_height {
+
+                let mut height_above: u16 = 0;
+                let mut idx = cursor;
+                while idx > 0 {
+                    let card_height = cards[idx - 1].total_height;
+                    if height_above + height_below + card_height > viewport_height {
                         break;
                     }
-                    h_above += ch;
-                    i -= 1;
+                    height_above += card_height;
+                    idx -= 1;
                 }
-                start_index = i;
+                idx
             }
-        }
+        };
 
         // Render visible cards
         let mut y = content_area.y;
@@ -203,7 +201,6 @@ impl EbpfPanelRenderer {
             }
 
             let is_cursor = state.show_cursor && idx == state.cursor_trace_index;
-            let title_style = Style::default().add_modifier(Modifier::BOLD);
 
             let mut border_style = Style::default();
             let mut border_type = BorderType::Plain;
@@ -278,7 +275,7 @@ impl EbpfPanelRenderer {
         // Render numeric prefix or 'g' hint (style consistent with SourceCode panel)
         if state.g_pressed || state.numeric_prefix.is_some() {
             let input_text = if let Some(ref s) = state.numeric_prefix {
-                format!("{}", s)
+                s.clone()
             } else {
                 "g".to_string()
             };
@@ -292,7 +289,8 @@ impl EbpfPanelRenderer {
             let full_text = if hint_text.is_empty() {
                 input_text.clone()
             } else {
-                format!("{} ({})", input_text, &hint_text[1..])
+                let hint_body = &hint_text[1..];
+                format!("{input_text} ({hint_body})")
             };
 
             let text_width = full_text.len() as u16;
@@ -304,8 +302,9 @@ impl EbpfPanelRenderer {
                 Style::default().fg(Color::Green).bg(Color::Rgb(30, 30, 30)),
             )];
             if !hint_text.is_empty() {
+                let hint_body = &hint_text[1..];
                 spans.push(Span::styled(
-                    format!(" ({})", &hint_text[1..]),
+                    format!(" ({hint_body})"),
                     Style::default()
                         .fg(border_style.fg.unwrap_or(Color::White))
                         .bg(Color::Rgb(30, 30, 30)),
@@ -356,5 +355,11 @@ impl EbpfPanelRenderer {
         } else {
             lines
         }
+    }
+}
+
+impl Default for EbpfPanelRenderer {
+    fn default() -> Self {
+        Self::new()
     }
 }

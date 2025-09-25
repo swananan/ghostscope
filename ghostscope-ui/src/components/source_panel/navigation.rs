@@ -409,9 +409,8 @@ impl SourceNavigation {
                 Self::show_error(
                     state,
                     format!(
-                        "Cannot read source file '{}': {}. \
-                        Ensure source files are accessible at the paths recorded in debug info.",
-                        file_path, e
+                        "Cannot read source file '{file_path}': {e}. \
+                        Ensure source files are accessible at the paths recorded in debug info."
                     ),
                 );
             }
@@ -469,14 +468,14 @@ impl SourceNavigation {
         state.content = vec![
             "// Source code loading failed".to_string(),
             "//".to_string(),
-            format!("// File: {}", path_display),
+            format!("// File: {path_display}"),
             if dir_display.is_empty() {
                 "// Dir: <unknown>".to_string()
             } else {
-                format!("// Dir: {}", dir_display)
+                format!("// Dir: {dir_display}")
             },
             "//".to_string(),
-            format!("// Error: {}", error_message),
+            format!("// Error: {error_message}"),
             "//".to_string(),
             "// To fix this issue:".to_string(),
             "// 1. Ensure the binary was compiled with debug symbols (-g flag)".to_string(),
@@ -492,7 +491,7 @@ impl SourceNavigation {
 
     /// Detect programming language from file extension
     fn detect_language(file_path: &str) -> String {
-        if let Some(extension) = file_path.split('.').last() {
+        if let Some(extension) = file_path.rsplit('.').next() {
             match extension.to_lowercase().as_str() {
                 "c" => "c".to_string(),
                 "cpp" | "cc" | "cxx" | "hpp" | "hxx" => "cpp".to_string(),
@@ -514,7 +513,7 @@ impl SourceNavigation {
         }
 
         // Calculate dynamic scrolloff: 1/5 of visible lines, min 2, max 5
-        let vertical_scrolloff = (visible_lines / 5).max(2).min(5);
+        let vertical_scrolloff = (visible_lines / 5).clamp(2, 5);
 
         // Calculate cursor position relative to current scroll
         let cursor_in_view = state.cursor_line.saturating_sub(state.scroll_offset);
@@ -584,10 +583,9 @@ impl SourceNavigation {
             }
 
             let line_char_count = current_line_content.chars().count();
-            let old_scroll_offset = state.horizontal_scroll_offset;
 
             // Apply vim-style scrolloff regardless of line length
-            let horizontal_scrolloff = (available_width / 4).max(3).min(8); // Dynamic scrolloff, 3-8 chars
+            let horizontal_scrolloff = (available_width / 4).clamp(3, 8); // Dynamic scrolloff, 3-8 chars
 
             // Calculate cursor position relative to current scroll
             let cursor_in_view = state

@@ -54,11 +54,20 @@ impl CommandHistory {
     pub fn load_from_file(&mut self) {
         if let Ok(file) = File::open(&self.file_path) {
             let reader = BufReader::new(file);
-            self.entries = reader
-                .lines()
-                .filter_map(|line| line.ok())
-                .filter(|line| !line.trim().is_empty())
-                .collect();
+            let mut entries = Vec::new();
+
+            for line in reader.lines() {
+                match line {
+                    Ok(line) => {
+                        if !line.trim().is_empty() {
+                            entries.push(line);
+                        }
+                    }
+                    Err(_) => continue,
+                }
+            }
+
+            self.entries = entries;
         }
     }
 
@@ -75,7 +84,7 @@ impl CommandHistory {
             .open(&self.file_path)
         {
             for entry in &self.entries {
-                let _ = writeln!(file, "{}", entry);
+                let _ = writeln!(file, "{entry}");
             }
         }
     }
@@ -123,13 +132,11 @@ impl CommandHistory {
             return None;
         }
 
-        for entry in self.entries.iter().rev() {
-            if entry.starts_with(prefix) && entry != prefix {
-                return Some(entry);
-            }
-        }
-
-        None
+        self.entries
+            .iter()
+            .rev()
+            .find(|entry| entry.starts_with(prefix) && entry.as_str() != prefix)
+            .map(|entry| entry.as_str())
     }
 
     pub fn get_entry(&self, index: usize) -> Option<&str> {

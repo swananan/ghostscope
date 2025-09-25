@@ -1,6 +1,5 @@
 use ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout},
-    style::{Color, Modifier, Style},
+    style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Gauge, Paragraph},
     Frame,
@@ -27,9 +26,7 @@ impl ProgressRenderer {
             .gauge_style(Style::default().fg(Color::Cyan))
             .ratio(ratio)
             .label(format!(
-                "{}/{} modules ({}%)",
-                completed,
-                total,
+                "{completed}/{total} modules ({}%)",
                 (ratio * 100.0) as u8
             ));
 
@@ -77,7 +74,7 @@ impl ProgressRenderer {
                         Span::styled("✗ ", Style::default().fg(Color::Red)),
                         Span::styled(path, Style::default().fg(Color::White)),
                         Span::styled(
-                            format!("  ❌ Failed: {} | Time: {:.1}s", error, load_time),
+                            format!("  ❌ Failed: {error} | Time: {load_time:.1}s"),
                             Style::default().fg(Color::Red),
                         ),
                     ]);
@@ -144,10 +141,7 @@ impl ProgressRenderer {
 
         let stats_line = Line::from(vec![
             Span::styled("⏱️ Elapsed: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{:.1}s", elapsed),
-                Style::default().fg(Color::White),
-            ),
+            Span::styled(format!("{elapsed:.1}s"), Style::default().fg(Color::White)),
             Span::styled(" | ", Style::default().fg(Color::DarkGray)),
             Span::styled("📊 Total: ", Style::default().fg(Color::DarkGray)),
             Span::styled(

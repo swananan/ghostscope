@@ -450,7 +450,7 @@ impl CommandParser {
     ) -> Vec<Action> {
         state.input_state = InputState::WaitingResponse {
             command: if let Some(id) = trace_id {
-                format!("info trace {}", id)
+                format!("info trace {id}")
             } else {
                 "info trace".to_string()
             },

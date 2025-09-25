@@ -91,12 +91,10 @@ impl UISymbols {
             } else {
                 Self::STATUS_DISABLED_ASCII
             }
+        } else if active {
+            Self::STATUS_ACTIVE
         } else {
-            if active {
-                Self::STATUS_ACTIVE
-            } else {
-                Self::STATUS_DISABLED
-            }
+            Self::STATUS_DISABLED
         }
     }
 
@@ -107,12 +105,10 @@ impl UISymbols {
             } else {
                 Self::STATUS_NO_ASCII
             }
+        } else if yes {
+            Self::STATUS_YES
         } else {
-            if yes {
-                Self::STATUS_YES
-            } else {
-                Self::STATUS_NO
-            }
+            Self::STATUS_NO
         }
     }
 }

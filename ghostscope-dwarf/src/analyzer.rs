@@ -126,10 +126,8 @@ impl DwarfAnalyzer {
         // No loaded address since we're not analyzing a running process
         let module_mapping = ModuleMapping {
             path: exec_path.clone(),
-            base_address: 0x0,    // Base address in file
             loaded_address: None, // No process mapping in exec path mode
             size: 0,              // Will be determined from file size if needed
-            is_executable: true,  // This is the main executable
         };
 
         // Load the single module using parallel loading
@@ -173,16 +171,6 @@ impl DwarfAnalyzer {
         );
 
         analyzer
-    }
-
-    /// Get module by path
-    pub(crate) fn get_module(&self, module_path: &PathBuf) -> Option<&ModuleData> {
-        self.modules.get(module_path)
-    }
-
-    /// Get mutable module by path
-    pub(crate) fn get_module_mut(&mut self, module_path: &PathBuf) -> Option<&mut ModuleData> {
-        self.modules.get_mut(module_path)
     }
 
     /// Lookup function addresses across all modules
@@ -303,20 +291,6 @@ impl DwarfAnalyzer {
             );
         }
 
-        results
-    }
-
-    /// Get all source files (cross-module)
-    pub(crate) fn get_all_source_files(&self) -> Vec<(PathBuf, Vec<crate::parser::SourceFile>)> {
-        let mut results = Vec::new();
-        for module_path in self.modules.keys() {
-            if let Some(module) = self.get_module(module_path) {
-                let files = module.get_all_files();
-                if !files.is_empty() {
-                    results.push((module_path.clone(), files));
-                }
-            }
-        }
         results
     }
 

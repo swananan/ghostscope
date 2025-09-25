@@ -12,7 +12,6 @@ pub struct MemoryMapping {
     pub start_addr: u64,
     pub end_addr: u64,
     pub permissions: String, // r-xp, rw-p etc.
-    pub offset: u64,         // File offset
     pub device: String,      // major:minor device
     pub inode: u64,
     pub pathname: Option<String>, // Binary file path
@@ -22,10 +21,8 @@ pub struct MemoryMapping {
 #[derive(Debug, Clone)]
 pub struct ModuleMapping {
     pub path: PathBuf,
-    pub base_address: u64,           // Base address in file
     pub loaded_address: Option<u64>, // Loaded address in process (None for exec path mode)
     pub size: u64,
-    pub is_executable: bool, // Main executable vs dynamic library
 }
 
 /// Process memory mapping parser
@@ -41,14 +38,16 @@ impl ProcMappingParser {
 
         let mut module_mappings = Vec::new();
         let mut processed_paths = std::collections::HashSet::new();
+        let mut processed_device_keys = std::collections::HashSet::new();
 
         // Process executable mappings to find modules
         for mapping in &mappings {
             if let Some(path) = &mapping.pathname {
                 // Only process executable mappings and avoid duplicates
-                if mapping.permissions.contains('x') && !processed_paths.contains(path) {
-                    processed_paths.insert(path.clone());
-
+                if mapping.permissions.contains('x')
+                    && processed_device_keys.insert((mapping.device.clone(), mapping.inode))
+                    && processed_paths.insert(path.clone())
+                {
                     match Self::try_create_module(path, mapping) {
                         Ok(module_mapping) => {
                             tracing::debug!(
@@ -109,7 +108,7 @@ impl ProcMappingParser {
 
         // Parse other fields
         let permissions = parts[1].to_string();
-        let offset = u64::from_str_radix(parts[2], 16).ok()?;
+        let _ = u64::from_str_radix(parts[2], 16).ok()?;
         let device = parts[3].to_string();
         let inode = parts[4].parse().ok()?;
 
@@ -130,7 +129,6 @@ impl ProcMappingParser {
             start_addr,
             end_addr,
             permissions,
-            offset,
             device,
             inode,
             pathname,
@@ -148,14 +146,10 @@ impl ProcMappingParser {
         }
 
         // Determine if this is the main executable or a dynamic library
-        let is_executable = !path.contains(".so");
-
         let module_mapping = ModuleMapping {
             path: path_buf,
-            base_address: mapping.offset,
             loaded_address: Some(mapping.start_addr),
             size: mapping.end_addr - mapping.start_addr,
-            is_executable,
         };
 
         tracing::debug!(

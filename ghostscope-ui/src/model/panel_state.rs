@@ -89,6 +89,12 @@ impl SourcePanelState {
     }
 }
 
+impl Default for SourcePanelState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// eBPF panel state
 #[derive(Debug)]
 pub struct EbpfPanelState {
@@ -283,6 +289,12 @@ impl EbpfPanelState {
         self.display_mode = DisplayMode::AutoRefresh;
         self.show_cursor = false;
         self.auto_scroll = true;
+    }
+}
+
+impl Default for EbpfPanelState {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1034,5 +1046,11 @@ impl CommandPanelState {
         tracing::debug!("get_display_cursor_position: is_in_history_search={}, input_text='{}', cursor_position={}, result={}",
             self.is_in_history_search(), self.input_text, self.cursor_position, result);
         result
+    }
+}
+
+impl Default for CommandPanelState {
+    fn default() -> Self {
+        Self::new()
     }
 }

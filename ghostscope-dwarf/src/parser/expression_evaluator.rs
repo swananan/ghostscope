@@ -96,17 +96,12 @@ impl ExpressionEvaluator {
         let mut has_stack_value = false;
 
         // Parse all operations in the expression
-        loop {
-            match Operation::parse(&mut expression.0, encoding) {
-                Ok(op) => {
-                    if matches!(op, Operation::StackValue) {
-                        has_stack_value = true;
-                        debug!("Found DW_OP_stack_value - this is a computed value");
-                    }
-                    operations.push(op);
-                }
-                Err(_) => break, // End of expression
+        while let Ok(op) = Operation::parse(&mut expression.0, encoding) {
+            if matches!(op, Operation::StackValue) {
+                has_stack_value = true;
+                debug!("Found DW_OP_stack_value - this is a computed value");
             }
+            operations.push(op);
         }
 
         if operations.is_empty() {
@@ -121,7 +116,7 @@ impl ExpressionEvaluator {
         }
 
         // Build compute steps from operations
-        if operations.len() >= 1 {
+        if !operations.is_empty() {
             let mut steps = Vec::new();
 
             for op in &operations {
@@ -130,7 +125,7 @@ impl ExpressionEvaluator {
                         register, offset, ..
                     } => {
                         // Load register and add offset if non-zero
-                        steps.push(ComputeStep::LoadRegister(register.0 as u16));
+                        steps.push(ComputeStep::LoadRegister(register.0));
                         if *offset != 0 {
                             steps.push(ComputeStep::PushConstant(*offset));
                             steps.push(ComputeStep::Add);
@@ -139,7 +134,7 @@ impl ExpressionEvaluator {
                     Operation::Register { register } => {
                         // DW_OP_reg* means the value IS in the register (direct value)
                         // We'll handle this specially below
-                        steps.push(ComputeStep::LoadRegister(register.0 as u16));
+                        steps.push(ComputeStep::LoadRegister(register.0));
                     }
                     Operation::PlusConstant { value } => {
                         steps.push(ComputeStep::PushConstant(*value as i64));
@@ -292,7 +287,7 @@ impl ExpressionEvaluator {
             Operation::Register { register } => {
                 debug!("Single DW_OP_reg{} - direct register value", register.0);
                 Ok(EvaluationResult::DirectValue(
-                    DirectValueResult::RegisterValue(register.0 as u16),
+                    DirectValueResult::RegisterValue(register.0),
                 ))
             }
 
@@ -308,7 +303,7 @@ impl ExpressionEvaluator {
                 );
                 Ok(EvaluationResult::MemoryLocation(
                     LocationResult::RegisterAddress {
-                        register: register.0 as u16,
+                        register: register.0,
                         offset: if *offset != 0 { Some(*offset) } else { None },
                         size: None,
                     },
@@ -515,55 +510,5 @@ impl ExpressionEvaluator {
             entry_count, offset.0
         );
         Ok(EvaluationResult::Optimized)
-    }
-
-    /// Parse a multi-operation DWARF expression (future enhancement)
-    /// This would handle complex expressions with multiple operations
-    pub fn parse_complex_expression(
-        expr_bytes: &[u8],
-        encoding: gimli::Encoding,
-    ) -> Result<EvaluationResult> {
-        // TODO: Implement full DWARF expression evaluation
-        // This would need to:
-        // 1. Parse all operations in sequence
-        // 2. Maintain an evaluation stack
-        // 3. Generate ComputeStep sequences for eBPF
-
-        warn!("Complex DWARF expression evaluation not yet implemented");
-        // Can't provide CFA without context
-        Self::parse_expression(expr_bytes, encoding, 0, None)
-    }
-
-    /// Check if a DIE represents an optimized-out variable
-    pub fn is_optimized_out(
-        entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
-    ) -> Result<bool> {
-        // Check for DW_AT_location
-        let has_location = entry.attr(gimli::constants::DW_AT_location)?.is_some();
-
-        // Check for DW_AT_const_value (constant folded)
-        let has_const_value = entry.attr(gimli::constants::DW_AT_const_value)?.is_some();
-
-        // If neither location nor const_value, it's optimized out
-        Ok(!has_location && !has_const_value)
-    }
-
-    /// Extract constant value if variable is compile-time constant
-    pub fn extract_const_value(
-        entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
-    ) -> Result<Option<i64>> {
-        if let Some(attr) = entry.attr(gimli::constants::DW_AT_const_value)? {
-            match attr.value() {
-                gimli::AttributeValue::Udata(val) => Ok(Some(val as i64)),
-                gimli::AttributeValue::Sdata(val) => Ok(Some(val)),
-                gimli::AttributeValue::Data1(val) => Ok(Some(val as i64)),
-                gimli::AttributeValue::Data2(val) => Ok(Some(val as i64)),
-                gimli::AttributeValue::Data4(val) => Ok(Some(val as i64)),
-                gimli::AttributeValue::Data8(val) => Ok(Some(val as i64)),
-                _ => Ok(None),
-            }
-        } else {
-            Ok(None)
-        }
     }
 }

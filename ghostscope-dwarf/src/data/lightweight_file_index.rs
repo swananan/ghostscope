@@ -208,14 +208,14 @@ impl ScopedFileIndexManager {
         &self,
         compilation_unit: &str,
         file_index: u64,
-    ) -> Option<FileInfo> {
+    ) -> Option<String> {
         // Removed debug logging to reduce noise in normal operation
 
         let file_index_ref = self.cu_file_indices.get(compilation_unit)?;
 
         // Debug: list all files in this CU
         tracing::debug!("  Available files in CU '{}':", compilation_unit);
-        for (_i, entry) in file_index_ref.file_entries().iter().enumerate() {
+        for entry in file_index_ref.file_entries().iter() {
             tracing::debug!(
                 "    file_index={}, filename='{}', dir_index={}",
                 entry.file_index,
@@ -230,11 +230,6 @@ impl ScopedFileIndexManager {
             .get_full_path(file_index_ref)
             .unwrap_or_else(|| file_entry.filename.to_string());
 
-        let directory_path = std::path::Path::new(&full_path)
-            .parent()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-
         tracing::debug!(
             "  Resolved file_index={} -> filename='{}', full_path='{}'",
             file_index,
@@ -242,15 +237,7 @@ impl ScopedFileIndexManager {
             full_path
         );
 
-        // Create FileInfo on-demand (compatibility layer)
-        Some(FileInfo {
-            file_index: file_entry.file_index,
-            compilation_unit: compilation_unit.to_string(),
-            directory_index: file_entry.directory_index,
-            directory_path,
-            filename: file_entry.filename.to_string(),
-            full_path,
-        })
+        Some(full_path)
     }
     /// Get statistics (total files, total compilation units)
     pub fn get_stats(&self) -> (usize, usize) {
@@ -269,19 +256,6 @@ impl Default for ScopedFileIndexManager {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Compatibility layer: FileInfo struct to maintain API compatibility
-/// This will eventually be phased out in favor of direct LightweightFileEntry usage
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub(crate) struct FileInfo {
-    pub file_index: u64,
-    pub compilation_unit: String,
-    pub directory_index: u64,
-    pub directory_path: String,
-    pub filename: String,
-    pub full_path: String,
 }
 
 #[cfg(test)]
@@ -358,7 +332,7 @@ mod tests {
         let main_file = manager.lookup_by_scoped_index("main.c", 1).unwrap();
         let lib_file = manager.lookup_by_scoped_index("lib.c", 1).unwrap();
 
-        assert_eq!(main_file.full_path, "/src/main.c");
-        assert_eq!(lib_file.full_path, "/lib/lib.c");
+        assert_eq!(main_file, "/src/main.c");
+        assert_eq!(lib_file, "/lib/lib.c");
     }
 }

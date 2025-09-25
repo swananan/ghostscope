@@ -136,9 +136,9 @@ impl ModuleDebugInfo {
         // Add source information if available
         if let Some(ref file) = source_file {
             if let Some(line) = source_line {
-                result.push_str(&format!(" @ {}:{}\n", file, line));
+                result.push_str(&format!(" @ {file}:{line}\n"));
             } else {
-                result.push_str(&format!(" @ {}\n", file));
+                result.push_str(&format!(" @ {file}\n"));
             }
         } else {
             result.push('\n');
@@ -146,142 +146,83 @@ impl ModuleDebugInfo {
 
         for (addr_idx, mapping) in self.address_mappings.iter().enumerate() {
             let is_last_addr = addr_idx == self.address_mappings.len() - 1;
-            let addr_prefix = if is_last_module {
-                if is_last_addr {
-                    "   └─"
-                } else {
-                    "   ├─"
-                }
-            } else {
-                if is_last_addr {
-                    "│  └─"
-                } else {
-                    "│  ├─"
-                }
+            let addr_prefix = match (is_last_module, is_last_addr) {
+                (true, true) => "   └─",
+                (true, false) => "   ├─",
+                (false, true) => "│  └─",
+                (false, false) => "│  ├─",
             };
 
             // Enhanced PC address display
             let pc_description = format!("🎯 0x{:x}", mapping.address);
 
-            result.push_str(&format!("{} {}\n", addr_prefix, pc_description));
+            result.push_str(&format!("{addr_prefix} {pc_description}\n"));
 
             // Format parameters
             if !mapping.parameters.is_empty() {
-                let param_prefix = if is_last_module {
-                    if is_last_addr {
-                        "      ├─"
-                    } else {
-                        "   │  ├─"
-                    }
-                } else {
-                    if is_last_addr {
-                        "│     ├─"
-                    } else {
-                        "│  │  ├─"
-                    }
+                let param_prefix = match (is_last_module, is_last_addr) {
+                    (true, true) => "      ├─",
+                    (true, false) => "   │  ├─",
+                    (false, true) => "│     ├─",
+                    (false, false) => "│  │  ├─",
                 };
 
-                result.push_str(&format!("{} 📥 Parameters\n", param_prefix));
+                result.push_str(&format!("{param_prefix} 📥 Parameters\n"));
 
                 for (param_idx, param) in mapping.parameters.iter().enumerate() {
                     let is_last_param =
                         param_idx == mapping.parameters.len() - 1 && mapping.variables.is_empty();
-                    let item_prefix = if is_last_module {
-                        if is_last_addr {
-                            if is_last_param {
-                                "      │  └─"
-                            } else {
-                                "      │  ├─"
-                            }
-                        } else {
-                            if is_last_param {
-                                "   │  │  └─"
-                            } else {
-                                "   │  │  ├─"
-                            }
-                        }
-                    } else {
-                        if is_last_addr {
-                            if is_last_param {
-                                "│     │  └─"
-                            } else {
-                                "│     │  ├─"
-                            }
-                        } else {
-                            if is_last_param {
-                                "│  │  │  └─"
-                            } else {
-                                "│  │  │  ├─"
-                            }
-                        }
+                    let item_prefix = match (is_last_module, is_last_addr, is_last_param) {
+                        (true, true, true) => "      │  └─",
+                        (true, true, false) => "      │  ├─",
+                        (true, false, true) => "   │  │  └─",
+                        (true, false, false) => "   │  │  ├─",
+                        (false, true, true) => "│     │  └─",
+                        (false, true, false) => "│     │  ├─",
+                        (false, false, true) => "│  │  │  └─",
+                        (false, false, false) => "│  │  │  ├─",
                     };
 
                     let param_line = Self::format_variable_line(param);
 
                     result.push_str(&Self::wrap_long_line(
-                        &format!("{} {}", item_prefix, param_line),
+                        &format!("{item_prefix} {param_line}"),
                         80,
-                        &item_prefix,
+                        item_prefix,
                     ));
                 }
             }
 
             // Format variables
             if !mapping.variables.is_empty() {
-                let var_prefix = if is_last_module {
-                    if is_last_addr {
-                        "      └─"
-                    } else {
-                        "   │  └─"
-                    }
-                } else {
-                    if is_last_addr {
-                        "│     └─"
-                    } else {
-                        "│  │  └─"
-                    }
+                let var_prefix = match (is_last_module, is_last_addr) {
+                    (true, true) => "      └─",
+                    (true, false) => "   │  └─",
+                    (false, true) => "│     └─",
+                    (false, false) => "│  │  └─",
                 };
 
-                result.push_str(&format!("{} 📦 Variables\n", var_prefix));
+                result.push_str(&format!("{var_prefix} 📦 Variables\n"));
 
                 for (var_idx, var) in mapping.variables.iter().enumerate() {
                     let is_last_var = var_idx == mapping.variables.len() - 1;
-                    let item_prefix = if is_last_module {
-                        if is_last_addr {
-                            if is_last_var {
-                                "         └─"
-                            } else {
-                                "         ├─"
-                            }
-                        } else {
-                            if is_last_var {
-                                "   │     └─"
-                            } else {
-                                "   │     ├─"
-                            }
-                        }
-                    } else {
-                        if is_last_addr {
-                            if is_last_var {
-                                "│        └─"
-                            } else {
-                                "│        ├─"
-                            }
-                        } else {
-                            if is_last_var {
-                                "│  │     └─"
-                            } else {
-                                "│  │     ├─"
-                            }
-                        }
+                    let item_prefix = match (is_last_module, is_last_addr, is_last_var) {
+                        (true, true, true) => "         └─",
+                        (true, true, false) => "         ├─",
+                        (true, false, true) => "   │     └─",
+                        (true, false, false) => "   │     ├─",
+                        (false, true, true) => "│        └─",
+                        (false, true, false) => "│        ├─",
+                        (false, false, true) => "│  │     └─",
+                        (false, false, false) => "│  │     ├─",
                     };
 
                     let var_line = Self::format_variable_line(var);
 
                     result.push_str(&Self::wrap_long_line(
-                        &format!("{} {}", item_prefix, var_line),
+                        &format!("{item_prefix} {var_line}"),
                         80,
-                        &item_prefix,
+                        item_prefix,
                     ));
                 }
             }
@@ -300,20 +241,19 @@ impl ModuleDebugInfo {
             .cloned()
             .unwrap_or_else(|| "unknown".to_string());
 
+        let name = &var.name;
         if var.location_description.is_empty() || var.location_description == "None" {
-            format!("{} ({})", var.name, type_display)
+            format!("{name} ({type_display})")
         } else {
-            format!(
-                "{} ({}) = {}",
-                var.name, type_display, var.location_description
-            )
+            let location = &var.location_description;
+            format!("{name} ({type_display}) = {location}")
         }
     }
 
     /// Wrap long lines with proper indentation
     fn wrap_long_line(text: &str, max_width: usize, indent: &str) -> String {
         if text.len() <= max_width {
-            format!("{}\n", text)
+            format!("{text}\n")
         } else {
             let mut result = String::new();
             let mut current_line = text.to_string();
@@ -323,16 +263,17 @@ impl ModuleDebugInfo {
                     .rfind(' ')
                     .unwrap_or(max_width.saturating_sub(10));
                 let (first_part, rest) = current_line.split_at(break_point);
-                result.push_str(&format!("{}\n", first_part));
+                result.push_str(&format!("{first_part}\n"));
 
                 // Create continuation line with proper indentation
                 let continuation_indent =
                     format!("{}   ", indent.replace("├─", "│ ").replace("└─", "  "));
-                current_line = format!("{}{}", continuation_indent, rest.trim());
+                let trimmed_rest = rest.trim();
+                current_line = format!("{continuation_indent}{trimmed_rest}");
             }
 
             if !current_line.trim().is_empty() {
-                result.push_str(&format!("{}\n", current_line));
+                result.push_str(&format!("{current_line}\n"));
             }
 
             result
@@ -600,7 +541,7 @@ impl TraceDetailInfo {
             self.target_display,
             binary_name,
             self.pc,
-            self.status.to_string(),
+            self.status,
             self.duration
         )
     }
@@ -687,12 +628,8 @@ impl RuntimeStatus {
                 pc,
             } => {
                 // Header line
-                let mut result = format!(
-                    "🔎 Trace [{}] {} {}\n",
-                    trace_id,
-                    status.to_emoji(),
-                    status.to_string()
-                );
+                let mut result =
+                    format!("🔎 Trace [{}] {} {}\n", trace_id, status.to_emoji(), status);
 
                 // Collect fields for aligned key-value formatting
                 let binary_name = std::path::Path::new(binary)
@@ -703,7 +640,7 @@ impl RuntimeStatus {
                 let mut fields: Vec<(&str, String)> = Vec::new();
                 fields.push(("🎯 Target", target.clone()));
                 fields.push(("📦 Binary", binary.clone()));
-                fields.push(("📍 Address", format!("{}+0x{:x}", binary_name, pc)));
+                fields.push(("📍 Address", format!("{binary_name}+0x{pc:x}")));
                 if let Some(pid_val) = pid {
                     fields.push(("🏷️ PID", pid_val.to_string()));
                 }
@@ -718,7 +655,7 @@ impl RuntimeStatus {
                     let key_width = key.width();
                     let pad = max_key_width.saturating_sub(key_width);
                     let spaces = " ".repeat(pad);
-                    result.push_str(&format!("  {}{}: {}\n", key, spaces, value));
+                    result.push_str(&format!("  {key}{spaces}: {value}\n"));
                 }
 
                 Some(result)

@@ -86,10 +86,6 @@ impl SourceRenderer {
                 };
 
                 // Calculate available width for content dynamically
-                const LINE_NUMBER_WIDTH: u16 = 5; // "1234 " format
-                const BORDER_WIDTH: u16 = 2; // left and right borders
-                let available_width = area.width.saturating_sub(LINE_NUMBER_WIDTH + BORDER_WIDTH);
-                let max_visible_width = available_width as usize;
 
                 // Pure vim-style display - no truncation, just show what fits
                 // Horizontal scrolling is already applied above
@@ -102,7 +98,7 @@ impl SourceRenderer {
                 let final_spans =
                     Self::apply_search_overlay(&display_line, highlighted_spans, i, state);
 
-                let mut spans = vec![Span::styled(format!("{:4} ", line_num), line_number_style)];
+                let mut spans = vec![Span::styled(format!("{line_num:4} "), line_number_style)];
                 spans.extend(final_spans);
 
                 ListItem::new(Line::from(spans))
@@ -116,7 +112,7 @@ impl SourceRenderer {
         };
 
         let title = match &state.file_path {
-            Some(path) => format!("Source Code - {}", path),
+            Some(path) => format!("Source Code - {path}"),
             None => "Source Code".to_string(),
         };
 
@@ -228,7 +224,7 @@ impl SourceRenderer {
             };
 
             // Create display text with safe truncation
-            let full_text = format!("{} {}", icon, path);
+            let full_text = format!("{icon} {path}");
             let max_width = (area.width.saturating_sub(4)) as usize;
             let display_text = Self::truncate_text(&full_text, max_width);
 
@@ -284,14 +280,14 @@ impl SourceRenderer {
 
         if !hint_text.is_empty() {
             spans.push(Span::styled(
-                format!(" ({})", hint_text),
+                format!(" ({hint_text})"),
                 Style::default().fg(Color::Cyan).bg(Color::Rgb(30, 30, 30)),
             ));
         }
 
         let text = ratatui::text::Text::from(Line::from(spans));
         let full_text = if !hint_text.is_empty() {
-            format!("{} ({})", display_text, hint_text)
+            format!("{display_text} ({hint_text})")
         } else {
             display_text
         };

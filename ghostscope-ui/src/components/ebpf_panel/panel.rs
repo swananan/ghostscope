@@ -54,3 +54,9 @@ impl EbpfPanelHandler {
         actions
     }
 }
+
+impl Default for EbpfPanelHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}

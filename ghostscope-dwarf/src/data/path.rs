@@ -10,9 +10,7 @@ pub(crate) fn directory_from_index<T: AsRef<str>>(
     let resolve_relative = |entry: &str| {
         if entry.is_empty() {
             comp_dir.trim().to_string()
-        } else if Path::new(entry).is_absolute() {
-            entry.to_string()
-        } else if comp_dir.trim().is_empty() {
+        } else if Path::new(entry).is_absolute() || comp_dir.trim().is_empty() {
             entry.to_string()
         } else {
             join_paths(comp_dir.trim(), entry)

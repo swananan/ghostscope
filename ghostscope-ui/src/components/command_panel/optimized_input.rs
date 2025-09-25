@@ -1,6 +1,5 @@
 use crate::action::{Action, CursorDirection};
 use crate::model::panel_state::{CommandPanelState, InputState, InteractionMode, JkEscapeState};
-use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::crossterm::event::KeyEvent;
 use std::time::Instant;
 
@@ -373,12 +372,9 @@ impl OptimizedInputHandler {
         }
 
         // Current input line
-        if matches!(
-            state.input_state,
-            crate::model::panel_state::InputState::Ready
-        ) {
+        if matches!(state.input_state, InputState::Ready) {
             let prompt = "(ghostscope) ";
-            let input_line = format!("{}{}", prompt, state.input_text);
+            let input_line = format!("{prompt}{input_text}", input_text = state.input_text);
             display_lines.push(input_line);
         }
 
@@ -517,7 +513,7 @@ impl OptimizedInputHandler {
                     let chars: Vec<char> = state.input_text.chars().collect();
                     let before: String = chars[..state.cursor_position].iter().collect();
                     let after: String = chars[state.cursor_position + 1..].iter().collect();
-                    state.input_text = format!("{}{}", before, after);
+                    state.input_text = format!("{before}{after}");
                 }
                 Vec::new()
             }
@@ -534,7 +530,7 @@ impl OptimizedInputHandler {
                             let chars: Vec<char> = line.chars().collect();
                             let before: String = chars[..cache.cursor_col].iter().collect();
                             let after: String = chars[cache.cursor_col + 1..].iter().collect();
-                            cache.lines[cache.cursor_line] = format!("{}{}", before, after);
+                            cache.lines[cache.cursor_line] = format!("{before}{after}");
                         }
                     }
                 }
@@ -715,8 +711,8 @@ impl OptimizedInputHandler {
         if state.command_cursor_line + 1 < total_lines {
             if let Some(content) = self.get_line_content_at_cursor(state) {
                 // Extract command part if it's a command line (remove prompt)
-                if content.starts_with("(ghostscope) ") {
-                    state.input_text = content[13..].to_string(); // "(ghostscope) ".len() = 13
+                if let Some(stripped) = content.strip_prefix("(ghostscope) ") {
+                    state.input_text = stripped.to_string(); // "(ghostscope) ".len() = 13
                 } else {
                     // For response lines, copy as-is (user might want to edit it as a command)
                     state.input_text = content;

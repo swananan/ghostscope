@@ -2,43 +2,28 @@
 //! This version actually parses DWARF DIEs instead of returning hardcoded data
 
 use crate::{
-    core::{FunctionInfo, Result, VariableInfo},
-    parser::{DetailedParser, RangeExtractor, VariableWithEvaluation},
+    core::Result,
+    parser::{
+        detailed_parser::VariableCollectionRequest, DetailedParser, RangeExtractor,
+        VariableWithEvaluation,
+    },
 };
-use gimli::{EndianSlice, LittleEndian, UnitOffset};
-use std::collections::HashMap;
-use std::time::Instant;
+use gimli::{EndianSlice, LittleEndian};
 use tracing::{debug, info};
-
-/// Cached DIE information
-#[derive(Debug, Clone)]
-pub struct CachedDIE {
-    pub variable_info: Option<VariableInfo>,
-    pub function_info: Option<FunctionInfo>,
-    pub type_ref: Option<UnitOffset>,
-    pub cached_at: Instant,
-}
 
 /// Real on-demand DWARF resolver
 #[derive(Debug)]
 pub struct OnDemandResolver {
     dwarf: gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
-    base_addresses: gimli::BaseAddresses,
-    die_cache: HashMap<UnitOffset, CachedDIE>,
     detailed_parser: DetailedParser,
 }
 
 impl OnDemandResolver {
     /// Create new on-demand resolver
-    pub fn new(
-        dwarf: gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
-        base_addresses: gimli::BaseAddresses,
-    ) -> Self {
+    pub fn new(dwarf: gimli::Dwarf<EndianSlice<'static, LittleEndian>>) -> Self {
         let detailed_parser = DetailedParser::new();
         Self {
             dwarf,
-            base_addresses,
-            die_cache: HashMap::new(),
             detailed_parser,
         }
     }
@@ -90,13 +75,15 @@ impl OnDemandResolver {
 
                     // Now traverse only this function's children
                     self.detailed_parser.collect_variables_in_function(
-                        entry,
-                        &unit,
-                        &self.dwarf,
-                        address,
-                        &mut variables,
-                        0, // Start at scope depth 0 for the function
-                        get_cfa,
+                        VariableCollectionRequest {
+                            parent_entry: entry,
+                            unit: &unit,
+                            dwarf: &self.dwarf,
+                            address,
+                            variables: &mut variables,
+                            scope_depth: 0, // Start at scope depth 0 for the function
+                            get_cfa,
+                        },
                     )?;
 
                     // We found our function, no need to continue
@@ -122,47 +109,8 @@ impl OnDemandResolver {
         Ok(variables)
     }
 
-    /// Legacy resolve function (for compatibility)
-    pub fn resolve_variable_at_address(
-        &mut self,
-        address: u64,
-        var_name: &str,
-        die_offset: UnitOffset,
-    ) -> Option<VariableInfo> {
-        // Check cache first
-        if let Some(cached) = self.die_cache.get(&die_offset) {
-            if let Some(var_info) = &cached.variable_info {
-                if var_info.name == var_name {
-                    debug!(
-                        "Cache hit for variable '{}' at address {:#x}",
-                        var_name, address
-                    );
-                    return Some(var_info.clone());
-                }
-            }
-        }
-
-        // For compatibility, return a basic variable info
-        Some(VariableInfo {
-            name: var_name.to_string(),
-            type_name: "unknown".to_string(),
-            location: None,
-            scope_start: None,
-            scope_end: None,
-        })
-    }
-
     /// Get cache statistics
     pub fn get_cache_stats(&self) -> (usize, usize) {
-        (self.die_cache.len(), self.detailed_parser.get_cache_stats())
-    }
-
-    /// Clear old cache entries
-    pub fn cleanup_cache(&mut self, max_age_secs: u64) {
-        let now = Instant::now();
-        let max_age = std::time::Duration::from_secs(max_age_secs);
-
-        self.die_cache
-            .retain(|_, cached| now.duration_since(cached.cached_at) < max_age);
+        (0, self.detailed_parser.get_cache_stats())
     }
 }

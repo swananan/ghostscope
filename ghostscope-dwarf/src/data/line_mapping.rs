@@ -17,76 +17,14 @@ pub struct LineMappingTable {
     /// Basename to full paths mapping for flexible path matching
     /// e.g., "nginx.c" → ["/home/user/nginx/src/core/nginx.c", ...]
     basename_to_paths: HashMap<String, HashSet<String>>,
-
-    /// Legacy file_index mapping (kept for compatibility)
-    line_to_addresses_map: HashMap<(u64, u64), Vec<u64>>,
-
-    /// Total line entries count for statistics
-    total_entries: usize,
 }
 
 impl LineMappingTable {
-    /// Create new empty line mapping table
-    pub fn new() -> Self {
-        Self {
-            address_to_line_map: BTreeMap::new(),
-            path_line_to_addresses: HashMap::new(),
-            basename_to_paths: HashMap::new(),
-            line_to_addresses_map: HashMap::new(),
-            total_entries: 0,
-        }
-    }
-
-    /// Create from pre-built line entries map
-    pub fn from_btree_map(entries: BTreeMap<u64, LineEntry>) -> Self {
-        let total_entries = entries.len();
-        let mut path_line_to_addresses = HashMap::new();
-        let mut basename_to_paths = HashMap::new();
-        let mut line_to_addresses_map = HashMap::new();
-
-        // Build reverse mappings
-        for (address, entry) in &entries {
-            // Path-based mapping
-            let path_key = (entry.file_path.clone(), entry.line);
-            path_line_to_addresses
-                .entry(path_key)
-                .or_insert_with(Vec::new)
-                .push(*address);
-
-            // Basename mapping
-            if let Some(basename) = Path::new(&entry.file_path)
-                .file_name()
-                .and_then(|n| n.to_str())
-            {
-                basename_to_paths
-                    .entry(basename.to_string())
-                    .or_insert_with(HashSet::new)
-                    .insert(entry.file_path.clone());
-            }
-
-            // Legacy file_index mapping
-            let index_key = (entry.file_index, entry.line);
-            line_to_addresses_map
-                .entry(index_key)
-                .or_insert_with(Vec::new)
-                .push(*address);
-        }
-
-        Self {
-            address_to_line_map: entries,
-            path_line_to_addresses,
-            basename_to_paths,
-            line_to_addresses_map,
-            total_entries,
-        }
-    }
-
     /// Create from vector of line entries
     pub fn from_entries(entries: Vec<LineEntry>) -> Self {
         let mut address_to_line_map = BTreeMap::new();
         let mut path_line_to_addresses = HashMap::new();
         let mut basename_to_paths = HashMap::new();
-        let mut line_to_addresses_map = HashMap::new();
 
         for entry in &entries {
             address_to_line_map.insert(entry.address, entry.clone());
@@ -108,28 +46,13 @@ impl LineMappingTable {
                     .or_insert_with(HashSet::new)
                     .insert(entry.file_path.clone());
             }
-
-            // Legacy file_index mapping
-            let index_key = (entry.file_index, entry.line);
-            line_to_addresses_map
-                .entry(index_key)
-                .or_insert_with(Vec::new)
-                .push(entry.address);
         }
 
-        let total_entries = entries.len();
         Self {
             address_to_line_map,
             path_line_to_addresses,
             basename_to_paths,
-            line_to_addresses_map,
-            total_entries,
         }
-    }
-
-    /// High-performance line lookup with exact address match
-    pub fn lookup_line_exact(&self, address: u64) -> Option<&LineEntry> {
-        self.address_to_line_map.get(&address)
     }
 
     /// Find best matching line (closest address <= target address)
@@ -186,36 +109,6 @@ impl LineMappingTable {
         }
 
         matches
-    }
-
-    /// Get total line entry count
-    pub fn total_entries(&self) -> usize {
-        self.total_entries
-    }
-
-    /// Get address range covered
-    pub fn address_range(&self) -> Option<(u64, u64)> {
-        if self.address_to_line_map.is_empty() {
-            return None;
-        }
-
-        let min_addr = *self.address_to_line_map.keys().next()?;
-        let max_addr = *self.address_to_line_map.keys().next_back()?;
-        Some((min_addr, max_addr))
-    }
-
-    /// Check if table is empty
-    pub fn is_empty(&self) -> bool {
-        self.address_to_line_map.is_empty()
-    }
-
-    /// Lookup addresses by file index and line number (legacy)
-    /// Returns all addresses that correspond to the given source line
-    pub fn lookup_addresses_by_line(&self, file_index: u64, line_number: u64) -> Vec<u64> {
-        self.line_to_addresses_map
-            .get(&(file_index, line_number))
-            .cloned()
-            .unwrap_or_default()
     }
 
     /// Lookup addresses by file path and line number

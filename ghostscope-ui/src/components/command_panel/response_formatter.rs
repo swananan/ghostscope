@@ -5,7 +5,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Paragraph},
+    widgets::Paragraph,
     Frame,
 };
 use unicode_width::UnicodeWidthChar;
@@ -41,7 +41,11 @@ impl ResponseFormatter {
         // Add history items
         for (index, item) in state.command_history.iter().enumerate() {
             // Add command line
-            let command_line = format!("{}{}", item.prompt, item.command);
+            let command_line = format!(
+                "{prompt}{command}",
+                prompt = item.prompt,
+                command = item.command
+            );
             state.static_lines.push(StaticTextLine {
                 content: command_line,
                 line_type: LineType::Command,
@@ -68,7 +72,7 @@ impl ResponseFormatter {
         // Add current input line if should show prompt
         if Self::should_show_input_prompt(state) {
             let prompt = Self::get_prompt(state);
-            let input_line = format!("{}{}", prompt, state.input_text);
+            let input_line = format!("{prompt}{input}", input = state.input_text);
             state.static_lines.push(StaticTextLine {
                 content: input_line,
                 line_type: LineType::CurrentInput,
@@ -132,16 +136,10 @@ impl ResponseFormatter {
 
     /// Format current input line with cursor indication
     fn format_current_input_line(
-        state: &CommandPanelState,
+        _state: &CommandPanelState,
         content: &str,
         width: usize,
     ) -> Vec<Line<'static>> {
-        let prompt = Self::get_prompt(state);
-        let prompt_len = prompt.len();
-
-        // Calculate cursor position within the line
-        let cursor_pos = prompt_len + state.cursor_position;
-
         let wrapped_lines = Self::wrap_text(content, width);
 
         // For now, just return the styled line without cursor indication
@@ -334,16 +332,15 @@ impl ResponseFormatter {
         const MAX_FILES_PER_MODULE: usize = 50;
 
         let total_files: usize = groups.iter().map(|g| g.files.len()).sum();
+        let folder_icon = if use_ascii {
+            UISymbols::FILE_FOLDER_ASCII
+        } else {
+            UISymbols::FILE_FOLDER
+        };
         let mut response = format!(
-            "{} {} ({} modules, {} files):\n\n",
-            if use_ascii {
-                UISymbols::FILE_FOLDER_ASCII
-            } else {
-                UISymbols::FILE_FOLDER
-            },
+            "{folder_icon} {} ({} modules, {total_files} files):\n\n",
             UIStrings::SOURCE_FILES_HEADER,
-            groups.len(),
-            total_files
+            groups.len()
         );
 
         if groups.is_empty() {
@@ -354,8 +351,7 @@ impl ResponseFormatter {
         // For large datasets, show summary mode
         if total_files > MAX_FILES_DETAILED {
             response.push_str(&format!(
-                "⚠️  Large dataset detected ({} files). Showing summary view.\n\n",
-                total_files
+                "⚠️  Large dataset detected ({total_files} files). Showing summary view.\n\n"
             ));
             Self::format_file_summary(groups, use_ascii, &mut response);
         } else {
@@ -383,9 +379,9 @@ impl ResponseFormatter {
 
         for group in groups.iter().take(10) {
             // Show top 10 modules
+            let module_icon = if use_ascii { "+" } else { "📦" };
             response.push_str(&format!(
-                "{} {} ({} files)\n",
-                if use_ascii { "+" } else { "📦" },
+                "{module_icon} {} ({} files)\n",
                 group.module_path,
                 group.files.len()
             ));
@@ -411,7 +407,7 @@ impl ResponseFormatter {
 
         for (ext, count) in sorted_types.into_iter().take(10) {
             let icon = UISymbols::get_file_icon(&ext, use_ascii);
-            response.push_str(&format!("  {} .{}: {} files\n", icon, ext, count));
+            response.push_str(&format!("  {icon} .{ext}: {count} files\n"));
         }
 
         response.push_str("\n💡 Use 'o' key in source panel to search for specific files.\n");
@@ -423,13 +419,13 @@ impl ResponseFormatter {
         use_ascii: bool,
         response: &mut String,
     ) {
+        let package_icon = if use_ascii {
+            UISymbols::FILE_PACKAGE_ASCII
+        } else {
+            UISymbols::FILE_PACKAGE
+        };
         response.push_str(&format!(
-            "{} {} ({} files - showing summary)\n",
-            if use_ascii {
-                UISymbols::FILE_PACKAGE_ASCII
-            } else {
-                UISymbols::FILE_PACKAGE
-            },
+            "{package_icon} {} ({} files - showing summary)\n",
             group.module_path,
             group.files.len()
         ));
@@ -444,7 +440,7 @@ impl ResponseFormatter {
         for (i, (dir, count)) in dir_map.iter().enumerate().take(5) {
             let is_last = i == 4 || i == dir_map.len() - 1;
             let prefix = if is_last { "  └─" } else { "  ├─" };
-            response.push_str(&format!("{} {} ({} files)\n", prefix, dir, count));
+            response.push_str(&format!("{prefix} {dir} ({count} files)\n"));
         }
 
         if dir_map.len() > 5 {
@@ -464,15 +460,14 @@ impl ResponseFormatter {
         response: &mut String,
     ) {
         let group_file_count = group.files.len();
+        let package_icon = if use_ascii {
+            UISymbols::FILE_PACKAGE_ASCII
+        } else {
+            UISymbols::FILE_PACKAGE
+        };
         response.push_str(&format!(
-            "{} {} ({} files)\n",
-            if use_ascii {
-                UISymbols::FILE_PACKAGE_ASCII
-            } else {
-                UISymbols::FILE_PACKAGE
-            },
-            group.module_path,
-            group_file_count
+            "{package_icon} {} ({group_file_count} files)\n",
+            group.module_path
         ));
 
         if group.files.is_empty() {
@@ -495,19 +490,12 @@ impl ResponseFormatter {
                 } else {
                     UISymbols::NAV_TREE_LAST
                 }
+            } else if use_ascii {
+                UISymbols::NAV_TREE_BRANCH_ASCII
             } else {
-                if use_ascii {
-                    UISymbols::NAV_TREE_BRANCH_ASCII
-                } else {
-                    UISymbols::NAV_TREE_BRANCH
-                }
+                UISymbols::NAV_TREE_BRANCH
             };
-            response.push_str(&format!(
-                "  {} {} ({} files)\n",
-                dir_prefix,
-                dir,
-                files.len()
-            ));
+            response.push_str(&format!("  {dir_prefix} {dir} ({} files)\n", files.len()));
 
             for (fidx, file) in files.iter().enumerate() {
                 let last_file = fidx + 1 == files.len();
@@ -529,7 +517,8 @@ impl ResponseFormatter {
                     .unwrap_or("")
                     .to_ascii_lowercase();
                 let icon = UISymbols::get_file_icon(&ext, use_ascii);
-                response.push_str(&format!("{} {} {}\n", file_prefix, icon, file.path));
+                let path = &file.path;
+                response.push_str(&format!("{file_prefix} {icon} {path}\n"));
             }
         }
 
@@ -571,12 +560,13 @@ impl ResponseFormatter {
                 ));
 
                 if !lib.debug_info_available {
+                    let library_name = lib
+                        .library_path
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(lib.library_path.as_str());
                     response.push_str(&format!(
-                        "⚠️  Warning: {} {}\n",
-                        lib.library_path
-                            .split('/')
-                            .last()
-                            .unwrap_or(&lib.library_path),
+                        "⚠️  Warning: {library_name} {}\n",
                         UIStrings::NO_DEBUG_INFO_WARNING
                     ));
                 }
