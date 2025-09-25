@@ -6,8 +6,8 @@
 
 mod common;
 
-use common::{init, FIXTURES};
 use common::OptimizationLevel;
+use common::{init, FIXTURES};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,7 +35,12 @@ async fn run_ghostscope_optimized(
 
     // Get workspace root and ghostscope binary path
     let workspace_root = std::env::var("CARGO_MANIFEST_DIR")
-        .map(|dir| std::path::PathBuf::from(dir).parent().unwrap().to_path_buf())
+        .map(|dir| {
+            std::path::PathBuf::from(dir)
+                .parent()
+                .unwrap()
+                .to_path_buf()
+        })
         .unwrap_or_else(|_| std::path::PathBuf::from("."));
     let ghostscope_binary = workspace_root.join("target/debug/ghostscope");
 
@@ -66,8 +71,13 @@ async fn run_ghostscope_optimized(
 
     let read_task = async {
         // Read both stdout and stderr
-        for _ in 0..50 { // Read up to 50 lines
-            let stdout_result = timeout(Duration::from_millis(100), stdout_reader.read_line(&mut line)).await;
+        for _ in 0..50 {
+            // Read up to 50 lines
+            let stdout_result = timeout(
+                Duration::from_millis(100),
+                stdout_reader.read_line(&mut line),
+            )
+            .await;
             if let Ok(Ok(bytes_read)) = stdout_result {
                 if bytes_read > 0 {
                     output.push_str(&line);
@@ -77,7 +87,11 @@ async fn run_ghostscope_optimized(
 
             // Check for error output as well
             line.clear();
-            let stderr_result = timeout(Duration::from_millis(50), stderr_reader.read_line(&mut line)).await;
+            let stderr_result = timeout(
+                Duration::from_millis(50),
+                stderr_reader.read_line(&mut line),
+            )
+            .await;
             if let Ok(Ok(bytes_read)) = stderr_result {
                 if bytes_read > 0 {
                     error_output.push_str(&line);
@@ -122,13 +136,10 @@ async fn test_optimized_function_parameters() -> anyhow::Result<()> {
     init();
 
     // Test O0 and O2 optimization levels
-    let opt_levels = [
-        OptimizationLevel::Debug,
-        OptimizationLevel::O2,
-    ];
+    let opt_levels = [OptimizationLevel::Debug, OptimizationLevel::O2];
 
     for opt_level in &opt_levels {
-        let binary_path = FIXTURES.get_test_binary_with_opt("test_program", *opt_level)?;
+        let binary_path = FIXTURES.get_test_binary_with_opt("sample_program", *opt_level)?;
 
         let script = r#"
             trace_function("calculate_something");
@@ -140,9 +151,15 @@ async fn test_optimized_function_parameters() -> anyhow::Result<()> {
         // Function parameters should be available even in optimized builds
         // (though we may need to handle cases where they're optimized away)
         if !output.is_empty() && !output.contains("Error") {
-            println!("✓ {} - Function parameters accessible", opt_level.description());
+            println!(
+                "✓ {} - Function parameters accessible",
+                opt_level.description()
+            );
         } else if output.contains("variable not found") || output.contains("optimized") {
-            println!("○ {} - Variables optimized away (expected)", opt_level.description());
+            println!(
+                "○ {} - Variables optimized away (expected)",
+                opt_level.description()
+            );
         } else {
             println!("? {} - Unexpected output format", opt_level.description());
         }
@@ -158,7 +175,7 @@ async fn test_optimized_return_value_tracing() -> anyhow::Result<()> {
     let opt_levels = [OptimizationLevel::Debug, OptimizationLevel::O2];
 
     for opt_level in &opt_levels {
-        let binary_path = FIXTURES.get_test_binary_with_opt("test_program", *opt_level)?;
+        let binary_path = FIXTURES.get_test_binary_with_opt("sample_program", *opt_level)?;
 
         let script = r#"
             trace_function("calculate_something");
@@ -171,7 +188,10 @@ async fn test_optimized_return_value_tracing() -> anyhow::Result<()> {
         if !output.is_empty() && !output.contains("Error") {
             println!("✓ {} - Return value tracing works", opt_level.description());
         } else {
-            println!("? {} - Return value tracing issues", opt_level.description());
+            println!(
+                "? {} - Return value tracing issues",
+                opt_level.description()
+            );
         }
     }
 
@@ -183,20 +203,26 @@ async fn test_dwarf_parsing_robustness() -> anyhow::Result<()> {
     init();
 
     // Test DWARF parsing with O0 and O2 optimization levels
-    let opt_levels = [
-        OptimizationLevel::Debug,
-        OptimizationLevel::O2,
-    ];
+    let opt_levels = [OptimizationLevel::Debug, OptimizationLevel::O2];
 
     for opt_level in &opt_levels {
-        let binary_path = FIXTURES.get_test_binary_with_opt("test_program", *opt_level)?;
+        let binary_path = FIXTURES.get_test_binary_with_opt("sample_program", *opt_level)?;
 
-        println!("Testing DWARF parsing for {}: {}", opt_level.description(), binary_path.display());
+        println!(
+            "Testing DWARF parsing for {}: {}",
+            opt_level.description(),
+            binary_path.display()
+        );
 
         // Use dwarf-tool to verify DWARF information is parseable
         // Get the dwarf-tool path relative to workspace root
         let workspace_root = std::env::var("CARGO_MANIFEST_DIR")
-            .map(|dir| std::path::PathBuf::from(dir).parent().unwrap().to_path_buf())
+            .map(|dir| {
+                std::path::PathBuf::from(dir)
+                    .parent()
+                    .unwrap()
+                    .to_path_buf()
+            })
             .unwrap_or_else(|_| std::path::PathBuf::from("."));
         let dwarf_tool_path = workspace_root.join("target/debug/dwarf-tool");
 
@@ -214,11 +240,18 @@ async fn test_dwarf_parsing_robustness() -> anyhow::Result<()> {
             if stdout.contains("function_name") {
                 println!("✓ {} - DWARF parsing successful", opt_level.description());
             } else {
-                println!("? {} - DWARF parsing returned unexpected format", opt_level.description());
+                println!(
+                    "? {} - DWARF parsing returned unexpected format",
+                    opt_level.description()
+                );
             }
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            println!("✗ {} - DWARF parsing failed: {}", opt_level.description(), stderr.trim());
+            println!(
+                "✗ {} - DWARF parsing failed: {}",
+                opt_level.description(),
+                stderr.trim()
+            );
         }
     }
 
@@ -237,22 +270,21 @@ async fn test_optimization_level_comparison() -> anyhow::Result<()> {
     "#;
 
     // Compare different optimization levels
-    let levels = [
-        OptimizationLevel::Debug,
-        OptimizationLevel::O2,
-    ];
+    let levels = [OptimizationLevel::Debug, OptimizationLevel::O2];
 
     for opt_level in &levels {
-        let binary_path = FIXTURES.get_test_binary_with_opt("test_program", *opt_level)?;
+        let binary_path = FIXTURES.get_test_binary_with_opt("sample_program", *opt_level)?;
 
         let start = std::time::Instant::now();
         let output = run_ghostscope_optimized(&binary_path, script, *opt_level).await?;
         let duration = start.elapsed();
 
-        println!("{}: {} characters output, took {:?}",
-                opt_level.description(),
-                output.len(),
-                duration);
+        println!(
+            "{}: {} characters output, took {:?}",
+            opt_level.description(),
+            output.len(),
+            duration
+        );
     }
 
     Ok(())
@@ -263,7 +295,7 @@ async fn test_optimized_simple_print() -> anyhow::Result<()> {
     init();
 
     // Simple test that should work regardless of optimization level
-    let binary_path = FIXTURES.get_test_binary_with_opt("test_program", OptimizationLevel::O2)?;
+    let binary_path = FIXTURES.get_test_binary_with_opt("sample_program", OptimizationLevel::O2)?;
 
     let script = r#"
         trace_function("main");
@@ -278,7 +310,9 @@ async fn test_optimized_simple_print() -> anyhow::Result<()> {
         println!("✓ Optimized (O2) - Basic tracing functional");
         println!("Output length: {} characters", output.len());
     } else {
-        println!("○ Optimized (O2) - No output received (this may be normal for optimized binaries)");
+        println!(
+            "○ Optimized (O2) - No output received (this may be normal for optimized binaries)"
+        );
         // Don't fail the test if there's simply no output - this can be expected with optimization
     }
 

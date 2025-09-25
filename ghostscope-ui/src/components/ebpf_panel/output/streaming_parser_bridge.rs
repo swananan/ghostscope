@@ -73,7 +73,7 @@ mod tests {
         let string_table = StringTable::new();
 
         // Create test segment data with valid TraceEventHeader
-        use ghostscope_protocol::{TraceEventHeader, consts};
+        use ghostscope_protocol::{consts, TraceEventHeader};
         let test_header = TraceEventHeader {
             magic: consts::MAGIC,
         };

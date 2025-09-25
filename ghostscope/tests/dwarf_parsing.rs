@@ -9,10 +9,19 @@ use serde_json::Value;
 use tokio::process::Command as AsyncCommand;
 
 /// Run dwarf-tool command and return JSON output
-async fn run_dwarf_tool_json(binary_path: &std::path::Path, subcommand: &str, args: &[&str]) -> anyhow::Result<Value> {
+async fn run_dwarf_tool_json(
+    binary_path: &std::path::Path,
+    subcommand: &str,
+    args: &[&str],
+) -> anyhow::Result<Value> {
     // Get the dwarf-tool path relative to workspace root
     let workspace_root = std::env::var("CARGO_MANIFEST_DIR")
-        .map(|dir| std::path::PathBuf::from(dir).parent().unwrap().to_path_buf())
+        .map(|dir| {
+            std::path::PathBuf::from(dir)
+                .parent()
+                .unwrap()
+                .to_path_buf()
+        })
         .unwrap_or_else(|_| std::path::PathBuf::from("."));
     let dwarf_tool_path = workspace_root.join("target/debug/dwarf-tool");
 
@@ -36,8 +45,11 @@ async fn run_dwarf_tool_json(binary_path: &std::path::Path, subcommand: &str, ar
     let json_start = stdout.find('{').or_else(|| stdout.find('[')).unwrap_or(0);
 
     // Extract JSON by finding lines starting from [ or {
-    let json_lines: Vec<&str> = stdout.lines()
-        .skip_while(|line| !line.trim_start().starts_with('[') && !line.trim_start().starts_with('{'))
+    let json_lines: Vec<&str> = stdout
+        .lines()
+        .skip_while(|line| {
+            !line.trim_start().starts_with('[') && !line.trim_start().starts_with('{')
+        })
         .collect();
 
     let json_candidate = if !json_lines.is_empty() {
@@ -48,16 +60,30 @@ async fn run_dwarf_tool_json(binary_path: &std::path::Path, subcommand: &str, ar
     };
 
     let json: Value = serde_json::from_str(&json_candidate).map_err(|e| {
-        anyhow::anyhow!("JSON parse error: {}. Candidate:\n{}\n\nFull output:\n{}", e, json_candidate, stdout)
+        anyhow::anyhow!(
+            "JSON parse error: {}. Candidate:\n{}\n\nFull output:\n{}",
+            e,
+            json_candidate,
+            stdout
+        )
     })?;
     Ok(json)
 }
 
 /// Run dwarf-tool command and return text output
-async fn run_dwarf_tool_text(binary_path: &std::path::Path, subcommand: &str, args: &[&str]) -> anyhow::Result<String> {
+async fn run_dwarf_tool_text(
+    binary_path: &std::path::Path,
+    subcommand: &str,
+    args: &[&str],
+) -> anyhow::Result<String> {
     // Get the dwarf-tool path relative to workspace root
     let workspace_root = std::env::var("CARGO_MANIFEST_DIR")
-        .map(|dir| std::path::PathBuf::from(dir).parent().unwrap().to_path_buf())
+        .map(|dir| {
+            std::path::PathBuf::from(dir)
+                .parent()
+                .unwrap()
+                .to_path_buf()
+        })
         .unwrap_or_else(|_| std::path::PathBuf::from("."));
     let dwarf_tool_path = workspace_root.join("target/debug/dwarf-tool");
 
@@ -81,9 +107,12 @@ async fn run_dwarf_tool_text(binary_path: &std::path::Path, subcommand: &str, ar
 async fn test_dwarf_tool_function_analysis() -> anyhow::Result<()> {
     init();
 
-    let binary_path = FIXTURES.get_test_binary("test_program")?;
+    let binary_path = FIXTURES.get_test_binary("sample_program")?;
 
-    println!("Testing dwarf-tool function analysis: {}", binary_path.display());
+    println!(
+        "Testing dwarf-tool function analysis: {}",
+        binary_path.display()
+    );
 
     // Test function command with JSON output - use main as function name
     let json = run_dwarf_tool_json(&binary_path, "function", &["main"]).await?;
@@ -117,26 +146,38 @@ async fn test_dwarf_tool_function_analysis() -> anyhow::Result<()> {
 async fn test_dwarf_tool_source_line_analysis() -> anyhow::Result<()> {
     init();
 
-    let binary_path = FIXTURES.get_test_binary("test_program")?;
+    let binary_path = FIXTURES.get_test_binary("sample_program")?;
 
-    println!("Testing dwarf-tool source-line analysis: {}", binary_path.display());
+    println!(
+        "Testing dwarf-tool source-line analysis: {}",
+        binary_path.display()
+    );
 
-    // Test source-line command with JSON output - use test_program.c:25
-    let json = run_dwarf_tool_json(&binary_path, "source-line", &["test_program.c:25"]).await?;
+    // Test source-line command with JSON output - use sample_program.c:25
+    let json = run_dwarf_tool_json(&binary_path, "source-line", &["sample_program.c:25"]).await?;
 
     // Verify JSON structure - source-line returns object with variables at that location
-    assert!(json.is_object(), "Source line analysis should return object");
+    assert!(
+        json.is_object(),
+        "Source line analysis should return object"
+    );
 
     // Check source location info
     if let Some(location) = json.get("location").and_then(|l| l.as_str()) {
-        assert!(location.contains("test_program.c"), "Should reference test_program.c");
+        assert!(
+            location.contains("sample_program.c"),
+            "Should reference sample_program.c"
+        );
         println!("✓ Found source location: {}", location);
     }
 
     // Check if we have modules with variables
     if let Some(modules) = json.get("modules").and_then(|m| m.as_array()) {
         if !modules.is_empty() {
-            println!("✓ Found {} modules with variables at source line", modules.len());
+            println!(
+                "✓ Found {} modules with variables at source line",
+                modules.len()
+            );
         } else {
             println!("No variables found at this specific source line (this is normal)");
         }
@@ -149,9 +190,12 @@ async fn test_dwarf_tool_source_line_analysis() -> anyhow::Result<()> {
 async fn test_dwarf_tool_modules_list() -> anyhow::Result<()> {
     init();
 
-    let binary_path = FIXTURES.get_test_binary("test_program")?;
+    let binary_path = FIXTURES.get_test_binary("sample_program")?;
 
-    println!("Testing dwarf-tool modules listing: {}", binary_path.display());
+    println!(
+        "Testing dwarf-tool modules listing: {}",
+        binary_path.display()
+    );
 
     // Test modules command with JSON output
     let json = run_dwarf_tool_json(&binary_path, "modules", &[]).await?;
@@ -162,18 +206,18 @@ async fn test_dwarf_tool_modules_list() -> anyhow::Result<()> {
     assert!(!modules.is_empty(), "Should find at least one module");
 
     // Look for our test program module
-    let mut found_test_program = false;
+    let mut found_sample_program = false;
     for module in modules {
         if let Some(path) = module.as_str() {
-            if path.contains("test_program") {
-                found_test_program = true;
+            if path.contains("sample_program") {
+                found_sample_program = true;
                 println!("✓ Found test program module: {}", path);
             }
         }
     }
 
     println!("Found {} modules total", modules.len());
-    assert!(found_test_program, "Should find test_program module");
+    assert!(found_sample_program, "Should find sample_program module");
 
     Ok(())
 }
@@ -182,9 +226,12 @@ async fn test_dwarf_tool_modules_list() -> anyhow::Result<()> {
 async fn test_dwarf_tool_source_files_list() -> anyhow::Result<()> {
     init();
 
-    let binary_path = FIXTURES.get_test_binary("test_program")?;
+    let binary_path = FIXTURES.get_test_binary("sample_program")?;
 
-    println!("Testing dwarf-tool source-files listing: {}", binary_path.display());
+    println!(
+        "Testing dwarf-tool source-files listing: {}",
+        binary_path.display()
+    );
 
     // Test source-files command with JSON output
     let json = run_dwarf_tool_json(&binary_path, "source-files", &[]).await?;
@@ -195,7 +242,7 @@ async fn test_dwarf_tool_source_files_list() -> anyhow::Result<()> {
     assert!(!modules.is_empty(), "Should find at least one module");
 
     // Look for our test source files in the module
-    let mut found_test_program_c = false;
+    let mut found_sample_program_c = false;
     let mut found_test_lib_c = false;
     let mut _found_test_lib_h = false;
     let mut total_files = 0;
@@ -205,9 +252,9 @@ async fn test_dwarf_tool_source_files_list() -> anyhow::Result<()> {
             total_files += files.len();
             for file in files {
                 if let Some(path) = file.get("full_path").and_then(|p| p.as_str()) {
-                    if path.contains("test_program.c") {
-                        found_test_program_c = true;
-                        println!("✓ Found source file: test_program.c");
+                    if path.contains("sample_program.c") {
+                        found_sample_program_c = true;
+                        println!("✓ Found source file: sample_program.c");
                     } else if path.contains("test_lib.c") {
                         found_test_lib_c = true;
                         println!("✓ Found source file: test_lib.c");
@@ -222,7 +269,7 @@ async fn test_dwarf_tool_source_files_list() -> anyhow::Result<()> {
 
     println!("Found {} source files total", total_files);
     assert!(
-        found_test_program_c || found_test_lib_c,
+        found_sample_program_c || found_test_lib_c,
         "Should find at least one of our test source files"
     );
 
@@ -233,9 +280,12 @@ async fn test_dwarf_tool_source_files_list() -> anyhow::Result<()> {
 async fn test_dwarf_tool_module_address_analysis() -> anyhow::Result<()> {
     init();
 
-    let binary_path = FIXTURES.get_test_binary("test_program")?;
+    let binary_path = FIXTURES.get_test_binary("sample_program")?;
 
-    println!("Testing dwarf-tool module-addr analysis: {}", binary_path.display());
+    println!(
+        "Testing dwarf-tool module-addr analysis: {}",
+        binary_path.display()
+    );
 
     // First get a valid address from function analysis
     let functions_json = run_dwarf_tool_json(&binary_path, "function", &["main"]).await?;
@@ -255,11 +305,17 @@ async fn test_dwarf_tool_module_address_analysis() -> anyhow::Result<()> {
         }
     }
 
-    let address = test_address.ok_or_else(|| anyhow::anyhow!("Could not find main function address"))?;
+    let address =
+        test_address.ok_or_else(|| anyhow::anyhow!("Could not find main function address"))?;
     println!("Testing module-addr with address: {}", address);
 
     // Test module-addr command with JSON output
-    let json = run_dwarf_tool_json(&binary_path, "module-addr", &[binary_path.to_str().unwrap(), &address]).await?;
+    let json = run_dwarf_tool_json(
+        &binary_path,
+        "module-addr",
+        &[binary_path.to_str().unwrap(), &address],
+    )
+    .await?;
 
     // Verify we got module information for this address
     if let Some(module_name) = json.get("module").and_then(|m| m.as_str()) {
@@ -280,7 +336,12 @@ async fn test_dwarf_tool_error_handling() -> anyhow::Result<()> {
 
     // Get the dwarf-tool path relative to workspace root
     let workspace_root = std::env::var("CARGO_MANIFEST_DIR")
-        .map(|dir| std::path::PathBuf::from(dir).parent().unwrap().to_path_buf())
+        .map(|dir| {
+            std::path::PathBuf::from(dir)
+                .parent()
+                .unwrap()
+                .to_path_buf()
+        })
         .unwrap_or_else(|_| std::path::PathBuf::from("."));
     let dwarf_tool_path = workspace_root.join("target/debug/dwarf-tool");
 
@@ -290,13 +351,16 @@ async fn test_dwarf_tool_error_handling() -> anyhow::Result<()> {
         .output()
         .await?;
 
-    assert!(!result.status.success(), "Should fail with non-existent file");
+    assert!(
+        !result.status.success(),
+        "Should fail with non-existent file"
+    );
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(!stderr.is_empty(), "Should provide error message");
     println!("✓ Properly handles non-existent file: {}", stderr.trim());
 
     // Test with invalid address for module-addr
-    let binary_path = FIXTURES.get_test_binary("test_program")?;
+    let binary_path = FIXTURES.get_test_binary("sample_program")?;
     let result = AsyncCommand::new(&dwarf_tool_path)
         .args(&["module-addr", "0xdeadbeef", binary_path.to_str().unwrap()])
         .output()
@@ -312,20 +376,27 @@ async fn test_dwarf_tool_error_handling() -> anyhow::Result<()> {
 async fn test_dwarf_tool_text_output_format() -> anyhow::Result<()> {
     init();
 
-    let binary_path = FIXTURES.get_test_binary("test_program")?;
+    let binary_path = FIXTURES.get_test_binary("sample_program")?;
 
-    println!("Testing dwarf-tool text output format: {}", binary_path.display());
+    println!(
+        "Testing dwarf-tool text output format: {}",
+        binary_path.display()
+    );
 
     // Test function command without --json flag
     let output = run_dwarf_tool_text(&binary_path, "function", &["main"]).await?;
 
     assert!(!output.is_empty(), "Text output should not be empty");
-    assert!(output.contains("Function") || output.contains("main"),
-            "Text output should contain function information");
+    assert!(
+        output.contains("Function") || output.contains("main"),
+        "Text output should contain function information"
+    );
 
     println!("✓ Text output format works properly");
-    println!("Sample output (first 200 chars): {}",
-             &output.chars().take(200).collect::<String>());
+    println!(
+        "Sample output (first 200 chars): {}",
+        &output.chars().take(200).collect::<String>()
+    );
 
     Ok(())
 }

@@ -30,9 +30,12 @@ struct GlobalTestProcess {
 
 impl GlobalTestProcess {
     async fn start() -> anyhow::Result<Self> {
-        let binary_path = FIXTURES.get_test_binary("test_program")?;
+        let binary_path = FIXTURES.get_test_binary("sample_program")?;
 
-        println!("🚀 Starting global test_program: {}", binary_path.display());
+        println!(
+            "🚀 Starting global sample_program: {}",
+            binary_path.display()
+        );
 
         let child = Command::new(binary_path)
             .stdout(Stdio::null())
@@ -46,7 +49,7 @@ impl GlobalTestProcess {
         // Give it a moment to start
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        println!("✓ Started global test_program with PID: {}", pid);
+        println!("✓ Started global sample_program with PID: {}", pid);
 
         Ok(Self { child, pid })
     }
@@ -56,7 +59,7 @@ impl GlobalTestProcess {
     }
 
     async fn terminate(mut self) -> anyhow::Result<()> {
-        println!("🛑 Terminating global test_program (PID: {})", self.pid);
+        println!("🛑 Terminating global sample_program (PID: {})", self.pid);
 
         // Try graceful shutdown first
         let _ = self.child.kill().await;
@@ -64,14 +67,14 @@ impl GlobalTestProcess {
         // Wait for termination with timeout
         match timeout(Duration::from_secs(2), self.child.wait()).await {
             Ok(_) => {
-                println!("✓ Global test_program terminated gracefully");
+                println!("✓ Global sample_program terminated gracefully");
             }
             Err(_) => {
                 // Force kill if it doesn't respond
                 let _ = std::process::Command::new("kill")
                     .args(&["-KILL", &self.pid.to_string()])
                     .output();
-                println!("⚠️ Force killed global test_program");
+                println!("⚠️ Force killed global sample_program");
             }
         }
 
@@ -143,26 +146,26 @@ fn ensure_global_cleanup_registered() {
         extern "C" fn cleanup_on_exit() {
             println!("🧹 Global test cleanup: All tests finished, cleaning up...");
 
-            // Kill any remaining test_program processes
+            // Kill any remaining sample_program processes
             let _pkill_result = std::process::Command::new("pkill")
-                .args(&["-f", "test_program"])
+                .args(&["-f", "sample_program"])
                 .output();
 
-            // Clean up test_program build files
+            // Clean up sample_program build files
             let fixtures_path =
                 std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-            let test_program_dir = fixtures_path.join("test_program");
+            let sample_program_dir = fixtures_path.join("sample_program");
 
-            println!("🧹 Running make clean in test_program directory...");
+            println!("🧹 Running make clean in sample_program directory...");
             let clean_result = std::process::Command::new("make")
                 .arg("clean")
-                .current_dir(&test_program_dir)
+                .current_dir(&sample_program_dir)
                 .output();
 
             match clean_result {
                 Ok(output) => {
                     if output.status.success() {
-                        println!("✓ Successfully cleaned test_program build files");
+                        println!("✓ Successfully cleaned sample_program build files");
                     } else {
                         let stderr = String::from_utf8_lossy(&output.stderr);
                         println!("⚠️ Make clean failed: {}", stderr);
@@ -191,7 +194,7 @@ async fn run_ghostscope_with_script(
     script_content: &str,
     timeout_secs: u64,
 ) -> anyhow::Result<(i32, String, String)> {
-    // Get PID of running test_program
+    // Get PID of running sample_program
     let test_pid = get_global_test_pid().await?;
 
     let mut script_file = NamedTempFile::new()?;
@@ -368,7 +371,7 @@ async fn test_nonexistent_function() -> anyhow::Result<()> {
 
     let script_content = r#"
 trace nonexistent_function_12345 {
-    print "This function does not exist in test_program";
+    print "This function does not exist in sample_program";
 }
 "#;
 
@@ -460,7 +463,7 @@ trace calculate_something {
         }
 
         if function_calls_found == 0 {
-            panic!("❌ No function calls captured - test failed. Expected at least one calculate_something call. This indicates either:\n  1. test_program is not running\n  2. Function is not being called\n  3. Ghostscope failed to attach properly");
+            panic!("❌ No function calls captured - test failed. Expected at least one calculate_something call. This indicates either:\n  1. sample_program is not running\n  2. Function is not being called\n  3. Ghostscope failed to attach properly");
         } else if !validation_errors.is_empty() {
             panic!("❌ Function calls captured but math validation failed:\n  Found {} function calls, {} validation errors:\n  {}",
                 function_calls_found, validation_errors.len(), validation_errors.join("\n  "));
@@ -488,7 +491,7 @@ trace calculate_something {
     print "FUNC: a={} b={}", a, b;
 }
 
-trace test_program.c:16 {
+trace sample_program.c:16 {
     print "LINE16: a={} b={} result={}", a, b, result;
 }
 "#;
@@ -585,7 +588,7 @@ trace test_program.c:16 {
 
         if !has_func && !has_line16 {
             println!("⚠️ No traces captured during test window");
-            println!("   This could be normal if test_program doesn't trigger functions within {} seconds", 3);
+            println!("   This could be normal if sample_program doesn't trigger functions within {} seconds", 3);
         } else {
             if !validation_errors.is_empty() {
                 panic!("❌ Traces captured but validation failed:\n  Function validations: {}, Line validations: {}\n  Errors: {}",
@@ -665,9 +668,9 @@ async fn test_line_level_tracing() -> anyhow::Result<()> {
     init();
     ensure_global_cleanup_registered();
 
-    // Test line-level tracing at test_program.c:16 (return result;)
+    // Test line-level tracing at sample_program.c:16 (return result;)
     let script_content = r#"
-trace test_program.c:16 {
+trace sample_program.c:16 {
     print "LINE16: a={} b={} result={}", a, b, result;
 }
 "#;
@@ -720,7 +723,7 @@ trace test_program.c:16 {
         }
 
         if function_calls_found == 0 {
-            panic!("❌ No line traces captured - test failed. Expected at least one line:16 execution trace. This indicates either:\n  1. test_program is not running\n  2. Line 16 is not being executed\n  3. Line-level tracing failed to attach");
+            panic!("❌ No line traces captured - test failed. Expected at least one line:16 execution trace. This indicates either:\n  1. sample_program is not running\n  2. Line 16 is not being executed\n  3. Line-level tracing failed to attach");
         } else if !validation_errors.is_empty() {
             panic!("❌ Line traces captured but math validation failed:\n  Found {} line executions, {} validation errors:\n  {}",
                 function_calls_found, validation_errors.len(), validation_errors.join("\n  "));
@@ -965,7 +968,7 @@ struct TestProgramInstance {
 
 impl TestProgramInstance {
     async fn terminate(mut self) -> anyhow::Result<()> {
-        println!("🛑 Terminating test_program (PID: {})", self.pid);
+        println!("🛑 Terminating sample_program (PID: {})", self.pid);
         let _ = self.child.kill().await;
 
         // Wait for termination with timeout
@@ -975,16 +978,16 @@ impl TestProgramInstance {
                 let _ = std::process::Command::new("kill")
                     .args(&["-KILL", &self.pid.to_string()])
                     .output();
-                println!("⚠️ Force killed test_program");
+                println!("⚠️ Force killed sample_program");
             }
         }
         Ok(())
     }
 }
 
-/// Start an independent test_program instance (not shared with other tests)
-async fn start_independent_test_program() -> anyhow::Result<TestProgramInstance> {
-    let binary_path = FIXTURES.get_test_binary("test_program")?;
+/// Start an independent sample_program instance (not shared with other tests)
+async fn start_independent_sample_program() -> anyhow::Result<TestProgramInstance> {
+    let binary_path = FIXTURES.get_test_binary("sample_program")?;
 
     let child = Command::new(binary_path)
         .stdout(Stdio::null())
@@ -1146,16 +1149,22 @@ trace calculate_something {
 
     println!("=== Correct PID Filtering Test ===");
 
-    // Start two independent test_program processes
-    let test_program_1 = start_independent_test_program().await?;
-    let test_program_2 = start_independent_test_program().await?;
+    // Start two independent sample_program processes
+    let sample_program_1 = start_independent_sample_program().await?;
+    let sample_program_2 = start_independent_sample_program().await?;
 
-    println!("Started test_program_1 with PID: {}", test_program_1.pid);
-    println!("Started test_program_2 with PID: {}", test_program_2.pid);
+    println!(
+        "Started sample_program_1 with PID: {}",
+        sample_program_1.pid
+    );
+    println!(
+        "Started sample_program_2 with PID: {}",
+        sample_program_2.pid
+    );
 
     // Only trace the first process
     let (exit_code, stdout, stderr) =
-        run_ghostscope_with_specific_pid(script_content, test_program_1.pid, 3).await?;
+        run_ghostscope_with_specific_pid(script_content, sample_program_1.pid, 3).await?;
 
     println!("Exit code: {}", exit_code);
     println!("STDOUT: {}", stdout);
@@ -1163,8 +1172,8 @@ trace calculate_something {
     println!("=====================================");
 
     // Clean up processes
-    test_program_1.terminate().await?;
-    test_program_2.terminate().await?;
+    sample_program_1.terminate().await?;
+    sample_program_2.terminate().await?;
 
     if exit_code == 0 {
         let filtered_outputs = stdout
@@ -1201,15 +1210,15 @@ trace calculate_something {
 
     println!("=== PID Specificity with Multiple Processes Test ===");
 
-    // Start 3 independent test_program processes
+    // Start 3 independent sample_program processes
     let programs = vec![
-        start_independent_test_program().await?,
-        start_independent_test_program().await?,
-        start_independent_test_program().await?,
+        start_independent_sample_program().await?,
+        start_independent_sample_program().await?,
+        start_independent_sample_program().await?,
     ];
 
     for (i, program) in programs.iter().enumerate() {
-        println!("Started test_program_{} with PID: {}", i + 1, program.pid);
+        println!("Started sample_program_{} with PID: {}", i + 1, program.pid);
     }
 
     // Only trace the middle process (programs[1])
