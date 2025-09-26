@@ -1,6 +1,7 @@
 use crate::action::ResponseType;
 use crate::model::panel_state::{CommandPanelState, LineType, StaticTextLine};
 use crate::ui::{strings::UIStrings, symbols::UISymbols, themes::UIThemes};
+use super::syntax_highlighter;
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
@@ -239,20 +240,22 @@ impl ResponseFormatter {
                             )];
 
                             if !code_part.is_empty() {
-                                spans.push(Span::styled(
-                                    code_part.to_string(),
-                                    Style::default().fg(Color::White),
-                                ));
+                                // Apply syntax highlighting to the code part
+                                let highlighted_spans = syntax_highlighter::highlight_line(code_part);
+                                spans.extend(highlighted_spans);
                             }
 
                             Line::from(spans)
                         } else {
                             // Continuation lines - indent to align with code
                             let indent = " ".repeat(line_number_part.len());
-                            Line::from(vec![
-                                Span::styled(indent, Style::default()),
-                                Span::styled(line, Style::default().fg(Color::White)),
-                            ])
+                            let mut spans = vec![Span::styled(indent, Style::default())];
+
+                            // Apply syntax highlighting to continuation lines too
+                            let highlighted_spans = syntax_highlighter::highlight_line(&line);
+                            spans.extend(highlighted_spans);
+
+                            Line::from(spans)
                         }
                     })
                     .collect()

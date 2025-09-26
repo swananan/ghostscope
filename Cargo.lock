@@ -730,6 +730,7 @@ dependencies = [
  "futures-util",
  "ghostscope-protocol",
  "ratatui",
+ "regex",
  "tokio",
  "tracing",
  "unicode-width",

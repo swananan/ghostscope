@@ -1,3 +1,4 @@
+use super::syntax_highlighter;
 use crate::action::ResponseType;
 use crate::model::panel_state::{CommandPanelState, InteractionMode, LineType};
 use crate::ui::themes::UIThemes;
@@ -314,16 +315,9 @@ impl OptimizedRenderer {
                                 script_cache.cursor_col,
                             ));
                         } else {
-                            lines.push(Line::from(vec![
-                                Span::styled(
-                                    line_number.clone(),
-                                    Style::default().fg(Color::DarkGray),
-                                ),
-                                Span::styled(
-                                    wrapped_content.clone(),
-                                    Style::default().fg(Color::White),
-                                ),
-                            ]));
+                            lines.push(
+                                self.create_highlighted_script_line(&line_number, wrapped_content),
+                            );
                         }
                     } else {
                         // Continuation lines use spaces for alignment
@@ -340,16 +334,10 @@ impl OptimizedRenderer {
                                 cursor_in_continuation,
                             ));
                         } else {
-                            lines.push(Line::from(vec![
-                                Span::styled(
-                                    continuation_prefix,
-                                    Style::default().fg(Color::DarkGray),
-                                ),
-                                Span::styled(
-                                    wrapped_content.clone(),
-                                    Style::default().fg(Color::White),
-                                ),
-                            ]));
+                            lines.push(self.create_highlighted_script_line(
+                                &continuation_prefix,
+                                wrapped_content,
+                            ));
                         }
                     }
                 }
@@ -362,10 +350,7 @@ impl OptimizedRenderer {
                         script_cache.cursor_col,
                     ));
                 } else {
-                    lines.push(Line::from(vec![
-                        Span::styled(line_number, Style::default().fg(Color::DarkGray)),
-                        Span::styled(line_content.clone(), Style::default().fg(Color::White)),
-                    ]));
+                    lines.push(self.create_highlighted_script_line(&line_number, line_content));
                 }
             }
         }
@@ -830,7 +815,21 @@ impl OptimizedRenderer {
         Line::from(spans)
     }
 
-    /// Create a script line with cursor
+    /// Create a script line with syntax highlighting
+    fn create_highlighted_script_line(&self, line_number: &str, content: &str) -> Line<'static> {
+        let mut spans = vec![Span::styled(
+            line_number.to_string(),
+            Style::default().fg(Color::DarkGray),
+        )];
+
+        // Get syntax highlighted spans for the content
+        let highlighted_spans = syntax_highlighter::highlight_line(content);
+        spans.extend(highlighted_spans);
+
+        Line::from(spans)
+    }
+
+    /// Create a script line with cursor and syntax highlighting
     fn create_script_line_with_cursor(
         &self,
         line_number: &str,
@@ -846,31 +845,32 @@ impl OptimizedRenderer {
         if chars.is_empty() {
             spans.push(Span::styled(" ".to_string(), UIThemes::cursor_style()));
         } else if cursor_pos >= chars.len() {
-            spans.push(Span::styled(
-                content.to_string(),
-                Style::default().fg(Color::White),
-            ));
+            // Add syntax highlighted content, then cursor at end
+            let highlighted_spans = syntax_highlighter::highlight_line(content);
+            spans.extend(highlighted_spans);
             spans.push(Span::styled(" ".to_string(), UIThemes::cursor_style()));
         } else {
+            // Split content at cursor position
             let before_cursor: String = chars[..cursor_pos].iter().collect();
             let at_cursor = chars[cursor_pos];
             let after_cursor: String = chars[cursor_pos + 1..].iter().collect();
 
+            // Highlight before cursor part
             if !before_cursor.is_empty() {
-                spans.push(Span::styled(
-                    before_cursor,
-                    Style::default().fg(Color::White),
-                ));
+                let before_spans = syntax_highlighter::highlight_line(&before_cursor);
+                spans.extend(before_spans);
             }
+
+            // Character at cursor position as block cursor
             spans.push(Span::styled(
                 at_cursor.to_string(),
                 UIThemes::cursor_style(),
             ));
+
+            // Highlight after cursor part
             if !after_cursor.is_empty() {
-                spans.push(Span::styled(
-                    after_cursor,
-                    Style::default().fg(Color::White),
-                ));
+                let after_spans = syntax_highlighter::highlight_line(&after_cursor);
+                spans.extend(after_spans);
             }
         }
 

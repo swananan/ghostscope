@@ -13,3 +13,4 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 unicode-width = "0.1"
+regex = "1.10"
