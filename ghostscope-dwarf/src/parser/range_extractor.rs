@@ -107,26 +107,19 @@ impl RangeExtractor {
         let mut ranges = Vec::new();
 
         while let Some(range) = ranges_iter.next()? {
-            // Adjust range with base address if needed
             let begin = range.begin;
             let end = range.end;
 
-            // Skip invalid ranges
-            if begin >= end {
+            if begin > end {
                 continue;
             }
 
-            // Apply base address if this is a relative range
-            let adjusted_begin = if begin == 0 && base_address != 0 {
-                base_address + begin
-            } else {
-                begin
-            };
-            let adjusted_end = if begin == 0 && base_address != 0 {
-                base_address + end
-            } else {
-                end
-            };
+            let (mut adjusted_begin, mut adjusted_end) = (begin, end);
+
+            if begin == 0 && base_address != 0 {
+                adjusted_begin = base_address + begin;
+                adjusted_end = base_address + end;
+            }
 
             ranges.push((adjusted_begin, adjusted_end));
             debug!(

@@ -5,7 +5,7 @@
 use crate::core::{
     ComputeStep, DirectValueResult, EvaluationResult, LocationResult, MemoryAccessSize, Result,
 };
-use gimli::{EndianSlice, Expression, LittleEndian, Operation, Reader};
+use gimli::{read::RawLocListEntry, EndianSlice, Expression, LittleEndian, Operation, Reader};
 use tracing::{debug, trace, warn};
 
 /// DWARF expression evaluator
@@ -481,9 +481,13 @@ impl ExpressionEvaluator {
 
                     debug!("  Parsed expression: {:?}", location_expr);
 
-                    // For now, return the first valid expression
-                    // In a full implementation, we'd need to select based on PC
-                    if !matches!(location_expr, EvaluationResult::Optimized) {
+                    let contains_address = if start_pc == end_pc {
+                        address == start_pc
+                    } else {
+                        address >= start_pc && address < end_pc
+                    };
+
+                    if contains_address && !matches!(location_expr, EvaluationResult::Optimized) {
                         return Ok(location_expr);
                     }
                 }
@@ -500,6 +504,247 @@ impl ExpressionEvaluator {
                         offset.0, e
                     );
                     break;
+                }
+            }
+        }
+
+        if entry_count == 0 {
+            debug!(
+                "No entries returned by gimli::locations, attempting raw fallback for offset 0x{:x}",
+                offset.0
+            );
+
+            if let Ok(mut raw_iter) = dwarf.raw_locations(unit, offset) {
+                let mut base_address = unit.low_pc;
+
+                while let Some(raw_entry) = raw_iter.next()? {
+                    match raw_entry {
+                        RawLocListEntry::BaseAddress { addr } => {
+                            base_address = addr;
+                        }
+                        RawLocListEntry::BaseAddressx { addr } => {
+                            if let Ok(resolved) = dwarf.address(unit, addr) {
+                                base_address = resolved;
+                            }
+                        }
+                        RawLocListEntry::StartLength {
+                            begin,
+                            length,
+                            data,
+                        } => {
+                            debug!(
+                                "  Raw fallback StartLength begin=0x{:x} length={}",
+                                begin, length
+                            );
+                            let start = begin;
+                            let end = begin.wrapping_add(length);
+                            let contains = if length == 0 {
+                                address == start
+                            } else {
+                                address >= start && address < end
+                            };
+
+                            debug!(
+                                "   StartLength contains={} (address=0x{:x})",
+                                contains, address
+                            );
+
+                            if contains {
+                                let location_expr = Self::parse_expression(
+                                    data.0.slice(),
+                                    unit.encoding(),
+                                    address,
+                                    get_cfa,
+                                )?;
+
+                                debug!("   Raw fallback expression result: {:?}", location_expr);
+
+                                if !matches!(location_expr, EvaluationResult::Optimized) {
+                                    debug!(
+                                        "Raw fallback matched StartLength entry at 0x{:x}-0x{:x}",
+                                        start, end
+                                    );
+                                    return Ok(location_expr);
+                                }
+                            }
+                        }
+                        RawLocListEntry::StartEnd { begin, end, data } => {
+                            debug!(
+                                "  Raw fallback StartEnd begin=0x{:x} end=0x{:x}",
+                                begin, end
+                            );
+                            let contains = if begin == end {
+                                address == begin
+                            } else {
+                                address >= begin && address < end
+                            };
+
+                            debug!(
+                                "   StartEnd contains={} (address=0x{:x})",
+                                contains, address
+                            );
+
+                            if contains {
+                                let location_expr = Self::parse_expression(
+                                    data.0.slice(),
+                                    unit.encoding(),
+                                    address,
+                                    get_cfa,
+                                )?;
+
+                                debug!("   Raw fallback expression result: {:?}", location_expr);
+
+                                if !matches!(location_expr, EvaluationResult::Optimized) {
+                                    debug!(
+                                        "Raw fallback matched StartEnd entry at 0x{:x}-0x{:x}",
+                                        begin, end
+                                    );
+                                    return Ok(location_expr);
+                                }
+                            }
+                        }
+                        RawLocListEntry::OffsetPair { begin, end, data }
+                        | RawLocListEntry::AddressOrOffsetPair { begin, end, data } => {
+                            debug!(
+                                "  Raw fallback OffsetPair begin=0x{:x} end=0x{:x} base=0x{:x}",
+                                begin, end, base_address
+                            );
+                            let start = base_address.wrapping_add(begin);
+                            let end_addr = base_address.wrapping_add(end);
+                            let contains = if start == end_addr {
+                                address == start
+                            } else {
+                                address >= start && address < end_addr
+                            };
+
+                            debug!(
+                                "   OffsetPair contains={} (address=0x{:x})",
+                                contains, address
+                            );
+
+                            if contains {
+                                let location_expr = Self::parse_expression(
+                                    data.0.slice(),
+                                    unit.encoding(),
+                                    address,
+                                    get_cfa,
+                                )?;
+
+                                debug!("   Raw fallback expression result: {:?}", location_expr);
+
+                                if !matches!(location_expr, EvaluationResult::Optimized) {
+                                    debug!(
+                                        "Raw fallback matched OffsetPair entry at 0x{:x}-0x{:x}",
+                                        start, end_addr
+                                    );
+                                    return Ok(location_expr);
+                                }
+                            }
+                        }
+                        RawLocListEntry::StartxLength {
+                            begin,
+                            length,
+                            data,
+                        } => {
+                            if let Ok(start) = dwarf.address(unit, begin) {
+                                debug!(
+                                    "  Raw fallback StartxLength begin=0x{:x} length={}",
+                                    start, length
+                                );
+                                let end = start.wrapping_add(length);
+                                let contains = if length == 0 {
+                                    address == start
+                                } else {
+                                    address >= start && address < end
+                                };
+
+                                debug!(
+                                    "   StartxLength contains={} (address=0x{:x})",
+                                    contains, address
+                                );
+
+                                if contains {
+                                    let location_expr = Self::parse_expression(
+                                        data.0.slice(),
+                                        unit.encoding(),
+                                        address,
+                                        get_cfa,
+                                    )?;
+
+                                    debug!(
+                                        "   Raw fallback expression result: {:?}",
+                                        location_expr
+                                    );
+
+                                    if !matches!(location_expr, EvaluationResult::Optimized) {
+                                        debug!(
+                                            "Raw fallback matched StartxLength entry at 0x{:x}-0x{:x}",
+                                            start, end
+                                        );
+                                        return Ok(location_expr);
+                                    }
+                                }
+                            }
+                        }
+                        RawLocListEntry::StartxEndx { begin, end, data } => {
+                            if let (Ok(start), Ok(end_addr)) =
+                                (dwarf.address(unit, begin), dwarf.address(unit, end))
+                            {
+                                debug!(
+                                    "  Raw fallback StartxEndx begin=0x{:x} end=0x{:x}",
+                                    start, end_addr
+                                );
+                                let contains = if start == end_addr {
+                                    address == start
+                                } else {
+                                    address >= start && address < end_addr
+                                };
+
+                                debug!(
+                                    "   StartxEndx contains={} (address=0x{:x})",
+                                    contains, address
+                                );
+
+                                if contains {
+                                    let location_expr = Self::parse_expression(
+                                        data.0.slice(),
+                                        unit.encoding(),
+                                        address,
+                                        get_cfa,
+                                    )?;
+
+                                    debug!(
+                                        "   Raw fallback expression result: {:?}",
+                                        location_expr
+                                    );
+
+                                    if !matches!(location_expr, EvaluationResult::Optimized) {
+                                        debug!(
+                                            "Raw fallback matched StartxEndx entry at 0x{:x}-0x{:x}",
+                                            start, end_addr
+                                        );
+                                        return Ok(location_expr);
+                                    }
+                                }
+                            }
+                        }
+                        RawLocListEntry::DefaultLocation { data } => {
+                            debug!("  Raw fallback default location entry");
+                            let location_expr = Self::parse_expression(
+                                data.0.slice(),
+                                unit.encoding(),
+                                address,
+                                get_cfa,
+                            )?;
+
+                            debug!("   Raw fallback expression result: {:?}", location_expr);
+
+                            if !matches!(location_expr, EvaluationResult::Optimized) {
+                                debug!("Raw fallback matched default location entry");
+                                return Ok(location_expr);
+                            }
+                        }
+                    }
                 }
             }
         }

@@ -10,6 +10,7 @@ use crate::{
     parser::{ExpressionEvaluator, RangeExtractor, TypeResolver},
 };
 use gimli::{EndianSlice, LittleEndian};
+use std::collections::HashSet;
 use tracing::{debug, trace};
 
 /// Variable with complete information including EvaluationResult
@@ -116,9 +117,19 @@ impl DetailedParser {
                     let ranges =
                         RangeExtractor::extract_all_ranges(entry, context.unit, context.dwarf)?;
                     let block_contains_address = ranges.is_empty()
-                        || ranges
-                            .iter()
-                            .any(|(low, high)| context.address >= *low && context.address < *high);
+                        || ranges.iter().any(|(low, high)| {
+                            if low == high {
+                                context.address == *low
+                            } else {
+                                context.address >= *low && context.address < *high
+                            }
+                        })
+                        || Self::entry_pc_matches(
+                            entry,
+                            context.unit,
+                            context.dwarf,
+                            context.address,
+                        )?;
 
                     if block_contains_address {
                         trace!(
@@ -159,31 +170,22 @@ impl DetailedParser {
         context: &VariableTraversalContext<'_, '_>,
         scope_depth: usize,
     ) -> Result<Option<VariableWithEvaluation>> {
-        // Get variable name
-        let name = entry
-            .attr_value(gimli::constants::DW_AT_name)?
-            .and_then(|attr| match attr {
-                gimli::AttributeValue::DebugStrRef(offset) => context
-                    .dwarf
-                    .debug_str
-                    .get_str(offset)
-                    .ok()?
-                    .to_string()
-                    .ok(),
-                gimli::AttributeValue::String(s) => s.to_string().ok(),
-                _ => None,
-            });
+        let mut visited = HashSet::new();
+        let name =
+            Self::resolve_name_with_origins(entry, context.unit, context.dwarf, &mut visited)?;
 
         let name = match name {
-            Some(n) => n.to_string(),
+            Some(n) => n,
             None => return Ok(None), // Skip unnamed variables
         };
 
-        // Check if artificial (compiler-generated)
-        let is_artificial = matches!(
-            entry.attr_value(gimli::constants::DW_AT_artificial)?,
-            Some(gimli::AttributeValue::Flag(true))
-        );
+        let is_artificial = Self::resolve_flag_with_origins(
+            entry,
+            context.unit,
+            context.dwarf,
+            gimli::constants::DW_AT_artificial,
+        )?
+        .unwrap_or(false);
 
         // Check if parameter
         let is_parameter = entry.tag() == gimli::constants::DW_TAG_formal_parameter;
@@ -193,14 +195,56 @@ impl DetailedParser {
 
         // Get type reference and resolve full type information
         let dwarf_type =
-            entry
-                .attr_value(gimli::constants::DW_AT_type)?
-                .and_then(|attr| match attr {
-                    gimli::AttributeValue::UnitRef(offset) => self
-                        .type_resolver
-                        .resolve_type_at_offset(context.dwarf, context.unit, offset),
-                    _ => None,
-                });
+            Self::resolve_type_ref(entry, context.unit, context.dwarf)?.and_then(|offset| {
+                self.type_resolver
+                    .resolve_type_at_offset(context.dwarf, context.unit, offset)
+            });
+
+        let location_attr = entry.attr_value(gimli::constants::DW_AT_location)?;
+        debug!("DW_AT_location raw attr: {:?}", location_attr);
+        if let Some(gimli::AttributeValue::LocationListsRef(offset)) = location_attr {
+            if let Ok(mut raw_iter) = context.dwarf.raw_locations(context.unit, offset) {
+                let mut raw_index = 0;
+                while let Ok(Some(raw_entry)) = raw_iter.next() {
+                    debug!("  raw_loc[{}]: {:?}", raw_index, raw_entry);
+                    raw_index += 1;
+                }
+            }
+        }
+
+        let locviews_attr = entry.attr_value(gimli::constants::DW_AT_GNU_locviews)?;
+
+        if let Some(ref attr) = locviews_attr {
+            debug!("DW_AT_GNU_locviews present: {:?}", attr);
+
+            if let gimli::AttributeValue::SecOffset(offset) = *attr {
+                let view_offset = offset;
+                match context
+                    .dwarf
+                    .locations(context.unit, gimli::LocationListsOffset(view_offset))
+                {
+                    Ok(mut views) => {
+                        let mut view_index = 0;
+                        while let Ok(Some(entry)) = views.next() {
+                            debug!(
+                                "  locview[{}]: range=0x{:x}-0x{:x} len={} bytes",
+                                view_index,
+                                entry.range.begin,
+                                entry.range.end,
+                                entry.range.end.saturating_sub(entry.range.begin)
+                            );
+                            view_index += 1;
+                        }
+                    }
+                    Err(e) => {
+                        debug!(
+                            "  Failed to decode locviews at offset 0x{:x}: {:?}",
+                            view_offset, e
+                        );
+                    }
+                }
+            }
+        }
 
         // Parse location
         let evaluation_result = self.parse_location(
@@ -228,73 +272,43 @@ impl DetailedParser {
         unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
         dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
     ) -> Result<String> {
-        // Try to get type reference
-        let type_ref =
-            entry
-                .attr_value(gimli::constants::DW_AT_type)?
-                .and_then(|attr| match attr {
-                    gimli::AttributeValue::UnitRef(offset) => Some(offset),
-                    _ => None,
-                });
-
-        if let Some(offset) = type_ref {
-            // Use entries_tree to look up the type DIE
+        if let Some(offset) = Self::resolve_type_ref(entry, unit, dwarf)? {
             let mut tree = unit.entries_tree(Some(offset))?;
             let type_node = tree.root()?;
             let type_entry = type_node.entry();
 
-            // Try to get type name
-            if let Some(name) = type_entry
-                .attr_value(gimli::constants::DW_AT_name)?
-                .and_then(|attr| match attr {
-                    gimli::AttributeValue::DebugStrRef(str_offset) => {
-                        dwarf.debug_str.get_str(str_offset).ok()?.to_string().ok()
-                    }
-                    gimli::AttributeValue::String(s) => s.to_string().ok(),
-                    _ => None,
-                })
+            let mut visited = HashSet::new();
+            if let Some(name) =
+                Self::resolve_name_with_origins(type_entry, unit, dwarf, &mut visited)?
             {
-                return Ok(name.to_string());
+                return Ok(name);
             }
 
-            // Handle pointer types
             if type_entry.tag() == gimli::constants::DW_TAG_pointer_type {
                 let pointee_type = Self::resolve_type_name(type_entry, unit, dwarf)?;
                 return Ok(format!("{pointee_type}*"));
             }
 
-            // Handle const types
             if type_entry.tag() == gimli::constants::DW_TAG_const_type {
                 let base_type = Self::resolve_type_name(type_entry, unit, dwarf)?;
                 return Ok(format!("const {base_type}"));
             }
 
-            // Handle array types
             if type_entry.tag() == gimli::constants::DW_TAG_array_type {
                 let element_type = Self::resolve_type_name(type_entry, unit, dwarf)?;
                 return Ok(format!("{element_type}[]"));
             }
 
-            // Handle typedef
             if type_entry.tag() == gimli::constants::DW_TAG_typedef {
-                // First try to get the typedef name
-                if let Some(typedef_name) = type_entry
-                    .attr_value(gimli::constants::DW_AT_name)?
-                    .and_then(|attr| match attr {
-                        gimli::AttributeValue::DebugStrRef(str_offset) => {
-                            dwarf.debug_str.get_str(str_offset).ok()?.to_string().ok()
-                        }
-                        gimli::AttributeValue::String(s) => s.to_string().ok(),
-                        _ => None,
-                    })
+                let mut typedef_visited = HashSet::new();
+                if let Some(typedef_name) =
+                    Self::resolve_name_with_origins(type_entry, unit, dwarf, &mut typedef_visited)?
                 {
-                    return Ok(typedef_name.to_string());
+                    return Ok(typedef_name);
                 }
-                // Otherwise resolve the underlying type
                 return Self::resolve_type_name(type_entry, unit, dwarf);
             }
 
-            // Return tag name if no name attribute
             return Ok(format!("{:?}", type_entry.tag()));
         }
 
@@ -314,29 +328,139 @@ impl DetailedParser {
         ExpressionEvaluator::evaluate_location(entry, unit, dwarf, address, get_cfa)
     }
 
-    /// Extract name from DIE
+    /// Extract name from DIE (considering abstract origins/specifications)
     pub fn extract_name(
         &self,
         entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
+        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
         dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
     ) -> Result<Option<String>> {
-        let name = entry
-            .attr_value(gimli::constants::DW_AT_name)?
-            .and_then(|attr| match attr {
-                gimli::AttributeValue::DebugStrRef(offset) => {
-                    dwarf.debug_str.get_str(offset).ok()?.to_string().ok()
-                }
-                gimli::AttributeValue::String(s) => s.to_string().ok(),
-                _ => None,
-            })
-            .map(|s| s.to_string());
-
-        Ok(name)
+        Self::resolve_name_with_origins(entry, unit, dwarf, &mut HashSet::new())
     }
 
     /// Get cache statistics from type resolver
     pub fn get_cache_stats(&self) -> usize {
         self.type_resolver.get_cache_stats()
+    }
+
+    #[allow(clippy::only_used_in_recursion)]
+    fn resolve_attr_with_origins(
+        entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
+        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
+        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
+        attr: gimli::DwAt,
+        visited: &mut HashSet<gimli::UnitOffset>,
+    ) -> Result<Option<gimli::AttributeValue<EndianSlice<'static, LittleEndian>>>> {
+        if let Some(value) = entry.attr_value(attr)? {
+            return Ok(Some(value));
+        }
+
+        for origin_attr in [
+            gimli::constants::DW_AT_abstract_origin,
+            gimli::constants::DW_AT_specification,
+        ] {
+            if let Some(gimli::AttributeValue::UnitRef(offset)) = entry.attr_value(origin_attr)? {
+                if visited.insert(offset) {
+                    let origin_entry = unit.entry(offset)?;
+                    if let Some(value) =
+                        Self::resolve_attr_with_origins(&origin_entry, unit, dwarf, attr, visited)?
+                    {
+                        return Ok(Some(value));
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn resolve_name_with_origins(
+        entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
+        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
+        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
+        visited: &mut HashSet<gimli::UnitOffset>,
+    ) -> Result<Option<String>> {
+        if let Some(attr) = Self::resolve_attr_with_origins(
+            entry,
+            unit,
+            dwarf,
+            gimli::constants::DW_AT_name,
+            visited,
+        )? {
+            return Self::attr_to_string(attr, unit, dwarf);
+        }
+        Ok(None)
+    }
+
+    fn resolve_flag_with_origins(
+        entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
+        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
+        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
+        attr: gimli::DwAt,
+    ) -> Result<Option<bool>> {
+        let mut visited = HashSet::new();
+        Ok(
+            Self::resolve_attr_with_origins(entry, unit, dwarf, attr, &mut visited)?.and_then(
+                |value| match value {
+                    gimli::AttributeValue::Flag(flag) => Some(flag),
+                    _ => None,
+                },
+            ),
+        )
+    }
+
+    fn resolve_type_ref(
+        entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
+        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
+        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
+    ) -> Result<Option<gimli::UnitOffset>> {
+        let mut visited = HashSet::new();
+        Ok(Self::resolve_attr_with_origins(
+            entry,
+            unit,
+            dwarf,
+            gimli::constants::DW_AT_type,
+            &mut visited,
+        )?
+        .and_then(|value| match value {
+            gimli::AttributeValue::UnitRef(offset) => Some(offset),
+            _ => None,
+        }))
+    }
+
+    fn attr_to_string(
+        attr: gimli::AttributeValue<EndianSlice<'static, LittleEndian>>,
+        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
+        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
+    ) -> Result<Option<String>> {
+        if let Ok(attr_string) = dwarf.attr_string(unit, attr) {
+            return Ok(Some(attr_string.to_string_lossy().into_owned()));
+        }
+
+        if let gimli::AttributeValue::String(s) = attr {
+            return Ok(s.to_string().ok().map(|cow| cow.to_owned()));
+        }
+
+        Ok(None)
+    }
+
+    fn entry_pc_matches(
+        entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
+        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
+        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
+        address: u64,
+    ) -> Result<bool> {
+        if let Some(attr) = entry.attr_value(gimli::constants::DW_AT_entry_pc)? {
+            match attr {
+                gimli::AttributeValue::Addr(addr) => return Ok(addr == address),
+                gimli::AttributeValue::DebugAddrIndex(index) => {
+                    let resolved = dwarf.address(unit, index)?;
+                    return Ok(resolved == address);
+                }
+                _ => {}
+            }
+        }
+        Ok(false)
     }
 }
 

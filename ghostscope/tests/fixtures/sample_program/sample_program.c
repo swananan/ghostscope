@@ -41,6 +41,9 @@ int main() {
         // Call our original test functions
         test_function(counter);
         int result = calculate_something(counter, counter + 5);
+        if (result % 7 == 0) {
+            ++record.value;
+        }
         
         // Call library functions for testing
         int sum = add_numbers(counter, counter * 2);
@@ -79,4 +82,3 @@ int main() {
     
     return 0;
 }
-

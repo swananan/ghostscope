@@ -58,15 +58,24 @@ impl OnDemandResolver {
             if entry.tag() == gimli::constants::DW_TAG_subprogram {
                 // Check if this function contains our address
                 let ranges = RangeExtractor::extract_all_ranges(entry, &unit, &self.dwarf)?;
-                let contains_address = ranges
-                    .iter()
-                    .any(|(low, high)| address >= *low && address < *high);
+                let mut contains_address = ranges.iter().any(|(low, high)| {
+                    if low == high {
+                        address == *low
+                    } else {
+                        address >= *low && address < *high
+                    }
+                });
+
+                if !contains_address && Self::entry_pc_matches(entry, &unit, &self.dwarf, address)?
+                {
+                    contains_address = true;
+                }
 
                 if contains_address {
                     // Found the containing function
                     let func_name = self
                         .detailed_parser
-                        .extract_name(entry, &self.dwarf)?
+                        .extract_name(entry, &unit, &self.dwarf)?
                         .unwrap_or_else(|| "unknown".to_string());
                     debug!(
                         "Found containing function '{}' for address 0x{:x}",
@@ -112,5 +121,25 @@ impl OnDemandResolver {
     /// Get cache statistics
     pub fn get_cache_stats(&self) -> (usize, usize) {
         (0, self.detailed_parser.get_cache_stats())
+    }
+
+    fn entry_pc_matches(
+        entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
+        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
+        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
+        address: u64,
+    ) -> Result<bool> {
+        if let Some(attr) = entry.attr(gimli::constants::DW_AT_entry_pc)? {
+            match attr.value() {
+                gimli::AttributeValue::Addr(addr) => return Ok(addr == address),
+                gimli::AttributeValue::DebugAddrIndex(index) => {
+                    let resolved = dwarf.address(unit, index)?;
+                    return Ok(resolved == address);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(false)
     }
 }

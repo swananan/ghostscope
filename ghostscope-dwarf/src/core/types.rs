@@ -91,6 +91,8 @@ pub struct IndexEntry {
     /// For variables: vec![(address, address)] if static
     /// Empty vec if no address (e.g., types, inlined functions without concrete instances)
     pub address_ranges: Vec<(u64, u64)>,
+    /// Optional DW_AT_entry_pc for inline/call site DIEs (single-point locations)
+    pub entry_pc: Option<u64>,
 }
 
 /// Index flags (inspired by GDB's cooked_index_flag_enum)

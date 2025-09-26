@@ -87,6 +87,10 @@ impl LightweightIndex {
             for (start_addr, _end_addr) in &entry.address_ranges {
                 address_map.insert(*start_addr, idx);
             }
+
+            if let Some(entry_pc) = entry.entry_pc {
+                address_map.insert(entry_pc, idx);
+            }
         }
 
         debug!(
@@ -135,9 +139,28 @@ impl LightweightIndex {
         for (_addr, &idx) in self.address_map.range(..=address).rev() {
             let entry = &self.entries[idx];
 
+            if let Some(entry_pc) = entry.entry_pc {
+                if address == entry_pc {
+                    tracing::info!(
+                        "  ✓ Found DIE '{}' (tag={:?}) at entry_pc 0x{:x}",
+                        entry.name,
+                        entry.tag,
+                        entry_pc
+                    );
+                    best_match = Some(entry);
+                    break;
+                }
+            }
+
             // Check all ranges for this entry
             for (start, end) in &entry.address_ranges {
-                if address >= *start && address < *end {
+                let contains = if start == end {
+                    address == *start
+                } else {
+                    address >= *start && address < *end
+                };
+
+                if contains {
                     tracing::info!(
                         "  ✓ Found DIE '{}' (tag={:?}) at range 0x{:x}-0x{:x}",
                         entry.name,
@@ -172,12 +195,19 @@ impl LightweightIndex {
 
             tracing::info!("  Found {} entries for function '{}'", entries.len(), name);
             for entry in &entries {
-                if !entry.address_ranges.is_empty() {
-                    let (start, _) = entry.address_ranges[0];
+                let display_addr = if entry.flags.is_inline {
+                    entry
+                        .entry_pc
+                        .or_else(|| entry.address_ranges.first().map(|(start, _)| *start))
+                } else {
+                    entry.address_ranges.first().map(|(start, _)| *start)
+                };
+
+                if let Some(addr) = display_addr {
                     tracing::info!(
                         "    - {} at 0x{:x} (inline={}, {} ranges)",
                         entry.name,
-                        start,
+                        addr,
                         entry.flags.is_inline,
                         entry.address_ranges.len()
                     );

@@ -565,6 +565,33 @@ impl GhostScopeLoader {
         Ok(events)
     }
 
+    /// Drain all currently available events without blocking
+    pub fn drain_available_events(&mut self) -> Result<Vec<ParsedTraceEvent>> {
+        let Some(ringbuf) = self.ringbuf.as_mut() else {
+            return Ok(Vec::new());
+        };
+
+        let Some(string_table) = self.string_table.as_ref() else {
+            return Err(LoaderError::Generic(
+                "No string table available - cannot parse trace events".to_string(),
+            ));
+        };
+
+        let mut events = Vec::new();
+
+        while let Some(item) = ringbuf.next() {
+            match self.parser.process_segment(&item, string_table) {
+                Ok(Some(parsed_event)) => events.push(parsed_event),
+                Ok(None) => {}
+                Err(e) => {
+                    warn!("Failed to parse trace event segment: {}", e);
+                }
+            }
+        }
+
+        Ok(events)
+    }
+
     /// Set the string table for parsing trace events
     pub fn set_string_table(&mut self, string_table: StringTable) {
         info!("Setting string table for trace event parsing");

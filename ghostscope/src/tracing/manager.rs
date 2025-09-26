@@ -1,6 +1,8 @@
 use crate::tracing::instance::TraceInstance;
 use crate::tracing::snapshot::{TraceSnapshot, TraceSummary};
 use anyhow::Result;
+use futures::future::{select_all, BoxFuture};
+use futures::FutureExt;
 use ghostscope_loader::GhostScopeLoader;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -119,20 +121,6 @@ impl TraceManager {
         self.traces.values().filter(|t| t.is_enabled).count()
     }
 
-    /// Get IDs of all active traces
-    pub fn get_active_trace_ids(&self) -> Vec<u32> {
-        self.traces
-            .iter()
-            .filter(|(_, trace)| trace.is_enabled)
-            .map(|(id, _)| *id)
-            .collect()
-    }
-
-    /// Get a mutable trace instance by ID
-    pub fn get_trace_mut(&mut self, trace_id: u32) -> Option<&mut TraceInstance> {
-        self.traces.get_mut(&trace_id)
-    }
-
     /// Get all trace IDs
     pub fn get_all_trace_ids(&self) -> Vec<u32> {
         self.traces.keys().cloned().collect()
@@ -221,36 +209,68 @@ impl TraceManager {
         self.no_trace_wait_notify.notified().await;
     }
 
-    /// Wait for events from all active traces
+    /// Wait for events from all active traces using futures::select_all
     pub async fn wait_for_all_events_async(
         &mut self,
     ) -> Vec<ghostscope_protocol::ParsedTraceEvent> {
-        let active_trace_ids = self.get_active_trace_ids();
-
-        if active_trace_ids.is_empty() {
-            // No active traces, wait for first trace to be enabled
-            self.wait_for_first_trace().await;
-            return Vec::new();
-        }
-
-        // Simple approach: iterate through active traces and try to get events from each
-        for trace_id in active_trace_ids {
-            if let Some(trace) = self.get_trace_mut(trace_id) {
-                match trace.wait_for_events_async().await {
-                    Ok(events) => {
-                        if !events.is_empty() {
-                            return events;
-                        }
+        loop {
+            let futures: Vec<
+                BoxFuture<
+                    '_,
+                    (
+                        u32,
+                        anyhow::Result<Vec<ghostscope_protocol::ParsedTraceEvent>>,
+                    ),
+                >,
+            > = self
+                .traces
+                .iter_mut()
+                .filter_map(|(&trace_id, trace)| {
+                    if trace.is_enabled {
+                        Some(async move { (trace_id, trace.wait_for_events_async().await) }.boxed())
+                    } else {
+                        None
                     }
-                    Err(e) => {
-                        warn!("Error from trace {}: {}", trace_id, e);
+                })
+                .collect();
+
+            if futures.is_empty() {
+                drop(futures);
+                self.wait_for_first_trace().await;
+                continue;
+            }
+
+            let ((trace_id, result), _index, remaining) = select_all(futures).await;
+
+            let mut aggregated_events = Vec::new();
+
+            match result {
+                Ok(events) => {
+                    aggregated_events.extend(events);
+                }
+                Err(e) => {
+                    warn!("Error waiting for events from trace {}: {}", trace_id, e);
+                }
+            }
+
+            for future in remaining {
+                if let Some((trace_id, result)) = future.now_or_never() {
+                    match result {
+                        Ok(events) => {
+                            aggregated_events.extend(events);
+                        }
+                        Err(e) => {
+                            warn!("Error waiting for events from trace {}: {}", trace_id, e);
+                        }
                     }
                 }
             }
-        }
 
-        // No events from any trace
-        Vec::new()
+            if !aggregated_events.is_empty() {
+                return aggregated_events;
+            }
+            // No events received after draining ready traces, continue looping.
+        }
     }
 }
 

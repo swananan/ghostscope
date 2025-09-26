@@ -238,17 +238,32 @@ impl ModuleData {
         let mut addresses = Vec::new();
 
         for entry in entries {
-            for (start_addr, _end_addr) in &entry.address_ranges {
-                if entry.flags.is_inline {
-                    // Inline function, use original address
+            if entry.flags.is_inline {
+                let mut candidate_addresses: Vec<u64> = entry
+                    .address_ranges
+                    .iter()
+                    .map(|(start_addr, _)| *start_addr)
+                    .collect();
+
+                if let Some(entry_pc) = entry.entry_pc {
+                    candidate_addresses.push(entry_pc);
+                }
+
+                candidate_addresses.sort_unstable();
+                candidate_addresses.dedup();
+
+                for candidate in candidate_addresses {
                     tracing::debug!(
-                        "ModuleData: function '{}' is inline at 0x{:x}, using original address",
+                        "ModuleData: function '{}' is inline at 0x{:x}, registering address",
                         name,
-                        start_addr
+                        candidate
                     );
-                    addresses.push(*start_addr);
-                } else {
-                    // Real function, skip prologue
+                    if !addresses.contains(&candidate) {
+                        addresses.push(candidate);
+                    }
+                }
+            } else {
+                for (start_addr, _end_addr) in &entry.address_ranges {
                     let executable_addr =
                         self.line_mapping.find_first_executable_address(*start_addr);
                     tracing::debug!(

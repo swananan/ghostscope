@@ -9,8 +9,16 @@ use crate::{
     parser::RangeExtractor,
 };
 use gimli::{EndianSlice, LittleEndian};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::debug;
+
+#[derive(Clone, Default)]
+struct FunctionMetadata {
+    name: Option<String>,
+    is_inline: bool,
+    is_linkage_name: bool,
+    is_external: Option<bool>,
+}
 
 /// Compilation unit information with associated directories and files.
 #[derive(Debug, Clone)]
@@ -79,6 +87,17 @@ impl<'a> DwarfParser<'a> {
         Self { dwarf }
     }
 
+    fn extract_attr_string(
+        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
+        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
+        attr_value: gimli::AttributeValue<EndianSlice<'static, LittleEndian>>,
+    ) -> Result<Option<String>> {
+        if let Ok(string) = dwarf.attr_string(unit, attr_value) {
+            return Ok(Some(string.to_string_lossy().into_owned()));
+        }
+        Ok(None)
+    }
+
     /// Process single compilation unit - decoupled debug_line and debug_info processing
     // Helper methods (extracted from unified_builder.rs)
     fn extract_name(
@@ -93,6 +112,123 @@ impl<'a> DwarfParser<'a> {
             }
         }
         Ok(None)
+    }
+
+    fn extract_linkage_name(
+        &self,
+        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
+        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
+    ) -> Result<Option<(String, bool)>> {
+        if let Some(attr) = entry.attr(gimli::constants::DW_AT_linkage_name)? {
+            if let Some(name) = Self::extract_attr_string(dwarf, unit, attr.value())? {
+                return Ok(Some((name, true)));
+            }
+        }
+        if let Some(attr) = entry.attr(gimli::constants::DW_AT_MIPS_linkage_name)? {
+            if let Some(name) = Self::extract_attr_string(dwarf, unit, attr.value())? {
+                return Ok(Some((name, true)));
+            }
+        }
+        Ok(None)
+    }
+
+    fn extract_inline_flag(
+        entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
+    ) -> Result<bool> {
+        if let Some(attr) = entry.attr(gimli::constants::DW_AT_inline)? {
+            if let gimli::AttributeValue::Inline(inline_attr) = attr.value() {
+                return Ok(inline_attr == gimli::DW_INL_inlined
+                    || inline_attr == gimli::DW_INL_declared_inlined);
+            }
+        }
+        Ok(false)
+    }
+
+    fn resolve_function_metadata(
+        &self,
+        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
+        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
+        cache: &mut HashMap<gimli::UnitOffset, FunctionMetadata>,
+        visited: &mut HashSet<gimli::UnitOffset>,
+    ) -> Result<FunctionMetadata> {
+        let offset = entry.offset();
+        if let Some(cached) = cache.get(&offset) {
+            return Ok(cached.clone());
+        }
+
+        if !visited.insert(offset) {
+            return Ok(FunctionMetadata::default());
+        }
+
+        let mut metadata = FunctionMetadata::default();
+        if let Some(name) = self.extract_name(dwarf, unit, entry)? {
+            metadata.name = Some(name);
+        } else if let Some((name, is_linkage)) = self.extract_linkage_name(dwarf, unit, entry)? {
+            metadata.name = Some(name);
+            metadata.is_linkage_name = is_linkage;
+        }
+
+        metadata.is_inline = Self::extract_inline_flag(entry)?;
+
+        if let Some(attr) = entry.attr(gimli::constants::DW_AT_external)? {
+            if let gimli::AttributeValue::Flag(flag) = attr.value() {
+                metadata.is_external = Some(flag);
+            }
+        }
+
+        let mut merge_from_origin = |origin_offset: gimli::UnitOffset| -> Result<()> {
+            if visited.contains(&origin_offset) {
+                return Ok(());
+            }
+
+            let origin_entry = unit.entry(origin_offset)?;
+            let origin_metadata =
+                self.resolve_function_metadata(dwarf, unit, &origin_entry, cache, visited)?;
+
+            if metadata.name.is_none() {
+                metadata.name = origin_metadata.name.clone();
+            }
+            metadata.is_inline |= origin_metadata.is_inline;
+            if metadata.is_external.is_none() {
+                metadata.is_external = origin_metadata.is_external;
+            }
+            metadata.is_linkage_name |= origin_metadata.is_linkage_name;
+            Ok(())
+        };
+
+        if let Some(attr) = entry.attr(gimli::constants::DW_AT_abstract_origin)? {
+            match attr.value() {
+                gimli::AttributeValue::UnitRef(unit_ref) => {
+                    merge_from_origin(unit_ref)?;
+                }
+                gimli::AttributeValue::DebugInfoRef(debug_info_ref) => {
+                    if let Some(unit_ref) = debug_info_ref.to_unit_offset(&unit.header) {
+                        merge_from_origin(unit_ref)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(attr) = entry.attr(gimli::constants::DW_AT_specification)? {
+            match attr.value() {
+                gimli::AttributeValue::UnitRef(unit_ref) => {
+                    merge_from_origin(unit_ref)?;
+                }
+                gimli::AttributeValue::DebugInfoRef(debug_info_ref) => {
+                    if let Some(unit_ref) = debug_info_ref.to_unit_offset(&unit.header) {
+                        merge_from_origin(unit_ref)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        visited.remove(&offset);
+        cache.insert(offset, metadata.clone());
+        Ok(metadata)
     }
 
     fn is_static_symbol(
@@ -132,6 +268,18 @@ impl<'a> DwarfParser<'a> {
                     return Ok(Some(addr));
                 }
                 // TODO: Handle location expressions for more complex cases
+            }
+        }
+        Ok(None)
+    }
+
+    fn extract_entry_pc(
+        &self,
+        entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
+    ) -> Result<Option<u64>> {
+        if let Some(attr) = entry.attr(gimli::constants::DW_AT_entry_pc)? {
+            if let gimli::AttributeValue::Addr(addr) = attr.value() {
+                return Ok(Some(addr));
             }
         }
         Ok(None)
@@ -307,13 +455,29 @@ impl<'a> DwarfParser<'a> {
 
             // Parse DIEs without file path resolution (will be resolved later)
             let mut entries = unit.entries();
+            let mut metadata_cache: HashMap<gimli::UnitOffset, FunctionMetadata> = HashMap::new();
             while let Some((_, entry)) = entries.next_dfs()? {
                 match entry.tag() {
                     gimli::constants::DW_TAG_subprogram => {
-                        if let Some(name) = self.extract_name(self.dwarf, &unit, entry)? {
+                        let mut visited = HashSet::new();
+                        let metadata = self.resolve_function_metadata(
+                            self.dwarf,
+                            &unit,
+                            entry,
+                            &mut metadata_cache,
+                            &mut visited,
+                        )?;
+                        if let Some(name) = metadata.name.clone() {
+                            let is_main = self.is_main_function(entry, &name).unwrap_or(false);
+                            let is_static = metadata
+                                .is_external
+                                .map(|external| !external)
+                                .unwrap_or_else(|| self.is_static_symbol(entry).unwrap_or(false));
                             let flags = crate::core::IndexFlags {
-                                is_static: self.is_static_symbol(entry).unwrap_or(false),
-                                is_main: self.is_main_function(entry, &name).unwrap_or(false),
+                                is_static,
+                                is_main,
+                                is_inline: metadata.is_inline,
+                                is_linkage: metadata.is_linkage_name,
                                 ..Default::default()
                             };
 
@@ -328,15 +492,30 @@ impl<'a> DwarfParser<'a> {
                                 flags,
                                 language: self.extract_language(self.dwarf, &unit, entry),
                                 address_ranges: address_ranges.clone(),
+                                entry_pc: self.extract_entry_pc(entry)?,
                             };
 
                             functions.entry(name).or_default().push(index_entry);
                         }
                     }
                     gimli::constants::DW_TAG_inlined_subroutine => {
-                        if let Some(name) = self.extract_name(self.dwarf, &unit, entry)? {
+                        let mut visited = HashSet::new();
+                        let metadata = self.resolve_function_metadata(
+                            self.dwarf,
+                            &unit,
+                            entry,
+                            &mut metadata_cache,
+                            &mut visited,
+                        )?;
+                        if let Some(name) = metadata.name.clone() {
+                            let is_static = metadata
+                                .is_external
+                                .map(|external| !external)
+                                .unwrap_or(false);
                             let flags = crate::core::IndexFlags {
+                                is_static,
                                 is_inline: true,
+                                is_linkage: metadata.is_linkage_name,
                                 ..Default::default()
                             };
 
@@ -351,6 +530,7 @@ impl<'a> DwarfParser<'a> {
                                 flags,
                                 language: self.extract_language(self.dwarf, &unit, entry),
                                 address_ranges: address_ranges.clone(),
+                                entry_pc: self.extract_entry_pc(entry)?,
                             };
 
                             functions.entry(name).or_default().push(index_entry);
@@ -381,6 +561,7 @@ impl<'a> DwarfParser<'a> {
                                 flags,
                                 language: self.extract_language(self.dwarf, &unit, entry),
                                 address_ranges,
+                                entry_pc: None,
                             };
 
                             variables.entry(name).or_default().push(index_entry);
@@ -391,20 +572,19 @@ impl<'a> DwarfParser<'a> {
             }
         }
 
-        let lightweight_index =
-            LightweightIndex::from_builder_data(functions.clone(), variables.clone());
+        let functions_count = functions.len();
+        let variables_count = variables.len();
+        let lightweight_index = LightweightIndex::from_builder_data(functions, variables);
 
         debug!(
             "Completed debug_info parsing for {}: {} functions, {} variables",
-            module_path,
-            functions.len(),
-            variables.len()
+            module_path, functions_count, variables_count
         );
 
         Ok(DebugParseResult {
             lightweight_index,
-            functions_count: functions.len(),
-            variables_count: variables.len(),
+            functions_count,
+            variables_count,
         })
     }
 

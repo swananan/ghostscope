@@ -47,7 +47,8 @@ impl<'ctx> EbpfContext<'ctx> {
         info!("Sent TraceEventHeader");
 
         // Step 2: Send TraceEventMessage with dynamic trace_id
-        self.send_trace_event_message(0)?; // trace_id will be set by uprobe loader
+        let trace_id = self.current_trace_id.map(|id| id as u64).unwrap_or(0);
+        self.send_trace_event_message(trace_id)?;
         info!("Sent TraceEventMessage");
 
         // Step 3: Process each statement and generate LLVM IR on-demand
