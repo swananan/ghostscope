@@ -3,7 +3,7 @@
 //! This module handles the integration of StreamingTraceParser with the UI crate,
 //! returning ParsedTraceEvent directly for UI processing.
 
-use ghostscope_protocol::{ParsedTraceEvent, StreamingTraceParser, StringTable};
+use ghostscope_protocol::{ParsedTraceEvent, StreamingTraceParser, TraceContext};
 use tracing::debug;
 
 /// Bridge for streaming trace event parsing in UI context
@@ -26,10 +26,10 @@ impl StreamingParserBridge {
     pub fn process_ringbuf_segment(
         &mut self,
         segment_data: &[u8],
-        string_table: &StringTable,
+        trace_context: &TraceContext,
     ) -> Result<Option<ParsedTraceEvent>, String> {
         // Use StreamingTraceParser to process the segment
-        let parsed_event = self.parser.process_segment(segment_data, string_table)?;
+        let parsed_event = self.parser.process_segment(segment_data, trace_context)?;
 
         if let Some(trace_event) = parsed_event {
             debug!(
@@ -65,12 +65,12 @@ impl Default for StreamingParserBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ghostscope_protocol::StringTable;
+    use ghostscope_protocol::TraceContext;
 
     #[test]
     fn test_streaming_parser_bridge() {
         let mut bridge = StreamingParserBridge::new();
-        let string_table = StringTable::new();
+        let trace_context = TraceContext::new();
 
         // Create test segment data with valid TraceEventHeader
         use ghostscope_protocol::{consts, TraceEventHeader};
@@ -87,7 +87,7 @@ mod tests {
         };
 
         // Process valid header segment
-        let result = bridge.process_ringbuf_segment(header_bytes, &string_table);
+        let result = bridge.process_ringbuf_segment(header_bytes, &trace_context);
 
         // Should succeed with valid header but return None (incomplete event)
         assert!(result.is_ok());

@@ -1,11 +1,12 @@
-//! Core protocol types and constants
+//! TypeKind enumeration and protocol constants
 
+use crate::type_info::TypeInfo;
 use serde::{Deserialize, Serialize};
 
-/// Variable type encoding - used by compiler and streaming parser
+/// Variable type kind - used by compiler and streaming parser for runtime classification
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum TypeEncoding {
+pub enum TypeKind {
     U8 = 0x01,
     U16 = 0x02,
     U32 = 0x03,
@@ -35,8 +36,8 @@ pub enum TypeEncoding {
     Error = 0x82,
 }
 
-impl TypeEncoding {
-    /// Convert a u8 value to TypeEncoding enum
+impl TypeKind {
+    /// Convert a u8 value to TypeKind enum
     pub fn from_u8(value: u8) -> Option<Self> {
         match value {
             x if x == (Self::U8 as u8) => Some(Self::U8),
@@ -63,6 +64,60 @@ impl TypeEncoding {
             x if x == (Self::OptimizedOut as u8) => Some(Self::OptimizedOut),
             x if x == (Self::Error as u8) => Some(Self::Error),
             _ => None,
+        }
+    }
+}
+
+impl From<&TypeInfo> for TypeKind {
+    /// Convert TypeInfo to TypeKind for runtime classification
+    fn from(type_info: &TypeInfo) -> Self {
+        match type_info {
+            TypeInfo::BaseType { size, encoding, .. } => {
+                // Use DWARF encoding constants for proper type mapping
+                match *encoding {
+                    1 => TypeKind::Pointer, // DW_ATE_address
+                    2 => TypeKind::Bool,    // DW_ATE_boolean
+                    4 => match size {
+                        // DW_ATE_float
+                        4 => TypeKind::F32,
+                        8 => TypeKind::F64,
+                        _ => TypeKind::F64, // Default to F64
+                    },
+                    5 => match size {
+                        // DW_ATE_signed
+                        1 => TypeKind::I8,
+                        2 => TypeKind::I16,
+                        4 => TypeKind::I32,
+                        8 => TypeKind::I64,
+                        _ => TypeKind::I64, // Default to I64
+                    },
+                    7 => match size {
+                        // DW_ATE_unsigned
+                        1 => TypeKind::U8,
+                        2 => TypeKind::U16,
+                        4 => TypeKind::U32,
+                        8 => TypeKind::U64,
+                        _ => TypeKind::U64, // Default to U64
+                    },
+                    6 => TypeKind::I8, // DW_ATE_signed_char
+                    8 => TypeKind::U8, // DW_ATE_unsigned_char
+                    _ => TypeKind::U8, // Default to byte for unknown encoding
+                }
+            }
+            TypeInfo::PointerType { .. } => TypeKind::Pointer,
+            TypeInfo::ArrayType { .. } => TypeKind::Array,
+            TypeInfo::StructType { .. } => TypeKind::Struct,
+            TypeInfo::UnionType { .. } => TypeKind::Union,
+            TypeInfo::EnumType { .. } => TypeKind::I32, // Treat enum as integer
+            TypeInfo::TypedefType {
+                underlying_type, ..
+            } => TypeKind::from(underlying_type.as_ref()),
+            TypeInfo::QualifiedType {
+                underlying_type, ..
+            } => TypeKind::from(underlying_type.as_ref()),
+            TypeInfo::FunctionType { .. } => TypeKind::Pointer,
+            TypeInfo::UnknownType { .. } => TypeKind::U8, // Default to byte for unknown types
+            TypeInfo::OptimizedOut { .. } => TypeKind::OptimizedOut,
         }
     }
 }
@@ -105,6 +160,14 @@ pub mod consts {
     /// Instruction header size
     pub const INSTRUCTION_HEADER_SIZE: usize =
         std::mem::size_of::<crate::trace_event::InstructionHeader>();
+
+    /// Print variable index data size (extended with type_index)
+    pub const PRINT_VARIABLE_INDEX_DATA_SIZE: usize =
+        std::mem::size_of::<crate::trace_event::PrintVariableIndexData>();
+
+    /// Print format data size
+    pub const PRINT_FORMAT_DATA_SIZE: usize =
+        std::mem::size_of::<crate::trace_event::PrintFormatData>();
 
     // TraceEventMessage field offsets
     pub const TRACE_EVENT_MESSAGE_TRACE_ID_OFFSET: usize = 0;

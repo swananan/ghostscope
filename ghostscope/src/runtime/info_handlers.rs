@@ -356,10 +356,7 @@ fn process_module_addresses_for_variables(
                 let var_info = VariableDebugInfo {
                     name: enhanced_var.name.clone(),
                     type_name: enhanced_var.type_name.clone(),
-                    type_pretty: enhanced_var
-                        .dwarf_type
-                        .as_ref()
-                        .map(|t| t.to_human_readable_with_size()),
+                    type_pretty: enhanced_var.dwarf_type.as_ref().map(|t| t.to_string()),
                     location_description,
                     size: enhanced_var.dwarf_type.as_ref().map(|t| t.size()),
                     scope_start: None, // VariableWithEvaluation doesn't have scope_ranges

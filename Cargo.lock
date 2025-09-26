@@ -675,6 +675,7 @@ dependencies = [
  "anyhow",
  "futures",
  "ghostscope-platform",
+ "ghostscope-protocol",
  "gimli 0.32.2",
  "libc",
  "memmap2",

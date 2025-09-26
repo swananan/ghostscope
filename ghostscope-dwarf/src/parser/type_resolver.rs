@@ -1,6 +1,6 @@
 //! DWARF type resolution utilities
 
-use crate::core::{DwarfType, TypeCache};
+use crate::{TypeCache, TypeInfo, TypeQualifier};
 use gimli::{EndianSlice, LittleEndian, UnitOffset};
 use std::collections::HashMap;
 use tracing::debug;
@@ -25,7 +25,7 @@ impl TypeResolver {
         dwarf: &gimli::Dwarf<EndianSlice<LittleEndian>>,
         unit: &gimli::Unit<EndianSlice<LittleEndian>>,
         type_offset: UnitOffset,
-    ) -> Option<DwarfType> {
+    ) -> Option<TypeInfo> {
         // Check cache first
         if let Some(cached_type) = self.type_cache.get(&type_offset) {
             return cached_type.clone();
@@ -75,7 +75,7 @@ impl TypeResolver {
         dwarf: &gimli::Dwarf<EndianSlice<LittleEndian>>,
         entry: &gimli::DebuggingInformationEntry<EndianSlice<LittleEndian>>,
         unit: &gimli::Unit<EndianSlice<LittleEndian>>,
-    ) -> Option<DwarfType> {
+    ) -> Option<TypeInfo> {
         let mut name = String::new();
         let mut byte_size = 0;
         let mut encoding = gimli::constants::DW_ATE_address; // Default
@@ -106,10 +106,10 @@ impl TypeResolver {
             name = format!("unknown_base_type_{byte_size}");
         }
 
-        Some(DwarfType::BaseType {
+        Some(TypeInfo::BaseType {
             name,
             size: byte_size,
-            encoding,
+            encoding: encoding.0 as u16,
         })
     }
 
@@ -119,7 +119,7 @@ impl TypeResolver {
         dwarf: &gimli::Dwarf<EndianSlice<LittleEndian>>,
         entry: &gimli::DebuggingInformationEntry<EndianSlice<LittleEndian>>,
         unit: &gimli::Unit<EndianSlice<LittleEndian>>,
-    ) -> Option<DwarfType> {
+    ) -> Option<TypeInfo> {
         let mut byte_size = 8; // Default pointer size for 64-bit
         let mut target_type = None;
 
@@ -140,11 +140,11 @@ impl TypeResolver {
             }
         }
 
-        let target = target_type.unwrap_or(DwarfType::UnknownType {
+        let target = target_type.unwrap_or(TypeInfo::UnknownType {
             name: "void".to_string(),
         });
 
-        Some(DwarfType::PointerType {
+        Some(TypeInfo::PointerType {
             target_type: Box::new(target),
             size: byte_size,
         })
@@ -156,7 +156,7 @@ impl TypeResolver {
         dwarf: &gimli::Dwarf<EndianSlice<LittleEndian>>,
         entry: &gimli::DebuggingInformationEntry<EndianSlice<LittleEndian>>,
         unit: &gimli::Unit<EndianSlice<LittleEndian>>,
-    ) -> Option<DwarfType> {
+    ) -> Option<TypeInfo> {
         let mut element_type = None;
         let mut total_size = None;
         let mut element_count = None;
@@ -198,11 +198,11 @@ impl TypeResolver {
             }
         }
 
-        let element = element_type.unwrap_or(DwarfType::UnknownType {
+        let element = element_type.unwrap_or(TypeInfo::UnknownType {
             name: "unknown".to_string(),
         });
 
-        Some(DwarfType::ArrayType {
+        Some(TypeInfo::ArrayType {
             element_type: Box::new(element),
             element_count,
             total_size,
@@ -215,7 +215,7 @@ impl TypeResolver {
         dwarf: &gimli::Dwarf<EndianSlice<LittleEndian>>,
         entry: &gimli::DebuggingInformationEntry<EndianSlice<LittleEndian>>,
         unit: &gimli::Unit<EndianSlice<LittleEndian>>,
-    ) -> Option<DwarfType> {
+    ) -> Option<TypeInfo> {
         let mut name = String::new();
         let mut byte_size = 0;
 
@@ -241,7 +241,7 @@ impl TypeResolver {
         }
 
         // TODO: Parse struct members from child DIEs
-        Some(DwarfType::StructType {
+        Some(TypeInfo::StructType {
             name,
             size: byte_size,
             members: Vec::new(),
@@ -254,7 +254,7 @@ impl TypeResolver {
         dwarf: &gimli::Dwarf<EndianSlice<LittleEndian>>,
         entry: &gimli::DebuggingInformationEntry<EndianSlice<LittleEndian>>,
         unit: &gimli::Unit<EndianSlice<LittleEndian>>,
-    ) -> Option<DwarfType> {
+    ) -> Option<TypeInfo> {
         let mut name = String::new();
         let mut byte_size = 0;
 
@@ -279,7 +279,7 @@ impl TypeResolver {
             name = format!("anonymous_union_{byte_size}");
         }
 
-        Some(DwarfType::UnionType {
+        Some(TypeInfo::UnionType {
             name,
             size: byte_size,
             members: Vec::new(),
@@ -292,7 +292,7 @@ impl TypeResolver {
         dwarf: &gimli::Dwarf<EndianSlice<LittleEndian>>,
         entry: &gimli::DebuggingInformationEntry<EndianSlice<LittleEndian>>,
         unit: &gimli::Unit<EndianSlice<LittleEndian>>,
-    ) -> Option<DwarfType> {
+    ) -> Option<TypeInfo> {
         let mut name = String::new();
         let mut byte_size = 4; // Default enum size
 
@@ -318,13 +318,13 @@ impl TypeResolver {
         }
 
         // Treat enum as signed integer base type
-        let base_type = DwarfType::BaseType {
+        let base_type = TypeInfo::BaseType {
             name: "int".to_string(),
             size: byte_size,
-            encoding: gimli::constants::DW_ATE_signed,
+            encoding: gimli::constants::DW_ATE_signed.0 as u16,
         };
 
-        Some(DwarfType::EnumType {
+        Some(TypeInfo::EnumType {
             name,
             size: byte_size,
             base_type: Box::new(base_type),
@@ -338,7 +338,7 @@ impl TypeResolver {
         dwarf: &gimli::Dwarf<EndianSlice<LittleEndian>>,
         entry: &gimli::DebuggingInformationEntry<EndianSlice<LittleEndian>>,
         unit: &gimli::Unit<EndianSlice<LittleEndian>>,
-    ) -> Option<DwarfType> {
+    ) -> Option<TypeInfo> {
         let mut name = String::new();
         let mut underlying_type = None;
 
@@ -359,11 +359,11 @@ impl TypeResolver {
             }
         }
 
-        let underlying = underlying_type.unwrap_or(DwarfType::UnknownType {
+        let underlying = underlying_type.unwrap_or(TypeInfo::UnknownType {
             name: "unknown".to_string(),
         });
 
-        Some(DwarfType::TypedefType {
+        Some(TypeInfo::TypedefType {
             name,
             underlying_type: Box::new(underlying),
         })
@@ -375,11 +375,11 @@ impl TypeResolver {
         dwarf: &gimli::Dwarf<EndianSlice<LittleEndian>>,
         entry: &gimli::DebuggingInformationEntry<EndianSlice<LittleEndian>>,
         unit: &gimli::Unit<EndianSlice<LittleEndian>>,
-    ) -> Option<DwarfType> {
+    ) -> Option<TypeInfo> {
         let qualifier = match entry.tag() {
-            gimli::DW_TAG_const_type => crate::core::TypeQualifier::Const,
-            gimli::DW_TAG_volatile_type => crate::core::TypeQualifier::Volatile,
-            gimli::DW_TAG_restrict_type => crate::core::TypeQualifier::Restrict,
+            gimli::DW_TAG_const_type => TypeQualifier::Const,
+            gimli::DW_TAG_volatile_type => TypeQualifier::Volatile,
+            gimli::DW_TAG_restrict_type => TypeQualifier::Restrict,
             _ => return None,
         };
 
@@ -395,11 +395,11 @@ impl TypeResolver {
             }
         }
 
-        let underlying = underlying_type.unwrap_or(DwarfType::UnknownType {
+        let underlying = underlying_type.unwrap_or(TypeInfo::UnknownType {
             name: "unknown".to_string(),
         });
 
-        Some(DwarfType::QualifiedType {
+        Some(TypeInfo::QualifiedType {
             qualifier,
             underlying_type: Box::new(underlying),
         })
@@ -411,7 +411,7 @@ impl TypeResolver {
         dwarf: &gimli::Dwarf<EndianSlice<LittleEndian>>,
         entry: &gimli::DebuggingInformationEntry<EndianSlice<LittleEndian>>,
         unit: &gimli::Unit<EndianSlice<LittleEndian>>,
-    ) -> Option<DwarfType> {
+    ) -> Option<TypeInfo> {
         let mut return_type = None;
 
         let mut attrs = entry.attrs();
@@ -430,7 +430,7 @@ impl TypeResolver {
 
         // TODO: Parse parameter types from child DIEs
 
-        Some(DwarfType::FunctionType {
+        Some(TypeInfo::FunctionType {
             return_type,
             parameters: Vec::new(),
         })

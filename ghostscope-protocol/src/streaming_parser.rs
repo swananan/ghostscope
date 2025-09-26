@@ -1,6 +1,7 @@
-use crate::string_table::StringTable;
+use crate::format_printer::FormatPrinter;
+use crate::trace_context::TraceContext;
 use crate::trace_event::*;
-use crate::TypeEncoding;
+use crate::TypeKind;
 use tracing::{debug, warn};
 
 /// Parsed instruction from trace event
@@ -11,12 +12,22 @@ pub enum ParsedInstruction {
     },
     PrintVariable {
         name: String,
-        type_encoding: TypeEncoding,
+        type_encoding: TypeKind,
         formatted_value: String,
         raw_data: Vec<u8>,
     },
     PrintFormat {
         formatted_output: String,
+    },
+    PrintComplexFormat {
+        formatted_output: String,
+    },
+    PrintComplexVariable {
+        name: String,
+        access_path: String,
+        type_index: u16,
+        formatted_value: String,
+        raw_data: Vec<u8>,
     },
     PrintVariableError {
         name: String,
@@ -138,7 +149,7 @@ pub enum ParseState {
 }
 
 /// Streaming parser for trace events received in segments
-/// StringTable is externally managed by the loader
+/// TraceContext is externally managed by the loader
 pub struct StreamingTraceParser {
     parse_state: ParseState,
     buffer: Vec<u8>,
@@ -152,7 +163,7 @@ impl Default for StreamingTraceParser {
 
 impl StreamingTraceParser {
     /// Create a new streaming parser
-    /// Note: StringTable is provided by loader during parsing
+    /// Note: TraceContext is provided by loader during parsing
     pub fn new() -> Self {
         Self {
             parse_state: ParseState::WaitingForHeader,
@@ -161,11 +172,11 @@ impl StreamingTraceParser {
     }
 
     /// Process incoming data segment and return complete trace events
-    /// StringTable is provided by the loader (uprobe config after compilation)
+    /// TraceContext is provided by the loader (uprobe config after compilation)
     pub fn process_segment(
         &mut self,
         data: &[u8],
-        string_table: &StringTable,
+        trace_context: &TraceContext,
     ) -> Result<Option<ParsedTraceEvent>, String> {
         debug!(
             "Processing segment of {} bytes, current state: {:?}",
@@ -224,7 +235,7 @@ impl StreamingTraceParser {
                 instructions,
             } => {
                 // Parse instruction from segment
-                let parsed_instruction = self.parse_instruction_segment(data, string_table)?;
+                let parsed_instruction = self.parse_instruction_segment(data, trace_context)?;
 
                 let mut new_instructions = instructions.clone();
 
@@ -266,7 +277,7 @@ impl StreamingTraceParser {
             ParseState::Complete => {
                 warn!("Received data while in Complete state, resetting");
                 self.parse_state = ParseState::WaitingForHeader;
-                self.process_segment(data, string_table)
+                self.process_segment(data, trace_context)
             }
         }
     }
@@ -275,7 +286,7 @@ impl StreamingTraceParser {
     fn parse_instruction_segment(
         &self,
         data: &[u8],
-        string_table: &StringTable,
+        trace_context: &TraceContext,
     ) -> Result<ParsedInstruction, String> {
         if data.len() < std::mem::size_of::<InstructionHeader>() {
             return Err("Instruction segment too small for header".to_string());
@@ -307,7 +318,7 @@ impl StreamingTraceParser {
                 };
 
                 let string_index = data_struct.string_index;
-                let string_content = string_table
+                let string_content = trace_context
                     .get_string(string_index)
                     .ok_or_else(|| format!("Invalid string index: {string_index}"))?;
 
@@ -326,7 +337,7 @@ impl StreamingTraceParser {
                 };
 
                 let var_name_index = data_struct.var_name_index;
-                let var_name = string_table
+                let var_name = trace_context
                     .get_variable_name(var_name_index)
                     .ok_or_else(|| format!("Invalid variable index: {var_name_index}"))?;
 
@@ -338,16 +349,39 @@ impl StreamingTraceParser {
                 let var_data =
                     &inst_data[var_data_offset..var_data_offset + data_struct.data_len as usize];
 
-                let type_encoding = TypeEncoding::from_u8(data_struct.type_encoding)
-                    .unwrap_or(TypeEncoding::Unknown);
+                let type_encoding =
+                    TypeKind::from_u8(data_struct.type_encoding).unwrap_or(TypeKind::Unknown);
 
-                // Use FormatPrinter for consistent formatting
-                let parsed_variable = crate::format_printer::ParsedVariable {
-                    var_name_index: data_struct.var_name_index,
-                    type_encoding,
-                    data: var_data.to_vec(),
+                // Use FormatPrinter with type context for enhanced formatting
+                let type_index = data_struct.type_index; // Copy to avoid packed field alignment issues
+                tracing::debug!("streaming_parser - type_index = {}", type_index);
+                tracing::debug!(
+                    "streaming_parser - TraceContext has {} types",
+                    trace_context.types.len()
+                );
+
+                let formatted_value = match trace_context.get_type(type_index) {
+                    Some(type_info) => {
+                        tracing::debug!(
+                            "streaming_parser - Found type_info for index {}",
+                            type_index
+                        );
+                        // Use advanced formatting with full type information
+                        crate::format_printer::FormatPrinter::format_data_with_type_info(
+                            var_data, type_info,
+                        )
+                    }
+                    None => {
+                        tracing::debug!(
+                            "streaming_parser - No type_info found for index {}",
+                            type_index
+                        );
+                        // Type information missing - this indicates a serious compiler bug
+                        format!(
+                            "<COMPILER_ERROR: type_index {type_index} not found in TraceContext>"
+                        )
+                    }
                 };
-                let formatted_value = crate::format_printer::FormatPrinter::format_variable_value(&parsed_variable);
 
                 Ok(ParsedInstruction::PrintVariable {
                     name: var_name.to_string(),
@@ -367,7 +401,7 @@ impl StreamingTraceParser {
                 };
 
                 let var_name_index = data_struct.var_name_index;
-                let var_name = string_table
+                let var_name = trace_context
                     .get_variable_name(var_name_index)
                     .ok_or_else(|| format!("Invalid variable index: {var_name_index}"))?;
 
@@ -421,11 +455,12 @@ impl StreamingTraceParser {
 
                     // Convert type encoding byte to enum
                     let type_encoding =
-                        TypeEncoding::from_u8(type_encoding_byte).unwrap_or(TypeEncoding::Unknown);
+                        TypeKind::from_u8(type_encoding_byte).unwrap_or(TypeKind::Unknown);
 
                     variables.push(crate::format_printer::ParsedVariable {
                         var_name_index,
                         type_encoding,
+                        type_index: None, // TODO: Extract type_index when format supports it
                         data: var_data,
                     });
                 }
@@ -434,10 +469,80 @@ impl StreamingTraceParser {
                 let formatted_output = crate::format_printer::FormatPrinter::format_print_data(
                     format_data.format_string_index,
                     &variables,
-                    string_table,
+                    trace_context,
                 );
 
                 Ok(ParsedInstruction::PrintFormat { formatted_output })
+            }
+
+            t if t == InstructionType::PrintComplexFormat as u8 => {
+                if inst_data.len() < std::mem::size_of::<PrintComplexFormatData>() {
+                    return Err("Invalid PrintComplexFormat data".to_string());
+                }
+
+                let format_data = unsafe {
+                    std::ptr::read_unaligned(inst_data.as_ptr() as *const PrintComplexFormatData)
+                };
+
+                // Parse complex variable data
+                let mut complex_variables = Vec::new();
+                let mut data_offset = std::mem::size_of::<PrintComplexFormatData>();
+
+                for _ in 0..format_data.arg_count {
+                    if data_offset + 6 > inst_data.len() {
+                        return Err("Invalid PrintComplexFormat argument data".to_string());
+                    }
+
+                    // Read complex variable header: var_name_index, type_index, access_path_len
+                    let var_name_index =
+                        u16::from_le_bytes([inst_data[data_offset], inst_data[data_offset + 1]]);
+                    let type_index = u16::from_le_bytes([
+                        inst_data[data_offset + 2],
+                        inst_data[data_offset + 3],
+                    ]);
+                    let access_path_len = inst_data[data_offset + 4] as usize;
+                    data_offset += 5; // 2+2+1 bytes
+
+                    // Read access path
+                    if data_offset + access_path_len > inst_data.len() {
+                        return Err("Invalid PrintComplexFormat access path".to_string());
+                    }
+                    let access_path_bytes = &inst_data[data_offset..data_offset + access_path_len];
+                    let access_path = String::from_utf8_lossy(access_path_bytes).to_string();
+                    data_offset += access_path_len;
+
+                    // Read data length
+                    if data_offset + 2 > inst_data.len() {
+                        return Err("Invalid PrintComplexFormat data length".to_string());
+                    }
+                    let data_len =
+                        u16::from_le_bytes([inst_data[data_offset], inst_data[data_offset + 1]]);
+                    data_offset += 2;
+
+                    // Read variable data
+                    if data_offset + data_len as usize > inst_data.len() {
+                        return Err("Invalid PrintComplexFormat variable data".to_string());
+                    }
+                    let var_data = inst_data[data_offset..data_offset + data_len as usize].to_vec();
+                    data_offset += data_len as usize;
+
+                    complex_variables.push(crate::format_printer::ParsedComplexVariable {
+                        var_name_index,
+                        type_index,
+                        access_path,
+                        data: var_data,
+                    });
+                }
+
+                // Use FormatPrinter to generate formatted output
+                let formatted_output =
+                    crate::format_printer::FormatPrinter::format_complex_print_data(
+                        format_data.format_string_index,
+                        &complex_variables,
+                        trace_context,
+                    );
+
+                Ok(ParsedInstruction::PrintComplexFormat { formatted_output })
             }
 
             t if t == InstructionType::Backtrace as u8 => {
@@ -447,6 +552,59 @@ impl StreamingTraceParser {
 
                 let depth = inst_data[0];
                 Ok(ParsedInstruction::Backtrace { depth })
+            }
+
+            t if t == InstructionType::PrintComplexVariable as u8 => {
+                if inst_data.len() < std::mem::size_of::<PrintComplexVariableData>() {
+                    return Err("Invalid PrintComplexVariable data".to_string());
+                }
+
+                let data_struct = unsafe {
+                    std::ptr::read_unaligned(inst_data.as_ptr() as *const PrintComplexVariableData)
+                };
+
+                // Extract variable name
+                let var_name_index = data_struct.var_name_index;
+                let var_name = trace_context
+                    .get_variable_name(var_name_index)
+                    .ok_or_else(|| format!("Invalid variable index: {var_name_index}"))?;
+
+                // Extract access path
+                let access_path_len = data_struct.access_path_len as usize;
+                let struct_size = std::mem::size_of::<PrintComplexVariableData>();
+
+                if inst_data.len() < struct_size + access_path_len {
+                    return Err("Invalid PrintComplexVariable access path length".to_string());
+                }
+
+                let access_path_bytes = &inst_data[struct_size..struct_size + access_path_len];
+                let access_path = String::from_utf8_lossy(access_path_bytes);
+
+                // Extract variable data
+                let var_data_offset = struct_size + access_path_len;
+                if inst_data.len() < var_data_offset + data_struct.data_len as usize {
+                    return Err("Invalid PrintComplexVariable data length".to_string());
+                }
+
+                let var_data =
+                    &inst_data[var_data_offset..var_data_offset + data_struct.data_len as usize];
+
+                // Get type information from TraceContext and format using FormatPrinter
+                let formatted_value = FormatPrinter::format_complex_variable(
+                    var_name_index,
+                    data_struct.type_index,
+                    &access_path,
+                    var_data,
+                    trace_context,
+                );
+
+                Ok(ParsedInstruction::PrintComplexVariable {
+                    name: var_name.to_string(),
+                    access_path: access_path.to_string(),
+                    type_index: data_struct.type_index,
+                    formatted_value,
+                    raw_data: var_data.to_vec(),
+                })
             }
 
             t if t == InstructionType::EndInstruction as u8 => {
@@ -499,6 +657,16 @@ impl ParsedInstruction {
                 format!("{name} ({type_encoding:?}): {formatted_value}")
             }
             ParsedInstruction::PrintFormat { formatted_output } => formatted_output.clone(),
+            ParsedInstruction::PrintComplexFormat { formatted_output } => formatted_output.clone(),
+            ParsedInstruction::PrintComplexVariable {
+                name: _,
+                access_path,
+                type_index: _,
+                formatted_value,
+                raw_data: _,
+            } => {
+                format!("{access_path}: {formatted_value}")
+            }
             ParsedInstruction::PrintVariableError {
                 name,
                 error_code: _,
@@ -530,6 +698,8 @@ impl ParsedInstruction {
             ParsedInstruction::PrintString { .. } => "PrintString".to_string(),
             ParsedInstruction::PrintVariable { .. } => "PrintVariable".to_string(),
             ParsedInstruction::PrintFormat { .. } => "PrintFormat".to_string(),
+            ParsedInstruction::PrintComplexFormat { .. } => "PrintComplexFormat".to_string(),
+            ParsedInstruction::PrintComplexVariable { .. } => "PrintComplexVariable".to_string(),
             ParsedInstruction::PrintVariableError { .. } => "PrintVariableError".to_string(),
             ParsedInstruction::Backtrace { .. } => "Backtrace".to_string(),
             ParsedInstruction::EndInstruction { .. } => "EndInstruction".to_string(),
@@ -543,8 +713,8 @@ mod tests {
 
     #[test]
     fn test_streaming_parser() {
-        let mut string_table = StringTable::new();
-        let _str_idx = string_table.add_string("hello world");
+        let mut trace_context = TraceContext::new();
+        let _str_idx = trace_context.add_string("hello world".to_string());
 
         let mut parser = StreamingTraceParser::new();
 
@@ -567,7 +737,9 @@ mod tests {
                 std::mem::size_of::<TraceEventHeader>(),
             )
         };
-        let result = parser.process_segment(header_bytes, &string_table).unwrap();
+        let result = parser
+            .process_segment(header_bytes, &trace_context)
+            .unwrap();
         assert!(result.is_none()); // Not complete yet
 
         // Test message segment
@@ -578,12 +750,12 @@ mod tests {
             )
         };
         let result = parser
-            .process_segment(message_bytes, &string_table)
+            .process_segment(message_bytes, &trace_context)
             .unwrap();
         assert!(result.is_none()); // Not complete yet
 
         // TODO: Add instruction segments and EndInstruction test
-        // This demonstrates the pattern: StringTable is managed externally by loader,
+        // This demonstrates the pattern: TraceContext is managed externally by loader,
         // not by the parser itself
     }
 }

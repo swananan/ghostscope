@@ -29,7 +29,6 @@ pub use core::{
     ComputeStep,
     DirectValueResult,
     DwarfError,
-    DwarfType,
     EvaluationResult,
     FunctionInfo,
     LocationResult,
@@ -39,6 +38,11 @@ pub use core::{
     Result,
     SourceLocation,
     VariableInfo,
+};
+
+// Re-export type definitions from protocol (avoiding circular dependencies)
+pub use ghostscope_protocol::{
+    EnumVariant, StructMember, TypeCache, TypeInfo, TypeKind, TypeQualifier,
 };
 
 // Re-export data types needed by external users

@@ -5,10 +5,9 @@
 
 use super::context::{CodeGenError, EbpfContext, Result};
 use ghostscope_dwarf::{
-    ComputeStep, DirectValueResult, DwarfType, EvaluationResult, LocationResult, MemoryAccessSize,
+    ComputeStep, DirectValueResult, EvaluationResult, LocationResult, MemoryAccessSize, TypeInfo,
     VariableWithEvaluation,
 };
-use ghostscope_protocol::TypeEncoding;
 use inkwell::values::{BasicValueEnum, IntValue, PointerValue};
 use tracing::{debug, warn};
 
@@ -17,7 +16,7 @@ impl<'ctx> EbpfContext<'ctx> {
     pub fn evaluate_result_to_llvm_value(
         &mut self,
         evaluation_result: &EvaluationResult,
-        dwarf_type: &DwarfType,
+        dwarf_type: &TypeInfo,
         var_name: &str,
         pc_address: u64,
     ) -> Result<BasicValueEnum<'ctx>> {
@@ -64,7 +63,7 @@ impl<'ctx> EbpfContext<'ctx> {
     }
 
     /// Convert DWARF type size to MemoryAccessSize
-    fn dwarf_type_to_memory_access_size(&self, dwarf_type: &DwarfType) -> MemoryAccessSize {
+    fn dwarf_type_to_memory_access_size(&self, dwarf_type: &TypeInfo) -> MemoryAccessSize {
         let size = self.get_dwarf_type_size(dwarf_type);
         match size {
             1 => MemoryAccessSize::U8,
@@ -119,7 +118,7 @@ impl<'ctx> EbpfContext<'ctx> {
         &mut self,
         location: &LocationResult,
         pt_regs_ptr: PointerValue<'ctx>,
-        dwarf_type: &DwarfType,
+        dwarf_type: &TypeInfo,
     ) -> Result<BasicValueEnum<'ctx>> {
         match location {
             LocationResult::Address(addr) => {
@@ -387,6 +386,38 @@ impl<'ctx> EbpfContext<'ctx> {
         }
     }
 
+    /// Query DWARF for complex expression (supports member access, array access, etc.)
+    pub fn query_dwarf_for_complex_expr(
+        &mut self,
+        expr: &crate::script::Expr,
+    ) -> Result<Option<VariableWithEvaluation>> {
+        use crate::script::Expr;
+
+        match expr {
+            // Simple variable lookup
+            Expr::Variable(var_name) => self.query_dwarf_for_variable(var_name),
+
+            // Member access: obj.field
+            Expr::MemberAccess(obj_expr, field_name) => {
+                self.query_dwarf_for_member_access(obj_expr, field_name)
+            }
+
+            // Array access: arr[index]
+            Expr::ArrayAccess(array_expr, index_expr) => {
+                self.query_dwarf_for_array_access(array_expr, index_expr)
+            }
+
+            // Chain access: person.name.first
+            Expr::ChainAccess(chain) => self.query_dwarf_for_chain_access(chain),
+
+            // Pointer dereference: *ptr
+            Expr::PointerDeref(expr) => self.query_dwarf_for_pointer_deref(expr),
+
+            // Other expression types are not supported for DWARF queries
+            _ => Ok(None),
+        }
+    }
+
     /// Query DWARF for variable information
     pub fn query_dwarf_for_variable(
         &mut self,
@@ -436,77 +467,440 @@ impl<'ctx> EbpfContext<'ctx> {
         }
     }
 
-    /// Convert DWARF type to protocol encoding
+    /// Get DWARF type size in bytes
     #[allow(clippy::only_used_in_recursion)]
-    pub fn dwarf_type_to_protocol_encoding(&self, dwarf_type: &DwarfType) -> TypeEncoding {
+    pub fn get_dwarf_type_size(&self, dwarf_type: &TypeInfo) -> u64 {
         match dwarf_type {
-            DwarfType::BaseType { size, encoding, .. } => {
-                // Use numeric constants instead of gimli constants for now
-                // Consider both encoding and size for proper type mapping
-                match encoding.0 {
-                    1 => TypeEncoding::Pointer, // DW_ATE_address
-                    2 => TypeEncoding::Bool,    // DW_ATE_boolean
-                    4 => match size {
-                        // DW_ATE_float
-                        4 => TypeEncoding::F32,
-                        8 => TypeEncoding::F64,
-                        _ => TypeEncoding::F64, // Default to F64
-                    },
-                    5 => match size {
-                        // DW_ATE_signed
-                        1 => TypeEncoding::I8,
-                        2 => TypeEncoding::I16,
-                        4 => TypeEncoding::I32,
-                        8 => TypeEncoding::I64,
-                        _ => TypeEncoding::I64, // Default to I64
-                    },
-                    7 => match size {
-                        // DW_ATE_unsigned
-                        1 => TypeEncoding::U8,
-                        2 => TypeEncoding::U16,
-                        4 => TypeEncoding::U32,
-                        8 => TypeEncoding::U64,
-                        _ => TypeEncoding::U64, // Default to U64
-                    },
-                    6 => TypeEncoding::I8, // DW_ATE_signed_char
-                    8 => TypeEncoding::U8, // DW_ATE_unsigned_char
-                    _ => TypeEncoding::U8, // Default to byte for unknown encoding
-                }
-            }
-            DwarfType::PointerType { .. } => TypeEncoding::Pointer,
-            DwarfType::ArrayType { .. } => TypeEncoding::Array,
-            DwarfType::StructType { .. } => TypeEncoding::Struct,
-            DwarfType::UnionType { .. } => TypeEncoding::Union,
-            DwarfType::EnumType { .. } => TypeEncoding::I32, // Treat enum as integer
-            DwarfType::TypedefType {
+            TypeInfo::BaseType { size, .. } => *size,
+            TypeInfo::PointerType { size, .. } => *size,
+            TypeInfo::ArrayType { total_size, .. } => total_size.unwrap_or(0),
+            TypeInfo::StructType { size, .. } => *size,
+            TypeInfo::UnionType { size, .. } => *size,
+            TypeInfo::EnumType { size, .. } => *size,
+            TypeInfo::TypedefType {
                 underlying_type, ..
-            } => self.dwarf_type_to_protocol_encoding(underlying_type),
-            DwarfType::QualifiedType {
+            } => self.get_dwarf_type_size(underlying_type),
+            TypeInfo::QualifiedType {
                 underlying_type, ..
-            } => self.dwarf_type_to_protocol_encoding(underlying_type),
-            DwarfType::FunctionType { .. } => TypeEncoding::Pointer,
-            DwarfType::UnknownType { .. } => TypeEncoding::U8, // Default to byte for unknown types
+            } => self.get_dwarf_type_size(underlying_type),
+            TypeInfo::FunctionType { .. } => 8, // Function pointer size
+            TypeInfo::UnknownType { .. } => 0,
+            TypeInfo::OptimizedOut { .. } => 0, // Optimized out has no size
         }
     }
 
-    /// Get DWARF type size in bytes
+    /// Query DWARF for member access (obj.field)
+    pub fn query_dwarf_for_member_access(
+        &mut self,
+        obj_expr: &crate::script::Expr,
+        field_name: &str,
+    ) -> Result<Option<VariableWithEvaluation>> {
+        // First, resolve the base object
+        let base_var = match self.query_dwarf_for_complex_expr(obj_expr)? {
+            Some(var) => var,
+            None => return Ok(None),
+        };
+
+        // Get the object's type
+        let obj_type = match &base_var.dwarf_type {
+            Some(type_info) => type_info,
+            None => return Ok(None),
+        };
+
+        // Find the member in the struct type
+        let member_info = self.find_struct_member(obj_type, field_name)?;
+        let member_info = match member_info {
+            Some(info) => info,
+            None => return Ok(None),
+        };
+
+        // Create a new VariableWithEvaluation for the member
+        let member_var = VariableWithEvaluation {
+            name: format!("{}.{}", self.expr_to_string(obj_expr), field_name),
+            type_name: self.type_info_to_name(&member_info.member_type),
+            dwarf_type: Some(member_info.member_type.clone()),
+            evaluation_result: self
+                .compute_member_address(&base_var.evaluation_result, member_info.offset)?,
+            scope_depth: base_var.scope_depth,
+            is_parameter: false,
+            is_artificial: false,
+        };
+
+        Ok(Some(member_var))
+    }
+
+    /// Query DWARF for array access (arr[index])
+    pub fn query_dwarf_for_array_access(
+        &mut self,
+        array_expr: &crate::script::Expr,
+        _index_expr: &crate::script::Expr,
+    ) -> Result<Option<VariableWithEvaluation>> {
+        // First, resolve the base array
+        let base_var = match self.query_dwarf_for_complex_expr(array_expr)? {
+            Some(var) => var,
+            None => return Ok(None),
+        };
+
+        // Get the array's type
+        let array_type = match &base_var.dwarf_type {
+            Some(type_info) => type_info,
+            None => return Ok(None),
+        };
+
+        // Extract element type from array type
+        let element_type = match array_type {
+            TypeInfo::ArrayType { element_type, .. } => element_type.as_ref().clone(),
+            _ => return Ok(None), // Not an array type
+        };
+
+        // Calculate element size for address computation
+        let element_size = element_type.size();
+
+        // For dynamic indexing, we need to create a computed location that includes offset calculation
+        // The evaluation result should represent: base_address + (index * element_size)
+        let element_evaluation_result = match &base_var.evaluation_result {
+            EvaluationResult::DirectValue(_) => {
+                // If base is a value, we can't do array indexing
+                return Ok(None);
+            }
+            EvaluationResult::MemoryLocation(location) => {
+                // Create a computed location that includes the array indexing calculation
+                let array_access_steps = self.create_array_access_steps(location, element_size);
+                EvaluationResult::MemoryLocation(LocationResult::ComputedLocation {
+                    steps: array_access_steps,
+                })
+            }
+            EvaluationResult::Optimized => {
+                return Ok(None);
+            }
+            EvaluationResult::Composite(_) => {
+                // Array access on composite locations is complex, skip for now
+                return Ok(None);
+            }
+        };
+
+        let element_var = VariableWithEvaluation {
+            name: format!("{}[index]", self.expr_to_string(array_expr)),
+            type_name: self.type_info_to_name(&element_type),
+            dwarf_type: Some(element_type),
+            evaluation_result: element_evaluation_result,
+            scope_depth: base_var.scope_depth,
+            is_parameter: false,
+            is_artificial: false,
+        };
+
+        Ok(Some(element_var))
+    }
+
+    /// Query DWARF for chain access (person.name.first)
+    pub fn query_dwarf_for_chain_access(
+        &mut self,
+        chain: &[String],
+    ) -> Result<Option<VariableWithEvaluation>> {
+        if chain.is_empty() {
+            return Ok(None);
+        }
+
+        // Start with the first variable in the chain
+        let mut current_var = match self.query_dwarf_for_variable(&chain[0])? {
+            Some(var) => var,
+            None => return Ok(None),
+        };
+
+        // Follow the chain for remaining members
+        for field_name in chain.iter().skip(1) {
+            let current_type = match &current_var.dwarf_type {
+                Some(type_info) => type_info,
+                None => return Ok(None),
+            };
+
+            let member_info = self.find_struct_member(current_type, field_name)?;
+            let member_info = match member_info {
+                Some(info) => info,
+                None => return Ok(None),
+            };
+
+            // Update current_var to point to the member
+            current_var = VariableWithEvaluation {
+                name: format!("{}.{}", current_var.name, field_name),
+                type_name: self.type_info_to_name(&member_info.member_type),
+                dwarf_type: Some(member_info.member_type.clone()),
+                evaluation_result: self
+                    .compute_member_address(&current_var.evaluation_result, member_info.offset)?,
+                scope_depth: current_var.scope_depth,
+                is_parameter: false,
+                is_artificial: false,
+            };
+        }
+
+        Ok(Some(current_var))
+    }
+
+    /// Query DWARF for pointer dereference (*ptr)
+    pub fn query_dwarf_for_pointer_deref(
+        &mut self,
+        expr: &crate::script::Expr,
+    ) -> Result<Option<VariableWithEvaluation>> {
+        // First, resolve the pointer expression
+        let ptr_var = match self.query_dwarf_for_complex_expr(expr)? {
+            Some(var) => var,
+            None => return Ok(None),
+        };
+
+        // Get the pointer's type
+        let ptr_type = match &ptr_var.dwarf_type {
+            Some(type_info) => type_info,
+            None => return Ok(None),
+        };
+
+        // Extract pointed-to type from pointer type
+        let pointed_type = match ptr_type {
+            TypeInfo::PointerType { target_type, .. } => target_type.as_ref().clone(),
+            _ => return Ok(None), // Not a pointer type
+        };
+
+        // Create dereferenced variable
+        let deref_var = VariableWithEvaluation {
+            name: format!("*{}", self.expr_to_string(expr)),
+            type_name: self.type_info_to_name(&pointed_type),
+            dwarf_type: Some(pointed_type),
+            evaluation_result: self.compute_pointer_dereference(&ptr_var.evaluation_result)?,
+            scope_depth: ptr_var.scope_depth,
+            is_parameter: false,
+            is_artificial: false,
+        };
+
+        Ok(Some(deref_var))
+    }
+
+    /// Helper: Find struct member information by name
     #[allow(clippy::only_used_in_recursion)]
-    pub fn get_dwarf_type_size(&self, dwarf_type: &DwarfType) -> u64 {
-        match dwarf_type {
-            DwarfType::BaseType { size, .. } => *size,
-            DwarfType::PointerType { size, .. } => *size,
-            DwarfType::ArrayType { total_size, .. } => total_size.unwrap_or(0),
-            DwarfType::StructType { size, .. } => *size,
-            DwarfType::UnionType { size, .. } => *size,
-            DwarfType::EnumType { size, .. } => *size,
-            DwarfType::TypedefType {
+    fn find_struct_member(
+        &self,
+        type_info: &TypeInfo,
+        field_name: &str,
+    ) -> Result<Option<StructMemberInfo>> {
+        match type_info {
+            TypeInfo::StructType { members, .. } => {
+                for member in members {
+                    if member.name == field_name {
+                        return Ok(Some(StructMemberInfo {
+                            offset: member.offset,
+                            member_type: member.member_type.clone(),
+                        }));
+                    }
+                }
+                Ok(None)
+            }
+            // Handle typedef/qualified types by following the underlying type
+            TypeInfo::TypedefType {
                 underlying_type, ..
-            } => self.get_dwarf_type_size(underlying_type),
-            DwarfType::QualifiedType {
+            } => self.find_struct_member(underlying_type, field_name),
+            TypeInfo::QualifiedType {
                 underlying_type, ..
-            } => self.get_dwarf_type_size(underlying_type),
-            DwarfType::FunctionType { .. } => 8, // Function pointer size
-            DwarfType::UnknownType { .. } => 0,
+            } => self.find_struct_member(underlying_type, field_name),
+            _ => Ok(None),
         }
     }
+
+    /// Helper: Compute member address by adding offset to base address
+    fn compute_member_address(
+        &self,
+        base_result: &EvaluationResult,
+        member_offset: u64,
+    ) -> Result<EvaluationResult> {
+        use ghostscope_dwarf::{ComputeStep, LocationResult};
+
+        match base_result {
+            EvaluationResult::MemoryLocation(LocationResult::Address(base_addr)) => {
+                // Simple case: base is absolute address
+                Ok(EvaluationResult::MemoryLocation(LocationResult::Address(
+                    base_addr + member_offset,
+                )))
+            }
+            EvaluationResult::MemoryLocation(LocationResult::RegisterAddress {
+                register,
+                offset,
+                size,
+            }) => {
+                // Add member offset to existing register offset
+                let new_offset = offset.unwrap_or(0) + member_offset as i64;
+                Ok(EvaluationResult::MemoryLocation(
+                    LocationResult::RegisterAddress {
+                        register: *register,
+                        offset: Some(new_offset),
+                        size: *size,
+                    },
+                ))
+            }
+            // For computed locations, add offset to the computation
+            EvaluationResult::MemoryLocation(LocationResult::ComputedLocation { steps }) => {
+                let mut new_steps = steps.clone();
+                new_steps.push(ComputeStep::PushConstant(member_offset as i64));
+                new_steps.push(ComputeStep::Add);
+                Ok(EvaluationResult::MemoryLocation(
+                    LocationResult::ComputedLocation { steps: new_steps },
+                ))
+            }
+            // For direct values, we can't compute member access
+            _ => Err(CodeGenError::NotImplemented(
+                "Member access on direct values not supported".to_string(),
+            )),
+        }
+    }
+
+    /// Helper: Compute pointer dereference
+    fn compute_pointer_dereference(
+        &self,
+        ptr_result: &EvaluationResult,
+    ) -> Result<EvaluationResult> {
+        use ghostscope_dwarf::{ComputeStep, LocationResult, MemoryAccessSize};
+
+        match ptr_result {
+            // If the pointer is a memory location, we need to read that location first,
+            // then use the result as an address for another read
+            EvaluationResult::MemoryLocation(location) => {
+                let steps = [
+                    self.location_to_compute_steps(location),
+                    // Then dereference the pointer (read from the computed address)
+                    vec![ComputeStep::Dereference {
+                        size: MemoryAccessSize::U64,
+                    }],
+                ]
+                .concat();
+
+                Ok(EvaluationResult::MemoryLocation(
+                    LocationResult::ComputedLocation { steps },
+                ))
+            }
+            // If the pointer is a direct value, use it as an address
+            EvaluationResult::DirectValue(_) => {
+                // The pointer value itself becomes the address to read from
+                // This is complex to implement generically, return error for now
+                Err(CodeGenError::NotImplemented(
+                    "Pointer dereference of direct values not yet implemented".to_string(),
+                ))
+            }
+            _ => Err(CodeGenError::NotImplemented(
+                "Unsupported pointer dereference scenario".to_string(),
+            )),
+        }
+    }
+
+    /// Helper: Convert location to compute steps
+    fn location_to_compute_steps(&self, location: &LocationResult) -> Vec<ComputeStep> {
+        use ghostscope_dwarf::{ComputeStep, LocationResult};
+
+        match location {
+            LocationResult::Address(addr) => {
+                vec![ComputeStep::PushConstant(*addr as i64)]
+            }
+            LocationResult::RegisterAddress {
+                register, offset, ..
+            } => {
+                let mut steps = vec![ComputeStep::LoadRegister(*register)];
+                if let Some(offset) = offset {
+                    steps.push(ComputeStep::PushConstant(*offset));
+                    steps.push(ComputeStep::Add);
+                }
+                steps
+            }
+            LocationResult::ComputedLocation { steps } => steps.clone(),
+        }
+    }
+
+    /// Helper: Convert expression to string for debugging
+    #[allow(clippy::only_used_in_recursion)]
+    fn expr_to_string(&self, expr: &crate::script::Expr) -> String {
+        use crate::script::Expr;
+
+        match expr {
+            Expr::Variable(name) => name.clone(),
+            Expr::MemberAccess(obj, field) => format!("{}.{}", self.expr_to_string(obj), field),
+            Expr::ArrayAccess(arr, _) => format!("{}[index]", self.expr_to_string(arr)),
+            Expr::ChainAccess(chain) => chain.join("."),
+            Expr::PointerDeref(expr) => format!("*{}", self.expr_to_string(expr)),
+            _ => "expr".to_string(),
+        }
+    }
+
+    /// Helper: Extract readable name from TypeInfo
+    #[allow(clippy::only_used_in_recursion)]
+    fn type_info_to_name(&self, type_info: &TypeInfo) -> String {
+        match type_info {
+            TypeInfo::BaseType { name, .. } => name.clone(),
+            TypeInfo::PointerType { target_type, .. } => {
+                format!("{}*", self.type_info_to_name(target_type))
+            }
+            TypeInfo::ArrayType {
+                element_type,
+                element_count,
+                ..
+            } => {
+                if let Some(count) = element_count {
+                    format!("{}[{}]", self.type_info_to_name(element_type), count)
+                } else {
+                    format!("{}[]", self.type_info_to_name(element_type))
+                }
+            }
+            TypeInfo::StructType { name, .. } => format!("struct {}", name),
+            TypeInfo::UnionType { name, .. } => format!("union {}", name),
+            TypeInfo::EnumType { name, .. } => format!("enum {}", name),
+            TypeInfo::TypedefType { name, .. } => name.clone(),
+            TypeInfo::QualifiedType {
+                underlying_type, ..
+            } => self.type_info_to_name(underlying_type),
+            TypeInfo::FunctionType { .. } => "function".to_string(),
+            TypeInfo::UnknownType { name } => name.clone(),
+            TypeInfo::OptimizedOut { name } => format!("<optimized_out> {name}"),
+        }
+    }
+
+    /// Create computation steps for array access: base_address + (index * element_size)
+    fn create_array_access_steps(
+        &self,
+        base_location: &LocationResult,
+        element_size: u64,
+    ) -> Vec<ComputeStep> {
+        let mut steps = Vec::new();
+
+        // First, get the base address computation steps
+        match base_location {
+            LocationResult::Address(addr) => {
+                steps.push(ComputeStep::PushConstant(*addr as i64));
+            }
+            LocationResult::RegisterAddress {
+                register, offset, ..
+            } => {
+                steps.push(ComputeStep::LoadRegister(*register));
+                if let Some(offset) = offset {
+                    if *offset != 0 {
+                        steps.push(ComputeStep::PushConstant(*offset));
+                        steps.push(ComputeStep::Add);
+                    }
+                }
+            }
+            LocationResult::ComputedLocation { steps: base_steps } => {
+                steps.extend(base_steps.clone());
+            }
+        }
+
+        // Now add array indexing computation: current_address + (index * element_size)
+        // Note: For now, we assume index is 0 as a placeholder.
+        // In a full implementation, the index would need to be evaluated at runtime.
+        // This is a simplified version that assumes constant index of 0.
+        steps.push(ComputeStep::PushConstant(0)); // index (placeholder)
+        steps.push(ComputeStep::PushConstant(element_size as i64)); // element_size
+        steps.push(ComputeStep::Mul); // index * element_size
+        steps.push(ComputeStep::Add); // base_address + (index * element_size)
+
+        steps
+    }
+}
+
+/// Information about a struct member
+#[derive(Debug, Clone)]
+struct StructMemberInfo {
+    offset: u64,
+    member_type: TypeInfo,
 }

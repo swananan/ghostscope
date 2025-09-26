@@ -85,7 +85,7 @@ pub struct EbpfContext<'ctx> {
     pub current_compile_time_context: Option<CompileTimeContext>, // PC address and module for DWARF queries
 
     // === New instruction-based compilation system ===
-    pub string_table: ghostscope_protocol::StringTable, // String table for optimized transmission
+    pub trace_context: ghostscope_protocol::TraceContext, // Trace context for optimized transmission
 }
 
 // Temporary alias for backward compatibility during refactoring
@@ -170,7 +170,7 @@ impl<'ctx> EbpfContext<'ctx> {
             current_compile_time_context: None,
 
             // Initialize new instruction-based compilation system
-            string_table: ghostscope_protocol::StringTable::new(),
+            trace_context: ghostscope_protocol::TraceContext::new(),
         })
     }
 
@@ -243,8 +243,8 @@ impl<'ctx> EbpfContext<'ctx> {
     }
 
     /// Get the string table after compilation
-    pub fn get_string_table(&self) -> ghostscope_protocol::StringTable {
-        self.string_table.clone()
+    pub fn get_trace_context(&self) -> ghostscope_protocol::TraceContext {
+        self.trace_context.clone()
     }
 
     /// Get pt_regs parameter from current function
@@ -273,7 +273,7 @@ impl<'ctx> EbpfContext<'ctx> {
         target_pid: Option<u32>,
         compile_time_pc: Option<u64>,
         module_path: Option<&str>,
-    ) -> Result<(FunctionValue<'ctx>, ghostscope_protocol::StringTable)> {
+    ) -> Result<(FunctionValue<'ctx>, ghostscope_protocol::TraceContext)> {
         info!(
             "Starting program compilation with function: {}",
             function_name
@@ -321,11 +321,11 @@ impl<'ctx> EbpfContext<'ctx> {
         let variable_types = std::collections::HashMap::new(); // Empty for now, will be populated by codegen
 
         // Generate staged transmission code using new architecture
-        let string_table =
+        let trace_context =
             self.compile_program_with_staged_transmission(&program, variable_types)?;
         info!(
-            "Generated StringTable with {} strings",
-            string_table.string_count()
+            "Generated TraceContext with {} strings",
+            trace_context.string_count()
         );
 
         // Return success
@@ -336,10 +336,10 @@ impl<'ctx> EbpfContext<'ctx> {
             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
 
         info!(
-            "Successfully compiled program with function: {} and StringTable",
+            "Successfully compiled program with function: {} and TraceContext",
             function_name
         );
-        Ok((main_function, string_table))
+        Ok((main_function, trace_context))
     }
 
     /// Create the main eBPF function

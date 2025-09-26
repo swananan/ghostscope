@@ -1,4 +1,4 @@
-use crate::TypeEncoding;
+use crate::TypeKind;
 use serde::{Deserialize, Serialize};
 
 /// Each trace event contains multiple instructions followed by EndInstruction
@@ -22,11 +22,13 @@ pub struct TraceEventMessage {
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum InstructionType {
-    PrintStringIndex = 0x01,   // print "string" (using string table index)
-    PrintVariableIndex = 0x02, // print variable (using variable name index)
-    PrintFormat = 0x04,        // print "format {} {}", var1, var2 (formatted print)
-    PrintVariableError = 0x12, // variable read error (using variable name index)
-    Backtrace = 0x10,          // backtrace instruction
+    PrintStringIndex = 0x01,     // print "string" (using string table index)
+    PrintVariableIndex = 0x02,   // print variable (using variable name index)
+    PrintComplexVariable = 0x03, // print complex variable (with full type info)
+    PrintFormat = 0x04,          // print "format {} {}", var1, var2 (formatted print)
+    PrintComplexFormat = 0x05,   // print with complex variables in format args
+    PrintVariableError = 0x12,   // variable read error (using variable name index)
+    Backtrace = 0x10,            // backtrace instruction
 
     // Control instructions
     EndInstruction = 0xFF, // marks end of instruction sequence
@@ -53,10 +55,23 @@ pub struct PrintStringIndexData {
 #[derive(Debug, Clone, Copy)]
 pub struct PrintVariableIndexData {
     pub var_name_index: u16, // Index into variable name table
-    pub type_encoding: u8,   // TypeEncoding
+    pub type_encoding: u8,   // TypeKind
     pub data_len: u16,       // Length of variable data that follows
-    pub reserved: u8,
-    // Followed by variable data
+    pub type_index: u16,     // Index into type table (new field)
+    pub reserved: u8,        // Reduced reserved space
+                             // Followed by variable data
+}
+
+/// Print complex variable instruction data (enhanced with full type info)
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct PrintComplexVariableData {
+    pub var_name_index: u16, // Index into variable name table
+    pub type_index: u16,     // Index into type table for complete type information
+    pub access_path_len: u8, // Length of access path description (e.g., "person.name.first")
+    pub reserved: u8,        // Padding for alignment
+    pub data_len: u16,       // Length of variable data that follows
+                             // Followed by access_path (UTF-8 string) then variable data
 }
 
 /// Format print instruction data
@@ -67,6 +82,16 @@ pub struct PrintFormatData {
     pub arg_count: u8,            // Number of arguments
     pub reserved: u8,             // Padding for alignment
                                   // Followed by argument data: [var_name_index:u16, type_encoding:u8, data_len:u16, data:bytes] * arg_count
+}
+
+/// Complex format print instruction data (with full type info)
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct PrintComplexFormatData {
+    pub format_string_index: u16, // Index into string table for format string
+    pub arg_count: u8,            // Number of arguments
+    pub reserved: u8,             // Padding for alignment
+                                  // Followed by complex argument data: [var_name_index:u16, type_index:u16, access_path_len:u8, access_path:bytes, data_len:u16, data:bytes] * arg_count
 }
 
 /// Variable read error instruction data
@@ -105,7 +130,8 @@ pub enum Instruction {
     },
     PrintVariableIndex {
         var_name_index: u16,
-        type_encoding: TypeEncoding,
+        type_encoding: TypeKind,
+        type_index: u16, // Index into type table (new field)
         data: Vec<u8>,
     },
     PrintFormat {
@@ -131,7 +157,8 @@ pub enum Instruction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VariableData {
     pub var_name_index: u16,
-    pub type_encoding: TypeEncoding,
+    pub type_encoding: TypeKind,
+    pub type_index: u16, // Index into type table (new field)
     pub data: Vec<u8>,
 }
 

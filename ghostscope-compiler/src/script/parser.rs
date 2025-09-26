@@ -386,6 +386,7 @@ fn parse_factor(pair: Pair<Rule>) -> Result<Expr> {
                     let name = inner.as_str().to_string();
                     Ok(Expr::Variable(name))
                 }
+                Rule::array_access => parse_array_access(inner),
                 Rule::member_access => {
                     let mut parts = inner.into_inner();
                     let base = parts.next().unwrap().as_str().to_string();
@@ -481,6 +482,11 @@ fn parse_print_content(pair: Pair<Rule>) -> Result<PrintStatement> {
             let var_name = inner.as_str().to_string();
             Ok(PrintStatement::Variable(var_name))
         }
+        Rule::complex_variable => {
+            // Parse complex variable expression (person.name, arr[0], etc.)
+            let expr = parse_complex_variable(inner)?;
+            Ok(PrintStatement::ComplexVariable(expr))
+        }
         Rule::format_expr => {
             // Format string with arguments
             let mut inner_pairs = inner.into_inner();
@@ -507,4 +513,81 @@ fn parse_print_content(pair: Pair<Rule>) -> Result<PrintStatement> {
         }
         _ => Err(ParseError::UnexpectedToken(inner.as_rule())),
     }
+}
+
+// Parse complex variable expressions (person.name, arr[0], etc.)
+fn parse_complex_variable(pair: Pair<Rule>) -> Result<Expr> {
+    debug!(
+        "parse_complex_variable: {:?} = \"{}\"",
+        pair.as_rule(),
+        pair.as_str().trim()
+    );
+
+    let inner = pair.into_inner().next().unwrap();
+    match inner.as_rule() {
+        Rule::chain_access => parse_chain_access(inner),
+        Rule::array_access => parse_array_access(inner),
+        Rule::member_access => parse_member_access(inner),
+        Rule::pointer_deref => parse_pointer_deref(inner),
+        _ => Err(ParseError::UnexpectedToken(inner.as_rule())),
+    }
+}
+
+// Parse chain access: person.name.first
+fn parse_chain_access(pair: Pair<Rule>) -> Result<Expr> {
+    let mut chain = Vec::new();
+    for inner_pair in pair.into_inner() {
+        match inner_pair.as_rule() {
+            Rule::identifier => {
+                chain.push(inner_pair.as_str().to_string());
+            }
+            Rule::expr => {
+                // This would be for arr[index] part in chain_access
+                // For now, we'll keep it simple and just handle the identifier chain
+                // TODO: Handle array access within chain access
+            }
+            _ => {}
+        }
+    }
+
+    if chain.is_empty() {
+        return Err(ParseError::InvalidExpression);
+    }
+
+    Ok(Expr::ChainAccess(chain))
+}
+
+// Parse array access: arr[index]
+fn parse_array_access(pair: Pair<Rule>) -> Result<Expr> {
+    let mut inner_pairs = pair.into_inner();
+    let array_name = inner_pairs.next().unwrap();
+    let index_expr = inner_pairs.next().unwrap();
+
+    let array_expr = Box::new(Expr::Variable(array_name.as_str().to_string()));
+    let index_expr = Box::new(parse_expr(index_expr)?);
+
+    Ok(Expr::ArrayAccess(array_expr, index_expr))
+}
+
+// Parse member access: person.name
+fn parse_member_access(pair: Pair<Rule>) -> Result<Expr> {
+    let mut parts = pair.into_inner();
+    let base = parts.next().unwrap().as_str().to_string();
+    let member = parts.next().unwrap().as_str().to_string();
+
+    // Copy base to avoid move errors
+    let base_clone = base.clone();
+    let mut expr = Expr::Variable(base_clone);
+
+    for part in parts {
+        expr = Expr::MemberAccess(Box::new(expr), part.as_str().to_string());
+    }
+
+    Ok(Expr::MemberAccess(Box::new(Expr::Variable(base)), member))
+}
+
+// Parse pointer dereference: *ptr
+fn parse_pointer_deref(pair: Pair<Rule>) -> Result<Expr> {
+    let var = pair.into_inner().next().unwrap().as_str().to_string();
+    Ok(Expr::PointerDeref(Box::new(Expr::Variable(var))))
 }

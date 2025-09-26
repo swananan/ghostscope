@@ -170,6 +170,18 @@ impl MemoryAccessSize {
             MemoryAccessSize::U64 => 8,
         }
     }
+
+    /// Create MemoryAccessSize from byte size
+    pub fn from_size(size: u64) -> Self {
+        match size {
+            1 => MemoryAccessSize::U8,
+            2 => MemoryAccessSize::U16,
+            4 => MemoryAccessSize::U32,
+            8 => MemoryAccessSize::U64,
+            _ if size <= 8 => MemoryAccessSize::U64, // Default to U64 for larger sizes
+            _ => MemoryAccessSize::U64,              // Fallback
+        }
+    }
 }
 
 impl EvaluationResult {

@@ -32,6 +32,7 @@ print_stmt = { "print" ~ print_content ~ ";" }
 print_content = {
     format_expr |      // print "format {} {}", arg1, arg2 (must be first to match)
     string |           // print "hello world"
+    complex_variable | // print person.name or arr[0] (new: support complex expressions)
     identifier         // print variable_name
 }
 format_expr = { string ~ "," ~ expr ~ ("," ~ expr)* }
@@ -55,6 +56,7 @@ factor = {
     float |
     int |
     special_var |
+    array_access |     // new: arr[index] support
     member_access |
     pointer_deref |
     identifier |
@@ -63,6 +65,11 @@ factor = {
 
 special_var = @{ "$" ~ (ASCII_ALPHANUMERIC | "_")+ }
 
+// Complex variable access patterns
+complex_variable = { chain_access | array_access | member_access | pointer_deref }
+
+chain_access = { identifier ~ ("." ~ identifier)* ~ ("[" ~ expr ~ "]")? }
+array_access = { identifier ~ "[" ~ expr ~ "]" ~ ("." ~ identifier)* }
 member_access = { identifier ~ ("." ~ identifier)+ }
 pointer_deref = { "*" ~ identifier }
 

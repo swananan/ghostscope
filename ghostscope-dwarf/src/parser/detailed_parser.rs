@@ -6,8 +6,9 @@
 //! - Scope-aware variable resolution
 
 use crate::{
-    core::{DwarfType, EvaluationResult, Result},
+    core::{EvaluationResult, Result},
     parser::{ExpressionEvaluator, RangeExtractor, TypeResolver},
+    TypeInfo,
 };
 use gimli::{EndianSlice, LittleEndian};
 use std::collections::HashSet;
@@ -18,7 +19,7 @@ use tracing::{debug, trace};
 pub struct VariableWithEvaluation {
     pub name: String,
     pub type_name: String,
-    pub dwarf_type: Option<DwarfType>,
+    pub dwarf_type: Option<TypeInfo>,
     pub evaluation_result: EvaluationResult,
     pub scope_depth: usize,
     pub is_parameter: bool,

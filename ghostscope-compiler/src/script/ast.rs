@@ -4,9 +4,11 @@ pub enum Expr {
     Float(f64),
     String(String),
     Variable(String),
-    MemberAccess(Box<Expr>, String),
-    PointerDeref(Box<Expr>),
-    SpecialVar(String), // For $arg0, $arg1, $retval, $pc, $sp etc.
+    MemberAccess(Box<Expr>, String),   // person.name
+    PointerDeref(Box<Expr>),           // *ptr
+    ArrayAccess(Box<Expr>, Box<Expr>), // arr[0] (new)
+    ChainAccess(Vec<String>),          // person.name.first (new)
+    SpecialVar(String),                // For $arg0, $arg1, $retval, $pc, $sp etc.
     BinaryOp {
         left: Box<Expr>,
         op: BinaryOp,
@@ -68,7 +70,9 @@ pub enum PrintStatement {
     String(String),
     /// print variable_name
     Variable(String),
-    /// print "format {} {}" arg1, arg2 (future)
+    /// print person.name or arr[0] (new: support complex expressions)
+    ComplexVariable(Expr),
+    /// print "format {} {}" arg1, arg2
     Formatted { format: String, args: Vec<Expr> },
 }
 
@@ -159,7 +163,9 @@ pub fn infer_type(expr: &Expr) -> Result<VarType, String> {
         Expr::Variable(_) => Ok(VarType::Int), // Temporarily assume variables are integer type to let parsing pass
         Expr::MemberAccess(_, _) => Ok(VarType::Int), // Same as above
         Expr::PointerDeref(_) => Ok(VarType::Int), // Same as above
-        Expr::SpecialVar(_) => Ok(VarType::Int), // Special variables like $arg0, $retval etc.
+        Expr::ArrayAccess(_, _) => Ok(VarType::Int), // New: array access returns element type (assume int for now)
+        Expr::ChainAccess(_) => Ok(VarType::Int), // New: chain access returns final member type (assume int for now)
+        Expr::SpecialVar(_) => Ok(VarType::Int),  // Special variables like $arg0, $retval etc.
         Expr::BinaryOp { left, op, right } => {
             // Only check types when both sides are literals
             let left_is_literal = matches!(

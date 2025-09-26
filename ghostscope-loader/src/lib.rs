@@ -6,7 +6,7 @@ use aya::{
     },
     Ebpf, EbpfLoader, VerifierLogLevel,
 };
-use ghostscope_protocol::{ParsedTraceEvent, StreamingTraceParser, StringTable};
+use ghostscope_protocol::{ParsedTraceEvent, StreamingTraceParser, TraceContext};
 use std::convert::TryInto;
 use std::os::unix::io::AsRawFd;
 use tokio::io::unix::AsyncFd;
@@ -42,7 +42,7 @@ pub struct GhostScopeLoader {
     // Streaming parser for trace events
     parser: StreamingTraceParser,
     // String table for parsing trace events
-    string_table: Option<StringTable>,
+    trace_context: Option<TraceContext>,
 }
 
 #[derive(Debug, Clone)]
@@ -86,7 +86,7 @@ impl GhostScopeLoader {
                     uprobe_link: None,
                     attachment_params: None,
                     parser: StreamingTraceParser::new(),
-                    string_table: None,
+                    trace_context: None,
                 })
             }
             Err(e) => {
@@ -539,11 +539,11 @@ impl GhostScopeLoader {
         // Read all available events using streaming parser
         let mut events = Vec::new();
 
-        // Check if we have a string table for parsing
-        if let Some(string_table) = &self.string_table {
+        // Check if we have a trace context for parsing
+        if let Some(trace_context) = &self.trace_context {
             while let Some(item) = ringbuf.next() {
-                // Process segment with string table
-                match self.parser.process_segment(&item, string_table) {
+                // Process segment with trace context
+                match self.parser.process_segment(&item, trace_context) {
                     Ok(Some(parsed_event)) => {
                         // Directly use ParsedTraceEvent
                         events.push(parsed_event);
@@ -565,37 +565,10 @@ impl GhostScopeLoader {
         Ok(events)
     }
 
-    /// Drain all currently available events without blocking
-    pub fn drain_available_events(&mut self) -> Result<Vec<ParsedTraceEvent>> {
-        let Some(ringbuf) = self.ringbuf.as_mut() else {
-            return Ok(Vec::new());
-        };
-
-        let Some(string_table) = self.string_table.as_ref() else {
-            return Err(LoaderError::Generic(
-                "No string table available - cannot parse trace events".to_string(),
-            ));
-        };
-
-        let mut events = Vec::new();
-
-        while let Some(item) = ringbuf.next() {
-            match self.parser.process_segment(&item, string_table) {
-                Ok(Some(parsed_event)) => events.push(parsed_event),
-                Ok(None) => {}
-                Err(e) => {
-                    warn!("Failed to parse trace event segment: {}", e);
-                }
-            }
-        }
-
-        Ok(events)
-    }
-
-    /// Set the string table for parsing trace events
-    pub fn set_string_table(&mut self, string_table: StringTable) {
-        info!("Setting string table for trace event parsing");
-        self.string_table = Some(string_table);
+    /// Set the trace context for parsing trace events
+    pub fn set_trace_context(&mut self, trace_context: TraceContext) {
+        info!("Setting trace context for trace event parsing");
+        self.trace_context = Some(trace_context);
     }
 
     // Helper functions removed - now using protocol parser

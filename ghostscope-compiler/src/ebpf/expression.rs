@@ -74,23 +74,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     "Variable '{}' not found in script variables, checking DWARF",
                     var_name
                 );
-                let compile_context = self.get_compile_time_context()?.clone();
-                let variable_with_eval = match self.query_dwarf_for_variable(var_name)? {
-                    Some(var) => var,
-                    None => return Err(CodeGenError::VariableNotFound(var_name.to_string())),
-                };
-
-                let dwarf_type = variable_with_eval.dwarf_type.as_ref().ok_or_else(|| {
-                    CodeGenError::DwarfError("Variable has no DWARF type information".to_string())
-                })?;
-
-                // Use the unified evaluation logic
-                self.evaluate_result_to_llvm_value(
-                    &variable_with_eval.evaluation_result,
-                    dwarf_type,
-                    var_name,
-                    compile_context.pc_address,
-                )
+                self.compile_dwarf_expression(expr)
             }
             Expr::SpecialVar(name) => self.handle_special_variable(name),
             Expr::BinaryOp { left, op, right } => {
@@ -98,13 +82,21 @@ impl<'ctx> EbpfContext<'ctx> {
                 let right_val = self.compile_expr(right)?;
                 self.compile_binary_op(left_val, op.clone(), right_val)
             }
-            Expr::MemberAccess(obj, field) => {
-                let obj_val = self.compile_expr(obj)?;
-                self.compile_member_access(obj_val, field)
+            Expr::MemberAccess(_, _) => {
+                // Use unified DWARF expression compilation
+                self.compile_dwarf_expression(expr)
             }
-            Expr::PointerDeref(expr) => {
-                let ptr_val = self.compile_expr(expr)?;
-                self.compile_pointer_deref(ptr_val)
+            Expr::PointerDeref(_) => {
+                // Use unified DWARF expression compilation
+                self.compile_dwarf_expression(expr)
+            }
+            Expr::ArrayAccess(_, _) => {
+                // Use unified DWARF expression compilation
+                self.compile_dwarf_expression(expr)
+            }
+            Expr::ChainAccess(_) => {
+                // Use unified DWARF expression compilation
+                self.compile_dwarf_expression(expr)
             }
         }
     }
@@ -397,32 +389,92 @@ impl<'ctx> EbpfContext<'ctx> {
     /// Compile member access (struct.field)
     pub fn compile_member_access(
         &mut self,
-        _obj: BasicValueEnum<'ctx>,
-        _field: &str,
+        obj_expr: &Expr,
+        field: &str,
     ) -> Result<BasicValueEnum<'ctx>> {
-        // TODO: Implement struct member access with DWARF type info
-        Err(CodeGenError::NotImplemented(
-            "Member access not yet implemented".to_string(),
-        ))
+        // Create a MemberAccess expression and use the unified DWARF compilation
+        let member_access_expr = Expr::MemberAccess(Box::new(obj_expr.clone()), field.to_string());
+        self.compile_dwarf_expression(&member_access_expr)
     }
 
     /// Compile pointer dereference (*ptr)
-    pub fn compile_pointer_deref(
+    pub fn compile_pointer_deref(&mut self, expr: &Expr) -> Result<BasicValueEnum<'ctx>> {
+        // Create a PointerDeref expression and use the unified DWARF compilation
+        let pointer_deref_expr = Expr::PointerDeref(Box::new(expr.clone()));
+        self.compile_dwarf_expression(&pointer_deref_expr)
+    }
+
+    /// Compile array access (arr[index])
+    pub fn compile_array_access(
         &mut self,
-        ptr: BasicValueEnum<'ctx>,
+        array_expr: &Expr,
+        index_expr: &Expr,
     ) -> Result<BasicValueEnum<'ctx>> {
-        if let BasicValueEnum::PointerValue(ptr_val) = ptr {
-            // Convert pointer to IntValue first
-            let ptr_as_int = self
-                .builder
-                .build_ptr_to_int(ptr_val, self.context.i64_type(), "ptr_as_int")
-                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-            // Use BPF helper to safely read from user memory
-            self.generate_memory_read(ptr_as_int, ghostscope_dwarf::MemoryAccessSize::U64)
-        } else {
-            Err(CodeGenError::TypeError(
-                "Cannot dereference non-pointer value".to_string(),
-            ))
+        // Create an ArrayAccess expression and use the unified DWARF compilation
+        let array_access_expr =
+            Expr::ArrayAccess(Box::new(array_expr.clone()), Box::new(index_expr.clone()));
+        self.compile_dwarf_expression(&array_access_expr)
+    }
+
+    /// Compile chain access (person.name.first)
+    pub fn compile_chain_access(&mut self, chain: &[String]) -> Result<BasicValueEnum<'ctx>> {
+        // Create a ChainAccess expression and use the unified DWARF compilation
+        let chain_access_expr = Expr::ChainAccess(chain.to_vec());
+        self.compile_dwarf_expression(&chain_access_expr)
+    }
+
+    /// Unified DWARF expression compilation
+    pub fn compile_dwarf_expression(
+        &mut self,
+        expr: &crate::script::Expr,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        debug!(
+            "compile_dwarf_expression: Compiling complex expression: {:?}",
+            expr
+        );
+
+        // Query DWARF for the complex expression
+        let compile_context = self.get_compile_time_context()?.clone();
+        let variable_with_eval = match self.query_dwarf_for_complex_expr(expr)? {
+            Some(var) => var,
+            None => {
+                let expr_str = self.expr_to_debug_string(expr);
+                return Err(CodeGenError::VariableNotFound(expr_str));
+            }
+        };
+
+        let dwarf_type = variable_with_eval.dwarf_type.as_ref().ok_or_else(|| {
+            CodeGenError::DwarfError("Expression has no DWARF type information".to_string())
+        })?;
+
+        debug!(
+            "compile_dwarf_expression: Found DWARF info for expression '{}' with type: {:?}",
+            variable_with_eval.name, dwarf_type
+        );
+
+        // Use the unified evaluation logic to generate LLVM IR
+        self.evaluate_result_to_llvm_value(
+            &variable_with_eval.evaluation_result,
+            dwarf_type,
+            &variable_with_eval.name,
+            compile_context.pc_address,
+        )
+    }
+
+    /// Helper: Convert expression to string for debugging
+    #[allow(clippy::only_used_in_recursion)]
+    fn expr_to_debug_string(&self, expr: &crate::script::Expr) -> String {
+        use crate::script::Expr;
+
+        match expr {
+            Expr::Variable(name) => name.clone(),
+            Expr::MemberAccess(obj, field) => {
+                format!("{}.{}", self.expr_to_debug_string(obj), field)
+            }
+            Expr::ArrayAccess(arr, _) => format!("{}[index]", self.expr_to_debug_string(arr)),
+            Expr::ChainAccess(chain) => chain.join("."),
+            Expr::PointerDeref(expr) => format!("*{}", self.expr_to_debug_string(expr)),
+            _ => "expr".to_string(),
         }
     }
 }
