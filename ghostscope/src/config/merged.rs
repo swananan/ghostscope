@@ -13,6 +13,7 @@ pub struct MergedConfig {
     pub pid: Option<u32>,
     pub log_file: PathBuf,
     pub enable_logging: bool,
+    pub enable_console_logging: bool,
     pub log_level: crate::config::settings::LogLevel,
     pub debug_file: Option<PathBuf>,
     pub script: Option<String>,
@@ -66,8 +67,18 @@ impl MergedConfig {
             }
         };
 
+        let enable_console_logging = if args.has_explicit_console_log_flag {
+            // Command line explicitly set console logging (--log-console or --no-log-console takes precedence)
+            args.enable_console_logging
+        } else {
+            // Use config file setting
+            config.general.enable_console_logging
+        };
+
+        // Log level priority: 1. Command line args, 2. RUST_LOG env var, 3. Config file (default: warn)
+        // Note: Command line and RUST_LOG are already processed in args.rs
         let log_level = if args.log_level != crate::config::settings::LogLevel::Warn {
-            // Command line explicitly set log level
+            // Command line or RUST_LOG explicitly set log level
             args.log_level
         } else {
             // Use config file setting
@@ -123,6 +134,7 @@ impl MergedConfig {
             pid: args.pid,
             log_file,
             enable_logging,
+            enable_console_logging,
             log_level,
             debug_file: args.debug_file,
             script: args.script,

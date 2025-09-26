@@ -88,10 +88,14 @@ pub struct GeneralConfig {
     /// Default UI mode when no script is provided (overridden by --tui)
     #[serde(default = "default_tui_mode")]
     pub default_tui_mode: bool,
-    /// Enable/disable logging (overridden by --log/--no-log)
+    /// Enable/disable file logging (overridden by --log/--no-log)
     #[serde(default = "default_enable_logging")]
     pub enable_logging: bool,
-    /// Log level filter (overridden by --log-level)
+    /// Enable/disable console logging (overridden by --log-console/--no-log-console)
+    #[serde(default = "default_enable_console_logging")]
+    pub enable_console_logging: bool,
+    /// Log level filter
+    /// Priority: 1. Command line args, 2. RUST_LOG env var, 3. Config file (default: warn)
     #[serde(default)]
     pub log_level: LogLevel,
 }
@@ -162,7 +166,11 @@ fn default_tui_mode() -> bool {
 }
 
 fn default_enable_logging() -> bool {
-    false // Changed: script mode should default to no logging
+    false // Script mode should default to no logging
+}
+
+fn default_enable_console_logging() -> bool {
+    false // Console logging disabled by default for cleaner output
 }
 
 fn default_debug_search_paths() -> Vec<String> {
@@ -210,6 +218,7 @@ impl Default for GeneralConfig {
             log_file: default_log_file(),
             default_tui_mode: default_tui_mode(),
             enable_logging: default_enable_logging(),
+            enable_console_logging: default_enable_console_logging(),
             log_level: LogLevel::default(),
         }
     }

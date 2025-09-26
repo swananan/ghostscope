@@ -13,8 +13,9 @@ static INIT_GUARD: OnceLock<()> = OnceLock::new();
 pub fn initialize_logging_with_config(
     log_file_path: Option<&str>,
     enable_logging: bool,
+    enable_console_logging: bool,
     log_level: crate::config::LogLevel,
-    tui_mode: bool,
+    _tui_mode: bool,
 ) -> Result<()> {
     if INIT_GUARD.set(()).is_err() {
         // Already initialized elsewhere; do nothing and succeed
@@ -61,14 +62,8 @@ pub fn initialize_logging_with_config(
                 .with_ansi(false)
                 .with_filter(level_filter);
 
-            if tui_mode {
-                // TUI mode: only log to file
-                let init_res = tracing_subscriber::registry()
-                    .with(file_subscriber)
-                    .try_init();
-                let _ = init_res; // ignore AlreadyInit errors silently
-            } else {
-                // Non-TUI mode: dual output to file and stdout with level filter
+            if enable_console_logging {
+                // Console logging enabled: dual output to file and stdout with level filter
                 let stdout_subscriber = tracing_subscriber::fmt::layer()
                     .with_writer(std::io::stdout)
                     .with_filter(level_filter);
@@ -78,17 +73,31 @@ pub fn initialize_logging_with_config(
                     .with(stdout_subscriber)
                     .try_init();
                 let _ = init_res;
+            } else {
+                // Console logging disabled: only log to file
+                let init_res = tracing_subscriber::registry()
+                    .with(file_subscriber)
+                    .try_init();
+                let _ = init_res; // ignore AlreadyInit errors silently
             }
         }
         Err(_) => {
-            // Fallback to stdout only if file creation fails
-            let init_res = tracing_subscriber::fmt()
-                .with_file(true)
-                .with_line_number(true)
-                .with_target(true)
-                .with_max_level(level_filter)
-                .try_init();
-            let _ = init_res;
+            // Fallback to stdout only if file creation fails and console logging is enabled
+            if enable_console_logging {
+                let init_res = tracing_subscriber::fmt()
+                    .with_file(true)
+                    .with_line_number(true)
+                    .with_target(true)
+                    .with_max_level(level_filter)
+                    .try_init();
+                let _ = init_res;
+            } else {
+                // No file and no console logging - set up minimal subscriber that discards everything
+                let init_res = tracing_subscriber::registry()
+                    .with(tracing_subscriber::filter::LevelFilter::OFF)
+                    .try_init();
+                let _ = init_res;
+            }
         }
     }
 

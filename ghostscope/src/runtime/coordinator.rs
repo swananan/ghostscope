@@ -20,6 +20,7 @@ pub async fn run_tui_coordinator_with_config(config: MergedConfig) -> Result<()>
         binary_args: config.binary_args,
         log_file: Some(config.log_file),
         enable_logging: config.enable_logging,
+        enable_console_logging: config.enable_console_logging,
         log_level: config.log_level,
         config: None, // Not needed for runtime conversion
         debug_file: config.debug_file,
@@ -32,6 +33,7 @@ pub async fn run_tui_coordinator_with_config(config: MergedConfig) -> Result<()>
         should_save_ast: config.should_save_ast,
         layout_mode: config.layout_mode,
         has_explicit_log_flag: false, // Not relevant for TUI conversion
+        has_explicit_console_log_flag: false, // Not relevant for TUI conversion
     };
 
     run_tui_coordinator_with_ui_config(parsed_args, ui_config).await

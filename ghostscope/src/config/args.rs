@@ -39,15 +39,24 @@ pub struct Args {
     #[arg(long, value_name = "PATH")]
     pub log_file: Option<PathBuf>,
 
-    /// Enable logging (overrides config file)
+    /// Enable logging to file (overrides config file)
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub log: bool,
 
-    /// Disable logging (overrides config file)
+    /// Disable logging completely (overrides config file)
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub no_log: bool,
 
-    /// Set log level (error, warn, info, debug, trace) (overrides config file)
+    /// Enable console/stdout logging in addition to file logging (overrides config file)
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub log_console: bool,
+
+    /// Disable console/stdout logging, file logging only (overrides config file)
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub no_log_console: bool,
+
+    /// Set log level (error, warn, info, debug, trace)
+    /// Priority: 1. Command line args, 2. RUST_LOG env var, 3. Config file (default: warn)
     #[arg(long, value_name = "LEVEL")]
     pub log_level: Option<String>,
 
@@ -119,8 +128,10 @@ pub struct ParsedArgs {
     pub binary_args: Vec<String>,
     pub log_file: Option<PathBuf>,
     pub enable_logging: bool,
+    pub enable_console_logging: bool,
     pub log_level: crate::config::settings::LogLevel,
     pub has_explicit_log_flag: bool, // Track if --log/--no-log was explicitly provided
+    pub has_explicit_console_log_flag: bool, // Track if --log-console/--no-log-console was explicitly provided
     pub config: Option<PathBuf>,
     pub debug_file: Option<PathBuf>,
     pub script: Option<String>,
@@ -162,8 +173,13 @@ impl Args {
             let should_save_ast = Self::should_save_ast(&parsed);
             let tui_mode = Self::determine_tui_mode(&parsed);
             let target_path = Self::resolve_target_path(&parsed);
-            let (enable_logging, log_level, has_explicit_log_flag) =
-                Self::determine_logging_config(&parsed);
+            let (
+                enable_logging,
+                enable_console_logging,
+                log_level,
+                has_explicit_log_flag,
+                has_explicit_console_log_flag,
+            ) = Self::determine_logging_config(&parsed);
 
             ParsedArgs {
                 binary_path,
@@ -171,8 +187,10 @@ impl Args {
                 binary_args,
                 log_file: parsed.log_file,
                 enable_logging,
+                enable_console_logging,
                 log_level,
                 has_explicit_log_flag,
+                has_explicit_console_log_flag,
                 config: parsed.config,
                 debug_file: parsed.debug_file,
                 script: parsed.script,
@@ -193,8 +211,13 @@ impl Args {
             let should_save_ast = Self::should_save_ast(&parsed);
             let tui_mode = Self::determine_tui_mode(&parsed);
             let target_path = Self::resolve_target_path(&parsed);
-            let (enable_logging, log_level, has_explicit_log_flag) =
-                Self::determine_logging_config(&parsed);
+            let (
+                enable_logging,
+                enable_console_logging,
+                log_level,
+                has_explicit_log_flag,
+                has_explicit_console_log_flag,
+            ) = Self::determine_logging_config(&parsed);
 
             ParsedArgs {
                 binary_path: parsed.binary,
@@ -202,8 +225,10 @@ impl Args {
                 binary_args: Vec::new(),
                 log_file: parsed.log_file,
                 enable_logging,
+                enable_console_logging,
                 log_level,
                 has_explicit_log_flag,
+                has_explicit_console_log_flag,
                 config: parsed.config,
                 debug_file: parsed.debug_file,
                 script: parsed.script,
@@ -318,40 +343,58 @@ impl Args {
     }
 
     /// Determine logging configuration from command line arguments
-    fn determine_logging_config(parsed: &Args) -> (bool, crate::config::settings::LogLevel, bool) {
+    fn determine_logging_config(
+        parsed: &Args,
+    ) -> (bool, bool, crate::config::settings::LogLevel, bool, bool) {
         // Check if we're in script mode (script provided via --script or --script-file)
         let is_script_mode = parsed.script.is_some() || parsed.script_file.is_some();
 
         // Check if explicit log flags were provided
         let has_explicit_log_flag = parsed.log || parsed.no_log;
+        let has_explicit_console_log_flag = parsed.log_console || parsed.no_log_console;
 
-        // Determine enable_logging
+        // Determine enable_logging (file logging)
         let enable_logging = if parsed.no_log {
-            false // --no-log takes precedence
+            false // --no-log takes precedence, disables all logging
         } else if parsed.log {
-            true // --log takes precedence
+            true // --log takes precedence, enables file logging
         } else if is_script_mode {
             false // Script mode defaults to no logging
         } else {
             true // TUI mode defaults to logging enabled
         };
 
-        // Determine log_level - check RUST_LOG first, then command line args
+        // Determine enable_console_logging
+        let enable_console_logging = if parsed.no_log || parsed.no_log_console {
+            false // --no-log or --no-log-console disables console logging
+        } else if parsed.log_console {
+            true // --log-console explicitly enables console logging
+        } else {
+            false // Default: console logging is disabled for cleaner output
+        };
+
+        // Determine log_level - Priority: 1. Command line, 2. RUST_LOG env, 3. Config file (default: warn)
         let log_level = if let Some(ref level_str) = parsed.log_level {
-            // --log-level takes precedence
+            // --log-level takes highest precedence
             crate::config::settings::LogLevel::from_str(level_str).unwrap_or_else(|_| {
                 warn!("Invalid log level '{}', using default 'warn'", level_str);
                 crate::config::settings::LogLevel::Warn
             })
         } else if let Ok(rust_log) = std::env::var("RUST_LOG") {
-            // RUST_LOG environment variable as fallback
+            // RUST_LOG environment variable as second priority
             crate::config::settings::LogLevel::from_str(&rust_log)
                 .unwrap_or(crate::config::settings::LogLevel::Warn)
         } else {
-            crate::config::settings::LogLevel::Warn // Default level
+            crate::config::settings::LogLevel::Warn // Default level (will be overridden by config file in merged.rs)
         };
 
-        (enable_logging, log_level, has_explicit_log_flag)
+        (
+            enable_logging,
+            enable_console_logging,
+            log_level,
+            has_explicit_log_flag,
+            has_explicit_console_log_flag,
+        )
     }
 }
 

@@ -95,6 +95,7 @@ async fn main() -> Result<()> {
     if let Err(e) = logging::initialize_logging_with_config(
         log_file_path,
         merged_config.enable_logging,
+        merged_config.enable_console_logging,
         merged_config.log_level,
         merged_config.tui_mode,
     ) {
@@ -110,6 +111,7 @@ async fn main() -> Result<()> {
         binary_args: merged_config.binary_args.clone(),
         log_file: Some(merged_config.log_file.clone()),
         enable_logging: merged_config.enable_logging,
+        enable_console_logging: merged_config.enable_console_logging,
         log_level: merged_config.log_level,
         config: None, // Not needed for validation
         debug_file: merged_config.debug_file.clone(),
@@ -122,6 +124,7 @@ async fn main() -> Result<()> {
         should_save_ast: merged_config.should_save_ast,
         layout_mode: merged_config.layout_mode,
         has_explicit_log_flag: false, // Not needed for validation
+        has_explicit_console_log_flag: false, // Not needed for validation
     };
     temp_args.validate()?;
 
