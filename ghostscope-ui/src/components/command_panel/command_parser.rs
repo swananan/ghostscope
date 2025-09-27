@@ -127,14 +127,20 @@ impl CommandParser {
     /// Format navigation command section
     fn format_navigation_commands() -> String {
         [
-            "🧭 Navigation:",
-            "  jk                   - Switch to command mode (vim-like)",
+            "🧭 Navigation & Input:",
+            "Input Mode:",
+            "  Tab                  - Command completion",
+            "  Right/Ctrl+E         - Accept auto-suggestion",
             "  Ctrl+P/N             - Navigate command history",
             "  Ctrl+A/E             - Move to beginning/end of line (emacs)",
             "  Ctrl+B/F             - Move cursor left/right (emacs)",
             "  Ctrl+H               - Delete previous character (emacs)",
             "  Ctrl+W               - Delete previous word (emacs)",
-            "  Escape               - Return to input mode",
+            "",
+            "Command Mode (vim-style):",
+            "  jk/Escape            - Enter command mode",
+            "  hjkl                 - Navigate (left/down/up/right)",
+            "  i                    - Return to input mode",
         ]
         .join("\n")
     }
@@ -145,7 +151,7 @@ impl CommandParser {
             "🔧 General:",
             "  help                 - Show this help message",
             "",
-            "💡 Tip: Tab for command completion, Right/Ctrl+E for auto-suggestion, 'jk' for vim navigation.",
+            "💡 Input: Tab=completion, Right/Ctrl+E=auto-suggest, emacs keys | Command: jk/Esc enter, i exit, hjkl move",
         ]
         .join("\n")
     }
