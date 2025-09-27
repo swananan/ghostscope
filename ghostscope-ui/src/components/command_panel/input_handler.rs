@@ -24,24 +24,42 @@ impl InputHandler {
                     // Return NoOp action to prevent fallback character processing
                     return vec![Action::NoOp];
                 }
-                // Tab: Command completion
+                // Tab: Command and file completion
                 (KeyCode::Tab, KeyModifiers::NONE) => {
-                    tracing::debug!("Tab pressed for command completion");
+                    tracing::debug!("Tab pressed for completion, input: '{}'", state.input_text);
 
-                    if let Some(completion) =
-                        crate::components::command_panel::CommandParser::get_command_completion(
-                            &state.input_text,
-                        )
-                    {
-                        tracing::debug!("Found completion: '{}'", completion);
+                    let needs_file_comp = crate::components::command_panel::file_completion::needs_file_completion(&state.input_text);
+                    tracing::debug!("Needs file completion for '{}': {}", state.input_text, needs_file_comp);
 
-                        // Insert the completion at cursor position
+                    let completion = if needs_file_comp {
+                        // File completion needed
+                        tracing::debug!("Attempting file completion, cache available: {}", state.file_completion_cache.is_some());
+
+                        if let Some(cache) = &mut state.file_completion_cache {
+                            let result = cache.get_file_completion(&state.input_text);
+                            tracing::debug!("File completion result: {:?}", result);
+                            result
+                        } else {
+                            tracing::debug!("File completion cache not available, falling back to command completion");
+                            crate::components::command_panel::CommandParser::get_command_completion(&state.input_text)
+                        }
+                    } else {
+                        // Regular command completion
+                        tracing::debug!("Using command completion");
+                        crate::components::command_panel::CommandParser::get_command_completion(&state.input_text)
+                    };
+
+                    if let Some(completion_text) = completion {
+                        tracing::debug!("Found completion: '{}'", completion_text);
+
+                        // Insert the completion at cursor position (same logic for both command and file completion)
                         let cursor_pos = state.cursor_position.min(state.input_text.len());
-                        state.input_text.insert_str(cursor_pos, &completion);
-                        state.cursor_position += completion.len();
+                        state.input_text.insert_str(cursor_pos, &completion_text);
+                        state.cursor_position += completion_text.len();
 
                         // Update auto suggestion after completion
                         state.update_auto_suggestion();
+                        tracing::debug!("After completion: '{}', cursor at {}", state.input_text, state.cursor_position);
                     } else {
                         tracing::debug!("No completion found for input: '{}'", state.input_text);
                     }

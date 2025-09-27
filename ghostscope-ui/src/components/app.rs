@@ -156,6 +156,9 @@ impl App {
                     if crate::components::command_panel::input_handler::InputHandler::check_jk_timeout(&mut self.state.command_panel) {
                         needs_render = true;
                     }
+
+                    // Periodic cleanup of file completion cache
+                    self.state.command_panel.cleanup_file_completion_cache();
                 }
             }
 
@@ -1391,23 +1394,36 @@ impl App {
                 );
                 additional_actions.extend(actions);
 
-                // Set routing flag and request file information from runtime
-                self.state.route_file_info_to_file_search = true;
-                if let Err(e) = self
-                    .state
-                    .event_registry
-                    .command_sender
-                    .send(crate::events::RuntimeCommand::InfoSource)
-                {
-                    tracing::error!("Failed to send InfoSource command: {}", e);
-                    // Clear routing flag if send failed
-                    self.state.route_file_info_to_file_search = false;
-                    let error_actions =
-                        crate::components::source_panel::SourceSearch::set_file_search_error(
-                            &mut self.state.source_panel,
-                            "Failed to request file list".to_string(),
-                        );
-                    additional_actions.extend(error_actions);
+                // Use cached file list if available, otherwise request from runtime
+                if let Some(cache) = &self.state.command_panel.file_completion_cache {
+                    // Use existing file cache to populate source panel search
+                    tracing::debug!("Using cached file list for source panel search");
+                    let files = cache.get_all_files().to_vec();
+                    let actions = crate::components::source_panel::SourceSearch::set_file_search_files(
+                        &mut self.state.source_panel,
+                        files,
+                    );
+                    additional_actions.extend(actions);
+                } else {
+                    // Fallback: request file information from runtime
+                    tracing::debug!("No cached files available, requesting from runtime");
+                    self.state.route_file_info_to_file_search = true;
+                    if let Err(e) = self
+                        .state
+                        .event_registry
+                        .command_sender
+                        .send(crate::events::RuntimeCommand::InfoSource)
+                    {
+                        tracing::error!("Failed to send InfoSource command: {}", e);
+                        // Clear routing flag if send failed
+                        self.state.route_file_info_to_file_search = false;
+                        let error_actions =
+                            crate::components::source_panel::SourceSearch::set_file_search_error(
+                                &mut self.state.source_panel,
+                                "Failed to request file list".to_string(),
+                            );
+                        additional_actions.extend(error_actions);
+                    }
                 }
             }
             Action::ExitFileSearch => {
@@ -1542,6 +1558,31 @@ impl App {
     pub fn transition_to_ready_with_completion(&mut self) {
         self.add_loading_completion_summary();
         self.state.set_loading_state(LoadingState::Ready);
+    }
+
+    /// Sync file list to command panel for file completion
+    fn sync_files_to_command_panel(&mut self, files: Vec<String>) {
+        tracing::debug!("Syncing {} files to command panel completion cache", files.len());
+        if !files.is_empty() {
+            tracing::debug!("First 5 files: {:?}", files.iter().take(5).collect::<Vec<_>>());
+        }
+
+        // Create or update file completion cache
+        if let Some(cache) = &mut self.state.command_panel.file_completion_cache {
+            // Update existing cache
+            let updated = cache.sync_from_source_panel(&files);
+            tracing::debug!("Updated existing file completion cache: {}", updated);
+        } else {
+            // Create new cache only if there are files
+            if !files.is_empty() {
+                tracing::debug!("Creating new file completion cache with {} files", files.len());
+                self.state.command_panel.file_completion_cache =
+                    Some(crate::components::command_panel::file_completion::FileCompletionCache::new(&files));
+                tracing::debug!("File completion cache created successfully");
+            } else {
+                tracing::debug!("No files to create cache with");
+            }
+        }
     }
 
     /// Generate and add completion summary to command panel
@@ -1833,27 +1874,39 @@ impl App {
                 for action in actions {
                     let _ = self.handle_action(action);
                 }
+
+                // Auto-request file list for both file completion and source panel search
+                tracing::debug!("Auto-requesting file list after source code loaded");
+                if let Err(e) = self
+                    .state
+                    .event_registry
+                    .command_sender
+                    .send(crate::events::RuntimeCommand::InfoSource)
+                {
+                    tracing::warn!("Failed to auto-request file list: {}", e);
+                }
             }
             RuntimeStatus::FileInfo { groups } => {
-                if self.state.route_file_info_to_file_search {
-                    // Convert file groups to flat file list for search
-                    let mut files = Vec::new();
-                    for group in &groups {
-                        for file in &group.files {
-                            // Combine directory and filename for full path
-                            let full_path = if file.directory.is_empty() {
-                                file.path.clone()
-                            } else {
-                                format!("{}/{}", file.directory, file.path)
-                            };
-                            files.push(full_path);
-                        }
+                // Convert file groups to flat file list
+                let mut files = Vec::new();
+                for group in &groups {
+                    for file in &group.files {
+                        // Combine directory and filename for full path
+                        let full_path = if file.directory.is_empty() {
+                            file.path.clone()
+                        } else {
+                            format!("{}/{}", file.directory, file.path)
+                        };
+                        files.push(full_path);
                     }
+                }
 
+                if self.state.route_file_info_to_file_search {
+                    // Route to source panel file search
                     let actions =
                         crate::components::source_panel::SourceSearch::set_file_search_files(
                             &mut self.state.source_panel,
-                            files,
+                            files.clone(),
                         );
                     for action in actions {
                         let _ = self.handle_action(action);
@@ -1874,6 +1927,9 @@ impl App {
                     };
                     let _ = self.handle_action(action);
                 }
+
+                // Always sync file list to command panel for file completion
+                self.sync_files_to_command_panel(files);
             }
             RuntimeStatus::FileInfoFailed { error } => {
                 if self.state.route_file_info_to_file_search {

@@ -473,7 +473,11 @@ impl OptimizedRenderer {
                 let line_char_count = line.chars().count();
                 let line_end = char_count + line_char_count;
 
-                if cursor_pos_with_prompt >= char_count && cursor_pos_with_prompt < line_end {
+                let is_last_line = line_idx == wrapped_lines.len() - 1;
+                let cursor_in_range = cursor_pos_with_prompt >= char_count &&
+                    (cursor_pos_with_prompt < line_end || (cursor_pos_with_prompt == line_end && is_last_line));
+
+                if cursor_in_range {
                     let cursor_in_line = cursor_pos_with_prompt - char_count;
                     lines.push(self.create_input_line_with_cursor(
                         line,

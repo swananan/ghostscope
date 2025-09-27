@@ -322,6 +322,9 @@ pub struct CommandPanelState {
     pub command_cursor_column: usize,
     pub cached_panel_width: u16, // Cached panel width for text wrapping calculations
 
+    // File completion cache
+    pub file_completion_cache: Option<crate::components::command_panel::file_completion::FileCompletionCache>,
+
     // Saved cursor states for mode switching
     pub saved_input_cursor: usize, // Input mode cursor position
     pub saved_script_cursor: Option<(usize, usize)>, // Script mode (line, col)
@@ -459,6 +462,7 @@ impl CommandPanelState {
             command_cursor_line: 0,
             command_cursor_column: 0,
             cached_panel_width: 80, // Default width
+            file_completion_cache: None,
             saved_input_cursor: 0,
             saved_script_cursor: None,
             previous_mode: None,
@@ -481,6 +485,16 @@ impl CommandPanelState {
     /// Update cached panel width for text wrapping calculations
     pub fn update_panel_width(&mut self, width: u16) {
         self.cached_panel_width = width;
+    }
+
+    /// Clean up file completion cache if unused for too long
+    pub fn cleanup_file_completion_cache(&mut self) {
+        if let Some(cache) = &self.file_completion_cache {
+            if cache.should_cleanup() {
+                tracing::debug!("Cleaning up unused file completion cache");
+                self.file_completion_cache = None;
+            }
+        }
     }
 
     /// Enter command mode from current mode, saving cursor state

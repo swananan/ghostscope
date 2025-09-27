@@ -1,4 +1,5 @@
 pub mod command_parser;
+pub mod file_completion;
 pub mod history_manager;
 pub mod input_handler;
 pub mod optimized_input;
