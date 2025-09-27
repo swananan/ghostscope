@@ -252,25 +252,9 @@ impl App {
                                 .modifiers
                                 .contains(crossterm::event::KeyModifiers::CONTROL) =>
                         {
-                            // Special handling for different panel modes
-                            if self.state.ui.focus.current_panel
-                                == crate::action::PanelType::InteractiveCommand
-                                && self.state.command_panel.is_in_history_search()
-                            {
-                                // Let Ctrl+C go to focused panel handler for history search exit
-                                let panel_actions = self.handle_focused_panel_input(key)?;
-                                actions_to_process.extend(panel_actions);
-                            } else if self.state.ui.focus.current_panel
-                                == crate::action::PanelType::Source
-                                && self.state.source_panel.mode
-                                    == crate::model::panel_state::SourcePanelMode::FileSearch
-                            {
-                                // Ctrl+C in file search mode should exit file search, not quit app
-                                actions_to_process.push(Action::ExitFileSearch);
-                            } else {
-                                // Normal Ctrl+C behavior: quit application
-                                actions_to_process.push(Action::Quit);
-                            }
+                            // Use the new centralized Ctrl+C handler
+                            let ctrl_c_actions = self.handle_ctrl_c();
+                            actions_to_process.extend(ctrl_c_actions);
                         }
                         KeyCode::Char('w')
                             if key
@@ -2389,6 +2373,85 @@ impl App {
     /// Clear waiting state to return to ready input mode
     fn clear_waiting_state(&mut self) {
         self.state.command_panel.input_state = crate::model::panel_state::InputState::Ready;
+    }
+
+    /// Handle Ctrl+C with double-press quit and special mode handling
+    fn handle_ctrl_c(&mut self) -> Vec<Action> {
+        use std::time::{Duration, Instant};
+
+        let now = Instant::now();
+        let double_press_threshold = Duration::from_millis(500); // 500ms window for double press
+
+        // Check if this is a double Ctrl+C press
+        let is_double_press = if let Some(last_time) = self.state.last_ctrl_c_time {
+            now.duration_since(last_time) <= double_press_threshold
+        } else {
+            false
+        };
+
+        // Update last Ctrl+C time
+        self.state.last_ctrl_c_time = Some(now);
+
+        // Handle double press - always quit
+        if is_double_press {
+            tracing::info!("Double Ctrl+C detected, quitting application");
+            return vec![Action::Quit];
+        }
+
+        // Single Ctrl+C - handle based on current context
+        match self.state.ui.focus.current_panel {
+            crate::action::PanelType::InteractiveCommand => {
+                // Command panel specific handling
+                if self.state.command_panel.is_in_history_search() {
+                    // In history search mode - exit search directly
+                    self.state.command_panel.exit_history_search();
+                    vec![Action::AddResponse {
+                        content: String::new(),
+                        response_type: crate::action::ResponseType::Info,
+                    }]
+                } else {
+                    match self.state.command_panel.mode {
+                        crate::model::panel_state::InteractionMode::ScriptEditor => {
+                            // In script mode - exit to input mode
+                            vec![Action::ExitScriptMode]
+                        }
+                        crate::model::panel_state::InteractionMode::Input => {
+                            // In input mode - clear input and add "quit" command
+                            self.state.command_panel.input_text.clear();
+                            self.state.command_panel.cursor_position = 0;
+                            self.state.command_panel.input_text = "quit".to_string();
+                            self.state.command_panel.cursor_position = 4;
+                            // Clear auto-suggestion to prevent suggestions after "quit"
+                            self.state.command_panel.auto_suggestion.clear();
+                            vec![Action::AddResponse {
+                                content: "Press Ctrl+C again to quit or modify the command"
+                                    .to_string(),
+                                response_type: crate::action::ResponseType::Info,
+                            }]
+                        }
+                        _ => {
+                            // Other modes - no action needed
+                            vec![]
+                        }
+                    }
+                }
+            }
+            crate::action::PanelType::Source => {
+                if self.state.source_panel.mode
+                    == crate::model::panel_state::SourcePanelMode::FileSearch
+                {
+                    // In file search mode - exit file search
+                    vec![Action::ExitFileSearch]
+                } else {
+                    // Normal source panel - no action needed
+                    vec![]
+                }
+            }
+            _ => {
+                // Other panels - no action needed
+                vec![]
+            }
+        }
     }
 
     /// Cleanup terminal

@@ -45,6 +45,9 @@ pub struct AppState {
 
     // UI configuration
     pub emoji_config: EmojiConfig,
+
+    // Ctrl+C tracking for double-press quit
+    pub last_ctrl_c_time: Option<std::time::Instant>,
 }
 
 impl AppState {
@@ -66,6 +69,7 @@ impl AppState {
             route_file_info_to_file_search: false,
             target_pid: None,
             emoji_config: EmojiConfig::default(),
+            last_ctrl_c_time: None,
         }
     }
 
@@ -90,6 +94,7 @@ impl AppState {
             route_file_info_to_file_search: false,
             target_pid: None,
             emoji_config: EmojiConfig::default(),
+            last_ctrl_c_time: None,
         }
     }
 
