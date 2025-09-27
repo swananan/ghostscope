@@ -24,9 +24,15 @@ impl CommandParser {
             return actions;
         }
 
-        // Handle trace command
+        // Handle trace command (support both full command and abbreviation)
         if cmd.starts_with("trace ") {
             return vec![Action::EnterScriptMode(cmd.to_string())];
+        }
+        if cmd.starts_with("t ") {
+            // Convert "t target" to "trace target" for consistent handling
+            let target = cmd.strip_prefix("t ").unwrap();
+            let full_command = format!("trace {target}");
+            return vec![Action::EnterScriptMode(full_command)];
         }
 
         // Handle shortcut commands
@@ -85,10 +91,10 @@ impl CommandParser {
     fn format_tracing_commands() -> String {
         [
             "📊 Tracing Commands:",
-            "  trace <target>       - Start tracing a function/location",
-            "  enable <id|all>      - Enable specific trace or all traces",
-            "  disable <id|all>     - Disable specific trace or all traces",
-            "  delete <id|all>      - Delete specific trace or all traces",
+            "  trace <target>       - Start tracing a function/location (t)",
+            "  enable <id|all>      - Enable specific trace or all traces (en)",
+            "  disable <id|all>     - Disable specific trace or all traces (dis)",
+            "  delete <id|all>      - Delete specific trace or all traces (del)",
         ]
         .join("\n")
     }
@@ -146,18 +152,33 @@ impl CommandParser {
 
     /// Parse synchronous commands (enable/disable/delete)
     fn parse_sync_command(state: &mut CommandPanelState, command: &str) -> Option<Vec<Action>> {
+        // Support both full command and abbreviation for disable
         if command.starts_with("disable ") {
             let target = command.strip_prefix("disable ").unwrap().trim();
             return Some(Self::parse_disable_command(state, target));
         }
+        if command.starts_with("dis ") {
+            let target = command.strip_prefix("dis ").unwrap().trim();
+            return Some(Self::parse_disable_command(state, target));
+        }
 
+        // Support both full command and abbreviation for enable
         if command.starts_with("enable ") {
             let target = command.strip_prefix("enable ").unwrap().trim();
             return Some(Self::parse_enable_command(state, target));
         }
+        if command.starts_with("en ") {
+            let target = command.strip_prefix("en ").unwrap().trim();
+            return Some(Self::parse_enable_command(state, target));
+        }
 
+        // Support both full command and abbreviation for delete
         if command.starts_with("delete ") {
             let target = command.strip_prefix("delete ").unwrap().trim();
+            return Some(Self::parse_delete_command(state, target));
+        }
+        if command.starts_with("del ") {
+            let target = command.strip_prefix("del ").unwrap().trim();
             return Some(Self::parse_delete_command(state, target));
         }
 
