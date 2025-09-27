@@ -24,11 +24,34 @@ impl InputHandler {
                     // Return NoOp action to prevent fallback character processing
                     return vec![Action::NoOp];
                 }
-                // Tab or Ctrl+E: Accept auto suggestion (only if there's a suggestion)
-                (KeyCode::Tab, KeyModifiers::NONE)
-                | (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
+                // Tab: Command completion
+                (KeyCode::Tab, KeyModifiers::NONE) => {
+                    tracing::debug!("Tab pressed for command completion");
+
+                    if let Some(completion) =
+                        crate::components::command_panel::CommandParser::get_command_completion(
+                            &state.input_text,
+                        )
+                    {
+                        tracing::debug!("Found completion: '{}'", completion);
+
+                        // Insert the completion at cursor position
+                        let cursor_pos = state.cursor_position.min(state.input_text.len());
+                        state.input_text.insert_str(cursor_pos, &completion);
+                        state.cursor_position += completion.len();
+
+                        // Update auto suggestion after completion
+                        state.update_auto_suggestion();
+                    } else {
+                        tracing::debug!("No completion found for input: '{}'", state.input_text);
+                    }
+
+                    return vec![Action::NoOp];
+                }
+                // Ctrl+E: Accept auto suggestion (only if there's a suggestion)
+                (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
                     tracing::debug!(
-                        "Tab/Ctrl+E pressed, suggestion available: {}",
+                        "Ctrl+E pressed, suggestion available: {}",
                         state.get_suggestion_text().is_some()
                     );
                     if let Some(suggestion_text) = state.get_suggestion_text() {
@@ -37,9 +60,24 @@ impl InputHandler {
                         // Return NoOp action to prevent fallback processing
                         return vec![Action::NoOp];
                     } else {
-                        tracing::debug!("No suggestion available, Tab/Ctrl+E ignored");
+                        tracing::debug!("No suggestion available, Ctrl+E ignored");
                         // Return NoOp action to prevent fallback processing
                         return vec![Action::NoOp];
+                    }
+                }
+                // Right Arrow: Accept auto suggestion if available, otherwise move cursor
+                (KeyCode::Right, KeyModifiers::NONE) => {
+                    if let Some(_suggestion_text) = state.get_suggestion_text() {
+                        tracing::debug!("Right Arrow accepting auto suggestion");
+                        state.accept_auto_suggestion();
+                        // Return NoOp action to prevent fallback processing
+                        return vec![Action::NoOp];
+                    } else {
+                        // No suggestion available, let right arrow fall through to normal cursor movement
+                        tracing::debug!(
+                            "Right Arrow - no suggestion, allowing normal cursor movement"
+                        );
+                        // Return empty vector to allow fallback processing (cursor movement)
                     }
                 }
                 // Other keys are not handled by this function

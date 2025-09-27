@@ -145,9 +145,100 @@ impl CommandParser {
             "🔧 General:",
             "  help                 - Show this help message",
             "",
-            "💡 Tip: Use tab completion and 'jk' for vim-like navigation.",
+            "💡 Tip: Tab for command completion, Right/Ctrl+E for auto-suggestion, 'jk' for vim navigation.",
         ]
         .join("\n")
+    }
+
+    /// Get command completion for the given input
+    pub fn get_command_completion(input: &str) -> Option<String> {
+        let input = input.trim();
+
+        // All available commands (full commands + abbreviations)
+        let commands = [
+            // Primary commands
+            "trace",
+            "enable",
+            "disable",
+            "delete",
+            "info",
+            "help",
+            "clear",
+            "quit",
+            "exit",
+            // Abbreviations
+            "t",
+            "en",
+            "dis",
+            "del",
+            // Info subcommands
+            "info trace",
+            "info source",
+            "info share",
+            "info function",
+            "info line",
+            "info address",
+            // Shortcut commands
+            "i",
+            "i s",
+            "i sh",
+            "i t",
+            "i f",
+            "i l",
+            "i a",
+        ];
+
+        // Find commands that start with the input
+        let matches: Vec<&str> = commands
+            .iter()
+            .filter(|cmd| cmd.starts_with(input) && cmd.len() > input.len())
+            .cloned()
+            .collect();
+
+        match matches.len() {
+            0 => None, // No matches
+            1 => {
+                // Single match - return the completion part
+                let full_command = matches[0];
+                Some(full_command[input.len()..].to_string())
+            }
+            _ => {
+                // Multiple matches - find common prefix
+                Self::find_common_prefix(&matches, input.len())
+            }
+        }
+    }
+
+    /// Find the longest common prefix among multiple command matches
+    fn find_common_prefix(matches: &[&str], input_len: usize) -> Option<String> {
+        if matches.is_empty() {
+            return None;
+        }
+
+        let first = &matches[0][input_len..];
+        let mut common_len = first.len();
+
+        for &cmd in &matches[1..] {
+            let suffix = &cmd[input_len..];
+            common_len = first
+                .chars()
+                .zip(suffix.chars())
+                .take_while(|(a, b)| a == b)
+                .count()
+                .min(common_len);
+        }
+
+        if common_len > 0 {
+            let common_prefix = &first[..common_len];
+            // Don't complete with just whitespace
+            if common_prefix.trim().is_empty() {
+                None
+            } else {
+                Some(common_prefix.to_string())
+            }
+        } else {
+            None
+        }
     }
 
     /// Parse synchronous commands (enable/disable/delete)
@@ -542,5 +633,68 @@ impl CommandParser {
                 UIStrings::GHOSTSCOPE_PROMPT.to_string()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_command_completion_exact_match() {
+        // Test exact single match
+        assert_eq!(
+            CommandParser::get_command_completion("tr"),
+            Some("ace".to_string())
+        );
+        assert_eq!(
+            CommandParser::get_command_completion("hel"),
+            Some("p".to_string())
+        );
+        assert_eq!(
+            CommandParser::get_command_completion("clea"),
+            Some("r".to_string())
+        );
+    }
+
+    #[test]
+    fn test_command_completion_multiple_matches() {
+        // Test multiple matches - should return None when no common prefix exists
+        assert_eq!(CommandParser::get_command_completion("d"), None); // "delete", "disable", "dis", "del" have no common prefix
+        assert_eq!(CommandParser::get_command_completion("e"), None); // "enable", "exit" have no common prefix beyond "e"
+
+        // Test with actual matches
+        assert_eq!(
+            CommandParser::get_command_completion("de"),
+            Some("l".to_string())
+        ); // "del" and "delete" -> common prefix "del"
+        assert_eq!(CommandParser::get_command_completion("info "), None); // Multiple info subcommands, whitespace prefix filtered out
+    }
+
+    #[test]
+    fn test_command_completion_no_match() {
+        // Test no matches
+        assert_eq!(CommandParser::get_command_completion("xyz"), None);
+        assert_eq!(CommandParser::get_command_completion("unknown"), None);
+    }
+
+    #[test]
+    fn test_command_completion_exact_command() {
+        // Test already complete commands
+        assert_eq!(CommandParser::get_command_completion("trace"), None);
+        assert_eq!(CommandParser::get_command_completion("help"), None);
+    }
+
+    #[test]
+    fn test_command_completion_abbreviations() {
+        // Test abbreviations work
+        assert_eq!(
+            CommandParser::get_command_completion("en"),
+            Some("able".to_string())
+        ); // "en" -> "enable"
+        assert_eq!(
+            CommandParser::get_command_completion("di"),
+            Some("s".to_string())
+        ); // "di" -> "dis" (common prefix of "disable")
     }
 }
