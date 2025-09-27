@@ -62,6 +62,56 @@ impl<'ctx> EbpfContext<'ctx> {
         }
     }
 
+    /// Convert an EvaluationResult into a concrete address (IntValue) when possible
+    /// Returns error for unsupported cases (e.g., direct values without an address)
+    pub fn evaluation_result_to_address(
+        &mut self,
+        evaluation_result: &EvaluationResult,
+    ) -> Result<IntValue<'ctx>> {
+        let pt_regs_ptr = self.get_pt_regs_parameter()?;
+        match evaluation_result {
+            EvaluationResult::MemoryLocation(LocationResult::Address(addr)) => {
+                Ok(self.context.i64_type().const_int(*addr, false))
+            }
+            EvaluationResult::MemoryLocation(LocationResult::RegisterAddress {
+                register,
+                offset,
+                ..
+            }) => {
+                let reg_val = self.load_register_value(*register, pt_regs_ptr)?;
+                if let BasicValueEnum::IntValue(reg_i) = reg_val {
+                    if let Some(ofs) = offset {
+                        let ofs_val = self.context.i64_type().const_int(*ofs as u64, true);
+                        let sum = self
+                            .builder
+                            .build_int_add(reg_i, ofs_val, "addr_with_offset")
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        Ok(sum)
+                    } else {
+                        Ok(reg_i)
+                    }
+                } else {
+                    Err(CodeGenError::RegisterMappingError(
+                        "Register value is not integer".to_string(),
+                    ))
+                }
+            }
+            EvaluationResult::MemoryLocation(LocationResult::ComputedLocation { steps }) => {
+                let val = self.generate_compute_steps(steps, pt_regs_ptr, None)?;
+                if let BasicValueEnum::IntValue(i) = val {
+                    Ok(i)
+                } else {
+                    Err(CodeGenError::LLVMError(
+                        "Computed location did not produce integer".to_string(),
+                    ))
+                }
+            }
+            _ => Err(CodeGenError::NotImplemented(
+                "Unable to compute address from evaluation result".to_string(),
+            )),
+        }
+    }
+
     /// Convert DWARF type size to MemoryAccessSize
     fn dwarf_type_to_memory_access_size(&self, dwarf_type: &TypeInfo) -> MemoryAccessSize {
         let size = self.get_dwarf_type_size(dwarf_type);
@@ -477,6 +527,12 @@ impl<'ctx> EbpfContext<'ctx> {
             TypeInfo::StructType { size, .. } => *size,
             TypeInfo::UnionType { size, .. } => *size,
             TypeInfo::EnumType { size, .. } => *size,
+            TypeInfo::BitfieldType {
+                underlying_type, ..
+            } => {
+                // Read size equals the storage type size
+                self.get_dwarf_type_size(underlying_type)
+            }
             TypeInfo::TypedefType {
                 underlying_type, ..
             } => self.get_dwarf_type_size(underlying_type),
@@ -533,7 +589,7 @@ impl<'ctx> EbpfContext<'ctx> {
     pub fn query_dwarf_for_array_access(
         &mut self,
         array_expr: &crate::script::Expr,
-        _index_expr: &crate::script::Expr,
+        index_expr: &crate::script::Expr,
     ) -> Result<Option<VariableWithEvaluation>> {
         // First, resolve the base array
         let base_var = match self.query_dwarf_for_complex_expr(array_expr)? {
@@ -556,8 +612,16 @@ impl<'ctx> EbpfContext<'ctx> {
         // Calculate element size for address computation
         let element_size = element_type.size();
 
-        // For dynamic indexing, we need to create a computed location that includes offset calculation
-        // The evaluation result should represent: base_address + (index * element_size)
+        // For indexing, create a computed location representing: base + (index * element_size)
+        // Only literal integer indices are supported at this stage
+        let index_value: i64 = match index_expr {
+            crate::script::Expr::Int(v) => *v,
+            _ => {
+                return Err(CodeGenError::NotImplemented(
+                    "Only literal integer array indices are supported (TODO)".to_string(),
+                ))
+            }
+        };
         let element_evaluation_result = match &base_var.evaluation_result {
             EvaluationResult::DirectValue(_) => {
                 // If base is a value, we can't do array indexing
@@ -565,7 +629,8 @@ impl<'ctx> EbpfContext<'ctx> {
             }
             EvaluationResult::MemoryLocation(location) => {
                 // Create a computed location that includes the array indexing calculation
-                let array_access_steps = self.create_array_access_steps(location, element_size);
+                let array_access_steps =
+                    self.create_array_access_steps(location, element_size, index_value);
                 EvaluationResult::MemoryLocation(LocationResult::ComputedLocation {
                     steps: array_access_steps,
                 })
@@ -846,6 +911,18 @@ impl<'ctx> EbpfContext<'ctx> {
             TypeInfo::StructType { name, .. } => format!("struct {}", name),
             TypeInfo::UnionType { name, .. } => format!("union {}", name),
             TypeInfo::EnumType { name, .. } => format!("enum {}", name),
+            TypeInfo::BitfieldType {
+                underlying_type,
+                bit_offset,
+                bit_size,
+            } => {
+                format!(
+                    "bitfield<{}:{}> {}",
+                    bit_offset,
+                    bit_size,
+                    self.type_info_to_name(underlying_type)
+                )
+            }
             TypeInfo::TypedefType { name, .. } => name.clone(),
             TypeInfo::QualifiedType {
                 underlying_type, ..
@@ -861,6 +938,7 @@ impl<'ctx> EbpfContext<'ctx> {
         &self,
         base_location: &LocationResult,
         element_size: u64,
+        index: i64,
     ) -> Vec<ComputeStep> {
         let mut steps = Vec::new();
 
@@ -886,10 +964,7 @@ impl<'ctx> EbpfContext<'ctx> {
         }
 
         // Now add array indexing computation: current_address + (index * element_size)
-        // Note: For now, we assume index is 0 as a placeholder.
-        // In a full implementation, the index would need to be evaluated at runtime.
-        // This is a simplified version that assumes constant index of 0.
-        steps.push(ComputeStep::PushConstant(0)); // index (placeholder)
+        steps.push(ComputeStep::PushConstant(index)); // literal index
         steps.push(ComputeStep::PushConstant(element_size as i64)); // element_size
         steps.push(ComputeStep::Mul); // index * element_size
         steps.push(ComputeStep::Add); // base_address + (index * element_size)

@@ -71,6 +71,13 @@ pub enum TypeInfo {
         parameters: Vec<TypeInfo>,
     },
 
+    /// Bitfield type: a view over an underlying integer type with bit offset/size
+    BitfieldType {
+        underlying_type: Box<TypeInfo>,
+        bit_offset: u8,
+        bit_size: u8,
+    },
+
     /// Unresolved or unknown type
     UnknownType { name: String },
 
@@ -120,6 +127,9 @@ impl TypeInfo {
                 underlying_type, ..
             } => underlying_type.size(),
             TypeInfo::FunctionType { .. } => 8, // Function pointer size
+            TypeInfo::BitfieldType {
+                underlying_type, ..
+            } => underlying_type.size(),
             TypeInfo::UnknownType { .. } => 0,
             TypeInfo::OptimizedOut { .. } => 0, // Optimized out has no size
         }
@@ -236,6 +246,16 @@ impl TypeInfo {
                     .join(", ");
                 format!("{return_str} ({param_str})")
             }
+            TypeInfo::BitfieldType {
+                underlying_type,
+                bit_offset,
+                bit_size,
+            } => format!(
+                "bitfield<{}:{}> {}",
+                bit_offset,
+                bit_size,
+                underlying_type.type_name()
+            ),
             TypeInfo::UnknownType { name } => name.clone(),
             TypeInfo::OptimizedOut { name } => format!("<optimized_out> {name}"),
         }
@@ -253,6 +273,9 @@ impl TypeInfo {
             TypeInfo::QualifiedType {
                 underlying_type, ..
             } => underlying_type.is_signed_int(),
+            TypeInfo::BitfieldType {
+                underlying_type, ..
+            } => underlying_type.is_signed_int(),
             TypeInfo::OptimizedOut { .. } => false,
             _ => false,
         }
@@ -268,6 +291,9 @@ impl TypeInfo {
                 underlying_type, ..
             } => underlying_type.is_unsigned_int(),
             TypeInfo::QualifiedType {
+                underlying_type, ..
+            } => underlying_type.is_unsigned_int(),
+            TypeInfo::BitfieldType {
                 underlying_type, ..
             } => underlying_type.is_unsigned_int(),
             TypeInfo::OptimizedOut { .. } => false,
@@ -327,6 +353,9 @@ impl TypeInfo {
                 underlying_type, ..
             } => underlying_type.underlying_type(),
             TypeInfo::QualifiedType {
+                underlying_type, ..
+            } => underlying_type.underlying_type(),
+            TypeInfo::BitfieldType {
                 underlying_type, ..
             } => underlying_type.underlying_type(),
             _ => self,
@@ -411,6 +440,13 @@ impl fmt::Display for TypeInfo {
                 } else {
                     write!(f, "enum {name}")
                 }
+            }
+            TypeInfo::BitfieldType {
+                underlying_type,
+                bit_offset,
+                bit_size,
+            } => {
+                write!(f, "bitfield<{bit_offset}:{bit_size}> {underlying_type}")
             }
             TypeInfo::TypedefType {
                 name,

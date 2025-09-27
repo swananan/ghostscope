@@ -104,6 +104,9 @@ impl From<&TypeInfo> for TypeKind {
                     _ => TypeKind::U8, // Default to byte for unknown encoding
                 }
             }
+            TypeInfo::BitfieldType {
+                underlying_type, ..
+            } => TypeKind::from(underlying_type.as_ref()),
             TypeInfo::PointerType { .. } => TypeKind::Pointer,
             TypeInfo::ArrayType { .. } => TypeKind::Array,
             TypeInfo::StructType { .. } => TypeKind::Struct,

@@ -638,6 +638,7 @@ dependencies = [
  "ghostscope-ui",
  "lazy_static",
  "libc",
+ "regex",
  "scopeguard",
  "serde",
  "serde_json",

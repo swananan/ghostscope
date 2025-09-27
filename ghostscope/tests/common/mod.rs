@@ -142,6 +142,75 @@ pub fn ensure_test_program_compiled_with_opt(opt_level: OptimizationLevel) -> an
     result
 }
 
+static COMPILE_COMPLEX_DEBUG: Once = Once::new();
+static COMPILE_COMPLEX_OPT: Once = Once::new();
+
+fn ensure_complex_program_compiled_with_opt(opt_level: OptimizationLevel) -> anyhow::Result<()> {
+    let mut result = Ok(());
+    let compile_fn = || {
+        let fixtures_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let program_dir = fixtures_path.join("complex_types_program");
+
+        println!(
+            "Compiling complex_types_program {} in {:?}",
+            opt_level.description(),
+            program_dir
+        );
+
+        // Clean first for debug builds
+        if opt_level == OptimizationLevel::Debug {
+            let _ = Command::new("make")
+                .arg("clean")
+                .current_dir(&program_dir)
+                .output();
+        }
+
+        let target = match opt_level {
+            OptimizationLevel::Debug => "complex_types_program",
+            OptimizationLevel::O1 => "complex_types_program_o1",
+            OptimizationLevel::O2 => "complex_types_program_o2",
+            OptimizationLevel::O3 => "complex_types_program_o3",
+        };
+
+        let compile_output = Command::new("make")
+            .arg(target)
+            .current_dir(&program_dir)
+            .output();
+
+        match compile_output {
+            Ok(output) => {
+                if output.status.success() {
+                    println!(
+                        "✓ Successfully compiled complex_types_program {}",
+                        opt_level.description()
+                    );
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    result = Err(anyhow::anyhow!(
+                        "Failed to compile complex_types_program {}: {}",
+                        opt_level.description(),
+                        stderr
+                    ));
+                }
+            }
+            Err(e) => {
+                result = Err(anyhow::anyhow!(
+                    "Failed to run make for complex_types_program {}: {}",
+                    opt_level.description(),
+                    e
+                ));
+            }
+        }
+    };
+
+    match opt_level {
+        OptimizationLevel::Debug => COMPILE_COMPLEX_DEBUG.call_once(compile_fn),
+        _ => COMPILE_COMPLEX_OPT.call_once(compile_fn),
+    }
+
+    result
+}
+
 /// Test fixtures manager
 pub struct TestFixtures {
     base_path: PathBuf,
@@ -162,14 +231,21 @@ impl TestFixtures {
         name: &str,
         opt_level: OptimizationLevel,
     ) -> anyhow::Result<PathBuf> {
-        // Ensure compilation happens before getting binary path
-        ensure_test_program_compiled_with_opt(opt_level)?;
-
         let binary_path = if name == "sample_program" {
-            // Use our compiled sample_program with specific optimization level
+            // Ensure compilation happens before getting binary path
+            ensure_test_program_compiled_with_opt(opt_level)?;
             self.base_path
                 .join("sample_program")
                 .join(opt_level.as_binary_name())
+        } else if name == "complex_types_program" {
+            ensure_complex_program_compiled_with_opt(opt_level)?;
+            let bin_name = match opt_level {
+                OptimizationLevel::Debug => "complex_types_program",
+                OptimizationLevel::O1 => "complex_types_program_o1",
+                OptimizationLevel::O2 => "complex_types_program_o2",
+                OptimizationLevel::O3 => "complex_types_program_o3",
+            };
+            self.base_path.join("complex_types_program").join(bin_name)
         } else {
             // Fallback to old binaries directory (debug only)
             self.base_path.join("binaries").join(name).join(name)

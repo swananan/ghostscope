@@ -26,6 +26,9 @@ pub enum ParseError {
 
     #[error("Type error: {0}")]
     TypeError(String),
+
+    #[error("Unsupported feature: {0}")]
+    UnsupportedFeature(String),
 }
 
 impl From<pest::error::Error<Rule>> for ParseError {
@@ -542,9 +545,10 @@ fn parse_chain_access(pair: Pair<Rule>) -> Result<Expr> {
                 chain.push(inner_pair.as_str().to_string());
             }
             Rule::expr => {
-                // This would be for arr[index] part in chain_access
-                // For now, we'll keep it simple and just handle the identifier chain
-                // TODO: Handle array access within chain access
+                // Not supported for now: array access inside chain access
+                return Err(ParseError::UnsupportedFeature(
+                    "array access inside chain access is not supported yet (TODO)".to_string(),
+                ));
             }
             _ => {}
         }
@@ -564,7 +568,16 @@ fn parse_array_access(pair: Pair<Rule>) -> Result<Expr> {
     let index_expr = inner_pairs.next().unwrap();
 
     let array_expr = Box::new(Expr::Variable(array_name.as_str().to_string()));
-    let index_expr = Box::new(parse_expr(index_expr)?);
+    let parsed_index = parse_expr(index_expr)?;
+
+    // Enforce: array index must be a literal integer at parse stage
+    if !matches!(parsed_index, Expr::Int(_)) {
+        return Err(ParseError::UnsupportedFeature(
+            "array index must be a literal integer (TODO: support non-literal)".to_string(),
+        ));
+    }
+
+    let index_expr = Box::new(parsed_index);
 
     Ok(Expr::ArrayAccess(array_expr, index_expr))
 }

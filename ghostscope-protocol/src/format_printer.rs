@@ -29,6 +29,12 @@ pub struct ParsedComplexVariable {
 pub struct FormatPrinter;
 
 impl FormatPrinter {
+    /// Simple formatting helper: replace placeholders with variable values using TypeKind-based formatting
+    /// Note: This path does not use TraceContext type table; kept for unit tests and legacy behavior.
+    pub fn apply_format(format_string: &str, variables: &[ParsedVariable]) -> String {
+        let rendered: Vec<String> = variables.iter().map(Self::format_variable_value).collect();
+        Self::apply_format_strings(format_string, &rendered)
+    }
     /// Convert PrintFormat instruction data into a formatted string
     /// This is the main entry point for format printing
     pub fn format_print_data(
@@ -44,8 +50,8 @@ impl FormatPrinter {
             }
         };
 
-        // Parse the format string and replace placeholders with variable values
-        Self::apply_format(format_string, variables)
+        // Replace placeholders with variable values, preferring type_index formatting when available
+        Self::apply_format_with_context(format_string, variables, trace_context)
     }
 
     /// Format printer for converting PrintComplexFormat data to formatted strings
@@ -84,8 +90,14 @@ impl FormatPrinter {
         Self::apply_format_strings(format_string, &formatted_vars)
     }
 
-    /// Apply formatting: replace {} placeholders with variable values
-    fn apply_format(format_string: &str, variables: &[ParsedVariable]) -> String {
+    // Removed unused apply_format (was a pre-type-aware path)
+
+    /// Apply formatting with type-aware variables using TraceContext when available
+    fn apply_format_with_context(
+        format_string: &str,
+        variables: &[ParsedVariable],
+        trace_context: &TraceContext,
+    ) -> String {
         let mut result = String::new();
         let mut chars = format_string.chars().peekable();
         let mut var_index = 0;
@@ -94,10 +106,9 @@ impl FormatPrinter {
             match ch {
                 '{' => {
                     if chars.peek() == Some(&'{') {
-                        chars.next(); // Skip escaped '{{'
+                        chars.next();
                         result.push('{');
                     } else {
-                        // Found a placeholder, skip to '}' and replace with variable value
                         let mut found_closing = false;
                         for inner_ch in chars.by_ref() {
                             if inner_ch == '}' {
@@ -105,12 +116,23 @@ impl FormatPrinter {
                                 break;
                             }
                         }
-
                         if found_closing {
-                            // Replace with variable value
                             if var_index < variables.len() {
-                                let formatted_value =
-                                    Self::format_variable_value(&variables[var_index]);
+                                let var = &variables[var_index];
+                                let formatted_value = if let Some(type_index) = var.type_index {
+                                    // Use perfect formatting via type info
+                                    match trace_context.get_type(type_index) {
+                                        Some(type_info) => {
+                                            Self::format_data_with_type_info(&var.data, type_info)
+                                        }
+                                        None => format!(
+                                            "<COMPILER_ERROR: type_index {type_index} not found>",
+                                        ),
+                                    }
+                                } else {
+                                    // Fallback to simple TypeKind path
+                                    Self::format_variable_value(var)
+                                };
                                 result.push_str(&formatted_value);
                                 var_index += 1;
                             } else {
@@ -123,17 +145,15 @@ impl FormatPrinter {
                 }
                 '}' => {
                     if chars.peek() == Some(&'}') {
-                        chars.next(); // Skip escaped '}}'
+                        chars.next();
                         result.push('}');
                     } else {
-                        // Unmatched '}' - just output it (protocol doesn't validate)
                         result.push('}');
                     }
                 }
                 _ => result.push(ch),
             }
         }
-
         result
     }
 
@@ -243,6 +263,19 @@ impl FormatPrinter {
             TypeInfo::BaseType { size, encoding, .. } => {
                 Self::format_base_type_data(data, *size, *encoding)
             }
+            TypeInfo::BitfieldType {
+                underlying_type,
+                bit_offset,
+                bit_size,
+            } => {
+                let u_size = underlying_type.size() as usize;
+                if data.len() < u_size || *bit_size == 0 {
+                    return "<INVALID_BITFIELD>".to_string();
+                }
+                let val =
+                    Self::extract_bits_le(&data[..u_size], *bit_offset as u32, *bit_size as u32);
+                Self::format_bitfield_value(val, underlying_type, *bit_size as u32)
+            }
             TypeInfo::PointerType { target_type, .. } => {
                 if data.len() < 8 {
                     "<INVALID_POINTER>".to_string()
@@ -262,6 +295,10 @@ impl FormatPrinter {
                 element_count,
                 ..
             } => {
+                // Special-case: char arrays -> print as string
+                if Self::is_char_byte_type(element_type) {
+                    return Self::format_char_array_as_string(data, element_count);
+                }
                 let elem_size = element_type.size() as usize;
                 if elem_size == 0 {
                     return "<ZERO_SIZE_ELEMENT>".to_string();
@@ -314,19 +351,57 @@ impl FormatPrinter {
                     first = false;
 
                     let offset = member.offset as usize;
-                    let member_size = member.member_type.size() as usize;
-
-                    if offset + member_size <= data.len() {
-                        let member_data = &data[offset..offset + member_size];
-                        let formatted_value = Self::format_data_with_type_info_impl(
-                            member_data,
-                            &member.member_type,
-                            current_depth + 1,
-                            max_depth,
-                        );
-                        result.push_str(&format!("{}: {}", member.name, formatted_value));
+                    // Prefer explicit BitfieldType on member_type, else use legacy member.bit_* fields
+                    if let TypeInfo::BitfieldType {
+                        underlying_type,
+                        bit_offset,
+                        bit_size,
+                    } = &member.member_type
+                    {
+                        let u_size = underlying_type.size() as usize;
+                        if offset + u_size <= data.len() && *bit_size > 0 && *bit_size <= 64 {
+                            let raw = &data[offset..offset + u_size];
+                            let val_u64 =
+                                Self::extract_bits_le(raw, *bit_offset as u32, *bit_size as u32);
+                            let formatted_value = Self::format_bitfield_value(
+                                val_u64,
+                                underlying_type,
+                                *bit_size as u32,
+                            );
+                            result.push_str(&format!("{}: {}", member.name, formatted_value));
+                        } else {
+                            result.push_str(&format!("{}: <OUT_OF_BOUNDS>", member.name));
+                        }
+                    } else if let (Some(bit_size), maybe_bit_offset) =
+                        (member.bit_size, member.bit_offset)
+                    {
+                        // Handle bitfield member formatting (up to 64 bits)
+                        let bit_size = bit_size as u32;
+                        let bit_offset = maybe_bit_offset.unwrap_or(0) as u32;
+                        let bytes_needed = (bit_offset + bit_size).div_ceil(8) as usize;
+                        if offset + bytes_needed <= data.len() && bit_size > 0 && bit_size <= 64 {
+                            let raw = &data[offset..offset + bytes_needed];
+                            let val_u64 = Self::extract_bits_le(raw, bit_offset, bit_size);
+                            let formatted_value =
+                                Self::format_bitfield_value(val_u64, &member.member_type, bit_size);
+                            result.push_str(&format!("{}: {}", member.name, formatted_value));
+                        } else {
+                            result.push_str(&format!("{}: <OUT_OF_BOUNDS>", member.name));
+                        }
                     } else {
-                        result.push_str(&format!("{}: <OUT_OF_BOUNDS>", member.name));
+                        let member_size = member.member_type.size() as usize;
+                        if offset + member_size <= data.len() {
+                            let member_data = &data[offset..offset + member_size];
+                            let formatted_value = Self::format_data_with_type_info_impl(
+                                member_data,
+                                &member.member_type,
+                                current_depth + 1,
+                                max_depth,
+                            );
+                            result.push_str(&format!("{}: {}", member.name, formatted_value));
+                        } else {
+                            result.push_str(&format!("{}: <OUT_OF_BOUNDS>", member.name));
+                        }
                     }
                 }
 
@@ -824,6 +899,112 @@ impl FormatPrinter {
             _ => format!("<UNSUPPORTED_TYPE_{:?}>", variable.type_encoding),
         }
     }
+
+    /// Determine if a type is a single-byte character type (signed/unsigned char)
+    fn is_char_byte_type(t: &TypeInfo) -> bool {
+        match t {
+            TypeInfo::BaseType { size, encoding, .. } => {
+                *size == 1
+                    && (*encoding == gimli::constants::DW_ATE_signed_char.0 as u16
+                        || *encoding == gimli::constants::DW_ATE_unsigned_char.0 as u16
+                        || *encoding == gimli::constants::DW_ATE_unsigned.0 as u16
+                        || *encoding == gimli::constants::DW_ATE_signed.0 as u16)
+            }
+            TypeInfo::TypedefType {
+                underlying_type, ..
+            }
+            | TypeInfo::QualifiedType {
+                underlying_type, ..
+            } => Self::is_char_byte_type(underlying_type),
+            _ => false,
+        }
+    }
+
+    /// Format a char array as a UTF-8-ish escaped string (best-effort)
+    fn format_char_array_as_string(data: &[u8], element_count: &Option<u64>) -> String {
+        let max_len = element_count.map(|c| c as usize).unwrap_or(data.len());
+        let mut s = String::new();
+        s.push('"');
+        let mut i = 0usize;
+        while i < data.len() && i < max_len {
+            let b = data[i];
+            if b == 0 {
+                break; // C-string termination
+            }
+            match b {
+                b'"' => s.push_str("\\\""),
+                b'\\' => s.push_str("\\\\"),
+                0x20..=0x7E => s.push(b as char),
+                _ => s.push_str(&format!("\\x{b:02x}")),
+            }
+            // Avoid extremely long output
+            if i >= 255 {
+                s.push_str("...");
+                break;
+            }
+            i += 1;
+        }
+        s.push('"');
+        s
+    }
+
+    /// Extract bits from a little-endian byte slice, starting at bit_offset, with length bit_size (<=64)
+    fn extract_bits_le(raw: &[u8], bit_offset: u32, bit_size: u32) -> u64 {
+        // Assemble up to 8 bytes into a u64 (little-endian)
+        let mut word: u64 = 0;
+        let take = std::cmp::min(8, raw.len());
+        for (i, byte) in raw.iter().take(take).enumerate() {
+            word |= (*byte as u64) << (8 * i);
+        }
+        let shifted = word >> bit_offset;
+        let mask: u64 = if bit_size == 64 {
+            u64::MAX
+        } else {
+            (1u64 << bit_size) - 1
+        };
+        shifted & mask
+    }
+
+    /// Format bitfield value according to the member's TypeInfo (basic support)
+    fn format_bitfield_value(val: u64, ty: &TypeInfo, bit_size: u32) -> String {
+        // Bool by encoding
+        if let TypeInfo::BaseType { encoding, .. } = ty {
+            if *encoding == gimli::constants::DW_ATE_boolean.0 as u16 {
+                return if val != 0 {
+                    "true".to_string()
+                } else {
+                    "false".to_string()
+                };
+            }
+        }
+
+        // Enum mapping
+        if let TypeInfo::EnumType { variants, .. } = ty {
+            let sval = val as i64; // interpret as non-negative; signed variants must match exact value
+            for v in variants {
+                if v.value == sval {
+                    return v.name.clone();
+                }
+            }
+        }
+
+        // Signed extension if base type is signed
+        let is_signed = ty.is_signed_int();
+        if is_signed && bit_size > 0 && bit_size <= 64 {
+            let sign_bit = 1u64 << (bit_size - 1);
+            let signed_val: i64 = if (val & sign_bit) != 0 {
+                // negative value, sign-extend
+                let ext_mask = (!0u64) << bit_size;
+                (val | ext_mask) as i64
+            } else {
+                val as i64
+            };
+            return signed_val.to_string();
+        }
+
+        // Default: unsigned decimal
+        val.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -1017,5 +1198,103 @@ mod tests {
 
         let result = FormatPrinter::format_data_with_type_info(&data, &array_type);
         assert_eq!(result, "[1, 2, 3]");
+    }
+
+    #[test]
+    fn test_bitfield_value_signed_and_unsigned() {
+        use crate::type_info::TypeInfo;
+
+        // Unsigned 3-bit at bit 0 from a u32 container
+        let u32_type = TypeInfo::BaseType {
+            name: "unsigned int".to_string(),
+            size: 4,
+            encoding: gimli::constants::DW_ATE_unsigned.0 as u16,
+        };
+        let bf_unsigned = TypeInfo::BitfieldType {
+            underlying_type: Box::new(u32_type.clone()),
+            bit_offset: 0,
+            bit_size: 3,
+        };
+        let data = [0b0000_0101u8, 0, 0, 0]; // value = 5
+        let res = FormatPrinter::format_data_with_type_info(&data, &bf_unsigned);
+        assert_eq!(res, "5");
+
+        // Signed 3-bit at bit 0 from an i32 container (0b111 -> -1)
+        let i32_type = TypeInfo::BaseType {
+            name: "int".to_string(),
+            size: 4,
+            encoding: gimli::constants::DW_ATE_signed.0 as u16,
+        };
+        let bf_signed = TypeInfo::BitfieldType {
+            underlying_type: Box::new(i32_type),
+            bit_offset: 0,
+            bit_size: 3,
+        };
+        let data_neg1 = [0b0000_0111u8, 0, 0, 0];
+        let res2 = FormatPrinter::format_data_with_type_info(&data_neg1, &bf_signed);
+        assert_eq!(res2, "-1");
+
+        // Boolean 1-bit at bit 0 from a bool underlying type
+        let bool_type = TypeInfo::BaseType {
+            name: "bool".to_string(),
+            size: 1,
+            encoding: gimli::constants::DW_ATE_boolean.0 as u16,
+        };
+        let bf_bool = TypeInfo::BitfieldType {
+            underlying_type: Box::new(bool_type),
+            bit_offset: 0,
+            bit_size: 1,
+        };
+        let data_true = [0x01u8];
+        let res3 = FormatPrinter::format_data_with_type_info(&data_true, &bf_bool);
+        assert_eq!(res3, "true");
+    }
+
+    #[test]
+    fn test_struct_with_bitfields() {
+        use crate::type_info::{StructMember, TypeInfo};
+
+        // Define a struct S with two bitfields in a 32-bit storage at offset 0
+        let u32_type = TypeInfo::BaseType {
+            name: "unsigned int".to_string(),
+            size: 4,
+            encoding: gimli::constants::DW_ATE_unsigned.0 as u16,
+        };
+
+        let s_type = TypeInfo::StructType {
+            name: "S".to_string(),
+            size: 4,
+            members: vec![
+                StructMember {
+                    name: "active".to_string(),
+                    member_type: TypeInfo::BitfieldType {
+                        underlying_type: Box::new(u32_type.clone()),
+                        bit_offset: 0,
+                        bit_size: 1,
+                    },
+                    offset: 0,
+                    bit_offset: Some(0),
+                    bit_size: Some(1),
+                },
+                StructMember {
+                    name: "flags".to_string(),
+                    member_type: TypeInfo::BitfieldType {
+                        underlying_type: Box::new(u32_type.clone()),
+                        bit_offset: 1,
+                        bit_size: 3,
+                    },
+                    offset: 0,
+                    bit_offset: Some(1),
+                    bit_size: Some(3),
+                },
+            ],
+        };
+
+        // Value layout: bit0=1 (active), bits1..3=0b011 (flags=3)
+        let data = [0b0000_0111u8, 0, 0, 0];
+        let res = FormatPrinter::format_data_with_type_info(&data, &s_type);
+        assert!(res.contains("S {"));
+        assert!(res.contains("active: 1"));
+        assert!(res.contains("flags: 3"));
     }
 }

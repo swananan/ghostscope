@@ -331,7 +331,8 @@ impl<'ctx> EbpfContext<'ctx> {
     /// Create a global instruction buffer to avoid eBPF dynamic stack allocation
     pub fn create_instruction_buffer(&mut self) -> PointerValue<'ctx> {
         // Create a global buffer for instructions
-        let buffer_size = 512; // Sufficient for instruction data
+        // Increased to support complex variable payloads up to ~2KB plus headers
+        let buffer_size = 4096; // Sufficient for instruction data
         let i8_type = self.context.i8_type();
         let buffer_type = i8_type.array_type(buffer_size);
 

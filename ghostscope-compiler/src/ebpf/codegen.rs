@@ -5,6 +5,7 @@
 
 use super::context::{CodeGenError, EbpfContext, Result};
 use crate::script::{Expr, PrintStatement, Program, Statement};
+use aya_ebpf_bindings::bindings::bpf_func_id::BPF_FUNC_probe_read_user;
 use ghostscope_protocol::trace_event::{
     BacktraceData, InstructionHeader, PrintComplexVariableData, PrintFormatData,
     PrintStringIndexData, PrintVariableErrorData, PrintVariableIndexData,
@@ -33,7 +34,85 @@ enum FormatValueSource {
     IntegerLiteral, // Integer literal value serialized directly
 }
 
+/// Source for complex formatted argument data
+#[derive(Debug, Clone)]
+enum ComplexArgSource {
+    RuntimeRead {
+        eval_result: ghostscope_dwarf::EvaluationResult,
+        dwarf_type: ghostscope_dwarf::TypeInfo,
+    },
+    ImmediateBytes {
+        bytes: Vec<u8>,
+    },
+}
+
+/// Argument descriptor for PrintComplexFormat
+#[derive(Debug, Clone)]
+struct ComplexArg {
+    var_name_index: u16,
+    type_index: u16,
+    access_path: Vec<u8>,
+    data_len: usize,
+    source: ComplexArgSource,
+}
+
 impl<'ctx> EbpfContext<'ctx> {
+    /// Determine if a TypeInfo qualifies as a "simple variable" for PrintVariableIndex
+    /// Simple: base types (bool/int/float/char), enums (with base type 1/2/4/8), pointers;
+    /// Complex: arrays, structs, unions, functions
+    #[allow(clippy::only_used_in_recursion)]
+    fn is_simple_typeinfo(&self, t: &ghostscope_dwarf::TypeInfo) -> bool {
+        use ghostscope_dwarf::TypeInfo as TI;
+        match t {
+            TI::BaseType { size, .. } => matches!(*size, 1 | 2 | 4 | 8),
+            TI::EnumType { base_type, .. } => {
+                let sz = base_type.size();
+                matches!(sz, 1 | 2 | 4 | 8)
+            }
+            TI::PointerType { .. } => true,
+            TI::TypedefType {
+                underlying_type, ..
+            }
+            | TI::QualifiedType {
+                underlying_type, ..
+            } => self.is_simple_typeinfo(underlying_type),
+            _ => false,
+        }
+    }
+
+    /// Compute read size for a given DWARF type.
+    /// No fallback: if DWARF doesn't provide size for arrays, return 0 and let caller error out.
+    #[allow(clippy::only_used_in_recursion)]
+    fn compute_read_size_for_type(&self, t: &ghostscope_dwarf::TypeInfo) -> usize {
+        use ghostscope_dwarf::TypeInfo as TI;
+        match t {
+            TI::ArrayType {
+                element_type,
+                element_count,
+                total_size,
+            } => {
+                if let Some(ts) = total_size {
+                    return *ts as usize;
+                }
+                let elem_size = element_type.size() as usize;
+                if elem_size == 0 {
+                    return 0;
+                }
+                if let Some(cnt) = element_count {
+                    return elem_size * (*cnt as usize);
+                }
+                0
+            }
+            TI::TypedefType {
+                underlying_type, ..
+            }
+            | TI::QualifiedType {
+                underlying_type, ..
+            } => self.compute_read_size_for_type(underlying_type),
+            _ => t.size() as usize,
+        }
+    }
+
     /// Main entry point: compile program with staged transmission system
     pub fn compile_program_with_staged_transmission(
         &mut self,
@@ -206,18 +285,55 @@ impl<'ctx> EbpfContext<'ctx> {
             }
             PrintStatement::Variable(var_name) => {
                 info!("Processing variable: {}", var_name);
-
-                // Follow the correct priority: script variables first, then DWARF variables
+                // Resolve display name index and type encoding first
                 let (var_name_index, type_encoding) =
                     self.resolve_variable_with_priority(var_name)?;
 
-                // Generate eBPF code for PrintVariableIndex
-                self.generate_print_variable_index(var_name_index, type_encoding, var_name)?;
-                Ok(1) // Generated 1 instruction
+                // If DWARF type exists and is complex, route to complex path
+                let is_complex = match self.query_dwarf_for_variable(var_name)? {
+                    Some(v) => match v.dwarf_type {
+                        Some(ref t) => !self.is_simple_typeinfo(t),
+                        None => false,
+                    },
+                    None => false,
+                };
+                tracing::trace!(
+                    var_name = %var_name,
+                    var_name_index = var_name_index,
+                    ?type_encoding,
+                    is_complex,
+                    "compile_print_statement: routing decision"
+                );
+                if is_complex {
+                    // Use complex var pipeline for better formatting and correct sizing
+                    let expr = crate::script::Expr::Variable(var_name.clone());
+                    let n = self.process_complex_variable_print(&expr)?;
+                    tracing::trace!(
+                        var_name = %var_name,
+                        instructions = n,
+                        "compile_print_statement: complex variable emitted"
+                    );
+                    Ok(n)
+                } else {
+                    // Simple variable - use PrintVariableIndex with type_index
+                    self.generate_print_variable_index(var_name_index, type_encoding, var_name)?;
+                    tracing::trace!(
+                        var_name = %var_name,
+                        var_name_index = var_name_index,
+                        ?type_encoding,
+                        "compile_print_statement: simple variable emitted (PrintVariableIndex)"
+                    );
+                    Ok(1)
+                }
             }
             PrintStatement::ComplexVariable(expr) => {
                 info!("Processing complex variable: {:?}", expr);
-                self.process_complex_variable_print(expr)
+                let n = self.process_complex_variable_print(expr)?;
+                tracing::trace!(
+                    instructions = n,
+                    "compile_print_statement: complex expr emitted"
+                );
+                Ok(n)
             }
             PrintStatement::Formatted { format, args } => {
                 info!(
@@ -230,7 +346,7 @@ impl<'ctx> EbpfContext<'ctx> {
         }
     }
 
-    /// Compile formatted print statement: collect all variable data and send as PrintFormat instruction
+    /// Compile formatted print statement: collect all variable data and send as PrintFormat/PrintComplexFormat instruction
     fn compile_formatted_print(
         &mut self,
         format: &str,
@@ -249,72 +365,166 @@ impl<'ctx> EbpfContext<'ctx> {
             format_string_index
         );
 
-        // 2. Process each argument and collect variable data information
-        let mut variable_infos = Vec::new();
+        // 2. Decide path: if any arg is complex (MemberAccess/ArrayAccess/PointerDeref/ChainAccess),
+        //    emit PrintComplexFormat; otherwise use PrintFormat fast path
+        let has_complex = args.iter().any(|arg| {
+            matches!(
+                arg,
+                crate::script::ast::Expr::MemberAccess(_, _)
+                    | crate::script::ast::Expr::ArrayAccess(_, _)
+                    | crate::script::ast::Expr::PointerDeref(_)
+                    | crate::script::ast::Expr::ChainAccess(_)
+            )
+        });
 
+        if !has_complex {
+            // Simple fast path: variables + literals via PrintFormat
+            let mut variable_infos = Vec::new();
+            for (i, arg) in args.iter().enumerate() {
+                match arg {
+                    crate::script::ast::Expr::Variable(var_name) => {
+                        info!("Processing argument {}: variable '{}'", i, var_name);
+                        let (var_name_index, type_encoding) =
+                            self.resolve_variable_with_priority(var_name)?;
+                        let data_size = self.get_type_size(type_encoding);
+                        variable_infos.push(FormatVariableInfo {
+                            var_name: var_name.clone(),
+                            var_name_index,
+                            type_encoding,
+                            data_size,
+                            value_source: FormatValueSource::Variable,
+                        });
+                    }
+                    crate::script::ast::Expr::String(s) => {
+                        info!("Processing argument {}: string literal '{}'", i, s);
+                        let var_name = format!("__str_literal_{}", i);
+                        let var_name_index = self.trace_context.add_variable_name(var_name.clone());
+                        variable_infos.push(FormatVariableInfo {
+                            var_name,
+                            var_name_index,
+                            type_encoding: TypeKind::CString,
+                            data_size: s.len() + 1,
+                            value_source: FormatValueSource::StringLiteral,
+                        });
+                    }
+                    crate::script::ast::Expr::Int(_) => {
+                        info!("Processing argument {}: integer literal", i);
+                        let var_name = format!("__int_literal_{}", i);
+                        let var_name_index = self.trace_context.add_variable_name(var_name.clone());
+                        variable_infos.push(FormatVariableInfo {
+                            var_name,
+                            var_name_index,
+                            type_encoding: TypeKind::I64,
+                            data_size: 8,
+                            value_source: FormatValueSource::IntegerLiteral,
+                        });
+                    }
+                    other => {
+                        return Err(CodeGenError::NotImplemented(format!(
+                            "Expression type {:?} not supported in formatted print",
+                            other
+                        )));
+                    }
+                }
+            }
+            self.generate_print_format_instruction(format_string_index, &variable_infos)?;
+            return Ok(1);
+        }
+
+        // Complex path: build PrintComplexFormat with DWARF-resolved arguments (and embed literals)
+        let mut complex_args: Vec<ComplexArg> = Vec::with_capacity(args.len());
         for (i, arg) in args.iter().enumerate() {
             match arg {
-                crate::script::ast::Expr::Variable(var_name) => {
-                    info!("Processing argument {}: variable '{}'", i, var_name);
-
-                    // Resolve variable to get type and name index
-                    let (var_name_index, type_encoding) =
-                        self.resolve_variable_with_priority(var_name)?;
-
-                    // Determine data size based on type
-                    let data_size = self.get_type_size(type_encoding);
-
-                    variable_infos.push(FormatVariableInfo {
-                        var_name: var_name.clone(),
-                        var_name_index,
-                        type_encoding,
-                        data_size,
-                        value_source: FormatValueSource::Variable,
-                    });
-                }
                 crate::script::ast::Expr::String(s) => {
-                    info!("Processing argument {}: string literal '{}'", i, s);
-
-                    // Add string literal to variable names with a unique identifier
+                    // Treat as char array type with immediate bytes
                     let var_name = format!("__str_literal_{}", i);
-                    let var_name_index = self.trace_context.add_variable_name(var_name.clone());
-
-                    variable_infos.push(FormatVariableInfo {
-                        var_name,
+                    let var_name_index = self.trace_context.add_variable_name(var_name);
+                    let mut bytes = s.as_bytes().to_vec();
+                    bytes.push(0); // null-terminate like C string
+                    let char_type = ghostscope_dwarf::TypeInfo::BaseType {
+                        name: "char".to_string(),
+                        size: 1,
+                        encoding: ghostscope_dwarf::constants::DW_ATE_unsigned_char.0 as u16,
+                    };
+                    let array_type = ghostscope_dwarf::TypeInfo::ArrayType {
+                        element_type: Box::new(char_type),
+                        element_count: Some(bytes.len() as u64),
+                        total_size: Some(bytes.len() as u64),
+                    };
+                    let type_index = self.trace_context.add_type(array_type.clone());
+                    complex_args.push(ComplexArg {
                         var_name_index,
-                        type_encoding: TypeKind::CString,
-                        data_size: s.len() + 1, // +1 for null terminator
-                        value_source: FormatValueSource::StringLiteral,
+                        type_index,
+                        access_path: Vec::new(),
+                        data_len: bytes.len(),
+                        source: ComplexArgSource::ImmediateBytes { bytes },
                     });
                 }
-                crate::script::ast::Expr::Int(value) => {
-                    info!("Processing argument {}: integer literal {}", i, value);
-
-                    // Add integer literal to variable names
+                crate::script::ast::Expr::Int(v) => {
+                    // Treat as i64 base type with immediate bytes
                     let var_name = format!("__int_literal_{}", i);
-                    let var_name_index = self.trace_context.add_variable_name(var_name.clone());
-
-                    variable_infos.push(FormatVariableInfo {
-                        var_name,
+                    let var_name_index = self.trace_context.add_variable_name(var_name);
+                    let mut bytes = Vec::with_capacity(8);
+                    bytes.extend_from_slice(&(*v).to_le_bytes());
+                    let int_type = ghostscope_dwarf::TypeInfo::BaseType {
+                        name: "i64".to_string(),
+                        size: 8,
+                        encoding: ghostscope_dwarf::constants::DW_ATE_signed.0 as u16,
+                    };
+                    let type_index = self.trace_context.add_type(int_type.clone());
+                    complex_args.push(ComplexArg {
                         var_name_index,
-                        type_encoding: TypeKind::I64,
-                        data_size: 8,
-                        value_source: FormatValueSource::IntegerLiteral,
+                        type_index,
+                        access_path: Vec::new(),
+                        data_len: 8,
+                        source: ComplexArgSource::ImmediateBytes { bytes },
                     });
                 }
-                _ => {
+                // Variables and complex expressions -> resolve via DWARF
+                expr @ (crate::script::ast::Expr::Variable(_)
+                | crate::script::ast::Expr::MemberAccess(_, _)
+                | crate::script::ast::Expr::ArrayAccess(_, _)
+                | crate::script::ast::Expr::PointerDeref(_)
+                | crate::script::ast::Expr::ChainAccess(_)) => {
+                    let var = self
+                        .query_dwarf_for_complex_expr(expr)?
+                        .ok_or_else(|| CodeGenError::VariableNotFound(format!("{:?}", expr)))?;
+                    let dwarf_type = var.dwarf_type.as_ref().ok_or_else(|| {
+                        CodeGenError::DwarfError(
+                            "Expression has no DWARF type information".to_string(),
+                        )
+                    })?;
+                    let var_name_index = self.trace_context.add_variable_name(var.name.clone());
+                    let type_index = self.trace_context.add_type(dwarf_type.clone());
+                    let mut data_len = self.compute_read_size_for_type(dwarf_type);
+                    if data_len == 0 {
+                        return Err(CodeGenError::TypeSizeNotAvailable(var.name));
+                    }
+                    if data_len > 1993 {
+                        data_len = 1993;
+                    }
+                    complex_args.push(ComplexArg {
+                        var_name_index,
+                        type_index,
+                        access_path: Vec::new(), // The raw data already points to the final member
+                        data_len,
+                        source: ComplexArgSource::RuntimeRead {
+                            eval_result: var.evaluation_result.clone(),
+                            dwarf_type: dwarf_type.clone(),
+                        },
+                    });
+                }
+                other => {
                     return Err(CodeGenError::NotImplemented(format!(
                         "Expression type {:?} not supported in formatted print",
-                        arg
+                        other
                     )));
                 }
             }
         }
 
-        // 3. Generate PrintFormat instruction in LLVM IR
-        self.generate_print_format_instruction(format_string_index, &variable_infos)?;
-
-        Ok(1) // Generated 1 PrintFormat instruction
+        self.generate_print_complex_format_instruction(format_string_index, &complex_args)?;
+        Ok(1)
     }
 
     /// Get the size in bytes for a given type encoding
@@ -428,8 +638,10 @@ impl<'ctx> EbpfContext<'ctx> {
         let mut total_variable_data_size = 0;
         for var_info in variable_infos {
             if let FormatValueSource::Variable = &var_info.value_source {
-                // Each variable: var_name_index(2) + type_encoding(1) + data_len(2) + data
-                total_variable_data_size += 5 + var_info.data_size;
+                // Each variable header is 7 bytes:
+                //   var_name_index(2) + type_encoding(1) + type_index(2) + data_len(2)
+                // Then followed by `data_len` bytes of data
+                total_variable_data_size += 7 + var_info.data_size;
             }
         }
 
@@ -595,7 +807,26 @@ impl<'ctx> EbpfContext<'ctx> {
                     var_info.var_name, current_offset
                 );
 
-                // Write variable header: [var_name_index:u16, type_encoding:u8, data_len:u16]
+                // Resolve DWARF type index for perfect formatting (no fallback)
+                let type_index = match self.query_dwarf_for_variable(&var_info.var_name)? {
+                    Some(v) => match v.dwarf_type {
+                        Some(ref t) => self.trace_context.add_type(t.clone()),
+                        None => {
+                            return Err(CodeGenError::DwarfError(format!(
+                                "Variable '{}' missing DWARF type for formatted print",
+                                var_info.var_name
+                            )));
+                        }
+                    },
+                    None => {
+                        return Err(CodeGenError::VariableNotFound(format!(
+                            "Variable '{}' not found for formatted print",
+                            var_info.var_name
+                        )));
+                    }
+                };
+
+                // Write variable header: [var_name_index:u16, type_encoding:u8, type_index:u16, data_len:u16]
                 let var_header_ptr = unsafe {
                     self.builder
                         .build_gep(
@@ -662,13 +893,43 @@ impl<'ctx> EbpfContext<'ctx> {
                         CodeGenError::LLVMError(format!("Failed to store type_encoding: {}", e))
                     })?;
 
-                // data_len at offset 3
-                let data_len_ptr = unsafe {
+                // type_index at offset 3..5
+                let type_index_ptr = unsafe {
                     self.builder
                         .build_gep(
                             self.context.i8_type(),
                             var_header_ptr,
                             &[self.context.i32_type().const_int(3, false)],
+                            "type_index_ptr",
+                        )
+                        .map_err(|e| {
+                            CodeGenError::LLVMError(format!("Failed to get type_index GEP: {}", e))
+                        })?
+                };
+                let type_index_i16_ptr = self
+                    .builder
+                    .build_pointer_cast(
+                        type_index_ptr,
+                        self.context.ptr_type(AddressSpace::default()),
+                        "type_index_i16_ptr",
+                    )
+                    .map_err(|e| {
+                        CodeGenError::LLVMError(format!("Failed to cast type_index ptr: {}", e))
+                    })?;
+                let type_index_val = self.context.i16_type().const_int(type_index as u64, false);
+                self.builder
+                    .build_store(type_index_i16_ptr, type_index_val)
+                    .map_err(|e| {
+                        CodeGenError::LLVMError(format!("Failed to store type_index: {}", e))
+                    })?;
+
+                // data_len at offset 5
+                let data_len_ptr = unsafe {
+                    self.builder
+                        .build_gep(
+                            self.context.i8_type(),
+                            var_header_ptr,
+                            &[self.context.i32_type().const_int(5, false)],
                             "data_len_ptr",
                         )
                         .map_err(|e| {
@@ -695,13 +956,13 @@ impl<'ctx> EbpfContext<'ctx> {
                         CodeGenError::LLVMError(format!("Failed to store data_len: {}", e))
                     })?;
 
-                // Generate variable data reading at offset 5
+                // Generate variable data reading at offset 7
                 let var_data_ptr = unsafe {
                     self.builder
                         .build_gep(
                             self.context.i8_type(),
                             var_header_ptr,
-                            &[self.context.i32_type().const_int(5, false)],
+                            &[self.context.i32_type().const_int(7, false)],
                             "var_data_ptr",
                         )
                         .map_err(|e| {
@@ -747,7 +1008,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     }
                 }
 
-                current_offset += 5 + var_info.data_size;
+                current_offset += 7 + var_info.data_size;
             }
         }
 
@@ -758,6 +1019,339 @@ impl<'ctx> EbpfContext<'ctx> {
             "Successfully generated true single PrintFormat instruction with {} variables",
             actual_var_count
         );
+        Ok(())
+    }
+
+    /// Generate eBPF code for PrintComplexFormat instruction with runtime reads for variables
+    fn generate_print_complex_format_instruction(
+        &mut self,
+        format_string_index: u16,
+        complex_args: &[ComplexArg],
+    ) -> Result<()> {
+        use ghostscope_protocol::trace_event::PrintComplexFormatData;
+        use InstructionType::PrintComplexFormat as IT;
+
+        // Calculate total size
+        let mut total_args_payload = 0usize;
+        let mut arg_count = 0u8;
+        for a in complex_args.iter() {
+            // var_name_index(2) + type_index(2) + access_path_len(1) + access_path + data_len(2) + data
+            total_args_payload += 2 + 2 + 1 + a.access_path.len() + 2 + a.data_len;
+            arg_count = arg_count.saturating_add(1);
+        }
+        let inst_data_size = std::mem::size_of::<PrintComplexFormatData>() + total_args_payload;
+        let total_size = std::mem::size_of::<InstructionHeader>() + inst_data_size;
+
+        // Allocate buffer
+        let buffer = self.create_instruction_buffer();
+
+        // Clear buffer
+        let total_size_val = self.context.i64_type().const_int(total_size as u64, false);
+        self.builder
+            .build_memset(
+                buffer,
+                std::mem::align_of::<InstructionHeader>() as u32,
+                self.context.i8_type().const_zero(),
+                total_size_val,
+            )
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to clear buffer: {}", e)))?;
+
+        // Write InstructionHeader
+        let inst_type_val = self.context.i8_type().const_int(IT as u8 as u64, false);
+        self.builder
+            .build_store(buffer, inst_type_val)
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store inst_type: {}", e)))?;
+        // data_length at +1
+        let data_length_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    buffer,
+                    &[self.context.i32_type().const_int(1, false)],
+                    "data_length_ptr",
+                )
+                .map_err(|e| {
+                    CodeGenError::LLVMError(format!("Failed to get data_length GEP: {}", e))
+                })?
+        };
+        let data_length_i16_ptr = self
+            .builder
+            .build_pointer_cast(
+                data_length_ptr,
+                self.context.ptr_type(AddressSpace::default()),
+                "data_length_i16_ptr",
+            )
+            .map_err(|e| {
+                CodeGenError::LLVMError(format!("Failed to cast data_length ptr: {}", e))
+            })?;
+        let data_length_val = self
+            .context
+            .i16_type()
+            .const_int(inst_data_size as u64, false);
+        self.builder
+            .build_store(data_length_i16_ptr, data_length_val)
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_length: {}", e)))?;
+
+        // Write PrintComplexFormatData at offset 4
+        let data_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    buffer,
+                    &[self.context.i32_type().const_int(4, false)],
+                    "pcf_data_ptr",
+                )
+                .map_err(|e| {
+                    CodeGenError::LLVMError(format!("Failed to get pcf_data_ptr GEP: {}", e))
+                })?
+        };
+
+        // format_string_index (u16) at +0
+        let fsi_ptr = self
+            .builder
+            .build_pointer_cast(
+                data_ptr,
+                self.context.ptr_type(AddressSpace::default()),
+                "fsi_ptr",
+            )
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast fsi_ptr: {}", e)))?;
+        let fsi_val = self
+            .context
+            .i16_type()
+            .const_int(format_string_index as u64, false);
+        self.builder
+            .build_store(fsi_ptr, fsi_val)
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store fsi: {}", e)))?;
+        // arg_count (u8) at +2
+        let arg_cnt_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    data_ptr,
+                    &[self.context.i32_type().const_int(2, false)],
+                    "arg_count_ptr",
+                )
+                .map_err(|e| {
+                    CodeGenError::LLVMError(format!("Failed to get arg_count GEP: {}", e))
+                })?
+        };
+        self.builder
+            .build_store(
+                arg_cnt_ptr,
+                self.context.i8_type().const_int(arg_count as u64, false),
+            )
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store arg_count: {}", e)))?;
+
+        // Start of variable payload after PrintComplexFormatData
+        let mut offset = std::mem::size_of::<PrintComplexFormatData>();
+        for a in complex_args.iter() {
+            // var_name_index (u16)
+            let vni_ptr = unsafe {
+                self.builder
+                    .build_gep(
+                        self.context.i8_type(),
+                        data_ptr,
+                        &[self.context.i32_type().const_int(offset as u64, false)],
+                        "vni_ptr",
+                    )
+                    .map_err(|e| CodeGenError::LLVMError(format!("Failed to get vni GEP: {}", e)))?
+            };
+            let vni_cast = self
+                .builder
+                .build_pointer_cast(
+                    vni_ptr,
+                    self.context.ptr_type(AddressSpace::default()),
+                    "vni_cast",
+                )
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast vni ptr: {}", e)))?;
+            self.builder
+                .build_store(
+                    vni_cast,
+                    self.context
+                        .i16_type()
+                        .const_int(a.var_name_index as u64, false),
+                )
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to store vni: {}", e)))?;
+            offset += 2;
+
+            // type_index (u16)
+            let ti_ptr = unsafe {
+                self.builder
+                    .build_gep(
+                        self.context.i8_type(),
+                        data_ptr,
+                        &[self.context.i32_type().const_int(offset as u64, false)],
+                        "ti_ptr",
+                    )
+                    .map_err(|e| CodeGenError::LLVMError(format!("Failed to get ti GEP: {}", e)))?
+            };
+            let ti_cast = self
+                .builder
+                .build_pointer_cast(
+                    ti_ptr,
+                    self.context.ptr_type(AddressSpace::default()),
+                    "ti_cast",
+                )
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast ti ptr: {}", e)))?;
+            self.builder
+                .build_store(
+                    ti_cast,
+                    self.context
+                        .i16_type()
+                        .const_int(a.type_index as u64, false),
+                )
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to store ti: {}", e)))?;
+            offset += 2;
+
+            // access_path_len (u8)
+            let apl_ptr = unsafe {
+                self.builder
+                    .build_gep(
+                        self.context.i8_type(),
+                        data_ptr,
+                        &[self.context.i32_type().const_int(offset as u64, false)],
+                        "apl_ptr",
+                    )
+                    .map_err(|e| CodeGenError::LLVMError(format!("Failed to get apl GEP: {}", e)))?
+            };
+            self.builder
+                .build_store(
+                    apl_ptr,
+                    self.context
+                        .i8_type()
+                        .const_int(a.access_path.len() as u64, false),
+                )
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to store apl: {}", e)))?;
+            offset += 1;
+
+            // access_path bytes
+            for (i, b) in a.access_path.iter().enumerate() {
+                let byte_ptr = unsafe {
+                    self.builder
+                        .build_gep(
+                            self.context.i8_type(),
+                            data_ptr,
+                            &[self
+                                .context
+                                .i32_type()
+                                .const_int((offset + i) as u64, false)],
+                            &format!("ap_byte_{}", i),
+                        )
+                        .map_err(|e| {
+                            CodeGenError::LLVMError(format!("Failed to get ap byte GEP: {}", e))
+                        })?
+                };
+                self.builder
+                    .build_store(byte_ptr, self.context.i8_type().const_int(*b as u64, false))
+                    .map_err(|e| {
+                        CodeGenError::LLVMError(format!("Failed to store ap byte: {}", e))
+                    })?;
+            }
+            offset += a.access_path.len();
+
+            // data_len (u16)
+            let dl_ptr = unsafe {
+                self.builder
+                    .build_gep(
+                        self.context.i8_type(),
+                        data_ptr,
+                        &[self.context.i32_type().const_int(offset as u64, false)],
+                        "dl_ptr",
+                    )
+                    .map_err(|e| CodeGenError::LLVMError(format!("Failed to get dl GEP: {}", e)))?
+            };
+            let dl_cast = self
+                .builder
+                .build_pointer_cast(
+                    dl_ptr,
+                    self.context.ptr_type(AddressSpace::default()),
+                    "dl_cast",
+                )
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast dl ptr: {}", e)))?;
+            self.builder
+                .build_store(
+                    dl_cast,
+                    self.context.i16_type().const_int(a.data_len as u64, false),
+                )
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_len: {}", e)))?;
+            offset += 2;
+
+            // variable data
+            let var_data_ptr = unsafe {
+                self.builder
+                    .build_gep(
+                        self.context.i8_type(),
+                        data_ptr,
+                        &[self.context.i32_type().const_int(offset as u64, false)],
+                        "var_data_ptr",
+                    )
+                    .map_err(|e| {
+                        CodeGenError::LLVMError(format!("Failed to get var_data GEP: {}", e))
+                    })?
+            };
+
+            match &a.source {
+                ComplexArgSource::ImmediateBytes { bytes, .. } => {
+                    for (i, b) in bytes.iter().enumerate() {
+                        let byte_ptr = unsafe {
+                            self.builder
+                                .build_gep(
+                                    self.context.i8_type(),
+                                    var_data_ptr,
+                                    &[self.context.i32_type().const_int(i as u64, false)],
+                                    &format!("var_byte_{}", i),
+                                )
+                                .map_err(|e| {
+                                    CodeGenError::LLVMError(format!(
+                                        "Failed to get var byte GEP: {}",
+                                        e
+                                    ))
+                                })?
+                        };
+                        self.builder
+                            .build_store(
+                                byte_ptr,
+                                self.context.i8_type().const_int(*b as u64, false),
+                            )
+                            .map_err(|e| {
+                                CodeGenError::LLVMError(format!("Failed to store var byte: {}", e))
+                            })?;
+                    }
+                }
+                ComplexArgSource::RuntimeRead {
+                    eval_result,
+                    dwarf_type,
+                } => {
+                    // Read from user memory at runtime via BPF helper
+                    let ptr_type = self.context.ptr_type(AddressSpace::default());
+                    let i32_type = self.context.i32_type();
+                    let dst_ptr = self
+                        .builder
+                        .build_bit_cast(var_data_ptr, ptr_type, "dst_ptr")
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    let size_val = i32_type.const_int(a.data_len as u64, false);
+                    let src_addr = self.evaluation_result_to_address(eval_result)?;
+                    let src_ptr = self
+                        .builder
+                        .build_int_to_ptr(src_addr, ptr_type, "src_ptr")
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+                    let _ = self.create_bpf_helper_call(
+                        BPF_FUNC_probe_read_user as u64,
+                        &[dst_ptr, size_val.into(), src_ptr.into()],
+                        i32_type.into(),
+                        "probe_read_user",
+                    )?;
+                    let _ = dwarf_type; // silence unused warning in some cfgs
+                }
+            }
+
+            offset += a.data_len;
+        }
+
+        // Send via ringbuf
+        self.create_ringbuf_output(buffer, total_size as u64)
+            .map_err(|e| CodeGenError::LLVMError(format!("Ringbuf output failed: {}", e)))?;
         Ok(())
     }
 
@@ -1229,10 +1823,26 @@ impl<'ctx> EbpfContext<'ctx> {
         );
 
         // First, try to read the variable value
+        // Require DWARF type info for perfect formatting (no fallback synthesis)
+        let type_index = match self.query_dwarf_for_variable(var_name)? {
+            Some(var) => match var.dwarf_type {
+                Some(ref t) => self.trace_context.add_type(t.clone()),
+                None => {
+                    // Missing type info -> emit error and return
+                    return self.generate_print_variable_error(var_name_index, 2, var_name);
+                }
+            },
+            None => {
+                // Not found in DWARF -> emit error and return
+                return self.generate_print_variable_error(var_name_index, 2, var_name);
+            }
+        };
+
         match self.resolve_variable_value(var_name, type_encoding) {
             Ok(var_data) => self.generate_successful_variable_instruction(
                 var_name_index,
                 type_encoding,
+                type_index,
                 var_data,
             ),
             Err(_) => {
@@ -1247,6 +1857,7 @@ impl<'ctx> EbpfContext<'ctx> {
         &mut self,
         var_name_index: u16,
         type_encoding: TypeKind,
+        type_index: u16,
         var_data: BasicValueEnum<'ctx>,
     ) -> Result<()> {
         // Determine data size based on type
@@ -1427,6 +2038,58 @@ impl<'ctx> EbpfContext<'ctx> {
         self.builder
             .build_store(data_len_i16_ptr, data_len_val)
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_len: {}", e)))?;
+
+        // Store type_index using correct offset
+        let type_index_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    variable_data_start,
+                    &[self.context.i32_type().const_int(
+                        std::mem::offset_of!(PrintVariableIndexData, type_index) as u64,
+                        false,
+                    )],
+                    "type_index_ptr",
+                )
+                .map_err(|e| {
+                    CodeGenError::LLVMError(format!("Failed to get type_index GEP: {}", e))
+                })?
+        };
+        let type_index_i16_ptr = self
+            .builder
+            .build_pointer_cast(
+                type_index_ptr,
+                self.context.ptr_type(AddressSpace::default()),
+                "type_index_i16_ptr",
+            )
+            .map_err(|e| {
+                CodeGenError::LLVMError(format!("Failed to cast type_index ptr: {}", e))
+            })?;
+        let type_index_val = self.context.i16_type().const_int(type_index as u64, false);
+        self.builder
+            .build_store(type_index_i16_ptr, type_index_val)
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store type_index: {}", e)))?;
+
+        // Store reserved (set to 0)
+        let reserved_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    variable_data_start,
+                    &[self.context.i32_type().const_int(
+                        std::mem::offset_of!(PrintVariableIndexData, reserved) as u64,
+                        false,
+                    )],
+                    "reserved_ptr",
+                )
+                .map_err(|e| {
+                    CodeGenError::LLVMError(format!("Failed to get reserved GEP: {}", e))
+                })?
+        };
+        let reserved_val = self.context.i8_type().const_int(0, false);
+        self.builder
+            .build_store(reserved_ptr, reserved_val)
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store reserved: {}", e)))?;
 
         // Store actual variable data after PrintVariableIndexData structure
         let var_data_ptr = unsafe {
@@ -1752,7 +2415,7 @@ impl<'ctx> EbpfContext<'ctx> {
             "Processing complex variable with full DWARF support: {:?}",
             expr
         );
-
+        tracing::trace!(?expr, "process_complex_variable_print: start");
         // Query DWARF for the complex expression
         let variable_with_eval = match self.query_dwarf_for_complex_expr(expr)? {
             Some(var) => var,
@@ -1762,7 +2425,15 @@ impl<'ctx> EbpfContext<'ctx> {
                 return Err(CodeGenError::VariableNotFound(expr_str));
             }
         };
-
+        tracing::trace!(
+            var_name = %variable_with_eval.name,
+            type_name = %variable_with_eval.type_name,
+            scope_depth = variable_with_eval.scope_depth,
+            is_parameter = variable_with_eval.is_parameter,
+            is_artificial = variable_with_eval.is_artificial,
+            eval = ?variable_with_eval.evaluation_result,
+            "process_complex_variable_print: resolved DWARF variable"
+        );
         let dwarf_type = variable_with_eval.dwarf_type.as_ref().ok_or_else(|| {
             CodeGenError::DwarfError("Complex expression has no DWARF type information".to_string())
         })?;
@@ -1775,27 +2446,46 @@ impl<'ctx> EbpfContext<'ctx> {
         // Add type information to TraceContext
         let type_index = self.trace_context.add_type(dwarf_type.clone());
 
-        // Convert DWARF type to protocol encoding for backward compatibility
-        let type_encoding = TypeKind::from(dwarf_type);
-
-        info!(
-            "Complex expression '{}' resolved successfully: var_index={}, type_index={}, type_encoding={:?}",
-            variable_with_eval.name, var_name_index, type_index, type_encoding
-        );
-
-        // Generate print instruction with enhanced type information
-        self.generate_print_variable_with_type_info(
+        // Compute data size with truncation cap
+        let mut data_size = self.compute_read_size_for_type(dwarf_type);
+        tracing::trace!(
             var_name_index,
             type_index,
-            type_encoding,
-            &variable_with_eval.name,
-            Some(&variable_with_eval),
-        )?;
+            data_size,
+            type_size = dwarf_type.size(),
+            "process_complex_variable_print: sizing"
+        );
+        if data_size == 0 {
+            return Err(CodeGenError::TypeSizeNotAvailable(
+                variable_with_eval.name.clone(),
+            ));
+        }
+        if data_size > 1993 {
+            data_size = 1993;
+        }
 
-        Ok(1) // Generated 1 instruction
+        // Build and emit PrintComplexVariable with runtime memory copy
+        tracing::trace!(
+            var_name_index,
+            type_index,
+            data_size,
+            "process_complex_variable_print: emitting PrintComplexVariable(runtime)"
+        );
+        self.generate_print_complex_variable_runtime(
+            var_name_index,
+            type_index,
+            "",
+            &variable_with_eval.evaluation_result,
+            dwarf_type,
+            data_size,
+        )?;
+        tracing::trace!("process_complex_variable_print: emitted successfully");
+
+        Ok(1)
     }
 
     /// Generate print instruction with both legacy type encoding and new type info
+    #[allow(dead_code)]
     fn generate_print_variable_with_type_info(
         &mut self,
         var_name_index: u16,
@@ -1809,12 +2499,386 @@ impl<'ctx> EbpfContext<'ctx> {
             var_name, var_name_index, type_index, type_encoding
         );
 
-        // For now, fallback to the old PrintVariableIndex implementation
-        // TODO: Complete the complex variable implementation later
-        warn!("Complex variable printing not fully implemented yet, falling back to basic variable printing for: {}", var_name);
+        // Prefer complex variable runtime path even for top-level if requested
+        let _dummy_eval = ghostscope_dwarf::EvaluationResult::Optimized;
+        let _size = 0usize;
+        let _ = (type_index, type_encoding, var_name);
+        // No-op as this path is now superseded by process_complex_variable_print
+        Ok(())
+    }
 
-        // Use the existing PrintVariableIndex implementation
-        self.generate_print_variable_index(var_name_index, type_encoding, var_name)?;
+    /// Generate PrintComplexVariable instruction and copy data at runtime using probe_read_user
+    fn generate_print_complex_variable_runtime(
+        &mut self,
+        var_name_index: u16,
+        type_index: u16,
+        access_path: &str,
+        eval_result: &ghostscope_dwarf::EvaluationResult,
+        dwarf_type: &ghostscope_dwarf::TypeInfo,
+        data_len_limit: usize,
+    ) -> Result<()> {
+        tracing::trace!(
+            var_name_index,
+            type_index,
+            access_path = %access_path,
+            type_size = dwarf_type.size(),
+            data_len_limit,
+            eval = ?eval_result,
+            "generate_print_complex_variable_runtime: begin"
+        );
+        // Create instruction buffer
+        let inst_buffer = self.create_instruction_buffer();
+
+        // Compute sizes
+        let access_path_bytes = access_path.as_bytes();
+        let access_path_len = std::cmp::min(access_path_bytes.len(), 255); // u8 max
+        let type_size = dwarf_type.size() as usize;
+        let mut data_len = std::cmp::min(type_size, data_len_limit);
+        if data_len > u16::MAX as usize {
+            data_len = u16::MAX as usize;
+        }
+
+        let header_size = std::mem::size_of::<InstructionHeader>();
+        let data_struct_size = std::mem::size_of::<PrintComplexVariableData>();
+        let total_data_length = data_struct_size + access_path_len + data_len;
+        let total_size = header_size + total_data_length;
+        tracing::trace!(
+            header_size,
+            data_struct_size,
+            access_path_len,
+            data_len,
+            total_data_length,
+            total_size,
+            "generate_print_complex_variable_runtime: sizes computed"
+        );
+
+        // Clear memory buffer
+        self.builder
+            .build_memset(
+                inst_buffer,
+                std::mem::align_of::<InstructionHeader>() as u32,
+                self.context.i8_type().const_zero(),
+                self.context.i64_type().const_int(total_size as u64, false),
+            )
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to memset: {}", e)))?;
+
+        // Write InstructionHeader.inst_type at offset 0
+        let inst_type_val = self
+            .context
+            .i8_type()
+            .const_int(InstructionType::PrintComplexVariable as u64, false);
+        self.builder
+            .build_store(inst_buffer, inst_type_val)
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store inst_type: {}", e)))?;
+        tracing::trace!(
+            "generate_print_complex_variable_runtime: wrote inst_type=PrintComplexVariable"
+        );
+
+        // Write InstructionHeader
+        // data_length field (u16) at offset 1
+        let data_length_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    inst_buffer,
+                    &[self.context.i32_type().const_int(1, false)],
+                    "data_length_ptr",
+                )
+                .map_err(|e| {
+                    CodeGenError::LLVMError(format!("Failed to get data_length GEP: {}", e))
+                })?
+        };
+        let data_length_ptr_cast = self
+            .builder
+            .build_pointer_cast(
+                data_length_ptr,
+                self.context.ptr_type(AddressSpace::default()),
+                "data_length_ptr_cast",
+            )
+            .map_err(|e| {
+                CodeGenError::LLVMError(format!("Failed to cast data_length ptr: {}", e))
+            })?;
+        self.builder
+            .build_store(
+                data_length_ptr_cast,
+                self.context
+                    .i16_type()
+                    .const_int(total_data_length as u64, false),
+            )
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_length: {}", e)))?;
+        tracing::trace!(
+            data_length = total_data_length,
+            "generate_print_complex_variable_runtime: wrote data_length"
+        );
+
+        // Data pointer (after header)
+        let data_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    inst_buffer,
+                    &[self.context.i32_type().const_int(header_size as u64, false)],
+                    "data_ptr",
+                )
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get data GEP: {}", e)))?
+        };
+
+        // var_name_index (u16)
+        let var_name_index_val = self
+            .context
+            .i16_type()
+            .const_int(var_name_index as u64, false);
+        // Store var_name_index at offset offsetof(PrintComplexVariableData, var_name_index)
+        let var_name_index_off =
+            std::mem::offset_of!(PrintComplexVariableData, var_name_index) as u64;
+        let var_name_index_ptr_i8 = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    data_ptr,
+                    &[self.context.i32_type().const_int(var_name_index_off, false)],
+                    "var_name_index_ptr_i8",
+                )
+                .map_err(|e| {
+                    CodeGenError::LLVMError(format!("Failed to get var_name_index GEP: {}", e))
+                })?
+        };
+        let var_name_index_ptr_i16 = self
+            .builder
+            .build_pointer_cast(
+                var_name_index_ptr_i8,
+                self.context.ptr_type(AddressSpace::default()),
+                "var_name_index_ptr_i16",
+            )
+            .map_err(|e| {
+                CodeGenError::LLVMError(format!("Failed to cast var_name_index ptr: {}", e))
+            })?;
+        self.builder
+            .build_store(var_name_index_ptr_i16, var_name_index_val)
+            .map_err(|e| {
+                CodeGenError::LLVMError(format!("Failed to store var_name_index: {}", e))
+            })?;
+        tracing::trace!(
+            var_name_index,
+            "generate_print_complex_variable_runtime: wrote var_name_index"
+        );
+
+        // type_index (u16) right after var_name_index
+        // type_index at offset offsetof(PrintComplexVariableData, type_index) = 2
+        let type_index_offset = std::mem::offset_of!(PrintComplexVariableData, type_index) as u64;
+        let type_index_ptr_i8 = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    data_ptr,
+                    &[self.context.i32_type().const_int(type_index_offset, false)],
+                    "type_index_ptr_i8",
+                )
+                .map_err(|e| {
+                    CodeGenError::LLVMError(format!("Failed to get type_index GEP: {}", e))
+                })?
+        };
+        let type_index_ptr = self
+            .builder
+            .build_pointer_cast(
+                type_index_ptr_i8,
+                self.context.ptr_type(AddressSpace::default()),
+                "type_index_ptr_i16",
+            )
+            .map_err(|e| {
+                CodeGenError::LLVMError(format!("Failed to cast type_index ptr: {}", e))
+            })?;
+        let type_index_val = self.context.i16_type().const_int(type_index as u64, false);
+        self.builder
+            .build_store(type_index_ptr, type_index_val)
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store type_index: {}", e)))?;
+        tracing::trace!(
+            type_index,
+            "generate_print_complex_variable_runtime: wrote type_index"
+        );
+
+        // access_path_len (u8)
+        // access_path_len at offset offsetof(..., access_path_len)
+        let access_path_len_off =
+            std::mem::offset_of!(PrintComplexVariableData, access_path_len) as u64;
+        let access_path_len_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    data_ptr,
+                    &[self
+                        .context
+                        .i32_type()
+                        .const_int(access_path_len_off, false)],
+                    "access_path_len_ptr",
+                )
+                .map_err(|e| {
+                    CodeGenError::LLVMError(format!("Failed to get access_path_len GEP: {}", e))
+                })?
+        };
+        self.builder
+            .build_store(
+                access_path_len_ptr,
+                self.context
+                    .i8_type()
+                    .const_int(access_path_len as u64, false),
+            )
+            .map_err(|e| {
+                CodeGenError::LLVMError(format!("Failed to store access_path_len: {}", e))
+            })?;
+        tracing::trace!(
+            access_path_len,
+            "generate_print_complex_variable_runtime: wrote access_path_len"
+        );
+
+        // reserved (u8) at offset 5
+        let reserved_off = std::mem::offset_of!(PrintComplexVariableData, reserved) as u64;
+        let reserved_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    data_ptr,
+                    &[self.context.i32_type().const_int(reserved_off, false)],
+                    "reserved_ptr",
+                )
+                .map_err(|e| {
+                    CodeGenError::LLVMError(format!("Failed to get reserved GEP: {}", e))
+                })?
+        };
+        self.builder
+            .build_store(reserved_ptr, self.context.i8_type().const_int(0, false))
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store reserved: {}", e)))?;
+
+        // data_len (u16)
+        let data_len_off = std::mem::offset_of!(PrintComplexVariableData, data_len) as u64;
+        let data_len_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    data_ptr,
+                    &[self.context.i32_type().const_int(data_len_off, false)],
+                    "data_len_ptr",
+                )
+                .map_err(|e| {
+                    CodeGenError::LLVMError(format!("Failed to get data_len GEP: {}", e))
+                })?
+        };
+        let data_len_ptr_cast = self
+            .builder
+            .build_pointer_cast(
+                data_len_ptr,
+                self.context.ptr_type(AddressSpace::default()),
+                "data_len_ptr_i16",
+            )
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast data_len ptr: {}", e)))?;
+        self.builder
+            .build_store(
+                data_len_ptr_cast,
+                self.context.i16_type().const_int(data_len as u64, false),
+            )
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_len: {}", e)))?;
+        tracing::trace!(
+            data_len,
+            "generate_print_complex_variable_runtime: wrote data_len"
+        );
+
+        // access_path bytes start after PrintComplexVariableData
+        let access_path_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    data_ptr,
+                    &[self.context.i32_type().const_int(
+                        std::mem::size_of::<PrintComplexVariableData>() as u64,
+                        false,
+                    )],
+                    "access_path_ptr",
+                )
+                .map_err(|e| {
+                    CodeGenError::LLVMError(format!("Failed to get access_path GEP: {}", e))
+                })?
+        };
+
+        // Copy access path bytes
+        for (i, &byte) in access_path_bytes.iter().enumerate().take(access_path_len) {
+            let byte_ptr = unsafe {
+                self.builder
+                    .build_gep(
+                        self.context.i8_type(),
+                        access_path_ptr,
+                        &[self.context.i32_type().const_int(i as u64, false)],
+                        &format!("access_path_byte_{}", i),
+                    )
+                    .map_err(|e| {
+                        CodeGenError::LLVMError(format!(
+                            "Failed to get access_path byte GEP: {}",
+                            e
+                        ))
+                    })?
+            };
+            let byte_val = self.context.i8_type().const_int(byte as u64, false);
+            self.builder.build_store(byte_ptr, byte_val).map_err(|e| {
+                CodeGenError::LLVMError(format!("Failed to store access_path byte: {}", e))
+            })?;
+        }
+        if access_path_len > 0 {
+            tracing::trace!("generate_print_complex_variable_runtime: wrote access_path bytes");
+        }
+
+        // Variable data starts after access_path
+        let variable_data_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    access_path_ptr,
+                    &[self
+                        .context
+                        .i32_type()
+                        .const_int(access_path_len as u64, false)],
+                    "variable_data_ptr",
+                )
+                .map_err(|e| {
+                    CodeGenError::LLVMError(format!("Failed to get variable_data GEP: {}", e))
+                })?
+        };
+
+        // Compute source address from evaluation result
+        let src_addr = self.evaluation_result_to_address(eval_result)?;
+        tracing::trace!(src_addr = %{src_addr}, "generate_print_complex_variable_runtime: computed src_addr");
+
+        // Call probe_read_user(dst, size, src)
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let i32_type = self.context.i32_type();
+        let dst_ptr = self
+            .builder
+            .build_bit_cast(variable_data_ptr, ptr_type, "dst_ptr")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let size_val = i32_type.const_int(data_len as u64, false);
+        let src_ptr = self
+            .builder
+            .build_int_to_ptr(src_addr, ptr_type, "src_ptr")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        let _ = self.create_bpf_helper_call(
+            BPF_FUNC_probe_read_user as u64,
+            &[dst_ptr, size_val.into(), src_ptr.into()],
+            i32_type.into(),
+            "probe_read_user",
+        )?;
+        tracing::trace!(
+            size_val = data_len,
+            "generate_print_complex_variable_runtime: called probe_read_user"
+        );
+
+        // Send the instruction via ringbuf
+        self.send_instruction_via_ringbuf(
+            inst_buffer,
+            self.context.i64_type().const_int(total_size as u64, false),
+        )?;
+        tracing::trace!(
+            total_size,
+            "generate_print_complex_variable_runtime: sent via ringbuf"
+        );
 
         Ok(())
     }

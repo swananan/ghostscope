@@ -26,6 +26,7 @@ Thumbs.db
 *.ll
 *.dwarf
 *.bpf
+*.gs
 gs_*
 output.*
 ghostscope.log

@@ -433,7 +433,8 @@ impl StreamingTraceParser {
                 let mut offset = std::mem::size_of::<PrintFormatData>();
 
                 for _ in 0..format_data.arg_count {
-                    if offset + 5 > inst_data.len() {
+                    // Header: var_name_index:u16 (2), type_encoding:u8 (1), type_index:u16 (2), data_len:u16 (2)
+                    if offset + 7 > inst_data.len() {
                         return Err("Invalid PrintFormat variable header".to_string());
                     }
 
@@ -441,10 +442,12 @@ impl StreamingTraceParser {
                     let var_name_index =
                         u16::from_le_bytes([inst_data[offset], inst_data[offset + 1]]);
                     let type_encoding_byte = inst_data[offset + 2];
-                    let data_len =
+                    let type_index =
                         u16::from_le_bytes([inst_data[offset + 3], inst_data[offset + 4]]);
+                    let data_len =
+                        u16::from_le_bytes([inst_data[offset + 5], inst_data[offset + 6]]);
 
-                    offset += 5;
+                    offset += 7;
 
                     if offset + data_len as usize > inst_data.len() {
                         return Err("Invalid PrintFormat variable data".to_string());
@@ -460,7 +463,8 @@ impl StreamingTraceParser {
                     variables.push(crate::format_printer::ParsedVariable {
                         var_name_index,
                         type_encoding,
-                        type_index: None, // TODO: Extract type_index when format supports it
+                        // Preserve zero-based indices; 0 is a valid type_index
+                        type_index: Some(type_index),
                         data: var_data,
                     });
                 }
