@@ -94,6 +94,7 @@ pub enum Action {
     SourceNumberInput(char),
     SourceGoToLine,
     SourceGoToBottom,
+    SetTraceFromSourceLine, // Space key - set trace at current cursor line
 
     // eBPF panel actions
     NavigateEbpf(EbpfNavigation),

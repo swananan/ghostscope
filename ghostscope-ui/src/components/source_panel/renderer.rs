@@ -2,7 +2,7 @@ use crate::model::panel_state::{SourcePanelMode, SourcePanelState};
 use crate::ui::themes::UIThemes;
 use ratatui::{
     layout::Rect,
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, List, ListItem, Paragraph},
     Frame,
@@ -67,7 +67,21 @@ impl SourceRenderer {
                 let line_num = i + 1;
                 let is_current_line = i == state.cursor_line;
 
-                let line_number_style = if is_current_line && is_focused {
+                // Check if this line has an active trace
+                let is_traced = state.traced_lines.contains(&line_num);
+                let is_pending = state.pending_trace_line == Some(line_num);
+
+                let line_number_style = if is_traced {
+                    // Green bold for successfully traced lines
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD)
+                } else if is_pending {
+                    // Yellow for pending trace
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else if is_current_line && is_focused {
                     Style::default().fg(Color::LightYellow).bg(Color::DarkGray)
                 } else {
                     Style::default().fg(Color::DarkGray)

@@ -858,6 +858,10 @@ impl App {
                                 crate::action::SourceNavigation::LineEnd,
                             ));
                         }
+                        KeyCode::Char(' ') => {
+                            // Space key - set trace at current line
+                            actions.push(Action::SetTraceFromSourceLine);
+                        }
                         KeyCode::Char(c) => {
                             // Handle Ctrl+key combinations in source panel
                             if key
@@ -1491,6 +1495,74 @@ impl App {
                     &mut self.state.source_panel,
                 );
                 additional_actions.extend(actions);
+            }
+            Action::SetTraceFromSourceLine => {
+                // Get current file and line from source panel
+                if let Some(file_path) = &self.state.source_panel.file_path {
+                    let line_num = self.state.source_panel.cursor_line + 1; // Convert to 1-based
+
+                    // Mark line as pending
+                    self.state.source_panel.pending_trace_line = Some(line_num);
+
+                    // Build the trace command
+                    let trace_command = format!("trace {file_path}:{line_num}");
+
+                    // Exit fullscreen mode if enabled
+                    if self.state.ui.layout.is_fullscreen {
+                        self.state.ui.layout.is_fullscreen = false;
+                    }
+
+                    // Focus command panel
+                    self.state.ui.focus.current_panel = PanelType::InteractiveCommand;
+
+                    // Add command to both history managers
+                    self.state
+                        .command_panel
+                        .command_history_manager
+                        .add_command(&trace_command);
+
+                    // Add to command_history for proper response handling
+                    self.state.command_panel.command_history.push(
+                        crate::model::panel_state::CommandHistoryItem {
+                            command: trace_command.clone(),
+                            response: None,
+                            timestamp: std::time::Instant::now(),
+                            prompt: crate::ui::strings::UIStrings::GHOSTSCOPE_PROMPT.to_string(),
+                            response_type: None,
+                        },
+                    );
+
+                    // Add the command to static lines for display
+                    self.state.command_panel.static_lines.push(
+                        crate::model::panel_state::StaticTextLine {
+                            content: format!(
+                                "{} {}",
+                                crate::ui::strings::UIStrings::GHOSTSCOPE_PROMPT,
+                                trace_command
+                            ),
+                            line_type: crate::model::panel_state::LineType::Command,
+                            history_index: Some(
+                                self.state
+                                    .command_panel
+                                    .command_history
+                                    .len()
+                                    .saturating_sub(1),
+                            ),
+                            response_type: None,
+                            styled_content: None,
+                        },
+                    );
+
+                    // Store the pending trace info for failure handling
+                    self.state.command_panel.last_trace_line = Some((file_path.clone(), line_num));
+
+                    // Clear input and directly enter script mode
+                    self.state.command_panel.input_text.clear();
+                    self.state.command_panel.cursor_position = 0;
+
+                    // Enter script mode directly
+                    additional_actions.push(Action::EnterScriptMode(trace_command));
+                }
             }
             Action::NoOp => {
                 // No operation - does nothing but prevents event fallback
@@ -2221,13 +2293,31 @@ impl App {
 
     /// Format runtime status for display in command panel
     fn format_runtime_status_for_display(
-        &self,
+        &mut self,
         status: &crate::events::RuntimeStatus,
     ) -> Option<String> {
         use crate::events::RuntimeStatus;
 
         match status {
             RuntimeStatus::ScriptCompilationCompleted { details } => {
+                // Handle traced line visual feedback
+                if let Some((_file_path, line_num)) = &self.state.command_panel.last_trace_line {
+                    if details.success_count > 0 {
+                        // Move line from pending to traced on success
+                        if self.state.source_panel.pending_trace_line == Some(*line_num) {
+                            self.state.source_panel.pending_trace_line = None;
+                            self.state.source_panel.traced_lines.insert(*line_num);
+                        }
+                    } else {
+                        // Remove pending status on failure
+                        if self.state.source_panel.pending_trace_line == Some(*line_num) {
+                            self.state.source_panel.pending_trace_line = None;
+                        }
+                    }
+                    // Clear the last trace line tracking
+                    self.state.command_panel.last_trace_line = None;
+                }
+
                 // Check if compilation actually succeeded
                 if details.success_count > 0 {
                     // Find the first successful result
@@ -2306,6 +2396,16 @@ impl App {
                 }
             }
             RuntimeStatus::ScriptCompilationFailed { error, target } => {
+                // Handle traced line visual feedback on failure
+                if let Some((_file_path, line_num)) = &self.state.command_panel.last_trace_line {
+                    // Remove pending status on failure
+                    if self.state.source_panel.pending_trace_line == Some(*line_num) {
+                        self.state.source_panel.pending_trace_line = None;
+                    }
+                    // Clear the last trace line tracking
+                    self.state.command_panel.last_trace_line = None;
+                }
+
                 // Create detailed error information
                 let error_details =
                     crate::components::command_panel::script_editor::TraceErrorDetails {
