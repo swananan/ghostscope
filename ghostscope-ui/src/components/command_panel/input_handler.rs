@@ -48,7 +48,7 @@ impl InputHandler {
 
                     return vec![Action::NoOp];
                 }
-                // Ctrl+E: Accept auto suggestion (only if there's a suggestion)
+                // Ctrl+E: Accept auto suggestion if available, otherwise jump to end of line
                 (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
                     tracing::debug!(
                         "Ctrl+E pressed, suggestion available: {}",
@@ -57,13 +57,12 @@ impl InputHandler {
                     if let Some(suggestion_text) = state.get_suggestion_text() {
                         tracing::debug!("Accepting auto suggestion: '{}'", suggestion_text);
                         state.accept_auto_suggestion();
-                        // Return NoOp action to prevent fallback processing
-                        return vec![Action::NoOp];
                     } else {
-                        tracing::debug!("No suggestion available, Ctrl+E ignored");
-                        // Return NoOp action to prevent fallback processing
-                        return vec![Action::NoOp];
+                        tracing::debug!("No suggestion available, jumping to end of line");
+                        state.cursor_position = state.input_text.chars().count();
                     }
+                    // Return NoOp action to prevent fallback processing
+                    return vec![Action::NoOp];
                 }
                 // Right Arrow: Accept auto suggestion if available, otherwise move cursor
                 (KeyCode::Right, KeyModifiers::NONE) => {
