@@ -461,11 +461,53 @@ impl OptimizedRenderer {
         let prompt = "(ghostscope) ";
         let input_text = state.get_display_text();
         let cursor_pos = state.get_display_cursor_position();
-        let full_content = format!("{prompt}{input_text}");
 
-        if full_content.chars().count() > width as usize {
-            // Handle wrapped input
-            let wrapped_lines = self.wrap_text(&full_content, width);
+        // Include auto-suggestion in wrapping calculation
+        let suggestion_text = state.get_suggestion_text().unwrap_or_default();
+        let full_content_with_suggestion = format!("{prompt}{input_text}{suggestion_text}");
+        let base_content = format!("{prompt}{input_text}");
+
+        if full_content_with_suggestion.chars().count() > width as usize {
+            // Handle wrapped input - wrap based on input only, but suggestion affects decision
+            tracing::debug!(
+                "Wrapping text: suggestion_len={}, input_len={}, total_len={}, width={}",
+                suggestion_text.len(),
+                input_text.len(),
+                full_content_with_suggestion.len(),
+                width
+            );
+            // Calculate how much space suggestion would take in the last line
+            let base_wrapped = self.wrap_text(&base_content, width);
+            let last_line_len = base_wrapped
+                .last()
+                .map(|line| line.chars().count())
+                .unwrap_or(0);
+            let suggestion_fits_in_last_line =
+                last_line_len + suggestion_text.chars().count() <= width as usize;
+
+            let wrapped_lines = if suggestion_fits_in_last_line {
+                // Suggestion fits, use base wrapping
+                base_wrapped
+            } else {
+                // Suggestion doesn't fit, wrap the full content but remove suggestion from lines
+                let full_wrapped = self.wrap_text(&full_content_with_suggestion, width);
+                full_wrapped
+                    .into_iter()
+                    .map(|line| {
+                        // Remove suggestion text from lines (it will be added back during rendering)
+                        if line.ends_with(&suggestion_text) {
+                            line[..line.len() - suggestion_text.len()].to_string()
+                        } else {
+                            line
+                        }
+                    })
+                    .collect()
+            };
+            tracing::debug!(
+                "Wrapped into {} lines: {:?}",
+                wrapped_lines.len(),
+                wrapped_lines
+            );
             let cursor_pos_with_prompt = cursor_pos + prompt.chars().count();
 
             let mut char_count = 0;
@@ -474,16 +516,19 @@ impl OptimizedRenderer {
                 let line_end = char_count + line_char_count;
 
                 let is_last_line = line_idx == wrapped_lines.len() - 1;
-                let cursor_in_range = cursor_pos_with_prompt >= char_count &&
-                    (cursor_pos_with_prompt < line_end || (cursor_pos_with_prompt == line_end && is_last_line));
+                let cursor_in_range = cursor_pos_with_prompt >= char_count
+                    && (cursor_pos_with_prompt < line_end
+                        || (cursor_pos_with_prompt == line_end && is_last_line));
 
                 if cursor_in_range {
                     let cursor_in_line = cursor_pos_with_prompt - char_count;
-                    lines.push(self.create_input_line_with_cursor(
+                    lines.push(self.create_input_line_with_cursor_wrapped(
                         line,
                         prompt,
                         cursor_in_line,
                         line_idx == 0,
+                        is_last_line,
+                        state,
                     ));
                 } else {
                     lines.push(self.create_input_line_without_cursor(line, prompt, line_idx == 0));
@@ -568,13 +613,15 @@ impl OptimizedRenderer {
         Line::from(spans)
     }
 
-    /// Create input line with cursor
-    fn create_input_line_with_cursor(
+    /// Create input line with cursor for wrapped text environment
+    fn create_input_line_with_cursor_wrapped(
         &self,
         line: &str,
         prompt: &str,
         cursor_pos: usize,
         is_first_line: bool,
+        is_last_line: bool,
+        state: &CommandPanelState,
     ) -> Line<'static> {
         let chars: Vec<char> = line.chars().collect();
         let mut spans = Vec::new();
@@ -593,9 +640,37 @@ impl OptimizedRenderer {
 
             let text_part: String = chars[prompt_len..].iter().collect();
             let cursor_in_text = cursor_pos.saturating_sub(prompt_len);
-            self.add_text_with_cursor(&mut spans, &text_part, cursor_in_text);
+
+            // Only show auto-suggestion on last line when cursor is at end
+            if is_last_line && cursor_in_text >= text_part.chars().count() {
+                // Add text with suggestion
+                tracing::debug!(
+                    "Rendering with suggestion: is_last_line={}, cursor_in_text={}, text_part='{}'",
+                    is_last_line,
+                    cursor_in_text,
+                    text_part
+                );
+                self.add_text_with_cursor_and_suggestion(
+                    &mut spans,
+                    &text_part,
+                    cursor_in_text,
+                    state,
+                );
+            } else {
+                // Add text without suggestion
+                tracing::debug!("Rendering without suggestion: is_last_line={}, cursor_in_text={}, text_part='{}'",
+                               is_last_line, cursor_in_text, text_part);
+                self.add_text_with_cursor(&mut spans, &text_part, cursor_in_text);
+            }
         } else {
-            self.add_text_with_cursor(&mut spans, line, cursor_pos);
+            // Only show auto-suggestion on last line when cursor is at end
+            if is_last_line && cursor_pos >= line.chars().count() {
+                // Add text with suggestion
+                self.add_text_with_cursor_and_suggestion(&mut spans, line, cursor_pos, state);
+            } else {
+                // Add text without suggestion
+                self.add_text_with_cursor(&mut spans, line, cursor_pos);
+            }
         }
 
         Line::from(spans)
@@ -984,6 +1059,147 @@ impl OptimizedRenderer {
 
             if !after_cursor.is_empty() {
                 spans.push(Span::styled(after_cursor, Style::default()));
+            }
+        }
+    }
+
+    /// Add text with cursor and auto-suggestion support
+    fn add_text_with_cursor_and_suggestion(
+        &self,
+        spans: &mut Vec<Span<'static>>,
+        text: &str,
+        cursor_pos: usize,
+        state: &CommandPanelState,
+    ) {
+        let chars: Vec<char> = text.chars().collect();
+        let show_cursor = matches!(state.mode, InteractionMode::Input);
+
+        if chars.is_empty() {
+            if let Some(suggestion_text) = state.get_suggestion_text() {
+                let suggestion_chars: Vec<char> = suggestion_text.chars().collect();
+                if !suggestion_chars.is_empty() {
+                    spans.push(Span::styled(
+                        suggestion_chars[0].to_string(),
+                        if show_cursor {
+                            UIThemes::cursor_style()
+                        } else {
+                            Style::default().fg(Color::DarkGray)
+                        },
+                    ));
+
+                    if suggestion_chars.len() > 1 {
+                        let remaining: String = suggestion_chars[1..].iter().collect();
+                        spans.push(Span::styled(
+                            remaining,
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
+                } else {
+                    spans.push(Span::styled(
+                        " ".to_string(),
+                        if show_cursor {
+                            UIThemes::cursor_style()
+                        } else {
+                            Style::default()
+                        },
+                    ));
+                }
+            } else {
+                spans.push(Span::styled(
+                    " ".to_string(),
+                    if show_cursor {
+                        UIThemes::cursor_style()
+                    } else {
+                        Style::default()
+                    },
+                ));
+            }
+        } else if cursor_pos >= chars.len() {
+            // Cursor at end - check if we have auto-suggestion to merge
+            if let Some(suggestion_text) = state.get_suggestion_text() {
+                // We have auto-suggestion, show merged text with cursor at boundary
+                let full_text = format!("{text}{suggestion_text}");
+                let full_chars: Vec<char> = full_text.chars().collect();
+
+                // Show input part in normal color
+                if !text.is_empty() {
+                    spans.push(Span::styled(text.to_string(), Style::default()));
+                }
+
+                // Show the character at cursor position as block cursor
+                if cursor_pos < full_chars.len() {
+                    let cursor_char = full_chars[cursor_pos];
+                    spans.push(Span::styled(
+                        cursor_char.to_string(),
+                        if show_cursor {
+                            UIThemes::cursor_style()
+                        } else {
+                            Style::default().fg(Color::DarkGray)
+                        },
+                    ));
+
+                    // Show remaining characters in dark gray
+                    if cursor_pos + 1 < full_chars.len() {
+                        let remaining: String = full_chars[cursor_pos + 1..].iter().collect();
+                        spans.push(Span::styled(
+                            remaining,
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
+                } else {
+                    // Fallback - show space as block cursor
+                    spans.push(Span::styled(
+                        " ".to_string(),
+                        if show_cursor {
+                            UIThemes::cursor_style()
+                        } else {
+                            Style::default()
+                        },
+                    ));
+                }
+            } else {
+                // No auto-suggestion, show block cursor at end
+                spans.push(Span::styled(text.to_string(), Style::default()));
+                spans.push(Span::styled(
+                    " ".to_string(),
+                    if show_cursor {
+                        UIThemes::cursor_style()
+                    } else {
+                        Style::default()
+                    },
+                ));
+            }
+        } else {
+            // Cursor in middle of text
+            let before_cursor: String = chars[..cursor_pos].iter().collect();
+            let at_cursor = chars[cursor_pos];
+            let after_cursor: String = chars[cursor_pos + 1..].iter().collect();
+
+            if !before_cursor.is_empty() {
+                spans.push(Span::styled(before_cursor, Style::default()));
+            }
+
+            spans.push(Span::styled(
+                at_cursor.to_string(),
+                if show_cursor {
+                    UIThemes::cursor_style()
+                } else {
+                    Style::default()
+                },
+            ));
+
+            if !after_cursor.is_empty() {
+                spans.push(Span::styled(after_cursor, Style::default()));
+            }
+
+            // Add auto-suggestion at the end if cursor is at the end of meaningful text
+            if cursor_pos + 1 >= chars.len() {
+                if let Some(suggestion_text) = state.get_suggestion_text() {
+                    spans.push(Span::styled(
+                        suggestion_text.to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
             }
         }
     }

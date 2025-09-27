@@ -28,12 +28,22 @@ impl InputHandler {
                 (KeyCode::Tab, KeyModifiers::NONE) => {
                     tracing::debug!("Tab pressed for completion, input: '{}'", state.input_text);
 
-                    let needs_file_comp = crate::components::command_panel::file_completion::needs_file_completion(&state.input_text);
-                    tracing::debug!("Needs file completion for '{}': {}", state.input_text, needs_file_comp);
+                    let needs_file_comp =
+                        crate::components::command_panel::file_completion::needs_file_completion(
+                            &state.input_text,
+                        );
+                    tracing::debug!(
+                        "Needs file completion for '{}': {}",
+                        state.input_text,
+                        needs_file_comp
+                    );
 
                     let completion = if needs_file_comp {
                         // File completion needed
-                        tracing::debug!("Attempting file completion, cache available: {}", state.file_completion_cache.is_some());
+                        tracing::debug!(
+                            "Attempting file completion, cache available: {}",
+                            state.file_completion_cache.is_some()
+                        );
 
                         if let Some(cache) = &mut state.file_completion_cache {
                             let result = cache.get_file_completion(&state.input_text);
@@ -41,12 +51,16 @@ impl InputHandler {
                             result
                         } else {
                             tracing::debug!("File completion cache not available, falling back to command completion");
-                            crate::components::command_panel::CommandParser::get_command_completion(&state.input_text)
+                            crate::components::command_panel::CommandParser::get_command_completion(
+                                &state.input_text,
+                            )
                         }
                     } else {
                         // Regular command completion
                         tracing::debug!("Using command completion");
-                        crate::components::command_panel::CommandParser::get_command_completion(&state.input_text)
+                        crate::components::command_panel::CommandParser::get_command_completion(
+                            &state.input_text,
+                        )
                     };
 
                     if let Some(completion_text) = completion {
@@ -59,7 +73,11 @@ impl InputHandler {
 
                         // Update auto suggestion after completion
                         state.update_auto_suggestion();
-                        tracing::debug!("After completion: '{}', cursor at {}", state.input_text, state.cursor_position);
+                        tracing::debug!(
+                            "After completion: '{}', cursor at {}",
+                            state.input_text,
+                            state.cursor_position
+                        );
                     } else {
                         tracing::debug!("No completion found for input: '{}'", state.input_text);
                     }

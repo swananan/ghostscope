@@ -1399,10 +1399,11 @@ impl App {
                     // Use existing file cache to populate source panel search
                     tracing::debug!("Using cached file list for source panel search");
                     let files = cache.get_all_files().to_vec();
-                    let actions = crate::components::source_panel::SourceSearch::set_file_search_files(
-                        &mut self.state.source_panel,
-                        files,
-                    );
+                    let actions =
+                        crate::components::source_panel::SourceSearch::set_file_search_files(
+                            &mut self.state.source_panel,
+                            files,
+                        );
                     additional_actions.extend(actions);
                 } else {
                     // Fallback: request file information from runtime
@@ -1562,9 +1563,15 @@ impl App {
 
     /// Sync file list to command panel for file completion
     fn sync_files_to_command_panel(&mut self, files: Vec<String>) {
-        tracing::debug!("Syncing {} files to command panel completion cache", files.len());
+        tracing::debug!(
+            "Syncing {} files to command panel completion cache",
+            files.len()
+        );
         if !files.is_empty() {
-            tracing::debug!("First 5 files: {:?}", files.iter().take(5).collect::<Vec<_>>());
+            tracing::debug!(
+                "First 5 files: {:?}",
+                files.iter().take(5).collect::<Vec<_>>()
+            );
         }
 
         // Create or update file completion cache
@@ -1575,9 +1582,15 @@ impl App {
         } else {
             // Create new cache only if there are files
             if !files.is_empty() {
-                tracing::debug!("Creating new file completion cache with {} files", files.len());
-                self.state.command_panel.file_completion_cache =
-                    Some(crate::components::command_panel::file_completion::FileCompletionCache::new(&files));
+                tracing::debug!(
+                    "Creating new file completion cache with {} files",
+                    files.len()
+                );
+                self.state.command_panel.file_completion_cache = Some(
+                    crate::components::command_panel::file_completion::FileCompletionCache::new(
+                        &files,
+                    ),
+                );
                 tracing::debug!("File completion cache created successfully");
             } else {
                 tracing::debug!("No files to create cache with");

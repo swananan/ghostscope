@@ -46,7 +46,11 @@ impl FileCompletionCache {
         // Extract command and file part
         let (command_prefix, file_part) = extract_file_context(input)?;
 
-        tracing::debug!("File completion for command '{}', file part '{}'", command_prefix, file_part);
+        tracing::debug!(
+            "File completion for command '{}', file part '{}'",
+            command_prefix,
+            file_part
+        );
 
         // Get completion candidates
         let candidates = self.find_completion_candidates(file_part);
@@ -75,7 +79,11 @@ impl FileCompletionCache {
             return false;
         }
 
-        tracing::debug!("File completion cache updating: {} -> {} files", self.cached_count, new_count);
+        tracing::debug!(
+            "File completion cache updating: {} -> {} files",
+            self.cached_count,
+            new_count
+        );
         self.rebuild_cache(source_files);
         true
     }
@@ -118,8 +126,12 @@ impl FileCompletionCache {
             }
         }
 
-        tracing::debug!("File completion cache rebuilt: {} files, {} basenames, {} directories",
-                       self.cached_count, self.by_basename.len(), self.by_directory.len());
+        tracing::debug!(
+            "File completion cache rebuilt: {} files, {} basenames, {} directories",
+            self.cached_count,
+            self.by_basename.len(),
+            self.by_directory.len()
+        );
     }
 
     /// Find completion candidates based on input
@@ -167,12 +179,19 @@ impl FileCompletionCache {
 
     /// Calculate completion string for a single match
     fn calculate_completion(&self, user_input: &str, full_path: &str) -> String {
-        tracing::debug!("calculate_completion: user_input='{}', full_path='{}'", user_input, full_path);
+        tracing::debug!(
+            "calculate_completion: user_input='{}', full_path='{}'",
+            user_input,
+            full_path
+        );
 
         // Extract the part that user hasn't typed yet
         if let Some(relative) = Self::make_relative_path(full_path) {
             tracing::debug!("relative path: '{}'", relative);
-            if relative.to_lowercase().starts_with(&user_input.to_lowercase()) {
+            if relative
+                .to_lowercase()
+                .starts_with(&user_input.to_lowercase())
+            {
                 let completion = relative[user_input.len()..].to_string();
                 tracing::debug!("relative match: completion='{}'", completion);
                 return completion;
@@ -182,7 +201,10 @@ impl FileCompletionCache {
         // Fallback: return basename if prefix doesn't match
         if let Some(basename) = Self::extract_basename(full_path) {
             tracing::debug!("basename: '{}'", basename);
-            if basename.to_lowercase().starts_with(&user_input.to_lowercase()) {
+            if basename
+                .to_lowercase()
+                .starts_with(&user_input.to_lowercase())
+            {
                 let completion = basename[user_input.len()..].to_string();
                 tracing::debug!("basename match: completion='{}'", completion);
                 return completion;
@@ -194,7 +216,11 @@ impl FileCompletionCache {
     }
 
     /// Find common prefix among multiple candidates
-    fn find_common_completion_prefix(&self, user_input: &str, candidates: &[usize]) -> Option<String> {
+    fn find_common_completion_prefix(
+        &self,
+        user_input: &str,
+        candidates: &[usize],
+    ) -> Option<String> {
         if candidates.len() < 2 {
             return None;
         }
@@ -242,10 +268,7 @@ impl FileCompletionCache {
         files.len().hash(&mut hasher);
 
         // Hash first 10 files for quick comparison
-        files
-            .iter()
-            .take(10)
-            .for_each(|f| f.hash(&mut hasher));
+        files.iter().take(10).for_each(|f| f.hash(&mut hasher));
 
         hasher.finish()
     }
@@ -322,8 +345,10 @@ fn contains_path_chars(input: &str) -> bool {
 /// Check if input looks like a filename (for trace command)
 fn looks_like_filename(input: &str) -> bool {
     // Accept any non-empty input that looks like it could be a filename
-    !input.is_empty() &&
-    input.chars().all(|c| c.is_alphanumeric() || "_-".contains(c))
+    !input.is_empty()
+        && input
+            .chars()
+            .all(|c| c.is_alphanumeric() || "_-".contains(c))
 }
 
 /// Check if input needs file completion
@@ -357,10 +382,7 @@ mod tests {
             None // No path chars
         );
 
-        assert_eq!(
-            extract_file_context("help"),
-            None
-        );
+        assert_eq!(extract_file_context("help"), None);
     }
 
     #[test]

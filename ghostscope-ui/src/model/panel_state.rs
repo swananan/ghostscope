@@ -323,7 +323,8 @@ pub struct CommandPanelState {
     pub cached_panel_width: u16, // Cached panel width for text wrapping calculations
 
     // File completion cache
-    pub file_completion_cache: Option<crate::components::command_panel::file_completion::FileCompletionCache>,
+    pub file_completion_cache:
+        Option<crate::components::command_panel::file_completion::FileCompletionCache>,
 
     // Saved cursor states for mode switching
     pub saved_input_cursor: usize, // Input mode cursor position
