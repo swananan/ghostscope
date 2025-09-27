@@ -67,19 +67,25 @@ impl SourceRenderer {
                 let line_num = i + 1;
                 let is_current_line = i == state.cursor_line;
 
-                // Check if this line has an active trace
-                let is_traced = state.traced_lines.contains(&line_num);
+                // Check trace status for this line
+                let is_enabled = state.traced_lines.contains(&line_num);
+                let is_disabled = state.disabled_lines.contains(&line_num);
                 let is_pending = state.pending_trace_line == Some(line_num);
 
-                let line_number_style = if is_traced {
-                    // Green bold for successfully traced lines
+                let line_number_style = if is_enabled {
+                    // Green bold for enabled traces
                     Style::default()
                         .fg(Color::Green)
                         .add_modifier(Modifier::BOLD)
-                } else if is_pending {
-                    // Yellow for pending trace
+                } else if is_disabled {
+                    // Yellow bold for disabled traces
                     Style::default()
                         .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else if is_pending {
+                    // Light yellow for pending trace
+                    Style::default()
+                        .fg(Color::LightYellow)
                         .add_modifier(Modifier::BOLD)
                 } else if is_current_line && is_focused {
                     Style::default().fg(Color::LightYellow).bg(Color::DarkGray)

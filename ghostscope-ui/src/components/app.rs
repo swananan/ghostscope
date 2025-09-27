@@ -1501,8 +1501,7 @@ impl App {
                 if let Some(file_path) = &self.state.source_panel.file_path {
                     let line_num = self.state.source_panel.cursor_line + 1; // Convert to 1-based
 
-                    // Mark line as pending
-                    self.state.source_panel.pending_trace_line = Some(line_num);
+                    // Don't mark line as pending here - wait for trace response
 
                     // Build the trace command
                     let trace_command = format!("trace {file_path}:{line_num}");
@@ -1553,8 +1552,7 @@ impl App {
                         },
                     );
 
-                    // Store the pending trace info for failure handling
-                    self.state.command_panel.last_trace_line = Some((file_path.clone(), line_num));
+                    // Don't store trace line here - will be determined from trace info response
 
                     // Clear input and directly enter script mode
                     self.state.command_panel.input_text.clear();
@@ -2117,6 +2115,48 @@ impl App {
                 pc,
             } => {
                 self.clear_waiting_state();
+
+                // Extract source location from target (could be "file:line" or "function_name")
+                // TODO: For function traces, we need source_file and source_line fields in TraceInfo
+                // Currently only file:line format works for source panel updates
+                if let Some(colon_pos) = target.rfind(':') {
+                    let file_part = &target[..colon_pos];
+                    if let Ok(line_num) = target[colon_pos + 1..].parse::<usize>() {
+                        // Store the trace location
+                        self.state
+                            .source_panel
+                            .trace_locations
+                            .insert(trace_id, (file_part.to_string(), line_num));
+
+                        // Update line colors if this is the current file
+                        if self.state.source_panel.file_path.as_ref()
+                            == Some(&file_part.to_string())
+                        {
+                            // Clear pending status if it exists
+                            if self.state.source_panel.pending_trace_line == Some(line_num) {
+                                self.state.source_panel.pending_trace_line = None;
+                            }
+
+                            // Update line color based on trace status
+                            match status {
+                                crate::events::TraceStatus::Active => {
+                                    self.state.source_panel.disabled_lines.remove(&line_num);
+                                    self.state.source_panel.traced_lines.insert(line_num);
+                                }
+                                crate::events::TraceStatus::Disabled => {
+                                    self.state.source_panel.traced_lines.remove(&line_num);
+                                    self.state.source_panel.disabled_lines.insert(line_num);
+                                }
+                                _ => {
+                                    // For other statuses, don't color the line
+                                    self.state.source_panel.traced_lines.remove(&line_num);
+                                    self.state.source_panel.disabled_lines.remove(&line_num);
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Format trace info with enhanced display
                 let mut response = format!("🔍 Trace {trace_id} Info:\n");
                 response.push_str(&format!("  Target: {target}\n"));
@@ -2137,6 +2177,44 @@ impl App {
             }
             RuntimeStatus::TraceInfoAll { summary, traces } => {
                 self.clear_waiting_state();
+
+                // Update source panel line colors based on trace status
+                for trace in &traces {
+                    // Try to extract file and line from target_display (format: "file:line" or "function_name")
+                    // TODO: Need source_file and source_line fields for function traces
+                    if let Some(colon_pos) = trace.target_display.rfind(':') {
+                        let file_part = &trace.target_display[..colon_pos];
+                        if let Ok(line_num) = trace.target_display[colon_pos + 1..].parse::<usize>()
+                        {
+                            // Store the trace location
+                            self.state
+                                .source_panel
+                                .trace_locations
+                                .insert(trace.trace_id, (file_part.to_string(), line_num));
+
+                            // Update line colors if this is the current file
+                            if self.state.source_panel.file_path.as_ref()
+                                == Some(&file_part.to_string())
+                            {
+                                match trace.status {
+                                    crate::events::TraceStatus::Active => {
+                                        self.state.source_panel.disabled_lines.remove(&line_num);
+                                        self.state.source_panel.traced_lines.insert(line_num);
+                                    }
+                                    crate::events::TraceStatus::Disabled => {
+                                        self.state.source_panel.traced_lines.remove(&line_num);
+                                        self.state.source_panel.disabled_lines.insert(line_num);
+                                    }
+                                    crate::events::TraceStatus::Failed => {
+                                        self.state.source_panel.traced_lines.remove(&line_num);
+                                        self.state.source_panel.disabled_lines.remove(&line_num);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let mut response = format!(
                     "🔍 All Traces ({} total, {} active):\n\n",
                     summary.total, summary.active
@@ -2163,6 +2241,17 @@ impl App {
             }
             RuntimeStatus::TraceEnabled { trace_id } => {
                 self.clear_waiting_state();
+
+                // Update source panel line color
+                if let Some((file_path, line_num)) =
+                    self.state.source_panel.trace_locations.get(&trace_id)
+                {
+                    if self.state.source_panel.file_path.as_ref() == Some(file_path) {
+                        self.state.source_panel.disabled_lines.remove(line_num);
+                        self.state.source_panel.traced_lines.insert(*line_num);
+                    }
+                }
+
                 let action = Action::AddResponse {
                     content: format!("✓ Trace {trace_id} enabled"),
                     response_type: crate::action::ResponseType::Success,
@@ -2171,6 +2260,17 @@ impl App {
             }
             RuntimeStatus::TraceDisabled { trace_id } => {
                 self.clear_waiting_state();
+
+                // Update source panel line color
+                if let Some((file_path, line_num)) =
+                    self.state.source_panel.trace_locations.get(&trace_id)
+                {
+                    if self.state.source_panel.file_path.as_ref() == Some(file_path) {
+                        self.state.source_panel.traced_lines.remove(line_num);
+                        self.state.source_panel.disabled_lines.insert(*line_num);
+                    }
+                }
+
                 let action = Action::AddResponse {
                     content: format!("✓ Trace {trace_id} disabled"),
                     response_type: crate::action::ResponseType::Success,
@@ -2179,6 +2279,15 @@ impl App {
             }
             RuntimeStatus::AllTracesEnabled { count } => {
                 self.clear_waiting_state();
+
+                // Move all known traces from disabled to enabled
+                for (file_path, line_num) in self.state.source_panel.trace_locations.values() {
+                    if self.state.source_panel.file_path.as_ref() == Some(file_path) {
+                        self.state.source_panel.disabled_lines.remove(line_num);
+                        self.state.source_panel.traced_lines.insert(*line_num);
+                    }
+                }
+
                 let action = Action::AddResponse {
                     content: format!("✓ All traces enabled ({count} traces)"),
                     response_type: crate::action::ResponseType::Success,
@@ -2187,6 +2296,15 @@ impl App {
             }
             RuntimeStatus::AllTracesDisabled { count } => {
                 self.clear_waiting_state();
+
+                // Move all known traces from enabled to disabled
+                for (file_path, line_num) in self.state.source_panel.trace_locations.values() {
+                    if self.state.source_panel.file_path.as_ref() == Some(file_path) {
+                        self.state.source_panel.traced_lines.remove(line_num);
+                        self.state.source_panel.disabled_lines.insert(*line_num);
+                    }
+                }
+
                 let action = Action::AddResponse {
                     content: format!("✓ All traces disabled ({count} traces)"),
                     response_type: crate::action::ResponseType::Success,
@@ -2211,6 +2329,17 @@ impl App {
             }
             RuntimeStatus::TraceDeleted { trace_id } => {
                 self.clear_waiting_state();
+
+                // Remove from source panel line colors
+                if let Some((file_path, line_num)) =
+                    self.state.source_panel.trace_locations.remove(&trace_id)
+                {
+                    if self.state.source_panel.file_path.as_ref() == Some(&file_path) {
+                        self.state.source_panel.traced_lines.remove(&line_num);
+                        self.state.source_panel.disabled_lines.remove(&line_num);
+                    }
+                }
+
                 let action = Action::AddResponse {
                     content: format!("✓ Trace {trace_id} deleted"),
                     response_type: crate::action::ResponseType::Success,
@@ -2219,6 +2348,12 @@ impl App {
             }
             RuntimeStatus::AllTracesDeleted { count } => {
                 self.clear_waiting_state();
+
+                // Clear all trace locations and colors
+                self.state.source_panel.traced_lines.clear();
+                self.state.source_panel.disabled_lines.clear();
+                self.state.source_panel.trace_locations.clear();
+
                 let action = Action::AddResponse {
                     content: format!("✓ All traces deleted ({count} traces)"),
                     response_type: crate::action::ResponseType::Success,
@@ -2300,22 +2435,17 @@ impl App {
 
         match status {
             RuntimeStatus::ScriptCompilationCompleted { details } => {
-                // Handle traced line visual feedback
-                if let Some((_file_path, line_num)) = &self.state.command_panel.last_trace_line {
-                    if details.success_count > 0 {
-                        // Move line from pending to traced on success
-                        if self.state.source_panel.pending_trace_line == Some(*line_num) {
-                            self.state.source_panel.pending_trace_line = None;
-                            self.state.source_panel.traced_lines.insert(*line_num);
-                        }
-                    } else {
-                        // Remove pending status on failure
-                        if self.state.source_panel.pending_trace_line == Some(*line_num) {
-                            self.state.source_panel.pending_trace_line = None;
-                        }
+                // Request trace info for all successful compilations to get source locations
+                if details.success_count > 0 {
+                    // Send trace info command to get source locations for all traces
+                    if let Err(e) = self
+                        .state
+                        .event_registry
+                        .command_sender
+                        .send(crate::events::RuntimeCommand::InfoTrace { trace_id: None })
+                    {
+                        tracing::error!("Failed to send InfoTrace command: {}", e);
                     }
-                    // Clear the last trace line tracking
-                    self.state.command_panel.last_trace_line = None;
                 }
 
                 // Check if compilation actually succeeded
@@ -2396,14 +2526,9 @@ impl App {
                 }
             }
             RuntimeStatus::ScriptCompilationFailed { error, target } => {
-                // Handle traced line visual feedback on failure
-                if let Some((_file_path, line_num)) = &self.state.command_panel.last_trace_line {
-                    // Remove pending status on failure
-                    if self.state.source_panel.pending_trace_line == Some(*line_num) {
-                        self.state.source_panel.pending_trace_line = None;
-                    }
-                    // Clear the last trace line tracking
-                    self.state.command_panel.last_trace_line = None;
+                // Clear any pending trace line status on failure
+                if self.state.source_panel.pending_trace_line.is_some() {
+                    self.state.source_panel.pending_trace_line = None;
                 }
 
                 // Create detailed error information

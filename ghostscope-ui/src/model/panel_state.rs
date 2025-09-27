@@ -50,7 +50,10 @@ pub struct SourcePanelState {
 
     // Traced lines tracking
     pub traced_lines: HashSet<usize>, // Line numbers with active traces (1-based)
+    pub disabled_lines: HashSet<usize>, // Line numbers with disabled traces (1-based)
     pub pending_trace_line: Option<usize>, // Line waiting for trace confirmation (1-based)
+    // Map from trace_id to (file_path, line_number) for managing trace status
+    pub trace_locations: HashMap<u32, (String, usize)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,7 +93,9 @@ impl SourcePanelState {
             g_pressed: false,
             mode: SourcePanelMode::Normal,
             traced_lines: HashSet::new(),
+            disabled_lines: HashSet::new(),
             pending_trace_line: None,
+            trace_locations: HashMap::new(),
         }
     }
 }
@@ -354,9 +359,6 @@ pub struct CommandPanelState {
     pub command_history_manager: crate::components::command_panel::CommandHistory,
     pub history_search: crate::components::command_panel::HistorySearchState,
     pub auto_suggestion: crate::components::command_panel::AutoSuggestionState,
-
-    // Trace tracking for source panel integration
-    pub last_trace_line: Option<(String, usize)>, // (file_path, line_number) of last trace attempt
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -489,7 +491,6 @@ impl CommandPanelState {
                 crate::components::command_panel::CommandHistory::new_with_config(history_config),
             history_search: crate::components::command_panel::HistorySearchState::new(),
             auto_suggestion: crate::components::command_panel::AutoSuggestionState::new(),
-            last_trace_line: None,
         }
     }
 

@@ -347,6 +347,7 @@ pub struct ScriptExecutionResult {
     pub target_name: String,
     pub binary_path: String, // Full path to the binary
     pub status: ExecutionStatus,
+    // TODO: Add source_file: Option<String> and source_line: Option<usize> for function traces
 }
 
 /// Detailed compilation result for a script with multiple targets
