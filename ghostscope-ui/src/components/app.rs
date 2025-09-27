@@ -174,6 +174,16 @@ impl App {
             }
         }
 
+        // Send shutdown command to runtime before cleanup
+        if let Err(e) = self
+            .state
+            .event_registry
+            .command_sender
+            .send(crate::events::RuntimeCommand::Shutdown)
+        {
+            tracing::warn!("Failed to send shutdown command to runtime: {}", e);
+        }
+
         self.cleanup().await
     }
 
