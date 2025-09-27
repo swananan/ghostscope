@@ -143,19 +143,19 @@ impl FocusState {
             LayoutMode::Horizontal => {
                 match direction {
                     WindowDirection::Left => {
-                        // Source <- EbpfInfo <- InteractiveCommand
+                        // Source <- EbpfInfo <- InteractiveCommand (with wrapping)
                         self.current_panel = match self.current_panel {
                             PanelType::InteractiveCommand => PanelType::EbpfInfo,
                             PanelType::EbpfInfo => PanelType::Source,
-                            PanelType::Source => PanelType::Source, // Stay at leftmost
+                            PanelType::Source => PanelType::InteractiveCommand, // Wrap to rightmost
                         };
                     }
                     WindowDirection::Right => {
-                        // Source -> EbpfInfo -> InteractiveCommand
+                        // Source -> EbpfInfo -> InteractiveCommand (with wrapping)
                         self.current_panel = match self.current_panel {
                             PanelType::Source => PanelType::EbpfInfo,
                             PanelType::EbpfInfo => PanelType::InteractiveCommand,
-                            PanelType::InteractiveCommand => PanelType::InteractiveCommand, // Stay at rightmost
+                            PanelType::InteractiveCommand => PanelType::Source, // Wrap to leftmost
                         };
                     }
                     _ => {} // Up/Down not relevant in horizontal layout
@@ -164,19 +164,19 @@ impl FocusState {
             LayoutMode::Vertical => {
                 match direction {
                     WindowDirection::Up => {
-                        // Source up from EbpfInfo up from InteractiveCommand
+                        // Source up from EbpfInfo up from InteractiveCommand (with wrapping)
                         self.current_panel = match self.current_panel {
                             PanelType::InteractiveCommand => PanelType::EbpfInfo,
                             PanelType::EbpfInfo => PanelType::Source,
-                            PanelType::Source => PanelType::Source, // Stay at top
+                            PanelType::Source => PanelType::InteractiveCommand, // Wrap to bottom
                         };
                     }
                     WindowDirection::Down => {
-                        // Source down to EbpfInfo down to InteractiveCommand
+                        // Source down to EbpfInfo down to InteractiveCommand (with wrapping)
                         self.current_panel = match self.current_panel {
                             PanelType::Source => PanelType::EbpfInfo,
                             PanelType::EbpfInfo => PanelType::InteractiveCommand,
-                            PanelType::InteractiveCommand => PanelType::InteractiveCommand, // Stay at bottom
+                            PanelType::InteractiveCommand => PanelType::Source, // Wrap to top
                         };
                     }
                     _ => {} // Left/Right not relevant in vertical layout

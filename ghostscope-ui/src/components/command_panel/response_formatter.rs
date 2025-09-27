@@ -1,7 +1,7 @@
+use super::syntax_highlighter;
 use crate::action::ResponseType;
 use crate::model::panel_state::{CommandPanelState, LineType, StaticTextLine};
 use crate::ui::{strings::UIStrings, symbols::UISymbols, themes::UIThemes};
-use super::syntax_highlighter;
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
@@ -241,7 +241,8 @@ impl ResponseFormatter {
 
                             if !code_part.is_empty() {
                                 // Apply syntax highlighting to the code part
-                                let highlighted_spans = syntax_highlighter::highlight_line(code_part);
+                                let highlighted_spans =
+                                    syntax_highlighter::highlight_line(code_part);
                                 spans.extend(highlighted_spans);
                             }
 
