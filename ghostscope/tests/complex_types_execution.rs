@@ -183,6 +183,118 @@ trace complex_types_program.c:25 {
 }
 
 #[tokio::test]
+async fn test_pointer_auto_deref_member_access() -> anyhow::Result<()> {
+    init();
+
+    // Build and start complex_types_program (Debug)
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("complex_types_program", OptimizationLevel::Debug)?;
+    let mut prog = Command::new(&binary_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    // Give it time to start
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Function attach where 'c' (struct Complex*) is in scope
+    // Auto-deref expected: c.name, c.age resolve via implicit pointer dereference
+    let script = r#"
+trace update_complex {
+    print c.name;
+    print "U:{} A:{}", c.name, c.age;
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 8, pid).await?;
+
+    // Cleanup program
+    let _ = prog.kill().await;
+
+    assert_eq!(
+        exit_code, 0,
+        "ghostscope should run successfully. stderr={} stdout={}",
+        stderr, stdout
+    );
+
+    // Expect at least one line referencing the name string from pointer-deref path
+    let has_name = stdout.contains("\"Alice\"") || stdout.contains("\"Bob\"");
+    assert!(
+        has_name,
+        "Expected dereferenced name (\"Alice\" or \"Bob\"). STDOUT: {}",
+        stdout
+    );
+
+    // Ensure formatted print line exists with both fields
+    let has_formatted = stdout.contains("U:") && stdout.contains("A:");
+    assert!(
+        has_formatted,
+        "Expected formatted pointer-deref output. STDOUT: {}",
+        stdout
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_pointer_auto_deref_source_line_entry() -> anyhow::Result<()> {
+    init();
+
+    // Build and start complex_types_program (Debug)
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("complex_types_program", OptimizationLevel::Debug)?;
+    let mut prog = Command::new(&binary_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    // Give it time to start
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Source-line attach to the function declaration line (expected to be before/at prologue)
+    // Validate auto-deref for register-resident pointer parameter 'c'
+    let script = r#"
+trace complex_types_program.c:6 {
+    print c.name;
+    print "U:{} A:{}", c.name, c.age;
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 8, pid).await?;
+
+    // Cleanup program
+    let _ = prog.kill().await;
+
+    assert_eq!(
+        exit_code, 0,
+        "ghostscope should run successfully. stderr={} stdout={}",
+        stderr, stdout
+    );
+
+    // Name should be readable via auto-deref
+    let has_name = stdout.contains("\"Alice\"") || stdout.contains("\"Bob\"");
+    assert!(
+        has_name,
+        "Expected dereferenced name at entry (\"Alice\" or \"Bob\"). STDOUT: {}",
+        stdout
+    );
+
+    // Ensure formatted print line exists
+    let has_formatted = stdout.contains("U:") && stdout.contains("A:");
+    assert!(
+        has_formatted,
+        "Expected formatted pointer-deref output at entry. STDOUT: {}",
+        stdout
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_bitfields_correctness() -> anyhow::Result<()> {
     init();
 

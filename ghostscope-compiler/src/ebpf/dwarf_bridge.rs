@@ -556,15 +556,35 @@ impl<'ctx> EbpfContext<'ctx> {
             Some(var) => var,
             None => return Ok(None),
         };
-
-        // Get the object's type
-        let obj_type = match &base_var.dwarf_type {
-            Some(type_info) => type_info,
+        // Get the object's type/eval and perform implicit auto-deref until we reach an aggregate
+        let mut current_type = match &base_var.dwarf_type {
+            Some(type_info) => type_info.clone(),
             None => return Ok(None),
         };
+        let mut current_eval = base_var.evaluation_result.clone();
 
-        // Find the member in the struct type
-        let member_info = self.find_struct_member(obj_type, field_name)?;
+        // Follow typedef/qualified
+        loop {
+            match &current_type {
+                TypeInfo::TypedefType {
+                    underlying_type, ..
+                }
+                | TypeInfo::QualifiedType {
+                    underlying_type, ..
+                } => {
+                    current_type = underlying_type.as_ref().clone();
+                }
+                // Auto-deref pointers for member access using '.'
+                TypeInfo::PointerType { target_type, .. } => {
+                    current_eval = self.compute_pointer_dereference(&current_eval)?;
+                    current_type = target_type.as_ref().clone();
+                }
+                _ => break,
+            }
+        }
+
+        // Find the member in the resolved aggregate type
+        let member_info = self.find_struct_member(&current_type, field_name)?;
         let member_info = match member_info {
             Some(info) => info,
             None => return Ok(None),
@@ -575,8 +595,7 @@ impl<'ctx> EbpfContext<'ctx> {
             name: format!("{}.{}", self.expr_to_string(obj_expr), field_name),
             type_name: self.type_info_to_name(&member_info.member_type),
             dwarf_type: Some(member_info.member_type.clone()),
-            evaluation_result: self
-                .compute_member_address(&base_var.evaluation_result, member_info.offset)?,
+            evaluation_result: self.compute_member_address(&current_eval, member_info.offset)?,
             scope_depth: base_var.scope_depth,
             is_parameter: false,
             is_artificial: false,
@@ -674,12 +693,32 @@ impl<'ctx> EbpfContext<'ctx> {
 
         // Follow the chain for remaining members
         for field_name in chain.iter().skip(1) {
-            let current_type = match &current_var.dwarf_type {
-                Some(type_info) => type_info,
+            // Resolve typedef/qualified/pointer auto-deref before accessing next field
+            let mut ctype = match &current_var.dwarf_type {
+                Some(t) => t.clone(),
                 None => return Ok(None),
             };
+            let mut ceval = current_var.evaluation_result.clone();
 
-            let member_info = self.find_struct_member(current_type, field_name)?;
+            loop {
+                match &ctype {
+                    TypeInfo::TypedefType {
+                        underlying_type, ..
+                    }
+                    | TypeInfo::QualifiedType {
+                        underlying_type, ..
+                    } => {
+                        ctype = underlying_type.as_ref().clone();
+                    }
+                    TypeInfo::PointerType { target_type, .. } => {
+                        ceval = self.compute_pointer_dereference(&ceval)?;
+                        ctype = target_type.as_ref().clone();
+                    }
+                    _ => break,
+                }
+            }
+
+            let member_info = self.find_struct_member(&ctype, field_name)?;
             let member_info = match member_info {
                 Some(info) => info,
                 None => return Ok(None),
@@ -690,8 +729,7 @@ impl<'ctx> EbpfContext<'ctx> {
                 name: format!("{}.{}", current_var.name, field_name),
                 type_name: self.type_info_to_name(&member_info.member_type),
                 dwarf_type: Some(member_info.member_type.clone()),
-                evaluation_result: self
-                    .compute_member_address(&current_var.evaluation_result, member_info.offset)?,
+                evaluation_result: self.compute_member_address(&ceval, member_info.offset)?,
                 scope_depth: current_var.scope_depth,
                 is_parameter: false,
                 is_artificial: false,
@@ -838,13 +876,35 @@ impl<'ctx> EbpfContext<'ctx> {
                     LocationResult::ComputedLocation { steps },
                 ))
             }
-            // If the pointer is a direct value, use it as an address
-            EvaluationResult::DirectValue(_) => {
-                // The pointer value itself becomes the address to read from
-                // This is complex to implement generically, return error for now
-                Err(CodeGenError::NotImplemented(
-                    "Pointer dereference of direct values not yet implemented".to_string(),
-                ))
+            // If the pointer value is held directly (common for function parameters)
+            // interpret the value as an address to the pointed-to object.
+            EvaluationResult::DirectValue(dv) => {
+                use ghostscope_dwarf::DirectValueResult as DV;
+                match dv {
+                    DV::RegisterValue(reg) => Ok(EvaluationResult::MemoryLocation(
+                        LocationResult::RegisterAddress {
+                            register: *reg,
+                            offset: None,
+                            size: None,
+                        },
+                    )),
+                    DV::Constant(val) => Ok(EvaluationResult::MemoryLocation(
+                        LocationResult::Address(*val as u64),
+                    )),
+                    DV::ImplicitValue(bytes) => {
+                        // Assemble up to 8 bytes little-endian into u64
+                        let mut v: u64 = 0;
+                        for (i, b) in bytes.iter().take(8).enumerate() {
+                            v |= (*b as u64) << (8 * i);
+                        }
+                        Ok(EvaluationResult::MemoryLocation(LocationResult::Address(v)))
+                    }
+                    DV::ComputedValue { steps, .. } => Ok(EvaluationResult::MemoryLocation(
+                        LocationResult::ComputedLocation {
+                            steps: steps.clone(),
+                        },
+                    )),
+                }
             }
             _ => Err(CodeGenError::NotImplemented(
                 "Unsupported pointer dereference scenario".to_string(),
