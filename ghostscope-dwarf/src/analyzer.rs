@@ -196,6 +196,21 @@ impl DwarfAnalyzer {
         results
     }
 
+    /// Convert a module-relative virtual address (DWARF PC) to an ELF file offset
+    /// Returns None if the module is unknown or the address is not within a PT_LOAD segment
+    pub fn vaddr_to_file_offset<P: AsRef<std::path::Path>>(
+        &self,
+        module_path: P,
+        vaddr: u64,
+    ) -> Option<u64> {
+        let path_buf = module_path.as_ref().to_path_buf();
+        if let Some(module_data) = self.modules.get(&path_buf) {
+            module_data.vaddr_to_file_offset(vaddr)
+        } else {
+            None
+        }
+    }
+
     /// Get all variables visible at the given module address with EvaluationResult
     ///
     /// # Arguments

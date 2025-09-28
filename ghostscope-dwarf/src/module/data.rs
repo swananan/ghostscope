@@ -30,7 +30,7 @@ use crate::{
     proc_mapping::ModuleMapping,
 };
 use gimli::{EndianSlice, LittleEndian};
-use object::{Object, ObjectSection};
+use object::{Object, ObjectSection, ObjectSegment};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
@@ -227,6 +227,35 @@ impl ModuleData {
 
         let dwarf = gimli::Dwarf::load(load_section)?;
         Ok(dwarf)
+    }
+
+    /// Convert a virtual address (DWARF PC) to an ELF file offset using PT_LOAD segments
+    /// Returns None if no containing segment is found
+    pub(crate) fn vaddr_to_file_offset(&self, vaddr: u64) -> Option<u64> {
+        // Re-parse the object file on-demand from the mapped file
+        if self._mapped_file.data.is_empty() {
+            return None;
+        }
+        let data: &[u8] = &self._mapped_file.data;
+        let obj = match object::File::parse(data) {
+            Ok(f) => f,
+            Err(_) => return None,
+        };
+
+        for seg in obj.segments() {
+            let svaddr = seg.address();
+            let ssize = seg.size();
+            if ssize == 0 {
+                continue;
+            }
+            if vaddr >= svaddr && vaddr < svaddr + ssize {
+                let (file_off, _file_sz) = seg.file_range();
+                let delta = vaddr - svaddr;
+                return Some(file_off.saturating_add(delta));
+            }
+        }
+
+        None
     }
 
     /// Lookup function addresses by name with prologue skipping for real functions

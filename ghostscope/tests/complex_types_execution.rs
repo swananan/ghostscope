@@ -295,6 +295,112 @@ trace complex_types_program.c:6 {
 }
 
 #[tokio::test]
+async fn test_complex_types_formatting_nopie() -> anyhow::Result<()> {
+    init();
+
+    // Build and start complex_types_program (Non-PIE)
+    let binary_path = FIXTURES.get_test_binary_complex_nopie()?;
+    let mut prog = Command::new(&binary_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Use source-line attach where 'a' is in scope
+    let script_content = r#"
+trace complex_types_program.c:25 {
+    print a; // struct
+    print a.name;
+    print "User: {} Age: {} {}", a.name, a.age, a.status;
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_pid(script_content, 8, pid).await?;
+    let _ = prog.kill().await;
+
+    assert_eq!(
+        exit_code, 0,
+        "ghostscope should run successfully. stderr={} stdout={}",
+        stderr, stdout
+    );
+    let has_struct =
+        stdout.contains("Complex {") && stdout.contains("name:") && stdout.contains("age:");
+    assert!(
+        has_struct,
+        "Expected struct output with fields. STDOUT: {}",
+        stdout
+    );
+    let has_name_str = stdout.contains("\"Alice\"") || stdout.contains("\"Bob\"");
+    assert!(
+        has_name_str,
+        "Expected name string output. STDOUT: {}",
+        stdout
+    );
+    let has_arr_field = stdout.contains("arr:");
+    assert!(
+        has_arr_field,
+        "Expected struct output contains arr field. STDOUT: {}",
+        stdout
+    );
+    let has_formatted = stdout.contains("User:") && stdout.contains("Age:");
+    assert!(
+        has_formatted,
+        "Expected formatted print output. STDOUT: {}",
+        stdout
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_pointer_auto_deref_member_access_nopie() -> anyhow::Result<()> {
+    init();
+    let binary_path = FIXTURES.get_test_binary_complex_nopie()?;
+    let mut prog = Command::new(&binary_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let script = r#"
+trace update_complex {
+    print c.name;
+    print "U:{} A:{}", c.name, c.age;
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 8, pid).await?;
+    let _ = prog.kill().await;
+
+    assert_eq!(
+        exit_code, 0,
+        "ghostscope should run successfully. stderr={} stdout={}",
+        stderr, stdout
+    );
+    let has_name = stdout.contains("\"Alice\"") || stdout.contains("\"Bob\"");
+    assert!(
+        has_name,
+        "Expected dereferenced name (\"Alice\" or \"Bob\"). STDOUT: {}",
+        stdout
+    );
+    let has_formatted = stdout.contains("U:") && stdout.contains("A:");
+    assert!(
+        has_formatted,
+        "Expected formatted pointer-deref output. STDOUT: {}",
+        stdout
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_bitfields_correctness() -> anyhow::Result<()> {
     init();
 

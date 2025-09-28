@@ -219,11 +219,18 @@ impl<'a> AstCompiler<'a> {
                 let mut failed_addresses = 0;
 
                 for module_address in &module_addresses {
+                    // Convert DWARF PC (vaddr) to ELF file offset for uprobe
+                    let file_off = self.process_analyzer.as_ref().and_then(|an| {
+                        an.vaddr_to_file_offset(&module_address.module_path, module_address.address)
+                    });
+
                     let target_info = ResolvedTarget {
                         function_name: Some(format!("{file_path}:{line_number}")),
+                        // Keep function_address as DWARF PC for compile-time DWARF queries
                         function_address: Some(module_address.address),
                         binary_path: module_address.module_path.to_string_lossy().to_string(),
-                        uprobe_offset: Some(module_address.address), // For line addresses, offset equals address
+                        // Attach with absolute file offset if conversion succeeded
+                        uprobe_offset: file_off,
                         pattern: pattern.clone(),
                     };
 
@@ -305,14 +312,16 @@ impl<'a> AstCompiler<'a> {
                 let mut failed_addresses = 0;
 
                 for module_address in &module_addresses {
-                    // For DwarfAnalyzer, the address is already the binary offset we need for uprobe
-                    let uprobe_offset = module_address.address;
+                    // Convert DWARF function address (vaddr) to ELF file offset for uprobe attach
+                    let file_off = self.process_analyzer.as_ref().and_then(|an| {
+                        an.vaddr_to_file_offset(&module_address.module_path, module_address.address)
+                    });
 
                     let target_info = ResolvedTarget {
                         function_name: Some(func_name.clone()),
                         function_address: Some(module_address.address),
                         binary_path: module_address.module_path.to_string_lossy().to_string(),
-                        uprobe_offset: Some(uprobe_offset),
+                        uprobe_offset: file_off,
                         pattern: pattern.clone(),
                     };
 

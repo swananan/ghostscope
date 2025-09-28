@@ -10,6 +10,7 @@ use std::sync::Once;
 
 static INIT: Once = Once::new();
 static COMPILE: Once = Once::new();
+static REGISTER_CLEANUP: Once = Once::new();
 
 /// Initialize logging for tests (call once per test)
 pub fn init() {
@@ -18,6 +19,29 @@ pub fn init() {
             .with_env_filter("off")
             .try_init()
             .ok();
+    });
+
+    // Register an atexit cleanup to remove built fixtures after all tests
+    REGISTER_CLEANUP.call_once(|| unsafe {
+        extern "C" fn cleanup_fixtures() {
+            // Best-effort cleanup; ignore errors
+            let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+
+            // sample_program
+            let sample_dir = base.join("sample_program");
+            let _ = Command::new("make")
+                .arg("clean")
+                .current_dir(&sample_dir)
+                .output();
+
+            // complex_types_program (also remove Non-PIE target)
+            let complex_dir = base.join("complex_types_program");
+            let _ = Command::new("make")
+                .arg("clean")
+                .current_dir(&complex_dir)
+                .output();
+        }
+        libc::atexit(cleanup_fixtures);
     });
 }
 
@@ -144,6 +168,7 @@ pub fn ensure_test_program_compiled_with_opt(opt_level: OptimizationLevel) -> an
 
 static COMPILE_COMPLEX_DEBUG: Once = Once::new();
 static COMPILE_COMPLEX_OPT: Once = Once::new();
+static COMPILE_COMPLEX_NOPIE: Once = Once::new();
 
 fn ensure_complex_program_compiled_with_opt(opt_level: OptimizationLevel) -> anyhow::Result<()> {
     let mut result = Ok(());
@@ -260,6 +285,52 @@ impl TestFixtures {
         }
 
         Ok(binary_path)
+    }
+
+    /// Build and return the non-PIE variant of complex_types_program
+    pub fn get_test_binary_complex_nopie(&self) -> anyhow::Result<PathBuf> {
+        // Ensure build once
+        let program_dir = self.base_path.join("complex_types_program");
+        let mut result = Ok(());
+        COMPILE_COMPLEX_NOPIE.call_once(|| {
+            println!(
+                "Compiling complex_types_program Non-PIE (ET_EXEC) in {:?}",
+                program_dir
+            );
+            let _ = Command::new("make")
+                .arg("clean")
+                .current_dir(&program_dir)
+                .output();
+            let compile_output = Command::new("make")
+                .arg("complex_types_program_nopie")
+                .current_dir(&program_dir)
+                .output();
+            match compile_output {
+                Ok(out) => {
+                    if out.status.success() {
+                        println!("✓ Successfully compiled complex_types_program Non-PIE");
+                    } else {
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        result = Err(anyhow::anyhow!(
+                            "Failed to compile complex_types_program Non-PIE: {}",
+                            stderr
+                        ));
+                    }
+                }
+                Err(e) => {
+                    result = Err(anyhow::anyhow!(
+                        "Failed to run make for complex_types_program Non-PIE: {}",
+                        e
+                    ));
+                }
+            }
+        });
+        result?;
+        let bin_path = program_dir.join("complex_types_program_nopie");
+        if !bin_path.exists() {
+            anyhow::bail!("Non-PIE binary not found: {}", bin_path.display());
+        }
+        Ok(bin_path)
     }
 }
 
