@@ -322,9 +322,46 @@ pub fn extract_file_context(input: &str) -> Option<(&str, &str)> {
     }
 
     if let Some(file_part) = input.strip_prefix("trace ") {
-        // For trace command, provide file completion if it looks like a file path or filename
-        if contains_path_chars(file_part) || looks_like_filename(file_part) {
+        // For trace command, only provide file completion if it contains path chars
+        // This avoids triggering completion for function names
+        if contains_path_chars(file_part) {
             return Some(("trace ", extract_file_part_from_line_spec(file_part)));
+        }
+    }
+
+    // Support file completion for source command
+    if let Some(file_part) = input.strip_prefix("source ") {
+        return Some(("source ", file_part));
+    }
+
+    // Support file completion for save traces command
+    if let Some(file_part) = input.strip_prefix("save traces ") {
+        // Skip filter keywords
+        let file_part = file_part
+            .strip_prefix("enabled ")
+            .or_else(|| file_part.strip_prefix("disabled "))
+            .unwrap_or(file_part);
+        if !file_part.is_empty() {
+            return Some(("save traces ", file_part));
+        }
+    }
+
+    // Support abbreviations
+    if let Some(file_part) = input.strip_prefix("s ") {
+        // Not "s t" which is save traces abbreviation
+        if !file_part.starts_with("t ") {
+            return Some(("s ", file_part));
+        }
+    }
+
+    if let Some(file_part) = input.strip_prefix("s t ") {
+        // Skip filter keywords for save traces abbreviation
+        let file_part = file_part
+            .strip_prefix("enabled ")
+            .or_else(|| file_part.strip_prefix("disabled "))
+            .unwrap_or(file_part);
+        if !file_part.is_empty() {
+            return Some(("s t ", file_part));
         }
     }
 
@@ -340,15 +377,6 @@ fn extract_file_part_from_line_spec(spec: &str) -> &str {
 /// Check if input contains path-like characters
 fn contains_path_chars(input: &str) -> bool {
     input.contains('/') || input.contains('.')
-}
-
-/// Check if input looks like a filename (for trace command)
-fn looks_like_filename(input: &str) -> bool {
-    // Accept any non-empty input that looks like it could be a filename
-    !input.is_empty()
-        && input
-            .chars()
-            .all(|c| c.is_alphanumeric() || "_-".contains(c))
 }
 
 /// Check if input needs file completion
