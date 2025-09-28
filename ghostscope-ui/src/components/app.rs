@@ -249,6 +249,14 @@ impl App {
                     }
 
                     // Normal key handling
+
+                    // Clear Ctrl+C flag for any key that's not Ctrl+C
+                    let is_ctrl_c = matches!(key.code, KeyCode::Char('c'))
+                        && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
+                    if !is_ctrl_c {
+                        self.state.expecting_second_ctrl_c = false;
+                    }
+
                     match key.code {
                         KeyCode::Char('q')
                             if key
@@ -2902,20 +2910,11 @@ impl App {
 
     /// Handle Ctrl+C with double-press quit and special mode handling
     fn handle_ctrl_c(&mut self) -> Vec<Action> {
-        use std::time::{Duration, Instant};
+        // Check if this is a double Ctrl+C press (consecutive, no timeout)
+        let is_double_press = self.state.expecting_second_ctrl_c;
 
-        let now = Instant::now();
-        let double_press_threshold = Duration::from_millis(500); // 500ms window for double press
-
-        // Check if this is a double Ctrl+C press
-        let is_double_press = if let Some(last_time) = self.state.last_ctrl_c_time {
-            now.duration_since(last_time) <= double_press_threshold
-        } else {
-            false
-        };
-
-        // Update last Ctrl+C time
-        self.state.last_ctrl_c_time = Some(now);
+        // Set flag for next Ctrl+C press
+        self.state.expecting_second_ctrl_c = true;
 
         // Handle double press - always quit
         if is_double_press {
