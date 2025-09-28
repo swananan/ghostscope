@@ -283,10 +283,11 @@ impl FormatPrinter {
                     let addr = u64::from_le_bytes([
                         data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
                     ]);
+                    let ty = format!("{}*", target_type.type_name());
                     if addr == 0 {
-                        "NULL".to_string()
+                        format!("NULL ({ty})")
                     } else {
-                        format!("0x{:x} -> <POINTER_TO_{}>", addr, target_type.type_name())
+                        format!("0x{addr:x} ({ty})")
                     }
                 }
             }

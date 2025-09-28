@@ -44,6 +44,9 @@ enum ComplexArgSource {
     ImmediateBytes {
         bytes: Vec<u8>,
     },
+    AddressValue {
+        eval_result: ghostscope_dwarf::EvaluationResult,
+    },
 }
 
 /// Argument descriptor for PrintComplexFormat
@@ -328,6 +331,39 @@ impl<'ctx> EbpfContext<'ctx> {
             }
             PrintStatement::ComplexVariable(expr) => {
                 info!("Processing complex variable: {:?}", expr);
+                // Special-case address-of: print pointer value with type info
+                if let crate::script::Expr::AddressOf(inner) = expr {
+                    let var = self
+                        .query_dwarf_for_complex_expr(inner)?
+                        .ok_or_else(|| CodeGenError::VariableNotFound(format!("{:?}", inner)))?;
+                    let inner_ty = var.dwarf_type.as_ref().ok_or_else(|| {
+                        CodeGenError::DwarfError(
+                            "Expression has no DWARF type information".to_string(),
+                        )
+                    })?;
+                    let ptr_ty = ghostscope_dwarf::TypeInfo::PointerType {
+                        target_type: Box::new(inner_ty.clone()),
+                        size: 8,
+                    };
+                    let type_index = self.trace_context.add_type(ptr_ty);
+                    let var_name_index = self.trace_context.add_variable_name("&expr".to_string());
+
+                    let one_arg = vec![ComplexArg {
+                        var_name_index,
+                        type_index,
+                        access_path: Vec::new(),
+                        data_len: 8,
+                        source: ComplexArgSource::AddressValue {
+                            eval_result: var.evaluation_result.clone(),
+                        },
+                    }];
+                    let fmt_idx = self.trace_context.add_string("{}".to_string());
+                    self.generate_print_complex_format_instruction(fmt_idx, &one_arg)?;
+                    tracing::trace!(
+                        "compile_print_statement: address-of emitted via ComplexFormat"
+                    );
+                    return Ok(1);
+                }
                 let n = self.process_complex_variable_print(expr)?;
                 tracing::trace!(
                     instructions = n,
@@ -374,6 +410,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     | crate::script::ast::Expr::ArrayAccess(_, _)
                     | crate::script::ast::Expr::PointerDeref(_)
                     | crate::script::ast::Expr::ChainAccess(_)
+                    | crate::script::ast::Expr::AddressOf(_)
             )
         });
 
@@ -511,6 +548,31 @@ impl<'ctx> EbpfContext<'ctx> {
                         source: ComplexArgSource::RuntimeRead {
                             eval_result: var.evaluation_result.clone(),
                             dwarf_type: dwarf_type.clone(),
+                        },
+                    });
+                }
+                crate::script::ast::Expr::AddressOf(inner) => {
+                    let var = self
+                        .query_dwarf_for_complex_expr(inner)?
+                        .ok_or_else(|| CodeGenError::VariableNotFound(format!("{:?}", inner)))?;
+                    let inner_ty = var.dwarf_type.as_ref().ok_or_else(|| {
+                        CodeGenError::DwarfError(
+                            "Expression has no DWARF type information".to_string(),
+                        )
+                    })?;
+                    let ptr_ty = ghostscope_dwarf::TypeInfo::PointerType {
+                        target_type: Box::new(inner_ty.clone()),
+                        size: 8,
+                    };
+                    let type_index = self.trace_context.add_type(ptr_ty);
+
+                    complex_args.push(ComplexArg {
+                        var_name_index: self.trace_context.add_variable_name("&expr".to_string()),
+                        type_index,
+                        access_path: Vec::new(),
+                        data_len: 8,
+                        source: ComplexArgSource::AddressValue {
+                            eval_result: var.evaluation_result.clone(),
                         },
                     });
                 }
@@ -1343,6 +1405,21 @@ impl<'ctx> EbpfContext<'ctx> {
                         "probe_read_user",
                     )?;
                     let _ = dwarf_type; // silence unused warning in some cfgs
+                }
+                ComplexArgSource::AddressValue { eval_result } => {
+                    // Compute address and store as 8 bytes
+                    let addr = self.evaluation_result_to_address(eval_result)?;
+                    let cast_ptr = self
+                        .builder
+                        .build_pointer_cast(
+                            var_data_ptr,
+                            self.context.ptr_type(AddressSpace::default()),
+                            "addr_store_ptr",
+                        )
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    self.builder
+                        .build_store(cast_ptr, addr)
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
                 }
             }
 

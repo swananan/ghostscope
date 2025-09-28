@@ -6,6 +6,7 @@ pub enum Expr {
     Variable(String),
     MemberAccess(Box<Expr>, String),   // person.name
     PointerDeref(Box<Expr>),           // *ptr
+    AddressOf(Box<Expr>),              // &expr
     ArrayAccess(Box<Expr>, Box<Expr>), // arr[0] (new)
     ChainAccess(Vec<String>),          // person.name.first (new)
     SpecialVar(String),                // For $arg0, $arg1, $retval, $pc, $sp etc.
@@ -163,6 +164,7 @@ pub fn infer_type(expr: &Expr) -> Result<VarType, String> {
         Expr::Variable(_) => Ok(VarType::Int), // Temporarily assume variables are integer type to let parsing pass
         Expr::MemberAccess(_, _) => Ok(VarType::Int), // Same as above
         Expr::PointerDeref(_) => Ok(VarType::Int), // Same as above
+        Expr::AddressOf(_) => Ok(VarType::Int), // Address as integer/pointer value for now
         Expr::ArrayAccess(_, _) => Ok(VarType::Int), // New: array access returns element type (assume int for now)
         Expr::ChainAccess(_) => Ok(VarType::Int), // New: chain access returns final member type (assume int for now)
         Expr::SpecialVar(_) => Ok(VarType::Int),  // Special variables like $arg0, $retval etc.

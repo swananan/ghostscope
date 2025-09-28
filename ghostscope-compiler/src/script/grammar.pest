@@ -59,6 +59,7 @@ factor = {
     array_access |     // new: arr[index] support
     member_access |
     pointer_deref |
+    address_of |
     identifier |
     "(" ~ expr ~ ")"
 }
@@ -66,12 +67,13 @@ factor = {
 special_var = @{ "$" ~ (ASCII_ALPHANUMERIC | "_")+ }
 
 // Complex variable access patterns
-complex_variable = { chain_access | array_access | member_access | pointer_deref }
+complex_variable = { chain_access | array_access | member_access | pointer_deref | address_of }
 
 chain_access = { identifier ~ ("." ~ identifier)* ~ ("[" ~ expr ~ "]")? }
 array_access = { identifier ~ "[" ~ expr ~ "]" ~ ("." ~ identifier)* }
 member_access = { identifier ~ ("." ~ identifier)+ }
-pointer_deref = { "*" ~ identifier }
+pointer_deref = { "*" ~ ( "(" ~ expr ~ ")" | complex_variable | identifier ) }
+address_of = { "&" ~ ( "(" ~ expr ~ ")" | complex_variable | identifier ) }
 
 add_op = { "+" | "-" }
 mul_op = { "*" | "/" }

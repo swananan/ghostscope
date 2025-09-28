@@ -664,12 +664,13 @@ impl ParsedInstruction {
             ParsedInstruction::PrintComplexFormat { formatted_output } => formatted_output.clone(),
             ParsedInstruction::PrintComplexVariable {
                 name: _,
-                access_path,
+                access_path: _,
                 type_index: _,
                 formatted_value,
                 raw_data: _,
             } => {
-                format!("{access_path}: {formatted_value}")
+                // formatted_value already contains "name = ..." or "name.access = ..."
+                formatted_value.clone()
             }
             ParsedInstruction::PrintVariableError {
                 name,

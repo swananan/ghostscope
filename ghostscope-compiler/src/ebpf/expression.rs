@@ -90,6 +90,22 @@ impl<'ctx> EbpfContext<'ctx> {
                 // Use unified DWARF expression compilation
                 self.compile_dwarf_expression(expr)
             }
+            Expr::AddressOf(inner) => {
+                // Take address of an lvalue expression via DWARF evaluation result
+                // 1) Resolve complex expr to get EvaluationResult
+                let var = self.query_dwarf_for_complex_expr(inner)?.ok_or_else(|| {
+                    super::context::CodeGenError::TypeError(
+                        "cannot take address of unresolved expression".to_string(),
+                    )
+                })?;
+                // 2) Convert evaluation result to an address (i64)
+                match self.evaluation_result_to_address(&var.evaluation_result) {
+                    Ok(addr) => Ok(addr.into()),
+                    Err(_) => Err(super::context::CodeGenError::TypeError(
+                        "cannot take address of rvalue".to_string(),
+                    )),
+                }
+            }
             Expr::ArrayAccess(_, _) => {
                 // Use unified DWARF expression compilation
                 self.compile_dwarf_expression(expr)

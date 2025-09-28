@@ -532,6 +532,7 @@ fn parse_complex_variable(pair: Pair<Rule>) -> Result<Expr> {
         Rule::array_access => parse_array_access(inner),
         Rule::member_access => parse_member_access(inner),
         Rule::pointer_deref => parse_pointer_deref(inner),
+        Rule::address_of => parse_address_of(inner),
         _ => Err(ParseError::UnexpectedToken(inner.as_rule())),
     }
 }
@@ -601,6 +602,34 @@ fn parse_member_access(pair: Pair<Rule>) -> Result<Expr> {
 
 // Parse pointer dereference: *ptr
 fn parse_pointer_deref(pair: Pair<Rule>) -> Result<Expr> {
-    let var = pair.into_inner().next().unwrap().as_str().to_string();
-    Ok(Expr::PointerDeref(Box::new(Expr::Variable(var))))
+    let mut inner = pair.into_inner();
+    let target = inner.next().ok_or(ParseError::InvalidExpression)?;
+    let parsed = match target.as_rule() {
+        Rule::expr => parse_expr(target)?,
+        Rule::complex_variable => parse_complex_variable(target)?,
+        Rule::identifier => Expr::Variable(target.as_str().to_string()),
+        _ => return Err(ParseError::UnexpectedToken(target.as_rule())),
+    };
+    // Early normalization: *(&x) => x
+    match parsed {
+        Expr::AddressOf(inner_expr) => Ok(*inner_expr),
+        other => Ok(Expr::PointerDeref(Box::new(other))),
+    }
+}
+
+// Parse address-of: &expr
+fn parse_address_of(pair: Pair<Rule>) -> Result<Expr> {
+    let mut inner = pair.into_inner();
+    let target = inner.next().ok_or(ParseError::InvalidExpression)?;
+    let parsed = match target.as_rule() {
+        Rule::expr => parse_expr(target)?,
+        Rule::complex_variable => parse_complex_variable(target)?,
+        Rule::identifier => Expr::Variable(target.as_str().to_string()),
+        _ => return Err(ParseError::UnexpectedToken(target.as_rule())),
+    };
+    // Early normalization: &(*p) => p
+    match parsed {
+        Expr::PointerDeref(inner_expr) => Ok(*inner_expr),
+        other => Ok(Expr::AddressOf(Box::new(other))),
+    }
 }

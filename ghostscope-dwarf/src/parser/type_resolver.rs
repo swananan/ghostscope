@@ -74,18 +74,7 @@ impl TypeResolver {
             return cached_type.clone();
         }
 
-        // Detect recursion to avoid infinite loops (e.g., self-referential types)
-        if self.in_progress.contains(&type_offset) {
-            // Return a shallow placeholder without caching
-            return Some(TypeInfo::UnknownType {
-                name: "<recursive>".to_string(),
-            });
-        }
-
-        self.in_progress.insert(type_offset);
-        debug!("Resolving type at offset {:?}", type_offset);
-
-        // Get the type DIE
+        // Get the type DIE (needed to build a meaningful placeholder name on recursion)
         let type_entry = match unit.entry(type_offset) {
             Ok(entry) => entry,
             Err(e) => {
@@ -94,6 +83,41 @@ impl TypeResolver {
                 return None;
             }
         };
+
+        // Detect recursion to avoid infinite loops (e.g., self-referential types)
+        if self.in_progress.contains(&type_offset) {
+            // Build a more informative placeholder name using tag + DW_AT_name
+            let tag = type_entry.tag();
+            let mut name_str: Option<String> = None;
+            let mut attrs = type_entry.attrs();
+            while let Ok(Some(attr)) = attrs.next() {
+                if attr.name() == gimli::DW_AT_name {
+                    if let Ok(nv) = dwarf.attr_string(unit, attr.value()) {
+                        name_str = Some(nv.to_string_lossy().into_owned());
+                        break;
+                    }
+                }
+            }
+            let pretty = match tag {
+                gimli::DW_TAG_structure_type | gimli::DW_TAG_class_type => {
+                    format!(
+                        "struct {}",
+                        name_str.unwrap_or_else(|| "<anon>".to_string())
+                    )
+                }
+                gimli::DW_TAG_union_type => {
+                    format!("union {}", name_str.unwrap_or_else(|| "<anon>".to_string()))
+                }
+                gimli::DW_TAG_enumeration_type => {
+                    format!("enum {}", name_str.unwrap_or_else(|| "<anon>".to_string()))
+                }
+                _ => name_str.unwrap_or_else(|| "<recursive>".to_string()),
+            };
+            return Some(TypeInfo::UnknownType { name: pretty });
+        }
+
+        self.in_progress.insert(type_offset);
+        debug!("Resolving type at offset {:?}", type_offset);
 
         // Parse the type based on its tag
         let dwarf_type = match type_entry.tag() {
@@ -182,7 +206,69 @@ impl TypeResolver {
             match attr.name() {
                 gimli::DW_AT_type => {
                     if let gimli::AttributeValue::UnitRef(type_offset) = attr.value() {
-                        target_type = self.resolve_type_at_offset(dwarf, unit, type_offset);
+                        // If the pointed-to type is currently being resolved (recursive),
+                        // build a shallow named type instead of UnknownType, so that
+                        // pointers like struct Complex* render as POINTER_TO_struct Complex.
+                        if self.in_progress.contains(&type_offset) {
+                            if let Ok(pointee_entry) = unit.entry(type_offset) {
+                                let tag = pointee_entry.tag();
+                                // Try to get DW_AT_name for the pointee
+                                let mut pointee_name: Option<String> = None;
+                                let mut name_attrs = pointee_entry.attrs();
+                                while let Ok(Some(a)) = name_attrs.next() {
+                                    if a.name() == gimli::DW_AT_name {
+                                        if let Ok(nv) = dwarf.attr_string(unit, a.value()) {
+                                            pointee_name = Some(nv.to_string_lossy().into_owned());
+                                            break;
+                                        }
+                                    }
+                                }
+                                // Try to get size if available
+                                let mut byte_sz: Option<u64> = None;
+                                let mut sz_attrs = pointee_entry.attrs();
+                                while let Ok(Some(a)) = sz_attrs.next() {
+                                    if a.name() == gimli::DW_AT_byte_size {
+                                        if let gimli::AttributeValue::Udata(v) = a.value() {
+                                            byte_sz = Some(v);
+                                            break;
+                                        }
+                                    }
+                                }
+                                let name = pointee_name.unwrap_or_else(|| "<anon>".to_string());
+                                let shallow = match tag {
+                                    gimli::DW_TAG_structure_type | gimli::DW_TAG_class_type => {
+                                        TypeInfo::StructType {
+                                            name,
+                                            size: byte_sz.unwrap_or(0),
+                                            members: Vec::new(),
+                                        }
+                                    }
+                                    gimli::DW_TAG_union_type => TypeInfo::UnionType {
+                                        name,
+                                        size: byte_sz.unwrap_or(0),
+                                        members: Vec::new(),
+                                    },
+                                    gimli::DW_TAG_enumeration_type => TypeInfo::EnumType {
+                                        name,
+                                        size: byte_sz.unwrap_or(0),
+                                        base_type: Box::new(TypeInfo::BaseType {
+                                            name: "int".to_string(),
+                                            size: 4,
+                                            encoding: gimli::constants::DW_ATE_signed.0 as u16,
+                                        }),
+                                        variants: Vec::new(),
+                                    },
+                                    _ => TypeInfo::UnknownType { name },
+                                };
+                                target_type = Some(shallow);
+                            } else {
+                                target_type = Some(TypeInfo::UnknownType {
+                                    name: "<recursive>".to_string(),
+                                });
+                            }
+                        } else {
+                            target_type = self.resolve_type_at_offset(dwarf, unit, type_offset);
+                        }
                     }
                 }
                 gimli::DW_AT_byte_size => {
@@ -380,7 +466,33 @@ impl TypeResolver {
                                 }
                                 gimli::DW_AT_type => {
                                     if let gimli::AttributeValue::UnitRef(toff) = m_attr.value() {
-                                        m_type = self.resolve_type_at_offset(dwarf, unit, toff);
+                                        // Special-case: self-referential member that directly references the
+                                        // current struct DIE (some producers emit this for `struct T*` fields).
+                                        // Synthesize a pointer-to-self shallow type to avoid UnknownType.
+                                        if toff == entry.offset() {
+                                            let shallow = TypeInfo::StructType {
+                                                name: name.clone(),
+                                                size: byte_size,
+                                                members: Vec::new(),
+                                            };
+                                            m_type = Some(TypeInfo::PointerType {
+                                                target_type: Box::new(shallow),
+                                                size: 8, // assume 64-bit pointer
+                                            });
+                                        } else if let Ok(pointee_die) = unit.entry(toff) {
+                                            if pointee_die.tag() == gimli::DW_TAG_pointer_type {
+                                                m_type = self.parse_pointer_type(
+                                                    dwarf,
+                                                    &pointee_die,
+                                                    unit,
+                                                );
+                                            } else {
+                                                m_type =
+                                                    self.resolve_type_at_offset(dwarf, unit, toff);
+                                            }
+                                        } else {
+                                            m_type = self.resolve_type_at_offset(dwarf, unit, toff);
+                                        }
                                     }
                                 }
                                 gimli::DW_AT_data_member_location => match m_attr.value() {
