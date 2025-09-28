@@ -147,6 +147,13 @@ impl ScriptEditor {
             );
             cache.status = ScriptStatus::Submitted;
 
+            // Set waiting state for trace command
+            state.input_state = crate::model::panel_state::InputState::WaitingResponse {
+                command: format!("trace {}", cache.target),
+                sent_time: std::time::Instant::now(),
+                command_type: crate::model::panel_state::CommandType::Script,
+            };
+
             // Exit script editor mode
             state.mode = InteractionMode::Input;
 

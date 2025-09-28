@@ -157,6 +157,21 @@ impl App {
                         needs_render = true;
                     }
 
+                    // Check for command response timeout
+                    if let crate::model::panel_state::InputState::WaitingResponse { sent_time, command, .. } = &self.state.command_panel.input_state {
+                        const COMMAND_TIMEOUT_SECS: u64 = 5;
+                        if sent_time.elapsed().as_secs() >= COMMAND_TIMEOUT_SECS {
+                            let timeout_msg = format!("Command timeout: '{command}' - no response after {COMMAND_TIMEOUT_SECS} seconds");
+                            self.clear_waiting_state();
+                            crate::components::command_panel::ResponseFormatter::add_response(
+                                &mut self.state.command_panel,
+                                timeout_msg,
+                                crate::action::ResponseType::Error,
+                            );
+                            needs_render = true;
+                        }
+                    }
+
                     // Periodic cleanup of file completion cache
                     self.state.command_panel.cleanup_file_completion_cache();
                 }
@@ -252,7 +267,9 @@ impl App {
 
                     // Clear Ctrl+C flag for any key that's not Ctrl+C
                     let is_ctrl_c = matches!(key.code, KeyCode::Char('c'))
-                        && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
+                        && key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL);
                     if !is_ctrl_c {
                         self.state.expecting_second_ctrl_c = false;
                     }
@@ -2644,6 +2661,9 @@ impl App {
                 }
 
                 // Not batch loading, handle normally
+                // Clear waiting state for non-batch trace commands
+                self.clear_waiting_state();
+
                 // Check if compilation actually succeeded
                 if details.success_count > 0 {
                     // Find the first successful result
