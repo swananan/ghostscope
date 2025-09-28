@@ -449,15 +449,16 @@ impl FormatPrinter {
                     max_depth,
                 );
 
-                // Try to find matching enum variant
+                // Try to find matching enum variant and print both type::variant and numeric value
                 if let Ok(int_val) = base_value.parse::<i64>() {
                     for variant in variants {
                         if variant.value == int_val {
-                            return format!("{}::{}", name, variant.name);
+                            return format!("{}::{}({})", name, variant.name, base_value);
                         }
                     }
                 }
 
+                // No variant matched; still print type name with raw value
                 format!("{name}({base_value})")
             }
             TypeInfo::TypedefType {
