@@ -757,10 +757,35 @@ impl<'ctx> EbpfContext<'ctx> {
         };
 
         // Extract pointed-to type from pointer type
-        let pointed_type = match ptr_type {
+        let mut pointed_type = match ptr_type {
             TypeInfo::PointerType { target_type, .. } => target_type.as_ref().clone(),
             _ => return Ok(None), // Not a pointer type
         };
+
+        // If the pointed type is a shallow/placeholder struct (no members),
+        // try to resolve a full definition by name via the DWARF analyzer.
+        // This fixes cases like self-referential fields: struct Complex { Complex* friend_ref; }
+        // where the member pointer's target was synthesized shallowly during recursion breaking.
+        if let TypeInfo::StructType { name, members, .. } = &pointed_type {
+            if members.is_empty() {
+                if let Some(analyzer_ptr) = self.process_analyzer {
+                    // SAFETY: process_analyzer is set by the harness and lives longer than codegen
+                    let analyzer = unsafe { &mut *analyzer_ptr };
+                    // Prefer the current module if available; fall back to cross-module search
+                    if let Ok(ctx) = self.get_compile_time_context() {
+                        // Try resolve within current module first
+                        if let Some(full) = analyzer
+                            .resolve_struct_type_by_name_in_module(&ctx.module_path, name)
+                            .or_else(|| analyzer.resolve_struct_type_by_name(name))
+                        {
+                            pointed_type = full;
+                        }
+                    } else if let Some(full) = analyzer.resolve_struct_type_by_name(name) {
+                        pointed_type = full;
+                    }
+                }
+            }
+        }
 
         // Create dereferenced variable
         let deref_var = VariableWithEvaluation {

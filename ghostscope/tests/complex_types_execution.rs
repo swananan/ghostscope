@@ -107,6 +107,216 @@ async fn run_ghostscope_with_script_for_pid(
 }
 
 #[tokio::test]
+async fn test_entry_prints() -> anyhow::Result<()> {
+    init();
+
+    // Build and start complex_types_program (Debug)
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("complex_types_program", OptimizationLevel::Debug)?;
+    let mut prog = Command::new(&binary_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Script based on t.gs semantics, but inlined (no file read)
+    let script = r#"
+trace complex_types_program.c:7 {
+    print &*&*c;        // pointer address of c (struct Complex*)
+    print c.friend_ref; // pointer value or NULL
+    print c.name;       // char[16] -> string
+    print *c.friend_ref; // dereferenced struct (or null-deref error)
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
+
+    assert_eq!(
+        exit_code, 0,
+        "ghostscope should run successfully (stderr={}, stdout={})",
+        stderr, stdout
+    );
+
+    // Validate pointer prints include type suffix and hex
+    let has_any_ptr = stdout.contains("0x") && stdout.contains("(struct Complex*)");
+    assert!(
+        has_any_ptr,
+        "Expected pointer print with type suffix. STDOUT: {}",
+        stdout
+    );
+
+    // Validate c.name renders as a quoted string
+    let has_name = stdout.contains("\"Alice\"") || stdout.contains("\"Bob\"");
+    assert!(has_name, "Expected c.name string. STDOUT: {}", stdout);
+
+    // Validate deref prints either a pretty struct or a null-deref error
+    let has_deref_struct = stdout.contains("*c.friend_ref")
+        && (stdout.contains("Complex {") || stdout.contains("<error: null pointer dereference>"));
+    assert!(
+        has_deref_struct,
+        "Expected deref output (struct or null-deref). STDOUT: {}",
+        stdout
+    );
+
+    let _ = prog.kill().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_entry_pointer_values() -> anyhow::Result<()> {
+    init();
+
+    // Build and start complex_types_program (Debug)
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("complex_types_program", OptimizationLevel::Debug)?;
+    let mut prog = Command::new(&binary_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Focus on pointer prints at entry
+    let script = r#"
+trace complex_types_program.c:7 {
+    print &*&*c;
+    print c.friend_ref;
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
+
+    assert_eq!(
+        exit_code, 0,
+        "ghostscope should run successfully (stderr={}, stdout={})",
+        stderr, stdout
+    );
+
+    // Expect at least one pointer value with type suffix
+    assert!(
+        stdout.contains("0x") && stdout.contains("(struct Complex*)"),
+        "Expected pointer formatting with type suffix. STDOUT: {}",
+        stdout
+    );
+
+    let _ = prog.kill().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_entry_name_string_and_deref_struct_fields() -> anyhow::Result<()> {
+    init();
+
+    // Start program
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("complex_types_program", OptimizationLevel::Debug)?;
+    let mut prog = Command::new(&binary_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Focused script to capture name and deref content
+    let script = r#"
+trace complex_types_program.c:7 {
+    print c.name;
+    print *c.friend_ref;
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
+
+    let _ = prog.kill().await;
+
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    // Check c.name renders correctly
+    let has_name = stdout.contains("\"Alice\"") || stdout.contains("\"Bob\"");
+    assert!(has_name, "Expected c.name string. STDOUT: {}", stdout);
+
+    // Look for at least one deref with full struct fields
+    let mut found_struct = false;
+    for line in stdout.lines() {
+        if line.contains("*c.friend_ref = Complex {") {
+            // Validate presence of key fields
+            let has_status = line.contains("status:") && line.contains("Status::");
+            let has_data = line.contains("data: union Data {");
+            let has_arr = line.contains("arr: [");
+            let has_active = line.contains("active:");
+            let has_flags = line.contains("flags:");
+            if has_status && has_data && has_arr && has_active && has_flags {
+                found_struct = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        found_struct,
+        "Expected at least one full struct deref with fields. STDOUT: {}",
+        stdout
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_entry_friend_ref_null_and_non_null_cases() -> anyhow::Result<()> {
+    init();
+
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("complex_types_program", OptimizationLevel::Debug)?;
+    let mut prog = Command::new(&binary_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Print both pointer value and deref to observe null/non-null
+    let script = r#"
+trace complex_types_program.c:7 {
+    print c.friend_ref;
+    print *c.friend_ref;
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
+    let _ = prog.kill().await;
+
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    // We expect across events to see either NULL or non-NULL friend_ref at least once,
+    // and when non-NULL, deref should produce a struct.
+    let saw_null_ptr = stdout.contains("c.friend_ref = NULL (struct Complex*)");
+    let saw_non_null_ptr = stdout.contains("c.friend_ref = 0x");
+    let saw_struct_deref = stdout.contains("*c.friend_ref = Complex {");
+    let saw_null_deref_err = stdout.contains("*c.friend_ref = <error: null pointer dereference>");
+
+    assert!(
+        saw_null_ptr || saw_non_null_ptr,
+        "Expected at least one friend_ref pointer print. STDOUT: {}",
+        stdout
+    );
+    assert!(
+        saw_struct_deref || saw_null_deref_err,
+        "Expected deref to produce either struct or null-deref error. STDOUT: {}",
+        stdout
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_complex_types_formatting() -> anyhow::Result<()> {
     init();
 
@@ -134,7 +344,7 @@ trace complex_types_program.c:25 {
 "#;
 
     let (exit_code, stdout, stderr) =
-        run_ghostscope_with_script_for_pid(script_content, 8, pid).await?;
+        run_ghostscope_with_script_for_pid(script_content, 3, pid).await?;
 
     // Cleanup program
     let _ = prog.kill().await;
@@ -208,7 +418,7 @@ trace update_complex {
 }
 "#;
 
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 8, pid).await?;
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
 
     // Cleanup program
     let _ = prog.kill().await;
@@ -264,7 +474,7 @@ trace complex_types_program.c:6 {
 }
 "#;
 
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 8, pid).await?;
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
 
     // Cleanup program
     let _ = prog.kill().await;
@@ -319,7 +529,7 @@ trace complex_types_program.c:25 {
 "#;
 
     let (exit_code, stdout, stderr) =
-        run_ghostscope_with_script_for_pid(script_content, 8, pid).await?;
+        run_ghostscope_with_script_for_pid(script_content, 3, pid).await?;
     let _ = prog.kill().await;
 
     assert_eq!(
@@ -376,7 +586,7 @@ trace update_complex {
 }
 "#;
 
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 8, pid).await?;
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
     let _ = prog.kill().await;
 
     assert_eq!(
@@ -426,7 +636,7 @@ trace complex_types_program.c:25 {
 }
 "#;
 
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script_fn, 8, pid).await?;
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script_fn, 3, pid).await?;
 
     // Cleanup program
     let _ = prog.kill().await;

@@ -33,7 +33,6 @@ pub enum TypeKind {
 
     Unknown = 0x80,
     OptimizedOut = 0x81,
-    Error = 0x82,
 }
 
 impl TypeKind {
@@ -62,7 +61,6 @@ impl TypeKind {
             x if x == (Self::String as u8) => Some(Self::String),
             x if x == (Self::Unknown as u8) => Some(Self::Unknown),
             x if x == (Self::OptimizedOut as u8) => Some(Self::OptimizedOut),
-            x if x == (Self::Error as u8) => Some(Self::Error),
             _ => None,
         }
     }

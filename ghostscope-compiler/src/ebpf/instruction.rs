@@ -317,9 +317,62 @@ impl<'ctx> EbpfContext<'ctx> {
                 )
                 .map_err(|e| CodeGenError::LLVMError(format!("Failed to get status GEP: {}", e)))?
         };
-        let status_val = self.context.i8_type().const_int(0, false); // 0 = success
+        // Compute execution_status from runtime flags _gs_any_fail and _gs_any_success
+        let any_fail_ptr = self.get_or_create_flag_global("_gs_any_fail");
+        let any_succ_ptr = self.get_or_create_flag_global("_gs_any_success");
+
+        let any_fail_val = self
+            .builder
+            .build_load(self.context.i8_type(), any_fail_ptr, "any_fail")
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to load any_fail: {}", e)))?
+            .into_int_value();
+        let any_succ_val = self
+            .builder
+            .build_load(self.context.i8_type(), any_succ_ptr, "any_succ")
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to load any_succ: {}", e)))?
+            .into_int_value();
+
+        let zero = self.context.i8_type().const_zero();
+        let is_fail = self
+            .builder
+            .build_int_compare(inkwell::IntPredicate::NE, any_fail_val, zero, "is_fail")
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cmp any_fail: {}", e)))?;
+        let is_succ = self
+            .builder
+            .build_int_compare(inkwell::IntPredicate::NE, any_succ_val, zero, "is_succ")
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cmp any_succ: {}", e)))?;
+
+        // status = if is_fail && !is_succ => 2
+        //        else if is_fail && is_succ => 1
+        //        else 0
+        let not_succ = self
+            .builder
+            .build_not(is_succ, "not_succ")
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to build not: {}", e)))?;
+        let only_fail = self
+            .builder
+            .build_and(is_fail, not_succ, "only_fail")
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to build and: {}", e)))?;
+        let both = self
+            .builder
+            .build_and(is_fail, is_succ, "both")
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to build and: {}", e)))?;
+
+        let two = self.context.i8_type().const_int(2, false);
+        let one = self.context.i8_type().const_int(1, false);
+        let sel1 = self
+            .builder
+            .build_select(only_fail, two, zero, "status_sel1")
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to build select: {}", e)))?
+            .into_int_value();
+        let sel2 = self
+            .builder
+            .build_select(both, one, sel1, "status_sel2")
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to build select: {}", e)))?
+            .into_int_value();
+
         self.builder
-            .build_store(status_ptr, status_val)
+            .build_store(status_ptr, sel2)
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store status: {}", e)))?;
 
         // Send end instruction segment

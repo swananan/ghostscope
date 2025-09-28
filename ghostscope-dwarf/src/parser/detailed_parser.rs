@@ -58,6 +58,17 @@ impl DetailedParser {
         }
     }
 
+    /// Expose type resolution at a DIE offset using the internal TypeResolver
+    pub fn resolve_type_at_offset(
+        &mut self,
+        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
+        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
+        type_offset: gimli::UnitOffset,
+    ) -> Option<TypeInfo> {
+        self.type_resolver
+            .resolve_type_at_offset(dwarf, unit, type_offset)
+    }
+
     /// Recursively collect variables visible at the given address within a function
     pub fn collect_variables_in_function(
         &mut self,

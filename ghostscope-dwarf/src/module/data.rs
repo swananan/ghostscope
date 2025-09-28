@@ -64,6 +64,11 @@ impl ModuleData {
         Self::load_internal_parallel(module_mapping).await
     }
 
+    /// Resolve a struct/class type by name within this module via on-demand resolver
+    pub(crate) fn resolve_struct_type_by_name(&mut self, name: &str) -> Option<crate::TypeInfo> {
+        self.resolver.resolve_struct_type_by_name(name)
+    }
+
     /// Parallel internal load implementation - true parallelism for debug_info || debug_line || CFI
     async fn load_internal_parallel(module_mapping: ModuleMapping) -> Result<Self> {
         tracing::debug!(

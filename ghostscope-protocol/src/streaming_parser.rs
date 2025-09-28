@@ -29,11 +29,6 @@ pub enum ParsedInstruction {
         formatted_value: String,
         raw_data: Vec<u8>,
     },
-    PrintVariableError {
-        name: String,
-        error_code: u8,
-        error_message: String,
-    },
     Backtrace {
         depth: u8,
     },
@@ -391,34 +386,6 @@ impl StreamingTraceParser {
                 })
             }
 
-            t if t == InstructionType::PrintVariableError as u8 => {
-                if inst_data.len() < std::mem::size_of::<PrintVariableErrorData>() {
-                    return Err("Invalid PrintVariableError data".to_string());
-                }
-
-                let data_struct = unsafe {
-                    std::ptr::read_unaligned(inst_data.as_ptr() as *const PrintVariableErrorData)
-                };
-
-                let var_name_index = data_struct.var_name_index;
-                let var_name = trace_context
-                    .get_variable_name(var_name_index)
-                    .ok_or_else(|| format!("Invalid variable index: {var_name_index}"))?;
-
-                let error_message = match data_struct.error_code {
-                    1 => "failed to read user memory",
-                    2 => "variable not found",
-                    3 => "invalid memory address",
-                    _ => "unknown error",
-                };
-
-                Ok(ParsedInstruction::PrintVariableError {
-                    name: var_name.to_string(),
-                    error_code: data_struct.error_code,
-                    error_message: error_message.to_string(),
-                })
-            }
-
             t if t == InstructionType::PrintFormat as u8 => {
                 if inst_data.len() < std::mem::size_of::<PrintFormatData>() {
                     return Err("Invalid PrintFormat data".to_string());
@@ -433,21 +400,22 @@ impl StreamingTraceParser {
                 let mut offset = std::mem::size_of::<PrintFormatData>();
 
                 for _ in 0..format_data.arg_count {
-                    // Header: var_name_index:u16 (2), type_encoding:u8 (1), type_index:u16 (2), data_len:u16 (2)
-                    if offset + 7 > inst_data.len() {
+                    // Header: var_name_index:u16 (2), type_encoding:u8 (1), data_len:u16 (2), type_index:u16 (2), status:u8 (1)
+                    if offset + 8 > inst_data.len() {
                         return Err("Invalid PrintFormat variable header".to_string());
                     }
 
-                    // Read variable header: var_name_index:u16, type_encoding:u8, data_len:u16
+                    // Read variable header fields in struct order
                     let var_name_index =
                         u16::from_le_bytes([inst_data[offset], inst_data[offset + 1]]);
                     let type_encoding_byte = inst_data[offset + 2];
-                    let type_index =
-                        u16::from_le_bytes([inst_data[offset + 3], inst_data[offset + 4]]);
                     let data_len =
+                        u16::from_le_bytes([inst_data[offset + 3], inst_data[offset + 4]]);
+                    let type_index =
                         u16::from_le_bytes([inst_data[offset + 5], inst_data[offset + 6]]);
+                    let status = inst_data[offset + 7];
 
-                    offset += 7;
+                    offset += 8;
 
                     if offset + data_len as usize > inst_data.len() {
                         return Err("Invalid PrintFormat variable data".to_string());
@@ -465,6 +433,7 @@ impl StreamingTraceParser {
                         type_encoding,
                         // Preserve zero-based indices; 0 is a valid type_index
                         type_index: Some(type_index),
+                        status,
                         data: var_data,
                     });
                 }
@@ -493,19 +462,20 @@ impl StreamingTraceParser {
                 let mut data_offset = std::mem::size_of::<PrintComplexFormatData>();
 
                 for _ in 0..format_data.arg_count {
-                    if data_offset + 6 > inst_data.len() {
+                    if data_offset + 7 > inst_data.len() {
                         return Err("Invalid PrintComplexFormat argument data".to_string());
                     }
 
-                    // Read complex variable header: var_name_index, type_index, access_path_len
+                    // Read complex variable header: var_name_index, type_index, status, access_path_len
                     let var_name_index =
                         u16::from_le_bytes([inst_data[data_offset], inst_data[data_offset + 1]]);
                     let type_index = u16::from_le_bytes([
                         inst_data[data_offset + 2],
                         inst_data[data_offset + 3],
                     ]);
-                    let access_path_len = inst_data[data_offset + 4] as usize;
-                    data_offset += 5; // 2+2+1 bytes
+                    let status = inst_data[data_offset + 4];
+                    let access_path_len = inst_data[data_offset + 5] as usize;
+                    data_offset += 6; // 2+2+1(status)+1(ap_len)
 
                     // Read access path
                     if data_offset + access_path_len > inst_data.len() {
@@ -534,6 +504,7 @@ impl StreamingTraceParser {
                         var_name_index,
                         type_index,
                         access_path,
+                        status,
                         data: var_data,
                     });
                 }
@@ -584,7 +555,7 @@ impl StreamingTraceParser {
                 let access_path_bytes = &inst_data[struct_size..struct_size + access_path_len];
                 let access_path = String::from_utf8_lossy(access_path_bytes);
 
-                // Extract variable data
+                // Extract variable data (either value or error payload)
                 let var_data_offset = struct_size + access_path_len;
                 if inst_data.len() < var_data_offset + data_struct.data_len as usize {
                     return Err("Invalid PrintComplexVariable data length".to_string());
@@ -593,12 +564,13 @@ impl StreamingTraceParser {
                 let var_data =
                     &inst_data[var_data_offset..var_data_offset + data_struct.data_len as usize];
 
-                // Get type information from TraceContext and format using FormatPrinter
-                let formatted_value = FormatPrinter::format_complex_variable(
+                // Get type information and format with status-aware printer
+                let formatted_value = FormatPrinter::format_complex_variable_with_status(
                     var_name_index,
                     data_struct.type_index,
                     &access_path,
                     var_data,
+                    data_struct.status,
                     trace_context,
                 );
 
@@ -672,13 +644,6 @@ impl ParsedInstruction {
                 // formatted_value already contains "name = ..." or "name.access = ..."
                 formatted_value.clone()
             }
-            ParsedInstruction::PrintVariableError {
-                name,
-                error_code: _,
-                error_message,
-            } => {
-                format!("{name} (error: {error_message})")
-            }
             ParsedInstruction::Backtrace { depth } => {
                 format!("backtrace({depth})")
             }
@@ -705,7 +670,6 @@ impl ParsedInstruction {
             ParsedInstruction::PrintFormat { .. } => "PrintFormat".to_string(),
             ParsedInstruction::PrintComplexFormat { .. } => "PrintComplexFormat".to_string(),
             ParsedInstruction::PrintComplexVariable { .. } => "PrintComplexVariable".to_string(),
-            ParsedInstruction::PrintVariableError { .. } => "PrintVariableError".to_string(),
             ParsedInstruction::Backtrace { .. } => "Backtrace".to_string(),
             ParsedInstruction::EndInstruction { .. } => "EndInstruction".to_string(),
         }

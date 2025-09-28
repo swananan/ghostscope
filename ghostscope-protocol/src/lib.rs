@@ -15,8 +15,7 @@ pub use type_kind::{consts, TypeKind};
 
 pub use trace_event::{
     EndInstructionData, InstructionHeader, InstructionType, PrintFormatData, PrintStringIndexData,
-    PrintVariableErrorData, PrintVariableIndexData, TraceEventHeader, TraceEventMessage,
-    VariableData,
+    PrintVariableIndexData, TraceEventHeader, TraceEventMessage, VariableData, VariableStatus,
 };
 
 pub use trace_context::TraceContext;

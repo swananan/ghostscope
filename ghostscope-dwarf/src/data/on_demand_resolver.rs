@@ -9,6 +9,11 @@ use crate::{
     },
 };
 use gimli::{EndianSlice, LittleEndian};
+// Use upper-case aliases to satisfy non_upper_case_globals lint on pattern constants
+use gimli::constants::{
+    DW_AT_name as DW_AT_NAME, DW_TAG_class_type as DW_TAG_CLASS_TYPE,
+    DW_TAG_structure_type as DW_TAG_STRUCTURE_TYPE,
+};
 use tracing::{debug, info};
 
 /// Real on-demand DWARF resolver
@@ -28,6 +33,42 @@ impl OnDemandResolver {
         }
     }
 
+    /// Resolve a struct/class type by name (first match across all units)
+    pub fn resolve_struct_type_by_name(&mut self, name: &str) -> Option<crate::TypeInfo> {
+        // Iterate all compilation units and scan for a structure/class DIE with matching name
+        let mut units = self.dwarf.units();
+        while let Ok(Some(header)) = units.next() {
+            let unit = match self.dwarf.unit(header) {
+                Ok(u) => u,
+                Err(_) => continue,
+            };
+
+            let mut entries = unit.entries();
+
+            while let Ok(Some((_, entry))) = entries.next_dfs() {
+                match entry.tag() {
+                    DW_TAG_STRUCTURE_TYPE | DW_TAG_CLASS_TYPE => {
+                        if let Ok(Some(attr)) = entry.attr(DW_AT_NAME) {
+                            if let Ok(s) = self.dwarf.attr_string(&unit, attr.value()) {
+                                if s.to_string_lossy() == name {
+                                    // Resolve full type info via the detailed type resolver
+                                    if let Some(t) = self.detailed_parser.resolve_type_at_offset(
+                                        &self.dwarf,
+                                        &unit,
+                                        entry.offset(),
+                                    ) {
+                                        return Some(t);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        None
+    }
     /// Get all variables visible at the given address
     pub fn get_all_variables_at_address(
         &mut self,

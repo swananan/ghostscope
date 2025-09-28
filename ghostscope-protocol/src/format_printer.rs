@@ -4,6 +4,7 @@
 //! in the user space, converting raw variable data into formatted strings.
 
 use crate::trace_context::TraceContext;
+use crate::trace_event::VariableStatus;
 use crate::type_info::TypeInfo;
 use crate::TypeKind;
 
@@ -13,6 +14,7 @@ pub struct ParsedVariable {
     pub var_name_index: u16,
     pub type_encoding: TypeKind,
     pub type_index: Option<u16>, // Optional index into type table for perfect formatting
+    pub status: u8,              // 0 OK; non-zero means error payload in data
     pub data: Vec<u8>,
 }
 
@@ -22,6 +24,7 @@ pub struct ParsedComplexVariable {
     pub var_name_index: u16,
     pub type_index: u16,
     pub access_path: String,
+    pub status: u8, // 0 OK; non-zero means error payload in data
     pub data: Vec<u8>,
 }
 
@@ -72,11 +75,12 @@ impl FormatPrinter {
         let formatted_vars: Vec<String> = complex_variables
             .iter()
             .map(|var| {
-                Self::format_complex_variable(
+                Self::format_complex_variable_with_status(
                     var.var_name_index,
                     var.type_index,
                     &var.access_path,
                     &var.data,
+                    var.status,
                     trace_context,
                 )
                 .split(" = ")
@@ -119,7 +123,56 @@ impl FormatPrinter {
                         if found_closing {
                             if var_index < variables.len() {
                                 let var = &variables[var_index];
-                                let formatted_value = if let Some(type_index) = var.type_index {
+                                let formatted_value = if var.status != 0 {
+                                    // Status-aware error formatting. Prefer type_index when available for pointer suffix.
+                                    if let Some(type_index) = var.type_index {
+                                        if let Some(type_info) = trace_context.get_type(type_index)
+                                        {
+                                            let type_suffix = type_info.type_name();
+                                            match var.status {
+                                                1 => format!("<error: null pointer dereference> ({type_suffix}*)"),
+                                                2 => {
+                                                    let (errno, addr) = if var.data.len() >= 12 {
+                                                        let errno = i32::from_le_bytes([
+                                                            var.data[0],
+                                                            var.data[1],
+                                                            var.data[2],
+                                                            var.data[3],
+                                                        ]);
+                                                        let addr = u64::from_le_bytes([
+                                                            var.data[4],
+                                                            var.data[5],
+                                                            var.data[6],
+                                                            var.data[7],
+                                                            var.data[8],
+                                                            var.data[9],
+                                                            var.data[10],
+                                                            var.data[11],
+                                                        ]);
+                                                        (Some(errno), Some(addr))
+                                                    } else {
+                                                        (None, None)
+                                                    };
+                                                    match (errno, addr) {
+                                                        (Some(e), Some(a)) => {
+                                                            format!("<read_user failed errno={e} at 0x{a:x}> ({type_suffix}*)")
+                                                        }
+                                                        _ => {
+                                                            format!("<read_user failed> ({type_suffix}*)")
+                                                        }
+                                                    }
+                                                }
+                                                3 => format!("<address compute failed> ({type_suffix}*)"),
+                                                4 => format!("<truncated> ({type_suffix}*)"),
+                                                s => format!("<error status={s}> ({type_suffix}*)"),
+                                            }
+                                        } else {
+                                            format!("<error status={}>", var.status)
+                                        }
+                                    } else {
+                                        format!("<error status={}>", var.status)
+                                    }
+                                } else if let Some(type_index) = var.type_index {
                                     // Use perfect formatting via type info
                                     match trace_context.get_type(type_index) {
                                         Some(type_info) => {
@@ -231,6 +284,70 @@ impl FormatPrinter {
             format!("{var_name} = {formatted_data}")
         } else {
             format!("{var_name}.{access_path} = {formatted_data}")
+        }
+    }
+
+    /// Status-aware complex variable formatting
+    pub fn format_complex_variable_with_status(
+        var_name_index: u16,
+        type_index: u16,
+        access_path: &str,
+        data: &[u8],
+        status: u8,
+        trace_context: &TraceContext,
+    ) -> String {
+        let var_name = trace_context
+            .get_variable_name(var_name_index)
+            .unwrap_or("<INVALID_VAR_NAME>");
+        let type_info = match trace_context.get_type(type_index) {
+            Some(t) => t,
+            None => return format!("<INVALID_TYPE_INDEX_{type_index}>: {var_name}"),
+        };
+
+        // OK path delegates to existing formatter
+        if status == VariableStatus::Ok as u8 {
+            return Self::format_complex_variable(
+                var_name_index,
+                type_index,
+                access_path,
+                data,
+                trace_context,
+            );
+        }
+
+        // Build error prefix based on status and optional payload (errno:i32 + addr:u64)
+        let (errno, addr) = if data.len() >= 12 {
+            let errno = i32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+            let addr = u64::from_le_bytes([
+                data[4], data[5], data[6], data[7], data[8], data[9], data[10], data[11],
+            ]);
+            (Some(errno), Some(addr))
+        } else {
+            (None, None)
+        };
+
+        let type_suffix = type_info.type_name();
+        let err_text = match status {
+            s if s == VariableStatus::NullDeref as u8 => {
+                format!("<error: null pointer dereference> ({type_suffix}*)")
+            }
+            s if s == VariableStatus::ReadError as u8 => match (errno, addr) {
+                (Some(e), Some(a)) => {
+                    format!("<read_user failed errno={e} at 0x{a:x}> ({type_suffix}*)")
+                }
+                _ => format!("<read_user failed> ({type_suffix}*)"),
+            },
+            s if s == VariableStatus::AccessError as u8 => {
+                format!("<address compute failed> ({type_suffix}*)")
+            }
+            s if s == VariableStatus::Truncated as u8 => format!("<truncated> ({type_suffix}*)"),
+            _ => format!("<error status={status}> ({type_suffix}*)"),
+        };
+
+        if access_path.is_empty() {
+            format!("{var_name} = {err_text}")
+        } else {
+            format!("{var_name}.{access_path} = {err_text}")
         }
     }
 
@@ -651,6 +768,7 @@ impl FormatPrinter {
                             var_name_index: 0,           // dummy value
                             type_encoding: TypeKind::U8, // fallback
                             type_index: None,
+                            status: 0,
                             data: raw_data.clone(),
                         };
                         let reformatted =
@@ -897,7 +1015,6 @@ impl FormatPrinter {
             }
             TypeKind::Unknown => format!("<UNKNOWN_TYPE_{}_BYTES>", variable.data.len()),
             TypeKind::OptimizedOut => "<OPTIMIZED_OUT>".to_string(),
-            TypeKind::Error => "<ERROR>".to_string(),
             _ => format!("<UNSUPPORTED_TYPE_{:?}>", variable.type_encoding),
         }
     }
@@ -1020,12 +1137,14 @@ mod tests {
                 var_name_index: 0,
                 type_encoding: TypeKind::I32,
                 type_index: None,
+                status: 0,
                 data: vec![42, 0, 0, 0], // 42 in little-endian
             },
             ParsedVariable {
                 var_name_index: 1,
                 type_encoding: TypeKind::CString,
                 type_index: None,
+                status: 0,
                 data: b"hello\0".to_vec(),
             },
         ];
@@ -1040,6 +1159,7 @@ mod tests {
             var_name_index: 0,
             type_encoding: TypeKind::I32,
             type_index: None,
+            status: 0,
             data: vec![123, 0, 0, 0], // 123 in little-endian
         }];
 
@@ -1054,6 +1174,7 @@ mod tests {
             var_name_index: 0,
             type_encoding: TypeKind::U64,
             type_index: None,
+            status: 0,
             data: vec![255, 255, 255, 255, 255, 255, 255, 255], // u64::MAX
         };
         assert_eq!(
@@ -1066,6 +1187,7 @@ mod tests {
             var_name_index: 0,
             type_encoding: TypeKind::Pointer,
             type_index: None,
+            status: 0,
             data: vec![0xef, 0xbe, 0xad, 0xde, 0, 0, 0, 0], // 0xdeadbeef in little-endian
         };
         assert_eq!(FormatPrinter::format_variable_value(&var_ptr), "0xdeadbeef");
@@ -1075,6 +1197,7 @@ mod tests {
             var_name_index: 0,
             type_encoding: TypeKind::Bool,
             type_index: None,
+            status: 0,
             data: vec![1],
         };
         assert_eq!(FormatPrinter::format_variable_value(&var_bool_true), "true");
@@ -1083,6 +1206,7 @@ mod tests {
             var_name_index: 0,
             type_encoding: TypeKind::Bool,
             type_index: None,
+            status: 0,
             data: vec![0],
         };
         assert_eq!(
@@ -1109,12 +1233,14 @@ mod tests {
                 var_name_index: 0,
                 type_encoding: TypeKind::CString,
                 type_index: None,
+                status: 0,
                 data: b"Alice\0".to_vec(),
             },
             ParsedVariable {
                 var_name_index: 1,
                 type_encoding: TypeKind::U32,
                 type_index: None,
+                status: 0,
                 data: vec![25, 0, 0, 0], // 25 in little-endian
             },
         ];

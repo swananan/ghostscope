@@ -27,7 +27,6 @@ pub enum InstructionType {
     PrintComplexVariable = 0x03, // print complex variable (with full type info)
     PrintFormat = 0x04,          // print "format {} {}", var1, var2 (formatted print)
     PrintComplexFormat = 0x05,   // print with complex variables in format args
-    PrintVariableError = 0x12,   // variable read error (using variable name index)
     Backtrace = 0x10,            // backtrace instruction
 
     // Control instructions
@@ -41,6 +40,17 @@ pub struct InstructionHeader {
     pub inst_type: u8,    // InstructionType
     pub data_length: u16, // Length of instruction data following this header
     pub reserved: u8,
+}
+
+/// Per-variable runtime status for data acquisition
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VariableStatus {
+    Ok = 0,
+    NullDeref = 1,
+    ReadError = 2,
+    AccessError = 3,
+    Truncated = 4,
 }
 
 /// Print string instruction data (most optimized)
@@ -58,8 +68,8 @@ pub struct PrintVariableIndexData {
     pub type_encoding: u8,   // TypeKind
     pub data_len: u16,       // Length of variable data that follows
     pub type_index: u16,     // Index into type table (new field)
-    pub reserved: u8,        // Reduced reserved space
-                             // Followed by variable data
+    pub status: u8, // Variable read status: see VariableStatus. For script variables this is 0.
+                    // Followed by variable data
 }
 
 /// Print complex variable instruction data (enhanced with full type info)
@@ -69,7 +79,7 @@ pub struct PrintComplexVariableData {
     pub var_name_index: u16, // Index into variable name table
     pub type_index: u16,     // Index into type table for complete type information
     pub access_path_len: u8, // Length of access path description (e.g., "person.name.first")
-    pub reserved: u8,        // Padding for alignment
+    pub status: u8,          // Variable read status: see VariableStatus
     pub data_len: u16,       // Length of variable data that follows
                              // Followed by access_path (UTF-8 string) then variable data
 }
@@ -81,7 +91,9 @@ pub struct PrintFormatData {
     pub format_string_index: u16, // Index into string table for format string
     pub arg_count: u8,            // Number of arguments
     pub reserved: u8,             // Padding for alignment
-                                  // Followed by argument data: [var_name_index:u16, type_encoding:u8, data_len:u16, data:bytes] * arg_count
+                                  // Followed by argument data in struct order (8 bytes header):
+                                  // [var_name_index:u16, type_encoding:u8, data_len:u16, type_index:u16, status:u8, data:bytes] * arg_count
+                                  // Note: In fast path (script variables/literals), status is always 0 (VariableStatus::Ok)
 }
 
 /// Complex format print instruction data (with full type info)
@@ -91,17 +103,13 @@ pub struct PrintComplexFormatData {
     pub format_string_index: u16, // Index into string table for format string
     pub arg_count: u8,            // Number of arguments
     pub reserved: u8,             // Padding for alignment
-                                  // Followed by complex argument data: [var_name_index:u16, type_index:u16, access_path_len:u8, access_path:bytes, data_len:u16, data:bytes] * arg_count
+                                  // Followed by complex argument data:
+                                  // [var_name_index:u16, type_index:u16, status:u8, access_path_len:u8,
+                                  //  access_path:bytes, data_len:u16, data:bytes] * arg_count
 }
 
-/// Variable read error instruction data
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
-pub struct PrintVariableErrorData {
-    pub var_name_index: u16, // Index into variable name table
-    pub error_code: u8,      // Error type: 1=read_user failed, 2=other
-    pub reserved: u8,
-}
+// Note: historical PrintVariableError has been removed; per-variable errors
+// are carried via status in PrintVariableIndex/Format/ComplexFormat.
 
 /// Backtrace instruction data
 #[repr(C, packed)]
@@ -138,10 +146,6 @@ pub enum Instruction {
         format_string_index: u16,
         variables: Vec<VariableData>,
     },
-    PrintVariableError {
-        var_name_index: u16,
-        error_code: u8,
-    },
     Backtrace {
         depth: u8,
         flags: u8,
@@ -169,7 +173,6 @@ impl Instruction {
             Instruction::PrintStringIndex { .. } => InstructionType::PrintStringIndex,
             Instruction::PrintVariableIndex { .. } => InstructionType::PrintVariableIndex,
             Instruction::PrintFormat { .. } => InstructionType::PrintFormat,
-            Instruction::PrintVariableError { .. } => InstructionType::PrintVariableError,
             Instruction::Backtrace { .. } => InstructionType::Backtrace,
             Instruction::EndInstruction { .. } => InstructionType::EndInstruction,
         }

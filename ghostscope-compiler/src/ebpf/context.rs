@@ -425,4 +425,36 @@ impl<'ctx> EbpfContext<'ctx> {
         );
         Ok(())
     }
+
+    /// Get or create a global i8 flag by name, initialized to 0
+    pub fn get_or_create_flag_global(&mut self, name: &str) -> PointerValue<'ctx> {
+        if let Some(g) = self.module.get_global(name) {
+            return g.as_pointer_value();
+        }
+        let i8_type = self.context.i8_type();
+        let global = self
+            .module
+            .add_global(i8_type, Some(AddressSpace::default()), name);
+        global.set_initializer(&i8_type.const_zero());
+        global.as_pointer_value()
+    }
+
+    /// Set a flag global to a constant u8 value at runtime
+    pub fn store_flag_value(&mut self, name: &str, value: u8) -> Result<()> {
+        let ptr = self.get_or_create_flag_global(name);
+        self.builder
+            .build_store(ptr, self.context.i8_type().const_int(value as u64, false))
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store flag {name}: {e}")))?;
+        Ok(())
+    }
+
+    /// Mark that at least one variable succeeded (status==0)
+    pub fn mark_any_success(&mut self) -> Result<()> {
+        self.store_flag_value("_gs_any_success", 1)
+    }
+
+    /// Mark that at least one variable failed (status!=0)
+    pub fn mark_any_fail(&mut self) -> Result<()> {
+        self.store_flag_value("_gs_any_fail", 1)
+    }
 }

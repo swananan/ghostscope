@@ -531,13 +531,6 @@ trace calculate_something {
         println!("STDERR: {}", stderr);
         println!("===============================================");
 
-        // Check if we have permission to attach
-        if stderr.contains("Need root permissions") || stderr.contains("Failed to attach uprobe") {
-            println!("⚠️  Test requires sudo permissions - cannot validate math");
-            println!("   Run with: sudo cargo test test_calculate_something_math_validation");
-            continue;
-        }
-
         // If we have permissions, should run successfully and produce output
         assert_eq!(
             exit_code,
@@ -619,13 +612,6 @@ trace sample_program.c:16 {
         println!("STDOUT: {}", stdout);
         println!("STDERR: {}", stderr);
         println!("=====================================");
-
-        // Check if we have permission to attach
-        if stderr.contains("Need root permissions") || stderr.contains("Failed to attach uprobe") {
-            println!("⚠️  Test requires sudo permissions");
-            println!("   Run with: sudo cargo test test_multiple_trace_targets");
-            continue;
-        }
 
         // Check that script syntax is valid
         assert!(
@@ -804,12 +790,12 @@ trace sample_program.c:16 {
     println!("STDERR: {}", stderr);
     println!("===============================================");
 
-    // Check if we have permission to attach
-    if stderr.contains("Need root permissions") || stderr.contains("Failed to attach uprobe") {
-        println!("⚠️  Test requires sudo permissions - cannot validate line tracing");
-        println!("   Run with: sudo cargo test test_line_level_tracing_math_validation");
-        return Ok(());
-    }
+    // Must run successfully
+    assert_eq!(
+        exit_code, 0,
+        "Ghostscope should succeed (stderr: {})",
+        stderr
+    );
 
     // If we have permissions, should run successfully and produce output
     if exit_code == 0 {
@@ -853,11 +839,6 @@ trace sample_program.c:16 {
                 math_validations
             );
         }
-    } else {
-        println!(
-            "⚠️  Unexpected exit code: {}. STDERR: {}",
-            exit_code, stderr
-        );
     }
 
     Ok(())
@@ -913,16 +894,16 @@ trace calculate_something {
     println!("STDERR: {}", stderr);
     println!("======================================");
 
-    // Check if we have permission to attach
-    if stderr.contains("Need root permissions") || stderr.contains("Failed to attach uprobe") {
-        println!("⚠️  Test requires sudo permissions");
-        return Ok(());
-    }
-
     // Check that script syntax is valid
     assert!(
         !stderr.contains("Parse error"),
         "Print variables script should have valid syntax: {}",
+        stderr
+    );
+
+    assert_eq!(
+        exit_code, 0,
+        "Ghostscope should succeed (stderr: {})",
         stderr
     );
 
@@ -947,11 +928,6 @@ trace calculate_something {
         } else {
             println!("⚠️ No direct variable prints captured");
         }
-    } else {
-        println!(
-            "⚠️  Unexpected exit code: {}. STDERR: {}",
-            exit_code, stderr
-        );
     }
 
     Ok(())
@@ -981,16 +957,16 @@ trace calculate_something {
     println!("STDERR: {}", stderr);
     println!("==============================");
 
-    // Check if we have permission to attach
-    if stderr.contains("Need root permissions") || stderr.contains("Failed to attach uprobe") {
-        println!("⚠️  Test requires sudo permissions");
-        return Ok(());
-    }
-
     // Check that script syntax is valid
     assert!(
         !stderr.contains("Parse error"),
         "Custom variables script should have valid syntax: {}",
+        stderr
+    );
+
+    assert_eq!(
+        exit_code, 0,
+        "Ghostscope should succeed (stderr: {})",
         stderr
     );
 
@@ -1034,11 +1010,6 @@ trace calculate_something {
         } else {
             println!("⚠️ No custom variable outputs captured");
         }
-    } else {
-        println!(
-            "⚠️  Unexpected exit code: {}. STDERR: {}",
-            exit_code, stderr
-        );
     }
 
     Ok(())
