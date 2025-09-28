@@ -197,6 +197,20 @@ async fn run_runtime_coordinator(
                     RuntimeCommand::InfoAddress { target } => {
                         info_handlers::handle_info_address(&mut session, &mut runtime_channels, target).await;
                     }
+                    RuntimeCommand::SaveTraces { filename, filter } => {
+                        if let Some(ref session) = session {
+                            handle_save_traces(session, &mut runtime_channels, filename, filter).await;
+                        } else {
+                            let _ = runtime_channels
+                                .status_sender
+                                .send(RuntimeStatus::TracesSaveFailed {
+                                    error: "No debug session available".to_string(),
+                                });
+                        }
+                    }
+                    RuntimeCommand::LoadTraces { filename, traces } => {
+                        handle_load_traces(&mut session, &mut runtime_channels, filename, traces).await;
+                    }
                     RuntimeCommand::Shutdown => {
                         info!("Shutdown requested");
                         break;
@@ -249,4 +263,110 @@ async fn handle_execute_script(
                 target: script,
             });
     }
+}
+
+/// Handle save traces command
+async fn handle_save_traces(
+    session: &GhostSession,
+    runtime_channels: &mut RuntimeChannels,
+    filename: Option<String>,
+    filter: ghostscope_ui::components::command_panel::trace_persistence::SaveFilter,
+) {
+    use ghostscope_ui::components::command_panel::trace_persistence::{
+        TraceConfig, TracePersistence,
+    };
+    use ghostscope_ui::RuntimeStatus;
+
+    // Create TracePersistence instance
+    let mut persistence = TracePersistence::new();
+
+    // Set binary path if available
+    if let Some(ref binary_path) = session.binary_path() {
+        persistence.set_binary_path(binary_path.clone());
+    }
+
+    // Set PID if available
+    if let Some(pid) = session.pid() {
+        persistence.set_pid(pid);
+    }
+
+    // Collect trace information from session
+    let traces = session.get_traces();
+    for trace in &traces {
+        let config = TraceConfig {
+            id: trace.trace_id,
+            target: trace.target_display.clone(),
+            script: trace.script.clone(),
+            status: if trace.enabled {
+                ghostscope_ui::events::TraceStatus::Active
+            } else {
+                ghostscope_ui::events::TraceStatus::Disabled
+            },
+            binary_path: trace.binary_path.clone().unwrap_or_default(),
+        };
+        persistence.add_trace(config);
+    }
+
+    // Save traces to file
+    match persistence.save_traces(filename.as_deref(), filter) {
+        Ok(result) => {
+            let _ = runtime_channels
+                .status_sender
+                .send(RuntimeStatus::TracesSaved {
+                    filename: result.filename.to_string_lossy().to_string(),
+                    saved_count: result.saved_count,
+                    total_count: result.total_count,
+                });
+        }
+        Err(e) => {
+            let _ = runtime_channels
+                .status_sender
+                .send(RuntimeStatus::TracesSaveFailed {
+                    error: e.to_string(),
+                });
+        }
+    }
+}
+
+/// Handle load traces command
+async fn handle_load_traces(
+    session: &mut Option<GhostSession>,
+    runtime_channels: &mut RuntimeChannels,
+    filename: String,
+    traces: Vec<ghostscope_ui::events::TraceDefinition>,
+) {
+    use ghostscope_ui::RuntimeStatus;
+
+    if session.is_none() {
+        let _ = runtime_channels
+            .status_sender
+            .send(RuntimeStatus::TracesLoadFailed {
+                filename,
+                error: "No debug session available".to_string(),
+            });
+        return;
+    }
+
+    // Send all trace scripts for execution
+    // The UI will track individual ScriptCompilationCompleted responses
+    for trace in &traces {
+        // Build the trace command
+        let script_command = format!("trace {} {{\n{}\n}}", trace.target, trace.script);
+
+        // Execute the script (this sends the command but doesn't wait for result)
+        handle_execute_script(
+            session,
+            runtime_channels,
+            script_command,
+            &ghostscope_compiler::SaveOptions::default(),
+        )
+        .await;
+
+        // TODO: Handle disabled traces from //@disabled markers
+        // Currently ignoring disabled state - would need to track trace_id from
+        // ScriptCompilationCompleted response and then send disable command
+    }
+
+    // Don't send TracesLoaded here - let the UI track individual completions
+    // and send the final summary when all are done
 }

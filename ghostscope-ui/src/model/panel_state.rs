@@ -359,6 +359,21 @@ pub struct CommandPanelState {
     pub command_history_manager: crate::components::command_panel::CommandHistory,
     pub history_search: crate::components::command_panel::HistorySearchState,
     pub auto_suggestion: crate::components::command_panel::AutoSuggestionState,
+
+    // Batch loading state for source command
+    pub batch_loading: Option<BatchLoadingState>,
+}
+
+/// State for tracking batch trace loading (e.g., from source command)
+#[derive(Debug, Clone)]
+pub struct BatchLoadingState {
+    pub filename: String,
+    pub total_count: usize,
+    pub completed_count: usize,
+    pub success_count: usize,
+    pub failed_count: usize,
+    pub disabled_count: usize, // TODO: Currently not used - disabled traces are ignored during loading
+    pub details: Vec<crate::events::TraceLoadDetail>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -402,6 +417,8 @@ pub enum CommandType {
     InfoTraceAll,
     InfoSource,
     InfoShare,
+    SaveTraces,
+    LoadTraces,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -491,6 +508,7 @@ impl CommandPanelState {
                 crate::components::command_panel::CommandHistory::new_with_config(history_config),
             history_search: crate::components::command_panel::HistorySearchState::new(),
             auto_suggestion: crate::components::command_panel::AutoSuggestionState::new(),
+            batch_loading: None,
         }
     }
 

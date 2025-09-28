@@ -7,6 +7,7 @@ pub mod optimized_renderer;
 pub mod response_formatter;
 pub mod script_editor;
 pub mod syntax_highlighter;
+pub mod trace_persistence;
 
 pub use command_parser::CommandParser;
 pub use history_manager::{AutoSuggestionState, CommandHistory, HistorySearchState};

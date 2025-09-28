@@ -224,6 +224,16 @@ impl AutoSuggestionState {
             return;
         }
 
+        // First check static commands
+        if let Some(static_match) = Self::get_static_command_match(input) {
+            if static_match != input {
+                self.suggestion = Some(static_match);
+                self.start_position = input.len();
+                return;
+            }
+        }
+
+        // Then check history
         if let Some(matched_command) = history.get_prefix_match(input) {
             if matched_command != input {
                 self.suggestion = Some(matched_command.to_string());
@@ -234,6 +244,38 @@ impl AutoSuggestionState {
         } else {
             self.clear();
         }
+    }
+
+    fn get_static_command_match(prefix: &str) -> Option<String> {
+        // Built-in commands for auto-completion
+        const COMMANDS: &[&str] = &[
+            "save traces",
+            "save traces enabled",
+            "save traces disabled",
+            "source",
+            "info trace",
+            "info source",
+            "info share",
+            "info function",
+            "info line",
+            "info address",
+            "trace",
+            "enable",
+            "disable",
+            "delete",
+            "delete all",
+            "disable all",
+            "enable all",
+            "quit",
+            "exit",
+            "clear",
+            "help",
+        ];
+
+        COMMANDS
+            .iter()
+            .find(|cmd| cmd.starts_with(prefix) && **cmd != prefix)
+            .map(|cmd| cmd.to_string())
     }
 
     pub fn get_suggestion_text(&self) -> Option<&str> {

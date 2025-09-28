@@ -314,7 +314,9 @@ pub struct VariableDebugInfo {
 /// Commands that TUI can send to runtime
 #[derive(Debug, Clone)]
 pub enum RuntimeCommand {
-    ExecuteScript { command: String },
+    ExecuteScript {
+        command: String,
+    },
     RequestSourceCode, // Request source code for current function/address
     DisableTrace(u32), // Disable specific trace by ID
     EnableTrace(u32),  // Enable specific trace by ID
@@ -322,14 +324,56 @@ pub enum RuntimeCommand {
     EnableAllTraces,   // Enable all traces
     DeleteTrace(u32),  // Completely delete specific trace and all resources
     DeleteAllTraces,   // Delete all traces and resources
-    InfoFunction { target: String }, // Get debug info for a function by name
-    InfoLine { target: String }, // Get debug info for a source line (file:line)
-    InfoAddress { target: String }, // Get debug info for a memory address (TODO: not implemented yet)
-    InfoTrace { trace_id: Option<u32> }, // Get info for one/all traces (individual messages)
+    InfoFunction {
+        target: String,
+    }, // Get debug info for a function by name
+    InfoLine {
+        target: String,
+    }, // Get debug info for a source line (file:line)
+    InfoAddress {
+        target: String,
+    }, // Get debug info for a memory address (TODO: not implemented yet)
+    InfoTrace {
+        trace_id: Option<u32>,
+    }, // Get info for one/all traces (individual messages)
     InfoTraceAll,
     InfoSource, // Get all source files information
     InfoShare,  // Get shared library information (like GDB's "info share")
+    SaveTraces {
+        filename: Option<String>,
+        filter: crate::components::command_panel::trace_persistence::SaveFilter,
+    }, // Save traces to a file
+    LoadTraces {
+        filename: String,
+        traces: Vec<TraceDefinition>,
+    }, // Load traces from a file
     Shutdown,
+}
+
+/// Definition of a trace to be loaded
+#[derive(Debug, Clone)]
+pub struct TraceDefinition {
+    pub target: String,
+    pub script: String,
+    pub enabled: bool,
+}
+
+/// Result of loading a single trace
+#[derive(Debug, Clone)]
+pub struct TraceLoadDetail {
+    pub target: String,
+    pub trace_id: Option<u32>,
+    pub status: LoadStatus,
+    pub error: Option<String>,
+}
+
+/// Status of loading a trace
+#[derive(Debug, Clone)]
+pub enum LoadStatus {
+    Created,         // Successfully created and enabled
+    CreatedDisabled, // Created but disabled
+    Failed,          // Failed to create
+    Skipped,         // Skipped (e.g., duplicate)
 }
 
 /// Execution status for individual script targets
@@ -463,6 +507,30 @@ pub enum RuntimeStatus {
     },
     /// Failed to get file information
     FileInfoFailed {
+        error: String,
+    },
+    /// Traces saved to file successfully
+    TracesSaved {
+        filename: String,
+        saved_count: usize,
+        total_count: usize,
+    },
+    /// Failed to save traces
+    TracesSaveFailed {
+        error: String,
+    },
+    /// Traces loaded from file successfully
+    TracesLoaded {
+        filename: String,
+        total_count: usize,
+        success_count: usize,
+        failed_count: usize,
+        disabled_count: usize,
+        details: Vec<TraceLoadDetail>,
+    },
+    /// Failed to load traces
+    TracesLoadFailed {
+        filename: String,
         error: String,
     },
     /// Shared library information response

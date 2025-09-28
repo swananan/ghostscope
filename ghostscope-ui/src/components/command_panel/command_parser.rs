@@ -45,6 +45,16 @@ impl CommandParser {
             return actions;
         }
 
+        // Handle save traces command
+        if let Some(actions) = Self::parse_save_traces_command(state, cmd) {
+            return actions;
+        }
+
+        // Handle source command
+        if let Some(actions) = Self::parse_source_command(state, cmd) {
+            return actions;
+        }
+
         // Handle quit/exit commands
         if cmd == "quit" || cmd == "exit" {
             return vec![Action::Quit];
@@ -95,6 +105,10 @@ impl CommandParser {
             "  enable <id|all>      - Enable specific trace or all traces (en)",
             "  disable <id|all>     - Disable specific trace or all traces (dis)",
             "  delete <id|all>      - Delete specific trace or all traces (del)",
+            "  save traces [file]   - Save all traces to file (s t)",
+            "  save traces enabled  - Save only enabled traces",
+            "  save traces disabled - Save only disabled traces",
+            "  source <file>        - Load traces from file (s)",
         ]
         .join("\n")
     }
@@ -167,6 +181,8 @@ impl CommandParser {
             "enable",
             "disable",
             "delete",
+            "save",
+            "source",
             "info",
             "help",
             "clear",
@@ -177,6 +193,10 @@ impl CommandParser {
             "en",
             "dis",
             "del",
+            // Save subcommands
+            "save traces",
+            "save traces enabled",
+            "save traces disabled",
             // Info subcommands
             "info trace",
             "info source",
@@ -192,6 +212,7 @@ impl CommandParser {
             "i f",
             "i l",
             "i a",
+            "s t", // "s" alone is ambiguous (save/source), so we only support "s t" for save traces
         ];
 
         // Find commands that start with the input
@@ -466,8 +487,113 @@ impl CommandParser {
         None
     }
 
-    /// Parse shortcut commands (i s, i f, i l, i t, etc.)
+    /// Parse save traces command
+    fn parse_save_traces_command(
+        state: &mut CommandPanelState,
+        command: &str,
+    ) -> Option<Vec<Action>> {
+        use crate::components::command_panel::trace_persistence::CommandParser as TraceCmdParser;
+
+        // Use the CommandParser trait to parse the command
+        if let Some((filename, filter)) = command.parse_save_traces_command() {
+            state.input_state = InputState::WaitingResponse {
+                command: command.to_string(),
+                sent_time: Instant::now(),
+                command_type: CommandType::SaveTraces,
+            };
+
+            return Some(vec![Action::SendRuntimeCommand(
+                RuntimeCommand::SaveTraces { filename, filter },
+            )]);
+        }
+
+        None
+    }
+
+    /// Parse source command to load traces from file
+    fn parse_source_command(state: &mut CommandPanelState, command: &str) -> Option<Vec<Action>> {
+        use crate::components::command_panel::trace_persistence::TracePersistence;
+
+        // Parse "source <filename>" or "s <filename>"
+        let filename = if command.starts_with("source ") {
+            command.strip_prefix("source ").unwrap().trim()
+        } else if command.starts_with("s ")
+            && !command.starts_with("s t")
+            && !command.starts_with("save")
+        {
+            // Handle "s <filename>" but not "s t" (save traces) or "save"
+            command.strip_prefix("s ").unwrap().trim()
+        } else {
+            return None;
+        };
+
+        if filename.is_empty() {
+            return Some(vec![Action::AddResponse {
+                content: "Usage: source <filename>".to_string(),
+                response_type: ResponseType::Error,
+            }]);
+        }
+
+        // Try to load and parse the file
+        match TracePersistence::load_traces_from_file(filename) {
+            Ok(traces) => {
+                if traces.is_empty() {
+                    return Some(vec![Action::AddResponse {
+                        content: format!("No traces found in {filename}"),
+                        response_type: ResponseType::Warning,
+                    }]);
+                }
+
+                // Initialize batch loading state
+                state.batch_loading = Some(crate::model::panel_state::BatchLoadingState {
+                    filename: filename.to_string(),
+                    total_count: traces.len(),
+                    completed_count: 0,
+                    success_count: 0,
+                    failed_count: 0,
+                    disabled_count: 0,
+                    details: Vec::new(),
+                });
+
+                state.input_state = InputState::WaitingResponse {
+                    command: command.to_string(),
+                    sent_time: Instant::now(),
+                    command_type: CommandType::LoadTraces,
+                };
+
+                Some(vec![Action::SendRuntimeCommand(
+                    RuntimeCommand::LoadTraces {
+                        filename: filename.to_string(),
+                        traces,
+                    },
+                )])
+            }
+            Err(e) => Some(vec![Action::AddResponse {
+                content: format!("Failed to load {filename}: {e}"),
+                response_type: ResponseType::Error,
+            }]),
+        }
+    }
+
+    /// Parse shortcut commands (i s, i f, i l, i t, s t, etc.)
     fn parse_shortcut_command(state: &mut CommandPanelState, command: &str) -> Option<Vec<Action>> {
+        // Handle "s t" -> "save traces"
+        if command == "s t" {
+            return Self::parse_save_traces_command(state, "save traces");
+        }
+
+        // Handle "s t <filename>" -> "save traces <filename>"
+        if command.starts_with("s t ") {
+            let rest = command.strip_prefix("s t ").unwrap();
+            let full_command = format!("save traces {rest}");
+            return Self::parse_save_traces_command(state, &full_command);
+        }
+
+        // Handle "s <filename>" -> "source <filename>" (but not "s t")
+        if command.starts_with("s ") && !command.starts_with("s t") {
+            return Self::parse_source_command(state, command);
+        }
+
         // Handle "i s" -> "info source"
         if command == "i s" {
             state.input_state = InputState::WaitingResponse {

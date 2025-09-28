@@ -272,6 +272,11 @@ impl TraceManager {
             // No events received after draining ready traces, continue looping.
         }
     }
+
+    /// Get all traces for save/export operations
+    pub fn get_all_traces(&self) -> Vec<&TraceInstance> {
+        self.traces.values().collect()
+    }
 }
 
 impl Default for TraceManager {

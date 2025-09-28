@@ -2368,6 +2368,86 @@ impl App {
                 };
                 let _ = self.handle_action(action);
             }
+            RuntimeStatus::TracesSaved {
+                filename,
+                saved_count,
+                total_count,
+            } => {
+                self.clear_waiting_state();
+                let action = Action::AddResponse {
+                    content: format!("✓ Saved {saved_count} of {total_count} traces to {filename}"),
+                    response_type: crate::action::ResponseType::Success,
+                };
+                let _ = self.handle_action(action);
+            }
+            RuntimeStatus::TracesSaveFailed { error } => {
+                self.clear_waiting_state();
+                let action = Action::AddResponse {
+                    content: format!("✗ Failed to save traces: {error}"),
+                    response_type: crate::action::ResponseType::Error,
+                };
+                let _ = self.handle_action(action);
+            }
+            RuntimeStatus::TracesLoaded {
+                filename,
+                total_count,
+                success_count,
+                failed_count,
+                disabled_count,
+                details,
+            } => {
+                self.clear_waiting_state();
+
+                // Build response message
+                let mut response = String::new();
+
+                if failed_count == 0 {
+                    // All traces loaded successfully
+                    response.push_str(&format!(
+                        "✓ Loaded {} traces from {} ({} enabled, {} disabled)",
+                        total_count,
+                        filename,
+                        success_count - disabled_count,
+                        disabled_count
+                    ));
+                } else {
+                    // Some traces failed
+                    response.push_str(&format!("⚠ Partially loaded traces from {filename}\n"));
+                    response.push_str(&format!(
+                        "  ✓ {} traces created ({} enabled, {} disabled)\n",
+                        success_count,
+                        success_count - disabled_count,
+                        disabled_count
+                    ));
+
+                    // Show failed traces
+                    for detail in &details {
+                        if let crate::events::LoadStatus::Failed = detail.status {
+                            if let Some(ref error) = detail.error {
+                                response.push_str(&format!("  ✗ {} - {}\n", detail.target, error));
+                            }
+                        }
+                    }
+                }
+
+                let action = Action::AddResponse {
+                    content: response,
+                    response_type: if failed_count == 0 {
+                        crate::action::ResponseType::Success
+                    } else {
+                        crate::action::ResponseType::Warning
+                    },
+                };
+                let _ = self.handle_action(action);
+            }
+            RuntimeStatus::TracesLoadFailed { filename, error } => {
+                self.clear_waiting_state();
+                let action = Action::AddResponse {
+                    content: format!("✗ Failed to load {filename}: {error}"),
+                    response_type: crate::action::ResponseType::Error,
+                };
+                let _ = self.handle_action(action);
+            }
             RuntimeStatus::ScriptCompilationFailed { error, target } => {
                 self.clear_waiting_state();
                 // Provide detailed script compilation failure information
@@ -2435,19 +2515,127 @@ impl App {
 
         match status {
             RuntimeStatus::ScriptCompilationCompleted { details } => {
-                // Request trace info for all successful compilations to get source locations
-                if details.success_count > 0 {
-                    // Send trace info command to get source locations for all traces
-                    if let Err(e) = self
-                        .state
-                        .event_registry
-                        .command_sender
-                        .send(crate::events::RuntimeCommand::InfoTrace { trace_id: None })
-                    {
-                        tracing::error!("Failed to send InfoTrace command: {}", e);
+                // Check if this is part of a batch load operation
+                if let Some(ref mut batch) = self.state.command_panel.batch_loading {
+                    // Update batch loading state
+                    batch.completed_count += 1;
+                    if details.success_count > 0 {
+                        batch.success_count += details.success_count;
+                        // Add successful trace details
+                        for result in &details.results {
+                            if matches!(result.status, crate::events::ExecutionStatus::Success) {
+                                let trace_id = details.trace_ids.first().copied();
+                                batch.details.push(crate::events::TraceLoadDetail {
+                                    target: result.target_name.clone(),
+                                    trace_id,
+                                    status: crate::events::LoadStatus::Created,
+                                    error: None,
+                                });
+                            }
+                        }
+                    } else {
+                        batch.failed_count += 1;
+                        // Add failed trace details
+                        for result in &details.results {
+                            if let crate::events::ExecutionStatus::Failed(error) = &result.status {
+                                batch.details.push(crate::events::TraceLoadDetail {
+                                    target: result.target_name.clone(),
+                                    trace_id: None,
+                                    status: crate::events::LoadStatus::Failed,
+                                    error: Some(error.clone()),
+                                });
+                            }
+                        }
+                    }
+
+                    // Check if all traces have been processed
+                    if batch.completed_count >= batch.total_count {
+                        // All traces processed, show summary
+                        let filename = batch.filename.clone();
+                        let total_count = batch.total_count;
+                        let success_count = batch.success_count;
+                        let failed_count = batch.failed_count;
+                        let disabled_count = batch.disabled_count;
+                        let details = batch.details.clone();
+
+                        // Clear batch loading state
+                        self.state.command_panel.batch_loading = None;
+
+                        // Clear waiting state
+                        self.clear_waiting_state();
+
+                        // Show summary response
+                        let mut response = format!("📂 Loaded traces from {filename}\n");
+                        response.push_str(&format!(
+                            "  Total: {total_count}, Success: {success_count}, Failed: {failed_count}"
+                        ));
+                        if disabled_count > 0 {
+                            response.push_str(&format!(", Disabled: {disabled_count}"));
+                        }
+                        response.push('\n');
+
+                        // Show details
+                        if !details.is_empty() {
+                            response.push_str("\n📊 Details:\n");
+                            for detail in &details {
+                                match detail.status {
+                                    crate::events::LoadStatus::Created => {
+                                        if let Some(id) = detail.trace_id {
+                                            response.push_str(&format!(
+                                                "  ✓ {} → trace #{}\n",
+                                                detail.target, id
+                                            ));
+                                        } else {
+                                            response.push_str(&format!("  ✓ {}\n", detail.target));
+                                        }
+                                    }
+                                    crate::events::LoadStatus::CreatedDisabled => {
+                                        if let Some(id) = detail.trace_id {
+                                            response.push_str(&format!(
+                                                "  ⊘ {} → trace #{} (disabled)\n",
+                                                detail.target, id
+                                            ));
+                                        } else {
+                                            response.push_str(&format!(
+                                                "  ⊘ {} (disabled)\n",
+                                                detail.target
+                                            ));
+                                        }
+                                    }
+                                    crate::events::LoadStatus::Failed => {
+                                        if let Some(ref error) = detail.error {
+                                            response.push_str(&format!(
+                                                "  ✗ {}: {}\n",
+                                                detail.target, error
+                                            ));
+                                        } else {
+                                            response.push_str(&format!("  ✗ {}\n", detail.target));
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+
+                        let action = Action::AddResponse {
+                            content: response,
+                            response_type: if failed_count > 0 {
+                                crate::action::ResponseType::Warning
+                            } else {
+                                crate::action::ResponseType::Success
+                            },
+                        };
+                        let _ = self.handle_action(action);
+
+                        // Don't return - continue to allow individual trace display to be suppressed
+                        return None;
+                    } else {
+                        // Still waiting for more traces, suppress individual response
+                        return None;
                     }
                 }
 
+                // Not batch loading, handle normally
                 // Check if compilation actually succeeded
                 if details.success_count > 0 {
                     // Find the first successful result
@@ -2526,6 +2714,108 @@ impl App {
                 }
             }
             RuntimeStatus::ScriptCompilationFailed { error, target } => {
+                // Check if this is part of a batch load operation
+                if let Some(ref mut batch) = self.state.command_panel.batch_loading {
+                    // Update batch loading state
+                    batch.completed_count += 1;
+                    batch.failed_count += 1;
+
+                    // Add failed trace detail
+                    batch.details.push(crate::events::TraceLoadDetail {
+                        target: target.clone(),
+                        trace_id: None,
+                        status: crate::events::LoadStatus::Failed,
+                        error: Some(error.clone()),
+                    });
+
+                    // Check if all traces have been processed
+                    if batch.completed_count >= batch.total_count {
+                        // All traces processed, show summary (same as in ScriptCompilationCompleted)
+                        let filename = batch.filename.clone();
+                        let total_count = batch.total_count;
+                        let success_count = batch.success_count;
+                        let failed_count = batch.failed_count;
+                        let disabled_count = batch.disabled_count;
+                        let details = batch.details.clone();
+
+                        // Clear batch loading state
+                        self.state.command_panel.batch_loading = None;
+
+                        // Clear waiting state
+                        self.clear_waiting_state();
+
+                        // Show summary response
+                        let mut response = format!("📂 Loaded traces from {filename}\n");
+                        response.push_str(&format!(
+                            "  Total: {total_count}, Success: {success_count}, Failed: {failed_count}"
+                        ));
+                        if disabled_count > 0 {
+                            response.push_str(&format!(", Disabled: {disabled_count}"));
+                        }
+                        response.push('\n');
+
+                        // Show details
+                        if !details.is_empty() {
+                            response.push_str("\n📊 Details:\n");
+                            for detail in &details {
+                                match detail.status {
+                                    crate::events::LoadStatus::Created => {
+                                        if let Some(id) = detail.trace_id {
+                                            response.push_str(&format!(
+                                                "  ✓ {} → trace #{}\n",
+                                                detail.target, id
+                                            ));
+                                        } else {
+                                            response.push_str(&format!("  ✓ {}\n", detail.target));
+                                        }
+                                    }
+                                    crate::events::LoadStatus::CreatedDisabled => {
+                                        if let Some(id) = detail.trace_id {
+                                            response.push_str(&format!(
+                                                "  ⊘ {} → trace #{} (disabled)\n",
+                                                detail.target, id
+                                            ));
+                                        } else {
+                                            response.push_str(&format!(
+                                                "  ⊘ {} (disabled)\n",
+                                                detail.target
+                                            ));
+                                        }
+                                    }
+                                    crate::events::LoadStatus::Failed => {
+                                        if let Some(ref err) = detail.error {
+                                            response.push_str(&format!(
+                                                "  ✗ {}: {}\n",
+                                                detail.target, err
+                                            ));
+                                        } else {
+                                            response.push_str(&format!("  ✗ {}\n", detail.target));
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+
+                        let action = Action::AddResponse {
+                            content: response,
+                            response_type: if failed_count > 0 {
+                                crate::action::ResponseType::Warning
+                            } else {
+                                crate::action::ResponseType::Success
+                            },
+                        };
+                        let _ = self.handle_action(action);
+
+                        // Don't return - suppress individual error display
+                        return None;
+                    } else {
+                        // Still waiting for more traces, suppress individual response
+                        return None;
+                    }
+                }
+
+                // Not batch loading, handle normally
                 // Clear any pending trace line status on failure
                 if self.state.source_panel.pending_trace_line.is_some() {
                     self.state.source_panel.pending_trace_line = None;
