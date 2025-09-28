@@ -1,4 +1,5 @@
 [workspace]
+resolver = "2"
 members = [
     "ghostscope-compiler",
     "ghostscope-loader",
@@ -24,19 +25,20 @@ anyhow = "1.0.93"
 tracing = "0.1.41"
 tracing-log = "0.2.0"
 thiserror = "2.0.12"
-aya = "0.13.1"
-aya-ebpf-bindings = "0.1.1"
 tokio = { version = "1.0", features = ["full"] }
 chrono = { version = "0.4", features = ["serde", "clock"] }
 futures = "0.3"
 futures-util = "0.3"
 crossterm = { version = "0.28", features = ["event-stream"] }
-gimli = { path = "/mnt/500g/code/gimli" }
 clap = { version = "4.0", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
 dirs = "5.0"
+
+gimli = { git = "https://github.com/gimli-rs/gimli", rev = "0c2a60c00792b4d3c31344d8b5d5c6e8d98b5dd5" }
+aya = { git = "https://github.com/aya-rs/aya", rev = "9261554e3c6ca37e401ec23a287a1ddf9cb1f26d" }
+aya-ebpf-bindings = { git = "https://github.com/aya-rs/aya", rev = "9261554e3c6ca37e401ec23a287a1ddf9cb1f26d" }
 
 # Test dependencies
 tempfile = "3.8"
@@ -44,8 +46,3 @@ lazy_static = "1.4"
 serial_test = "3.0"
 criterion = "0.5"
 scopeguard = "1.2"
-
-
-[patch.crates-io]
-aya = { git = "https://github.com/aya-rs/aya", rev = "9261554e3c6ca37e401ec23a287a1ddf9cb1f26d" }
-aya-ebpf-bindings = { git = "https://github.com/aya-rs/aya", rev = "9261554e3c6ca37e401ec23a287a1ddf9cb1f26d" }
