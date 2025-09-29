@@ -297,6 +297,37 @@ impl AutoSuggestionState {
     }
 }
 
+// Test helper methods - available in tests
+impl CommandHistory {
+    /// Create a new history without loading from file (for testing)
+    #[doc(hidden)]
+    pub fn new_for_test() -> Self {
+        Self {
+            entries: Vec::new(),
+            file_path: PathBuf::new(), // Empty path prevents file operations
+            max_entries: 1000,
+        }
+    }
+
+    /// Get all entries for testing (only available in test builds)
+    #[doc(hidden)]
+    pub fn get_entries_for_test(&self) -> Vec<String> {
+        self.entries.clone()
+    }
+
+    /// Get entry at specific index for testing
+    #[doc(hidden)]
+    pub fn get_at(&self, index: usize) -> Option<String> {
+        self.entries.get(index).cloned()
+    }
+
+    /// Get entries in reverse order (as they would appear when navigating)
+    #[doc(hidden)]
+    pub fn get_entries_reversed(&self) -> Vec<String> {
+        self.entries.iter().rev().cloned().collect()
+    }
+}
+
 impl Default for CommandHistory {
     fn default() -> Self {
         Self::new()

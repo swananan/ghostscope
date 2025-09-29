@@ -37,6 +37,7 @@ log
 # Test programs and binaries (not part of Rust project)
 # Exclude compiled test binaries but keep source files
 test_*
+*.sh
 # Keep other C files in test fixtures but exclude random C files in root
 /*.c
 CLA*
