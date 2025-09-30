@@ -308,7 +308,6 @@ impl<'a> DwarfParser<'a> {
         &self,
         _dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
         unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
-        _entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
     ) -> Option<gimli::DwLang> {
         // Try to get language from compilation unit
         let mut entries = unit.entries();
@@ -337,7 +336,6 @@ impl<'a> DwarfParser<'a> {
         let mut units = self.dwarf.units();
         while let Ok(Some(header)) = units.next() {
             let unit = self.dwarf.unit(header)?;
-
             if let Some(ref line_program) = unit.line_program {
                 // Get compilation unit name
                 let cu_name = Self::extract_cu_name_from_dwarf(self.dwarf, &unit)
@@ -419,13 +417,15 @@ impl<'a> DwarfParser<'a> {
         }
 
         // Build line mapping with canonical paths using the scoped file index manager
+        // Avoid cloning the potentially large line_entries vector
+        let total_line_entries = line_entries.len();
         let line_mapping =
-            LineMappingTable::from_entries_with_scoped_manager(line_entries.clone(), &scoped_file_manager);
+            LineMappingTable::from_entries_with_scoped_manager(line_entries, &scoped_file_manager);
 
         debug!(
             "Completed debug_line parsing for {}: {} line entries, {} files, {} compilation units",
             module_path,
-            line_entries.len(),
+            total_line_entries,
             total_files,
             compilation_units.len()
         );
@@ -434,7 +434,7 @@ impl<'a> DwarfParser<'a> {
             line_mapping,
             scoped_file_manager,
             compilation_units,
-            line_entries_count: line_entries.len(),
+            line_entries_count: total_line_entries,
             files_count: total_files,
         })
     }
@@ -450,6 +450,7 @@ impl<'a> DwarfParser<'a> {
         let mut units = self.dwarf.units();
         while let Ok(Some(header)) = units.next() {
             let unit = self.dwarf.unit(header)?;
+            let cu_language = self.extract_language(self.dwarf, &unit);
 
             let unit_offset = match header.offset() {
                 gimli::UnitSectionOffset::DebugInfoOffset(offset) => offset,
@@ -493,8 +494,8 @@ impl<'a> DwarfParser<'a> {
                                 unit_offset,
                                 tag: entry.tag(),
                                 flags,
-                                language: self.extract_language(self.dwarf, &unit, entry),
-                                address_ranges: address_ranges.clone(),
+                                language: cu_language,
+                                address_ranges,
                                 entry_pc: self.extract_entry_pc(entry)?,
                             };
 
@@ -531,8 +532,8 @@ impl<'a> DwarfParser<'a> {
                                 unit_offset,
                                 tag: entry.tag(),
                                 flags,
-                                language: self.extract_language(self.dwarf, &unit, entry),
-                                address_ranges: address_ranges.clone(),
+                                language: cu_language,
+                                address_ranges,
                                 entry_pc: self.extract_entry_pc(entry)?,
                             };
 
@@ -562,7 +563,7 @@ impl<'a> DwarfParser<'a> {
                                 unit_offset,
                                 tag: entry.tag(),
                                 flags,
-                                language: self.extract_language(self.dwarf, &unit, entry),
+                                language: cu_language,
                                 address_ranges,
                                 entry_pc: None,
                             };
@@ -594,7 +595,7 @@ impl<'a> DwarfParser<'a> {
                                 unit_offset,
                                 tag: entry.tag(),
                                 flags,
-                                language: self.extract_language(self.dwarf, &unit, entry),
+                                language: cu_language,
                                 address_ranges: Vec::new(),
                                 entry_pc: None,
                             };

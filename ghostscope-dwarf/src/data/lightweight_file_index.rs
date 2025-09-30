@@ -209,19 +209,19 @@ impl ScopedFileIndexManager {
         compilation_unit: &str,
         file_index: u64,
     ) -> Option<String> {
-        // Removed debug logging to reduce noise in normal operation
-
         let file_index_ref = self.cu_file_indices.get(compilation_unit)?;
 
-        // Debug: list all files in this CU
-        tracing::debug!("  Available files in CU '{}':", compilation_unit);
-        for entry in file_index_ref.file_entries().iter() {
-            tracing::debug!(
-                "    file_index={}, filename='{}', dir_index={}",
-                entry.file_index,
-                entry.filename,
-                entry.directory_index
-            );
+        // Only enumerate files when debug logging is enabled to avoid O(n) cost per lookup
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            tracing::debug!("  Available files in CU '{}':", compilation_unit);
+            for entry in file_index_ref.file_entries().iter() {
+                tracing::debug!(
+                    "    file_index={}, filename='{}', dir_index={}",
+                    entry.file_index,
+                    entry.filename,
+                    entry.directory_index
+                );
+            }
         }
 
         let file_entry = file_index_ref.get_file_entry(file_index)?;
