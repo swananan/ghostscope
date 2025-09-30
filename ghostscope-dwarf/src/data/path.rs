@@ -70,6 +70,82 @@ pub(crate) fn join_paths(left: &str, right: &str) -> String {
     buf.to_string_lossy().into_owned()
 }
 
+/// Join left and right paths but avoid duplicating overlapping directory components.
+/// Example: left="/a/b/src/core", right="src/core/file.c" => "/a/b/src/core/file.c".
+fn join_paths_dedup(left: &str, right: &str) -> String {
+    if right.is_empty() {
+        return left.to_string();
+    }
+
+    // Start with the original left path
+    let mut out = if left.is_empty() {
+        PathBuf::new()
+    } else {
+        PathBuf::from(left)
+    };
+
+    // If right contains any parent directory traversals, fall back to normal join
+    // to preserve exact semantics of ".." handling.
+    let right_has_parent = Path::new(right)
+        .components()
+        .any(|c| matches!(c, Component::ParentDir));
+    if right_has_parent {
+        return join_paths(left, right);
+    }
+
+    // Collect only normal components for overlap comparison (no ".." in right at this point)
+    fn normals_of(p: &Path) -> Vec<String> {
+        p.components()
+            .filter_map(|c| match c {
+                Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    let left_normals = normals_of(Path::new(left));
+    let right_normals = normals_of(Path::new(right));
+
+    // Determine overlap length (suffix of left equals prefix of right)
+    let max_k = std::cmp::min(left_normals.len(), right_normals.len());
+    let mut overlap = 0usize;
+    for i in (1..=max_k).rev() {
+        if left_normals[left_normals.len() - i..] == right_normals[..i] {
+            overlap = i;
+            break;
+        }
+    }
+
+    // Append right with overlap trimmed (safe because right has no parent dirs)
+    let mut comps = Path::new(right).components();
+    // Skip the first `overlap` normal components
+    let mut skipped = 0usize;
+    while skipped < overlap {
+        if let Some(c) = comps.next() {
+            match c {
+                Component::Normal(_) => skipped += 1,
+                // Should not happen (we ensured no ParentDir), but break defensively
+                _ => break,
+            }
+        } else {
+            break;
+        }
+    }
+
+    for comp in comps {
+        match comp {
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                // Not expected here (guarded above), but handle safely
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+
+    out.to_string_lossy().into_owned()
+}
+
 /// Resolve a full file path using DWARF directory information.
 pub(crate) fn resolve_file_path<T: AsRef<str>>(
     dwarf_version: u16,
@@ -87,10 +163,10 @@ pub(crate) fn resolve_file_path<T: AsRef<str>>(
     }
 
     let directory = directory_from_index(dwarf_version, comp_dir, directories, directory_index);
-
     if directory.is_empty() {
         filename.to_string()
     } else {
-        join_paths(&directory, filename)
+        // Deduplicate overlapping segments between directory and filename
+        join_paths_dedup(&directory, filename)
     }
 }

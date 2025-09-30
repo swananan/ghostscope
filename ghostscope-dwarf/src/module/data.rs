@@ -69,8 +69,6 @@ impl ModuleData {
         Self::load_internal_parallel(module_mapping).await
     }
 
-    
-
     /// Resolve a struct/class type by name using only indexes + shallow resolution (no scanning).
     ///
     /// Preferred order:
@@ -600,12 +598,11 @@ impl ModuleData {
                             if chain.is_empty() {
                                 let one = vec![(func.cu_offset, v.die_offset)];
                                 let t1 = Instant::now();
-                                let vars =
-                                    self.resolver.resolve_variables_by_offsets_at_address(
-                                        address,
-                                        &one,
-                                        Some(&get_cfa_closure),
-                                    )?;
+                                let vars = self.resolver.resolve_variables_by_offsets_at_address(
+                                    address,
+                                    &one,
+                                    Some(&get_cfa_closure),
+                                )?;
                                 let mut var_opt = vars.into_iter().next();
                                 let mut type_ms = 0u128;
                                 if let Some(ref mut var0) = var_opt {
@@ -648,7 +645,10 @@ impl ModuleData {
                                 func.cu_offset,
                                 func.die_offset,
                                 v.die_offset,
-                                crate::data::on_demand_resolver::ChainSpec { base: base_var, fields: chain },
+                                crate::data::on_demand_resolver::ChainSpec {
+                                    base: base_var,
+                                    fields: chain,
+                                },
                                 Some(&get_cfa_closure),
                             )?;
                             tracing::info!(
@@ -928,31 +928,27 @@ impl ModuleData {
                 || line_entry.compilation_unit.ends_with(".cc")
                 || line_entry.compilation_unit.ends_with(".rs"))
         {
-            // Try to get base directory from file index resolution
-            let full_path = if let Some(full_path) = self
+            // If CU name already looks like a path, prefer the resolved full path directly.
+            // Avoid reconstructing "base_dir + CU" which can duplicate subpaths (e.g., src/core/src/core).
+            if let Some(resolved_full_path) = self
                 .scoped_file_manager
                 .lookup_by_scoped_index(&line_entry.compilation_unit, line_entry.file_index)
             {
-                // Extract base directory from the resolved absolute path
-                let resolved_path = &full_path;
-                if let Some(base_dir) =
-                    self.extract_base_directory(resolved_path, &line_entry.compilation_unit)
-                {
-                    let full_path = format!("{}/{}", base_dir, line_entry.compilation_unit);
-                    tracing::debug!(
-                        "create_source_location_from_entry: constructed full path '{}' from base_dir='{}' + compilation_unit='{}'",
-                        full_path, base_dir, line_entry.compilation_unit
-                    );
-                    full_path
-                } else {
-                    line_entry.compilation_unit.clone()
-                }
-            } else {
-                line_entry.compilation_unit.clone()
-            };
+                tracing::debug!(
+                    "create_source_location_from_entry: CU looks like path; using resolved full path '{}'",
+                    resolved_full_path
+                );
+                return Some(SourceLocation {
+                    file_path: resolved_full_path,
+                    line_number: line_entry.line as u32,
+                    column: Some(line_entry.column as u32),
+                    address: line_entry.address,
+                });
+            }
 
+            // Fallback to CU string if resolution failed
             return Some(SourceLocation {
-                file_path: full_path,
+                file_path: line_entry.compilation_unit.clone(),
                 line_number: line_entry.line as u32,
                 column: Some(line_entry.column as u32),
                 address: line_entry.address,
@@ -1063,34 +1059,6 @@ impl ModuleData {
             }
         }
 
-        None
-    }
-
-    /// Extract base directory from an absolute path by removing the filename
-    /// For example:
-    /// - absolute_path: "/mnt/500g/code/openresty/openresty-1.27.1.1/build/nginx-1.27.1/nginx.c"
-    /// - compilation_unit: "src/core/nginx.c"
-    /// - returns: "/mnt/500g/code/openresty/openresty-1.27.1.1/build/nginx-1.27.1"
-    /// - final result: "/mnt/500g/code/openresty/openresty-1.27.1.1/build/nginx-1.27.1/src/core/nginx.c"
-    fn extract_base_directory(
-        &self,
-        absolute_path: &str,
-        compilation_unit: &str,
-    ) -> Option<String> {
-        // Extract the directory part from the absolute path (remove filename)
-        if let Some(parent) = std::path::Path::new(absolute_path).parent() {
-            let base_dir = parent.to_string_lossy().to_string();
-            tracing::debug!(
-                "extract_base_directory: absolute_path='{}' -> base_dir='{}' (will append compilation_unit='{}')",
-                absolute_path, base_dir, compilation_unit
-            );
-            return Some(base_dir);
-        }
-
-        tracing::debug!(
-            "extract_base_directory: failed to extract parent directory from absolute_path='{}'",
-            absolute_path
-        );
         None
     }
 

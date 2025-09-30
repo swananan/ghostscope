@@ -746,7 +746,6 @@ impl<'ctx> EbpfContext<'ctx> {
         Ok(Some(deref_var))
     }
 
-
     /// Helper: Compute pointer dereference
     fn compute_pointer_dereference(
         &self,

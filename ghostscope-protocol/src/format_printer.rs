@@ -94,8 +94,6 @@ impl FormatPrinter {
         Self::apply_format_strings(format_string, &formatted_vars)
     }
 
-    
-
     /// Apply formatting with type-aware variables using TraceContext when available
     fn apply_format_with_context(
         format_string: &str,

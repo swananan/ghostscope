@@ -1,7 +1,9 @@
 //! Real on-demand DWARF resolver implementation
 //! This version actually parses DWARF DIEs instead of returning hardcoded data
 
-use crate::{core::Result, data::TypeNameIndex, parser::DetailedParser, parser::VariableWithEvaluation};
+use crate::{
+    core::Result, data::TypeNameIndex, parser::DetailedParser, parser::VariableWithEvaluation,
+};
 use gimli::{EndianSlice, LittleEndian};
 // Use upper-case aliases to satisfy non_upper_case_globals lint on pattern constants
 // No direct constant tag imports needed here
@@ -32,15 +34,18 @@ impl OnDemandResolver {
     ) -> Self {
         let mut detailed_parser = DetailedParser::new();
         detailed_parser.set_type_name_index(type_index.clone());
-        Self { dwarf, detailed_parser, type_name_index: Some(type_index), strict_index: true }
+        Self {
+            dwarf,
+            detailed_parser,
+            type_name_index: Some(type_index),
+            strict_index: true,
+        }
     }
 
     /// Borrow DWARF reference for building auxiliary indexes lazily
     pub fn dwarf_ref(&self) -> &gimli::Dwarf<EndianSlice<'static, LittleEndian>> {
         &self.dwarf
     }
-
-    
 
     /// Plan chain access starting from a known variable DIE (fast path)
     pub fn plan_chain_access_from_var(
@@ -133,7 +138,11 @@ impl OnDemandResolver {
                 gimli::UnitSectionOffset::DebugInfoOffset(off) => {
                     let h = self.dwarf.debug_info.header_from_offset(off)?;
                     let u = self.dwarf.unit(h)?;
-                    crate::parser::DetailedParser::resolve_type_shallow_at_offset(&self.dwarf, &u, ftl.die_off)
+                    crate::parser::DetailedParser::resolve_type_shallow_at_offset(
+                        &self.dwarf,
+                        &u,
+                        ftl.die_off,
+                    )
                 }
                 gimli::UnitSectionOffset::DebugTypesOffset(_off) => None,
             };
@@ -151,7 +160,11 @@ impl OnDemandResolver {
                     if let Some(
                         crate::TypeInfo::StructType { members, .. }
                         | crate::TypeInfo::UnionType { members, .. },
-                    ) = crate::parser::DetailedParser::resolve_type_shallow_at_offset(&self.dwarf, &u, ctx.parent_die_off) {
+                    ) = crate::parser::DetailedParser::resolve_type_shallow_at_offset(
+                        &self.dwarf,
+                        &u,
+                        ctx.parent_die_off,
+                    ) {
                         if let Some(m) = members.iter().find(|m| m.name == ctx.member_name) {
                             tracing::info!(
                                 "DWARF:parent_enrich member='{}' uses BitfieldType={}",
@@ -192,8 +205,6 @@ impl OnDemandResolver {
         Ok(Some(var))
     }
 
-    
-
     /// Resolve variables by DIE offsets at a specific address using DetailedParser
     pub fn resolve_variables_by_offsets_at_address(
         &mut self,
@@ -219,7 +230,6 @@ impl OnDemandResolver {
         }
         Ok(vars)
     }
-    
 
     /// Get cache statistics
     pub fn get_cache_stats(&self) -> (usize, usize) {

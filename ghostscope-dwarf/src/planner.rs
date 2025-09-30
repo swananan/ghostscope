@@ -213,8 +213,6 @@ impl<'dwarf> AccessPlanner<'dwarf> {
         })
     }
 
-    
-
     /// Start planning from a known variable (skip variable search)
     pub fn plan_chain_from_known(
         &self,
@@ -381,8 +379,6 @@ impl<'dwarf> AccessPlanner<'dwarf> {
             last_parent_ctx,
         ))
     }
-
-    
 
     fn compute_pointer_deref(base: EvaluationResult) -> EvaluationResult {
         use crate::core::ComputeStep;

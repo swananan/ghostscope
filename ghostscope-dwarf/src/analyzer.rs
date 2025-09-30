@@ -63,7 +63,6 @@ impl DwarfAnalyzer {
         Self::from_pid_parallel(pid).await
     }
 
-
     /// Resolve struct/class by name (shallow) in a specific module using only indexes
     pub fn resolve_struct_type_shallow_by_name_in_module<P: AsRef<Path>>(
         &mut self,
@@ -87,7 +86,6 @@ impl DwarfAnalyzer {
         None
     }
 
-    
     /// Create DWARF analyzer from PID using parallel loading
     pub async fn from_pid_parallel(pid: u32) -> Result<Self> {
         Self::from_pid_parallel_with_progress(pid, |_event| {}).await

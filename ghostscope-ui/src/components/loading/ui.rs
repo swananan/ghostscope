@@ -89,7 +89,7 @@ impl LoadingUI {
 
         // Main loading container with enhanced styling
         let loading_block = Block::default()
-            .title(" Ghostscope Debugger ")
+            .title(" Ghostscope Tracer ")
             .title_alignment(Alignment::Center)
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
