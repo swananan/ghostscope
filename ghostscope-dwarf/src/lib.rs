@@ -11,6 +11,7 @@ pub(crate) mod data;
 pub(crate) mod loader;
 pub(crate) mod module;
 pub(crate) mod parser;
+pub(crate) mod planner;
 pub(crate) mod proc_mapping;
 
 // Main entry point

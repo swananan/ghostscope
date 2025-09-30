@@ -94,7 +94,7 @@ impl FormatPrinter {
         Self::apply_format_strings(format_string, &formatted_vars)
     }
 
-    // Removed unused apply_format (was a pre-type-aware path)
+    
 
     /// Apply formatting with type-aware variables using TraceContext when available
     fn apply_format_with_context(
@@ -353,16 +353,8 @@ impl FormatPrinter {
 
     /// Format data using full DWARF type information
     pub fn format_data_with_type_info(data: &[u8], type_info: &TypeInfo) -> String {
-        // Debug: Log the TypeInfo we received
-        tracing::debug!(
-            "format_data_with_type_info called with TypeInfo: {:#?}",
-            type_info
-        );
-        tracing::debug!("Data bytes: {:?}", data);
-
-        let result = Self::format_data_with_type_info_impl(data, type_info, 0, 8); // max depth 8
-        tracing::debug!("Format result: '{}'", result);
-        result
+        // Relax display limits: increase max depth to print more nested content.
+        Self::format_data_with_type_info_impl(data, type_info, 0, 32)
     }
 
     /// Internal implementation with depth control for recursion
@@ -434,10 +426,6 @@ impl FormatPrinter {
                     if i > 0 {
                         result.push_str(", ");
                     }
-                    if i >= 16 {
-                        result.push_str("...");
-                        break;
-                    }
 
                     let start = i as usize * elem_size;
                     let end = std::cmp::min(start + elem_size, data.len());
@@ -455,14 +443,15 @@ impl FormatPrinter {
                 result
             }
             TypeInfo::StructType { name, members, .. } => {
-                if current_depth > 3 {
+                // Allow deeper nested structures now; cutoff managed by max_depth param
+                if current_depth > max_depth {
                     return format!("<STRUCT_{name}>");
                 }
 
                 let mut result = format!("{name} {{ ");
                 let mut first = true;
 
-                for member in members.iter().take(8) {
+                for member in members.iter() {
                     if !first {
                         result.push_str(", ");
                     }
@@ -523,9 +512,7 @@ impl FormatPrinter {
                     }
                 }
 
-                if members.len() > 8 {
-                    result.push_str(", ...");
-                }
+                // No explicit elision; show all available members
                 result.push_str(" }");
                 result
             }
@@ -1055,11 +1042,6 @@ impl FormatPrinter {
                 b'\\' => s.push_str("\\\\"),
                 0x20..=0x7E => s.push(b as char),
                 _ => s.push_str(&format!("\\x{b:02x}")),
-            }
-            // Avoid extremely long output
-            if i >= 255 {
-                s.push_str("...");
-                break;
             }
             i += 1;
         }

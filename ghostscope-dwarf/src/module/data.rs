@@ -34,6 +34,7 @@ use object::{Object, ObjectSection, ObjectSegment};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
+    time::Instant,
 };
 
 /// Complete DWARF data for a single module
@@ -55,6 +56,10 @@ pub(crate) struct ModuleData {
     resolver: OnDemandResolver,
     /// Memory mapped file (keep alive)
     _mapped_file: MappedFile,
+    /// Per-function block/variable index (blockvector-like)
+    block_index: crate::data::BlockIndex,
+    /// Type name index for cross-CU completion
+    type_name_index: crate::data::TypeNameIndex,
 }
 
 impl ModuleData {
@@ -64,9 +69,53 @@ impl ModuleData {
         Self::load_internal_parallel(module_mapping).await
     }
 
-    /// Resolve a struct/class type by name within this module via on-demand resolver
-    pub(crate) fn resolve_struct_type_by_name(&mut self, name: &str) -> Option<crate::TypeInfo> {
-        self.resolver.resolve_struct_type_by_name(name)
+    
+
+    /// Resolve a struct/class type by name using only indexes + shallow resolution (no scanning).
+    ///
+    /// Preferred order:
+    ///  1) aggregate definition by name (struct/class) via TypeNameIndex
+    ///  2) typedef by name -> follow DW_AT_type once -> shallow resolve underlying aggregate
+    ///     No fallback scanning; returns None on miss.
+    pub(crate) fn resolve_struct_type_shallow_by_name(
+        &mut self,
+        name: &str,
+    ) -> Option<crate::TypeInfo> {
+        // 1) Try aggregate definition first
+        if let Some(loc) = self
+            .type_name_index
+            .find_aggregate_definition(name, gimli::constants::DW_TAG_structure_type)
+            .or_else(|| {
+                self.type_name_index
+                    .find_aggregate_definition(name, gimli::constants::DW_TAG_class_type)
+            })
+        {
+            return self.detailed_shallow_type(loc.cu_offset, loc.die_offset);
+        }
+
+        // 2) Try typedef by name, then peel one layer to underlying type and shallow resolve
+        if let Some(td) = self.type_name_index.find_typedef(name) {
+            let dwarf = self.resolver.dwarf_ref();
+            if let Ok(header) = dwarf.debug_info.header_from_offset(td.cu_offset) {
+                if let Ok(unit) = dwarf.unit(header) {
+                    if let Ok(entry) = unit.entry(td.die_offset) {
+                        if let Ok(Some(gimli::AttributeValue::UnitRef(under))) =
+                            entry.attr_value(gimli::DW_AT_type)
+                        {
+                            return self.detailed_shallow_type(td.cu_offset, under);
+                        }
+                        // As a last resort, return shallow typedef itself
+                        return crate::parser::DetailedParser::resolve_type_shallow_at_offset(
+                            dwarf,
+                            &unit,
+                            td.die_offset,
+                        );
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     /// Parallel internal load implementation - true parallelism for debug_info || debug_line || CFI
@@ -151,10 +200,29 @@ impl ModuleData {
             module_mapping.path.to_string_lossy().to_string(),
         );
 
-        // Create resolver with parsed data
-        let resolver = crate::data::OnDemandResolver::new(
+        // Optionally log CFI stats to ensure associated APIs are exercised
+        if let Some(ref cfi) = cfi_index {
+            let stats = cfi.get_stats();
+            tracing::info!(
+                "CFI stats: has_eh_frame_hdr={}, fast_lookup={}",
+                stats.has_eh_frame_hdr,
+                stats.has_fast_lookup
+            );
+            if cfi.has_fast_lookup() {
+                tracing::debug!("CFI fast lookup enabled");
+            }
+        }
+
+        // Build type name index from lightweight index
+        let type_name_index =
+            crate::data::TypeNameIndex::build_from_lightweight(&parse_result.lightweight_index);
+        let type_index_arc = std::sync::Arc::new(type_name_index.clone());
+
+        // Create resolver with parsed data and type index
+        let resolver = crate::data::OnDemandResolver::new_with_type_index(
             std::sync::Arc::try_unwrap(dwarf)
                 .map_err(|_| anyhow::anyhow!("Failed to unwrap DWARF Arc"))?,
+            type_index_arc,
         );
 
         // Determine load state based on parallel loading results
@@ -197,6 +265,8 @@ impl ModuleData {
             compilation_units: parse_result.compilation_units,
             cfi_index,
             resolver,
+            block_index: crate::data::BlockIndex::new(),
+            type_name_index,
             _mapped_file: std::sync::Arc::try_unwrap(mapped_file)
                 .map_err(|_| anyhow::anyhow!("Failed to unwrap MappedFile Arc"))?,
         })
@@ -323,54 +393,172 @@ impl ModuleData {
         &mut self,
         address: u64,
     ) -> Result<Vec<crate::data::VariableWithEvaluation>> {
+        let t0 = Instant::now();
+        let mut built_funcs: usize = 0;
+        let mut build_ms: u128 = 0;
         tracing::info!(
-            "ModuleData::get_all_variables_at_address for module {}: address=0x{:x}",
+            "DWARF:get_vars module='{}' addr=0x{:x}",
             self.module_mapping.path.display(),
             address
         );
-
-        // Find the DIE containing this address (could be function, inline, lexical block, etc.)
-        if let Some(entry) = self.lightweight_index.find_die_at_address(address) {
-            tracing::info!(
-                "Found DIE '{}' (tag={:?}) at DIE offset {:?} containing address 0x{:x}",
-                entry.name,
-                entry.tag,
-                entry.unit_offset,
-                address
-            );
-
-            // Create CFA provider closure
-            // Note: We need to handle the borrow checker by getting CFA beforehand if needed
-            let cfa_result = if self.cfi_index.is_some() {
-                tracing::debug!("CFI index exists, querying CFA for address 0x{:x}", address);
-                match self.get_cfa_result(address) {
-                    Ok(Some(cfa)) => {
-                        tracing::debug!("CFA found for address 0x{:x}: {:?}", address, cfa);
-                        Some(cfa)
-                    }
-                    Ok(None) => {
-                        tracing::warn!(
-                            "No CFA found for address 0x{:x} despite CFI index",
-                            address
+        // Try block index fast path. If no function yet, build lazily for the CU containing this address.
+        if self.block_index.find_function_by_pc(address).is_none() {
+            let b0 = Instant::now();
+            if let Some(e) = self.lightweight_index.find_die_at_address(address) {
+                let cu_off = e.unit_offset;
+                let builder = crate::data::BlockIndexBuilder::new(self.resolver.dwarf_ref());
+                if e.tag == gimli::constants::DW_TAG_subprogram {
+                    if let Some(fb) = builder.build_for_function(cu_off, e.die_offset) {
+                        tracing::info!(
+                            "BlockIndex: built 1 function '{}' for CU {:?}",
+                            fb.name.clone().unwrap_or_else(|| "<anon>".to_string()),
+                            cu_off
                         );
-                        None
+                        self.block_index.add_functions(vec![fb]);
+                        built_funcs += 1;
                     }
-                    Err(e) => {
-                        tracing::error!("Error querying CFA for address 0x{:x}: {}", address, e);
-                        None
-                    }
+                } else if let Some(funcs) = builder.build_for_unit(cu_off) {
+                    tracing::info!(
+                        "BlockIndex: built {} functions for CU {:?}",
+                        funcs.len(),
+                        cu_off
+                    );
+                    built_funcs += funcs.len();
+                    self.block_index.add_functions(funcs);
+                }
+            }
+            build_ms = b0.elapsed().as_millis();
+        }
+
+        if let Some(func) = self.block_index.find_function_by_pc(address) {
+            let vars_in_func = func.nodes.iter().map(|n| n.variables.len()).sum::<usize>();
+            tracing::info!(
+                "DWARF:get_vars fast_path_hit addr=0x{:x} vars_in_func={} built_funcs={} build_ms={} total_ms={}",
+                address,
+                vars_in_func,
+                built_funcs,
+                build_ms,
+                t0.elapsed().as_millis()
+            );
+            let cfa_result = if self.cfi_index.is_some() {
+                match self.get_cfa_result(address) {
+                    Ok(Some(cfa)) => Some(cfa),
+                    _ => None,
                 }
             } else {
-                tracing::warn!(
-                    "No CFI index available for module {}",
-                    self.module_mapping.path.display()
-                );
                 None
             };
-
             let get_cfa_closure = move |addr: u64| -> Result<Option<crate::core::CfaResult>> {
-                // For now, return the pre-computed CFA if the address matches
-                // In a more complete implementation, we'd need a different approach
+                if addr == address {
+                    Ok(cfa_result.clone())
+                } else {
+                    Ok(None)
+                }
+            };
+            let var_refs = func.variables_at_pc(address);
+            if !var_refs.is_empty() {
+                let items: Vec<(gimli::DebugInfoOffset, gimli::UnitOffset)> = var_refs
+                    .iter()
+                    .map(|v| (v.cu_offset, v.die_offset))
+                    .collect();
+                let mut vars = self.resolver.resolve_variables_by_offsets_at_address(
+                    address,
+                    &items,
+                    Some(&get_cfa_closure),
+                )?;
+
+                // Attach shallow type info for simple path variables when missing
+                let dwarf_ref = self.resolver.dwarf_ref();
+                for (idx, var_out) in vars.iter_mut().enumerate() {
+                    if var_out.dwarf_type.is_none() {
+                        let vr = &var_refs[idx];
+                        if let Ok(header) = dwarf_ref.debug_info.header_from_offset(vr.cu_offset) {
+                            if let Ok(unit) = dwarf_ref.unit(header) {
+                                if let Ok(entry) = unit.entry(vr.die_offset) {
+                                    let planner = crate::planner::AccessPlanner::new(dwarf_ref);
+                                    if let Ok(Some(tdie)) =
+                                        planner.resolve_type_ref_with_origins_public(&entry, &unit)
+                                    {
+                                        if let Some(ty) =
+                                            self.detailed_shallow_type(vr.cu_offset, tdie)
+                                        {
+                                            var_out.type_name = ty.type_name();
+                                            var_out.dwarf_type = Some(ty);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                tracing::info!(
+                    "DWARF:get_vars resolved {} vars total_ms={}",
+                    vars.len(),
+                    t0.elapsed().as_millis()
+                );
+                return Ok(vars);
+            }
+        }
+
+        // Strict index: do not fallback to scanning
+        Err(anyhow::anyhow!(
+            "StrictIndex: no function found for address 0x{:x} in block index",
+            address
+        ))
+    }
+
+    /// Plan a chain access (e.g., r.headers_in) and synthesize a VariableWithEvaluation
+    pub(crate) fn plan_chain_access(
+        &mut self,
+        address: u64,
+        base_var: &str,
+        chain: &[String],
+    ) -> Result<Option<crate::data::VariableWithEvaluation>> {
+        let t0 = Instant::now();
+        let mut built_funcs: usize = 0;
+        let mut build_ms: u128 = 0;
+        tracing::info!(
+            "DWARF:plan_chain module='{}' addr=0x{:x} base='{}' chain_len={}",
+            self.module_mapping.path.display(),
+            address,
+            base_var,
+            chain.len()
+        );
+        // Build block index lazily and try fast path
+        if self.block_index.find_function_by_pc(address).is_none() {
+            let b0 = Instant::now();
+            let builder = crate::data::BlockIndexBuilder::new(self.resolver.dwarf_ref());
+            // Prefer building only the containing subprogram if we can identify it
+            if let Some(func_entry) = self.lightweight_index.find_function_by_address(address) {
+                if let Some(fb) =
+                    builder.build_for_function(func_entry.unit_offset, func_entry.die_offset)
+                {
+                    self.block_index.add_functions(vec![fb]);
+                    built_funcs += 1;
+                }
+            } else if let Some(e) = self.lightweight_index.find_die_at_address(address) {
+                // Fallback: if we only found a non-subprogram DIE, try to identify CU and build-for-unit
+                let cu_off = e.unit_offset;
+                if let Some(funcs) = builder.build_for_unit(cu_off) {
+                    built_funcs += funcs.len();
+                    self.block_index.add_functions(funcs);
+                }
+            }
+            build_ms = b0.elapsed().as_millis();
+        }
+
+        if let Some(func) = self.block_index.find_function_by_pc(address) {
+            // CFA closure as before
+            let cfa_result = if self.cfi_index.is_some() {
+                match self.get_cfa_result(address) {
+                    Ok(Some(cfa)) => Some(cfa),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let get_cfa_closure = move |addr: u64| -> Result<Option<crate::core::CfaResult>> {
                 if addr == address {
                     Ok(cfa_result.clone())
                 } else {
@@ -378,20 +566,118 @@ impl ModuleData {
                 }
             };
 
-            // Pass the DIE information to resolver for variable extraction
-            self.resolver.get_all_variables_at_address(
+            // Find variable DIE by name among visible vars
+            let dwarf = self.resolver.dwarf_ref();
+            let header = dwarf.debug_info.header_from_offset(func.cu_offset)?;
+            let unit = dwarf.unit(header)?;
+            let candidates = func.variables_at_pc(address);
+            tracing::info!(
+                "DWARF:plan_chain fast_path_hit addr=0x{:x} candidates={} built_funcs={} build_ms={}",
                 address,
-                entry.unit_offset,
-                Some(&get_cfa_closure),
-            )
-        } else {
-            tracing::warn!(
-                "No DIE found at address 0x{:x} in module {}",
-                address,
-                self.module_mapping.path.display()
+                candidates.len(),
+                built_funcs,
+                build_ms
             );
-            Ok(Vec::new())
+            // Log candidate variable names for diagnosis
+            let mut cand_names: Vec<String> = Vec::new();
+            for v in &candidates {
+                let e = unit.entry(v.die_offset)?;
+                if let Some(attr) = e.attr(gimli::DW_AT_name)? {
+                    if let Ok(s) = dwarf.attr_string(&unit, attr.value()) {
+                        cand_names.push(s.to_string_lossy().into_owned());
+                    }
+                }
+            }
+            tracing::info!("DWARF:plan_chain candidates_names={:?}", cand_names);
+
+            for v in candidates {
+                let e = unit.entry(v.die_offset)?;
+                if let Some(attr) = e.attr(gimli::DW_AT_name)? {
+                    if let Ok(s) = dwarf.attr_string(&unit, attr.value()) {
+                        let n = s.to_string_lossy();
+                        if n == base_var || n.starts_with(&format!("{base_var}@")) {
+                            // Chain empty: short-circuit to base variable (avoid heavy type resolution)
+                            if chain.is_empty() {
+                                let one = vec![(func.cu_offset, v.die_offset)];
+                                let t1 = Instant::now();
+                                let vars =
+                                    self.resolver.resolve_variables_by_offsets_at_address(
+                                        address,
+                                        &one,
+                                        Some(&get_cfa_closure),
+                                    )?;
+                                let mut var_opt = vars.into_iter().next();
+                                let mut type_ms = 0u128;
+                                if let Some(ref mut var0) = var_opt {
+                                    if var0.dwarf_type.is_none() {
+                                        // Resolve base variable type strictly via DWARF type DIE
+                                        let dwarf = self.resolver.dwarf_ref();
+                                        let header =
+                                            dwarf.debug_info.header_from_offset(func.cu_offset)?;
+                                        let unit = dwarf.unit(header)?;
+                                        let e = unit.entry(v.die_offset)?;
+                                        let planner = crate::planner::AccessPlanner::new(dwarf);
+                                        if let Some(type_die_off) = planner
+                                            .resolve_type_ref_with_origins_public(&e, &unit)?
+                                        {
+                                            let tstart = Instant::now();
+                                            if let Some(ty) = self
+                                                .detailed_shallow_type(func.cu_offset, type_die_off)
+                                            {
+                                                type_ms = tstart.elapsed().as_millis();
+                                                var0.type_name = ty.type_name();
+                                                var0.dwarf_type = Some(ty);
+                                            }
+                                        }
+                                    }
+                                }
+                                tracing::info!(
+                                    "DWARF:plan_chain var_match='{}' resolve_base_ms={} type_ms={} total_ms={}",
+                                    n,
+                                    t1.elapsed().as_millis(),
+                                    type_ms,
+                                    t0.elapsed().as_millis()
+                                );
+                                return Ok(var_opt);
+                            }
+
+                            // Non-empty chain: plan from the base variable
+                            let t1 = Instant::now();
+                            let res = self.resolver.plan_chain_access_from_var(
+                                address,
+                                func.cu_offset,
+                                func.die_offset,
+                                v.die_offset,
+                                crate::data::on_demand_resolver::ChainSpec { base: base_var, fields: chain },
+                                Some(&get_cfa_closure),
+                            )?;
+                            tracing::info!(
+                                "DWARF:plan_chain var_match='{}' plan_ms={} total_ms={}",
+                                n,
+                                t1.elapsed().as_millis(),
+                                t0.elapsed().as_millis()
+                            );
+                            return Ok(res);
+                        }
+                    }
+                }
+            }
         }
+
+        // Strict index: do not fallback to planner search
+        let err = anyhow::anyhow!(
+            "StrictIndex: no function found for address 0x{:x} in block index (plan_chain)",
+            address
+        );
+        tracing::info!(
+            "DWARF:plan_chain miss addr=0x{:x} built_funcs={} build_ms={} total_ms={} err={}",
+            address,
+            built_funcs,
+            build_ms,
+            t0.elapsed().as_millis(),
+            err
+        );
+        Err(err)
     }
 
     /// Lookup source location at address (line mapping + file manager)
@@ -849,6 +1135,18 @@ impl ModuleData {
             Some(cfi) => Ok(Some(cfi.get_cfa_result(pc)?)),
             None => Ok(None),
         }
+    }
+
+    /// Helper: shallow resolve a type at (cu, die_off)
+    fn detailed_shallow_type(
+        &self,
+        cu_off: gimli::DebugInfoOffset,
+        die_off: gimli::UnitOffset,
+    ) -> Option<crate::TypeInfo> {
+        let dwarf = self.resolver.dwarf_ref();
+        let header = dwarf.debug_info.header_from_offset(cu_off).ok()?;
+        let unit = dwarf.unit(header).ok()?;
+        crate::parser::DetailedParser::resolve_type_shallow_at_offset(dwarf, &unit, die_off)
     }
 
     /// Lookup addresses by source file path and line number

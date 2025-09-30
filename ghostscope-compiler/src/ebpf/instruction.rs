@@ -17,18 +17,8 @@ impl<'ctx> EbpfContext<'ctx> {
 
         let header_buffer = self.create_instruction_buffer();
 
-        // Clear buffer
+        // Buffer is a zero-initialized global; explicit memset is unnecessary and not BPF-safe.
         let header_size = std::mem::size_of::<TraceEventHeader>() as u64;
-        self.builder
-            .build_memset(
-                header_buffer,
-                1, // alignment
-                self.context.i8_type().const_zero(),
-                self.context.i64_type().const_int(header_size, false),
-            )
-            .map_err(|e| {
-                CodeGenError::LLVMError(format!("Failed to clear header buffer: {}", e))
-            })?;
 
         // Write TraceEventHeader
         // magic at offset 0 (only field needed)
@@ -64,18 +54,8 @@ impl<'ctx> EbpfContext<'ctx> {
 
         let message_buffer = self.create_instruction_buffer();
 
-        // Clear buffer
+        // Buffer is zero-initialized; avoid memset which is not allowed in eBPF.
         let message_size = std::mem::size_of::<TraceEventMessage>() as u64;
-        self.builder
-            .build_memset(
-                message_buffer,
-                1, // alignment
-                self.context.i8_type().const_zero(),
-                self.context.i64_type().const_int(message_size, false),
-            )
-            .map_err(|e| {
-                CodeGenError::LLVMError(format!("Failed to clear message buffer: {}", e))
-            })?;
 
         // Write TraceEventMessage
         // trace_id at offset 0
@@ -206,18 +186,10 @@ impl<'ctx> EbpfContext<'ctx> {
 
         let end_buffer = self.create_instruction_buffer();
 
-        // Clear buffer
+        // Avoid memset; buffer is zero-initialized as global
         let total_size =
             (std::mem::size_of::<ghostscope_protocol::trace_event::InstructionHeader>()
                 + std::mem::size_of::<EndInstructionData>()) as u64;
-        self.builder
-            .build_memset(
-                end_buffer,
-                1, // alignment
-                self.context.i8_type().const_zero(),
-                self.context.i64_type().const_int(total_size, false),
-            )
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to clear end buffer: {}", e)))?;
 
         // Write InstructionHeader
         // inst_type at offset 0

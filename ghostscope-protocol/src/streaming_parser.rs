@@ -466,15 +466,15 @@ impl StreamingTraceParser {
                         return Err("Invalid PrintComplexFormat argument data".to_string());
                     }
 
-                    // Read complex variable header: var_name_index, type_index, status, access_path_len
+                    // Read complex variable header: var_name_index, type_index, access_path_len, status
                     let var_name_index =
                         u16::from_le_bytes([inst_data[data_offset], inst_data[data_offset + 1]]);
                     let type_index = u16::from_le_bytes([
                         inst_data[data_offset + 2],
                         inst_data[data_offset + 3],
                     ]);
-                    let status = inst_data[data_offset + 4];
-                    let access_path_len = inst_data[data_offset + 5] as usize;
+                    let access_path_len = inst_data[data_offset + 4] as usize;
+                    let status = inst_data[data_offset + 5];
                     data_offset += 6; // 2+2+1(status)+1(ap_len)
 
                     // Read access path

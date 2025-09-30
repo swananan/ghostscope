@@ -418,7 +418,9 @@ impl<'a> DwarfParser<'a> {
             }
         }
 
-        let line_mapping = LineMappingTable::from_entries(line_entries.clone());
+        // Build line mapping with canonical paths using the scoped file index manager
+        let line_mapping =
+            LineMappingTable::from_entries_with_scoped_manager(line_entries.clone(), &scoped_file_manager);
 
         debug!(
             "Completed debug_line parsing for {}: {} line entries, {} files, {} compilation units",
@@ -443,6 +445,7 @@ impl<'a> DwarfParser<'a> {
 
         let mut functions: HashMap<String, Vec<IndexEntry>> = HashMap::new();
         let mut variables: HashMap<String, Vec<IndexEntry>> = HashMap::new();
+        let mut types: HashMap<String, Vec<IndexEntry>> = HashMap::new();
         // Parse all compilation units for debug info only
         let mut units = self.dwarf.units();
         while let Ok(Some(header)) = units.next() {
@@ -567,6 +570,37 @@ impl<'a> DwarfParser<'a> {
                             variables.entry(name).or_default().push(index_entry);
                         }
                     }
+                    gimli::constants::DW_TAG_structure_type
+                    | gimli::constants::DW_TAG_class_type
+                    | gimli::constants::DW_TAG_union_type
+                    | gimli::constants::DW_TAG_enumeration_type
+                    | gimli::constants::DW_TAG_typedef => {
+                        if let Some(name) = self.extract_name(self.dwarf, &unit, entry)? {
+                            // DW_AT_declaration indicates a declaration-only (no definition)
+                            let is_decl = match entry.attr(gimli::constants::DW_AT_declaration)? {
+                                Some(attr) => match attr.value() {
+                                    gimli::AttributeValue::Flag(f) => f,
+                                    _ => false,
+                                },
+                                None => false,
+                            };
+                            let flags = crate::core::IndexFlags {
+                                is_type_declaration: is_decl,
+                                ..Default::default()
+                            };
+                            let index_entry = IndexEntry {
+                                name: name.clone(),
+                                die_offset: entry.offset(),
+                                unit_offset,
+                                tag: entry.tag(),
+                                flags,
+                                language: self.extract_language(self.dwarf, &unit, entry),
+                                address_ranges: Vec::new(),
+                                entry_pc: None,
+                            };
+                            types.entry(name).or_default().push(index_entry);
+                        }
+                    }
                     _ => {} // Skip other DIE types
                 }
             }
@@ -574,7 +608,7 @@ impl<'a> DwarfParser<'a> {
 
         let functions_count = functions.len();
         let variables_count = variables.len();
-        let lightweight_index = LightweightIndex::from_builder_data(functions, variables);
+        let lightweight_index = LightweightIndex::from_builder_data(functions, variables, types);
 
         debug!(
             "Completed debug_info parsing for {}: {} functions, {} variables",

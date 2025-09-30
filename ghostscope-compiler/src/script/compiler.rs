@@ -199,11 +199,11 @@ impl<'a> AstCompiler<'a> {
                 };
 
                 if module_addresses.is_empty() {
-                    warn!(
-                        "No addresses resolved for source line {}:{} at trace point {}; skipping",
-                        file_path, line_number, index
-                    );
-                    return Ok(());
+                    // Strict behavior: fail this trace point immediately instead of skipping silently
+                    return Err(CompileError::Other(format!(
+                        "No addresses resolved for source line {}:{}",
+                        file_path, line_number
+                    )));
                 }
 
                 debug!(

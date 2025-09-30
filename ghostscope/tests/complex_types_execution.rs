@@ -199,7 +199,7 @@ trace complex_types_program.c:7 {
 
     // Expect at least one pointer value with type suffix
     assert!(
-        stdout.contains("0x") && stdout.contains("(struct Complex*)"),
+        stdout.contains("0x") && stdout.contains("(Complex*)"),
         "Expected pointer formatting with type suffix. STDOUT: {}",
         stdout
     );
@@ -688,7 +688,6 @@ trace complex_types_program.c:25 {
         }
     }
 
-    // Function attach path: precise checks with i（无法 attach 也应算失败）
     let i_val = found_i.ok_or_else(|| anyhow::anyhow!("Missing I=... line. STDOUT: {}", stdout))?;
     let active_val =
         found_active.ok_or_else(|| anyhow::anyhow!("Missing active line. STDOUT: {}", stdout))?;

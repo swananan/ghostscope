@@ -20,31 +20,48 @@ pub struct LineMappingTable {
 }
 
 impl LineMappingTable {
-    /// Create from vector of line entries
-    pub fn from_entries(entries: Vec<LineEntry>) -> Self {
+    // from_entries removed; use from_entries_with_scoped_manager to ensure canonical paths
+
+    /// Create from entries, resolving file paths via ScopedFileIndexManager.
+    /// This builds canonical path-based indices so basename lookups can take the fast path.
+    pub fn from_entries_with_scoped_manager(
+        mut entries: Vec<LineEntry>,
+        scoped: &crate::data::ScopedFileIndexManager,
+    ) -> Self {
         let mut address_to_line_map = BTreeMap::new();
-        let mut path_line_to_addresses = HashMap::new();
-        let mut basename_to_paths = HashMap::new();
+        let mut path_line_to_addresses: HashMap<(String, u64), Vec<u64>> = HashMap::new();
+        let mut basename_to_paths: HashMap<String, HashSet<String>> = HashMap::new();
 
-        for entry in &entries {
-            address_to_line_map.insert(entry.address, entry.clone());
+        for e in entries.iter_mut() {
+            // Resolve full path if missing, using scoped per-CU file index (DW_AT_comp_dir + line table)
+            if e.file_path.is_empty() {
+                if let Some(full_path) =
+                    scoped.lookup_by_scoped_index(&e.compilation_unit, e.file_index)
+                {
+                    e.file_path = full_path;
+                }
+            }
 
-            // Path-based mapping
-            let path_key = (entry.file_path.clone(), entry.line);
-            path_line_to_addresses
-                .entry(path_key)
-                .or_insert_with(Vec::new)
-                .push(entry.address);
+            // Always populate the address→line map
+            address_to_line_map.insert(e.address, e.clone());
 
-            // Basename mapping
-            if let Some(basename) = Path::new(&entry.file_path)
-                .file_name()
-                .and_then(|n| n.to_str())
-            {
-                basename_to_paths
-                    .entry(basename.to_string())
-                    .or_insert_with(HashSet::new)
-                    .insert(entry.file_path.clone());
+            // Populate path→(line→addresses) only when we have a resolved path
+            if !e.file_path.is_empty() {
+                let key = (e.file_path.clone(), e.line);
+                path_line_to_addresses
+                    .entry(key)
+                    .or_default()
+                    .push(e.address);
+
+                if let Some(base) = std::path::Path::new(&e.file_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                {
+                    basename_to_paths
+                        .entry(base.to_string())
+                        .or_default()
+                        .insert(e.file_path.clone());
+                }
             }
         }
 
@@ -80,42 +97,32 @@ impl LineMappingTable {
     }
 
     /// Find all line entries at exact address (for handling overlapping instructions)
+    /// Current map stores a single entry per address; use O(1) get to avoid O(N) scans.
     pub fn lookup_all_lines_at_address(&self, address: u64) -> Vec<&LineEntry> {
-        let mut matches = Vec::new();
-
-        // Collect all entries with the exact same address
-        for (addr, entry) in &self.address_to_line_map {
-            if *addr == address {
-                matches.push(entry);
-            }
-        }
-
-        tracing::debug!(
-            "LineMapping::lookup_all_lines_at_address: address=0x{:x} -> found {} entries",
-            address,
-            matches.len()
-        );
-
-        // Log all found entries for debugging
-        for (i, entry) in matches.iter().enumerate() {
+        if let Some(entry) = self.address_to_line_map.get(&address) {
             tracing::debug!(
-                "  entry {}: file='{}', line={}, cu='{}', is_stmt={}",
-                i,
+                "LineMapping::lookup_all_lines_at_address: address=0x{:x} -> 1 entry (file='{}', line={}, cu='{}', is_stmt={})",
+                address,
                 entry.file_path,
                 entry.line,
                 entry.compilation_unit,
                 entry.is_stmt
             );
+            vec![entry]
+        } else {
+            tracing::debug!(
+                "LineMapping::lookup_all_lines_at_address: address=0x{:x} -> 0 entries",
+                address
+            );
+            Vec::new()
         }
-
-        matches
     }
 
     /// Lookup addresses by file path and line number
-    /// Supports multiple matching strategies:
-    /// 1. Exact full path match
-    /// 2. Suffix match (e.g., "src/core/nginx.c" matches "/home/user/nginx/src/core/nginx.c")
-    /// 3. Basename match (e.g., "nginx.c" if unique)
+    /// Strategies (fast → slow), avoiding global scans:
+    /// 1. Exact full path match (O(1))
+    /// 2. Basename candidates + suffix check among those candidates (O(k))
+    /// 3. Unique basename match (O(1))
     ///
     /// For consecutive addresses on the same line, returns only the first is_stmt address
     pub fn lookup_addresses_by_path(&self, file_path: &str, line_number: u64) -> Vec<u64> {
@@ -128,26 +135,33 @@ impl LineMappingTable {
             return self.filter_consecutive_addresses(addresses.clone());
         }
 
-        // Strategy 2: Try suffix match (for relative paths)
-        for ((stored_path, stored_line), addresses) in &self.path_line_to_addresses {
-            if *stored_line == line_number
-                && (stored_path.ends_with(file_path) || file_path.ends_with(stored_path))
-            {
-                tracing::debug!(
-                    "Found addresses via suffix match: {} matches {}",
-                    file_path,
-                    stored_path
-                );
-                return self.filter_consecutive_addresses(addresses.clone());
-            }
-        }
-
-        // Strategy 3: Try basename match
+        // Strategy 2: Basename candidates + suffix check (avoid global scans)
         let basename = Path::new(file_path)
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or(file_path);
+        if let Some(full_paths) = self.basename_to_paths.get(basename) {
+            let has_sep = file_path.contains('/') || file_path.contains('\\');
+            if has_sep {
+                for full_path in full_paths {
+                    if full_path.ends_with(file_path) || file_path.ends_with(full_path) {
+                        if let Some(addresses) = self
+                            .path_line_to_addresses
+                            .get(&(full_path.clone(), line_number))
+                        {
+                            tracing::debug!(
+                                "Found addresses via basename+suffix match: {} -> {}",
+                                file_path,
+                                full_path
+                            );
+                            return self.filter_consecutive_addresses(addresses.clone());
+                        }
+                    }
+                }
+            }
+        }
 
+        // Strategy 3: Try basename match
         if let Some(full_paths) = self.basename_to_paths.get(basename) {
             // If there's only one file with this basename, use it
             if full_paths.len() == 1 {
@@ -156,17 +170,19 @@ impl LineMappingTable {
                     .path_line_to_addresses
                     .get(&(full_path.clone(), line_number))
                 {
-                    tracing::debug!(
-                        "Found addresses via unique basename match: {} -> {}",
+                    // Promote this message to info to confirm O(1) basename fast path hits
+                    tracing::info!(
+                        "LineMapping: unique basename fast path hit: {} -> {} ({} addrs)",
                         basename,
-                        full_path
+                        full_path,
+                        addresses.len()
                     );
                     return self.filter_consecutive_addresses(addresses.clone());
                 }
             } else {
-                // Multiple files with same basename - try to match with partial path
+                // Multiple files with same basename - try to match with partial path (best effort)
                 for full_path in full_paths {
-                    if full_path.contains(file_path) || file_path.contains(basename) {
+                    if full_path.ends_with(file_path) || file_path.ends_with(full_path) {
                         if let Some(addresses) = self
                             .path_line_to_addresses
                             .get(&(full_path.clone(), line_number))
@@ -257,7 +273,7 @@ impl LineMappingTable {
                 if let Some(chosen) = selected {
                     // Found is_stmt address - use it (GDB-like behavior)
                     result.push(chosen);
-                    tracing::info!(
+                    tracing::debug!(
                         "Filtered {} consecutive addresses to single is_stmt address 0x{:x}",
                         group.len(),
                         chosen
@@ -266,7 +282,7 @@ impl LineMappingTable {
                     // No is_stmt found - be more lenient than GDB and use first address
                     let chosen = group[0];
                     result.push(chosen);
-                    tracing::warn!(
+                    tracing::debug!(
                         "No is_stmt found in {} consecutive addresses, using first 0x{:x} (GDB might reject this line)",
                         group.len(),
                         chosen

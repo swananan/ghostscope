@@ -104,7 +104,7 @@ pub struct PrintComplexFormatData {
     pub arg_count: u8,            // Number of arguments
     pub reserved: u8,             // Padding for alignment
                                   // Followed by complex argument data:
-                                  // [var_name_index:u16, type_index:u16, status:u8, access_path_len:u8,
+                                  // [var_name_index:u16, type_index:u16, access_path_len:u8, status:u8,
                                   //  access_path:bytes, data_len:u16, data:bytes] * arg_count
 }
 

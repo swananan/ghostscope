@@ -499,7 +499,11 @@ impl<'ctx> EbpfContext<'ctx> {
         match analyzer.get_all_variables_at_address(&module_address) {
             Ok(vars) => {
                 // Look for the specific variable by name
-                if let Some(var_result) = vars.iter().find(|v| v.name == var_name) {
+                if let Some(var_result) = vars.iter().find(|v| v.name == var_name).or_else(|| {
+                    // GCC/Clang may synthesize names like r@entry; try a tolerant match
+                    let prefix = format!("{var_name}@");
+                    vars.iter().find(|v| v.name.starts_with(&prefix))
+                }) {
                     debug!("Found DWARF variable: {}", var_name);
                     Ok(Some(var_result.clone()))
                 } else {
@@ -551,57 +555,34 @@ impl<'ctx> EbpfContext<'ctx> {
         obj_expr: &crate::script::Expr,
         field_name: &str,
     ) -> Result<Option<VariableWithEvaluation>> {
-        // First, resolve the base object
-        let base_var = match self.query_dwarf_for_complex_expr(obj_expr)? {
-            Some(var) => var,
-            None => return Ok(None),
-        };
-        // Get the object's type/eval and perform implicit auto-deref until we reach an aggregate
-        let mut current_type = match &base_var.dwarf_type {
-            Some(type_info) => type_info.clone(),
-            None => return Ok(None),
-        };
-        let mut current_eval = base_var.evaluation_result.clone();
-
-        // Follow typedef/qualified
-        loop {
-            match &current_type {
-                TypeInfo::TypedefType {
-                    underlying_type, ..
-                }
-                | TypeInfo::QualifiedType {
-                    underlying_type, ..
-                } => {
-                    current_type = underlying_type.as_ref().clone();
-                }
-                // Auto-deref pointers for member access using '.'
-                TypeInfo::PointerType { target_type, .. } => {
-                    current_eval = self.compute_pointer_dereference(&current_eval)?;
-                    current_type = target_type.as_ref().clone();
-                }
-                _ => break,
+        // Planner-first: only support simple variable base; no guessing/fallback.
+        if let crate::script::Expr::Variable(base_name) = obj_expr {
+            let Some(analyzer_ptr) = self.process_analyzer else {
+                return Err(CodeGenError::DwarfError(
+                    "No DWARF analyzer available".to_string(),
+                ));
+            };
+            let analyzer = unsafe { &mut *analyzer_ptr };
+            let ctx = self.get_compile_time_context()?;
+            let module_address = ghostscope_dwarf::ModuleAddress::new(
+                std::path::PathBuf::from(ctx.module_path.clone()),
+                ctx.pc_address,
+            );
+            match analyzer
+                .plan_chain_access(&module_address, base_name, &[field_name.to_string()])
+                .map_err(|e| CodeGenError::DwarfError(format!("DWARF planning failed: {}", e)))?
+            {
+                Some(var) => Ok(Some(var)),
+                None => Err(CodeGenError::VariableNotFound(format!(
+                    "MemberAccess({}.{})",
+                    base_name, field_name
+                ))),
             }
+        } else {
+            Err(CodeGenError::NotImplemented(
+                "MemberAccess base must be a simple variable (use chain access)".to_string(),
+            ))
         }
-
-        // Find the member in the resolved aggregate type
-        let member_info = self.find_struct_member(&current_type, field_name)?;
-        let member_info = match member_info {
-            Some(info) => info,
-            None => return Ok(None),
-        };
-
-        // Create a new VariableWithEvaluation for the member
-        let member_var = VariableWithEvaluation {
-            name: format!("{}.{}", self.expr_to_string(obj_expr), field_name),
-            type_name: self.type_info_to_name(&member_info.member_type),
-            dwarf_type: Some(member_info.member_type.clone()),
-            evaluation_result: self.compute_member_address(&current_eval, member_info.offset)?,
-            scope_depth: base_var.scope_depth,
-            is_parameter: false,
-            is_artificial: false,
-        };
-
-        Ok(Some(member_var))
     }
 
     /// Query DWARF for array access (arr[index])
@@ -684,59 +665,29 @@ impl<'ctx> EbpfContext<'ctx> {
         if chain.is_empty() {
             return Ok(None);
         }
-
-        // Start with the first variable in the chain
-        let mut current_var = match self.query_dwarf_for_variable(&chain[0])? {
-            Some(var) => var,
-            None => return Ok(None),
+        // Planner path only; do not fallback. If planning fails, surface an error.
+        let Some(analyzer_ptr) = self.process_analyzer else {
+            return Err(CodeGenError::DwarfError(
+                "No DWARF analyzer available".to_string(),
+            ));
         };
-
-        // Follow the chain for remaining members
-        for field_name in chain.iter().skip(1) {
-            // Resolve typedef/qualified/pointer auto-deref before accessing next field
-            let mut ctype = match &current_var.dwarf_type {
-                Some(t) => t.clone(),
-                None => return Ok(None),
-            };
-            let mut ceval = current_var.evaluation_result.clone();
-
-            loop {
-                match &ctype {
-                    TypeInfo::TypedefType {
-                        underlying_type, ..
-                    }
-                    | TypeInfo::QualifiedType {
-                        underlying_type, ..
-                    } => {
-                        ctype = underlying_type.as_ref().clone();
-                    }
-                    TypeInfo::PointerType { target_type, .. } => {
-                        ceval = self.compute_pointer_dereference(&ceval)?;
-                        ctype = target_type.as_ref().clone();
-                    }
-                    _ => break,
-                }
+        let analyzer = unsafe { &mut *analyzer_ptr };
+        let ctx = self.get_compile_time_context()?;
+        let module_address = ghostscope_dwarf::ModuleAddress::new(
+            std::path::PathBuf::from(ctx.module_path.clone()),
+            ctx.pc_address,
+        );
+        match analyzer
+            .plan_chain_access(&module_address, &chain[0], &chain[1..])
+            .map_err(|e| CodeGenError::DwarfError(format!("DWARF planning failed: {}", e)))?
+        {
+            Some(var) => Ok(Some(var)),
+            None => {
+                let expr_str = format!("ChainAccess({:?})", chain);
+                Err(CodeGenError::VariableNotFound(expr_str))
             }
-
-            let member_info = self.find_struct_member(&ctype, field_name)?;
-            let member_info = match member_info {
-                Some(info) => info,
-                None => return Ok(None),
-            };
-
-            // Update current_var to point to the member
-            current_var = VariableWithEvaluation {
-                name: format!("{}.{}", current_var.name, field_name),
-                type_name: self.type_info_to_name(&member_info.member_type),
-                dwarf_type: Some(member_info.member_type.clone()),
-                evaluation_result: self.compute_member_address(&ceval, member_info.offset)?,
-                scope_depth: current_var.scope_depth,
-                is_parameter: false,
-                is_artificial: false,
-            };
         }
-
-        Ok(Some(current_var))
+        // unreachable
     }
 
     /// Query DWARF for pointer dereference (*ptr)
@@ -762,26 +713,20 @@ impl<'ctx> EbpfContext<'ctx> {
             _ => return Ok(None), // Not a pointer type
         };
 
-        // If the pointed type is a shallow/placeholder struct (no members),
-        // try to resolve a full definition by name via the DWARF analyzer.
-        // This fixes cases like self-referential fields: struct Complex { Complex* friend_ref; }
-        // where the member pointer's target was synthesized shallowly during recursion breaking.
-        if let TypeInfo::StructType { name, members, .. } = &pointed_type {
-            if members.is_empty() {
+        // Upgrade UnknownType(target_name) using analyzer's type index to get a shallow/full type
+        // This is important for expressions like *r.headers_in.host where the member is a typedef
+        // to a struct pointer; UnknownType would have size 0 and fail reads.
+        if let TypeInfo::UnknownType { name } = &pointed_type {
+            if !name.is_empty() {
                 if let Some(analyzer_ptr) = self.process_analyzer {
-                    // SAFETY: process_analyzer is set by the harness and lives longer than codegen
                     let analyzer = unsafe { &mut *analyzer_ptr };
-                    // Prefer the current module if available; fall back to cross-module search
-                    if let Ok(ctx) = self.get_compile_time_context() {
-                        // Try resolve within current module first
-                        if let Some(full) = analyzer
-                            .resolve_struct_type_by_name_in_module(&ctx.module_path, name)
-                            .or_else(|| analyzer.resolve_struct_type_by_name(name))
-                        {
-                            pointed_type = full;
-                        }
-                    } else if let Some(full) = analyzer.resolve_struct_type_by_name(name) {
-                        pointed_type = full;
+                    let ctx = self.get_compile_time_context()?;
+                    // Use module-scoped, shallow-only resolution to avoid slow paths
+                    if let Some(ti) = analyzer
+                        .resolve_struct_type_shallow_by_name_in_module(&ctx.module_path, name)
+                        .or_else(|| analyzer.resolve_struct_type_shallow_by_name(name))
+                    {
+                        pointed_type = ti;
                     }
                 }
             }
@@ -801,81 +746,6 @@ impl<'ctx> EbpfContext<'ctx> {
         Ok(Some(deref_var))
     }
 
-    /// Helper: Find struct member information by name
-    #[allow(clippy::only_used_in_recursion)]
-    fn find_struct_member(
-        &self,
-        type_info: &TypeInfo,
-        field_name: &str,
-    ) -> Result<Option<StructMemberInfo>> {
-        match type_info {
-            TypeInfo::StructType { members, .. } => {
-                for member in members {
-                    if member.name == field_name {
-                        return Ok(Some(StructMemberInfo {
-                            offset: member.offset,
-                            member_type: member.member_type.clone(),
-                        }));
-                    }
-                }
-                Ok(None)
-            }
-            // Handle typedef/qualified types by following the underlying type
-            TypeInfo::TypedefType {
-                underlying_type, ..
-            } => self.find_struct_member(underlying_type, field_name),
-            TypeInfo::QualifiedType {
-                underlying_type, ..
-            } => self.find_struct_member(underlying_type, field_name),
-            _ => Ok(None),
-        }
-    }
-
-    /// Helper: Compute member address by adding offset to base address
-    fn compute_member_address(
-        &self,
-        base_result: &EvaluationResult,
-        member_offset: u64,
-    ) -> Result<EvaluationResult> {
-        use ghostscope_dwarf::{ComputeStep, LocationResult};
-
-        match base_result {
-            EvaluationResult::MemoryLocation(LocationResult::Address(base_addr)) => {
-                // Simple case: base is absolute address
-                Ok(EvaluationResult::MemoryLocation(LocationResult::Address(
-                    base_addr + member_offset,
-                )))
-            }
-            EvaluationResult::MemoryLocation(LocationResult::RegisterAddress {
-                register,
-                offset,
-                size,
-            }) => {
-                // Add member offset to existing register offset
-                let new_offset = offset.unwrap_or(0) + member_offset as i64;
-                Ok(EvaluationResult::MemoryLocation(
-                    LocationResult::RegisterAddress {
-                        register: *register,
-                        offset: Some(new_offset),
-                        size: *size,
-                    },
-                ))
-            }
-            // For computed locations, add offset to the computation
-            EvaluationResult::MemoryLocation(LocationResult::ComputedLocation { steps }) => {
-                let mut new_steps = steps.clone();
-                new_steps.push(ComputeStep::PushConstant(member_offset as i64));
-                new_steps.push(ComputeStep::Add);
-                Ok(EvaluationResult::MemoryLocation(
-                    LocationResult::ComputedLocation { steps: new_steps },
-                ))
-            }
-            // For direct values, we can't compute member access
-            _ => Err(CodeGenError::NotImplemented(
-                "Member access on direct values not supported".to_string(),
-            )),
-        }
-    }
 
     /// Helper: Compute pointer dereference
     fn compute_pointer_dereference(
@@ -1056,11 +926,4 @@ impl<'ctx> EbpfContext<'ctx> {
 
         steps
     }
-}
-
-/// Information about a struct member
-#[derive(Debug, Clone)]
-struct StructMemberInfo {
-    offset: u64,
-    member_type: TypeInfo,
 }

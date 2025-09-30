@@ -63,30 +63,31 @@ impl DwarfAnalyzer {
         Self::from_pid_parallel(pid).await
     }
 
-    /// Resolve a struct/class type by name within a specific module.
-    /// Returns the first full TypeInfo match with populated members if found.
-    pub fn resolve_struct_type_by_name_in_module<P: AsRef<Path>>(
+
+    /// Resolve struct/class by name (shallow) in a specific module using only indexes
+    pub fn resolve_struct_type_shallow_by_name_in_module<P: AsRef<Path>>(
         &mut self,
         module_path: P,
         name: &str,
     ) -> Option<crate::TypeInfo> {
         let path_buf = module_path.as_ref().to_path_buf();
         if let Some(module_data) = self.modules.get_mut(&path_buf) {
-            return module_data.resolve_struct_type_by_name(name);
+            return module_data.resolve_struct_type_shallow_by_name(name);
         }
         None
     }
 
-    /// Resolve a struct/class type by name across all loaded modules.
-    /// Returns the first match found.
-    pub fn resolve_struct_type_by_name(&mut self, name: &str) -> Option<crate::TypeInfo> {
+    /// Resolve struct/class by name (shallow) across modules (first match)
+    pub fn resolve_struct_type_shallow_by_name(&mut self, name: &str) -> Option<crate::TypeInfo> {
         for module_data in self.modules.values_mut() {
-            if let Some(t) = module_data.resolve_struct_type_by_name(name) {
+            if let Some(t) = module_data.resolve_struct_type_shallow_by_name(name) {
                 return Some(t);
             }
         }
         None
     }
+
+    
     /// Create DWARF analyzer from PID using parallel loading
     pub async fn from_pid_parallel(pid: u32) -> Result<Self> {
         Self::from_pid_parallel_with_progress(pid, |_event| {}).await
@@ -260,6 +261,20 @@ impl DwarfAnalyzer {
                 "Module {} not loaded",
                 module_address.module_display()
             ))
+        }
+    }
+
+    /// Plan a chain access (e.g., r.headers_in) and synthesize a VariableWithEvaluation
+    pub fn plan_chain_access(
+        &mut self,
+        module_address: &ModuleAddress,
+        base_var: &str,
+        chain: &[String],
+    ) -> Result<Option<crate::data::VariableWithEvaluation>> {
+        if let Some(module_data) = self.modules.get_mut(&module_address.module_path) {
+            module_data.plan_chain_access(module_address.address, base_var, chain)
+        } else {
+            Ok(None)
         }
     }
 

@@ -63,8 +63,7 @@ impl<'ctx> EbpfContext<'ctx> {
     /// Determine if a TypeInfo qualifies as a "simple variable" for PrintVariableIndex
     /// Simple: base types (bool/int/float/char), enums (with base type 1/2/4/8), pointers;
     /// Complex: arrays, structs, unions, functions
-    #[allow(clippy::only_used_in_recursion)]
-    fn is_simple_typeinfo(&self, t: &ghostscope_dwarf::TypeInfo) -> bool {
+    fn is_simple_typeinfo(t: &ghostscope_dwarf::TypeInfo) -> bool {
         use ghostscope_dwarf::TypeInfo as TI;
         match t {
             TI::BaseType { size, .. } => matches!(*size, 1 | 2 | 4 | 8),
@@ -78,15 +77,14 @@ impl<'ctx> EbpfContext<'ctx> {
             }
             | TI::QualifiedType {
                 underlying_type, ..
-            } => self.is_simple_typeinfo(underlying_type),
+            } => Self::is_simple_typeinfo(underlying_type),
             _ => false,
         }
     }
 
     /// Compute read size for a given DWARF type.
     /// No fallback: if DWARF doesn't provide size for arrays, return 0 and let caller error out.
-    #[allow(clippy::only_used_in_recursion)]
-    fn compute_read_size_for_type(&self, t: &ghostscope_dwarf::TypeInfo) -> usize {
+    fn compute_read_size_for_type(t: &ghostscope_dwarf::TypeInfo) -> usize {
         use ghostscope_dwarf::TypeInfo as TI;
         match t {
             TI::ArrayType {
@@ -94,9 +92,11 @@ impl<'ctx> EbpfContext<'ctx> {
                 element_count,
                 total_size,
             } => {
+                // Prefer DWARF-provided total size
                 if let Some(ts) = total_size {
                     return *ts as usize;
                 }
+                // Fallback for arrays without total_size: need element_count * elem_size
                 let elem_size = element_type.size() as usize;
                 if elem_size == 0 {
                     return 0;
@@ -111,10 +111,12 @@ impl<'ctx> EbpfContext<'ctx> {
             }
             | TI::QualifiedType {
                 underlying_type, ..
-            } => self.compute_read_size_for_type(underlying_type),
+            } => Self::compute_read_size_for_type(underlying_type),
             _ => t.size() as usize,
         }
     }
+
+    // (No implicit char[] fallback here; rely on DWARF/type resolver to provide sizes.)
 
     /// Main entry point: compile program with staged transmission system
     pub fn compile_program_with_staged_transmission(
@@ -299,7 +301,7 @@ impl<'ctx> EbpfContext<'ctx> {
                 // If DWARF type exists and is complex, route to complex path
                 let is_complex = match self.query_dwarf_for_variable(var_name)? {
                     Some(v) => match v.dwarf_type {
-                        Some(ref t) => !self.is_simple_typeinfo(t),
+                        Some(ref t) => !Self::is_simple_typeinfo(t),
                         None => false,
                     },
                     None => false,
@@ -430,7 +432,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     if !self.variable_exists(name) {
                         if let Some(v) = self.query_dwarf_for_variable(name)? {
                             if let Some(ref t) = v.dwarf_type {
-                                if !self.is_simple_typeinfo(t) {
+                                if !Self::is_simple_typeinfo(t) {
                                     complex = true;
                                     break;
                                 }
@@ -565,7 +567,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     })?;
                     let var_name_index = self.trace_context.add_variable_name(var.name.clone());
                     let type_index = self.trace_context.add_type(dwarf_type.clone());
-                    let mut data_len = self.compute_read_size_for_type(dwarf_type);
+                    let mut data_len = Self::compute_read_size_for_type(dwarf_type);
                     if data_len == 0 {
                         return Err(CodeGenError::TypeSizeNotAvailable(var.name));
                     }
@@ -845,19 +847,7 @@ impl<'ctx> EbpfContext<'ctx> {
         // Allocate buffer using existing method
         let buffer = self.create_instruction_buffer();
 
-        // Clear the buffer
-        let buffer_size = self
-            .context
-            .i64_type()
-            .const_int(total_instruction_size as u64, false);
-        self.builder
-            .build_memset(
-                buffer,
-                std::mem::align_of::<InstructionHeader>() as u32,
-                self.context.i8_type().const_zero(),
-                buffer_size,
-            )
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to clear buffer: {}", e)))?;
+        // Avoid memset; global buffer is zero-initialized and we write explicit fields.
 
         // Write InstructionHeader
         let inst_type_val = self
@@ -1193,25 +1183,91 @@ impl<'ctx> EbpfContext<'ctx> {
                             "Variable '{}' read failed: {}, skipping data",
                             var_info.var_name, e
                         );
-                        // For failed reads, we could either skip or fill with error marker
-                        // For now, we'll fill with zeros
-                        let zero_size = self
-                            .context
-                            .i64_type()
-                            .const_int(var_info.data_size as u64, false);
-                        self.builder
-                            .build_memset(
-                                var_data_ptr,
-                                1,
-                                self.context.i8_type().const_zero(),
-                                zero_size,
-                            )
-                            .map_err(|e| {
-                                CodeGenError::LLVMError(format!(
-                                    "Failed to zero variable data: {}",
-                                    e
-                                ))
-                            })?;
+                        // For failed reads, we could either skip or fill with error marker.
+                        // Zero exactly data_size bytes to avoid overwriting subsequent variable headers/data
+                        let mut remaining = var_info.data_size as u64;
+                        let mut off: u64 = 0;
+
+                        let gep_off =
+                            |byte_off: u64| -> Result<inkwell::values::PointerValue<'ctx>> {
+                                let ptr = unsafe {
+                                    self.builder
+                                        .build_gep(
+                                            self.context.i8_type(),
+                                            var_data_ptr,
+                                            &[self.context.i32_type().const_int(byte_off, false)],
+                                            "var_data_ptr_off",
+                                        )
+                                        .map_err(|e| {
+                                            CodeGenError::LLVMError(format!(
+                                                "Failed to get var_data GEP(off={}): {}",
+                                                byte_off, e
+                                            ))
+                                        })?
+                                };
+                                Ok(ptr)
+                            };
+
+                        if remaining >= 8 {
+                            let p = gep_off(off)?;
+                            let p_cast = self
+                                .builder
+                                .build_pointer_cast(
+                                    p,
+                                    self.context.ptr_type(inkwell::AddressSpace::default()),
+                                    "var_data_u64_ptr",
+                                )
+                                .map_err(|e| CodeGenError::LLVMError(format!("cast u64: {}", e)))?;
+                            self.builder
+                                .build_store(p_cast, self.context.i64_type().const_zero())
+                                .map_err(|e| {
+                                    CodeGenError::LLVMError(format!("store u64: {}", e))
+                                })?;
+                            remaining -= 8;
+                            off += 8;
+                        }
+                        if remaining >= 4 {
+                            let p = gep_off(off)?;
+                            let p_cast = self
+                                .builder
+                                .build_pointer_cast(
+                                    p,
+                                    self.context.ptr_type(inkwell::AddressSpace::default()),
+                                    "var_data_u32_ptr",
+                                )
+                                .map_err(|e| CodeGenError::LLVMError(format!("cast u32: {}", e)))?;
+                            self.builder
+                                .build_store(p_cast, self.context.i32_type().const_zero())
+                                .map_err(|e| {
+                                    CodeGenError::LLVMError(format!("store u32: {}", e))
+                                })?;
+                            remaining -= 4;
+                            off += 4;
+                        }
+                        if remaining >= 2 {
+                            let p = gep_off(off)?;
+                            let p_cast = self
+                                .builder
+                                .build_pointer_cast(
+                                    p,
+                                    self.context.ptr_type(inkwell::AddressSpace::default()),
+                                    "var_data_u16_ptr",
+                                )
+                                .map_err(|e| CodeGenError::LLVMError(format!("cast u16: {}", e)))?;
+                            self.builder
+                                .build_store(p_cast, self.context.i16_type().const_zero())
+                                .map_err(|e| {
+                                    CodeGenError::LLVMError(format!("store u16: {}", e))
+                                })?;
+                            remaining -= 2;
+                            off += 2;
+                        }
+                        if remaining >= 1 {
+                            let p = gep_off(off)?;
+                            self.builder
+                                .build_store(p, self.context.i8_type().const_zero())
+                                .map_err(|e| CodeGenError::LLVMError(format!("store u8: {}", e)))?;
+                        }
                     }
                 }
 
@@ -1259,16 +1315,7 @@ impl<'ctx> EbpfContext<'ctx> {
         // Allocate buffer
         let buffer = self.create_instruction_buffer();
 
-        // Clear buffer
-        let total_size_val = self.context.i64_type().const_int(total_size as u64, false);
-        self.builder
-            .build_memset(
-                buffer,
-                std::mem::align_of::<InstructionHeader>() as u32,
-                self.context.i8_type().const_zero(),
-                total_size_val,
-            )
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to clear buffer: {}", e)))?;
+        // Avoid memset; global buffer is zero-initialized
 
         // Write InstructionHeader
         let inst_type_val = self.context.i8_type().const_int(IT as u8 as u64, false);
@@ -1426,13 +1473,13 @@ impl<'ctx> EbpfContext<'ctx> {
                 )
                 .map_err(|e| CodeGenError::LLVMError(format!("Failed to store ti: {}", e)))?;
 
-            // status(u8) at +4
+            // status(u8) at +5
             let apl_ptr = unsafe {
                 self.builder
                     .build_gep(
                         self.context.i8_type(),
                         arg_base,
-                        &[self.context.i32_type().const_int(4, false)],
+                        &[self.context.i32_type().const_int(5, false)],
                         "status_ptr",
                     )
                     .map_err(|e| {
@@ -1443,13 +1490,13 @@ impl<'ctx> EbpfContext<'ctx> {
                 .build_store(apl_ptr, self.context.i8_type().const_int(0, false))
                 .map_err(|e| CodeGenError::LLVMError(format!("Failed to store status: {}", e)))?;
 
-            // access_path_len(u8) at +5
+            // access_path_len(u8) at +4
             let apl_ptr2 = unsafe {
                 self.builder
                     .build_gep(
                         self.context.i8_type(),
                         arg_base,
-                        &[self.context.i32_type().const_int(5, false)],
+                        &[self.context.i32_type().const_int(4, false)],
                         "apl_ptr",
                     )
                     .map_err(|e| CodeGenError::LLVMError(format!("Failed to get apl GEP: {}", e)))?
@@ -2055,20 +2102,13 @@ impl<'ctx> EbpfContext<'ctx> {
         let inst_buffer = self.create_instruction_buffer();
 
         // Clear memory with static size
-        let inst_size = self.context.i64_type().const_int(
+        let _inst_size = self.context.i64_type().const_int(
             (std::mem::size_of::<PrintStringIndexData>()
                 + std::mem::size_of::<ghostscope_protocol::trace_event::InstructionHeader>())
                 as u64,
             false,
         );
-        self.builder
-            .build_memset(
-                inst_buffer,
-                std::mem::align_of::<InstructionHeader>() as u32, // proper alignment
-                self.context.i8_type().const_zero(),
-                inst_size,
-            )
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to memset: {}", e)))?;
+        // Avoid memset on eBPF; global buffer is zero-initialized and we write fields explicitly.
 
         // Fill instruction header using byte offsets
         // inst_type at offset 0 (first field of InstructionHeader)
@@ -2162,6 +2202,13 @@ impl<'ctx> EbpfContext<'ctx> {
             .build_store(string_index_i16_ptr, string_index_val)
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store string_index: {}", e)))?;
 
+        // Compute total instruction size: header + PrintStringIndexData
+        let inst_size = self.context.i64_type().const_int(
+            (std::mem::size_of::<PrintStringIndexData>()
+                + std::mem::size_of::<ghostscope_protocol::trace_event::InstructionHeader>())
+                as u64,
+            false,
+        );
         // Send via ringbuf
         self.send_instruction_via_ringbuf(inst_buffer, inst_size)
     }
@@ -2178,23 +2225,15 @@ impl<'ctx> EbpfContext<'ctx> {
             var_name_index, type_encoding, var_name
         );
 
-        // Resolve type_index from DWARF if available; otherwise synthesize for script variables
+        // Resolve type_index from DWARF if available; otherwise synthesize from TypeKind
         let type_index = match self.query_dwarf_for_variable(var_name)? {
             Some(var) => match var.dwarf_type {
                 Some(ref t) => self.trace_context.add_type(t.clone()),
-                None => {
-                    return Err(CodeGenError::DwarfError(
-                        "Variable has no DWARF type information".to_string(),
-                    ));
-                }
+                None => self.add_synthesized_type_index_for_kind(type_encoding),
             },
             None => {
-                // If it's a script variable, synthesize a compatible TypeInfo
-                if self.variable_exists(var_name) {
-                    self.add_synthesized_type_index_for_kind(type_encoding)
-                } else {
-                    return Err(CodeGenError::VariableNotFound(var_name.to_string()));
-                }
+                // Variable not found via DWARF; fall back to synthesized type info based on TypeKind
+                self.add_synthesized_type_index_for_kind(type_encoding)
             }
         };
 
@@ -2228,21 +2267,7 @@ impl<'ctx> EbpfContext<'ctx> {
 
         let inst_buffer = self.create_instruction_buffer();
 
-        // Clear memory with static size for PrintVariableIndexData
-        let inst_size = self.context.i64_type().const_int(
-            (std::mem::size_of::<PrintVariableIndexData>()
-                + std::mem::size_of::<ghostscope_protocol::trace_event::InstructionHeader>()
-                + data_size as usize) as u64,
-            false,
-        );
-        self.builder
-            .build_memset(
-                inst_buffer,
-                std::mem::align_of::<InstructionHeader>() as u32, // proper alignment
-                self.context.i8_type().const_zero(),
-                inst_size,
-            )
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to memset: {}", e)))?;
+        // Avoid memset; global buffer is zero-initialized
 
         // Store instruction type at offset 0
         let inst_type_val = self
@@ -2638,6 +2663,13 @@ impl<'ctx> EbpfContext<'ctx> {
             }
         }
 
+        // Compute total instruction size: header + PrintVariableIndexData + payload
+        let inst_size = self.context.i64_type().const_int(
+            (std::mem::size_of::<PrintVariableIndexData>()
+                + std::mem::size_of::<ghostscope_protocol::trace_event::InstructionHeader>()
+                + data_size as usize) as u64,
+            false,
+        );
         // Send via ringbuf
         self.send_instruction_via_ringbuf(inst_buffer, inst_size)
     }
@@ -2651,21 +2683,13 @@ impl<'ctx> EbpfContext<'ctx> {
 
         let inst_buffer = self.create_instruction_buffer();
 
-        // Clear memory with static size for BacktraceData
+        // Avoid memset; global instruction buffer is zero-initialized
         let inst_size = self.context.i64_type().const_int(
             (std::mem::size_of::<BacktraceData>()
                 + std::mem::size_of::<ghostscope_protocol::trace_event::InstructionHeader>())
                 as u64,
             false,
         );
-        self.builder
-            .build_memset(
-                inst_buffer,
-                std::mem::align_of::<InstructionHeader>() as u32, // proper alignment
-                self.context.i8_type().const_zero(),
-                inst_size,
-            )
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to memset: {}", e)))?;
 
         // Send via ringbuf
         self.send_instruction_via_ringbuf(inst_buffer, inst_size)
@@ -2782,7 +2806,7 @@ impl<'ctx> EbpfContext<'ctx> {
         let type_index = self.trace_context.add_type(dwarf_type.clone());
 
         // Compute data size with truncation cap
-        let mut data_size = self.compute_read_size_for_type(dwarf_type);
+        let mut data_size = Self::compute_read_size_for_type(dwarf_type);
         tracing::trace!(
             var_name_index,
             type_index,
@@ -2888,15 +2912,7 @@ impl<'ctx> EbpfContext<'ctx> {
             "generate_print_complex_variable_runtime: sizes computed"
         );
 
-        // Clear memory buffer
-        self.builder
-            .build_memset(
-                inst_buffer,
-                std::mem::align_of::<InstructionHeader>() as u32,
-                self.context.i8_type().const_zero(),
-                self.context.i64_type().const_int(total_size as u64, false),
-            )
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to memset: {}", e)))?;
+        // Avoid memset; global buffer is zero-initialized
 
         // Write InstructionHeader.inst_type at offset 0
         let inst_type_val = self
@@ -3387,15 +3403,7 @@ impl<'ctx> EbpfContext<'ctx> {
             false,
         );
 
-        // Clear memory buffer
-        self.builder
-            .build_memset(
-                inst_buffer,
-                std::mem::align_of::<InstructionHeader>() as u32,
-                self.context.i8_type().const_zero(),
-                inst_size,
-            )
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to memset: {}", e)))?;
+        // Avoid memset; global instruction buffer is zero-initialized
 
         // Send via ringbuf - the actual instruction data will be filled by higher-level code
         // that has access to the runtime variable values
@@ -3547,15 +3555,7 @@ impl<'ctx> EbpfContext<'ctx> {
 
         let inst_size = self.context.i64_type().const_int(total_size as u64, false);
 
-        // Clear memory buffer
-        self.builder
-            .build_memset(
-                inst_buffer,
-                std::mem::align_of::<InstructionHeader>() as u32,
-                self.context.i8_type().const_zero(),
-                inst_size,
-            )
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to memset: {}", e)))?;
+        // Avoid memset; global buffer is zero-initialized
 
         // Write InstructionHeader
         let _header_ptr = self
