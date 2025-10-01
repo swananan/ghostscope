@@ -1,0 +1,87 @@
+# GhostScope 配置文件
+#
+# 这是 GhostScope 的示例配置文件。
+# 使用此配置的方法：
+# 1. 复制此文件到 ~/.ghostscope/config.toml (用户级配置)
+# 2. 或重命名为 ghostscope.toml 放在项目目录中 (项目级配置)
+# 3. 或使用 --config 参数指定：ghostscope --config path/to/config.toml
+#
+# 配置优先级（从高到低）：
+# 1. 命令行参数
+# 2. --config 指定的配置文件
+# 3. ~/.ghostscope/config.toml
+# 4. ./ghostscope.toml
+#
+# 所有配置项和值都是可选的 - 如果未指定，将使用内置默认值。
+
+[general]
+# 默认日志文件路径（可通过 --log-file 覆盖）
+# 默认值："ghostscope.log"
+log_file = "ghostscope.log"
+
+# 未提供脚本时的默认 UI 模式（可通过 --tui 覆盖）
+# 默认值：true
+default_tui_mode = true
+
+# 启用/禁用日志记录（可通过 --log/--no-log 覆盖）
+# 默认值：true
+enable_logging = true
+
+# 日志级别过滤（可通过 --log-level 覆盖）
+# 可选值："error", "warn", "info", "debug", "trace"
+# 默认值："warn"
+log_level = "trace"
+
+[dwarf]
+# DWARF 调试信息搜索路径（用于未来的 --debug-file 自动发现功能）
+# 目前未实现，为未来使用保留
+# 默认值：["/usr/lib/debug", "/usr/local/lib/debug"]
+search_paths = [
+    "/usr/lib/debug",
+    "/usr/local/lib/debug",
+    "~/.local/lib/debug"
+]
+
+[files]
+# 文件保存选项（可通过 --save-*/--no-save-* 参数覆盖）
+# 格式：{ debug = bool, release = bool }
+# 控制在 debug/release 构建中是否默认保存文件
+
+# 保存 LLVM IR 文件（可通过 --save-llvm-ir/--no-save-llvm-ir 覆盖）
+# 默认值：{ debug = true, release = false }
+save_llvm_ir = { debug = true, release = false }
+
+# 保存 eBPF 字节码文件（可通过 --save-ebpf/--no-save-ebpf 覆盖）
+# 默认值：{ debug = true, release = false }
+save_ebpf = { debug = true, release = false }
+
+# 保存 AST 文件（可通过 --save-ast/--no-save-ast 覆盖）
+# 默认值：{ debug = true, release = false }
+save_ast = { debug = true, release = false }
+
+[ui]
+# TUI 布局模式（可通过 --layout 覆盖）
+# 可选值："Horizontal"（水平布局）, "Vertical"（垂直布局）
+# 默认值："Horizontal"
+layout = "Horizontal"
+
+# TUI 启动时的默认焦点面板
+# 可选值："Source"（源代码）, "EbpfInfo"（eBPF输出）, "InteractiveCommand"（命令交互）
+# 默认值："InteractiveCommand"
+default_focus = "InteractiveCommand"
+
+# 面板大小比例 [Source, EbpfInfo, InteractiveCommand]
+# 这些是相对比例，例如 [4, 3, 3] 表示 Source 占 40%，其他各占 30%
+# 必须是包含 3 个正数的数组
+# 默认值：[4, 3, 3]
+panel_ratios = [4, 3, 3]
+
+# 命令历史配置
+[ui.history]
+# 启用/禁用命令历史文件功能
+# 默认值：true
+enabled = true
+
+# .ghostscope_history 文件中保留的最大历史条目数
+# 默认值：5000
+max_entries = 5000

@@ -1,0 +1,22 @@
+<svg width="60" height="60" viewBox="0 0 60 60" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="perfGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#10b981;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#059669;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+
+  <!-- Lightning bolt for performance -->
+  <g transform="translate(30, 30)">
+    <path d="M -8,-15 L -2,-2 L -5,-2 L -3,15 L 8,-3 L 3,-3 L 6,-15 Z"
+          fill="url(#perfGrad)"
+          stroke="#059669"
+          stroke-width="1"
+          stroke-linejoin="round"/>
+
+    <!-- Speed lines -->
+    <line x1="-15" y1="-5" x2="-10" y2="-5" stroke="#10b981" stroke-width="2" opacity="0.6"/>
+    <line x1="-15" y1="0" x2="-8" y2="0" stroke="#059669" stroke-width="2" opacity="0.5"/>
+    <line x1="-15" y1="5" x2="-10" y2="5" stroke="#10b981" stroke-width="2" opacity="0.4"/>
+  </g>
+</svg>
