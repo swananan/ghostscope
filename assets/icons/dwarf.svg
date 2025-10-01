@@ -1,0 +1,33 @@
+<svg width="60" height="60" viewBox="0 0 60 60" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="dwarfGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#f59e0b;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#d97706;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+
+  <!-- DWARF debug symbol -->
+  <g transform="translate(30, 30)">
+    <!-- Stack frames -->
+    <rect x="-15" y="-12" width="30" height="6" fill="url(#dwarfGrad)" opacity="0.9" rx="1"/>
+    <rect x="-15" y="-3" width="30" height="6" fill="url(#dwarfGrad)" opacity="0.7" rx="1"/>
+    <rect x="-15" y="6" width="30" height="6" fill="url(#dwarfGrad)" opacity="0.5" rx="1"/>
+
+    <!-- Debug info lines -->
+    <line x1="-12" y1="-9" x2="-8" y2="-9" stroke="#fff" stroke-width="1"/>
+    <line x1="-5" y1="-9" x2="5" y2="-9" stroke="#fff" stroke-width="1"/>
+    <circle cx="8" cy="-9" r="1" fill="#fff"/>
+
+    <line x1="-12" y1="0" x2="-8" y2="0" stroke="#fff" stroke-width="1"/>
+    <line x1="-5" y1="0" x2="2" y2="0" stroke="#fff" stroke-width="1"/>
+    <circle cx="5" cy="0" r="1" fill="#fff"/>
+
+    <line x1="-12" y1="9" x2="-8" y2="9" stroke="#fff" stroke-width="1"/>
+    <line x1="-5" y1="9" x2="7" y2="9" stroke="#fff" stroke-width="1"/>
+    <circle cx="10" cy="9" r="1" fill="#fff"/>
+
+    <!-- Pointer arrow -->
+    <path d="M 18,-9 L 22,-9 L 20,-6 Z" fill="#d97706"/>
+    <line x1="20" y1="-9" x2="20" y2="-2" stroke="#d97706" stroke-width="1.5"/>
+  </g>
+</svg>

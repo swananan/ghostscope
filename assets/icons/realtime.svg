@@ -1,0 +1,41 @@
+<svg width="60" height="60" viewBox="0 0 60 60" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="rtGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#3b82f6;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#2563eb;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+
+  <!-- Real-time wave/pulse -->
+  <g transform="translate(30, 30)">
+    <!-- Pulse circles -->
+    <circle cx="0" cy="0" r="5" fill="url(#rtGrad)">
+      <animate attributeName="r" values="5;20;5" dur="2s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="1;0;1" dur="2s" repeatCount="indefinite"/>
+    </circle>
+    <circle cx="0" cy="0" r="5" fill="url(#rtGrad)">
+      <animate attributeName="r" values="5;20;5" dur="2s" begin="0.5s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="1;0;1" dur="2s" begin="0.5s" repeatCount="indefinite"/>
+    </circle>
+    <circle cx="0" cy="0" r="5" fill="url(#rtGrad)">
+      <animate attributeName="r" values="5;20;5" dur="2s" begin="1s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="1;0;1" dur="2s" begin="1s" repeatCount="indefinite"/>
+    </circle>
+
+    <!-- Center dot -->
+    <circle cx="0" cy="0" r="4" fill="#2563eb"/>
+
+    <!-- Signal waves -->
+    <path d="M -15,-10 Q -10,0 -5,-10 T 5,-10 T 15,-10"
+          fill="none"
+          stroke="#3b82f6"
+          stroke-width="2"
+          opacity="0.7">
+      <animate attributeName="d"
+               values="M -15,-10 Q -10,0 -5,-10 T 5,-10 T 15,-10;
+                       M -15,-5 Q -10,5 -5,-5 T 5,-5 T 15,-5;
+                       M -15,-10 Q -10,0 -5,-10 T 5,-10 T 15,-10"
+               dur="1s" repeatCount="indefinite"/>
+    </path>
+  </g>
+</svg>
