@@ -85,3 +85,14 @@ enabled = true
 # Maximum number of history entries to keep in .ghostscope_history file
 # Default: 5000
 max_entries = 5000
+
+# Realtime logging configuration
+# Note: Realtime logging is controlled via TUI commands (save/stop), not auto-started
+[ui.realtime_logging]
+# Default directory for realtime log files when not specified
+# Default: current working directory
+output_dir = "."
+
+# Default filename prefix for auto-generated realtime log files
+# Default: "ghostscope_session"
+filename_prefix = "ghostscope_session"

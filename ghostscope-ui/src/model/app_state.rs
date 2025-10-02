@@ -5,6 +5,121 @@ use crate::events::EventRegistry;
 use crate::model::ui_state::LayoutMode;
 use crate::model::{CommandPanelState, EbpfPanelState, SourcePanelState, UIState};
 use crate::ui::EmojiConfig;
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::PathBuf;
+
+/// Realtime logging state for command session
+#[derive(Debug)]
+pub struct RealtimeSessionLogger {
+    pub enabled: bool,
+    pub file_path: Option<PathBuf>,
+    pub writer: Option<BufWriter<File>>,
+}
+
+impl Default for RealtimeSessionLogger {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RealtimeSessionLogger {
+    pub fn new() -> Self {
+        Self {
+            enabled: false,
+            file_path: None,
+            writer: None,
+        }
+    }
+
+    /// Start realtime logging to a file
+    pub fn start(&mut self, file_path: PathBuf) -> anyhow::Result<()> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&file_path)?;
+
+        self.file_path = Some(file_path);
+        self.writer = Some(BufWriter::new(file));
+        self.enabled = true;
+        Ok(())
+    }
+
+    /// Stop realtime logging and flush
+    pub fn stop(&mut self) -> anyhow::Result<()> {
+        if let Some(mut writer) = self.writer.take() {
+            writer.flush()?;
+        }
+        self.enabled = false;
+        self.file_path = None;
+        Ok(())
+    }
+
+    /// Write a line to the log file
+    pub fn write_line(&mut self, line: &str) -> anyhow::Result<()> {
+        if let Some(writer) = &mut self.writer {
+            writeln!(writer, "{line}")?;
+            writer.flush()?; // Flush immediately for realtime logging
+        }
+        Ok(())
+    }
+}
+
+/// Realtime logging state for eBPF output
+#[derive(Debug)]
+pub struct RealtimeOutputLogger {
+    pub enabled: bool,
+    pub file_path: Option<PathBuf>,
+    pub writer: Option<BufWriter<File>>,
+}
+
+impl Default for RealtimeOutputLogger {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RealtimeOutputLogger {
+    pub fn new() -> Self {
+        Self {
+            enabled: false,
+            file_path: None,
+            writer: None,
+        }
+    }
+
+    /// Start realtime logging to a file
+    pub fn start(&mut self, file_path: PathBuf) -> anyhow::Result<()> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&file_path)?;
+
+        self.file_path = Some(file_path);
+        self.writer = Some(BufWriter::new(file));
+        self.enabled = true;
+        Ok(())
+    }
+
+    /// Stop realtime logging and flush
+    pub fn stop(&mut self) -> anyhow::Result<()> {
+        if let Some(mut writer) = self.writer.take() {
+            writer.flush()?;
+        }
+        self.enabled = false;
+        self.file_path = None;
+        Ok(())
+    }
+
+    /// Write a line to the log file
+    pub fn write_line(&mut self, line: &str) -> anyhow::Result<()> {
+        if let Some(writer) = &mut self.writer {
+            writeln!(writer, "{line}")?;
+            writer.flush()?; // Flush immediately for realtime logging
+        }
+        Ok(())
+    }
+}
 
 /// Root application state following TEA Model pattern
 #[derive(Debug)]
@@ -48,6 +163,10 @@ pub struct AppState {
 
     // Ctrl+C tracking for double-press quit (true if last key was Ctrl+C)
     pub expecting_second_ctrl_c: bool,
+
+    // Realtime logging for save commands
+    pub realtime_session_logger: RealtimeSessionLogger,
+    pub realtime_output_logger: RealtimeOutputLogger,
 }
 
 impl AppState {
@@ -70,6 +189,8 @@ impl AppState {
             target_pid: None,
             emoji_config: EmojiConfig::default(),
             expecting_second_ctrl_c: false,
+            realtime_session_logger: RealtimeSessionLogger::new(),
+            realtime_output_logger: RealtimeOutputLogger::new(),
         }
     }
 
@@ -95,6 +216,8 @@ impl AppState {
             target_pid: None,
             emoji_config: EmojiConfig::default(),
             expecting_second_ctrl_c: false,
+            realtime_session_logger: RealtimeSessionLogger::new(),
+            realtime_output_logger: RealtimeOutputLogger::new(),
         }
     }
 

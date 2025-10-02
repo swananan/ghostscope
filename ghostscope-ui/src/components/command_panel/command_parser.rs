@@ -45,8 +45,13 @@ impl CommandParser {
             return actions;
         }
 
-        // Handle save traces command
-        if let Some(actions) = Self::parse_save_traces_command(state, cmd) {
+        // Handle save commands (traces, output, session)
+        if let Some(actions) = Self::parse_save_command(state, cmd) {
+            return actions;
+        }
+
+        // Handle stop command (stop realtime logging)
+        if let Some(actions) = Self::parse_stop_command(cmd) {
             return actions;
         }
 
@@ -101,14 +106,18 @@ impl CommandParser {
     fn format_tracing_commands() -> String {
         [
             "📊 Tracing Commands:",
-            "  trace <target>       - Start tracing a function/location (t)",
-            "  enable <id|all>      - Enable specific trace or all traces (en)",
-            "  disable <id|all>     - Disable specific trace or all traces (dis)",
-            "  delete <id|all>      - Delete specific trace or all traces (del)",
-            "  save traces [file]   - Save all traces to file (s t)",
-            "  save traces enabled  - Save only enabled traces",
-            "  save traces disabled - Save only disabled traces",
-            "  source <file>        - Load traces from file (s)",
+            "  trace <target>             - Start tracing a function/location (t)",
+            "  enable <id|all>            - Enable specific trace or all traces (en)",
+            "  disable <id|all>           - Disable specific trace or all traces (dis)",
+            "  delete <id|all>            - Delete specific trace or all traces (del)",
+            "  save traces [file]         - Save all traces to file (s t)",
+            "  save traces enabled [file] - Save only enabled traces",
+            "  save traces disabled [file]- Save only disabled traces",
+            "  save output [file]         - Start realtime eBPF output logging (s o)",
+            "  save session [file]        - Start realtime session logging (s s)",
+            "  stop output                - Stop realtime eBPF output logging",
+            "  stop session               - Stop realtime session logging",
+            "  source <file>              - Load traces from file (s)",
         ]
         .join("\n")
     }
@@ -197,6 +206,11 @@ impl CommandParser {
             "save traces",
             "save traces enabled",
             "save traces disabled",
+            "save output",
+            "save session",
+            // Stop subcommands
+            "stop output",
+            "stop session",
             // Info subcommands
             "info trace",
             "info source",
@@ -212,7 +226,9 @@ impl CommandParser {
             "i f",
             "i l",
             "i a",
-            "s t", // "s" alone is ambiguous (save/source), so we only support "s t" for save traces
+            "s t", // "s" alone is ambiguous (save/source), so we only support specific "s" shortcuts
+            "s o", // save output
+            "s s", // save session
         ];
 
         // Find commands that start with the input
@@ -487,6 +503,35 @@ impl CommandParser {
         None
     }
 
+    /// Parse all save commands (traces, output, session)
+    fn parse_save_command(state: &mut CommandPanelState, command: &str) -> Option<Vec<Action>> {
+        let parts: Vec<&str> = command.split_whitespace().collect();
+
+        if parts.is_empty() || parts[0] != "save" {
+            return None;
+        }
+
+        if parts.len() < 2 {
+            return Some(vec![Action::AddResponse {
+                content: "Usage: save <traces|output|session> [filename]".to_string(),
+                response_type: ResponseType::Error,
+            }]);
+        }
+
+        match parts[1] {
+            "traces" => Self::parse_save_traces_command(state, command),
+            "output" => Self::parse_save_output_command(state, command),
+            "session" => Self::parse_save_session_command(state, command),
+            _ => Some(vec![Action::AddResponse {
+                content: format!(
+                    "Unknown save target: '{}'. Use 'save traces', 'save output', or 'save session'",
+                    parts[1]
+                ),
+                response_type: ResponseType::Error,
+            }]),
+        }
+    }
+
     /// Parse save traces command
     fn parse_save_traces_command(
         state: &mut CommandPanelState,
@@ -508,6 +553,68 @@ impl CommandParser {
         }
 
         None
+    }
+
+    /// Parse save output command (handled directly in UI)
+    fn parse_save_output_command(
+        _state: &mut CommandPanelState,
+        command: &str,
+    ) -> Option<Vec<Action>> {
+        let parts: Vec<&str> = command.split_whitespace().collect();
+
+        // save output [filename]
+        let filename = if parts.len() > 2 {
+            Some(parts[2..].join(" "))
+        } else {
+            None
+        };
+
+        Some(vec![Action::SaveEbpfOutput { filename }])
+    }
+
+    /// Parse save session command (handled directly in UI)
+    fn parse_save_session_command(
+        _state: &mut CommandPanelState,
+        command: &str,
+    ) -> Option<Vec<Action>> {
+        let parts: Vec<&str> = command.split_whitespace().collect();
+
+        // save session [filename]
+        let filename = if parts.len() > 2 {
+            Some(parts[2..].join(" "))
+        } else {
+            None
+        };
+
+        Some(vec![Action::SaveCommandSession { filename }])
+    }
+
+    /// Parse stop command to stop realtime logging
+    fn parse_stop_command(command: &str) -> Option<Vec<Action>> {
+        let parts: Vec<&str> = command.split_whitespace().collect();
+
+        if parts.is_empty() || parts[0] != "stop" {
+            return None;
+        }
+
+        if parts.len() < 2 {
+            return Some(vec![Action::AddResponse {
+                content: "Usage: stop <output|session>".to_string(),
+                response_type: ResponseType::Error,
+            }]);
+        }
+
+        match parts[1] {
+            "output" => Some(vec![Action::StopSaveOutput]),
+            "session" => Some(vec![Action::StopSaveSession]),
+            _ => Some(vec![Action::AddResponse {
+                content: format!(
+                    "Unknown stop target: '{}'. Use 'stop output' or 'stop session'",
+                    parts[1]
+                ),
+                response_type: ResponseType::Error,
+            }]),
+        }
     }
 
     /// Parse source command to load traces from file
@@ -575,7 +682,7 @@ impl CommandParser {
         }
     }
 
-    /// Parse shortcut commands (i s, i f, i l, i t, s t, etc.)
+    /// Parse shortcut commands (i s, i f, i l, i t, s t, s o, s s, etc.)
     fn parse_shortcut_command(state: &mut CommandPanelState, command: &str) -> Option<Vec<Action>> {
         // Handle "s t" -> "save traces"
         if command == "s t" {
@@ -589,8 +696,36 @@ impl CommandParser {
             return Self::parse_save_traces_command(state, &full_command);
         }
 
-        // Handle "s <filename>" -> "source <filename>" (but not "s t")
-        if command.starts_with("s ") && !command.starts_with("s t") {
+        // Handle "s o" -> "save output"
+        if command == "s o" {
+            return Self::parse_save_output_command(state, "save output");
+        }
+
+        // Handle "s o <filename>" -> "save output <filename>"
+        if command.starts_with("s o ") {
+            let rest = command.strip_prefix("s o ").unwrap();
+            let full_command = format!("save output {rest}");
+            return Self::parse_save_output_command(state, &full_command);
+        }
+
+        // Handle "s s" -> "save session"
+        if command == "s s" {
+            return Self::parse_save_session_command(state, "save session");
+        }
+
+        // Handle "s s <filename>" -> "save session <filename>"
+        if command.starts_with("s s ") {
+            let rest = command.strip_prefix("s s ").unwrap();
+            let full_command = format!("save session {rest}");
+            return Self::parse_save_session_command(state, &full_command);
+        }
+
+        // Handle "s <filename>" -> "source <filename>" (but not "s t", "s o", "s s")
+        if command.starts_with("s ")
+            && !command.starts_with("s t")
+            && !command.starts_with("s o")
+            && !command.starts_with("s s")
+        {
             return Self::parse_source_command(state, command);
         }
 

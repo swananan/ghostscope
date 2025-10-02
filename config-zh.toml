@@ -85,3 +85,14 @@ enabled = true
 # .ghostscope_history 文件中保留的最大历史条目数
 # 默认值：5000
 max_entries = 5000
+
+# 实时日志配置
+# 注意：实时日志通过 TUI 命令（save/stop）控制，不会自动启动
+[ui.realtime_logging]
+# 未指定时实时日志文件的默认目录
+# 默认值：当前工作目录
+output_dir = "."
+
+# 自动生成的实时日志文件的默认文件名前缀
+# 默认值："ghostscope_session"
+filename_prefix = "ghostscope_session"

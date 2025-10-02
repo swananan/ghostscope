@@ -99,6 +99,16 @@ pub enum Action {
     // eBPF panel actions
     NavigateEbpf(EbpfNavigation),
 
+    // Save actions (handled in UI directly)
+    SaveEbpfOutput {
+        filename: Option<String>,
+    },
+    SaveCommandSession {
+        filename: Option<String>,
+    },
+    StopSaveOutput,  // Stop realtime eBPF output logging
+    StopSaveSession, // Stop realtime command session logging
+
     // Internal actions
     NoOp, // No operation - used to prevent event fallback without side effects
 }

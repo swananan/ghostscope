@@ -121,6 +121,80 @@ save traces disabled backup.gs  # 只保存禁用的追踪
 s t session.gs                  # 缩写形式
 ```
 
+### save output - 启动实时 eBPF 输出日志
+
+**语法：**
+```
+save output [file]
+s o [file]          # 缩写形式
+```
+
+**参数：**
+- `[file]`: 可选文件名（未提供时使用带时间戳的默认文件名）
+
+**行为：**
+- 启动 eBPF 追踪事件的实时日志记录
+- 后续所有追踪事件立即写入文件
+- 文件不存在时创建，存在时追加
+- 每个事件立即刷新，确保实时捕获
+- 使用 `stop output` 停止日志记录
+
+**示例：**
+```
+save output                     # 开始记录到 ebpf_output_时间戳.log
+save output debug.log           # 开始记录到 debug.log
+s o trace_events.log            # 缩写形式
+```
+
+### save session - 启动实时会话日志
+
+**语法：**
+```
+save session [file]
+s s [file]          # 缩写形式
+```
+
+**参数：**
+- `[file]`: 可选文件名（未提供时使用带时间戳的默认文件名）
+
+**行为：**
+- 启动命令会话（命令 + 响应）的实时日志记录
+- 后续所有命令及其响应立即写入文件
+- 文件不存在时创建，存在时追加
+- 命令以 `>>>` 标记，响应缩进显示
+- 使用 `stop session` 停止日志记录
+
+**示例：**
+```
+save session                    # 开始记录到 command_session_时间戳.log
+save session debug_session.log  # 开始记录到 debug_session.log
+s s my_session.log              # 缩写形式
+```
+
+### stop output - 停止实时 eBPF 输出日志
+
+**语法：**
+```
+stop output
+```
+
+**行为：**
+- 停止实时 eBPF 输出日志记录
+- 刷新并关闭日志文件
+- 如果没有活动的日志记录则返回错误
+
+### stop session - 停止实时会话日志
+
+**语法：**
+```
+stop session
+```
+
+**行为：**
+- 停止实时会话日志记录
+- 刷新并关闭日志文件
+- 如果没有活动的日志记录则返回错误
+
 ### source - 加载追踪脚本
 
 **语法：**

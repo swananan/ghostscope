@@ -1133,6 +1133,21 @@ impl App {
                     .handle_submit(&mut self.state.command_panel);
                 additional_actions.extend(actions);
                 self.state.command_renderer.mark_pending_updates();
+
+                // Realtime logging: write command to file if enabled
+                if self.state.realtime_session_logger.enabled {
+                    if let Some(command) = self
+                        .state
+                        .command_panel
+                        .command_history
+                        .last()
+                        .map(|item| item.command.clone())
+                    {
+                        if let Err(e) = self.write_command_to_session_log(&command) {
+                            tracing::error!("Failed to write command to session log: {}", e);
+                        }
+                    }
+                }
             }
             Action::SubmitCommandWithText { command } => {
                 // Handle command submission from history search mode
@@ -1140,13 +1155,20 @@ impl App {
                 self.state.command_panel.add_command_to_history(&command);
 
                 // Set the input text and submit it
-                self.state.command_panel.input_text = command;
+                self.state.command_panel.input_text = command.clone();
                 let actions = self
                     .state
                     .command_input_handler
                     .handle_submit(&mut self.state.command_panel);
                 additional_actions.extend(actions);
                 self.state.command_renderer.mark_pending_updates();
+
+                // Realtime logging: write command to file if enabled
+                if self.state.realtime_session_logger.enabled {
+                    if let Err(e) = self.write_command_to_session_log(&command) {
+                        tracing::error!("Failed to write command to session log: {}", e);
+                    }
+                }
             }
             Action::HistoryUp => {
                 // Handled by input handler
@@ -1226,6 +1248,13 @@ impl App {
                 content,
                 response_type,
             } => {
+                // Realtime logging: write response to file if enabled (before moving content)
+                if self.state.realtime_session_logger.enabled {
+                    if let Err(e) = self.write_response_to_session_log(&content) {
+                        tracing::error!("Failed to write response to session log: {}", e);
+                    }
+                }
+
                 crate::components::command_panel::ResponseFormatter::add_response(
                     &mut self.state.command_panel,
                     content,
@@ -1586,6 +1615,96 @@ impl App {
                     // Enter script mode directly
                     additional_actions.push(Action::EnterScriptMode(trace_command));
                 }
+            }
+            Action::SaveEbpfOutput { filename } => {
+                // Start realtime eBPF output logging
+                let (content, response_type) = match self.start_realtime_output_logging(filename) {
+                    Ok(file_path) => (
+                        format!(
+                            "✓ Realtime eBPF output logging started: {}",
+                            file_path.display()
+                        ),
+                        crate::action::ResponseType::Success,
+                    ),
+                    Err(e) => (
+                        format!("✗ Failed to start output logging: {e}"),
+                        crate::action::ResponseType::Error,
+                    ),
+                };
+
+                // Directly add response to command history
+                crate::components::command_panel::ResponseFormatter::add_response(
+                    &mut self.state.command_panel,
+                    content,
+                    response_type,
+                );
+                self.state.command_renderer.mark_pending_updates();
+            }
+            Action::SaveCommandSession { filename } => {
+                // Start realtime command session logging
+                let (content, response_type) = match self.start_realtime_session_logging(filename) {
+                    Ok(file_path) => (
+                        format!(
+                            "✓ Realtime session logging started: {}",
+                            file_path.display()
+                        ),
+                        crate::action::ResponseType::Success,
+                    ),
+                    Err(e) => (
+                        format!("✗ Failed to start session logging: {e}"),
+                        crate::action::ResponseType::Error,
+                    ),
+                };
+
+                // Directly add response to command history
+                crate::components::command_panel::ResponseFormatter::add_response(
+                    &mut self.state.command_panel,
+                    content,
+                    response_type,
+                );
+                self.state.command_renderer.mark_pending_updates();
+            }
+            Action::StopSaveOutput => {
+                // Stop realtime eBPF output logging
+                let (content, response_type) = match self.state.realtime_output_logger.stop() {
+                    Ok(()) => (
+                        "✓ Realtime eBPF output logging stopped".to_string(),
+                        crate::action::ResponseType::Success,
+                    ),
+                    Err(e) => (
+                        format!("✗ Failed to stop output logging: {e}"),
+                        crate::action::ResponseType::Error,
+                    ),
+                };
+
+                // Directly add response to command history
+                crate::components::command_panel::ResponseFormatter::add_response(
+                    &mut self.state.command_panel,
+                    content,
+                    response_type,
+                );
+                self.state.command_renderer.mark_pending_updates();
+            }
+            Action::StopSaveSession => {
+                // Stop realtime command session logging
+                let (content, response_type) = match self.state.realtime_session_logger.stop() {
+                    Ok(()) => (
+                        "✓ Realtime session logging stopped".to_string(),
+                        crate::action::ResponseType::Success,
+                    ),
+                    Err(e) => (
+                        format!("✗ Failed to stop session logging: {e}"),
+                        crate::action::ResponseType::Error,
+                    ),
+                };
+
+                // Directly add response to command history
+                crate::components::command_panel::ResponseFormatter::add_response(
+                    &mut self.state.command_panel,
+                    content,
+                    response_type,
+                );
+                self.state.command_renderer.mark_pending_updates();
             }
             Action::NoOp => {
                 // No operation - does nothing but prevents event fallback
@@ -2528,6 +2647,14 @@ impl App {
     /// Handle trace events
     async fn handle_trace_event(&mut self, trace_event: ghostscope_protocol::ParsedTraceEvent) {
         tracing::debug!("Trace event: {:?}", trace_event);
+
+        // Realtime logging: write eBPF event to file if enabled
+        if self.state.realtime_output_logger.enabled {
+            if let Err(e) = self.write_ebpf_event_to_output_log(&trace_event) {
+                tracing::error!("Failed to write eBPF event to output log: {}", e);
+            }
+        }
+
         self.state.ebpf_panel.add_trace_event(trace_event);
     }
 
@@ -2926,6 +3053,253 @@ impl App {
     /// Clear waiting state to return to ready input mode
     fn clear_waiting_state(&mut self) {
         self.state.command_panel.input_state = crate::model::panel_state::InputState::Ready;
+    }
+
+    /// Validate and resolve file path for saving
+    /// Returns the absolute path if valid, or an error if the path is unsafe
+    fn validate_and_resolve_path(filename: &str) -> anyhow::Result<std::path::PathBuf> {
+        use std::path::{Path, PathBuf};
+
+        // Check for path traversal attempts
+        if filename.contains("..") {
+            return Err(anyhow::anyhow!(
+                "Path traversal not allowed (contains '..')"
+            ));
+        }
+
+        // Resolve to absolute path
+        let file_path = if Path::new(filename).is_relative() {
+            let current_dir = std::env::current_dir()?;
+            current_dir.join(filename)
+        } else {
+            PathBuf::from(filename)
+        };
+
+        // Canonicalize and verify the path stays within allowed directory
+        // For relative paths, ensure they resolve within current directory
+        if Path::new(filename).is_relative() {
+            let current_dir = std::env::current_dir()?;
+            let canonical_current = current_dir
+                .canonicalize()
+                .unwrap_or_else(|_| current_dir.clone());
+
+            // Check parent directory exists before canonicalizing
+            if let Some(parent) = file_path.parent() {
+                if !parent.exists() {
+                    return Err(anyhow::anyhow!(
+                        "Directory does not exist: {}",
+                        parent.display()
+                    ));
+                }
+
+                // Verify resolved path is within current directory
+                let canonical_parent = parent
+                    .canonicalize()
+                    .unwrap_or_else(|_| parent.to_path_buf());
+                if !canonical_parent.starts_with(&canonical_current) {
+                    return Err(anyhow::anyhow!("Cannot save outside current directory"));
+                }
+            }
+        }
+
+        Ok(file_path)
+    }
+
+    /// Start realtime eBPF output logging
+    fn start_realtime_output_logging(
+        &mut self,
+        filename: Option<String>,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        use chrono::Local;
+
+        // Check if already logging
+        if self.state.realtime_output_logger.enabled {
+            return Err(anyhow::anyhow!(
+                "Realtime output logging already active to: {}",
+                self.state
+                    .realtime_output_logger
+                    .file_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            ));
+        }
+
+        // Generate filename if not provided
+        let filename = filename.unwrap_or_else(|| {
+            let timestamp = Local::now().format("%Y%m%d_%H%M%S");
+            format!("ebpf_output_{timestamp}.log")
+        });
+
+        // Validate and resolve path
+        let file_path = Self::validate_and_resolve_path(&filename)?;
+
+        // Determine if this is a new file
+        let is_new_file = !file_path.exists();
+
+        // Start the logger
+        self.state.realtime_output_logger.start(file_path.clone())?;
+
+        // Write header if this is a new file
+        if is_new_file {
+            let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+            self.state
+                .realtime_output_logger
+                .write_line("# GhostScope eBPF Output Log (Realtime)")?;
+            self.state
+                .realtime_output_logger
+                .write_line(&format!("# Session: {timestamp}"))?;
+            self.state
+                .realtime_output_logger
+                .write_line("# ========================================")?;
+            self.state.realtime_output_logger.write_line("")?;
+        } else {
+            // Add separator for continuation
+            let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+            self.state.realtime_output_logger.write_line("")?;
+            self.state
+                .realtime_output_logger
+                .write_line("# ----------------------------------------")?;
+            self.state
+                .realtime_output_logger
+                .write_line(&format!("# Resumed: {timestamp}"))?;
+            self.state
+                .realtime_output_logger
+                .write_line("# ----------------------------------------")?;
+            self.state.realtime_output_logger.write_line("")?;
+        }
+
+        Ok(file_path)
+    }
+
+    /// Write an eBPF event to the output log (realtime)
+    fn write_ebpf_event_to_output_log(
+        &mut self,
+        event: &ghostscope_protocol::ParsedTraceEvent,
+    ) -> anyhow::Result<()> {
+        if self.state.realtime_output_logger.enabled {
+            // Format timestamp
+            let secs = event.timestamp / 1_000_000_000;
+            let nanos = event.timestamp % 1_000_000_000;
+            let formatted_ts = format!(
+                "{:02}:{:02}:{:02}.{:06}",
+                (secs / 3600) % 24,
+                (secs / 60) % 60,
+                secs % 60,
+                nanos / 1000
+            );
+
+            // Format output from instructions
+            let formatted_output = event.to_formatted_output();
+            let message = formatted_output.join(" ");
+
+            // Write: [timestamp] [PID xxxx/TID yyyy] Trace #id: message
+            self.state.realtime_output_logger.write_line(&format!(
+                "[{}] [PID {}/TID {}] Trace #{}: {}",
+                formatted_ts, event.pid, event.tid, event.trace_id, message
+            ))?;
+        }
+        Ok(())
+    }
+
+    /// Write a command to the session log (realtime)
+    fn write_command_to_session_log(&mut self, command: &str) -> anyhow::Result<()> {
+        if self.state.realtime_session_logger.enabled {
+            self.state.realtime_session_logger.write_line("")?;
+            self.state
+                .realtime_session_logger
+                .write_line(&format!(">>> {command}"))?;
+        }
+        Ok(())
+    }
+
+    /// Write a response to the session log (realtime)
+    fn write_response_to_session_log(&mut self, response: &str) -> anyhow::Result<()> {
+        if self.state.realtime_session_logger.enabled {
+            for line in response.lines() {
+                self.state
+                    .realtime_session_logger
+                    .write_line(&format!("    {line}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Start realtime command session logging
+    fn start_realtime_session_logging(
+        &mut self,
+        filename: Option<String>,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        use chrono::Local;
+
+        // Check if already logging
+        if self.state.realtime_session_logger.enabled {
+            return Err(anyhow::anyhow!(
+                "Realtime session logging already active to: {}",
+                self.state
+                    .realtime_session_logger
+                    .file_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            ));
+        }
+
+        // Generate filename if not provided
+        let filename = filename.unwrap_or_else(|| {
+            let timestamp = Local::now().format("%Y%m%d_%H%M%S");
+            format!("command_session_{timestamp}.log")
+        });
+
+        // Validate and resolve path
+        let file_path = Self::validate_and_resolve_path(&filename)?;
+
+        // Determine if this is a new file
+        let is_new_file = !file_path.exists();
+
+        // Start the logger
+        self.state
+            .realtime_session_logger
+            .start(file_path.clone())?;
+
+        // Write header if this is a new file
+        if is_new_file {
+            let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+            self.state
+                .realtime_session_logger
+                .write_line("# GhostScope Command Session Log (Realtime)")?;
+            self.state
+                .realtime_session_logger
+                .write_line(&format!("# Session: {timestamp}"))?;
+            self.state
+                .realtime_session_logger
+                .write_line("# ========================================")?;
+            self.state.realtime_session_logger.write_line("")?;
+
+            // Write static lines (welcome messages)
+            for static_line in &self.state.command_panel.static_lines {
+                self.state
+                    .realtime_session_logger
+                    .write_line(&static_line.content)?;
+            }
+            self.state.realtime_session_logger.write_line("")?;
+        } else {
+            // Add separator for continuation
+            let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+            self.state.realtime_session_logger.write_line("")?;
+            self.state
+                .realtime_session_logger
+                .write_line("# ----------------------------------------")?;
+            self.state
+                .realtime_session_logger
+                .write_line(&format!("# Resumed: {timestamp}"))?;
+            self.state
+                .realtime_session_logger
+                .write_line("# ----------------------------------------")?;
+            self.state.realtime_session_logger.write_line("")?;
+        }
+
+        Ok(file_path)
     }
 
     /// Handle Ctrl+C with double-press quit and special mode handling

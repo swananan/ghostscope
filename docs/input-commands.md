@@ -123,6 +123,80 @@ save traces disabled backup.gs  # Save only disabled traces
 s t session.gs                  # Short form
 ```
 
+### save output - Start Realtime eBPF Output Logging
+
+**Syntax:**
+```
+save output [file]
+s o [file]          # Short form
+```
+
+**Parameters:**
+- `[file]`: Optional filename (uses timestamped default if not provided)
+
+**Behavior:**
+- Starts realtime logging of eBPF trace events to file
+- All subsequent trace events are immediately written to file
+- File is created if it doesn't exist, or appended if it exists
+- Each event is flushed immediately for realtime capture
+- Use `stop output` to stop logging
+
+**Examples:**
+```
+save output                     # Start logging to ebpf_output_TIMESTAMP.log
+save output debug.log           # Start logging to debug.log
+s o trace_events.log            # Short form
+```
+
+### save session - Start Realtime Session Logging
+
+**Syntax:**
+```
+save session [file]
+s s [file]          # Short form
+```
+
+**Parameters:**
+- `[file]`: Optional filename (uses timestamped default if not provided)
+
+**Behavior:**
+- Starts realtime logging of command session (commands + responses)
+- All subsequent commands and their responses are immediately written to file
+- File is created if it doesn't exist, or appended if it exists
+- Commands are marked with `>>>`, responses are indented
+- Use `stop session` to stop logging
+
+**Examples:**
+```
+save session                    # Start logging to command_session_TIMESTAMP.log
+save session debug_session.log  # Start logging to debug_session.log
+s s my_session.log              # Short form
+```
+
+### stop output - Stop Realtime eBPF Output Logging
+
+**Syntax:**
+```
+stop output
+```
+
+**Behavior:**
+- Stops realtime eBPF output logging
+- Flushes and closes the log file
+- Returns error if no logging is active
+
+### stop session - Stop Realtime Session Logging
+
+**Syntax:**
+```
+stop session
+```
+
+**Behavior:**
+- Stops realtime session logging
+- Flushes and closes the log file
+- Returns error if no logging is active
+
 ### source - Load Trace Script
 
 **Syntax:**
