@@ -171,3 +171,9 @@ GhostScope 采用 [GNU 通用公共许可证](LICENSE) 授权。
 
 - [**GDB**](https://www.gnu.org/software/gdb/) - DWARF 解析优化
 - [**bpftrace**](https://github.com/iovisor/bpftrace) - eBPF 追踪技术
+- [**cgdb**](https://cgdb.github.io/) - TUI 设计和用户体验
+
+特别感谢以下优秀博客文章，学习了很多：
+
+- [**动态追踪漫谈**](https://blog.openresty.com.cn/cn/dynamic-tracing/)
+- [**硬核方式进行栈回溯**](https://lesenechal.fr/en/linux/unwinding-the-stack-the-hard-way)
