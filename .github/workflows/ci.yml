@@ -31,22 +31,19 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      LLVM_SYS_181_PREFIX: /usr/lib/llvm-18
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Install LLVM 18
-        uses: KyleMayes/install-llvm-action@v2
-        with:
-          version: "18"
-
-      - name: Install Polly library
+      - name: Install LLVM 18 and Polly
         run: |
           wget https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
           sudo ./llvm.sh 18
-          sudo apt-get install -y libpolly-18-dev
+          sudo apt-get install -y llvm-18-dev libpolly-18-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.88.0
@@ -84,22 +81,19 @@ jobs:
     name: Test Suite
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      LLVM_SYS_181_PREFIX: /usr/lib/llvm-18
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Install LLVM 18
-        uses: KyleMayes/install-llvm-action@v2
-        with:
-          version: "18"
-
-      - name: Install Polly library
+      - name: Install LLVM 18 and Polly
         run: |
           wget https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
           sudo ./llvm.sh 18
-          sudo apt-get install -y libpolly-18-dev
+          sudo apt-get install -y llvm-18-dev libpolly-18-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.88.0
@@ -140,22 +134,19 @@ jobs:
     name: Build
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      LLVM_SYS_181_PREFIX: /usr/lib/llvm-18
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Install LLVM 18
-        uses: KyleMayes/install-llvm-action@v2
-        with:
-          version: "18"
-
-      - name: Install Polly library
+      - name: Install LLVM 18 and Polly
         run: |
           wget https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
           sudo ./llvm.sh 18
-          sudo apt-get install -y libpolly-18-dev
+          sudo apt-get install -y llvm-18-dev libpolly-18-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.88.0
