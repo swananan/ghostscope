@@ -1,5 +1,10 @@
 # Development Guide
 
+## Prerequisites
+
+- Rust 1.88.0 (enforced via `rust-toolchain.toml`)
+- Linux kernel 4.4+
+
 ## Build
 
 ```bash
