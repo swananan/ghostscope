@@ -8,9 +8,19 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Once;
 
+use std::sync::Mutex;
+
 static INIT: Once = Once::new();
 static COMPILE: Once = Once::new();
 static REGISTER_CLEANUP: Once = Once::new();
+
+lazy_static! {
+    static ref COMPILE_DEBUG_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
+    static ref COMPILE_OPT_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
+    static ref COMPILE_COMPLEX_DEBUG_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
+    static ref COMPILE_COMPLEX_OPT_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
+    static ref COMPILE_COMPLEX_NOPIE_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
+}
 
 /// Initialize logging for tests (call once per test)
 pub fn init() {
@@ -94,76 +104,69 @@ pub fn ensure_test_program_compiled() -> anyhow::Result<()> {
 
 /// Compile test program with specific optimization level
 pub fn ensure_test_program_compiled_with_opt(opt_level: OptimizationLevel) -> anyhow::Result<()> {
-    let mut result = Ok(());
-
-    let compile_fn = || {
-        let fixtures_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-        let sample_program_dir = fixtures_path.join("sample_program");
-
-        println!(
-            "Compiling sample_program {} in {:?}",
-            opt_level.description(),
-            sample_program_dir
-        );
-
-        // Clean first (only for debug builds to avoid conflicts)
-        if opt_level == OptimizationLevel::Debug {
-            let clean_output = Command::new("make")
-                .arg("clean")
-                .current_dir(&sample_program_dir)
-                .output();
-
-            match clean_output {
-                Ok(_) => println!("✓ Cleaned sample_program build directory"),
-                Err(e) => {
-                    result = Err(anyhow::anyhow!("Failed to clean sample_program: {}", e));
-                    return;
-                }
-            }
-        }
-
-        // Compile specific optimization level
-        let compile_output = Command::new("make")
-            .arg(opt_level.as_make_target())
-            .current_dir(&sample_program_dir)
-            .output();
-
-        match compile_output {
-            Ok(output) => {
-                if output.status.success() {
-                    println!(
-                        "✓ Successfully compiled sample_program {}",
-                        opt_level.description()
-                    );
-                } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    result = Err(anyhow::anyhow!(
-                        "Failed to compile sample_program {}: {}",
-                        opt_level.description(),
-                        stderr
-                    ));
-                }
-            }
-            Err(e) => {
-                result = Err(anyhow::anyhow!(
-                    "Failed to run make for sample_program {}: {}",
-                    opt_level.description(),
-                    e
-                ));
-            }
-        }
-    };
-
     match opt_level {
         OptimizationLevel::Debug => {
-            COMPILE.call_once(compile_fn);
+            COMPILE.call_once(|| {
+                let compile_result = compile_sample_program(opt_level);
+                *COMPILE_DEBUG_RESULT.lock().unwrap() = Some(compile_result);
+            });
+            match COMPILE_DEBUG_RESULT.lock().unwrap().as_ref() {
+                Some(Ok(())) => Ok(()),
+                Some(Err(e)) => Err(anyhow::anyhow!("{}", e)),
+                None => panic!("Compilation result should be set after call_once"),
+            }
         }
         _ => {
-            COMPILE_OPTIMIZED.call_once(compile_fn);
+            COMPILE_OPTIMIZED.call_once(|| {
+                let compile_result = compile_sample_program(opt_level);
+                *COMPILE_OPT_RESULT.lock().unwrap() = Some(compile_result);
+            });
+            match COMPILE_OPT_RESULT.lock().unwrap().as_ref() {
+                Some(Ok(())) => Ok(()),
+                Some(Err(e)) => Err(anyhow::anyhow!("{}", e)),
+                None => panic!("Compilation result should be set after call_once"),
+            }
         }
     }
+}
 
-    result
+fn compile_sample_program(opt_level: OptimizationLevel) -> anyhow::Result<()> {
+    let fixtures_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let sample_program_dir = fixtures_path.join("sample_program");
+
+    println!(
+        "Compiling sample_program {} in {:?}",
+        opt_level.description(),
+        sample_program_dir
+    );
+
+    // Compile specific optimization level
+    let output = Command::new("make")
+        .arg(opt_level.as_make_target())
+        .current_dir(&sample_program_dir)
+        .output()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to run make for sample_program {}: {}",
+                opt_level.description(),
+                e
+            )
+        })?;
+
+    if output.status.success() {
+        println!(
+            "✓ Successfully compiled sample_program {}",
+            opt_level.description()
+        );
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(anyhow::anyhow!(
+            "Failed to compile sample_program {}: {}",
+            opt_level.description(),
+            stderr
+        ))
+    }
 }
 
 static COMPILE_COMPLEX_DEBUG: Once = Once::new();
@@ -171,69 +174,75 @@ static COMPILE_COMPLEX_OPT: Once = Once::new();
 static COMPILE_COMPLEX_NOPIE: Once = Once::new();
 
 fn ensure_complex_program_compiled_with_opt(opt_level: OptimizationLevel) -> anyhow::Result<()> {
-    let mut result = Ok(());
-    let compile_fn = || {
-        let fixtures_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-        let program_dir = fixtures_path.join("complex_types_program");
-
-        println!(
-            "Compiling complex_types_program {} in {:?}",
-            opt_level.description(),
-            program_dir
-        );
-
-        // Clean first for debug builds
-        if opt_level == OptimizationLevel::Debug {
-            let _ = Command::new("make")
-                .arg("clean")
-                .current_dir(&program_dir)
-                .output();
-        }
-
-        let target = match opt_level {
-            OptimizationLevel::Debug => "complex_types_program",
-            OptimizationLevel::O1 => "complex_types_program_o1",
-            OptimizationLevel::O2 => "complex_types_program_o2",
-            OptimizationLevel::O3 => "complex_types_program_o3",
-        };
-
-        let compile_output = Command::new("make")
-            .arg(target)
-            .current_dir(&program_dir)
-            .output();
-
-        match compile_output {
-            Ok(output) => {
-                if output.status.success() {
-                    println!(
-                        "✓ Successfully compiled complex_types_program {}",
-                        opt_level.description()
-                    );
-                } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    result = Err(anyhow::anyhow!(
-                        "Failed to compile complex_types_program {}: {}",
-                        opt_level.description(),
-                        stderr
-                    ));
-                }
-            }
-            Err(e) => {
-                result = Err(anyhow::anyhow!(
-                    "Failed to run make for complex_types_program {}: {}",
-                    opt_level.description(),
-                    e
-                ));
+    match opt_level {
+        OptimizationLevel::Debug => {
+            COMPILE_COMPLEX_DEBUG.call_once(|| {
+                let compile_result = compile_complex_program(opt_level);
+                *COMPILE_COMPLEX_DEBUG_RESULT.lock().unwrap() = Some(compile_result);
+            });
+            match COMPILE_COMPLEX_DEBUG_RESULT.lock().unwrap().as_ref() {
+                Some(Ok(())) => Ok(()),
+                Some(Err(e)) => Err(anyhow::anyhow!("{}", e)),
+                None => panic!("Compilation result should be set after call_once"),
             }
         }
+        _ => {
+            COMPILE_COMPLEX_OPT.call_once(|| {
+                let compile_result = compile_complex_program(opt_level);
+                *COMPILE_COMPLEX_OPT_RESULT.lock().unwrap() = Some(compile_result);
+            });
+            match COMPILE_COMPLEX_OPT_RESULT.lock().unwrap().as_ref() {
+                Some(Ok(())) => Ok(()),
+                Some(Err(e)) => Err(anyhow::anyhow!("{}", e)),
+                None => panic!("Compilation result should be set after call_once"),
+            }
+        }
+    }
+}
+
+fn compile_complex_program(opt_level: OptimizationLevel) -> anyhow::Result<()> {
+    let fixtures_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let program_dir = fixtures_path.join("complex_types_program");
+
+    println!(
+        "Compiling complex_types_program {} in {:?}",
+        opt_level.description(),
+        program_dir
+    );
+
+    let target = match opt_level {
+        OptimizationLevel::Debug => "complex_types_program",
+        OptimizationLevel::O1 => "complex_types_program_o1",
+        OptimizationLevel::O2 => "complex_types_program_o2",
+        OptimizationLevel::O3 => "complex_types_program_o3",
     };
 
-    match opt_level {
-        OptimizationLevel::Debug => COMPILE_COMPLEX_DEBUG.call_once(compile_fn),
-        _ => COMPILE_COMPLEX_OPT.call_once(compile_fn),
-    }
+    let output = Command::new("make")
+        .arg(target)
+        .current_dir(&program_dir)
+        .output()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to run make for complex_types_program {}: {}",
+                opt_level.description(),
+                e
+            )
+        })?;
 
-    result
+    if output.status.success() {
+        println!(
+            "✓ Successfully compiled complex_types_program {}",
+            opt_level.description()
+        );
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(anyhow::anyhow!(
+            "Failed to compile complex_types_program {}: {}",
+            opt_level.description(),
+            stderr
+        ))
+    }
 }
 
 /// Test fixtures manager
@@ -289,43 +298,48 @@ impl TestFixtures {
 
     /// Build and return the non-PIE variant of complex_types_program
     pub fn get_test_binary_complex_nopie(&self) -> anyhow::Result<PathBuf> {
-        // Ensure build once
         let program_dir = self.base_path.join("complex_types_program");
-        let mut result = Ok(());
+
         COMPILE_COMPLEX_NOPIE.call_once(|| {
-            println!(
-                "Compiling complex_types_program Non-PIE (ET_EXEC) in {:?}",
-                program_dir
-            );
-            let _ = Command::new("make")
-                .arg("clean")
-                .current_dir(&program_dir)
-                .output();
-            let compile_output = Command::new("make")
-                .arg("complex_types_program_nopie")
-                .current_dir(&program_dir)
-                .output();
-            match compile_output {
-                Ok(out) => {
-                    if out.status.success() {
-                        println!("✓ Successfully compiled complex_types_program Non-PIE");
-                    } else {
-                        let stderr = String::from_utf8_lossy(&out.stderr);
-                        result = Err(anyhow::anyhow!(
-                            "Failed to compile complex_types_program Non-PIE: {}",
-                            stderr
-                        ));
-                    }
+            let compile_result = (|| -> anyhow::Result<()> {
+                println!(
+                    "Compiling complex_types_program Non-PIE (ET_EXEC) in {:?}",
+                    program_dir
+                );
+
+                let output = Command::new("make")
+                    .arg("complex_types_program_nopie")
+                    .current_dir(&program_dir)
+                    .output()
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "Failed to run make for complex_types_program Non-PIE: {}",
+                            e
+                        )
+                    })?;
+
+                if output.status.success() {
+                    println!("✓ Successfully compiled complex_types_program Non-PIE");
+                    Ok(())
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    Err(anyhow::anyhow!(
+                        "Failed to compile complex_types_program Non-PIE: {}",
+                        stderr
+                    ))
                 }
-                Err(e) => {
-                    result = Err(anyhow::anyhow!(
-                        "Failed to run make for complex_types_program Non-PIE: {}",
-                        e
-                    ));
-                }
-            }
+            })();
+
+            *COMPILE_COMPLEX_NOPIE_RESULT.lock().unwrap() = Some(compile_result);
         });
-        result?;
+
+        // Check compilation result
+        match COMPILE_COMPLEX_NOPIE_RESULT.lock().unwrap().as_ref() {
+            Some(Ok(())) => {}
+            Some(Err(e)) => return Err(anyhow::anyhow!("{}", e)),
+            None => panic!("Compilation result should be set after call_once"),
+        }
+
         let bin_path = program_dir.join("complex_types_program_nopie");
         if !bin_path.exists() {
             anyhow::bail!("Non-PIE binary not found: {}", bin_path.display());
