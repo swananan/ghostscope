@@ -16,6 +16,9 @@ eBPF helper functions do not support handling page faults, which may cause failu
 ### 4. Read-Only Access, Cannot Modify Program Behavior
 Although eBPF technically supports modifying process behavior to some extent, GhostScope is designed as a read-only tool and cannot modify program state, variable values, or control flow. This ensures safety in production environments.
 
+### 5. Platform Support
+Currently only supports **Linux** operating system due to its core dependency on **eBPF** and **uprobe**.
+
 ## Soft Limitations
 
 ### 1. Language Support
@@ -23,8 +26,8 @@ Currently supports compiled languages (C, C++, Rust) with DWARF debug informatio
 
 For interpreted languages (Lua, Python, Ruby, etc.), only the interpreter itself can be traced (since interpreters are typically implemented in compiled languages). Tracing script code is technically feasible but requires substantial development time. JIT language support is an even more distant goal.
 
-### 2. Platform Support
-Currently only supports x86_64 (AMD64) architecture. Other platforms (such as ARM64) are technically feasible but require time for adaptation and testing.
+### 2. Architecture Support
+Currently only supports **x86_64 (AMD64)** architecture. Other platforms (such as ARM64) are technically feasible but require time for adaptation and testing.
 
 ### 3. Performance Impact
 Based on uprobe implementation, each probe trigger incurs a context switch overhead plus eBPF program execution time. If probes are set on hot paths, they may significantly impact the monitored process performance. Use with caution.

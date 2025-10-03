@@ -10,6 +10,12 @@
 
 作为辅助排查问题的工具，准确性是第一位的。将持续修复 bug，完善错误处理，提升追踪数据的可靠性。
 
+## 使用 bpftime 优化性能
+
+考虑从基于内核的 uprobe 迁移到 [**bpftime**](https://github.com/eunomia-bpf/bpftime) 用户态 eBPF 执行。这将通过避免内核上下文切换显著提升追踪性能。
+
+**参考**：https://github.com/eunomia-bpf/bpftime
+
 ## 高级语言特性支持
 
 两个主要方向：
