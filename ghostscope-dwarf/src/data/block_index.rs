@@ -6,7 +6,7 @@
 //! - Provides fast lookup of in-scope variables at a given PC
 
 use crate::parser::RangeExtractor;
-use gimli::{EndianSlice, LittleEndian};
+use gimli::{EndianArcSlice, LittleEndian, Reader};
 use std::collections::BTreeMap;
 
 /// Reference to a variable DIE within a unit
@@ -190,11 +190,11 @@ impl BlockIndex {
 
 /// Builder for block index using DWARF data
 pub struct BlockIndexBuilder<'a> {
-    dwarf: &'a gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
+    dwarf: &'a gimli::Dwarf<EndianArcSlice<LittleEndian>>,
 }
 
 impl<'a> BlockIndexBuilder<'a> {
-    pub fn new(dwarf: &'a gimli::Dwarf<EndianSlice<'static, LittleEndian>>) -> Self {
+    pub fn new(dwarf: &'a gimli::Dwarf<EndianArcSlice<LittleEndian>>) -> Self {
         Self { dwarf }
     }
 
@@ -213,7 +213,7 @@ impl<'a> BlockIndexBuilder<'a> {
                     .ok()
                     .and_then(|a| a)
                     .and_then(|a| self.dwarf.attr_string(&unit, a.value()).ok())
-                    .map(|s| s.to_string_lossy().into_owned());
+                    .and_then(|s| s.to_string_lossy().ok().map(|cow| cow.into_owned()));
                 let mut fb = FunctionBlocks::new(name, cu_offset, entry.offset());
                 if let Ok(ranges) = RangeExtractor::extract_all_ranges(entry, &unit, self.dwarf) {
                     fb.ranges = ranges;
@@ -250,7 +250,7 @@ impl<'a> BlockIndexBuilder<'a> {
             .ok()
             .and_then(|a| a)
             .and_then(|a| self.dwarf.attr_string(&unit, a.value()).ok())
-            .map(|s| s.to_string_lossy().into_owned());
+            .and_then(|s| s.to_string_lossy().ok().map(|cow| cow.into_owned()));
         let mut fb = FunctionBlocks::new(name, cu_offset, die_offset);
         if let Ok(ranges) = RangeExtractor::extract_all_ranges(&entry, &unit, self.dwarf) {
             fb.ranges = ranges;
@@ -269,8 +269,8 @@ impl<'a> BlockIndexBuilder<'a> {
 
     fn build_blocks_for_function(
         &self,
-        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
-        func_entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
+        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
+        func_entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
         fb: &mut FunctionBlocks,
     ) {
         // DFS but only within this function's subtree
@@ -283,8 +283,8 @@ impl<'a> BlockIndexBuilder<'a> {
 
     fn walk_children(
         &self,
-        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
-        node: gimli::EntriesTreeNode<EndianSlice<'static, LittleEndian>>,
+        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
+        node: gimli::EntriesTreeNode<EndianArcSlice<LittleEndian>>,
         parent_idx: usize,
         fb: &mut FunctionBlocks,
     ) {

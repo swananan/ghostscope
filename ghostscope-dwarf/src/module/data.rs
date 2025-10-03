@@ -29,7 +29,7 @@ use crate::{
     parser::{CompilationUnit, SourceFile},
     proc_mapping::ModuleMapping,
 };
-use gimli::{EndianSlice, LittleEndian};
+use gimli::{LittleEndian, Reader};
 use object::{Object, ObjectSection, ObjectSegment};
 use std::{
     collections::{HashMap, HashSet},
@@ -196,11 +196,8 @@ impl ModuleData {
         // Memory map the file once
         let mapped_file = std::sync::Arc::new(Self::map_file(&module_mapping.path)?);
 
-        // Parse object file
-        let object = object::File::parse(&mapped_file.data[..])?;
-
-        // Load DWARF sections
-        let dwarf = std::sync::Arc::new(Self::load_dwarf_sections(&object)?);
+        // Load DWARF sections (now returns Dwarf<EndianArcSlice>)
+        let dwarf = std::sync::Arc::new(Self::load_dwarf_sections(&mapped_file)?);
 
         tracing::debug!(
             "Starting parallel DWARF parsing with true debug_line || debug_info parallelism..."
@@ -226,16 +223,14 @@ impl ModuleData {
                     parser.parse_debug_info(&module_path)
                 }
             }),
-            // Parse CFI independently (uses raw file data)
+            // Parse CFI independently (now using Arc-based data, no unsafe!)
             tokio::task::spawn_blocking({
                 let mapped_file = std::sync::Arc::clone(&mapped_file);
                 let module_path = module_mapping.path.clone();
                 move || -> Result<Option<crate::data::CfiIndex>> {
-                    // SAFETY: We keep the mapped file alive for the lifetime of the module
-                    // The Arc ensures the memory remains valid during CFI parsing
-                    let static_data: &'static [u8] =
-                        unsafe { std::mem::transmute(&mapped_file.data[..]) };
-                    match crate::data::CfiIndex::from_static_data(static_data) {
+                    // Convert MappedFile data to Arc<[u8]>
+                    let file_data_arc: std::sync::Arc<[u8]> = mapped_file.data[..].into();
+                    match crate::data::CfiIndex::from_arc_data(file_data_arc) {
                         Ok(cfi) => {
                             tracing::info!(
                                 "CFI index initialized successfully for {}",
@@ -352,20 +347,35 @@ impl ModuleData {
         })
     }
 
-    /// Load DWARF sections using gimli
+    /// Load DWARF sections using gimli with Arc-based data
     fn load_dwarf_sections(
-        object: &object::File,
-    ) -> Result<gimli::Dwarf<EndianSlice<'static, LittleEndian>>> {
-        // Load DWARF sections
-        let load_section = |id: gimli::SectionId| -> Result<EndianSlice<'static, LittleEndian>> {
-            let data = object
-                .section_by_name(id.name())
-                .and_then(|section| section.uncompressed_data().ok())
-                .unwrap_or(std::borrow::Cow::Borrowed(&[]));
+        file_data: &std::sync::Arc<MappedFile>,
+    ) -> Result<gimli::Dwarf<gimli::EndianArcSlice<LittleEndian>>> {
+        use gimli::EndianArcSlice;
+        use std::sync::Arc;
 
-            // SAFETY: We keep the mapped file alive for the lifetime of the module
-            let data: &'static [u8] = unsafe { std::mem::transmute(data.as_ref()) };
-            Ok(EndianSlice::new(data, LittleEndian))
+        // Parse object file
+        let object = object::File::parse(&file_data.data[..])?;
+
+        // Load DWARF sections
+        let load_section = |id: gimli::SectionId| -> Result<EndianArcSlice<LittleEndian>> {
+            if let Some(section) = object.section_by_name(id.name()) {
+                // Get section file range
+                if let Some((start, size)) = section.file_range() {
+                    let start = start as usize;
+                    let end = start + size as usize;
+
+                    // Create Arc slice for this section (zero-copy: shares ownership with file_data)
+                    let section_arc: Arc<[u8]> = Arc::from(&file_data.data[start..end]);
+                    Ok(EndianArcSlice::new(section_arc, LittleEndian))
+                } else {
+                    // Section has no file range
+                    Ok(EndianArcSlice::new(Arc::from(vec![]), LittleEndian))
+                }
+            } else {
+                // Return empty slice if section not found
+                Ok(EndianArcSlice::new(Arc::from(vec![]), LittleEndian))
+            }
         };
 
         let dwarf = gimli::Dwarf::load(load_section)?;
@@ -652,7 +662,9 @@ impl ModuleData {
                 let e = unit.entry(v.die_offset)?;
                 if let Some(attr) = e.attr(gimli::DW_AT_name)? {
                     if let Ok(s) = dwarf.attr_string(&unit, attr.value()) {
-                        cand_names.push(s.to_string_lossy().into_owned());
+                        if let Ok(s_str) = s.to_string_lossy() {
+                            cand_names.push(s_str.into_owned());
+                        }
                     }
                 }
             }
@@ -662,72 +674,76 @@ impl ModuleData {
                 let e = unit.entry(v.die_offset)?;
                 if let Some(attr) = e.attr(gimli::DW_AT_name)? {
                     if let Ok(s) = dwarf.attr_string(&unit, attr.value()) {
-                        let n = s.to_string_lossy();
-                        if n == base_var || n.starts_with(&format!("{base_var}@")) {
-                            // Chain empty: short-circuit to base variable (avoid heavy type resolution)
-                            if chain.is_empty() {
-                                let one = vec![(func.cu_offset, v.die_offset)];
-                                let t1 = Instant::now();
-                                let vars = self.resolver.resolve_variables_by_offsets_at_address(
-                                    address,
-                                    &one,
-                                    Some(&get_cfa_closure),
-                                )?;
-                                let mut var_opt = vars.into_iter().next();
-                                let mut type_ms = 0u128;
-                                if let Some(ref mut var0) = var_opt {
-                                    if var0.dwarf_type.is_none() {
-                                        // Resolve base variable type strictly via DWARF type DIE
-                                        let dwarf = self.resolver.dwarf_ref();
-                                        let header =
-                                            dwarf.debug_info.header_from_offset(func.cu_offset)?;
-                                        let unit = dwarf.unit(header)?;
-                                        let e = unit.entry(v.die_offset)?;
-                                        let planner = crate::planner::AccessPlanner::new(dwarf);
-                                        if let Some(type_die_off) = planner
-                                            .resolve_type_ref_with_origins_public(&e, &unit)?
-                                        {
-                                            let tstart = Instant::now();
-                                            if let Some(ty) = self
-                                                .detailed_shallow_type(func.cu_offset, type_die_off)
+                        if let Ok(n) = s.to_string_lossy() {
+                            if n == base_var || n.starts_with(&format!("{base_var}@")) {
+                                // Chain empty: short-circuit to base variable (avoid heavy type resolution)
+                                if chain.is_empty() {
+                                    let one = vec![(func.cu_offset, v.die_offset)];
+                                    let t1 = Instant::now();
+                                    let vars =
+                                        self.resolver.resolve_variables_by_offsets_at_address(
+                                            address,
+                                            &one,
+                                            Some(&get_cfa_closure),
+                                        )?;
+                                    let mut var_opt = vars.into_iter().next();
+                                    let mut type_ms = 0u128;
+                                    if let Some(ref mut var0) = var_opt {
+                                        if var0.dwarf_type.is_none() {
+                                            // Resolve base variable type strictly via DWARF type DIE
+                                            let dwarf = self.resolver.dwarf_ref();
+                                            let header = dwarf
+                                                .debug_info
+                                                .header_from_offset(func.cu_offset)?;
+                                            let unit = dwarf.unit(header)?;
+                                            let e = unit.entry(v.die_offset)?;
+                                            let planner = crate::planner::AccessPlanner::new(dwarf);
+                                            if let Some(type_die_off) = planner
+                                                .resolve_type_ref_with_origins_public(&e, &unit)?
                                             {
-                                                type_ms = tstart.elapsed().as_millis();
-                                                var0.type_name = ty.type_name();
-                                                var0.dwarf_type = Some(ty);
+                                                let tstart = Instant::now();
+                                                if let Some(ty) = self.detailed_shallow_type(
+                                                    func.cu_offset,
+                                                    type_die_off,
+                                                ) {
+                                                    type_ms = tstart.elapsed().as_millis();
+                                                    var0.type_name = ty.type_name();
+                                                    var0.dwarf_type = Some(ty);
+                                                }
                                             }
                                         }
                                     }
+                                    tracing::info!(
+                                        "DWARF:plan_chain var_match='{}' resolve_base_ms={} type_ms={} total_ms={}",
+                                        n,
+                                        t1.elapsed().as_millis(),
+                                        type_ms,
+                                        t0.elapsed().as_millis()
+                                    );
+                                    return Ok(var_opt);
                                 }
+
+                                // Non-empty chain: plan from the base variable
+                                let t1 = Instant::now();
+                                let res = self.resolver.plan_chain_access_from_var(
+                                    address,
+                                    func.cu_offset,
+                                    func.die_offset,
+                                    v.die_offset,
+                                    crate::data::on_demand_resolver::ChainSpec {
+                                        base: base_var,
+                                        fields: chain,
+                                    },
+                                    Some(&get_cfa_closure),
+                                )?;
                                 tracing::info!(
-                                    "DWARF:plan_chain var_match='{}' resolve_base_ms={} type_ms={} total_ms={}",
+                                    "DWARF:plan_chain var_match='{}' plan_ms={} total_ms={}",
                                     n,
                                     t1.elapsed().as_millis(),
-                                    type_ms,
                                     t0.elapsed().as_millis()
                                 );
-                                return Ok(var_opt);
+                                return Ok(res);
                             }
-
-                            // Non-empty chain: plan from the base variable
-                            let t1 = Instant::now();
-                            let res = self.resolver.plan_chain_access_from_var(
-                                address,
-                                func.cu_offset,
-                                func.die_offset,
-                                v.die_offset,
-                                crate::data::on_demand_resolver::ChainSpec {
-                                    base: base_var,
-                                    fields: chain,
-                                },
-                                Some(&get_cfa_closure),
-                            )?;
-                            tracing::info!(
-                                "DWARF:plan_chain var_match='{}' plan_ms={} total_ms={}",
-                                n,
-                                t1.elapsed().as_millis(),
-                                t0.elapsed().as_millis()
-                            );
-                            return Ok(res);
                         }
                     }
                 }

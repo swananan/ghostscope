@@ -5,7 +5,9 @@
 use crate::core::{
     ComputeStep, DirectValueResult, EvaluationResult, LocationResult, MemoryAccessSize, Result,
 };
-use gimli::{read::RawLocListEntry, EndianSlice, Expression, LittleEndian, Operation, Reader};
+use gimli::{
+    read::RawLocListEntry, EndianArcSlice, EndianSlice, Expression, LittleEndian, Operation, Reader,
+};
 use tracing::{debug, trace, warn};
 
 /// DWARF expression evaluator
@@ -14,9 +16,9 @@ pub struct ExpressionEvaluator;
 impl ExpressionEvaluator {
     /// Evaluate a variable's location from its DIE attributes
     pub fn evaluate_location(
-        entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
-        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
-        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
+        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
+        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
         address: u64,
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
     ) -> Result<EvaluationResult> {
@@ -27,7 +29,12 @@ impl ExpressionEvaluator {
             Some(gimli::AttributeValue::Exprloc(expr)) => {
                 // Direct expression
                 debug!("Found Exprloc, parsing DWARF expression");
-                Self::parse_expression(expr.0.slice(), unit.encoding(), address, get_cfa)
+                Self::parse_expression(
+                    expr.0.to_slice().ok().as_deref().unwrap_or(&[]),
+                    unit.encoding(),
+                    address,
+                    get_cfa,
+                )
             }
             Some(gimli::AttributeValue::LocationListsRef(offset)) => {
                 // Location list - variable location changes based on PC
@@ -406,8 +413,8 @@ impl ExpressionEvaluator {
 
     /// Parse location lists from .debug_loclists or .debug_loc section
     fn parse_location_lists(
-        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
-        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
+        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
+        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
         offset: gimli::LocationListsOffset<usize>,
         address: u64,
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
@@ -473,7 +480,13 @@ impl ExpressionEvaluator {
                     // Parse the expression data for this PC range
                     // Use the actual PC range for address-specific parsing
                     let location_expr = Self::parse_expression(
-                        location_list_entry.data.0.slice(),
+                        location_list_entry
+                            .data
+                            .0
+                            .to_slice()
+                            .ok()
+                            .as_deref()
+                            .unwrap_or(&[]),
                         unit.encoding(),
                         address,
                         get_cfa,
@@ -551,7 +564,7 @@ impl ExpressionEvaluator {
 
                             if contains {
                                 let location_expr = Self::parse_expression(
-                                    data.0.slice(),
+                                    data.0.to_slice().ok().as_deref().unwrap_or(&[]),
                                     unit.encoding(),
                                     address,
                                     get_cfa,
@@ -586,7 +599,7 @@ impl ExpressionEvaluator {
 
                             if contains {
                                 let location_expr = Self::parse_expression(
-                                    data.0.slice(),
+                                    data.0.to_slice().ok().as_deref().unwrap_or(&[]),
                                     unit.encoding(),
                                     address,
                                     get_cfa,
@@ -624,7 +637,7 @@ impl ExpressionEvaluator {
 
                             if contains {
                                 let location_expr = Self::parse_expression(
-                                    data.0.slice(),
+                                    data.0.to_slice().ok().as_deref().unwrap_or(&[]),
                                     unit.encoding(),
                                     address,
                                     get_cfa,
@@ -665,7 +678,7 @@ impl ExpressionEvaluator {
 
                                 if contains {
                                     let location_expr = Self::parse_expression(
-                                        data.0.slice(),
+                                        data.0.to_slice().ok().as_deref().unwrap_or(&[]),
                                         unit.encoding(),
                                         address,
                                         get_cfa,
@@ -707,7 +720,7 @@ impl ExpressionEvaluator {
 
                                 if contains {
                                     let location_expr = Self::parse_expression(
-                                        data.0.slice(),
+                                        data.0.to_slice().ok().as_deref().unwrap_or(&[]),
                                         unit.encoding(),
                                         address,
                                         get_cfa,
@@ -731,7 +744,7 @@ impl ExpressionEvaluator {
                         RawLocListEntry::DefaultLocation { data } => {
                             debug!("  Raw fallback default location entry");
                             let location_expr = Self::parse_expression(
-                                data.0.slice(),
+                                data.0.to_slice().ok().as_deref().unwrap_or(&[]),
                                 unit.encoding(),
                                 address,
                                 get_cfa,
