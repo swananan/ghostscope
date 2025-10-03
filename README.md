@@ -4,7 +4,7 @@
     <source media="(prefers-color-scheme: light)" srcset="assets/logo-light.png">
     <img src="assets/logo-light.png" alt="GhostScope Logo" width="200"/>
   </picture>
-  <h1>GhostScope</h1>
+  <h1 style="margin-top: 0.2em;">GhostScope</h1>
   <h3>⚡ Next-Generation eBPF Userspace Runtime Tracer</h3>
   <p>
     <strong>Printf debugging evolved</strong> — Real-time tracing without stopping your application.

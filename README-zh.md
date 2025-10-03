@@ -4,7 +4,7 @@
     <source media="(prefers-color-scheme: light)" srcset="assets/logo-light.png">
     <img src="assets/logo-light.png" alt="GhostScope Logo" width="200"/>
   </picture>
-  <h1>GhostScope</h1>
+  <h1 style="margin-top: 0.2em;">GhostScope</h1>
   <h3>⚡ 下一代 eBPF 用户态运行时追踪器</h3>
   <p>
     <strong>Printf 调试的进化</strong> — 无需停止和修改应用即可实时追踪
