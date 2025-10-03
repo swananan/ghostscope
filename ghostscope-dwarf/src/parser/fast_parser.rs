@@ -8,7 +8,7 @@ use crate::{
     },
     parser::RangeExtractor,
 };
-use gimli::{EndianSlice, LittleEndian};
+use gimli::{EndianArcSlice, LittleEndian, Reader};
 use std::collections::{HashMap, HashSet};
 use tracing::debug;
 
@@ -78,22 +78,24 @@ pub(crate) struct DwarfParseStats {
 
 /// Unified DWARF parser - parses everything in optimized single pass
 pub(crate) struct DwarfParser<'a> {
-    dwarf: &'a gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
+    dwarf: &'a gimli::Dwarf<EndianArcSlice<LittleEndian>>,
 }
 
 /// Internal builder for accumulating parse results
 impl<'a> DwarfParser<'a> {
-    pub fn new(dwarf: &'a gimli::Dwarf<EndianSlice<'static, LittleEndian>>) -> Self {
+    pub fn new(dwarf: &'a gimli::Dwarf<EndianArcSlice<LittleEndian>>) -> Self {
         Self { dwarf }
     }
 
     fn extract_attr_string(
-        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
-        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
-        attr_value: gimli::AttributeValue<EndianSlice<'static, LittleEndian>>,
+        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
+        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
+        attr_value: gimli::AttributeValue<EndianArcSlice<LittleEndian>>,
     ) -> Result<Option<String>> {
         if let Ok(string) = dwarf.attr_string(unit, attr_value) {
-            return Ok(Some(string.to_string_lossy().into_owned()));
+            if let Ok(s_str) = string.to_string_lossy() {
+                return Ok(Some(s_str.into_owned()));
+            }
         }
         Ok(None)
     }
@@ -102,14 +104,16 @@ impl<'a> DwarfParser<'a> {
     // Helper methods (extracted from unified_builder.rs)
     fn extract_name(
         &self,
-        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
-        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
-        entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
+        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
+        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
     ) -> Result<Option<String>> {
         // Prefer local DW_AT_name
         if let Some(attr) = entry.attr(gimli::constants::DW_AT_name)? {
             if let Ok(name) = dwarf.attr_string(unit, attr.value()) {
-                return Ok(Some(name.to_string_lossy().into_owned()));
+                if let Ok(s_str) = name.to_string_lossy() {
+                    return Ok(Some(s_str.into_owned()));
+                }
             }
         }
 
@@ -130,16 +134,18 @@ impl<'a> DwarfParser<'a> {
     }
 
     fn resolve_name_via_ref(
-        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
-        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
-        value: gimli::AttributeValue<EndianSlice<'static, LittleEndian>>,
+        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
+        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
+        value: gimli::AttributeValue<EndianArcSlice<LittleEndian>>,
     ) -> Result<Option<String>> {
         match value {
             gimli::AttributeValue::UnitRef(uoff) => {
                 if let Ok(spec_entry) = unit.entry(uoff) {
                     if let Some(attr) = spec_entry.attr(gimli::constants::DW_AT_name)? {
                         if let Ok(name) = dwarf.attr_string(unit, attr.value()) {
-                            return Ok(Some(name.to_string_lossy().into_owned()));
+                            if let Ok(s_str) = name.to_string_lossy() {
+                                return Ok(Some(s_str.into_owned()));
+                            }
                         }
                     }
                 }
@@ -155,9 +161,9 @@ impl<'a> DwarfParser<'a> {
 
     fn extract_linkage_name(
         &self,
-        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
-        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
-        entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
+        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
+        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
     ) -> Result<Option<(String, bool)>> {
         if let Some(attr) = entry.attr(gimli::constants::DW_AT_linkage_name)? {
             if let Some(name) = Self::extract_attr_string(dwarf, unit, attr.value())? {
@@ -173,7 +179,7 @@ impl<'a> DwarfParser<'a> {
     }
 
     fn extract_inline_flag(
-        entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
     ) -> Result<bool> {
         if let Some(attr) = entry.attr(gimli::constants::DW_AT_inline)? {
             if let gimli::AttributeValue::Inline(inline_attr) = attr.value() {
@@ -186,9 +192,9 @@ impl<'a> DwarfParser<'a> {
 
     fn resolve_function_metadata(
         &self,
-        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
-        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
-        entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
+        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
+        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
         cache: &mut HashMap<gimli::UnitOffset, FunctionMetadata>,
         visited: &mut HashSet<gimli::UnitOffset>,
     ) -> Result<FunctionMetadata> {
@@ -272,7 +278,7 @@ impl<'a> DwarfParser<'a> {
 
     fn is_static_symbol(
         &self,
-        entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
     ) -> Result<bool> {
         if let Some(attr) = entry.attr(gimli::constants::DW_AT_external)? {
             if let gimli::AttributeValue::Flag(is_external) = attr.value() {
@@ -283,7 +289,7 @@ impl<'a> DwarfParser<'a> {
     }
 
     fn is_declaration(
-        entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
     ) -> Result<bool> {
         if let Some(attr) = entry.attr(gimli::constants::DW_AT_declaration)? {
             if let gimli::AttributeValue::Flag(is_decl) = attr.value() {
@@ -297,9 +303,9 @@ impl<'a> DwarfParser<'a> {
     /// Supports DW_AT_low_pc/high_pc and DW_AT_ranges (returns all ranges)
     fn extract_address_ranges(
         &self,
-        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
-        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
-        entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
+        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
+        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
     ) -> Result<Vec<(u64, u64)>> {
         // Use RangeExtractor for unified logic
         RangeExtractor::extract_all_ranges(entry, unit, dwarf)
@@ -309,8 +315,8 @@ impl<'a> DwarfParser<'a> {
     /// Supports direct Addr and simple Exprloc with DW_OP_addr or constant-as-address
     fn extract_variable_address(
         &self,
-        entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
-        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
+        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
     ) -> Result<Option<u64>> {
         if let Some(attr) = entry.attr(gimli::constants::DW_AT_location)? {
             match attr.value() {
@@ -395,7 +401,7 @@ impl<'a> DwarfParser<'a> {
 
     fn extract_entry_pc(
         &self,
-        entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
     ) -> Result<Option<u64>> {
         if let Some(attr) = entry.attr(gimli::constants::DW_AT_entry_pc)? {
             if let gimli::AttributeValue::Addr(addr) = attr.value() {
@@ -409,7 +415,7 @@ impl<'a> DwarfParser<'a> {
 
     fn is_main_function(
         &self,
-        entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
         name: &str,
     ) -> Result<bool> {
         // Check for DW_AT_main_subprogram attribute
@@ -426,8 +432,8 @@ impl<'a> DwarfParser<'a> {
 
     fn extract_language(
         &self,
-        _dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
-        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
+        _dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
+        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
     ) -> Option<gimli::DwLang> {
         // Try to get language from compilation unit
         let mut entries = unit.entries();
@@ -454,8 +460,9 @@ impl<'a> DwarfParser<'a> {
 
         // Parse all compilation units for line information only
         let mut units = self.dwarf.units();
-        while let Ok(Some(header)) = units.next() {
-            let unit = self.dwarf.unit(header)?;
+        while let Ok(Some(unit_header)) = units.next() {
+            let version = unit_header.version();
+            let unit = self.dwarf.unit(unit_header)?;
             if let Some(ref line_program) = unit.line_program {
                 // Get compilation unit name
                 let cu_name = Self::extract_cu_name_from_dwarf(self.dwarf, &unit)
@@ -463,14 +470,16 @@ impl<'a> DwarfParser<'a> {
                 let comp_dir = Self::extract_comp_dir_from_dwarf(self.dwarf, &unit);
 
                 // Create lightweight file index for this CU
-                let mut file_index = LightweightFileIndex::new(comp_dir, header.version());
+                let mut file_index = LightweightFileIndex::new(comp_dir, version);
 
                 let header = line_program.header();
 
                 // Add directories from line program
                 for dir_entry in header.include_directories() {
-                    if let Ok(dir_path) = self.dwarf.attr_string(&unit, *dir_entry) {
-                        file_index.add_directory(dir_path.to_string_lossy().into_owned());
+                    if let Ok(dir_path) = self.dwarf.attr_string(&unit, dir_entry.clone()) {
+                        if let Ok(s_str) = dir_path.to_string_lossy() {
+                            file_index.add_directory(s_str.into_owned());
+                        }
                     }
                 }
 
@@ -484,11 +493,13 @@ impl<'a> DwarfParser<'a> {
 
                     if let Ok(filename) = self.dwarf.attr_string(&unit, file_entry.path_name()) {
                         let dir_index = file_entry.directory_index();
-                        file_index.add_file_entry(
-                            file_index_value,
-                            dir_index,
-                            filename.to_string_lossy().into_owned(),
-                        );
+                        if let Ok(s_str) = filename.to_string_lossy() {
+                            file_index.add_file_entry(
+                                file_index_value,
+                                dir_index,
+                                s_str.into_owned(),
+                            );
+                        }
                     }
                 }
 
@@ -569,13 +580,13 @@ impl<'a> DwarfParser<'a> {
         // Parse all compilation units for debug info only
         let mut units = self.dwarf.units();
         while let Ok(Some(header)) = units.next() {
-            let unit = self.dwarf.unit(header)?;
-            let cu_language = self.extract_language(self.dwarf, &unit);
-
             let unit_offset = match header.offset() {
                 gimli::UnitSectionOffset::DebugInfoOffset(offset) => offset,
                 _ => continue,
             };
+
+            let unit = self.dwarf.unit(header)?;
+            let cu_language = self.extract_language(self.dwarf, &unit);
 
             // Parse DIEs without file path resolution (will be resolved later)
             let mut entries = unit.entries();
@@ -804,9 +815,9 @@ impl<'a> DwarfParser<'a> {
 
     /// Static version of extract_file_info_from_line_program for parallel use
     fn extract_file_info_from_line_program_static(
-        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
-        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
-        line_program: &gimli::IncompleteLineProgram<EndianSlice<'static, LittleEndian>>,
+        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
+        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
+        line_program: &gimli::IncompleteLineProgram<EndianArcSlice<LittleEndian>>,
     ) -> Result<CompilationUnit> {
         let cu_name = Self::extract_cu_name_from_dwarf(dwarf, unit)
             .unwrap_or_else(|| format!("unknown_cu_{:?}", unit.header.offset()));
@@ -828,9 +839,10 @@ impl<'a> DwarfParser<'a> {
             .enumerate()
             .map(|(i, path)| {
                 let path_str = dwarf
-                    .attr_string(unit, *path)
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|_| format!("unknown_dir_{i}"));
+                    .attr_string(unit, path.clone())
+                    .ok()
+                    .and_then(|s| s.to_string_lossy().ok().map(|cow| cow.into_owned()))
+                    .unwrap_or_else(|| format!("unknown_dir_{i}"));
                 debug!("Include directory [{}]: '{}'", i + 1, path_str);
                 path_str
             })
@@ -866,15 +878,17 @@ impl<'a> DwarfParser<'a> {
     }
 
     fn extract_cu_name_from_dwarf(
-        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
-        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
+        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
+        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
     ) -> Option<String> {
         let mut entries = unit.entries();
         let (_, entry) = entries.next_dfs().ok()??;
 
         if let Ok(Some(name_attr)) = entry.attr_value(gimli::constants::DW_AT_name) {
             if let Ok(name) = dwarf.attr_string(unit, name_attr) {
-                return Some(name.to_string_lossy().into_owned());
+                if let Ok(s_str) = name.to_string_lossy() {
+                    return Some(s_str.into_owned());
+                }
             }
         }
 
@@ -882,15 +896,17 @@ impl<'a> DwarfParser<'a> {
     }
 
     fn extract_comp_dir_from_dwarf(
-        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
-        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
+        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
+        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
     ) -> Option<String> {
         let mut entries = unit.entries();
         let (_, entry) = entries.next_dfs().ok()??;
 
         if let Ok(Some(comp_dir_attr)) = entry.attr_value(gimli::constants::DW_AT_comp_dir) {
             if let Ok(comp_dir) = dwarf.attr_string(unit, comp_dir_attr) {
-                return Some(comp_dir.to_string_lossy().into_owned());
+                if let Ok(s_str) = comp_dir.to_string_lossy() {
+                    return Some(s_str.into_owned());
+                }
             }
         }
 
@@ -898,10 +914,10 @@ impl<'a> DwarfParser<'a> {
     }
 
     fn extract_source_file_static(
-        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
-        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
+        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
+        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
         file_index: u64,
-        file_entry: &gimli::FileEntry<EndianSlice<'static, LittleEndian>>,
+        file_entry: &gimli::FileEntry<EndianArcSlice<LittleEndian>>,
         compilation_unit: &str,
         base_directory: &str,
         include_directories: &[String],
@@ -918,8 +934,9 @@ impl<'a> DwarfParser<'a> {
         // Get filename
         let filename = dwarf
             .attr_string(unit, file_entry.path_name())
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| "unknown".to_string());
+            .ok()
+            .and_then(|s| s.to_string_lossy().ok().map(|cow| cow.into_owned()))
+            .unwrap_or_else(|| "unknown".to_string());
 
         // Filter out system files
         if filename == "<built-in>" {

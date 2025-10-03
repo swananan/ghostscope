@@ -3,13 +3,13 @@
 
 use crate::core::{EvaluationResult, Result};
 use gimli::Reader;
-use gimli::{EndianSlice, LittleEndian};
+use gimli::{EndianArcSlice, LittleEndian};
 
 // PlanAction removed (unused)
 
 /// Utilities for DIE-level chain access planning
 pub struct AccessPlanner<'dwarf> {
-    dwarf: &'dwarf gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
+    dwarf: &'dwarf gimli::Dwarf<EndianArcSlice<LittleEndian>>,
     type_index: Option<std::sync::Arc<crate::data::TypeNameIndex>>,
     strict_index: bool,
 }
@@ -30,7 +30,7 @@ pub struct MemberParentCtx {
 }
 
 impl<'dwarf> AccessPlanner<'dwarf> {
-    pub fn new(dwarf: &'dwarf gimli::Dwarf<EndianSlice<'static, LittleEndian>>) -> Self {
+    pub fn new(dwarf: &'dwarf gimli::Dwarf<EndianArcSlice<LittleEndian>>) -> Self {
         Self {
             dwarf,
             type_index: None,
@@ -39,7 +39,7 @@ impl<'dwarf> AccessPlanner<'dwarf> {
     }
 
     pub fn new_with_index(
-        dwarf: &'dwarf gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
+        dwarf: &'dwarf gimli::Dwarf<EndianArcSlice<LittleEndian>>,
         type_index: std::sync::Arc<crate::data::TypeNameIndex>,
         strict_index: bool,
     ) -> Self {
@@ -53,16 +53,16 @@ impl<'dwarf> AccessPlanner<'dwarf> {
     /// Resolve DW_AT_type reference with origins/specification following
     fn resolve_type_ref_with_origins(
         &self,
-        entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
-        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
+        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
     ) -> crate::core::Result<Option<gimli::UnitOffset>> {
         // Local recursive helper mimicking DetailedParser::resolve_attr_with_origins
         fn resolve_attr_with_origins(
-            entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
-            unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
+            entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
+            unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
             attr: gimli::DwAt,
             visited: &mut std::collections::HashSet<gimli::UnitOffset>,
-        ) -> crate::core::Result<Option<gimli::AttributeValue<EndianSlice<'static, LittleEndian>>>>
+        ) -> crate::core::Result<Option<gimli::AttributeValue<EndianArcSlice<LittleEndian>>>>
         {
             if let Some(value) = entry.attr_value(attr)? {
                 return Ok(Some(value));
@@ -96,8 +96,8 @@ impl<'dwarf> AccessPlanner<'dwarf> {
     /// Public wrapper for resolving DW_AT_type via origins/specification chain
     pub fn resolve_type_ref_with_origins_public(
         &self,
-        entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
-        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
+        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
     ) -> crate::core::Result<Option<gimli::UnitOffset>> {
         self.resolve_type_ref_with_origins(entry, unit)
     }
@@ -105,7 +105,7 @@ impl<'dwarf> AccessPlanner<'dwarf> {
     /// Follow typedef/qualified chain to the underlying type DIE
     fn strip_typedef_qualified(
         &self,
-        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
+        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
         mut die_off: gimli::UnitOffset,
     ) -> crate::core::Result<gimli::UnitOffset> {
         loop {
@@ -129,8 +129,8 @@ impl<'dwarf> AccessPlanner<'dwarf> {
     /// If DIE is a declaration, try to find a full definition across units by name+tag
     fn maybe_complete_aggregate(
         &self,
-        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
-        die: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
+        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
+        die: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
     ) -> crate::core::Result<(Option<gimli::UnitSectionOffset>, gimli::UnitOffset)> {
         // Check declaration flag or childless struct
         let mut is_decl = false;
@@ -149,7 +149,7 @@ impl<'dwarf> AccessPlanner<'dwarf> {
             self.dwarf
                 .attr_string(unit, attr.value())
                 .ok()
-                .map(|s| s.to_string_lossy().into_owned())
+                .and_then(|s| s.to_string_lossy().ok().map(|cow| cow.into_owned()))
         } else {
             None
         };
@@ -178,9 +178,11 @@ impl<'dwarf> AccessPlanner<'dwarf> {
     /// Evaluate DW_AT_data_member_location expression to constant offset if possible
     fn eval_member_offset_expr(
         &self,
-        expr: &gimli::Expression<EndianSlice<'static, LittleEndian>>,
+        expr: &gimli::Expression<EndianArcSlice<LittleEndian>>,
     ) -> Option<u64> {
-        let bytes = expr.0.slice();
+        use gimli::Reader;
+        let bytes_cow = expr.0.to_slice().ok()?;
+        let bytes: &[u8] = &bytes_cow;
         if bytes.is_empty() {
             return None;
         }
@@ -201,7 +203,7 @@ impl<'dwarf> AccessPlanner<'dwarf> {
     fn header_from_cu_off(
         &self,
         cu_off: gimli::UnitSectionOffset,
-    ) -> crate::core::Result<gimli::UnitHeader<EndianSlice<'static, LittleEndian>>> {
+    ) -> crate::core::Result<gimli::UnitHeader<EndianArcSlice<LittleEndian>>> {
         Ok(match cu_off {
             gimli::UnitSectionOffset::DebugInfoOffset(off) => {
                 self.dwarf.debug_info.header_from_offset(off)?
@@ -270,85 +272,98 @@ impl<'dwarf> AccessPlanner<'dwarf> {
                         if e.tag() == gimli::DW_TAG_member {
                             if let Some(attr) = e.attr(gimli::DW_AT_name)? {
                                 if let Ok(s) = self.dwarf.attr_string(&unit_now2, attr.value()) {
-                                    if s.to_string_lossy() == field.as_str() {
-                                        // offset
-                                        let mut off: Option<u64> = None;
-                                        if let Some(a) =
-                                            e.attr(gimli::DW_AT_data_member_location)?
-                                        {
-                                            match a.value() {
-                                                gimli::AttributeValue::Udata(v) => off = Some(v),
-                                                gimli::AttributeValue::Exprloc(expr) => {
-                                                    off = self.eval_member_offset_expr(&expr)
-                                                }
-                                                _ => {}
-                                            }
-                                        }
-                                        if off.is_none() {
-                                            if let Some(a) = e.attr(gimli::DW_AT_data_bit_offset)? {
-                                                if let gimli::AttributeValue::Udata(v) = a.value() {
-                                                    off = Some(v / 8);
+                                    if let Ok(s_str) = s.to_string_lossy() {
+                                        if s_str == field.as_str() {
+                                            // offset
+                                            let mut off: Option<u64> = None;
+                                            if let Some(a) =
+                                                e.attr(gimli::DW_AT_data_member_location)?
+                                            {
+                                                match a.value() {
+                                                    gimli::AttributeValue::Udata(v) => {
+                                                        off = Some(v)
+                                                    }
+                                                    gimli::AttributeValue::Exprloc(expr) => {
+                                                        off = self.eval_member_offset_expr(&expr)
+                                                    }
+                                                    _ => {}
                                                 }
                                             }
-                                        }
-                                        // Apply offset immediately if available
-                                        if let Some(off) = off {
-                                            use crate::core::{
-                                                ComputeStep, EvaluationResult, LocationResult,
-                                            };
-                                            current_eval = match current_eval {
-                                                EvaluationResult::MemoryLocation(
-                                                    LocationResult::RegisterAddress {
-                                                        register,
-                                                        offset,
-                                                        size,
-                                                    },
-                                                ) => {
-                                                    let new_off = offset
-                                                        .unwrap_or(0)
-                                                        .saturating_add(off as i64);
+                                            if off.is_none() {
+                                                if let Some(a) =
+                                                    e.attr(gimli::DW_AT_data_bit_offset)?
+                                                {
+                                                    if let gimli::AttributeValue::Udata(v) =
+                                                        a.value()
+                                                    {
+                                                        off = Some(v / 8);
+                                                    }
+                                                }
+                                            }
+                                            // Apply offset immediately if available
+                                            if let Some(off) = off {
+                                                use crate::core::{
+                                                    ComputeStep, EvaluationResult, LocationResult,
+                                                };
+                                                current_eval = match current_eval {
                                                     EvaluationResult::MemoryLocation(
                                                         LocationResult::RegisterAddress {
                                                             register,
-                                                            offset: Some(new_off),
+                                                            offset,
                                                             size,
                                                         },
-                                                    )
-                                                }
-                                                EvaluationResult::MemoryLocation(
-                                                    LocationResult::Address(addr),
-                                                ) => EvaluationResult::MemoryLocation(
-                                                    LocationResult::Address(
-                                                        addr.saturating_add(off),
-                                                    ),
-                                                ),
-                                                EvaluationResult::MemoryLocation(
-                                                    LocationResult::ComputedLocation { mut steps },
-                                                ) => {
-                                                    steps.push(ComputeStep::PushConstant(
-                                                        off as i64,
-                                                    ));
-                                                    steps.push(ComputeStep::Add);
+                                                    ) => {
+                                                        let new_off = offset
+                                                            .unwrap_or(0)
+                                                            .saturating_add(off as i64);
+                                                        EvaluationResult::MemoryLocation(
+                                                            LocationResult::RegisterAddress {
+                                                                register,
+                                                                offset: Some(new_off),
+                                                                size,
+                                                            },
+                                                        )
+                                                    }
                                                     EvaluationResult::MemoryLocation(
-                                                        LocationResult::ComputedLocation { steps },
-                                                    )
-                                                }
-                                                other => other,
-                                            };
-                                        }
-                                        // type
-                                        if let Some(a) = e.attr(gimli::DW_AT_type)? {
-                                            if let gimli::AttributeValue::UnitRef(u) = a.value() {
-                                                next_type = Some(u);
+                                                        LocationResult::Address(addr),
+                                                    ) => EvaluationResult::MemoryLocation(
+                                                        LocationResult::Address(
+                                                            addr.saturating_add(off),
+                                                        ),
+                                                    ),
+                                                    EvaluationResult::MemoryLocation(
+                                                        LocationResult::ComputedLocation {
+                                                            mut steps,
+                                                        },
+                                                    ) => {
+                                                        steps.push(ComputeStep::PushConstant(
+                                                            off as i64,
+                                                        ));
+                                                        steps.push(ComputeStep::Add);
+                                                        EvaluationResult::MemoryLocation(
+                                                            LocationResult::ComputedLocation {
+                                                                steps,
+                                                            },
+                                                        )
+                                                    }
+                                                    other => other,
+                                                };
                                             }
+                                            // type
+                                            if let Some(a) = e.attr(gimli::DW_AT_type)? {
+                                                if let gimli::AttributeValue::UnitRef(u) = a.value()
+                                                {
+                                                    next_type = Some(u);
+                                                }
+                                            }
+                                            type_die_off = next_type.unwrap_or(type_die_off);
+                                            last_parent_ctx = Some(MemberParentCtx {
+                                                parent_cu_off: current_cu_off,
+                                                parent_die_off: def_off,
+                                                member_name: field.clone(),
+                                            });
+                                            break;
                                         }
-                                        type_die_off = next_type.unwrap_or(type_die_off);
-                                        last_parent_ctx = Some(MemberParentCtx {
-                                            parent_cu_off: current_cu_off,
-                                            parent_die_off: def_off,
-                                            member_name: field.clone(),
-                                        });
-                                        break;
                                     }
                                 }
                             }

@@ -4,7 +4,7 @@
 use crate::{
     core::Result, data::TypeNameIndex, parser::DetailedParser, parser::VariableWithEvaluation,
 };
-use gimli::{EndianSlice, LittleEndian};
+use gimli::{EndianArcSlice, LittleEndian};
 // Use upper-case aliases to satisfy non_upper_case_globals lint on pattern constants
 // No direct constant tag imports needed here
 // tracing::warn no longer used after removing legacy traversal
@@ -18,7 +18,7 @@ pub struct ChainSpec<'a> {
 /// Real on-demand DWARF resolver
 #[derive(Debug)]
 pub struct OnDemandResolver {
-    dwarf: gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
+    dwarf: gimli::Dwarf<EndianArcSlice<LittleEndian>>,
     detailed_parser: DetailedParser,
     /// Optional cross-CU type name index (built from lightweight index)
     type_name_index: Option<std::sync::Arc<TypeNameIndex>>,
@@ -29,7 +29,7 @@ pub struct OnDemandResolver {
 impl OnDemandResolver {
     /// Create resolver with a type name index for faster cross-CU completion
     pub fn new_with_type_index(
-        dwarf: gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
+        dwarf: gimli::Dwarf<EndianArcSlice<LittleEndian>>,
         type_index: std::sync::Arc<TypeNameIndex>,
     ) -> Self {
         let mut detailed_parser = DetailedParser::new();
@@ -43,7 +43,7 @@ impl OnDemandResolver {
     }
 
     /// Borrow DWARF reference for building auxiliary indexes lazily
-    pub fn dwarf_ref(&self) -> &gimli::Dwarf<EndianSlice<'static, LittleEndian>> {
+    pub fn dwarf_ref(&self) -> &gimli::Dwarf<EndianArcSlice<LittleEndian>> {
         &self.dwarf
     }
 

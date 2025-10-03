@@ -10,7 +10,7 @@ use crate::{
     parser::ExpressionEvaluator,
     TypeInfo,
 };
-use gimli::{EndianSlice, LittleEndian, Reader};
+use gimli::{EndianArcSlice, LittleEndian, Reader};
 // Alias gimli constants to upper-case identifiers to satisfy naming lints without allow attributes
 use gimli::constants::{
     DW_AT_byte_size as DW_AT_BYTE_SIZE, DW_AT_encoding as DW_AT_ENCODING, DW_AT_name as DW_AT_NAME,
@@ -57,8 +57,8 @@ impl DetailedParser {
     /// Shallow type resolution (no recursive member expansion)
     /// Returns minimal TypeInfo with name/size where possible.
     pub fn resolve_type_shallow_at_offset(
-        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
-        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
+        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
+        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
         mut type_offset: gimli::UnitOffset,
     ) -> Option<TypeInfo> {
         let mut visited = std::collections::HashSet::new();
@@ -80,7 +80,9 @@ impl DetailedParser {
             let mut entry_name: Option<String> = None;
             if let Ok(Some(a)) = entry.attr(DW_AT_NAME) {
                 if let Ok(s) = dwarf.attr_string(unit, a.value()) {
-                    entry_name = Some(s.to_string_lossy().into_owned());
+                    if let Ok(s_str) = s.to_string_lossy() {
+                        entry_name = Some(s_str.into_owned());
+                    }
                 }
             }
             match tag {
@@ -144,8 +146,9 @@ impl DetailedParser {
                                             if let Ok(Some(na)) = tentry.attr(DW_AT_NAME) {
                                                 if let Ok(s) = dwarf.attr_string(unit, na.value()) {
                                                     if pointee_name.is_none() {
-                                                        pointee_name =
-                                                            Some(s.to_string_lossy().into_owned());
+                                                        if let Ok(s_str) = s.to_string_lossy() {
+                                                            pointee_name = Some(s_str.into_owned());
+                                                        }
                                                     }
                                                 }
                                             }
@@ -175,7 +178,10 @@ impl DetailedParser {
                                         }
                                         let name = if let Ok(Some(na)) = tentry.attr(DW_AT_NAME) {
                                             if let Ok(s) = dwarf.attr_string(unit, na.value()) {
-                                                s.to_string_lossy().into_owned()
+                                                s.to_string_lossy()
+                                                    .ok()
+                                                    .map(|c| c.into_owned())
+                                                    .unwrap_or_else(|| "<base>".into())
                                             } else {
                                                 "<base>".into()
                                             }
@@ -197,11 +203,16 @@ impl DetailedParser {
                                         // Only record the name; deref-time upgrade will use analyzer's shallow index safely.
                                         if let Ok(Some(na)) = tentry.attr(DW_AT_NAME) {
                                             if let Ok(s) = dwarf.attr_string(unit, na.value()) {
-                                                let n = s.to_string_lossy().into_owned();
-                                                pointee_name = Some(n.clone());
-                                                // keep target as UnknownType{name} to avoid deep recursion here
-                                                if matches!(target, TypeInfo::UnknownType { .. }) {
-                                                    target = TypeInfo::UnknownType { name: n };
+                                                if let Ok(s_str) = s.to_string_lossy() {
+                                                    let n = s_str.into_owned();
+                                                    pointee_name = Some(n.clone());
+                                                    // keep target as UnknownType{name} to avoid deep recursion here
+                                                    if matches!(
+                                                        target,
+                                                        TypeInfo::UnknownType { .. }
+                                                    ) {
+                                                        target = TypeInfo::UnknownType { name: n };
+                                                    }
                                                 }
                                             }
                                         }
@@ -273,7 +284,9 @@ impl DetailedParser {
                                     let mut m_name = String::new();
                                     if let Ok(Some(na)) = ce.attr(DW_AT_NAME) {
                                         if let Ok(s) = dwarf.attr_string(unit, na.value()) {
-                                            m_name = s.to_string_lossy().into_owned();
+                                            if let Ok(s_str) = s.to_string_lossy() {
+                                                m_name = s_str.into_owned();
+                                            }
                                         }
                                     }
                                     // member type (shallow)
@@ -416,7 +429,9 @@ impl DetailedParser {
                                     let mut m_name = String::new();
                                     if let Ok(Some(na)) = ce.attr(gimli::DW_AT_name) {
                                         if let Ok(s) = dwarf.attr_string(unit, na.value()) {
-                                            m_name = s.to_string_lossy().into_owned();
+                                            if let Ok(s_str) = s.to_string_lossy() {
+                                                m_name = s_str.into_owned();
+                                            }
                                         }
                                     }
                                     let mut m_type = TypeInfo::UnknownType {
@@ -493,7 +508,9 @@ impl DetailedParser {
                                     let mut v_name = String::new();
                                     if let Ok(Some(na)) = ce.attr(gimli::DW_AT_name) {
                                         if let Ok(s) = dwarf.attr_string(unit, na.value()) {
-                                            v_name = s.to_string_lossy().into_owned();
+                                            if let Ok(s_str) = s.to_string_lossy() {
+                                                v_name = s_str.into_owned();
+                                            }
                                         }
                                     }
                                     let mut v_val: i64 = 0;
@@ -682,9 +699,10 @@ impl DetailedParser {
 
     /// Local simple evaluator for DW_AT_data_member_location exprloc when it's a constant offset.
     fn eval_member_offset_expr_local(
-        expr: &gimli::Expression<EndianSlice<'static, LittleEndian>>,
+        expr: &gimli::Expression<EndianArcSlice<LittleEndian>>,
     ) -> Option<u64> {
-        let bytes = expr.0.slice();
+        let temp = expr.0.to_slice().ok();
+        let bytes = temp.as_deref().unwrap_or(&[]);
         if bytes.is_empty() {
             return None;
         }
@@ -708,9 +726,9 @@ impl DetailedParser {
     /// Parse a variable and optionally skip full DWARF type resolution
     pub fn parse_variable_entry_with_mode(
         &mut self,
-        entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
-        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
-        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
+        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
+        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
         address: u64,
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
         scope_depth: usize,
@@ -742,18 +760,18 @@ impl DetailedParser {
     /// This function follows DW_AT_type chains (pointer/const/array/typedef) and
     /// includes a recursion guard to break true cycles (e.g., typedef A->B->A).
     fn resolve_type_name(
-        entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
-        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
-        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
+        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
+        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
     ) -> Result<String> {
         let mut visited_types: HashSet<gimli::UnitOffset> = HashSet::new();
         Self::resolve_type_name_rec(entry, unit, dwarf, &mut visited_types)
     }
 
     fn resolve_type_name_rec(
-        entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
-        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
-        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
+        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
+        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
         visited: &mut HashSet<gimli::UnitOffset>,
     ) -> Result<String> {
         // Follow DW_AT_type if present
@@ -817,9 +835,9 @@ impl DetailedParser {
     /// Parse location attribute
     pub fn parse_location(
         &self,
-        entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
-        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
-        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
+        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
+        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
         address: u64,
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
     ) -> Result<EvaluationResult> {
@@ -835,11 +853,11 @@ impl DetailedParser {
     }
 
     fn resolve_attr_with_origins(
-        entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
-        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
+        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
         attr: gimli::DwAt,
         visited: &mut HashSet<gimli::UnitOffset>,
-    ) -> Result<Option<gimli::AttributeValue<EndianSlice<'static, LittleEndian>>>> {
+    ) -> Result<Option<gimli::AttributeValue<EndianArcSlice<LittleEndian>>>> {
         if let Some(value) = entry.attr_value(attr)? {
             return Ok(Some(value));
         }
@@ -864,9 +882,9 @@ impl DetailedParser {
     }
 
     fn resolve_name_with_origins(
-        entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
-        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
-        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
+        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
+        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
         visited: &mut HashSet<gimli::UnitOffset>,
     ) -> Result<Option<String>> {
         if let Some(attr) =
@@ -878,8 +896,8 @@ impl DetailedParser {
     }
 
     fn resolve_type_ref(
-        entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
-        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
+        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
     ) -> Result<Option<gimli::UnitOffset>> {
         let mut visited = HashSet::new();
         Ok(Self::resolve_attr_with_origins(
@@ -895,16 +913,18 @@ impl DetailedParser {
     }
 
     fn attr_to_string(
-        attr: gimli::AttributeValue<EndianSlice<'static, LittleEndian>>,
-        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
-        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
+        attr: gimli::AttributeValue<EndianArcSlice<LittleEndian>>,
+        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
+        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
     ) -> Result<Option<String>> {
-        if let Ok(attr_string) = dwarf.attr_string(unit, attr) {
-            return Ok(Some(attr_string.to_string_lossy().into_owned()));
+        if let Ok(attr_string) = dwarf.attr_string(unit, attr.clone()) {
+            if let Ok(s_str) = attr_string.to_string_lossy() {
+                return Ok(Some(s_str.into_owned()));
+            }
         }
 
         if let gimli::AttributeValue::String(s) = attr {
-            return Ok(s.to_string().ok().map(|cow| cow.to_owned()));
+            return Ok(s.to_string().ok().map(|cow| cow.into_owned()));
         }
 
         Ok(None)
