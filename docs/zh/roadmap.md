@@ -1,24 +1,26 @@
-# 未来规划
+# GhostScope 路线图（里程碑）
 
-## 栈回溯（Stack Unwinding）
+## 全局变量在 `-p <pid>` 模式下的稳定性与兼容性提升：
+  - ASLR 偏移自动计算与下发
+  - 运行时空指针解引用保护
 
-支持在追踪点处获取完整的函数调用栈，基于 `.eh_frame` 解析实现。
+## `-t <exec_path>` 模式支持全局变量（计划中）：
+  - 背景：全局变量需要结合 `/proc/<pid>/maps` 计算模块偏移，`-t` 启动时尚无 PID 上下文。
+  - 方向：在 attach 流程中引入 PID 发现/订阅机制，或在触发时机得到 PID 后再计算并下发偏移；同时确保安全与时序正确。
+  - 在该能力落地前，`-t` 模式下全局变量保持禁用（见“使用限制”）。
 
-**参考**：https://lesenechal.fr/en/linux/unwinding-the-stack-the-hard-way#h5.1-parsing-eh_frame-and-eh_frame_hdr-with-gimli
+## 链式数组访问（`a.b[idx].c`）与动态下标（计划中）：
+  - 先支持常量下标，后续扩展到表达式下标，在验证 eBPF 验证器可接受的范围内分阶段推出。
 
-## 稳定性和准确性提升
+## 栈回溯（Stack Unwinding）：
+  - 在追踪点捕获完整调用栈，基于 `.eh_frame` 解析实现。
 
-作为辅助排查问题的工具，准确性是第一位的。将持续修复 bug，完善错误处理，提升追踪数据的可靠性。
+## 稳定性与准确性改进：
+  - 作为调试工具，持续修复缺陷、改进错误处理与数据一致性，提升可用性。
 
-## 使用 bpftime 优化性能
+## 使用 bpftime 优化性能：
+  - 评估从内核 uprobe 迁移到用户态 eBPF（bpftime）的可行性，以降低上下文切换开销。
 
-考虑从基于内核的 uprobe 迁移到 [**bpftime**](https://github.com/eunomia-bpf/bpftime) 用户态 eBPF 执行。这将通过避免内核上下文切换显著提升追踪性能。
-
-**参考**：https://github.com/eunomia-bpf/bpftime
-
-## 高级语言特性支持
-
-两个主要方向：
-
-1. **编译型语言高级特性**：优先支持 Rust 的高级特性（如异步函数、trait 对象等）
-2. **解释型语言支持**：探索对特定解释型语言的追踪支持（如 Lua）
+## 高级语言特性：
+  - 编译型方向：优先支持 Rust 高级特性（async、trait objects 等）
+  - 解释型方向：探索对特定解释型语言（如 Lua）的追踪支持

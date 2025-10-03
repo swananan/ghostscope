@@ -118,6 +118,10 @@ print obj.field.subfield;
 print arr[0].name;
 ```
 
+Note:
+- Auto-dereference is supported for locals, parameters, and globals. You don't need to write `*ptr` explicitly; when it is safe to do so, the pointer will be read and dereferenced at runtime (with null checks).
+- Array access in chains (e.g., `a.b[idx].c`) is not supported yet. This version will reject such expressions or return a clear error.
+
 ## Print Statement
 
 The `print` statement outputs information during tracing.

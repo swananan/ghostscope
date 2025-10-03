@@ -126,3 +126,35 @@ pub struct LineEntry {
     pub epilogue_begin: bool,
     pub end_sequence: bool,
 }
+
+/// Program section classification for global/static variables
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectionType {
+    Text,
+    Rodata,
+    Data,
+    Bss,
+    Unknown,
+}
+
+/// Lightweight global variable metadata resolved from DWARF/ELF
+#[derive(Debug, Clone)]
+pub struct GlobalVariableInfo {
+    pub name: String,
+    /// Link-time address from DWARF location (if available)
+    pub link_address: Option<u64>,
+    /// Best-effort section classification based on ELF section headers
+    pub section: Option<SectionType>,
+    /// For precise follow-up resolution/debugging
+    pub die_offset: gimli::UnitOffset,
+    pub unit_offset: gimli::DebugInfoOffset,
+}
+
+/// Per-module section offsets (runtime bias) computed from /proc/PID/maps
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SectionOffsets {
+    pub text: u64,
+    pub rodata: u64,
+    pub data: u64,
+    pub bss: u64,
+}

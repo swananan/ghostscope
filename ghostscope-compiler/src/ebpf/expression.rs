@@ -99,7 +99,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     )
                 })?;
                 // 2) Convert evaluation result to an address (i64)
-                match self.evaluation_result_to_address(&var.evaluation_result) {
+                match self.evaluation_result_to_address(&var.evaluation_result, None) {
                     Ok(addr) => Ok(addr.into()),
                     Err(_) => Err(super::context::CodeGenError::TypeError(
                         "cannot take address of rvalue".to_string(),

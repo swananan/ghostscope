@@ -15,6 +15,7 @@ pub struct MemoryMapping {
     pub device: String,      // major:minor device
     pub inode: u64,
     pub pathname: Option<String>, // Binary file path
+    pub file_offset: u64,         // File offset of this mapping
 }
 
 /// Module mapping information from proc maps analysis
@@ -108,7 +109,7 @@ impl ProcMappingParser {
 
         // Parse other fields
         let permissions = parts[1].to_string();
-        let _ = u64::from_str_radix(parts[2], 16).ok()?;
+        let file_offset = u64::from_str_radix(parts[2], 16).ok()?;
         let device = parts[3].to_string();
         let inode = parts[4].parse().ok()?;
 
@@ -132,6 +133,7 @@ impl ProcMappingParser {
             device,
             inode,
             pathname,
+            file_offset,
         })
     }
 
@@ -158,5 +160,10 @@ impl ProcMappingParser {
             module_mapping.size
         );
         Ok(module_mapping)
+    }
+
+    /// Public accessor for raw /proc/[pid]/maps entries (for offsets computation)
+    pub fn get_proc_maps(pid: u32) -> Result<Vec<MemoryMapping>> {
+        Self::parse_proc_maps(pid)
     }
 }

@@ -1,0 +1,879 @@
+#![allow(clippy::uninlined_format_args)]
+
+//! Globals program script execution tests
+//! - Validates printing of globals via local aliases in function scope
+//! - Checks struct formatting, string extraction, and formatted prints
+
+mod common;
+
+use common::{init, FIXTURES};
+use regex::Regex;
+use std::ffi::OsString;
+use std::io::Write;
+use std::process::Stdio;
+use std::time::Duration;
+use tempfile::NamedTempFile;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
+use tokio::time::timeout;
+
+async fn run_ghostscope_with_script_for_pid(
+    script_content: &str,
+    timeout_secs: u64,
+    pid: u32,
+) -> anyhow::Result<(i32, String, String)> {
+    let mut script_file = NamedTempFile::new()?;
+    script_file.write_all(script_content.as_bytes())?;
+    let script_path = script_file.path();
+
+    let binary_path = "../target/debug/ghostscope";
+    let args: Vec<OsString> = vec![
+        OsString::from("-p"),
+        OsString::from(pid.to_string()),
+        OsString::from("--script-file"),
+        script_path.as_os_str().to_os_string(),
+        OsString::from("--no-save-llvm-ir"),
+        OsString::from("--no-save-ebpf"),
+        OsString::from("--no-save-ast"),
+        OsString::from("--no-log"),
+    ];
+
+    let mut command = Command::new(binary_path);
+    command.args(&args);
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+
+    let mut child = command.spawn()?;
+    let stdout_handle = child.stdout.take().unwrap();
+    let stderr_handle = child.stderr.take().unwrap();
+    let mut stdout_reader = BufReader::new(stdout_handle);
+    let mut stderr_reader = BufReader::new(stderr_handle);
+    let mut stdout_content = String::new();
+    let mut stderr_content = String::new();
+
+    let read_task = async {
+        let mut stdout_line = String::new();
+        let mut stderr_line = String::new();
+        for _ in 0..120 {
+            stdout_line.clear();
+            if let Ok(Ok(n)) = timeout(
+                Duration::from_millis(50),
+                stdout_reader.read_line(&mut stdout_line),
+            )
+            .await
+            {
+                if n > 0 {
+                    stdout_content.push_str(&stdout_line);
+                }
+            }
+            stderr_line.clear();
+            if let Ok(Ok(n)) = timeout(
+                Duration::from_millis(50),
+                stderr_reader.read_line(&mut stderr_line),
+            )
+            .await
+            {
+                if n > 0 {
+                    stderr_content.push_str(&stderr_line);
+                }
+            }
+            if let Ok(Some(_)) = child.try_wait() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    };
+    let _ = timeout(Duration::from_secs(timeout_secs), read_task).await;
+
+    let mut exit_code = match child.try_wait() {
+        Ok(Some(status)) => status.code().unwrap_or(-1),
+        _ => {
+            let _ = child.kill().await;
+            match timeout(Duration::from_secs(2), child.wait()).await {
+                Ok(Ok(status)) => status.code().unwrap_or(-1),
+                _ => -1,
+            }
+        }
+    };
+    if exit_code == -1 && (!stdout_content.is_empty() || !stderr_content.is_empty()) {
+        exit_code = 0;
+    }
+    Ok((exit_code, stdout_content, stderr_content))
+}
+
+#[tokio::test]
+async fn test_print_format_current_global_member_leaf() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Current-module leaf member via formatted print
+    let script = r#"
+trace globals_program.c:31 {
+    print "GY:{}", G_STATE.inner.y;
+}
+"#;
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    let re = Regex::new(r"GY:([0-9]+(?:\.[0-9]+)?)").unwrap();
+    let mut vals: Vec<f64> = Vec::new();
+    for line in stdout.lines() {
+        if let Some(c) = re.captures(line) {
+            // Ensure scalar print (no struct pretty-print)
+            assert!(
+                !line.contains("Inner {"),
+                "Expected scalar for G_STATE.inner.y, got struct: {}",
+                line
+            );
+            vals.push(c[1].parse().unwrap_or(0.0));
+        }
+    }
+    assert!(
+        vals.len() >= 2,
+        "Insufficient GY events. STDOUT: {}",
+        stdout
+    );
+    // inner.y increments by 0.5 per tick in globals_program
+    let d = ((vals[1] - vals[0]) * 100.0).round() as i64;
+    assert_eq!(
+        d, 50,
+        "G_STATE.inner.y should +0.5 per tick. STDOUT: {}",
+        stdout
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_print_format_global_autoderef_pointer_member() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Test script: global base with one auto-deref in chain
+    let script = r#"
+trace globals_program.c:31 {
+    print "X: {}", G_STATE.lib.inner.x;
+}
+"#;
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    // Expect both a normal numeric output and a NullDeref error output while lib toggles
+    let num_re = Regex::new(r"X:\s*(-?\d+)").unwrap();
+    let err_re = Regex::new(r"X:\s*<error: null pointer dereference> \(int\*\)").unwrap();
+    let mut has_num = false;
+    let mut has_err = false;
+    for line in stdout.lines() {
+        if num_re.is_match(line) {
+            has_num = true;
+        }
+        if err_re.is_match(line) {
+            has_err = true;
+        }
+    }
+    assert!(has_num, "Expected numeric X line. STDOUT: {}", stdout);
+    assert!(has_err, "Expected NullDeref X line. STDOUT: {}", stdout);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_tick_once_entry_strings_and_structs() -> anyhow::Result<()> {
+    init();
+
+    // Build and start globals_program (Debug)
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Attach at a source line after local aliases are initialized (line 26 is first non-comment after 19..24)
+    let script = r#"
+trace globals_program.c:26 {
+    print s.name;       // char[32] -> string
+    print ls.name;      // from shared library
+    print s;            // struct GlobalState pretty print
+    print *ls;          // deref pointer to struct
+}
+"#;
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 2, pid).await?;
+
+    let _ = prog.kill().await;
+
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    // s.name should be a quoted string (either "INIT" or updated value)
+    let has_s_name = stdout.contains("\"INIT\"") || stdout.contains("\"RUNNING\"");
+    assert!(has_s_name, "Expected s.name string. STDOUT: {}", stdout);
+
+    // ls.name (library) should be "LIB"
+    assert!(
+        stdout.contains("\"LIB\""),
+        "Expected ls.name == \"LIB\". STDOUT: {}",
+        stdout
+    );
+
+    // Pretty struct prints for s or *ls should be present
+    let has_struct = stdout.contains("GlobalState {") || stdout.contains("*ls = GlobalState {");
+    assert!(
+        has_struct,
+        "Expected pretty struct output. STDOUT: {}",
+        stdout
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_tick_once_formatted_counters() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Verify formatted output combining fields from exe and lib globals via locals
+    let script = r#"
+trace tick_once {
+    print "G:{} L:{}", s.counter, ls.counter;
+}
+"#;
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 2, pid).await?;
+    let _ = prog.kill().await;
+
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    assert!(
+        stdout.contains("G:") && stdout.contains("L:"),
+        "Expected formatted counters. STDOUT: {}",
+        stdout
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_tick_once_pointer_values() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Validate pointers to rodata appear as addresses; attach after locals are set
+    let script = r#"
+trace globals_program.c:26 {
+    print gm; // const char* to executable rodata
+    print lm; // const char* to library rodata
+}
+"#;
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 2, pid).await?;
+    let _ = prog.kill().await;
+
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    assert!(
+        stdout.contains("0x"),
+        "Expected hexadecimal pointer output. STDOUT: {}",
+        stdout
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_two_events_evolution_and_statics() -> anyhow::Result<()> {
+    init();
+
+    // Build and start globals_program (Debug)
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Attach at initialized locals line; print counters and statics via local pointers
+    let script = r#"
+trace globals_program.c:26 {
+    print s.counter;
+    print ls.counter;
+    print *p_s_internal;
+    print *p_s_bss;
+    print *p_lib_internal;
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    // Parse first two occurrences for each metric
+    let re_s = Regex::new(r"s\.counter\s*=\s*(\d+)").unwrap();
+    let re_ls = Regex::new(r"ls\.counter\s*=\s*(\d+)").unwrap();
+    let re_si = Regex::new(r"\*p_s_internal\s*=\s*(\d+)").unwrap();
+    let re_sb = Regex::new(r"\*p_s_bss\s*=\s*(\d+)").unwrap();
+    let re_li = Regex::new(r"\*p_lib_internal\s*=\s*(\d+)").unwrap();
+
+    let mut s_vals = Vec::new();
+    let mut ls_vals = Vec::new();
+    let mut si_vals = Vec::new();
+    let mut sb_vals = Vec::new();
+    let mut li_vals = Vec::new();
+    for line in stdout.lines() {
+        if let Some(c) = re_s.captures(line) {
+            s_vals.push(c[1].parse::<i64>().unwrap_or(0));
+        }
+        if let Some(c) = re_ls.captures(line) {
+            ls_vals.push(c[1].parse::<i64>().unwrap_or(0));
+        }
+        if let Some(c) = re_si.captures(line) {
+            si_vals.push(c[1].parse::<i64>().unwrap_or(0));
+        }
+        if let Some(c) = re_sb.captures(line) {
+            sb_vals.push(c[1].parse::<i64>().unwrap_or(0));
+        }
+        if let Some(c) = re_li.captures(line) {
+            li_vals.push(c[1].parse::<i64>().unwrap_or(0));
+        }
+    }
+
+    // Ensure at least two events captured for robust delta checks
+    assert!(
+        s_vals.len() >= 2
+            && ls_vals.len() >= 2
+            && si_vals.len() >= 2
+            && sb_vals.len() >= 2
+            && li_vals.len() >= 2,
+        "Insufficient events for delta checks. STDOUT: {}",
+        stdout
+    );
+
+    // Check program logic deltas between first two hits
+    assert!(s_vals[1] >= s_vals[0], "s.counter should be non-decreasing");
+    assert_eq!(ls_vals[1] - ls_vals[0], 2, "ls.counter should +2 per tick");
+    assert_eq!(si_vals[1] - si_vals[0], 2, "s_internal should +2 per tick");
+    assert_eq!(
+        sb_vals[1] - sb_vals[0],
+        3,
+        "s_bss_counter should +3 per tick"
+    );
+    assert_eq!(
+        li_vals[1] - li_vals[0],
+        5,
+        "lib_internal_counter should +5 per tick"
+    );
+
+    Ok(())
+}
+#[tokio::test]
+async fn test_direct_globals_current_module() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Directly print globals without local aliases
+    let script = r#"
+trace globals_program.c:31 {
+    print G_STATE;
+    print s_internal;
+    print s_bss_counter;
+    // Also verify print format with direct globals
+    print "FMT:{}|{}", s_internal, s_bss_counter;
+}
+"#;
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    // Expect at least some struct pretty print and integer values present
+    assert!(
+        stdout.contains("G_STATE") && stdout.contains("GlobalState"),
+        "Expected G_STATE struct print. STDOUT: {}",
+        stdout
+    );
+
+    let re_si = Regex::new(r"s_internal\s*=\s*(-?\d+)").unwrap();
+    let re_sb = Regex::new(r"s_bss_counter\s*=\s*(-?\d+)").unwrap();
+    let mut si_vals = Vec::new();
+    let mut sb_vals = Vec::new();
+    for line in stdout.lines() {
+        if let Some(c) = re_si.captures(line) {
+            si_vals.push(c[1].parse::<i64>().unwrap_or(0));
+        }
+        if let Some(c) = re_sb.captures(line) {
+            sb_vals.push(c[1].parse::<i64>().unwrap_or(0));
+        }
+    }
+    // We expect at least 2 hits for each
+    assert!(
+        si_vals.len() >= 2 && sb_vals.len() >= 2,
+        "Insufficient events. STDOUT: {}",
+        stdout
+    );
+    // Check deltas align with logic: +2 and +3 per tick
+    assert_eq!(si_vals[1] - si_vals[0], 2, "s_internal should +2 per tick");
+    assert_eq!(
+        sb_vals[1] - sb_vals[0],
+        3,
+        "s_bss_counter should +3 per tick"
+    );
+    // Verify formatted line FMT:{}|{} reflects the same counters and deltas
+    let re_fmt = Regex::new(r"FMT:(-?\d+)\|(-?\d+)").unwrap();
+    let mut f_a = Vec::new();
+    let mut f_b = Vec::new();
+    for line in stdout.lines() {
+        if let Some(c) = re_fmt.captures(line) {
+            f_a.push(c[1].parse::<i64>().unwrap_or(0));
+            f_b.push(c[2].parse::<i64>().unwrap_or(0));
+        }
+    }
+    assert!(
+        f_a.len() >= 2 && f_b.len() >= 2,
+        "Insufficient FMT events. STDOUT: {}",
+        stdout
+    );
+    assert_eq!(f_a[1] - f_a[0], 2, "FMT s_internal delta +2");
+    assert_eq!(f_b[1] - f_b[0], 3, "FMT s_bss_counter delta +3");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_direct_global_cross_module() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Cross-module global: offsets are auto-populated in -p mode; expect successful struct print
+    let script = r#"
+trace globals_program.c:31 {
+    print LIB_STATE;
+    // Also emit formatted cross-module counter to ensure format-path works for globals
+    print "LIBCNT:{}", LIB_STATE.counter;
+}
+"#;
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 2, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    // Expect pretty struct output for LIB_STATE
+    assert!(
+        stdout.contains("LIB_STATE"),
+        "Expected LIB_STATE in output. STDOUT: {}",
+        stdout
+    );
+    // Accept either typedef name or resolved struct display
+    assert!(
+        stdout.contains("GlobalState {") || (stdout.contains("{") && stdout.contains("name:")),
+        "Expected pretty struct print for LIB_STATE. STDOUT: {}",
+        stdout
+    );
+    // Verify formatted LIBCNT increments across at least two events
+    let re = Regex::new(r"LIBCNT:(-?\d+)").unwrap();
+    let mut vals = Vec::new();
+    for line in stdout.lines() {
+        if let Some(c) = re.captures(line) {
+            vals.push(c[1].parse::<i64>().unwrap_or(0));
+        }
+    }
+    assert!(
+        vals.len() >= 2,
+        "Insufficient LIBCNT events. STDOUT: {}",
+        stdout
+    );
+    assert_eq!(vals[1] - vals[0], 2, "LIB_STATE.counter should +2 per tick");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rodata_direct_strings() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Directly print rodata arrays as strings (executable + library)
+    let script = r#"
+trace globals_program.c:31 {
+    print g_message;    // executable .rodata (char[...])
+    print lib_message;  // library .rodata (char[...])
+    // Also check formatted path for strings
+    print "FMT:{}|{}", g_message, lib_message;
+}
+"#;
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 2, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    // Expect two quoted strings present (best-effort; content may vary across builds)
+    let got_g_message = stdout
+        .lines()
+        .any(|l| l.contains("g_message = \"") && l.contains("\""));
+    let got_lib_message = stdout
+        .lines()
+        .any(|l| l.contains("lib_message = \"") && l.contains("\""));
+    assert!(
+        got_g_message && got_lib_message,
+        "Expected direct string prints for rodata. STDOUT: {}",
+        stdout
+    );
+    // Look for a formatted line with both quoted strings
+    let fmt_has_strings = stdout
+        .lines()
+        .any(|l| l.contains("FMT:") && l.matches('"').count() >= 2);
+    assert!(
+        fmt_has_strings,
+        "Expected formatted strings line. STDOUT: {}",
+        stdout
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_bss_first_byte_evolves() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Read first byte of executable/library .bss buffers via locals 'gb'/'lb'
+    let script = r#"
+trace globals_program.c:29 {
+    print *gb; // g_bss_buffer[0]
+    print *lb; // lib_bss[0]
+    // Also formatted first bytes from both buffers
+    print "BF:{}|{}", *gb, *lb;
+}
+"#;
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    let re_gb = Regex::new(r"\*gb\s*=\s*(-?\d+)").unwrap();
+    let re_lb = Regex::new(r"\*lb\s*=\s*(-?\d+)").unwrap();
+    let mut gb_vals = Vec::new();
+    let mut lb_vals = Vec::new();
+    for line in stdout.lines() {
+        if let Some(c) = re_gb.captures(line) {
+            gb_vals.push(c[1].parse::<i64>().unwrap_or(0));
+        }
+        if let Some(c) = re_lb.captures(line) {
+            lb_vals.push(c[1].parse::<i64>().unwrap_or(0));
+        }
+    }
+    assert!(
+        gb_vals.len() >= 2 && lb_vals.len() >= 2,
+        "Insufficient events. STDOUT: {}",
+        stdout
+    );
+    // Each tick_once increments first byte by 1
+    assert!(
+        gb_vals[1] >= gb_vals[0],
+        "gb[0] should not decrease. STDOUT: {}",
+        stdout
+    );
+    assert!(
+        lb_vals[1] >= lb_vals[0],
+        "lb[0] should not decrease. STDOUT: {}",
+        stdout
+    );
+    // Ensure formatted BF line present and non-decreasing as well
+    let re = Regex::new(r"BF:(-?\d+)\|(-?\d+)").unwrap();
+    let mut fa = Vec::new();
+    let mut fb = Vec::new();
+    for line in stdout.lines() {
+        if let Some(c) = re.captures(line) {
+            fa.push(c[1].parse::<i64>().unwrap_or(0));
+            fb.push(c[2].parse::<i64>().unwrap_or(0));
+        }
+    }
+    assert!(
+        fa.len() >= 2 && fb.len() >= 2,
+        "Insufficient BF events. STDOUT: {}",
+        stdout
+    );
+    assert!(
+        fa[1] >= fa[0] && fb[1] >= fb[0],
+        "BF values should not decrease. STDOUT: {}",
+        stdout
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_print_variable_global_member_direct() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Directly print global member fields in variable mode
+    let script = r#"
+trace globals_program.c:31 {
+    print G_STATE.counter;
+    print LIB_STATE.counter;
+}
+"#;
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    let re_g = Regex::new(r"G_STATE\.counter\s*=\s*(-?\d+)").unwrap();
+    let re_l = Regex::new(r"LIB_STATE\.counter\s*=\s*(-?\d+)").unwrap();
+    let mut gv = Vec::new();
+    let mut lv = Vec::new();
+    for line in stdout.lines() {
+        if let Some(c) = re_g.captures(line) {
+            gv.push(c[1].parse::<i64>().unwrap_or(0));
+        }
+        if let Some(c) = re_l.captures(line) {
+            lv.push(c[1].parse::<i64>().unwrap_or(0));
+        }
+    }
+    assert!(
+        gv.len() >= 2 && lv.len() >= 2,
+        "Insufficient events. STDOUT: {}",
+        stdout
+    );
+    // Ensure non-decreasing for current-module counter
+    assert!(gv[1] >= gv[0], "G_STATE.counter should be non-decreasing");
+    // Cross-module LIB_STATE.counter increments by +2 per tick
+    assert_eq!(lv[1] - lv[0], 2, "LIB_STATE.counter should +2 per tick");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_print_format_global_member_direct() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Print format with global member (counter int)
+    let script = r#"
+trace globals_program.c:31 {
+    print "LIBCNT:{}", LIB_STATE.counter;
+}
+"#;
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    let re = Regex::new(r"LIBCNT:(-?\d+)").unwrap();
+    let mut vals = Vec::new();
+    for line in stdout.lines() {
+        if let Some(c) = re.captures(line) {
+            vals.push(c[1].parse::<i64>().unwrap_or(0));
+        }
+    }
+    assert!(
+        vals.len() >= 2,
+        "Insufficient LIBCNT events. STDOUT: {}",
+        stdout
+    );
+    assert_eq!(vals[1] - vals[0], 2, "LIB_STATE.counter should +2 per tick");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_print_format_global_member_leaf() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Ensure formatted multi-level member prints scalar value, not whole struct
+    let script = r#"
+trace globals_program.c:31 {
+    print "LIBY:{}", LIB_STATE.inner.y;
+}
+"#;
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    // Capture floating values and ensure delta ~ 1.25 between first two events
+    let re = Regex::new(r"LIBY:([0-9]+(?:\.[0-9]+)?)").unwrap();
+    let mut vals: Vec<f64> = Vec::new();
+    for line in stdout.lines() {
+        if let Some(c) = re.captures(line) {
+            let v: f64 = c[1].parse().unwrap_or(0.0);
+            // Line should not include full struct formatting
+            assert!(
+                !line.contains("Inner {"),
+                "Leaf member should print scalar, got struct: {}",
+                line
+            );
+            vals.push(v);
+        }
+    }
+    assert!(
+        vals.len() >= 2,
+        "Insufficient LIBY events. STDOUT: {}",
+        stdout
+    );
+    // Compare with tolerance by scaling to centi-precision
+    let d = ((vals[1] - vals[0]) * 100.0).round() as i64;
+    assert_eq!(
+        d, 125,
+        "LIB_STATE.inner.y should +1.25 per tick. STDOUT: {}",
+        stdout
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_print_variable_global_member_leaf() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Variable mode: nested chain leaf prints as scalar
+    let script = r#"
+trace globals_program.c:31 {
+    print LIB_STATE.inner.y;
+}
+"#;
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    let re = Regex::new(r"LIB_STATE\.inner\.y\s*=\s*(-?[0-9]+(?:\.[0-9]+)?)").unwrap();
+    let mut vals: Vec<f64> = Vec::new();
+    for line in stdout.lines() {
+        if let Some(c) = re.captures(line) {
+            let v: f64 = c[1].parse().unwrap_or(0.0);
+            vals.push(v);
+        }
+    }
+    assert!(
+        vals.len() >= 2,
+        "Insufficient LIB_STATE.inner.y events. STDOUT: {}",
+        stdout
+    );
+    let d = ((vals[1] - vals[0]) * 100.0).round() as i64;
+    assert_eq!(d, 125, "inner.y should +1.25 per tick. STDOUT: {}", stdout);
+    Ok(())
+}

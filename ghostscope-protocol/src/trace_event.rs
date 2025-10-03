@@ -51,6 +51,9 @@ pub enum VariableStatus {
     ReadError = 2,
     AccessError = 3,
     Truncated = 4,
+    /// Required runtime offsets/proc mapping not available at eBPF time
+    /// (e.g., no (pid,module) offsets to compute address)
+    OffsetsUnavailable = 5,
 }
 
 /// Print string instruction data (most optimized)

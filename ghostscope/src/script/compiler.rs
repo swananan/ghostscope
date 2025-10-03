@@ -1,6 +1,6 @@
 use crate::core::GhostSession;
 use anyhow::{Context, Result};
-use ghostscope_loader::GhostScopeLoader;
+use ghostscope_loader::{GhostScopeLoader, ProcModuleOffsetsValue};
 use ghostscope_ui::events::{ExecutionStatus, ScriptCompilationDetails, ScriptExecutionResult};
 use tracing::{error, info, warn};
 
@@ -171,6 +171,35 @@ pub async fn compile_and_load_script_for_tui(
         success_count, failed_count
     );
 
+    // Prepare ASLR offsets map items once (for -p mode)
+    let mut offsets_items: Vec<(u64, ProcModuleOffsetsValue)> = Vec::new();
+    if let Some(pid) = session.target_pid {
+        match process_analyzer.compute_section_offsets() {
+            Ok(items) => {
+                offsets_items = items
+                    .into_iter()
+                    .map(|(_path, cookie, off)| {
+                        (
+                            cookie,
+                            ProcModuleOffsetsValue::new(off.text, off.rodata, off.data, off.bss),
+                        )
+                    })
+                    .collect();
+                info!(
+                    "Computed {} module offset entries for PID {}",
+                    offsets_items.len(),
+                    pid
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to compute section offsets: {} (globals may show OffsetsUnavailable)",
+                    e
+                );
+            }
+        }
+    }
+
     // Step 5: If we have successful configurations, attach uprobes and register traces
     if !compilation_result.uprobe_configs.is_empty() {
         // Prepare uprobe configurations with binary path
@@ -203,7 +232,23 @@ pub async fn compile_and_load_script_for_tui(
 
             // Create individual loader for this config
             match create_and_attach_loader(config, session.target_pid).await {
-                Ok(loader) => {
+                Ok(mut loader) => {
+                    // Populate proc_module_offsets for this loader (if available)
+                    if let Some(pid) = session.target_pid {
+                        if !offsets_items.is_empty() {
+                            if let Err(e) = loader.populate_proc_module_offsets(pid, &offsets_items)
+                            {
+                                warn!("Failed to populate proc_module_offsets: {}", e);
+                            } else {
+                                info!(
+                                    "✓ Populated proc_module_offsets ({} entries) for PID {}",
+                                    offsets_items.len(),
+                                    pid
+                                );
+                            }
+                        }
+                    }
+
                     info!(
                         "✓ Successfully attached uprobe for trace_id {}",
                         config.assigned_trace_id
@@ -337,6 +382,35 @@ pub async fn compile_and_load_script_for_cli(
         }
     }
 
+    // Pre-compute ASLR offsets once (for -p mode)
+    let mut offsets_items: Vec<(u64, ProcModuleOffsetsValue)> = Vec::new();
+    if let Some(pid) = session.target_pid {
+        match process_analyzer.compute_section_offsets() {
+            Ok(items) => {
+                offsets_items = items
+                    .into_iter()
+                    .map(|(_path, cookie, off)| {
+                        (
+                            cookie,
+                            ProcModuleOffsetsValue::new(off.text, off.rodata, off.data, off.bss),
+                        )
+                    })
+                    .collect();
+                info!(
+                    "Computed {} module offset entries for PID {}",
+                    offsets_items.len(),
+                    pid
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to compute section offsets: {} (globals may show OffsetsUnavailable)",
+                    e
+                );
+            }
+        }
+    }
+
     // Step 3: Prepare and attach uprobe configurations
     let mut uprobe_configs = compilation_result.uprobe_configs;
 
@@ -373,7 +447,22 @@ pub async fn compile_and_load_script_for_cli(
 
         // Create individual loader for this config
         match create_and_attach_loader(config, session.target_pid).await {
-            Ok(loader) => {
+            Ok(mut loader) => {
+                // Populate proc_module_offsets for this loader (if available)
+                if let Some(pid) = session.target_pid {
+                    if !offsets_items.is_empty() {
+                        if let Err(e) = loader.populate_proc_module_offsets(pid, &offsets_items) {
+                            warn!("Failed to populate proc_module_offsets: {}", e);
+                        } else {
+                            info!(
+                                "✓ Populated proc_module_offsets ({} entries) for PID {}",
+                                offsets_items.len(),
+                                pid
+                            );
+                        }
+                    }
+                }
+
                 info!(
                     "✓ Successfully attached uprobe for trace_id {}",
                     config.assigned_trace_id

@@ -390,21 +390,7 @@ fn parse_factor(pair: Pair<Rule>) -> Result<Expr> {
                     Ok(Expr::Variable(name))
                 }
                 Rule::array_access => parse_array_access(inner),
-                Rule::member_access => {
-                    let mut parts = inner.into_inner();
-                    let base = parts.next().unwrap().as_str().to_string();
-                    let member = parts.next().unwrap().as_str().to_string();
-
-                    // Copy base to avoid move errors
-                    let base_clone = base.clone();
-                    let mut expr = Expr::Variable(base_clone);
-
-                    for part in parts {
-                        expr = Expr::MemberAccess(Box::new(expr), part.as_str().to_string());
-                    }
-
-                    Ok(Expr::MemberAccess(Box::new(Expr::Variable(base)), member))
-                }
+                Rule::member_access => parse_member_access(inner),
                 Rule::pointer_deref => {
                     let var = inner.into_inner().next().unwrap().as_str().to_string();
                     Ok(Expr::PointerDeref(Box::new(Expr::Variable(var))))
@@ -587,17 +573,28 @@ fn parse_array_access(pair: Pair<Rule>) -> Result<Expr> {
 fn parse_member_access(pair: Pair<Rule>) -> Result<Expr> {
     let mut parts = pair.into_inner();
     let base = parts.next().unwrap().as_str().to_string();
-    let member = parts.next().unwrap().as_str().to_string();
 
-    // Copy base to avoid move errors
-    let base_clone = base.clone();
-    let mut expr = Expr::Variable(base_clone);
-
-    for part in parts {
-        expr = Expr::MemberAccess(Box::new(expr), part.as_str().to_string());
+    // Collect all subsequent identifiers after the base
+    let mut tail: Vec<String> = Vec::new();
+    for p in parts {
+        tail.push(p.as_str().to_string());
     }
 
-    Ok(Expr::MemberAccess(Box::new(Expr::Variable(base)), member))
+    // If there is only one member, keep MemberAccess for simplicity.
+    // For multi-level chains like a.b.c, normalize to ChainAccess([a, b, c])
+    match tail.len() {
+        0 => Err(ParseError::InvalidExpression),
+        1 => Ok(Expr::MemberAccess(
+            Box::new(Expr::Variable(base)),
+            tail.remove(0),
+        )),
+        _ => {
+            let mut chain = Vec::with_capacity(1 + tail.len());
+            chain.push(base);
+            chain.extend(tail);
+            Ok(Expr::ChainAccess(chain))
+        }
+    }
 }
 
 // Parse pointer dereference: *ptr

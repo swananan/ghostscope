@@ -151,6 +151,9 @@ GhostScope transforms compiled binaries into observable systems. Place trace poi
 - [**Contributing Guide**](docs/contributing.md)
   Join the community
 
+- [**Roadmap**](docs/roadmap.md)
+  Planned features and milestones
+
 </td>
 </tr>
 </table>

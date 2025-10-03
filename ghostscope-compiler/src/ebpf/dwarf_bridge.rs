@@ -67,10 +67,111 @@ impl<'ctx> EbpfContext<'ctx> {
     pub fn evaluation_result_to_address(
         &mut self,
         evaluation_result: &EvaluationResult,
+        status_ptr: Option<PointerValue<'ctx>>,
+    ) -> Result<IntValue<'ctx>> {
+        self.evaluation_result_to_address_with_hint(evaluation_result, status_ptr, None)
+    }
+
+    /// Variant that allows passing an explicit module hint for offsets lookup
+    pub fn evaluation_result_to_address_with_hint(
+        &mut self,
+        evaluation_result: &EvaluationResult,
+        status_ptr: Option<PointerValue<'ctx>>,
+        module_hint: Option<&str>,
     ) -> Result<IntValue<'ctx>> {
         let pt_regs_ptr = self.get_pt_regs_parameter()?;
         match evaluation_result {
             EvaluationResult::MemoryLocation(LocationResult::Address(addr)) => {
+                // Link-time address (global/static): attempt to apply ASLR offsets if possible
+                if let Some(analyzer_ptr) = self.process_analyzer {
+                    let analyzer = unsafe { &mut *analyzer_ptr };
+                    let ctx = self.get_compile_time_context()?;
+                    let module_for_offsets = module_hint
+                        .map(|s| s.to_string())
+                        .or_else(|| self.current_resolved_var_module_path.clone())
+                        .unwrap_or_else(|| ctx.module_path.clone());
+                    if let Ok(offsets) = analyzer.compute_section_offsets() {
+                        if let Some((_, cookie, sect_offs)) = offsets
+                            .iter()
+                            .find(|(p, _, _)| p.to_string_lossy() == module_for_offsets)
+                        {
+                            let st = analyzer
+                                .classify_section_for_address(&module_for_offsets, *addr)
+                                .unwrap_or(ghostscope_dwarf::core::SectionType::Data);
+                            let st_code: u8 = match st {
+                                ghostscope_dwarf::core::SectionType::Text => 0,
+                                ghostscope_dwarf::core::SectionType::Rodata => 1,
+                                ghostscope_dwarf::core::SectionType::Data => 2,
+                                ghostscope_dwarf::core::SectionType::Bss => 3,
+                                _ => 2,
+                            };
+                            let link_val = self.context.i64_type().const_int(*addr, false);
+                            let sect_bias = match st {
+                                ghostscope_dwarf::core::SectionType::Text => sect_offs.text,
+                                ghostscope_dwarf::core::SectionType::Rodata => sect_offs.rodata,
+                                ghostscope_dwarf::core::SectionType::Data => sect_offs.data,
+                                ghostscope_dwarf::core::SectionType::Bss => sect_offs.bss,
+                                _ => 0,
+                            };
+                            if sect_bias == 0 {
+                                self.current_resolved_var_module_path = None;
+                                return Ok(link_val);
+                            }
+                            let (rt_addr, found_flag) = self
+                                .generate_runtime_address_from_offsets(
+                                    link_val, st_code, *cookie,
+                                )?;
+                            // If offsets miss and we can record status, set OffsetsUnavailable preserving prior non-OK
+                            if let Some(sp) = status_ptr {
+                                let is_miss = self
+                                    .builder
+                                    .build_int_compare(
+                                        inkwell::IntPredicate::EQ,
+                                        found_flag,
+                                        self.context.bool_type().const_zero(),
+                                        "is_off_miss",
+                                    )
+                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                                let cur_status = self
+                                    .builder
+                                    .build_load(self.context.i8_type(), sp, "cur_status")
+                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                                let is_ok = self
+                                    .builder
+                                    .build_int_compare(
+                                        inkwell::IntPredicate::EQ,
+                                        cur_status.into_int_value(),
+                                        self.context.i8_type().const_zero(),
+                                        "status_is_ok",
+                                    )
+                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                                let should_store = self
+                                    .builder
+                                    .build_and(is_miss, is_ok, "store_offsets_unavail")
+                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                                let new_status = self
+                                    .builder
+                                    .build_select(
+                                        should_store,
+                                        self.context
+                                            .i8_type()
+                                            .const_int(ghostscope_protocol::VariableStatus::OffsetsUnavailable as u64, false)
+                                            .into(),
+                                        cur_status,
+                                        "new_status",
+                                    )
+                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                                self.builder
+                                    .build_store(sp, new_status)
+                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                            }
+                            self.current_resolved_var_module_path = None;
+                            return Ok(rt_addr);
+                        }
+                    }
+                }
+                // Fallback: return link-time address
+                self.current_resolved_var_module_path = None;
                 Ok(self.context.i64_type().const_int(*addr, false))
             }
             EvaluationResult::MemoryLocation(LocationResult::RegisterAddress {
@@ -97,7 +198,277 @@ impl<'ctx> EbpfContext<'ctx> {
                 }
             }
             EvaluationResult::MemoryLocation(LocationResult::ComputedLocation { steps }) => {
-                let val = self.generate_compute_steps(steps, pt_regs_ptr, None)?;
+                // Try to fold constant-only address expressions (e.g., global + const offset)
+                // If foldable, treat as link-time address and apply ASLR offsets via map.
+                let mut const_stack: Vec<i64> = Vec::new();
+                let mut foldable = true;
+                for s in steps.iter() {
+                    match s {
+                        ComputeStep::PushConstant(v) => const_stack.push(*v),
+                        ComputeStep::Add => {
+                            if const_stack.len() >= 2 {
+                                let b = const_stack.pop().unwrap();
+                                let a = const_stack.pop().unwrap();
+                                const_stack.push(a.saturating_add(b));
+                            } else {
+                                foldable = false;
+                                break;
+                            }
+                        }
+                        // Any register load or deref means runtime-derived address; not foldable
+                        ComputeStep::LoadRegister(_) | ComputeStep::Dereference { .. } => {
+                            foldable = false;
+                            break;
+                        }
+                        _ => {
+                            // Unknown/non-add op: treat as non-foldable
+                            foldable = false;
+                            break;
+                        }
+                    }
+                }
+
+                if foldable && const_stack.len() == 1 {
+                    let link_addr_u = const_stack[0] as u64;
+                    if let Some(analyzer_ptr) = self.process_analyzer {
+                        let analyzer = unsafe { &mut *analyzer_ptr };
+                        let ctx = self.get_compile_time_context()?;
+                        let module_for_offsets = module_hint
+                            .map(|s| s.to_string())
+                            .or_else(|| self.current_resolved_var_module_path.clone())
+                            .unwrap_or_else(|| ctx.module_path.clone());
+                        if let Ok(offsets) = analyzer.compute_section_offsets() {
+                            if let Some((_, cookie, sect_offs)) = offsets
+                                .iter()
+                                .find(|(p, _, _)| p.to_string_lossy() == module_for_offsets)
+                            {
+                                let st = analyzer
+                                    .classify_section_for_address(&module_for_offsets, link_addr_u)
+                                    .unwrap_or(ghostscope_dwarf::core::SectionType::Data);
+                                let st_code: u8 = match st {
+                                    ghostscope_dwarf::core::SectionType::Text => 0,
+                                    ghostscope_dwarf::core::SectionType::Rodata => 1,
+                                    ghostscope_dwarf::core::SectionType::Data => 2,
+                                    ghostscope_dwarf::core::SectionType::Bss => 3,
+                                    _ => 2,
+                                };
+                                // If we have no bias at all for this section, return link address
+                                let sect_bias = match st {
+                                    ghostscope_dwarf::core::SectionType::Text => sect_offs.text,
+                                    ghostscope_dwarf::core::SectionType::Rodata => sect_offs.rodata,
+                                    ghostscope_dwarf::core::SectionType::Data => sect_offs.data,
+                                    ghostscope_dwarf::core::SectionType::Bss => sect_offs.bss,
+                                    _ => 0,
+                                };
+                                let link_val =
+                                    self.context.i64_type().const_int(link_addr_u, false);
+                                if sect_bias == 0 {
+                                    self.current_resolved_var_module_path = None;
+                                    return Ok(link_val);
+                                }
+                                let (rt_addr, found_flag) = self
+                                    .generate_runtime_address_from_offsets(
+                                        link_val, st_code, *cookie,
+                                    )?;
+                                if let Some(sp) = status_ptr {
+                                    let is_miss = self
+                                        .builder
+                                        .build_int_compare(
+                                            inkwell::IntPredicate::EQ,
+                                            found_flag,
+                                            self.context.bool_type().const_zero(),
+                                            "is_off_miss",
+                                        )
+                                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                                    let cur_status = self
+                                        .builder
+                                        .build_load(self.context.i8_type(), sp, "cur_status")
+                                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                                    let is_ok = self
+                                        .builder
+                                        .build_int_compare(
+                                            inkwell::IntPredicate::EQ,
+                                            cur_status.into_int_value(),
+                                            self.context.i8_type().const_zero(),
+                                            "status_is_ok",
+                                        )
+                                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                                    let should_store = self
+                                        .builder
+                                        .build_and(is_miss, is_ok, "store_offsets_unavail")
+                                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                                    let new_status = self
+                                        .builder
+                                        .build_select(
+                                            should_store,
+                                            self.context
+                                                .i8_type()
+                                                .const_int(ghostscope_protocol::VariableStatus::OffsetsUnavailable as u64, false)
+                                                .into(),
+                                            cur_status,
+                                            "new_status",
+                                        )
+                                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                                    self.builder
+                                        .build_store(sp, new_status)
+                                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                                }
+                                self.current_resolved_var_module_path = None;
+                                return Ok(rt_addr);
+                            }
+                        }
+                    }
+                    // Analyzer missing or offsets not available: return link-time address
+                    self.current_resolved_var_module_path = None;
+                    return Ok(self.context.i64_type().const_int(link_addr_u, false));
+                }
+
+                // Attempt: if steps start with PushConstant(base) and first dynamic op is Dereference
+                // (with no LoadRegister before it), apply ASLR offsets to base and continue
+                if let Some(ComputeStep::PushConstant(base_const)) = steps.first() {
+                    // Scan until first Dereference or LoadRegister
+                    let mut saw_reg = false;
+                    let mut saw_deref = false;
+                    for s in &steps[1..] {
+                        match s {
+                            ComputeStep::LoadRegister(_) => {
+                                saw_reg = true;
+                                break;
+                            }
+                            ComputeStep::Dereference { .. } => {
+                                saw_deref = true;
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if saw_deref && !saw_reg {
+                        let link_addr_u = *base_const as u64;
+                        if let Some(analyzer_ptr) = self.process_analyzer {
+                            let analyzer = unsafe { &mut *analyzer_ptr };
+                            let ctx = self.get_compile_time_context()?;
+                            let module_for_offsets = module_hint
+                                .map(|s| s.to_string())
+                                .or_else(|| self.current_resolved_var_module_path.clone())
+                                .unwrap_or_else(|| ctx.module_path.clone());
+                            if let Ok(offsets) = analyzer.compute_section_offsets() {
+                                if let Some((_, cookie, sect_offs)) = offsets
+                                    .iter()
+                                    .find(|(p, _, _)| p.to_string_lossy() == module_for_offsets)
+                                {
+                                    let st = analyzer
+                                        .classify_section_for_address(
+                                            &module_for_offsets,
+                                            link_addr_u,
+                                        )
+                                        .unwrap_or(ghostscope_dwarf::core::SectionType::Data);
+                                    let st_code: u8 = match st {
+                                        ghostscope_dwarf::core::SectionType::Text => 0,
+                                        ghostscope_dwarf::core::SectionType::Rodata => 1,
+                                        ghostscope_dwarf::core::SectionType::Data => 2,
+                                        ghostscope_dwarf::core::SectionType::Bss => 3,
+                                        _ => 2,
+                                    };
+                                    let sect_bias = match st {
+                                        ghostscope_dwarf::core::SectionType::Text => sect_offs.text,
+                                        ghostscope_dwarf::core::SectionType::Rodata => {
+                                            sect_offs.rodata
+                                        }
+                                        ghostscope_dwarf::core::SectionType::Data => sect_offs.data,
+                                        ghostscope_dwarf::core::SectionType::Bss => sect_offs.bss,
+                                        _ => 0,
+                                    };
+                                    let link_val =
+                                        self.context.i64_type().const_int(link_addr_u, false);
+                                    let rt_base = if sect_bias == 0 {
+                                        link_val
+                                    } else {
+                                        let (rt, found_flag) = self
+                                            .generate_runtime_address_from_offsets(
+                                                link_val, st_code, *cookie,
+                                            )?;
+                                        if let Some(sp) = status_ptr {
+                                            let is_miss = self
+                                                .builder
+                                                .build_int_compare(
+                                                    inkwell::IntPredicate::EQ,
+                                                    found_flag,
+                                                    self.context.bool_type().const_zero(),
+                                                    "is_off_miss",
+                                                )
+                                                .map_err(|e| {
+                                                    CodeGenError::LLVMError(e.to_string())
+                                                })?;
+                                            let cur_status = self
+                                                .builder
+                                                .build_load(
+                                                    self.context.i8_type(),
+                                                    sp,
+                                                    "cur_status",
+                                                )
+                                                .map_err(|e| {
+                                                    CodeGenError::LLVMError(e.to_string())
+                                                })?;
+                                            let is_ok = self
+                                                .builder
+                                                .build_int_compare(
+                                                    inkwell::IntPredicate::EQ,
+                                                    cur_status.into_int_value(),
+                                                    self.context.i8_type().const_zero(),
+                                                    "status_is_ok",
+                                                )
+                                                .map_err(|e| {
+                                                    CodeGenError::LLVMError(e.to_string())
+                                                })?;
+                                            let should_store = self
+                                                .builder
+                                                .build_and(is_miss, is_ok, "store_offsets_unavail")
+                                                .map_err(|e| {
+                                                    CodeGenError::LLVMError(e.to_string())
+                                                })?;
+                                            let new_status = self
+                                                .builder
+                                                .build_select(
+                                                    should_store,
+                                                    self.context
+                                                        .i8_type()
+                                                        .const_int(ghostscope_protocol::VariableStatus::OffsetsUnavailable as u64, false)
+                                                        .into(),
+                                                    cur_status,
+                                                    "new_status",
+                                                )
+                                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                                            self.builder.build_store(sp, new_status).map_err(
+                                                |e| CodeGenError::LLVMError(e.to_string()),
+                                            )?;
+                                        }
+                                        rt
+                                    };
+                                    // Execute remaining steps with rt_base pre-pushed
+                                    let rest = &steps[1..];
+                                    let val = self.generate_compute_steps(
+                                        rest,
+                                        pt_regs_ptr,
+                                        None,
+                                        status_ptr,
+                                        Some(rt_base),
+                                    )?;
+                                    if let BasicValueEnum::IntValue(i) = val {
+                                        return Ok(i);
+                                    } else {
+                                        return Err(CodeGenError::LLVMError(
+                                            "Computed location did not produce integer".to_string(),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Fallback: execute steps at runtime and use the result directly (no offsets)
+                let val =
+                    self.generate_compute_steps(steps, pt_regs_ptr, None, status_ptr, None)?;
                 if let BasicValueEnum::IntValue(i) = val {
                     Ok(i)
                 } else {
@@ -158,7 +529,7 @@ impl<'ctx> EbpfContext<'ctx> {
 
             DirectValueResult::ComputedValue { steps, result_size } => {
                 debug!("Generating computed value: {} steps", steps.len());
-                self.generate_compute_steps(steps, pt_regs_ptr, Some(*result_size))
+                self.generate_compute_steps(steps, pt_regs_ptr, Some(*result_size), None, None)
             }
         }
     }
@@ -229,7 +600,8 @@ impl<'ctx> EbpfContext<'ctx> {
             LocationResult::ComputedLocation { steps } => {
                 debug!("Generating computed location: {} steps", steps.len());
                 // Execute steps to compute the address
-                let addr_value = self.generate_compute_steps(steps, pt_regs_ptr, None)?;
+                let addr_value =
+                    self.generate_compute_steps(steps, pt_regs_ptr, None, None, None)?;
                 if let BasicValueEnum::IntValue(addr) = addr_value {
                     // Use DWARF type size for memory access
                     let access_size = self.dwarf_type_to_memory_access_size(dwarf_type);
@@ -249,9 +621,17 @@ impl<'ctx> EbpfContext<'ctx> {
         steps: &[ComputeStep],
         pt_regs_ptr: PointerValue<'ctx>,
         _result_size: Option<MemoryAccessSize>,
+        status_ptr: Option<PointerValue<'ctx>>,
+        initial_top: Option<IntValue<'ctx>>,
     ) -> Result<BasicValueEnum<'ctx>> {
         // Implement stack-based computation
         let mut stack: Vec<IntValue<'ctx>> = Vec::new();
+        // Track a runtime null-pointer flag from dereference steps; when true, subsequent
+        // arithmetic will be masked to zero to avoid reads at small offsets from NULL.
+        let mut deref_null_flag: Option<inkwell::values::IntValue> = None;
+        if let Some(top) = initial_top {
+            stack.push(top);
+        }
 
         for step in steps {
             match step {
@@ -273,11 +653,24 @@ impl<'ctx> EbpfContext<'ctx> {
 
                 ComputeStep::Add => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
-                        let result = self
+                        let sum_val = self
                             .builder
                             .build_int_add(a, b, "add")
                             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                        stack.push(result);
+                        if let Some(nf) = deref_null_flag {
+                            let masked_bv = self
+                                .builder
+                                .build_select::<inkwell::values::BasicValueEnum<'ctx>, _>(
+                                    nf,
+                                    self.context.i64_type().const_zero().into(),
+                                    sum_val.into(),
+                                    "add_masked",
+                                )
+                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                            stack.push(masked_bv.into_int_value());
+                        } else {
+                            stack.push(sum_val);
+                        }
                     } else {
                         return Err(CodeGenError::LLVMError(
                             "Stack underflow in Add".to_string(),
@@ -399,15 +792,148 @@ impl<'ctx> EbpfContext<'ctx> {
 
                 ComputeStep::Dereference { size } => {
                     if let Some(addr) = stack.pop() {
+                        // Null guard: if addr == 0, set NullDeref (if status_ptr provided and current is Ok)
+                        let zero64 = self.context.i64_type().const_zero();
+                        let is_null = self
+                            .builder
+                            .build_int_compare(
+                                inkwell::IntPredicate::EQ,
+                                addr,
+                                zero64,
+                                "is_null_deref",
+                            )
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+                        let cur_fn = self
+                            .builder
+                            .get_insert_block()
+                            .unwrap()
+                            .get_parent()
+                            .unwrap();
+                        let null_bb = self.context.append_basic_block(cur_fn, "deref_null");
+                        let read_bb = self.context.append_basic_block(cur_fn, "deref_read");
+                        let cont_bb = self.context.append_basic_block(cur_fn, "deref_cont");
+                        self.builder
+                            .build_conditional_branch(is_null, null_bb, read_bb)
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+                        // Null path: optionally set status=NullDeref if currently Ok, branch to cont
+                        self.builder.position_at_end(null_bb);
+                        let null_val = self.context.i64_type().const_zero();
+                        if let Some(sp) = status_ptr {
+                            let cur_status = self
+                                .builder
+                                .build_load(self.context.i8_type(), sp, "cur_status")
+                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                                .into_int_value();
+                            let is_ok = self
+                                .builder
+                                .build_int_compare(
+                                    inkwell::IntPredicate::EQ,
+                                    cur_status,
+                                    self.context.i8_type().const_zero(),
+                                    "status_is_ok",
+                                )
+                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                            let then_val = self.context.i8_type().const_int(
+                                ghostscope_protocol::VariableStatus::NullDeref as u64,
+                                false,
+                            );
+                            let new_status_bv = self
+                                .builder
+                                .build_select::<inkwell::values::BasicValueEnum<'ctx>, _>(
+                                    is_ok,
+                                    then_val.into(),
+                                    cur_status.into(),
+                                    "new_status",
+                                )
+                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                            self.builder
+                                .build_store(sp, new_status_bv)
+                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        }
+                        self.builder
+                            .build_unconditional_branch(cont_bb)
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+                        // Read path: load pointer-sized value into tmp then branch to cont
+                        self.builder.position_at_end(read_bb);
                         let access_size = *size;
-                        let loaded_value = self.generate_memory_read(addr, access_size)?;
-                        if let BasicValueEnum::IntValue(int_val) = loaded_value {
-                            stack.push(int_val);
+                        let loaded_bv = self.generate_memory_read(addr, access_size)?;
+                        let loaded_int = if let BasicValueEnum::IntValue(int_val) = loaded_bv {
+                            int_val
                         } else {
                             return Err(CodeGenError::LLVMError(
                                 "Memory load did not return integer".to_string(),
                             ));
+                        };
+                        self.builder
+                            .build_unconditional_branch(cont_bb)
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+                        // Continue at cont: create PHI to merge null/read values, push once
+                        self.builder.position_at_end(cont_bb);
+                        let phi = self
+                            .builder
+                            .build_phi(self.context.i64_type(), "deref_phi")
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        phi.add_incoming(&[(&null_val, null_bb), (&loaded_int, read_bb)]);
+                        let merged = phi.as_basic_value().into_int_value();
+                        // Update null flag based on loaded pointer value being zero
+                        let is_zero_ptr = self
+                            .builder
+                            .build_int_compare(
+                                inkwell::IntPredicate::EQ,
+                                merged,
+                                self.context.i64_type().const_zero(),
+                                "is_zero_ptr",
+                            )
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        deref_null_flag = Some(match deref_null_flag {
+                            Some(prev) => self
+                                .builder
+                                .build_or(prev, is_zero_ptr, "null_or")
+                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?,
+                            None => is_zero_ptr,
+                        });
+                        if let (Some(sp), Some(nf)) = (status_ptr, deref_null_flag) {
+                            // Only store NullDeref if currently OK and nf is true
+                            let cur_status = self
+                                .builder
+                                .build_load(self.context.i8_type(), sp, "cur_status")
+                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                                .into_int_value();
+                            let is_ok = self
+                                .builder
+                                .build_int_compare(
+                                    inkwell::IntPredicate::EQ,
+                                    cur_status,
+                                    self.context.i8_type().const_zero(),
+                                    "status_is_ok2",
+                                )
+                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                            let should_store = self
+                                .builder
+                                .build_and(is_ok, nf, "store_null_deref_from_ptr")
+                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                            let then_val = self.context.i8_type().const_int(
+                                ghostscope_protocol::VariableStatus::NullDeref as u64,
+                                false,
+                            );
+                            let new_status_bv = self
+                                .builder
+                                .build_select::<inkwell::values::BasicValueEnum<'ctx>, _>(
+                                    should_store,
+                                    then_val.into(),
+                                    cur_status.into(),
+                                    "new_status2",
+                                )
+                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                            self.builder
+                                .build_store(sp, new_status_bv)
+                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
                         }
+                        stack.push(merged);
                     } else {
                         return Err(CodeGenError::LLVMError(
                             "Stack underflow in LoadMemory".to_string(),
@@ -507,8 +1033,58 @@ impl<'ctx> EbpfContext<'ctx> {
                     debug!("Found DWARF variable: {}", var_name);
                     Ok(Some(var_result.clone()))
                 } else {
-                    debug!("Variable '{}' not found in DWARF info", var_name);
-                    Ok(None)
+                    debug!(
+                        "Variable '{}' not found in DWARF locals/params, trying globals",
+                        var_name
+                    );
+                    // Global fallback: search per-module first, then cross-module
+                    let mut matches = analyzer.find_global_variables_by_name(var_name);
+                    if matches.is_empty() {
+                        return Ok(None);
+                    }
+                    // Prefer current module
+                    let preferred: Vec<(
+                        std::path::PathBuf,
+                        ghostscope_dwarf::core::GlobalVariableInfo,
+                    )> = matches
+                        .iter()
+                        .filter(|(p, _)| p.to_string_lossy() == module_path.as_str())
+                        .cloned()
+                        .collect();
+                    let chosen = if preferred.len() == 1 {
+                        Some(preferred[0].clone())
+                    } else if preferred.is_empty() && matches.len() == 1 {
+                        Some(matches.remove(0))
+                    } else {
+                        // Ambiguous across modules; bail out explicitly
+                        debug!(
+                            "Global '{}' is ambiguous across modules ({} matches)",
+                            var_name,
+                            matches.len()
+                        );
+                        return Err(CodeGenError::DwarfError(format!(
+                            "Ambiguous global '{}': {} matches",
+                            var_name,
+                            matches.len()
+                        )));
+                    };
+
+                    if let Some((mpath, info)) = chosen {
+                        // Resolve variable by CU/DIE offsets in that module
+                        let gv = analyzer
+                            .resolve_variable_by_offsets_in_module(
+                                &mpath,
+                                info.unit_offset,
+                                info.die_offset,
+                            )
+                            .map_err(|e| CodeGenError::DwarfError(e.to_string()))?;
+                        // Record module hint for codegen (ASLR offsets lookup)
+                        self.current_resolved_var_module_path =
+                            Some(mpath.to_string_lossy().to_string());
+                        Ok(Some(gv))
+                    } else {
+                        Ok(None)
+                    }
                 }
             }
             Err(e) => {
@@ -555,7 +1131,7 @@ impl<'ctx> EbpfContext<'ctx> {
         obj_expr: &crate::script::Expr,
         field_name: &str,
     ) -> Result<Option<VariableWithEvaluation>> {
-        // Planner-first: only support simple variable base; no guessing/fallback.
+        // Support simple variable base and fall back to global/static lowering
         if let crate::script::Expr::Variable(base_name) = obj_expr {
             let Some(analyzer_ptr) = self.process_analyzer else {
                 return Err(CodeGenError::DwarfError(
@@ -568,16 +1144,85 @@ impl<'ctx> EbpfContext<'ctx> {
                 std::path::PathBuf::from(ctx.module_path.clone()),
                 ctx.pc_address,
             );
-            match analyzer
-                .plan_chain_access(&module_address, base_name, &[field_name.to_string()])
-                .map_err(|e| CodeGenError::DwarfError(format!("DWARF planning failed: {}", e)))?
+            // Try current module at PC first
+            match analyzer.plan_chain_access(&module_address, base_name, &[field_name.to_string()])
             {
-                Some(var) => Ok(Some(var)),
-                None => Err(CodeGenError::VariableNotFound(format!(
-                    "MemberAccess({}.{})",
-                    base_name, field_name
-                ))),
+                Ok(Some(var)) => return Ok(Some(var)),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::debug!("member planner miss at current module: {}", e);
+                }
             }
+
+            // Fallback: globals across modules (prefer static-offset lowering)
+            let matches = analyzer.find_global_variables_by_name(base_name);
+            if matches.is_empty() {
+                return Ok(None);
+            }
+            // Build preferred order (current module first)
+            let cur_mod = ctx.module_path.clone();
+            let mut ordered: Vec<(
+                &std::path::PathBuf,
+                &ghostscope_dwarf::core::GlobalVariableInfo,
+            )> = Vec::new();
+            if let Some((mpath, info)) = matches
+                .iter()
+                .find(|(p, _)| p.to_string_lossy() == cur_mod.as_str())
+            {
+                ordered.push((mpath, info));
+            }
+            for (mpath, info) in &matches {
+                if mpath.to_string_lossy() != cur_mod.as_str() {
+                    ordered.push((mpath, info));
+                }
+            }
+
+            for (mpath, info) in &ordered {
+                if let Some(link) = info.link_address {
+                    if let Ok(Some((off, final_ty))) = analyzer.compute_global_member_static_offset(
+                        mpath,
+                        link,
+                        info.unit_offset,
+                        info.die_offset,
+                        &[field_name.to_string()],
+                    ) {
+                        let name = format!("{}.{}", base_name, field_name);
+                        let v = VariableWithEvaluation {
+                            name,
+                            type_name: final_ty.type_name(),
+                            dwarf_type: Some(final_ty),
+                            evaluation_result: ghostscope_dwarf::EvaluationResult::MemoryLocation(
+                                ghostscope_dwarf::LocationResult::Address(link + off),
+                            ),
+                            scope_depth: 0,
+                            is_parameter: false,
+                            is_artificial: false,
+                        };
+                        self.current_resolved_var_module_path =
+                            Some(mpath.to_string_lossy().to_string());
+                        return Ok(Some(v));
+                    }
+                }
+                // Planner fallback inside module (addr=0)
+                let ma = ghostscope_dwarf::ModuleAddress::new((*mpath).clone(), 0);
+                match analyzer.plan_chain_access(&ma, base_name, &[field_name.to_string()]) {
+                    Ok(Some(v)) => {
+                        self.current_resolved_var_module_path =
+                            Some(mpath.to_string_lossy().to_string());
+                        return Ok(Some(v));
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::debug!(
+                            "member planner miss in module '{}': {}",
+                            mpath.display(),
+                            e
+                        );
+                    }
+                }
+            }
+
+            Ok(None)
         } else {
             Err(CodeGenError::NotImplemented(
                 "MemberAccess base must be a simple variable (use chain access)".to_string(),
@@ -665,6 +1310,10 @@ impl<'ctx> EbpfContext<'ctx> {
         if chain.is_empty() {
             return Ok(None);
         }
+        // If chain has only one element, treat it as a simple variable and reuse variable lookup.
+        if chain.len() == 1 {
+            return self.query_dwarf_for_variable(&chain[0]);
+        }
         // Planner path only; do not fallback. If planning fails, surface an error.
         let Some(analyzer_ptr) = self.process_analyzer else {
             return Err(CodeGenError::DwarfError(
@@ -673,20 +1322,92 @@ impl<'ctx> EbpfContext<'ctx> {
         };
         let analyzer = unsafe { &mut *analyzer_ptr };
         let ctx = self.get_compile_time_context()?;
+        // First attempt: current module at current PC (locals/params)
         let module_address = ghostscope_dwarf::ModuleAddress::new(
             std::path::PathBuf::from(ctx.module_path.clone()),
             ctx.pc_address,
         );
-        match analyzer
-            .plan_chain_access(&module_address, &chain[0], &chain[1..])
-            .map_err(|e| CodeGenError::DwarfError(format!("DWARF planning failed: {}", e)))?
-        {
-            Some(var) => Ok(Some(var)),
-            None => {
-                let expr_str = format!("ChainAccess({:?})", chain);
-                Err(CodeGenError::VariableNotFound(expr_str))
+        match analyzer.plan_chain_access(&module_address, &chain[0], &chain[1..]) {
+            Ok(Some(var)) => return Ok(Some(var)),
+            Ok(None) => {}
+            Err(e) => {
+                // Treat planner errors as a miss and continue to global fallback
+                tracing::debug!("chain planner miss at current module: {}", e);
             }
         }
+
+        // Fallback: global base across modules. Prefer static-offset lowering for globals.
+        let base = &chain[0];
+        let rest = &chain[1..];
+        let matches = analyzer.find_global_variables_by_name(base);
+        if matches.is_empty() {
+            return Ok(None);
+        }
+        // Build preferred order with metadata (current module first)
+        let cur_mod = ctx.module_path.clone();
+        let mut ordered: Vec<(
+            &std::path::PathBuf,
+            &ghostscope_dwarf::core::GlobalVariableInfo,
+        )> = Vec::new();
+        if let Some((mpath, info)) = matches
+            .iter()
+            .find(|(p, _)| p.to_string_lossy() == cur_mod.as_str())
+        {
+            ordered.push((mpath, info));
+        }
+        for (mpath, info) in &matches {
+            if mpath.to_string_lossy() != cur_mod.as_str() {
+                ordered.push((mpath, info));
+            }
+        }
+
+        // Try static-offset lowering first; fall back to planner if needed
+        for (mpath, info) in &ordered {
+            if let Some(link) = info.link_address {
+                if let Ok(Some((off, final_ty))) = analyzer.compute_global_member_static_offset(
+                    mpath,
+                    link,
+                    info.unit_offset,
+                    info.die_offset,
+                    rest,
+                ) {
+                    let name = if rest.is_empty() {
+                        base.clone()
+                    } else {
+                        format!("{base}.{}", rest.join("."))
+                    };
+                    let v = VariableWithEvaluation {
+                        name,
+                        type_name: final_ty.type_name(),
+                        dwarf_type: Some(final_ty),
+                        evaluation_result: ghostscope_dwarf::EvaluationResult::MemoryLocation(
+                            ghostscope_dwarf::LocationResult::Address(link + off),
+                        ),
+                        scope_depth: 0,
+                        is_parameter: false,
+                        is_artificial: false,
+                    };
+                    self.current_resolved_var_module_path =
+                        Some(mpath.to_string_lossy().to_string());
+                    return Ok(Some(v));
+                }
+            }
+            // Planner fallback (addr=0 inside module)
+            let ma = ghostscope_dwarf::ModuleAddress::new((*mpath).clone(), 0);
+            match analyzer.plan_chain_access(&ma, base, rest) {
+                Ok(Some(v)) => {
+                    self.current_resolved_var_module_path =
+                        Some(mpath.to_string_lossy().to_string());
+                    return Ok(Some(v));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::debug!("chain planner miss in module '{}': {}", mpath.display(), e);
+                }
+            }
+        }
+
+        Ok(None)
         // unreachable
     }
 
@@ -713,20 +1434,112 @@ impl<'ctx> EbpfContext<'ctx> {
             _ => return Ok(None), // Not a pointer type
         };
 
-        // Upgrade UnknownType(target_name) using analyzer's type index to get a shallow/full type
-        // This is important for expressions like *r.headers_in.host where the member is a typedef
-        // to a struct pointer; UnknownType would have size 0 and fail reads.
+        // Upgrade UnknownType(target_name) using analyzer/type index to get a shallow type.
+        // 1) Struct/union/class/enum: try analyzer shallow lookup by name (module-scoped first)
+        // 2) Do NOT猜测内建类型大小 — 仅使用 DWARF 基础类型条目
         if let TypeInfo::UnknownType { name } = &pointed_type {
-            if !name.is_empty() {
-                if let Some(analyzer_ptr) = self.process_analyzer {
-                    let analyzer = unsafe { &mut *analyzer_ptr };
-                    let ctx = self.get_compile_time_context()?;
-                    // Use module-scoped, shallow-only resolution to avoid slow paths
-                    if let Some(ti) = analyzer
-                        .resolve_struct_type_shallow_by_name_in_module(&ctx.module_path, name)
-                        .or_else(|| analyzer.resolve_struct_type_shallow_by_name(name))
-                    {
+            let mut candidate_names: Vec<String> = Vec::new();
+            if !name.is_empty() && name != "void" {
+                candidate_names.push(name.clone());
+            }
+            // Fallback: derive from pointer variable's pretty type name, e.g., "GlobalState*" => "GlobalState"
+            if candidate_names.is_empty() {
+                let tn = ptr_var.type_name.trim().to_string();
+                if let Some(idx) = tn.find('*') {
+                    let mut base = tn[..idx].trim().to_string();
+                    // Strip common qualifiers and tags
+                    for prefix in [
+                        "const ",
+                        "volatile ",
+                        "restrict ",
+                        "struct ",
+                        "class ",
+                        "union ",
+                    ] {
+                        if base.starts_with(prefix) {
+                            base = base[prefix.len()..].trim().to_string();
+                        }
+                    }
+                    if !base.is_empty() && base != "void" {
+                        candidate_names.push(base);
+                    }
+                }
+            }
+            if let Some(analyzer_ptr) = self.process_analyzer {
+                let analyzer = unsafe { &mut *analyzer_ptr };
+                let ctx = self.get_compile_time_context()?;
+                let mut alias_used: Option<String> = None;
+                for n in candidate_names {
+                    // Prefer cross-module definitions first to avoid forward decls with size=0 in current CU
+                    let mut upgraded: Option<TypeInfo> = None;
+                    // struct/class
+                    if let Some(ti) = analyzer.resolve_struct_type_shallow_by_name(&n) {
+                        if ti.size() > 0 {
+                            upgraded = Some(ti);
+                        }
+                    }
+                    if upgraded.is_none() {
+                        if let Some(ti) = analyzer
+                            .resolve_struct_type_shallow_by_name_in_module(&ctx.module_path, &n)
+                        {
+                            if ti.size() > 0 {
+                                upgraded = Some(ti);
+                            }
+                        }
+                    }
+                    // union
+                    if upgraded.is_none() {
+                        if let Some(ti) = analyzer.resolve_union_type_shallow_by_name(&n) {
+                            if ti.size() > 0 {
+                                upgraded = Some(ti);
+                            }
+                        }
+                    }
+                    if upgraded.is_none() {
+                        if let Some(ti) = analyzer
+                            .resolve_union_type_shallow_by_name_in_module(&ctx.module_path, &n)
+                        {
+                            if ti.size() > 0 {
+                                upgraded = Some(ti);
+                            }
+                        }
+                    }
+                    // enum
+                    if upgraded.is_none() {
+                        if let Some(ti) = analyzer.resolve_enum_type_shallow_by_name(&n) {
+                            if ti.size() > 0 {
+                                upgraded = Some(ti);
+                            }
+                        }
+                    }
+                    if upgraded.is_none() {
+                        if let Some(ti) = analyzer
+                            .resolve_enum_type_shallow_by_name_in_module(&ctx.module_path, &n)
+                        {
+                            if ti.size() > 0 {
+                                upgraded = Some(ti);
+                            }
+                        }
+                    }
+                    if let Some(ti) = upgraded {
                         pointed_type = ti;
+                        alias_used = Some(n.clone());
+                        break;
+                    }
+                }
+
+                // If we upgraded to an aggregate and have an alias name, wrap it as a typedef
+                if let Some(alias) = alias_used {
+                    match &pointed_type {
+                        TypeInfo::StructType { .. }
+                        | TypeInfo::UnionType { .. }
+                        | TypeInfo::EnumType { .. } => {
+                            pointed_type = TypeInfo::TypedefType {
+                                name: alias,
+                                underlying_type: Box::new(pointed_type.clone()),
+                            };
+                        }
+                        _ => {}
                     }
                 }
             }

@@ -141,7 +141,7 @@ trace complex_types_program.c:7 {
     );
 
     // Validate pointer prints include type suffix and hex
-    let has_any_ptr = stdout.contains("0x") && stdout.contains("(struct Complex*)");
+    let has_any_ptr = stdout.contains("0x") && stdout.contains("(Complex*)");
     assert!(
         has_any_ptr,
         "Expected pointer print with type suffix. STDOUT: {}",

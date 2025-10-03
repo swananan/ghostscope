@@ -237,4 +237,71 @@ impl OnDemandResolver {
     }
 
     // entry_pc_matches removed (no longer used after switching to direct DIE traversal)
+
+    /// Compute static byte offset for a global variable's member chain.
+    /// Returns (total_offset_from_base, final_shallow_type) on success.
+    pub fn compute_member_offset_for_global(
+        &mut self,
+        address: u64,
+        cu_off: gimli::DebugInfoOffset,
+        var_die: gimli::UnitOffset,
+        link_address: u64,
+        fields: &[String],
+    ) -> crate::core::Result<Option<(u64, crate::TypeInfo)>> {
+        // Plan using existing machinery starting from the known variable DIE.
+        // We pass var_die also as the subprogram placeholder (not used for globals).
+        let spec = ChainSpec {
+            base: "__global__",
+            fields,
+        };
+        let planned =
+            self.plan_chain_access_from_var(address, cu_off, var_die, var_die, spec, None)?;
+        let Some(var) = planned else { return Ok(None) };
+
+        // Fold the final evaluation result into an absolute address if possible
+        use crate::core::{ComputeStep, EvaluationResult, LocationResult};
+        let abs_addr_opt = match &var.evaluation_result {
+            EvaluationResult::MemoryLocation(LocationResult::Address(a)) => Some(*a),
+            EvaluationResult::MemoryLocation(LocationResult::ComputedLocation { steps }) => {
+                // Simple constant-folder: only PushConstant/Add allowed
+                let mut st: Vec<i64> = Vec::new();
+                let mut foldable = true;
+                for s in steps {
+                    match s {
+                        ComputeStep::PushConstant(v) => st.push(*v),
+                        ComputeStep::Add => {
+                            if st.len() >= 2 {
+                                let b = st.pop().unwrap();
+                                let a = st.pop().unwrap();
+                                st.push(a.saturating_add(b));
+                            } else {
+                                foldable = false;
+                                break;
+                            }
+                        }
+                        _ => {
+                            foldable = false;
+                            break;
+                        }
+                    }
+                }
+                if foldable && st.len() == 1 {
+                    Some(st[0] as u64)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
+        if let Some(abs) = abs_addr_opt {
+            let off = abs.saturating_sub(link_address);
+            let final_ty = var
+                .dwarf_type
+                .unwrap_or(crate::TypeInfo::UnknownType { name: "".into() });
+            return Ok(Some((off, final_ty)));
+        }
+
+        Ok(None)
+    }
 }
