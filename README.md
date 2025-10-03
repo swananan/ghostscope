@@ -91,6 +91,14 @@ GhostScope transforms compiled binaries into observable systems. Place trace poi
   </table>
 </div>
 
+## ⚠️ Experimental Tool Disclaimer
+
+> **GhostScope is currently in early development** and under active iteration. While we strive for data accuracy, trace information may be incorrect or incomplete in certain scenarios, primarily due to unsupported features.
+>
+> **Recommendation**: Use GhostScope's collected data as an **auxiliary reference** for troubleshooting, not as the sole source of truth. Cross-validate with other debugging tools before making critical decisions.
+>
+> We are continuously improving stability and accuracy, and look forward to removing this disclaimer in future versions.
+
 ## 📚 Documentation
 
 <table>
