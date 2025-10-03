@@ -40,12 +40,14 @@ enum ComplexArgSource {
     RuntimeRead {
         eval_result: ghostscope_dwarf::EvaluationResult,
         dwarf_type: ghostscope_dwarf::TypeInfo,
+        module_for_offsets: Option<String>,
     },
     ImmediateBytes {
         bytes: Vec<u8>,
     },
     AddressValue {
         eval_result: ghostscope_dwarf::EvaluationResult,
+        module_for_offsets: Option<String>,
     },
 }
 
@@ -298,22 +300,29 @@ impl<'ctx> EbpfContext<'ctx> {
                 let (var_name_index, type_encoding) =
                     self.resolve_variable_with_priority(var_name)?;
 
-                // If DWARF type exists and is complex, route to complex path
-                let is_complex = match self.query_dwarf_for_variable(var_name)? {
-                    Some(v) => match v.dwarf_type {
-                        Some(ref t) => !Self::is_simple_typeinfo(t),
-                        None => false,
-                    },
-                    None => false,
-                };
+                // If DWARF type exists and is complex, or it's a link-time address (global), route to complex path
+                let mut route_complex = false;
+                if let Some(v) = self.query_dwarf_for_variable(var_name)? {
+                    if let Some(ref t) = v.dwarf_type {
+                        if !Self::is_simple_typeinfo(t) {
+                            route_complex = true;
+                        }
+                    }
+                    if let ghostscope_dwarf::EvaluationResult::MemoryLocation(
+                        ghostscope_dwarf::LocationResult::Address(_),
+                    ) = v.evaluation_result
+                    {
+                        route_complex = true;
+                    }
+                }
                 tracing::trace!(
                     var_name = %var_name,
                     var_name_index = var_name_index,
                     ?type_encoding,
-                    is_complex,
+                    route_complex,
                     "compile_print_statement: routing decision"
                 );
-                if is_complex {
+                if route_complex {
                     // Use complex var pipeline for better formatting and correct sizing
                     let expr = crate::script::Expr::Variable(var_name.clone());
                     let n = self.process_complex_variable_print(&expr)?;
@@ -354,6 +363,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     let type_index = self.trace_context.add_type(ptr_ty);
                     let var_name_index = self.trace_context.add_variable_name("&expr".to_string());
 
+                    let module_hint = self.take_module_hint();
                     let one_arg = vec![ComplexArg {
                         var_name_index,
                         type_index,
@@ -361,6 +371,7 @@ impl<'ctx> EbpfContext<'ctx> {
                         data_len: 8,
                         source: ComplexArgSource::AddressValue {
                             eval_result: var.evaluation_result.clone(),
+                            module_for_offsets: module_hint,
                         },
                     }];
                     let fmt_idx = self.trace_context.add_string("{}".to_string());
@@ -446,7 +457,31 @@ impl<'ctx> EbpfContext<'ctx> {
             false
         };
 
-        let use_complex = has_complex_shape || has_complex_dwarf_var;
+        // Additional rule: if any argument resolves to a link-time address (global/static),
+        // route to complex path to apply ASLR offsets at runtime.
+        let has_global_link_addr = if !has_complex_shape {
+            let mut has = false;
+            for arg in args.iter() {
+                if let crate::script::ast::Expr::Variable(name) = arg {
+                    if !self.variable_exists(name) {
+                        if let Some(v) = self.query_dwarf_for_variable(name)? {
+                            if let ghostscope_dwarf::EvaluationResult::MemoryLocation(
+                                ghostscope_dwarf::LocationResult::Address(_),
+                            ) = v.evaluation_result
+                            {
+                                has = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            has
+        } else {
+            false
+        };
+
+        let use_complex = has_complex_shape || has_complex_dwarf_var || has_global_link_addr;
 
         if !use_complex {
             // Simple fast path: variables + literals via PrintFormat
@@ -573,6 +608,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     }
                     // Avoid over-reading: cap upper bound only.
                     data_len = std::cmp::min(data_len, 1993);
+                    let module_hint = self.take_module_hint();
                     complex_args.push(ComplexArg {
                         var_name_index,
                         type_index,
@@ -581,6 +617,7 @@ impl<'ctx> EbpfContext<'ctx> {
                         source: ComplexArgSource::RuntimeRead {
                             eval_result: var.evaluation_result.clone(),
                             dwarf_type: dwarf_type.clone(),
+                            module_for_offsets: module_hint,
                         },
                     });
                 }
@@ -599,6 +636,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     };
                     let type_index = self.trace_context.add_type(ptr_ty);
 
+                    let module_hint = self.take_module_hint();
                     complex_args.push(ComplexArg {
                         var_name_index: self.trace_context.add_variable_name("&expr".to_string()),
                         type_index,
@@ -606,6 +644,7 @@ impl<'ctx> EbpfContext<'ctx> {
                         data_len: 8,
                         source: ComplexArgSource::AddressValue {
                             eval_result: var.evaluation_result.clone(),
+                            module_for_offsets: module_hint,
                         },
                     });
                 }
@@ -1613,6 +1652,7 @@ impl<'ctx> EbpfContext<'ctx> {
                 ComplexArgSource::RuntimeRead {
                     eval_result,
                     dwarf_type,
+                    module_for_offsets,
                 } => {
                     // Read from user memory at runtime via BPF helper
                     let ptr_type = self.context.ptr_type(AddressSpace::default());
@@ -1623,7 +1663,12 @@ impl<'ctx> EbpfContext<'ctx> {
                         .build_bit_cast(var_data_ptr, ptr_type, "dst_ptr")
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
                     let size_val = i32_type.const_int(a.data_len as u64, false);
-                    let src_addr = self.evaluation_result_to_address(eval_result)?;
+                    // Compute source address; if link-time address, apply ASLR offsets via map
+                    let src_addr = self.evaluation_result_to_address_with_hint(
+                        eval_result,
+                        Some(apl_ptr),
+                        module_for_offsets.as_deref(),
+                    )?;
                     let src_ptr = self
                         .builder
                         .build_int_to_ptr(src_addr, ptr_type, "src_ptr")
@@ -1769,9 +1814,16 @@ impl<'ctx> EbpfContext<'ctx> {
 
                     self.builder.position_at_end(cont2_block);
                 }
-                ComplexArgSource::AddressValue { eval_result } => {
-                    // Compute address and store as 8 bytes
-                    let addr = self.evaluation_result_to_address(eval_result)?;
+                ComplexArgSource::AddressValue {
+                    eval_result,
+                    module_for_offsets,
+                } => {
+                    // Compute address (apply ASLR if link-time address) and store as 8 bytes
+                    let addr = self.evaluation_result_to_address_with_hint(
+                        eval_result,
+                        Some(apl_ptr),
+                        module_for_offsets.as_deref(),
+                    )?;
                     let cast_ptr = self
                         .builder
                         .build_pointer_cast(
@@ -3197,8 +3249,8 @@ impl<'ctx> EbpfContext<'ctx> {
                 })?
         };
 
-        // Compute source address from evaluation result
-        let src_addr = self.evaluation_result_to_address(eval_result)?;
+        // Compute source address with ASLR-aware helper
+        let src_addr = self.evaluation_result_to_address(eval_result, Some(status_ptr))?;
         tracing::trace!(src_addr = %{src_addr}, "generate_print_complex_variable_runtime: computed src_addr");
 
         // Setup common types and casts
@@ -3281,13 +3333,31 @@ impl<'ctx> EbpfContext<'ctx> {
 
         // Error: status=2 (read_user failed); attach errno+addr payload and set data_len=12
         self.builder.position_at_end(err_block);
-        self.builder
-            .build_store(
-                status_ptr,
-                self.context
-                    .i8_type()
-                    .const_int(VariableStatus::ReadError as u64, false),
+        // Only set ReadError if status is still Ok (preserve OffsetsUnavailable etc.)
+        let cur_status1 = self
+            .builder
+            .build_load(self.context.i8_type(), status_ptr, "cur_status1")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let is_ok1 = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                cur_status1.into_int_value(),
+                self.context.i8_type().const_zero(),
+                "status_is_ok1",
             )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let readerr_val = self
+            .context
+            .i8_type()
+            .const_int(VariableStatus::ReadError as u64, false)
+            .into();
+        let new_status1 = self
+            .builder
+            .build_select(is_ok1, readerr_val, cur_status1, "status_after_readerr")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder
+            .build_store(status_ptr, new_status1)
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         // data_len = 12 (errno:i32 + addr:u64)
         self.builder

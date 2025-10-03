@@ -1,5 +1,5 @@
 use aya::{
-    maps::RingBuf,
+    maps::{HashMap as AyaHashMap, MapData, RingBuf},
     programs::{
         uprobe::{UProbeAttachLocation, UProbeLinkId},
         ProgramError, UProbe,
@@ -587,5 +587,89 @@ impl GhostScopeLoader {
             .programs()
             .map(|(name, _prog)| format!("Program: {name}"))
             .collect()
+    }
+
+    /// Populate the proc_module_offsets map with computed offsets for a given PID
+    /// items: iterator of (module_cookie, SectionOffsets {text, rodata, data, bss})
+    pub fn populate_proc_module_offsets(
+        &mut self,
+        pid: u32,
+        items: &[(u64, ProcModuleOffsetsValue)],
+    ) -> Result<()> {
+        // Look up the map by name
+        let map = self
+            .bpf
+            .map_mut("proc_module_offsets")
+            .ok_or_else(|| LoaderError::MapNotFound("proc_module_offsets".to_string()))?;
+
+        let mut hashmap: AyaHashMap<&mut MapData, ProcModuleKey, ProcModuleOffsetsValue> =
+            AyaHashMap::try_from(map)
+                .map_err(|e| LoaderError::Generic(format!("Failed to convert map: {e}")))?;
+
+        for (cookie, off) in items.iter() {
+            // Compose exact 16-byte key matching eBPF side: [pid:u32, pad:u32(0), cookie_lo:u32, cookie_hi:u32]
+            let cookie_lo = (*cookie & 0xffff_ffff) as u32;
+            let cookie_hi = (*cookie >> 32) as u32;
+            let key: ProcModuleKey = ProcModuleKey {
+                pid,
+                pad: 0,
+                cookie_lo,
+                cookie_hi,
+            };
+            let key_words = [key.pid, key.pad, key.cookie_lo, key.cookie_hi];
+            let _key_bytes = [
+                key_words[0].to_le_bytes(),
+                key_words[1].to_le_bytes(),
+                key_words[2].to_le_bytes(),
+                key_words[3].to_le_bytes(),
+            ];
+            tracing::info!(
+                "populate_proc_module_offsets: inserting pid={} cookie=0x{:08x}{:08x} text=0x{:x} rodata=0x{:x} data=0x{:x} bss=0x{:x}",
+                pid,
+                key.cookie_hi,
+                key.cookie_lo,
+                off.text,
+                off.rodata,
+                off.data,
+                off.bss
+            );
+            hashmap
+                .insert(key, off, 0)
+                .map_err(|e| LoaderError::Generic(format!("Failed to insert offsets: {e}")))?;
+        }
+
+        Ok(())
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct ProcModuleKey {
+    pid: u32,
+    pad: u32,
+    cookie_lo: u32,
+    cookie_hi: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ProcModuleOffsetsValue {
+    text: u64,
+    rodata: u64,
+    data: u64,
+    bss: u64,
+}
+
+unsafe impl aya::Pod for ProcModuleKey {}
+unsafe impl aya::Pod for ProcModuleOffsetsValue {}
+
+impl ProcModuleOffsetsValue {
+    pub fn new(text: u64, rodata: u64, data: u64, bss: u64) -> Self {
+        Self {
+            text,
+            rodata,
+            data,
+            bss,
+        }
     }
 }

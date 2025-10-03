@@ -4,6 +4,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use ghostscope_dwarf::core::SectionType;
 use ghostscope_dwarf::{DwarfAnalyzer, ModuleAddress};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -51,6 +52,34 @@ enum Commands {
         /// JSON output
         #[arg(long)]
         json: bool,
+    },
+    /// Export all global/static variables (DWARF index only)
+    #[command(name = "globals-all", alias = "ga")]
+    GlobalsAll {
+        /// Quiet output (module and address only)
+        #[arg(short, long)]
+        quiet: bool,
+        /// JSON output
+        #[arg(long)]
+        json: bool,
+        /// Verbose output
+        #[arg(short, long)]
+        verbose: bool,
+    },
+    /// Query global/static variables by name (DWARF index only)
+    #[command(name = "globals", alias = "g")]
+    Globals {
+        /// Variable name to search (exact match)
+        name: String,
+        /// Quiet output (module and address only)
+        #[arg(short, long)]
+        quiet: bool,
+        /// JSON output
+        #[arg(long)]
+        json: bool,
+        /// Verbose output
+        #[arg(short, long)]
+        verbose: bool,
     },
     /// Find function addresses and analyze variables at those addresses
     #[command(name = "function", alias = "f")]
@@ -110,6 +139,13 @@ enum Commands {
         /// Number of runs
         #[arg(long, default_value = "3")]
         runs: usize,
+    },
+    /// Compute per-module section offsets (PID mode)
+    #[command(name = "offsets", alias = "off")]
+    Offsets {
+        /// JSON output
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -179,6 +215,9 @@ impl CommonOptions for Commands {
             Commands::SourceLine { verbose, .. } => *verbose,
             Commands::Function { verbose, .. } => *verbose,
             Commands::ModuleAddr { verbose, .. } => *verbose,
+            Commands::Globals { verbose, .. } => *verbose,
+            Commands::GlobalsAll { verbose, .. } => *verbose,
+            Commands::Offsets { .. } => false,
             Commands::ListModules { .. } => false,
             Commands::SourceFiles { .. } => false,
             Commands::Benchmark { .. } => false,
@@ -190,6 +229,9 @@ impl CommonOptions for Commands {
             Commands::SourceLine { quiet, .. } => *quiet,
             Commands::Function { quiet, .. } => *quiet,
             Commands::ModuleAddr { quiet, .. } => *quiet,
+            Commands::Globals { quiet, .. } => *quiet,
+            Commands::GlobalsAll { quiet, .. } => *quiet,
+            Commands::Offsets { .. } => false,
             Commands::ListModules { quiet, .. } => *quiet,
             Commands::SourceFiles { quiet, .. } => *quiet,
             Commands::Benchmark { .. } => false,
@@ -201,6 +243,9 @@ impl CommonOptions for Commands {
             Commands::SourceLine { json, .. } => *json,
             Commands::Function { json, .. } => *json,
             Commands::ModuleAddr { json, .. } => *json,
+            Commands::Globals { json, .. } => *json,
+            Commands::GlobalsAll { json, .. } => *json,
+            Commands::Offsets { json, .. } => *json,
             Commands::ListModules { json, .. } => *json,
             Commands::SourceFiles { json, .. } => *json,
             Commands::Benchmark { .. } => false,
@@ -375,6 +420,15 @@ async fn load_analyzer_and_execute(cli: Cli) -> Result<std::time::Duration> {
             module, address, ..
         } => {
             analyze_module_address(&mut analyzer, module, address, &cli.command).await?;
+        }
+        Commands::Globals { name, .. } => {
+            analyze_globals(&mut analyzer, cli.pid, name, &cli.command).await?;
+        }
+        Commands::GlobalsAll { .. } => {
+            analyze_globals_all(&mut analyzer, cli.pid, &cli.command).await?;
+        }
+        Commands::Offsets { .. } => {
+            analyze_offsets(&mut analyzer, cli.pid, &cli.command).await?;
         }
         Commands::ListModules { .. } => {
             list_modules(&analyzer, &cli.command);
@@ -888,4 +942,218 @@ fn parse_address(address_str: &str) -> Result<u64> {
         address_str.parse::<u64>()
     }
     .map_err(|_| anyhow::anyhow!("Invalid address format: {}", address_str))
+}
+
+#[derive(Debug, serde::Serialize)]
+struct GlobalVarJsonItem {
+    module: String,
+    name: String,
+    link_address: Option<String>,
+    section: Option<String>,
+}
+
+async fn analyze_globals(
+    analyzer: &mut DwarfAnalyzer,
+    pid: Option<u32>,
+    var_name: &str,
+    options: &Commands,
+) -> Result<()> {
+    // -t 模式暂不支持全局变量：直接 TODO 警告 + 错误
+    if pid.is_none() {
+        eprintln!(
+            "TODO: -t mode does not support global variables yet (proc offsets unavailable)."
+        );
+        return Err(anyhow::anyhow!(
+            "proc_maps_unavailable: -t mode unsupported for globals"
+        ));
+    }
+
+    let results = analyzer.find_global_variables_by_name(var_name);
+
+    if options.json() {
+        let json_items: Vec<GlobalVarJsonItem> = results
+            .iter()
+            .map(|(module_path, info)| GlobalVarJsonItem {
+                module: module_path.display().to_string(),
+                name: info.name.clone(),
+                link_address: info.link_address.map(|addr| format!("0x{addr:x}")),
+                section: info.section.as_ref().map(|s| match s {
+                    SectionType::Text => "text".to_string(),
+                    SectionType::Rodata => "rodata".to_string(),
+                    SectionType::Data => "data".to_string(),
+                    SectionType::Bss => "bss".to_string(),
+                    SectionType::Unknown => "unknown".to_string(),
+                }),
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&json_items)?);
+    } else {
+        if results.is_empty() {
+            if !options.quiet() {
+                println!("No globals named '{var_name}' found");
+            }
+            return Ok(());
+        }
+
+        if !options.quiet() {
+            println!("=== Globals: '{var_name}' ===");
+        }
+        for (module_path, info) in results {
+            let module_str = module_path.display();
+            let addr_str = info
+                .link_address
+                .map(|a| format!("0x{a:x}"))
+                .unwrap_or_else(|| "<no-address>".to_string());
+            let sect_str = info.section.map(|s| match s {
+                SectionType::Text => ".text",
+                SectionType::Rodata => ".rodata",
+                SectionType::Data => ".data",
+                SectionType::Bss => ".bss",
+                SectionType::Unknown => "(unknown)",
+            });
+
+            if options.quiet() {
+                println!("{} {} {}", module_str, info.name, addr_str);
+            } else {
+                match sect_str {
+                    Some(s) => println!(
+                        "- Module: {module_str}\n  Name:   {}\n  Addr:   {}\n  Sect:   {}\n",
+                        info.name, addr_str, s
+                    ),
+                    None => println!(
+                        "- Module: {module_str}\n  Name:   {}\n  Addr:   {}\n  Sect:   (n/a)\n",
+                        info.name, addr_str
+                    ),
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn analyze_globals_all(
+    analyzer: &mut DwarfAnalyzer,
+    pid: Option<u32>,
+    options: &Commands,
+) -> Result<()> {
+    if pid.is_none() {
+        eprintln!(
+            "TODO: -t mode does not support global variables yet (proc offsets unavailable)."
+        );
+        return Err(anyhow::anyhow!(
+            "proc_maps_unavailable: -t mode unsupported for globals"
+        ));
+    }
+
+    let results = analyzer.list_all_global_variables();
+
+    if options.json() {
+        let json_items: Vec<GlobalVarJsonItem> = results
+            .iter()
+            .map(|(module_path, info)| GlobalVarJsonItem {
+                module: module_path.display().to_string(),
+                name: info.name.clone(),
+                link_address: info.link_address.map(|a| format!("0x{a:x}")),
+                section: info.section.as_ref().map(|s| match s {
+                    SectionType::Text => "text".to_string(),
+                    SectionType::Rodata => "rodata".to_string(),
+                    SectionType::Data => "data".to_string(),
+                    SectionType::Bss => "bss".to_string(),
+                    SectionType::Unknown => "unknown".to_string(),
+                }),
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&json_items)?);
+    } else {
+        if !options.quiet() {
+            println!("=== All Globals (with addresses) ===");
+        }
+        for (module_path, info) in results {
+            let module_str = module_path.display();
+            let addr_str = info
+                .link_address
+                .map(|a| format!("0x{a:x}"))
+                .unwrap_or_else(|| "<no-address>".to_string());
+            let sect_str = info.section.map(|s| match s {
+                SectionType::Text => ".text",
+                SectionType::Rodata => ".rodata",
+                SectionType::Data => ".data",
+                SectionType::Bss => ".bss",
+                SectionType::Unknown => "(unknown)",
+            });
+            if options.quiet() {
+                println!("{} {} {}", module_str, info.name, addr_str);
+            } else if let Some(s) = sect_str {
+                println!(
+                    "- Module: {module_str}\n  Name:   {}\n  Addr:   {}\n  Sect:   {}\n",
+                    info.name, addr_str, s
+                );
+            } else {
+                println!(
+                    "- Module: {module_str}\n  Name:   {}\n  Addr:   {}\n  Sect:   (n/a)\n",
+                    info.name, addr_str
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ModuleOffsetsJsonItem {
+    module: String,
+    cookie: String,
+    text: String,
+    rodata: String,
+    data: String,
+    bss: String,
+}
+
+async fn analyze_offsets(
+    analyzer: &mut DwarfAnalyzer,
+    pid: Option<u32>,
+    options: &Commands,
+) -> Result<()> {
+    if pid.is_none() {
+        eprintln!(
+            "TODO: -t mode does not support offsets computation yet (proc offsets unavailable)."
+        );
+        return Err(anyhow::anyhow!(
+            "proc_maps_unavailable: -t mode unsupported for offsets"
+        ));
+    }
+
+    let results = analyzer.compute_section_offsets()?;
+
+    if options.json() {
+        let json_items: Vec<ModuleOffsetsJsonItem> = results
+            .iter()
+            .map(|(module, cookie, off)| ModuleOffsetsJsonItem {
+                module: module.display().to_string(),
+                cookie: format!("0x{cookie:x}"),
+                text: format!("0x{:x}", off.text),
+                rodata: format!("0x{:x}", off.rodata),
+                data: format!("0x{:x}", off.data),
+                bss: format!("0x{:x}", off.bss),
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&json_items)?);
+    } else {
+        println!("=== Section Offsets (runtime bias) ===");
+        for (module, cookie, off) in results {
+            println!(
+                "- Module: {}\n  cookie=0x{:x}\n  text=0x{:x} rodata=0x{:x} data=0x{:x} bss=0x{:x}\n",
+                module.display(),
+                cookie,
+                off.text,
+                off.rodata,
+                off.data,
+                off.bss
+            );
+        }
+    }
+
+    Ok(())
 }

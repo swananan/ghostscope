@@ -119,29 +119,107 @@ impl DetailedParser {
                 }
                 DW_TAG_POINTER_TYPE => {
                     let mut byte_size: u64 = 8;
+                    // Default to unknown pointee until we find a concrete base/aggregate
+                    let mut target: TypeInfo = TypeInfo::UnknownType {
+                        name: "void".to_string(),
+                    };
                     if let Ok(Some(a)) = entry.attr(DW_AT_BYTE_SIZE) {
                         if let gimli::AttributeValue::Udata(sz) = a.value() {
                             byte_size = sz;
                         }
                     }
-                    // Try to get pointee name without resolving members
-                    let mut pointee_name = None;
-                    if let Ok(Some(gimli::AttributeValue::UnitRef(toff))) =
+                    // Very shallow pointee name resolution: unwrap typedef/qualifiers only, without recursion
+                    let mut pointee_name: Option<String> = None;
+                    if let Ok(Some(gimli::AttributeValue::UnitRef(mut toff))) =
                         entry.attr_value(DW_AT_TYPE)
                     {
-                        if let Ok(tentry) = unit.entry(toff) {
-                            if let Ok(Some(na)) = tentry.attr(DW_AT_NAME) {
-                                if let Ok(s) = dwarf.attr_string(unit, na.value()) {
-                                    pointee_name = Some(s.to_string_lossy().into_owned());
+                        // Unwrap up to a small bound to avoid deep recursion/stack blowups on real-world code
+                        for _ in 0..8 {
+                            if let Ok(tentry) = unit.entry(toff) {
+                                match tentry.tag() {
+                                    DW_TAG_TYPEDEF | DW_TAG_CONST_TYPE | DW_TAG_VOLATILE_TYPE
+                                    | DW_TAG_RESTRICT_TYPE => {
+                                        // Capture typedef name as a fallback pointee name
+                                        if tentry.tag() == DW_TAG_TYPEDEF {
+                                            if let Ok(Some(na)) = tentry.attr(DW_AT_NAME) {
+                                                if let Ok(s) = dwarf.attr_string(unit, na.value()) {
+                                                    if pointee_name.is_none() {
+                                                        pointee_name =
+                                                            Some(s.to_string_lossy().into_owned());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if let Ok(Some(gimli::AttributeValue::UnitRef(next))) =
+                                            tentry.attr_value(DW_AT_TYPE)
+                                        {
+                                            toff = next;
+                                            continue;
+                                        }
+                                        // No further type; bail
+                                    }
+                                    DW_TAG_BASE_TYPE => {
+                                        // Construct BaseType with size+encoding
+                                        let mut byte_size = 0u64;
+                                        let mut encoding = gimli::constants::DW_ATE_unsigned;
+                                        if let Ok(Some(a)) = tentry.attr(DW_AT_BYTE_SIZE) {
+                                            if let gimli::AttributeValue::Udata(sz) = a.value() {
+                                                byte_size = sz;
+                                            }
+                                        }
+                                        if let Ok(Some(a)) = tentry.attr(DW_AT_ENCODING) {
+                                            if let gimli::AttributeValue::Encoding(enc) = a.value()
+                                            {
+                                                encoding = enc;
+                                            }
+                                        }
+                                        let name = if let Ok(Some(na)) = tentry.attr(DW_AT_NAME) {
+                                            if let Ok(s) = dwarf.attr_string(unit, na.value()) {
+                                                s.to_string_lossy().into_owned()
+                                            } else {
+                                                "<base>".into()
+                                            }
+                                        } else {
+                                            "<base>".into()
+                                        };
+                                        pointee_name = Some(name.clone());
+                                        target = TypeInfo::BaseType {
+                                            name,
+                                            size: byte_size,
+                                            encoding: encoding.0 as u16,
+                                        };
+                                    }
+                                    DW_TAG_STRUCTURE_TYPE
+                                    | DW_TAG_CLASS_TYPE
+                                    | DW_TAG_UNION_TYPE
+                                    | DW_TAG_ENUMERATION_TYPE => {
+                                        // Do NOT recursively resolve aggregates here to avoid cycles on self-referential types.
+                                        // Only record the name; deref-time upgrade will use analyzer's shallow index safely.
+                                        if let Ok(Some(na)) = tentry.attr(DW_AT_NAME) {
+                                            if let Ok(s) = dwarf.attr_string(unit, na.value()) {
+                                                let n = s.to_string_lossy().into_owned();
+                                                pointee_name = Some(n.clone());
+                                                // keep target as UnknownType{name} to avoid deep recursion here
+                                                if matches!(target, TypeInfo::UnknownType { .. }) {
+                                                    target = TypeInfo::UnknownType { name: n };
+                                                }
+                                            }
+                                        }
+                                    }
+                                    _ => {}
                                 }
+                                break;
+                            } else {
+                                break;
                             }
                         }
                     }
-                    let target = pointee_name
-                        .map(|n| TypeInfo::UnknownType { name: n })
-                        .unwrap_or(TypeInfo::UnknownType {
-                            name: "void".to_string(),
-                        });
+                    // If only a name was found without concrete target, carry it as UnknownType
+                    if let Some(n) = pointee_name {
+                        if matches!(target, TypeInfo::UnknownType { .. }) {
+                            target = TypeInfo::UnknownType { name: n };
+                        }
+                    }
                     return Some(TypeInfo::PointerType {
                         target_type: Box::new(target),
                         size: byte_size,
@@ -174,7 +252,9 @@ impl DetailedParser {
                     });
                 }
                 DW_TAG_STRUCTURE_TYPE | DW_TAG_CLASS_TYPE => {
-                    let name = entry_name.unwrap_or_else(|| "<anon_struct>".to_string());
+                    let name = alias_name.clone().unwrap_or_else(|| {
+                        entry_name.unwrap_or_else(|| "<anon_struct>".to_string())
+                    });
                     let mut byte_size = 0u64;
                     if let Ok(Some(a)) = entry.attr(DW_AT_BYTE_SIZE) {
                         if let gimli::AttributeValue::Udata(sz) = a.value() {
@@ -317,7 +397,9 @@ impl DetailedParser {
                     });
                 }
                 DW_TAG_UNION_TYPE => {
-                    let name = entry_name.unwrap_or_else(|| "<anon_union>".to_string());
+                    let name = alias_name.clone().unwrap_or_else(|| {
+                        entry_name.unwrap_or_else(|| "<anon_union>".to_string())
+                    });
                     let mut byte_size = 0u64;
                     if let Ok(Some(a)) = entry.attr(DW_AT_BYTE_SIZE) {
                         if let gimli::AttributeValue::Udata(sz) = a.value() {
@@ -370,7 +452,9 @@ impl DetailedParser {
                     });
                 }
                 DW_TAG_ENUMERATION_TYPE => {
-                    let name = entry_name.unwrap_or_else(|| "<anon_enum>".to_string());
+                    let name = alias_name
+                        .clone()
+                        .unwrap_or_else(|| entry_name.unwrap_or_else(|| "<anon_enum>".to_string()));
                     // Parse base type and size
                     let mut byte_size = 0u64;
                     if let Ok(Some(a)) = entry.attr(DW_AT_BYTE_SIZE) {

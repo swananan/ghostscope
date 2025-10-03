@@ -162,6 +162,7 @@ impl FormatPrinter {
                                                 }
                                                 3 => format!("<address compute failed> ({type_suffix}*)"),
                                                 4 => format!("<truncated> ({type_suffix}*)"),
+                                                5 => format!("<proc offsets unavailable> ({type_suffix}*)"),
                                                 s => format!("<error status={s}> ({type_suffix}*)"),
                                             }
                                         } else {
@@ -337,6 +338,9 @@ impl FormatPrinter {
             },
             s if s == VariableStatus::AccessError as u8 => {
                 format!("<address compute failed> ({type_suffix}*)")
+            }
+            s if s == VariableStatus::OffsetsUnavailable as u8 => {
+                format!("<proc offsets unavailable> ({type_suffix}*)")
             }
             s if s == VariableStatus::Truncated as u8 => format!("<truncated> ({type_suffix}*)"),
             _ => format!("<error status={status}> ({type_suffix}*)"),
@@ -569,13 +573,44 @@ impl FormatPrinter {
                 underlying_type,
                 ..
             } => {
-                let underlying_formatted = Self::format_data_with_type_info_impl(
-                    data,
-                    underlying_type,
-                    current_depth,
-                    max_depth,
-                );
-                format!("{name}({underlying_formatted})")
+                // Reuse aggregate formatters by substituting display name
+                match &**underlying_type {
+                    TypeInfo::StructType { size, members, .. } => {
+                        let alias_struct = TypeInfo::StructType {
+                            name: name.clone(),
+                            size: *size,
+                            members: members.clone(),
+                        };
+                        Self::format_data_with_type_info_impl(
+                            data,
+                            &alias_struct,
+                            current_depth,
+                            max_depth,
+                        )
+                    }
+                    TypeInfo::UnionType { size, members, .. } => {
+                        let alias_union = TypeInfo::UnionType {
+                            name: name.clone(),
+                            size: *size,
+                            members: members.clone(),
+                        };
+                        Self::format_data_with_type_info_impl(
+                            data,
+                            &alias_union,
+                            current_depth,
+                            max_depth,
+                        )
+                    }
+                    _ => {
+                        let underlying_formatted = Self::format_data_with_type_info_impl(
+                            data,
+                            underlying_type,
+                            current_depth,
+                            max_depth,
+                        );
+                        format!("{name}({underlying_formatted})")
+                    }
+                }
             }
             TypeInfo::QualifiedType {
                 underlying_type, ..

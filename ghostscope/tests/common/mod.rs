@@ -40,6 +40,13 @@ pub fn init() {
                 .arg("clean")
                 .current_dir(&complex_dir)
                 .output();
+
+            // globals_program
+            let globals_dir = base.join("globals_program");
+            let _ = Command::new("make")
+                .arg("clean")
+                .current_dir(&globals_dir)
+                .output();
         }
         libc::atexit(cleanup_fixtures);
     });
@@ -271,6 +278,12 @@ impl TestFixtures {
                 OptimizationLevel::O3 => "complex_types_program_o3",
             };
             self.base_path.join("complex_types_program").join(bin_name)
+        } else if name == "globals_program" {
+            // Only debug build for globals fixture
+            ensure_globals_program_compiled()?;
+            self.base_path
+                .join("globals_program")
+                .join("globals_program")
         } else {
             // Fallback to old binaries directory (debug only)
             self.base_path.join("binaries").join(name).join(name)
@@ -336,4 +349,38 @@ impl TestFixtures {
 
 lazy_static! {
     pub static ref FIXTURES: TestFixtures = TestFixtures::new();
+}
+
+static COMPILE_GLOBALS: Once = Once::new();
+
+fn ensure_globals_program_compiled() -> anyhow::Result<()> {
+    let mut result = Ok(());
+    COMPILE_GLOBALS.call_once(|| {
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/globals_program");
+        println!("Compiling globals_program (Debug) in {:?}", base);
+        let _ = Command::new("make")
+            .arg("clean")
+            .current_dir(&base)
+            .output();
+        match Command::new("make").arg("all").current_dir(&base).output() {
+            Ok(out) => {
+                if out.status.success() {
+                    println!("✓ Successfully compiled globals_program and libgvars.so");
+                } else {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    result = Err(anyhow::anyhow!(
+                        "Failed to compile globals_program: {}",
+                        stderr
+                    ));
+                }
+            }
+            Err(e) => {
+                result = Err(anyhow::anyhow!(
+                    "Failed to run make for globals_program: {}",
+                    e
+                ));
+            }
+        }
+    });
+    result
 }

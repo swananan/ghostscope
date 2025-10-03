@@ -86,6 +86,10 @@ pub struct EbpfContext<'ctx> {
 
     // === New instruction-based compilation system ===
     pub trace_context: ghostscope_protocol::TraceContext, // Trace context for optimized transmission
+    pub current_resolved_var_module_path: Option<String>,
+
+    // Per-invocation stack key for proc_module_offsets lookups (allocated in entry block)
+    pub pm_key_alloca: Option<inkwell::values::PointerValue<'ctx>>, // [3 x i32] alloca
 }
 
 // Temporary alias for backward compatibility during refactoring
@@ -171,6 +175,8 @@ impl<'ctx> EbpfContext<'ctx> {
 
             // Initialize new instruction-based compilation system
             trace_context: ghostscope_protocol::TraceContext::new(),
+            current_resolved_var_module_path: None,
+            pm_key_alloca: None,
         })
     }
 
@@ -199,6 +205,11 @@ impl<'ctx> EbpfContext<'ctx> {
         self.current_compile_time_context
             .as_ref()
             .ok_or_else(|| CodeGenError::DwarfError("No compile-time context set".to_string()))
+    }
+
+    /// Take and clear the current module hint for offsets (if any)
+    pub fn take_module_hint(&mut self) -> Option<String> {
+        self.current_resolved_var_module_path.take()
     }
 
     /// Declare trace_printk eBPF helper function
@@ -301,6 +312,19 @@ impl<'ctx> EbpfContext<'ctx> {
             )
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to create ringbuf map: {e}")))?;
 
+        // Create ASLR offsets map for (pid,module) → section offsets
+        self.map_manager
+            .create_proc_module_offsets_map(
+                &self.module,
+                &self.di_builder,
+                &self.compile_unit,
+                "proc_module_offsets",
+                4096,
+            )
+            .map_err(|e| {
+                CodeGenError::LLVMError(format!("Failed to create proc_module_offsets map: {e}"))
+            })?;
+
         // Variables are now queried on-demand when accessed in expressions
         // No need to pre-populate DWARF variables
 
@@ -357,6 +381,15 @@ impl<'ctx> EbpfContext<'ctx> {
         // Create basic block and position builder
         let basic_block = self.context.append_basic_block(function, "entry");
         self.builder.position_at_end(basic_block);
+
+        // Allocate fixed-size per-invocation key buffer on the eBPF stack (entry block)
+        // Layout: [ pid:u32, pad:u32, cookie_lo:u32, cookie_hi:u32 ] to match struct {u32; u64}
+        let key_arr_ty = i32_type.array_type(4);
+        let key_alloca = self
+            .builder
+            .build_alloca(key_arr_ty, "pm_key")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.pm_key_alloca = Some(key_alloca);
 
         info!("Created main function: {}", function_name);
         Ok(function)

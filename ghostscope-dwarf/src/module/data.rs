@@ -22,7 +22,7 @@ mod file_selection_scoring {
 }
 
 use crate::{
-    core::{MappedFile, Result, SourceLocation},
+    core::{GlobalVariableInfo, MappedFile, Result, SectionType, SourceLocation},
     data::{
         CfiIndex, LightweightIndex, LineMappingTable, OnDemandResolver, ScopedFileIndexManager,
     },
@@ -103,6 +103,76 @@ impl ModuleData {
                             return self.detailed_shallow_type(td.cu_offset, under);
                         }
                         // As a last resort, return shallow typedef itself
+                        return crate::parser::DetailedParser::resolve_type_shallow_at_offset(
+                            dwarf,
+                            &unit,
+                            td.die_offset,
+                        );
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Resolve a union type by name using only indexes + shallow resolution.
+    pub(crate) fn resolve_union_type_shallow_by_name(
+        &mut self,
+        name: &str,
+    ) -> Option<crate::TypeInfo> {
+        if let Some(loc) = self
+            .type_name_index
+            .find_aggregate_definition(name, gimli::constants::DW_TAG_union_type)
+        {
+            return self.detailed_shallow_type(loc.cu_offset, loc.die_offset);
+        }
+
+        if let Some(td) = self.type_name_index.find_typedef(name) {
+            let dwarf = self.resolver.dwarf_ref();
+            if let Ok(header) = dwarf.debug_info.header_from_offset(td.cu_offset) {
+                if let Ok(unit) = dwarf.unit(header) {
+                    if let Ok(entry) = unit.entry(td.die_offset) {
+                        if let Ok(Some(gimli::AttributeValue::UnitRef(under))) =
+                            entry.attr_value(gimli::DW_AT_type)
+                        {
+                            return self.detailed_shallow_type(td.cu_offset, under);
+                        }
+                        return crate::parser::DetailedParser::resolve_type_shallow_at_offset(
+                            dwarf,
+                            &unit,
+                            td.die_offset,
+                        );
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Resolve an enum type by name using only indexes + shallow resolution.
+    pub(crate) fn resolve_enum_type_shallow_by_name(
+        &mut self,
+        name: &str,
+    ) -> Option<crate::TypeInfo> {
+        if let Some(loc) = self
+            .type_name_index
+            .find_aggregate_definition(name, gimli::constants::DW_TAG_enumeration_type)
+        {
+            return self.detailed_shallow_type(loc.cu_offset, loc.die_offset);
+        }
+
+        if let Some(td) = self.type_name_index.find_typedef(name) {
+            let dwarf = self.resolver.dwarf_ref();
+            if let Ok(header) = dwarf.debug_info.header_from_offset(td.cu_offset) {
+                if let Ok(unit) = dwarf.unit(header) {
+                    if let Ok(entry) = unit.entry(td.die_offset) {
+                        if let Ok(Some(gimli::AttributeValue::UnitRef(under))) =
+                            entry.attr_value(gimli::DW_AT_type)
+                        {
+                            return self.detailed_shallow_type(td.cu_offset, under);
+                        }
                         return crate::parser::DetailedParser::resolve_type_shallow_at_offset(
                             dwarf,
                             &unit,
@@ -663,11 +733,51 @@ impl ModuleData {
                 }
             }
         }
+        // Fallback: try planning from a CU-scope global/static variable with the same base name
+        // This enables expressions like G_STATE.counter when G_STATE is a global.
+        let globals = self.find_global_variables_by_name(base_var);
+        if !globals.is_empty() {
+            // Try each candidate until one plans successfully
+            for info in globals {
+                let spec = crate::data::on_demand_resolver::ChainSpec {
+                    base: base_var,
+                    fields: chain,
+                };
+                match self.resolver.plan_chain_access_from_var(
+                    address,
+                    info.unit_offset,
+                    // subprogram_die is unused in planner path; pass the var die offset for logging consistency
+                    info.die_offset,
+                    info.die_offset,
+                    spec,
+                    None,
+                ) {
+                    Ok(Some(v)) => {
+                        tracing::info!(
+                            "DWARF:plan_chain(global) success base='{}' total_ms={}",
+                            base_var,
+                            t0.elapsed().as_millis()
+                        );
+                        return Ok(Some(v));
+                    }
+                    Ok(None) => continue,
+                    Err(e) => {
+                        tracing::debug!(
+                            "DWARF:plan_chain(global) candidate failed for base='{}': {}",
+                            base_var,
+                            e
+                        );
+                        continue;
+                    }
+                }
+            }
+        }
 
-        // Strict index: do not fallback to planner search
+        // Strict index: do not fallback further
         let err = anyhow::anyhow!(
-            "StrictIndex: no function found for address 0x{:x} in block index (plan_chain)",
-            address
+            "StrictIndex: no function found for address 0x{:x} or no matching base var '{}' (plan_chain)",
+            address,
+            base_var
         );
         tracing::info!(
             "DWARF:plan_chain miss addr=0x{:x} built_funcs={} build_ms={} total_ms={} err={}",
@@ -678,6 +788,18 @@ impl ModuleData {
             err
         );
         Err(err)
+    }
+
+    /// Compute static byte offset for a global variable's member chain in this module
+    pub(crate) fn compute_global_member_static_offset(
+        &mut self,
+        cu_off: gimli::DebugInfoOffset,
+        var_die: gimli::UnitOffset,
+        link_address: u64,
+        fields: &[String],
+    ) -> Result<Option<(u64, crate::TypeInfo)>> {
+        self.resolver
+            .compute_member_offset_for_global(0, cu_off, var_die, link_address, fields)
     }
 
     /// Lookup source location at address (line mapping + file manager)
@@ -934,16 +1056,31 @@ impl ModuleData {
                 .scoped_file_manager
                 .lookup_by_scoped_index(&line_entry.compilation_unit, line_entry.file_index)
             {
-                tracing::debug!(
-                    "create_source_location_from_entry: CU looks like path; using resolved full path '{}'",
-                    resolved_full_path
-                );
-                return Some(SourceLocation {
-                    file_path: resolved_full_path,
-                    line_number: line_entry.line as u32,
-                    column: Some(line_entry.column as u32),
-                    address: line_entry.address,
-                });
+                // Only use the resolved path when it actually looks like a proper path.
+                if self.is_path_like(&resolved_full_path) {
+                    tracing::debug!(
+                        "create_source_location_from_entry: CU looks like path; using resolved full path '{}'",
+                        resolved_full_path
+                    );
+                    return Some(SourceLocation {
+                        file_path: resolved_full_path,
+                        line_number: line_entry.line as u32,
+                        column: Some(line_entry.column as u32),
+                        address: line_entry.address,
+                    });
+                } else {
+                    // Resolved result degraded to bare filename; keep CU path as it is richer
+                    tracing::debug!(
+                        "create_source_location_from_entry: resolved full path is bare filename; keeping CU '{}'",
+                        line_entry.compilation_unit
+                    );
+                    return Some(SourceLocation {
+                        file_path: line_entry.compilation_unit.clone(),
+                        line_number: line_entry.line as u32,
+                        column: Some(line_entry.column as u32),
+                        address: line_entry.address,
+                    });
+                }
             }
 
             // Fallback to CU string if resolution failed
@@ -956,43 +1093,51 @@ impl ModuleData {
         }
 
         // Try to find a better file if current one is a header
-        let preferred_file_path = if let Some(current_path) = self
-            .scoped_file_manager
-            .lookup_by_scoped_index(&line_entry.compilation_unit, line_entry.file_index)
-        {
+        let preferred_file_path = {
+            // Always returns Some(String) (falls back to filename when no dir info). Handle degradation here.
+            let current_path = self
+                .scoped_file_manager
+                .lookup_by_scoped_index(&line_entry.compilation_unit, line_entry.file_index)
+                .unwrap_or_else(|| line_entry.file_path.clone());
+
             tracing::debug!(
                 "create_source_location_from_entry: found file via ScopedFileIndexManager: '{}'",
                 current_path
             );
 
-            // If current file is a header, try to find the main source file
-            if self.is_header_file(&current_path) {
-                if let Some(alternative_path) =
-                    self.find_main_source_file_in_cu(&line_entry.compilation_unit)
-                {
-                    tracing::debug!(
-                        "create_source_location_from_entry: replaced header '{}' with main source '{}'",
-                        current_path, alternative_path
-                    );
-                    alternative_path
+            if self.is_path_like(&current_path) {
+                // If current file is a header, try to find the main source file
+                if self.is_header_file(&current_path) {
+                    if let Some(alternative_path) =
+                        self.find_main_source_file_in_cu(&line_entry.compilation_unit)
+                    {
+                        tracing::debug!(
+                            "create_source_location_from_entry: replaced header '{}' with main source '{}'",
+                            current_path, alternative_path
+                        );
+                        alternative_path
+                    } else {
+                        current_path
+                    }
                 } else {
                     current_path
                 }
+            } else if !line_entry.file_path.is_empty() && self.is_path_like(&line_entry.file_path) {
+                tracing::debug!(
+                    "create_source_location_from_entry: using line entry file_path: '{}' (scoped result was bare)",
+                    line_entry.file_path
+                );
+                line_entry.file_path.clone()
+            } else if self.is_path_like(&line_entry.compilation_unit) {
+                tracing::debug!(
+                    "create_source_location_from_entry: using CU path: '{}' (scoped result was bare)",
+                    line_entry.compilation_unit
+                );
+                line_entry.compilation_unit.clone()
             } else {
+                // Last resort: keep the bare filename
                 current_path
             }
-        } else if !line_entry.file_path.is_empty() {
-            tracing::debug!(
-                "create_source_location_from_entry: using line entry file_path: '{}'",
-                line_entry.file_path
-            );
-            line_entry.file_path.clone()
-        } else {
-            tracing::debug!(
-                "create_source_location_from_entry: no file info found, using compilation unit name: '{}'",
-                line_entry.compilation_unit
-            );
-            line_entry.compilation_unit.clone()
         };
 
         tracing::debug!(
@@ -1006,6 +1151,12 @@ impl ModuleData {
             column: Some(line_entry.column as u32),
             address: line_entry.address,
         })
+    }
+
+    /// Heuristic: whether a string looks like a path (has directory components)
+    fn is_path_like(&self, s: &str) -> bool {
+        // Prefer simple heuristic for Unix-like paths used in our environment
+        s.contains('/')
     }
 
     /// Check if a file path is a header file
@@ -1117,6 +1268,33 @@ impl ModuleData {
         crate::parser::DetailedParser::resolve_type_shallow_at_offset(dwarf, &unit, die_off)
     }
 
+    /// Compute shallow TypeInfo for a variable DIE located at (cu_off, die_off)
+    pub(crate) fn shallow_type_for_variable_offsets(
+        &self,
+        cu_off: gimli::DebugInfoOffset,
+        die_off: gimli::UnitOffset,
+    ) -> Option<crate::TypeInfo> {
+        let dwarf = self.resolver.dwarf_ref();
+        let header = dwarf.debug_info.header_from_offset(cu_off).ok()?;
+        let unit = dwarf.unit(header).ok()?;
+        let entry = unit.entry(die_off).ok()?;
+        let planner = crate::planner::AccessPlanner::new(dwarf);
+        match planner.resolve_type_ref_with_origins_public(&entry, &unit) {
+            Ok(Some(type_die_off)) => self.detailed_shallow_type(cu_off, type_die_off),
+            _ => None,
+        }
+    }
+
+    /// Resolve variables by (CU, DIE) offsets at a given address context using the on-demand resolver
+    pub(crate) fn resolve_variables_by_offsets_at_address(
+        &mut self,
+        address: u64,
+        items: &[(gimli::DebugInfoOffset, gimli::UnitOffset)],
+    ) -> Result<Vec<crate::data::VariableWithEvaluation>> {
+        self.resolver
+            .resolve_variables_by_offsets_at_address(address, items, None)
+    }
+
     /// Lookup addresses by source file path and line number
     /// Returns addresses that correspond to the given source line
     pub(crate) fn lookup_addresses_by_source_line(
@@ -1171,5 +1349,108 @@ impl ModuleData {
 
         source_files.sort_by(|a, b| a.full_path.cmp(&b.full_path));
         source_files
+    }
+
+    /// Find global/static variables by name within this module (DWARF-only)
+    /// Returns link-time address (if available) and best-effort section classification.
+    pub(crate) fn find_global_variables_by_name(&self, name: &str) -> Vec<GlobalVariableInfo> {
+        let mut out = Vec::new();
+        let entries = self.lightweight_index.find_variables_by_name(name);
+
+        // Parse object file once for section classification
+        let obj = match object::File::parse(&self._mapped_file.data[..]) {
+            Ok(f) => f,
+            Err(_) => {
+                // Cannot classify sections, but still return entries with link_address
+                for e in entries {
+                    let link_address =
+                        e.address_ranges
+                            .first()
+                            .and_then(|(lo, hi)| if lo == hi { Some(*lo) } else { None });
+                    out.push(GlobalVariableInfo {
+                        name: e.name.clone(),
+                        link_address,
+                        section: None,
+                        die_offset: e.die_offset,
+                        unit_offset: e.unit_offset,
+                    });
+                }
+                return out;
+            }
+        };
+
+        for e in entries {
+            let link_address =
+                e.address_ranges
+                    .first()
+                    .and_then(|(lo, hi)| if lo == hi { Some(*lo) } else { None });
+
+            let section = link_address.and_then(|addr| self.classify_section(&obj, addr));
+
+            out.push(GlobalVariableInfo {
+                name: e.name.clone(),
+                link_address,
+                section,
+                die_offset: e.die_offset,
+                unit_offset: e.unit_offset,
+            });
+        }
+
+        out
+    }
+
+    fn classify_section(&self, obj: &object::File<'_>, addr: u64) -> Option<SectionType> {
+        for sect in obj.sections() {
+            let saddr = sect.address();
+            let ssize = sect.size();
+            if ssize == 0 {
+                continue;
+            }
+            if addr >= saddr && addr < saddr + ssize {
+                let name = sect.name().ok().unwrap_or("");
+                let stype = if name == ".text" || name.starts_with(".text.") {
+                    SectionType::Text
+                } else if name == ".rodata" || name.starts_with(".rodata") {
+                    SectionType::Rodata
+                } else if name == ".data" || name.starts_with(".data.") {
+                    SectionType::Data
+                } else if name == ".bss" || name.starts_with(".bss.") {
+                    SectionType::Bss
+                } else {
+                    SectionType::Unknown
+                };
+                return Some(stype);
+            }
+        }
+        None
+    }
+
+    /// Public helper: classify a virtual address to a section type by parsing the module object
+    pub(crate) fn classify_section_for_vaddr(&self, addr: u64) -> Option<SectionType> {
+        match object::File::parse(&self._mapped_file.data[..]) {
+            Ok(obj) => self.classify_section(&obj, addr),
+            Err(_) => None,
+        }
+    }
+
+    /// List all global/static variables with usable addresses in this module
+    pub(crate) fn list_all_global_variables(&self) -> Vec<GlobalVariableInfo> {
+        let mut out = Vec::new();
+        // Parse object once for section classification
+        let _obj = match object::File::parse(&self._mapped_file.data[..]) {
+            Ok(f) => f,
+            Err(_) => {
+                return out;
+            }
+        };
+
+        for name in self.lightweight_index.get_variable_names() {
+            for info in self.find_global_variables_by_name(name) {
+                out.push(info);
+            }
+        }
+
+        // find_global_variables_by_name already classifies section using obj
+        out
     }
 }

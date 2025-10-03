@@ -106,10 +106,49 @@ impl<'a> DwarfParser<'a> {
         unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
         entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
     ) -> Result<Option<String>> {
+        // Prefer local DW_AT_name
         if let Some(attr) = entry.attr(gimli::constants::DW_AT_name)? {
             if let Ok(name) = dwarf.attr_string(unit, attr.value()) {
                 return Ok(Some(name.to_string_lossy().into_owned()));
             }
+        }
+
+        // Fall back to DW_AT_specification / DW_AT_abstract_origin to resolve name
+        // Common for globals defined in .c and declared in headers: definition DIE refers to declaration DIE for the name
+        if let Some(attr) = entry.attr(gimli::constants::DW_AT_specification)? {
+            if let Some(n) = Self::resolve_name_via_ref(dwarf, unit, attr.value())? {
+                return Ok(Some(n));
+            }
+        }
+        if let Some(attr) = entry.attr(gimli::constants::DW_AT_abstract_origin)? {
+            if let Some(n) = Self::resolve_name_via_ref(dwarf, unit, attr.value())? {
+                return Ok(Some(n));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn resolve_name_via_ref(
+        dwarf: &gimli::Dwarf<EndianSlice<'static, LittleEndian>>,
+        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
+        value: gimli::AttributeValue<EndianSlice<'static, LittleEndian>>,
+    ) -> Result<Option<String>> {
+        match value {
+            gimli::AttributeValue::UnitRef(uoff) => {
+                if let Ok(spec_entry) = unit.entry(uoff) {
+                    if let Some(attr) = spec_entry.attr(gimli::constants::DW_AT_name)? {
+                        if let Ok(name) = dwarf.attr_string(unit, attr.value()) {
+                            return Ok(Some(name.to_string_lossy().into_owned()));
+                        }
+                    }
+                }
+            }
+            gimli::AttributeValue::DebugInfoRef(_dioff) => {
+                // Cross-unit specification is rare for our use cases; skip to keep fast path simple
+                // and avoid heavy cross-CU resolution here.
+            }
+            _ => {}
         }
         Ok(None)
     }
@@ -243,6 +282,17 @@ impl<'a> DwarfParser<'a> {
         Ok(true)
     }
 
+    fn is_declaration(
+        entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
+    ) -> Result<bool> {
+        if let Some(attr) = entry.attr(gimli::constants::DW_AT_declaration)? {
+            if let gimli::AttributeValue::Flag(is_decl) = attr.value() {
+                return Ok(is_decl);
+            }
+        }
+        Ok(false)
+    }
+
     /// Extract all address ranges from DIE (for functions)
     /// Supports DW_AT_low_pc/high_pc and DW_AT_ranges (returns all ranges)
     fn extract_address_ranges(
@@ -255,19 +305,89 @@ impl<'a> DwarfParser<'a> {
         RangeExtractor::extract_all_ranges(entry, unit, dwarf)
     }
 
-    /// Extract variable address from DIE
+    /// Extract variable address from DIE (DW_AT_location)
+    /// Supports direct Addr and simple Exprloc with DW_OP_addr or constant-as-address
     fn extract_variable_address(
         &self,
         entry: &gimli::DebuggingInformationEntry<EndianSlice<'static, LittleEndian>>,
+        unit: &gimli::Unit<EndianSlice<'static, LittleEndian>>,
     ) -> Result<Option<u64>> {
-        let mut attrs = entry.attrs();
-        while let Some(attr) = attrs.next()? {
-            if attr.name() == gimli::constants::DW_AT_location {
-                // Simple case: direct address
-                if let gimli::AttributeValue::Addr(addr) = attr.value() {
-                    return Ok(Some(addr));
+        if let Some(attr) = entry.attr(gimli::constants::DW_AT_location)? {
+            match attr.value() {
+                gimli::AttributeValue::Addr(a) => return Ok(Some(a)),
+                gimli::AttributeValue::Exprloc(expr) => {
+                    // Fast-parse the expression to detect absolute address
+                    let mut e = gimli::Expression(expr.0);
+                    // Scan operations; accept first absolute address
+                    while let Ok(op) = gimli::Operation::parse(&mut e.0, unit.encoding()) {
+                        match op {
+                            gimli::Operation::Address { address } => return Ok(Some(address)),
+                            gimli::Operation::UnsignedConstant { value } => {
+                                // If expression is a single unsigned constant and not stack_value,
+                                // DWARF interprets it as memory location (address). We cannot
+                                // easily know if there will be a StackValue later without full scan.
+                                // Do a conservative approach: if there are no more operations, treat as address.
+                                let next = gimli::Operation::parse(&mut e.0, unit.encoding());
+                                if next.is_err() {
+                                    return Ok(Some(value));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                 }
-                // TODO: Handle location expressions for more complex cases
+                gimli::AttributeValue::LocationListsRef(offs) => {
+                    if let Ok(mut locations) = self
+                        .dwarf
+                        .locations(unit, gimli::LocationListsOffset(offs.0))
+                    {
+                        while let Ok(Some(loc)) = locations.next() {
+                            // Try to parse this entry's expression and see if it's a constant address
+                            let mut e = gimli::Expression(loc.data.0);
+                            while let Ok(op) = gimli::Operation::parse(&mut e.0, unit.encoding()) {
+                                match op {
+                                    gimli::Operation::Address { address } => {
+                                        return Ok(Some(address))
+                                    }
+                                    gimli::Operation::UnsignedConstant { value } => {
+                                        // Heuristic: treat single-constant expression as address
+                                        let next =
+                                            gimli::Operation::parse(&mut e.0, unit.encoding());
+                                        if next.is_err() {
+                                            return Ok(Some(value));
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+                gimli::AttributeValue::SecOffset(off) => {
+                    if let Ok(mut locations) =
+                        self.dwarf.locations(unit, gimli::LocationListsOffset(off))
+                    {
+                        while let Ok(Some(loc)) = locations.next() {
+                            let mut e = gimli::Expression(loc.data.0);
+                            while let Ok(op) = gimli::Operation::parse(&mut e.0, unit.encoding()) {
+                                match op {
+                                    gimli::Operation::Address { address } => {
+                                        return Ok(Some(address))
+                                    }
+                                    gimli::Operation::UnsignedConstant { value } => {
+                                        let next =
+                                            gimli::Operation::parse(&mut e.0, unit.encoding());
+                                        if next.is_err() {
+                                            return Ok(Some(value));
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         Ok(None)
@@ -460,7 +580,15 @@ impl<'a> DwarfParser<'a> {
             // Parse DIEs without file path resolution (will be resolved later)
             let mut entries = unit.entries();
             let mut metadata_cache: HashMap<gimli::UnitOffset, FunctionMetadata> = HashMap::new();
-            while let Some((_, entry)) = entries.next_dfs()? {
+            // Track lexical context to distinguish CU/file-scope vs function-scope
+            let mut tag_stack: Vec<gimli::DwTag> = Vec::new();
+            while let Some((depth, entry)) = entries.next_dfs()? {
+                // Maintain tag stack to current depth
+                let d: usize = depth as usize;
+                // Unwind to parent scope so siblings don't inherit previous scope tag
+                while tag_stack.len() > d {
+                    tag_stack.pop();
+                }
                 match entry.tag() {
                     gimli::constants::DW_TAG_subprogram => {
                         let mut visited = HashSet::new();
@@ -541,21 +669,35 @@ impl<'a> DwarfParser<'a> {
                         }
                     }
                     gimli::constants::DW_TAG_variable => {
+                        // Exclude variables declared within function scope (subprogram/inlined)
+                        let in_function_scope = tag_stack.iter().any(|t| {
+                            *t == gimli::constants::DW_TAG_subprogram
+                                || *t == gimli::constants::DW_TAG_inlined_subroutine
+                        });
+                        if in_function_scope {
+                            continue;
+                        }
+                        // Skip pure declarations (no definition in this CU)
+                        if Self::is_declaration(entry).unwrap_or(false) {
+                            continue;
+                        }
                         if let Some(name) = self.extract_name(self.dwarf, &unit, entry)? {
                             let flags = crate::core::IndexFlags {
                                 is_static: self.is_static_symbol(entry).unwrap_or(false),
                                 ..Default::default()
                             };
 
-                            let address_ranges = if flags.is_static {
-                                self.extract_variable_address(entry)
-                                    .ok()
-                                    .flatten()
-                                    .map(|addr| vec![(addr, addr)])
-                                    .unwrap_or_default()
-                            } else {
-                                Vec::new()
-                            };
+                            let address_ranges = self
+                                .extract_variable_address(entry, &unit)
+                                .ok()
+                                .flatten()
+                                .map(|addr| vec![(addr, addr)])
+                                .unwrap_or_default();
+
+                            // Only index variables with usable addresses
+                            if address_ranges.is_empty() {
+                                continue;
+                            }
 
                             let index_entry = IndexEntry {
                                 name: name.clone(),
@@ -576,6 +718,7 @@ impl<'a> DwarfParser<'a> {
                     | gimli::constants::DW_TAG_union_type
                     | gimli::constants::DW_TAG_enumeration_type
                     | gimli::constants::DW_TAG_typedef => {
+                        // No-op for scope; pushing is handled after match
                         if let Some(name) = self.extract_name(self.dwarf, &unit, entry)? {
                             // DW_AT_declaration indicates a declaration-only (no definition)
                             let is_decl = match entry.attr(gimli::constants::DW_AT_declaration)? {
@@ -604,6 +747,8 @@ impl<'a> DwarfParser<'a> {
                     }
                     _ => {} // Skip other DIE types
                 }
+                // Push current entry to stack to become ancestor of its children
+                tag_stack.push(entry.tag());
             }
         }
 

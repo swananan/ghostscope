@@ -237,6 +237,29 @@ impl<'ctx> MapManager<'ctx> {
         )
     }
 
+    /// Create the per-(pid,module) section offsets map used for ASLR address calculation
+    pub fn create_proc_module_offsets_map(
+        &mut self,
+        module: &Module<'ctx>,
+        di_builder: &DebugInfoBuilder<'ctx>,
+        compile_unit: &inkwell::debug_info::DICompileUnit<'ctx>,
+        name: &str,
+        max_entries: u64,
+    ) -> Result<()> {
+        // Key: {pid:u32, pad:u32, cookie:u64} => 16 bytes => 128 bits
+        // Value: {text, rodata, data, bss: u64} => 32 bytes => 256 bits
+        self.create_map_definition(
+            module,
+            di_builder,
+            compile_unit,
+            name,
+            BpfMapType::Hash,
+            max_entries,
+            SizedType::integer(128),
+            SizedType::integer(256),
+        )
+    }
+
     pub fn create_event_loss_counter_map(
         &mut self,
         module: &Module<'ctx>,

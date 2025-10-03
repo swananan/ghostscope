@@ -146,6 +146,9 @@ GhostScope 将编译后的二进制文件转变为可观测系统。在函数入
 - [**贡献指南**](docs/zh/contributing.md)
   加入社区
 
+- [**未来规划**](docs/zh/roadmap.md)
+  里程碑
+
 </td>
 </tr>
 </table>

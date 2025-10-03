@@ -1,10 +1,11 @@
 //! Main DWARF analyzer - unified entry point for all DWARF operations
 
 use crate::{
-    core::{ModuleAddress, Result, SourceLocation},
+    core::{GlobalVariableInfo, ModuleAddress, Result, SectionOffsets, SourceLocation},
     module::ModuleData,
     proc_mapping::{ModuleMapping, ProcMappingParser},
 };
+use object::{Object, ObjectSection, ObjectSegment};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -80,6 +81,52 @@ impl DwarfAnalyzer {
     pub fn resolve_struct_type_shallow_by_name(&mut self, name: &str) -> Option<crate::TypeInfo> {
         for module_data in self.modules.values_mut() {
             if let Some(t) = module_data.resolve_struct_type_shallow_by_name(name) {
+                return Some(t);
+            }
+        }
+        None
+    }
+
+    /// Resolve union by name (shallow) in a specific module
+    pub fn resolve_union_type_shallow_by_name_in_module<P: AsRef<Path>>(
+        &mut self,
+        module_path: P,
+        name: &str,
+    ) -> Option<crate::TypeInfo> {
+        let path_buf = module_path.as_ref().to_path_buf();
+        if let Some(module_data) = self.modules.get_mut(&path_buf) {
+            return module_data.resolve_union_type_shallow_by_name(name);
+        }
+        None
+    }
+
+    /// Resolve union by name (shallow) across modules (first match)
+    pub fn resolve_union_type_shallow_by_name(&mut self, name: &str) -> Option<crate::TypeInfo> {
+        for module_data in self.modules.values_mut() {
+            if let Some(t) = module_data.resolve_union_type_shallow_by_name(name) {
+                return Some(t);
+            }
+        }
+        None
+    }
+
+    /// Resolve enum by name (shallow) in a specific module
+    pub fn resolve_enum_type_shallow_by_name_in_module<P: AsRef<Path>>(
+        &mut self,
+        module_path: P,
+        name: &str,
+    ) -> Option<crate::TypeInfo> {
+        let path_buf = module_path.as_ref().to_path_buf();
+        if let Some(module_data) = self.modules.get_mut(&path_buf) {
+            return module_data.resolve_enum_type_shallow_by_name(name);
+        }
+        None
+    }
+
+    /// Resolve enum by name (shallow) across modules (first match)
+    pub fn resolve_enum_type_shallow_by_name(&mut self, name: &str) -> Option<crate::TypeInfo> {
+        for module_data in self.modules.values_mut() {
+            if let Some(t) = module_data.resolve_enum_type_shallow_by_name(name) {
                 return Some(t);
             }
         }
@@ -279,6 +326,97 @@ impl DwarfAnalyzer {
     /// Get all loaded module paths
     pub fn get_loaded_modules(&self) -> Vec<&PathBuf> {
         self.modules.keys().collect()
+    }
+
+    /// Find global/static variables by name across all loaded modules
+    pub fn find_global_variables_by_name(&self, name: &str) -> Vec<(PathBuf, GlobalVariableInfo)> {
+        let mut results = Vec::new();
+        for (module_path, module_data) in &self.modules {
+            let vars = module_data.find_global_variables_by_name(name);
+            for v in vars {
+                results.push((module_path.clone(), v));
+            }
+        }
+        results
+    }
+
+    /// Resolve a variable by CU/DIE offsets in a specific module at an arbitrary address context (for globals)
+    pub fn resolve_variable_by_offsets_in_module<P: AsRef<Path>>(
+        &mut self,
+        module_path: P,
+        cu_off: gimli::DebugInfoOffset,
+        die_off: gimli::UnitOffset,
+    ) -> Result<crate::data::VariableWithEvaluation> {
+        let path_buf = module_path.as_ref().to_path_buf();
+        if let Some(module_data) = self.modules.get_mut(&path_buf) {
+            let items = vec![(cu_off, die_off)];
+            let vars = module_data.resolve_variables_by_offsets_at_address(0, &items)?;
+            let mut var = vars.into_iter().next().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Failed to resolve variable at offsets {:?}/{:?} in module {}",
+                    cu_off,
+                    die_off,
+                    path_buf.display()
+                )
+            })?;
+            if var.dwarf_type.is_none() {
+                if let Some(ti) = module_data.shallow_type_for_variable_offsets(cu_off, die_off) {
+                    var.type_name = ti.type_name();
+                    var.dwarf_type = Some(ti);
+                }
+            }
+            Ok(var)
+        } else {
+            Err(anyhow::anyhow!(
+                "Module {} not loaded",
+                module_path.as_ref().display()
+            ))
+        }
+    }
+
+    /// List all global/static variables with usable addresses across all loaded modules
+    pub fn list_all_global_variables(&self) -> Vec<(PathBuf, GlobalVariableInfo)> {
+        let mut results = Vec::new();
+        for (module_path, module_data) in &self.modules {
+            for v in module_data.list_all_global_variables() {
+                results.push((module_path.clone(), v));
+            }
+        }
+        results
+    }
+
+    /// Classify the section type for a link-time virtual address in a specific module
+    pub fn classify_section_for_address<P: AsRef<Path>>(
+        &self,
+        module_path: P,
+        vaddr: u64,
+    ) -> Option<crate::core::SectionType> {
+        let path = module_path.as_ref();
+        if let Some(module_data) = self.modules.get(path) {
+            module_data.classify_section_for_vaddr(vaddr)
+        } else {
+            None
+        }
+    }
+
+    /// Compute static offset for a global variable member chain
+    pub fn compute_global_member_static_offset<P: AsRef<Path>>(
+        &mut self,
+        module_path: P,
+        link_address: u64,
+        cu_off: gimli::DebugInfoOffset,
+        var_die: gimli::UnitOffset,
+        fields: &[String],
+    ) -> Result<Option<(u64, crate::TypeInfo)>> {
+        let path_buf = module_path.as_ref().to_path_buf();
+        if let Some(module_data) = self.modules.get_mut(&path_buf) {
+            module_data.compute_global_member_static_offset(cu_off, var_die, link_address, fields)
+        } else {
+            Err(anyhow::anyhow!(
+                "Module {} not loaded",
+                module_path.as_ref().display()
+            ))
+        }
     }
 
     /// Lookup function address by name - returns first match
@@ -515,6 +653,164 @@ impl DwarfAnalyzer {
                 }
             })
             .collect()
+    }
+
+    /// Compute per-module section offsets (runtime bias) using /proc/[pid]/maps
+    /// Only available in -p mode; returns a vector of (module_path, offsets)
+    pub fn compute_section_offsets(&self) -> Result<Vec<(PathBuf, u64, SectionOffsets)>> {
+        if self.pid == 0 {
+            return Err(anyhow::anyhow!(
+                "proc_maps_unavailable: offsets computation requires -p mode"
+            ));
+        }
+
+        let maps = ProcMappingParser::get_proc_maps(self.pid)?;
+        let mut results = Vec::new();
+        let page_mask: u64 = !0xfffu64; // 4K alignment
+
+        for module_path in self.modules.keys() {
+            // Collect mappings for this module (ignore " (deleted)" suffix)
+            let module_str = module_path.to_string_lossy();
+            let candidates: Vec<&crate::proc_mapping::MemoryMapping> = maps
+                .iter()
+                .filter(|m| match &m.pathname {
+                    Some(p) => {
+                        let ps = if let Some(idx) = p.find(" (deleted)") {
+                            &p[..idx]
+                        } else {
+                            p.as_str()
+                        };
+                        ps == module_str
+                    }
+                    None => false,
+                })
+                .collect();
+
+            // Parse object file and build bias per PT_LOAD
+            // Re-open file from disk for object parsing; skip on failure
+            let file_bytes = match std::fs::read(module_path) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(
+                        "compute_section_offsets: skip module '{}' (read failed: {})",
+                        module_path.display(),
+                        e
+                    );
+                    continue;
+                }
+            };
+            let obj = match object::File::parse(&file_bytes[..]) {
+                Ok(o) => o,
+                Err(e) => {
+                    tracing::warn!(
+                        "compute_section_offsets: skip module '{}' (parse failed: {})",
+                        module_path.display(),
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            // Build map: (aligned file_off) -> bias
+            let mut seg_bias: Vec<(u64, u64, u64)> = Vec::new(); // (file_off_aligned, vaddr, bias)
+            for seg in obj.segments() {
+                let (file_off, _sz) = seg.file_range();
+                let vaddr = seg.address();
+                let key = file_off & page_mask;
+                // Find mapping with matching file offset page
+                if let Some(m) = candidates
+                    .iter()
+                    .find(|mm| (mm.file_offset & page_mask) == key)
+                {
+                    let bias = m.start_addr.saturating_sub(vaddr);
+                    seg_bias.push((key, vaddr, bias));
+                }
+            }
+
+            // Helper to find bias for a section address by segment containment
+            let find_bias_for = |addr: u64| -> Option<u64> {
+                for seg in obj.segments() {
+                    let vaddr = seg.address();
+                    let vsize = seg.size();
+                    if vsize == 0 {
+                        continue;
+                    }
+                    if addr >= vaddr && addr < vaddr + vsize {
+                        let (file_off, _sz) = seg.file_range();
+                        let key = file_off & page_mask;
+                        if let Some((_, _, b)) = seg_bias.iter().find(|(k, _, _)| *k == key) {
+                            return Some(*b);
+                        }
+                    }
+                }
+                None
+            };
+
+            // Pick representative section addresses
+            let mut text_addr: Option<u64> = None;
+            let mut rodata_addr: Option<u64> = None;
+            let mut data_addr: Option<u64> = None;
+            let mut bss_addr: Option<u64> = None;
+
+            for sect in obj.sections() {
+                if let Ok(name) = sect.name() {
+                    let addr = sect.address();
+                    if text_addr.is_none() && (name == ".text" || name.starts_with(".text")) {
+                        text_addr = Some(addr);
+                    } else if rodata_addr.is_none()
+                        && (name == ".rodata" || name.starts_with(".rodata"))
+                    {
+                        rodata_addr = Some(addr);
+                    } else if data_addr.is_none() && (name == ".data" || name.starts_with(".data"))
+                    {
+                        data_addr = Some(addr);
+                    } else if bss_addr.is_none() && (name == ".bss" || name.starts_with(".bss")) {
+                        bss_addr = Some(addr);
+                    }
+                }
+            }
+
+            let mut offsets = SectionOffsets::default();
+            if let Some(a0) = text_addr {
+                if let Some(b0) = find_bias_for(a0) {
+                    offsets.text = b0;
+                }
+            }
+            if let Some(a1) = rodata_addr {
+                if let Some(b1) = find_bias_for(a1) {
+                    offsets.rodata = b1;
+                }
+            }
+            if let Some(a2) = data_addr {
+                if let Some(b2) = find_bias_for(a2) {
+                    offsets.data = b2;
+                }
+            }
+            if let Some(a3) = bss_addr {
+                if let Some(b3) = find_bias_for(a3) {
+                    offsets.bss = b3;
+                }
+            }
+
+            // Compute module cookie from first candidate mapping (dev:ino)
+            let cookie = if let Some(m) = candidates.first() {
+                // device is like "08:01" (hex); split and parse
+                let mut maj: u64 = 0;
+                let mut min: u64 = 0;
+                if let Some((mj, mn)) = m.device.split_once(':') {
+                    maj = u64::from_str_radix(mj, 16).unwrap_or(0);
+                    min = u64::from_str_radix(mn, 16).unwrap_or(0);
+                }
+                // Low-risk packing: major[16]@48, minor[16]@32, inode_low[32]@0
+                ((maj & 0xffffu64) << 48) | ((min & 0xffffu64) << 32) | (m.inode & 0xffff_ffffu64)
+            } else {
+                0
+            };
+
+            results.push((module_path.clone(), cookie, offsets));
+        }
+
+        Ok(results)
     }
 
     /// Check if a module is a shared library

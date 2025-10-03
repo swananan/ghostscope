@@ -1,6 +1,3 @@
-#![allow(clippy::uninlined_format_args)]
-#![allow(clippy::needless_borrows_for_generic_args)]
-
 //! DWARF parsing integration tests using dwarf-tool
 //!
 //! Tests for DWARF parsing and analysis functionality using dwarf-tool binary.
@@ -8,7 +5,11 @@
 mod common;
 
 use common::{init, FIXTURES};
+use serde::Deserialize;
 use serde_json::Value;
+use std::path::PathBuf;
+use std::time::Duration;
+
 use tokio::process::Command as AsyncCommand;
 
 /// Run dwarf-tool command and return JSON output
@@ -106,6 +107,154 @@ async fn run_dwarf_tool_text(
     Ok(String::from_utf8(output.stdout)?)
 }
 
+// ===== Globals indexing tests (moved from globals_indexing.rs) =====
+
+#[derive(Debug, Deserialize)]
+struct GlobalVarItem {
+    module: String,
+    name: String,
+    link_address: Option<String>,
+    section: Option<String>,
+}
+
+/// Run dwarf-tool with -p <pid> and return full stdout text
+async fn run_dwarftool_text_pid(args: &[&str]) -> anyhow::Result<String> {
+    let workspace_root = std::env::var("CARGO_MANIFEST_DIR")
+        .map(|dir| {
+            std::path::PathBuf::from(dir)
+                .parent()
+                .unwrap()
+                .to_path_buf()
+        })
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let tool_path = workspace_root.join("target/debug/dwarf-tool");
+    let output = AsyncCommand::new(&tool_path).args(args).output().await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("dwarf-tool failed: {}", stderr);
+    }
+    Ok(String::from_utf8(output.stdout)?)
+}
+
+async fn run_dwarftool_json_pid(
+    pid: u32,
+    subcmd: &str,
+    extra: &[&str],
+) -> anyhow::Result<Vec<GlobalVarItem>> {
+    // Use --quiet to avoid banner lines like "Loading modules from PID ..." polluting stdout
+    let mut args: Vec<String> = vec![
+        "-p".into(),
+        pid.to_string(),
+        subcmd.into(),
+        "--json".into(),
+        "--quiet".into(),
+    ];
+    for a in extra {
+        args.push((*a).into());
+    }
+    let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let out = run_dwarftool_text_pid(&args_ref).await?;
+    // Be robust to any accidental non-JSON prefix
+    let json_start = out.find('{').or_else(|| out.find('[')).unwrap_or(0);
+    let json_lines: Vec<&str> = out
+        .lines()
+        .skip_while(|line| {
+            !line.trim_start().starts_with('[') && !line.trim_start().starts_with('{')
+        })
+        .collect();
+    let candidate = if !json_lines.is_empty() {
+        json_lines.join("\n")
+    } else {
+        out[json_start..].to_string()
+    };
+    let items: Vec<GlobalVarItem> = serde_json::from_str(&candidate)?;
+    Ok(items)
+}
+
+async fn spawn_globals_program() -> anyhow::Result<(tokio::process::Child, u32, PathBuf)> {
+    let bin_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = bin_path.parent().unwrap().to_path_buf();
+    let child = AsyncCommand::new(&bin_path)
+        .current_dir(&bin_dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    let pid = child.id().ok_or_else(|| anyhow::anyhow!("no pid"))?;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    Ok((child, pid, bin_dir))
+}
+
+#[tokio::test]
+async fn test_globals_indexing_executable_sections() -> anyhow::Result<()> {
+    init();
+    let (mut child, pid, _dir) = spawn_globals_program().await?;
+    let items = run_dwarftool_json_pid(pid, "globals-all", &[]).await?;
+    let exe_items: Vec<&GlobalVarItem> = items
+        .iter()
+        .filter(|i| i.module.ends_with("/globals_program"))
+        .collect();
+    assert!(!exe_items.is_empty(), "expected executable entries");
+    let mut map = std::collections::HashMap::new();
+    for it in exe_items {
+        map.insert(it.name.clone(), it.section.clone().unwrap_or_default());
+        // Touch link_address to avoid dead_code warning on the field
+        let _ = &it.link_address;
+    }
+    assert!(map.contains_key("g_counter"));
+    assert_eq!(map.get("g_counter").unwrap(), "data");
+    assert!(map.contains_key("g_message"));
+    assert_eq!(map.get("g_message").unwrap(), "rodata");
+    assert!(map.contains_key("g_bss_buffer"));
+    assert_eq!(map.get("g_bss_buffer").unwrap(), "bss");
+    assert!(map.contains_key("G_STATE"));
+    assert!(map.contains_key("s_internal"));
+    assert!(map.contains_key("s_bss_counter"));
+    let _ = child.kill().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_globals_indexing_shared_library_sections() -> anyhow::Result<()> {
+    init();
+    let (mut child, pid, _dir) = spawn_globals_program().await?;
+    let items = run_dwarftool_json_pid(pid, "globals-all", &[]).await?;
+    let lib_items: Vec<&GlobalVarItem> = items
+        .iter()
+        .filter(|i| i.module.ends_with("/libgvars.so"))
+        .collect();
+    assert!(!lib_items.is_empty(), "expected shared library entries");
+    let mut map = std::collections::HashMap::new();
+    for it in lib_items {
+        map.insert(it.name.clone(), it.section.clone().unwrap_or_default());
+    }
+    assert!(map.contains_key("lib_counter"));
+    assert_eq!(map.get("lib_counter").unwrap(), "data");
+    assert!(map.contains_key("lib_message"));
+    assert_eq!(map.get("lib_message").unwrap(), "rodata");
+    assert!(map.contains_key("lib_bss"));
+    assert_eq!(map.get("lib_bss").unwrap(), "bss");
+    assert!(map.contains_key("LIB_STATE"));
+    assert!(map.contains_key("lib_internal_counter"));
+    let _ = child.kill().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_globals_indexing_query_by_name() -> anyhow::Result<()> {
+    init();
+    let (mut child, pid, _dir) = spawn_globals_program().await?;
+    let items = run_dwarftool_json_pid(pid, "globals", &["G_STATE"]).await?;
+    assert!(items
+        .iter()
+        .any(|i| i.module.ends_with("/globals_program") && i.name == "G_STATE"));
+    let items2 = run_dwarftool_json_pid(pid, "globals", &["LIB_STATE"]).await?;
+    assert!(items2
+        .iter()
+        .any(|i| i.module.ends_with("/libgvars.so") && i.name == "LIB_STATE"));
+    let _ = child.kill().await;
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_dwarf_tool_function_analysis() -> anyhow::Result<()> {
     init();
@@ -126,7 +275,7 @@ async fn test_dwarf_tool_function_analysis() -> anyhow::Result<()> {
     // Check that we found the main function
     if let Some(function_name) = json.get("function_name").and_then(|n| n.as_str()) {
         assert_eq!(function_name, "main", "Should find main function");
-        println!("✓ Found function: {}", function_name);
+        println!("✓ Found function: {function_name}");
 
         // Check modules array
         if let Some(modules) = json.get("modules").and_then(|m| m.as_array()) {
@@ -136,7 +285,7 @@ async fn test_dwarf_tool_function_analysis() -> anyhow::Result<()> {
 
         // Check total variables count
         if let Some(total_vars) = json.get("total_variables").and_then(|v| v.as_u64()) {
-            println!("✓ Found {} variables in function", total_vars);
+            println!("✓ Found {total_vars} variables in function");
         }
     } else {
         anyhow::bail!("Expected function_name field in response");
@@ -171,7 +320,7 @@ async fn test_dwarf_tool_source_line_analysis() -> anyhow::Result<()> {
             location.contains("sample_program.c"),
             "Should reference sample_program.c"
         );
-        println!("✓ Found source location: {}", location);
+        println!("✓ Found source location: {location}");
     }
 
     // Check if we have modules with variables
@@ -214,7 +363,7 @@ async fn test_dwarf_tool_modules_list() -> anyhow::Result<()> {
         if let Some(path) = module.as_str() {
             if path.contains("sample_program") {
                 found_sample_program = true;
-                println!("✓ Found test program module: {}", path);
+                println!("✓ Found test program module: {path}");
             }
         }
     }
@@ -270,7 +419,7 @@ async fn test_dwarf_tool_source_files_list() -> anyhow::Result<()> {
         }
     }
 
-    println!("Found {} source files total", total_files);
+    println!("Found {total_files} source files total");
     assert!(
         found_sample_program_c || found_test_lib_c,
         "Should find at least one of our test source files"
@@ -310,7 +459,7 @@ async fn test_dwarf_tool_module_address_analysis() -> anyhow::Result<()> {
 
     let address =
         test_address.ok_or_else(|| anyhow::anyhow!("Could not find main function address"))?;
-    println!("Testing module-addr with address: {}", address);
+    println!("Testing module-addr with address: {address}");
 
     // Test module-addr command with JSON output
     let json = run_dwarf_tool_json(
@@ -322,7 +471,7 @@ async fn test_dwarf_tool_module_address_analysis() -> anyhow::Result<()> {
 
     // Verify we got module information for this address
     if let Some(module_name) = json.get("module").and_then(|m| m.as_str()) {
-        println!("✓ Found module for address {}: {}", address, module_name);
+        println!("✓ Found module for address {address}: {module_name}");
         assert!(!module_name.is_empty(), "Module name should not be empty");
     } else {
         anyhow::bail!("Expected module information for address {}", address);

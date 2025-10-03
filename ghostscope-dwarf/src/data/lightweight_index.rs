@@ -277,6 +277,19 @@ impl LightweightIndex {
         }
     }
 
+    /// Find DIE entries by variable name - returns all matching DIEs
+    /// Only variables recorded during debug_info parsing are returned.
+    pub fn find_variables_by_name(&self, name: &str) -> Vec<&IndexEntry> {
+        tracing::debug!("find_variables_by_name: '{}'", name);
+
+        if let Some(indices) = self.variable_map.get(name) {
+            indices.iter().map(|&idx| &self.entries[idx]).collect()
+        } else {
+            tracing::debug!("No entries found for variable '{}'", name);
+            vec![]
+        }
+    }
+
     // find_types_by_name removed; type resolution should go through TypeNameIndex instead.
 }
 
