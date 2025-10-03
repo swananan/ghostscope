@@ -1,12 +1,9 @@
 <div align="center">
-  <br />
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.png">
     <source media="(prefers-color-scheme: light)" srcset="assets/logo-light.png">
     <img src="assets/logo-light.png" alt="GhostScope Logo" width="200"/>
   </picture>
-  <br />
-  <br />
   <h1>GhostScope</h1>
   <h3>⚡ Next-Generation eBPF Userspace Runtime Tracer</h3>
   <p>
