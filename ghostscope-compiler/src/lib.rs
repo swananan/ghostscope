@@ -42,13 +42,28 @@ impl From<ParseError> for CompileError {
 // Public re-exports from script::compiler module
 pub use script::compiler::{CompilationResult, UProbeConfig};
 
-/// Save options for compilation output
-#[derive(Debug, Clone, Default)]
-pub struct SaveOptions {
+/// Compilation options including save options and eBPF map configuration
+#[derive(Debug, Clone)]
+pub struct CompileOptions {
     pub save_llvm_ir: bool,
     pub save_ebpf: bool,
     pub save_ast: bool,
     pub binary_path_hint: Option<String>,
+    pub ringbuf_size: u64,
+    pub proc_module_offsets_max_entries: u64,
+}
+
+impl Default for CompileOptions {
+    fn default() -> Self {
+        Self {
+            save_llvm_ir: false,
+            save_ebpf: false,
+            save_ast: false,
+            binary_path_hint: None,
+            ringbuf_size: 262144, // 256KB
+            proc_module_offsets_max_entries: 4096,
+        }
+    }
 }
 
 /// Main compilation interface with DwarfAnalyzer (multi-module support)
@@ -60,7 +75,7 @@ pub fn compile_script(
     process_analyzer: &mut ghostscope_dwarf::DwarfAnalyzer,
     pid: Option<u32>,
     trace_id: Option<u32>,
-    save_options: &SaveOptions,
+    compile_options: &CompileOptions,
 ) -> Result<CompilationResult> {
     info!("Starting unified script compilation with DwarfAnalyzer (multi-module support)");
 
@@ -71,9 +86,9 @@ pub fn compile_script(
     // Step 2: Use AstCompiler with full DwarfAnalyzer integration
     let mut compiler = AstCompiler::new(
         Some(process_analyzer),
-        save_options.binary_path_hint.clone(),
+        compile_options.binary_path_hint.clone(),
         trace_id.unwrap_or(0), // Default starting trace_id is 0 if not provided
-        save_options.clone(),
+        compile_options.clone(),
     );
 
     // Step 3: Compile using unified interface

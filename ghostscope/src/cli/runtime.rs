@@ -103,7 +103,7 @@ pub async fn run_command_line_runtime(parsed_args: ParsedArgs) -> Result<()> {
     }
 
     // Step 6: Compile and load script using unified interface
-    let save_options = ghostscope_compiler::SaveOptions {
+    let compile_options = ghostscope_compiler::CompileOptions {
         save_llvm_ir: parsed_args.should_save_llvm_ir,
         save_ast: parsed_args.should_save_ast,
         save_ebpf: parsed_args.should_save_ebpf,
@@ -118,12 +118,17 @@ pub async fn run_command_line_runtime(parsed_args: ParsedArgs) -> Result<()> {
                     .unwrap_or("unknown")
                     .to_string()
             }),
+        ringbuf_size: 262144,                  // Default
+        proc_module_offsets_max_entries: 4096, // Default
     };
 
     // Step 6: Compile and load script with graceful error handling
-    if let Err(e) =
-        crate::script::compile_and_load_script_for_cli(&script_content, &mut session, &save_options)
-            .await
+    if let Err(e) = crate::script::compile_and_load_script_for_cli(
+        &script_content,
+        &mut session,
+        &compile_options,
+    )
+    .await
     {
         error!("Failed to compile and load script: {}", e);
         info!("GhostScope encountered an error during script compilation. Exiting gracefully.");
@@ -239,28 +244,33 @@ async fn run_cli_with_session(
         }
     }
 
-    // Step 6: Compile and load script using unified interface
-    let save_options = ghostscope_compiler::SaveOptions {
-        save_llvm_ir: config.should_save_llvm_ir,
-        save_ast: config.should_save_ast,
-        save_ebpf: config.should_save_ebpf,
-        binary_path_hint: session
-            .process_analyzer
-            .as_ref()
-            .and_then(|analyzer| analyzer.get_main_executable())
-            .map(|main_module| {
-                std::path::Path::new(&main_module.path)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("unknown")
-                    .to_string()
-            }),
-    };
+    // Step 6: Build compile options from merged config
+    let binary_path_hint = session
+        .process_analyzer
+        .as_ref()
+        .and_then(|analyzer| analyzer.get_main_executable())
+        .map(|main_module| {
+            std::path::Path::new(&main_module.path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .to_string()
+        });
+
+    let compile_options = config.get_compile_options(
+        config.should_save_llvm_ir,
+        config.should_save_ebpf,
+        config.should_save_ast,
+        binary_path_hint,
+    );
 
     // Step 7: Compile and load script with graceful error handling
-    if let Err(e) =
-        crate::script::compile_and_load_script_for_cli(&script_content, &mut session, &save_options)
-            .await
+    if let Err(e) = crate::script::compile_and_load_script_for_cli(
+        &script_content,
+        &mut session,
+        &compile_options,
+    )
+    .await
     {
         error!("Failed to compile and load script: {}", e);
         info!("GhostScope encountered an error during script compilation. Exiting gracefully.");

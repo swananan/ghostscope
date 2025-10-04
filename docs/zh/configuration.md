@@ -206,6 +206,27 @@ enabled = true
 
 # 最大历史条目数
 max_entries = 5000
+
+[ebpf]
+# RingBuf map 大小（字节，必须是 2 的幂）
+# 控制从内核向用户空间传输跟踪事件的环形缓冲区大小
+# 有效范围：4096 (4KB) 到 16777216 (16MB)
+ringbuf_size = 262144  # 256KB（默认）
+
+# 推荐值：
+#   - 低频跟踪：131072 (128KB)
+#   - 中频跟踪：262144 (256KB)
+#   - 高频跟踪：524288 (512KB) 或 1048576 (1MB)
+
+# ASLR 地址转换的 (pid, module) 偏移条目最大数量
+# 存储每个进程中每个加载模块的运行时地址偏移
+# 有效范围：64 到 65536
+proc_module_offsets_max_entries = 4096  # 默认
+
+# 推荐值：
+#   - 单进程：1024
+#   - 多进程：4096
+#   - 系统级跟踪：8192 或 16384
 ```
 
 ### 配置示例
@@ -259,6 +280,40 @@ panel_ratios = [5, 2, 3]  # 更大的源代码面板
 [ui.history]
 enabled = true
 max_entries = 10000
+```
+
+#### 高频跟踪配置
+
+```toml
+# 针对高频事件跟踪优化
+[ebpf]
+ringbuf_size = 1048576  # 1MB 缓冲区用于高事件率
+proc_module_offsets_max_entries = 8192  # 支持更多模块
+
+[general]
+log_level = "info"  # 降低日志开销
+enable_console_logging = false
+```
+
+#### 低开销配置
+
+```toml
+# 生产环境最小资源占用
+[ebpf]
+ringbuf_size = 131072  # 128KB 最小缓冲区
+proc_module_offsets_max_entries = 1024  # 仅单进程
+
+[general]
+log_level = "error"
+enable_logging = false
+
+[files]
+[files.save_llvm_ir]
+debug = false
+release = false
+[files.save_ebpf]
+debug = false
+release = false
 ```
 
 ## 环境变量
@@ -337,6 +392,9 @@ GhostScope 在启动时验证配置：
 4. **面板比例**：确保所有 3 个值都是正（非零）整数
 5. **日志级别**：验证是否为允许的值（error, warn, info, debug, trace）
 6. **布局模式**：验证是否为允许的值（Horizontal, Vertical - 首字母大写）
+7. **eBPF 配置**：
+   - **ringbuf_size**：必须是 2 的幂，范围 4096-16777216 字节
+   - **proc_module_offsets_max_entries**：必须在 64-65536 范围内
 
 无效配置将产生清晰的错误消息和修复建议。
 
@@ -346,6 +404,9 @@ GhostScope 在启动时验证配置：
 - **"Target file does not exist"**：未找到指定的目标路径。检查文件路径。
 - **"Script file does not exist"**：未找到指定的脚本文件。
 - **"Invalid log level"**：使用以下之一：error, warn, info, debug, trace。
+- **"ringbuf_size must be a power of 2"**：使用 2 的幂值，如 131072、262144、524288 等。
+- **"ringbuf_size X is out of reasonable range"**：必须在 4KB 到 16MB 之间。
+- **"proc_module_offsets_max_entries X is out of reasonable range"**：必须在 64 到 65536 之间。
 
 ## 最佳实践
 
@@ -354,3 +415,8 @@ GhostScope 在启动时验证配置：
 3. **日志轮转**：为长时间运行的会话配置外部日志轮转
 4. **调试输出**：在生产环境中禁用调试文件保存以提高性能
 5. **面板布局**：宽屏使用水平布局，窄屏使用垂直布局
+6. **eBPF 调优**：
+   - 从默认 `ringbuf_size`（256KB）开始，如果事件丢失则增加
+   - 使用大缓冲区时监控内核内存使用情况
+   - 单进程调试时使用较小的 `proc_module_offsets_max_entries`
+   - 高频跟踪场景下增加缓冲区大小

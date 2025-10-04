@@ -124,21 +124,42 @@ impl<'ctx> MapManager<'ctx> {
         };
         let max_entries_u32 = max_entries.min(u32::MAX as u64) as u32;
 
-        // Create a simple struct with basic map definition layout
-        // Use the standard 4-field layout that most eBPF maps use
-        let elements = vec![
-            i32_type.into(), // type (map type)
-            i32_type.into(), // key_size
-            i32_type.into(), // value_size
-            i32_type.into(), // max_entries
-        ];
+        // Create struct with appropriate fields based on map type
+        // Ringbuf only needs type and max_entries, others need all 4 fields
+        let (elements, initializer_values): (Vec<_>, Vec<_>) = match map_type {
+            BpfMapType::Ringbuf => {
+                // Ringbuf: only type and max_entries
+                (
+                    vec![
+                        i32_type.into(), // type
+                        i32_type.into(), // max_entries
+                    ],
+                    vec![
+                        i32_type.const_int(map_type_id as u64, false).into(),
+                        i32_type.const_int(max_entries_u32 as u64, false).into(),
+                    ],
+                )
+            }
+            _ => {
+                // Other maps: type, key_size, value_size, max_entries
+                (
+                    vec![
+                        i32_type.into(), // type
+                        i32_type.into(), // key_size
+                        i32_type.into(), // value_size
+                        i32_type.into(), // max_entries
+                    ],
+                    vec![
+                        i32_type.const_int(map_type_id as u64, false).into(),
+                        i32_type.const_int(key_size as u64, false).into(),
+                        i32_type.const_int(value_size as u64, false).into(),
+                        i32_type.const_int(max_entries_u32 as u64, false).into(),
+                    ],
+                )
+            }
+        };
         let struct_type = self.context.struct_type(&elements, false);
-        let initializer = struct_type.const_named_struct(&[
-            i32_type.const_int(map_type_id as u64, false).into(),
-            i32_type.const_int(key_size as u64, false).into(),
-            i32_type.const_int(value_size as u64, false).into(),
-            i32_type.const_int(max_entries_u32 as u64, false).into(),
-        ]);
+        let initializer = struct_type.const_named_struct(&initializer_values);
 
         // Create BTF type information for the map
         // This is critical for aya to understand the map structure
@@ -215,15 +236,13 @@ impl<'ctx> MapManager<'ctx> {
         di_builder: &DebugInfoBuilder<'ctx>,
         compile_unit: &inkwell::debug_info::DICompileUnit<'ctx>,
         name: &str,
-        perf_rb_pages: u64,
+        ringbuf_size: u64,
     ) -> Result<()> {
-        // For ringbuf, max_entries should be power of 2 and reasonable size
-        // Use 256KB (262144 bytes) which is a common size for eBPF ringbuf
-        let max_entries = 256 * 1024; // 262144
-        info!(
-            "Creating ringbuf map: {} with {} max entries ({} pages)",
-            name, max_entries, perf_rb_pages
-        );
+        // For ringbuf, max_entries is the buffer size in bytes (must be power of 2)
+        // The parameter name is kept as perf_rb_pages for backward compatibility,
+        // but we now interpret it directly as the ringbuf size in bytes
+        let max_entries = ringbuf_size;
+        info!("Creating ringbuf map: {} with {} bytes", name, max_entries);
         self.create_map_definition(
             module,
             di_builder,

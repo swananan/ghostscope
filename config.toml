@@ -96,3 +96,26 @@ output_dir = "."
 # Default filename prefix for auto-generated realtime log files
 # Default: "ghostscope_session"
 filename_prefix = "ghostscope_session"
+
+[ebpf]
+# RingBuf map size in bytes (must be power of 2)
+# This controls the size of the ring buffer used to transfer trace events from kernel to userspace.
+# Larger sizes allow more events to be buffered but consume more kernel memory.
+# Valid range: 4096 (4KB) to 16777216 (16MB)
+# Recommended values:
+#   - Low-frequency tracing: 131072 (128KB)
+#   - Medium-frequency tracing: 262144 (256KB)
+#   - High-frequency tracing: 524288 (512KB) or 1048576 (1MB)
+# Default: 262144 (256KB)
+ringbuf_size = 262144
+
+# Maximum number of (pid, module) offset entries for ASLR translation
+# This map stores the runtime address offsets for each loaded module in each process.
+# Each entry stores offsets for text/rodata/data/bss sections.
+# Valid range: 64 to 65536
+# Recommended values:
+#   - Single process: 1024
+#   - Multi-process: 4096
+#   - System-wide tracing: 8192 or 16384
+# Default: 4096
+proc_module_offsets_max_entries = 4096

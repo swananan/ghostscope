@@ -78,6 +78,8 @@ pub struct Config {
     pub files: FilesConfig,
     #[serde(default)]
     pub ui: UiConfigToml,
+    #[serde(default)]
+    pub ebpf: EbpfConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -105,6 +107,24 @@ pub struct DwarfConfig {
     /// DWARF debug information search paths (for future --debug-file auto-discovery)
     #[serde(default = "default_debug_search_paths")]
     pub search_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EbpfConfig {
+    /// RingBuf map size in bytes (must be power of 2)
+    /// Recommended values:
+    ///   - Low-frequency tracing: 131072 (128KB)
+    ///   - Medium-frequency tracing: 262144 (256KB, default)
+    ///   - High-frequency tracing: 524288 (512KB) or 1048576 (1MB)
+    #[serde(default = "default_ringbuf_size")]
+    pub ringbuf_size: u64,
+    /// Maximum number of (pid, module) offset entries for ASLR translation
+    /// Recommended values:
+    ///   - Single process: 1024
+    ///   - Multi-process (default): 4096
+    ///   - System-wide tracing: 8192 or 16384
+    #[serde(default = "default_proc_module_offsets_max_entries")]
+    pub proc_module_offsets_max_entries: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -180,6 +200,14 @@ fn default_debug_search_paths() -> Vec<String> {
     ]
 }
 
+fn default_ringbuf_size() -> u64 {
+    262144 // 256KB
+}
+
+fn default_proc_module_offsets_max_entries() -> u64 {
+    4096
+}
+
 fn default_save_option() -> SaveOption {
     SaveOption {
         debug: true,
@@ -229,6 +257,65 @@ impl Default for DwarfConfig {
         Self {
             search_paths: default_debug_search_paths(),
         }
+    }
+}
+
+impl Default for EbpfConfig {
+    fn default() -> Self {
+        Self {
+            ringbuf_size: default_ringbuf_size(),
+            proc_module_offsets_max_entries: default_proc_module_offsets_max_entries(),
+        }
+    }
+}
+
+impl EbpfConfig {
+    /// Validate eBPF configuration values
+    pub fn validate(&self, file_path: &str) -> Result<()> {
+        // Validate ringbuf_size is power of 2
+        if !self.ringbuf_size.is_power_of_two() {
+            return Err(anyhow::anyhow!(
+                "❌ Invalid eBPF configuration in '{}':\n\n\
+                ringbuf_size must be a power of 2, got {}\n\n\
+                💡 Fix: Use a power of 2 value (e.g., 131072, 262144, 524288, 1048576)\n\
+                Recommended values:\n\
+                  - Low-frequency tracing: 131072 (128KB)\n\
+                  - Medium-frequency tracing: 262144 (256KB, default)\n\
+                  - High-frequency tracing: 524288 (512KB) or 1048576 (1MB)",
+                file_path,
+                self.ringbuf_size
+            ));
+        }
+
+        // Validate ringbuf_size is reasonable (between 4KB and 16MB)
+        if self.ringbuf_size < 4096 || self.ringbuf_size > 16 * 1024 * 1024 {
+            return Err(anyhow::anyhow!(
+                "❌ Invalid eBPF configuration in '{}':\n\n\
+                ringbuf_size {} is out of reasonable range\n\n\
+                💡 Valid range: 4096 (4KB) to 16777216 (16MB)\n\
+                Recommended: 262144 (256KB)",
+                file_path,
+                self.ringbuf_size
+            ));
+        }
+
+        // Validate proc_module_offsets_max_entries is reasonable (at least 64, at most 65536)
+        if self.proc_module_offsets_max_entries < 64 || self.proc_module_offsets_max_entries > 65536
+        {
+            return Err(anyhow::anyhow!(
+                "❌ Invalid eBPF configuration in '{}':\n\n\
+                proc_module_offsets_max_entries {} is out of reasonable range\n\n\
+                💡 Valid range: 64 to 65536\n\
+                Recommended values:\n\
+                  - Single process: 1024\n\
+                  - Multi-process: 4096 (default)\n\
+                  - System-wide: 8192 or 16384",
+                file_path,
+                self.proc_module_offsets_max_entries
+            ));
+        }
+
+        Ok(())
     }
 }
 
@@ -306,6 +393,9 @@ impl Config {
         let config: Config = toml::from_str(&content).map_err(|e| {
             Self::create_friendly_toml_error(&path.display().to_string(), &content, e)
         })?;
+
+        // Validate eBPF configuration
+        config.ebpf.validate(&path.display().to_string())?;
 
         Ok(config)
     }

@@ -69,7 +69,7 @@ async fn create_and_attach_loader(
 pub async fn compile_and_load_script_for_tui(
     script: &str,
     session: &mut GhostSession,
-    save_options: &ghostscope_compiler::SaveOptions,
+    compile_options: &ghostscope_compiler::CompileOptions,
 ) -> Result<ScriptCompilationDetails> {
     // Step 1: Validate process analyzer availability
     let process_analyzer = session
@@ -77,21 +77,7 @@ pub async fn compile_and_load_script_for_tui(
         .as_mut()
         .ok_or_else(|| anyhow::anyhow!("Process analyzer is required for script compilation"))?;
 
-    // Step 2: Use provided save options (TUI mode respects user configuration)
-    let mut save_options_with_hint = save_options.clone();
-    if save_options_with_hint.binary_path_hint.is_none() {
-        save_options_with_hint.binary_path_hint =
-            if let Some(main_module) = process_analyzer.get_main_executable() {
-                std::path::Path::new(&main_module.path)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.to_string())
-            } else {
-                Some("ghostscope".to_string())
-            };
-    }
-
-    // Step 2.5: Get binary path early for error handling
+    // Step 2: Get binary path early for error handling
     let binary_path = if let Some(main_module) = process_analyzer.get_main_executable() {
         main_module.path.clone()
     } else {
@@ -101,13 +87,14 @@ pub async fn compile_and_load_script_for_tui(
     // Step 3: Get starting trace ID from trace manager
     let starting_trace_id = session.trace_manager.get_next_trace_id();
 
+    // Step 4: Use provided compile options directly
     // Compile script using DWARF analyzer with proper starting trace ID
     let compilation_result = match ghostscope_compiler::compile_script(
         script,
         process_analyzer,
         session.target_pid,
         Some(starting_trace_id), // Use trace_manager's next available ID
-        &save_options_with_hint,
+        compile_options,
     ) {
         Ok(result) => result,
         Err(e) => {
@@ -329,7 +316,7 @@ pub async fn compile_and_load_script_for_tui(
 pub async fn compile_and_load_script_for_cli(
     script: &str,
     session: &mut GhostSession,
-    save_options: &ghostscope_compiler::SaveOptions,
+    compile_options: &ghostscope_compiler::CompileOptions,
 ) -> Result<()> {
     info!("Starting unified script compilation with DWARF integration...");
 
@@ -347,12 +334,14 @@ pub async fn compile_and_load_script_for_cli(
 
     // Step 2: Get starting trace ID from trace manager and use unified compilation interface with DwarfAnalyzer
     let starting_trace_id = session.trace_manager.get_next_trace_id();
+
+    // Use provided compile options directly
     let compilation_result = match ghostscope_compiler::compile_script(
         script,
         process_analyzer,
         session.target_pid,
         Some(starting_trace_id), // Use trace_manager's next available ID
-        save_options,
+        compile_options,
     ) {
         Ok(result) => result,
         Err(e) => {

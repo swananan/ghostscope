@@ -35,6 +35,9 @@ pub struct MergedConfig {
     // DWARF configuration
     #[allow(dead_code)]
     pub dwarf_search_paths: Vec<String>,
+
+    // eBPF configuration
+    pub ebpf_config: crate::config::settings::EbpfConfig,
 }
 
 impl MergedConfig {
@@ -149,6 +152,7 @@ impl MergedConfig {
             history_enabled: config.ui.history.enabled,
             history_max_entries: config.ui.history.max_entries,
             dwarf_search_paths: config.dwarf.search_paths,
+            ebpf_config: config.ebpf,
         }
     }
 
@@ -197,6 +201,24 @@ impl MergedConfig {
                 enabled: self.history_enabled,
                 max_entries: self.history_max_entries,
             },
+        }
+    }
+
+    /// Extract compilation options for ghostscope-compiler crate
+    pub fn get_compile_options(
+        &self,
+        save_llvm_ir: bool,
+        save_ebpf: bool,
+        save_ast: bool,
+        binary_path_hint: Option<String>,
+    ) -> ghostscope_compiler::CompileOptions {
+        ghostscope_compiler::CompileOptions {
+            save_llvm_ir,
+            save_ebpf,
+            save_ast,
+            binary_path_hint,
+            ringbuf_size: self.ebpf_config.ringbuf_size,
+            proc_module_offsets_max_entries: self.ebpf_config.proc_module_offsets_max_entries,
         }
     }
 }

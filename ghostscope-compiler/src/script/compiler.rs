@@ -76,7 +76,7 @@ pub struct AstCompiler<'a> {
     failed_targets: Vec<FailedTarget>, // Track failed compilation attempts
     binary_path_hint: Option<String>,
     current_trace_id: u32, // Current trace_id counter (increments for each uprobe)
-    save_options: Option<crate::SaveOptions>, // Save options for file output
+    compile_options: crate::CompileOptions, // Compilation options (save + eBPF map config)
 }
 
 impl<'a> AstCompiler<'a> {
@@ -84,7 +84,7 @@ impl<'a> AstCompiler<'a> {
         process_analyzer: Option<&'a mut ghostscope_dwarf::DwarfAnalyzer>,
         binary_path_hint: Option<String>,
         starting_trace_id: u32,
-        save_options: crate::SaveOptions,
+        compile_options: crate::CompileOptions,
     ) -> Self {
         Self {
             process_analyzer,
@@ -92,7 +92,7 @@ impl<'a> AstCompiler<'a> {
             failed_targets: Vec::new(),
             binary_path_hint,
             current_trace_id: starting_trace_id,
-            save_options: Some(save_options),
+            compile_options,
         }
     }
 
@@ -402,8 +402,8 @@ impl<'a> AstCompiler<'a> {
         );
 
         // Save AST immediately when we know the target details (before generating LLVM IR)
-        if let Some(save_options) = self.get_save_options() {
-            if save_options.save_ast {
+        if let Some(compile_options) = self.get_compile_options() {
+            if compile_options.save_ast {
                 let ast_filename = self.generate_filename(target, assigned_trace_id, "txt");
                 // Create a Program from statements to save
                 let program = Program {
@@ -423,6 +423,7 @@ impl<'a> AstCompiler<'a> {
             &ebpf_function_name,
             self.process_analyzer.as_deref_mut(),
             Some(assigned_trace_id),
+            &self.compile_options,
         )
         .map_err(|e| CompileError::LLVM(format!("Failed to create new codegen: {e}")))?;
 
@@ -527,8 +528,8 @@ impl<'a> AstCompiler<'a> {
     }
 
     /// Get save options (helper method)
-    fn get_save_options(&self) -> Option<&crate::SaveOptions> {
-        self.save_options.as_ref()
+    fn get_compile_options(&self) -> Option<&crate::CompileOptions> {
+        Some(&self.compile_options)
     }
 
     /// Pick a binary path, falling back to compiler hint when the resolved target is empty
@@ -577,8 +578,8 @@ impl<'a> AstCompiler<'a> {
         );
 
         // Save LLVM IR file if requested
-        if let Some(save_options) = self.get_save_options() {
-            if save_options.save_llvm_ir {
+        if let Some(compile_options) = self.get_compile_options() {
+            if compile_options.save_llvm_ir {
                 let filename = self.generate_filename(target, assigned_trace_id, "ll");
                 if let Err(e) = std::fs::write(&filename, &llvm_ir) {
                     warn!("Failed to save LLVM IR to {}: {}", filename, e);
@@ -675,8 +676,8 @@ impl<'a> AstCompiler<'a> {
         let bytecode = object_code.as_slice().to_vec();
 
         // Save eBPF object file and AST if requested
-        if let Some(save_options) = self.get_save_options() {
-            if save_options.save_ebpf {
+        if let Some(compile_options) = self.get_compile_options() {
+            if compile_options.save_ebpf {
                 let filename = self.generate_filename(target, assigned_trace_id, "o");
                 if let Err(e) = std::fs::write(&filename, &bytecode) {
                     warn!("Failed to save eBPF object to {}: {}", filename, e);

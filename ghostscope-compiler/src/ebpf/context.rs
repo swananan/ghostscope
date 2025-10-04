@@ -90,6 +90,9 @@ pub struct EbpfContext<'ctx> {
 
     // Per-invocation stack key for proc_module_offsets lookups (allocated in entry block)
     pub pm_key_alloca: Option<inkwell::values::PointerValue<'ctx>>, // [3 x i32] alloca
+
+    // Compilation options (includes eBPF map configuration)
+    pub compile_options: crate::CompileOptions,
 }
 
 // Temporary alias for backward compatibility during refactoring
@@ -97,7 +100,12 @@ pub type NewCodeGen<'ctx> = EbpfContext<'ctx>;
 
 impl<'ctx> EbpfContext<'ctx> {
     /// Create a new eBPF code generation context
-    pub fn new(context: &'ctx Context, module_name: &str, trace_id: Option<u32>) -> Result<Self> {
+    pub fn new(
+        context: &'ctx Context,
+        module_name: &str,
+        trace_id: Option<u32>,
+        compile_options: &crate::CompileOptions,
+    ) -> Result<Self> {
         let module = context.create_module(module_name);
         let builder = context.create_builder();
 
@@ -177,6 +185,7 @@ impl<'ctx> EbpfContext<'ctx> {
             trace_context: ghostscope_protocol::TraceContext::new(),
             current_resolved_var_module_path: None,
             pm_key_alloca: None,
+            compile_options: compile_options.clone(),
         })
     }
 
@@ -186,8 +195,9 @@ impl<'ctx> EbpfContext<'ctx> {
         module_name: &str,
         process_analyzer: Option<&mut DwarfAnalyzer>,
         trace_id: Option<u32>,
+        compile_options: &crate::CompileOptions,
     ) -> Result<Self> {
-        let mut codegen = Self::new(context, module_name, trace_id)?;
+        let mut codegen = Self::new(context, module_name, trace_id, compile_options)?;
         codegen.process_analyzer = process_analyzer.map(|pa| pa as *const _ as *mut _);
         Ok(codegen)
     }
@@ -302,13 +312,14 @@ impl<'ctx> EbpfContext<'ctx> {
             };
 
         // Create required maps - critical for eBPF loader
+        // Use configured ringbuf size directly (in bytes)
         self.map_manager
             .create_ringbuf_map(
                 &self.module,
                 &self.di_builder,
                 &self.compile_unit,
                 "ringbuf",
-                8,
+                self.compile_options.ringbuf_size,
             )
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to create ringbuf map: {e}")))?;
 
@@ -319,7 +330,7 @@ impl<'ctx> EbpfContext<'ctx> {
                 &self.di_builder,
                 &self.compile_unit,
                 "proc_module_offsets",
-                4096,
+                self.compile_options.proc_module_offsets_max_entries,
             )
             .map_err(|e| {
                 CodeGenError::LLVMError(format!("Failed to create proc_module_offsets map: {e}"))
