@@ -56,7 +56,8 @@ factor = {
     float |
     int |
     special_var |
-    array_access |     // new: arr[index] support
+    array_access |      // prefer array[index].field over chain_access to avoid premature match
+    chain_access |      // allow a.b.c and a.b.c[expr] (trailing index only)
     member_access |
     pointer_deref |
     address_of |
@@ -71,7 +72,8 @@ complex_variable = { chain_access | array_access | member_access | pointer_deref
 
 chain_access = { identifier ~ ("." ~ identifier)* ~ ("[" ~ expr ~ "]")? }
 array_access = { identifier ~ "[" ~ expr ~ "]" ~ ("." ~ identifier)* }
-member_access = { identifier ~ ("." ~ identifier)+ }
+// Ensure member_access doesn't preempt cases followed by '[' (those should be parsed by chain_access)
+member_access = { identifier ~ ("." ~ identifier)+ ~ !("[") }
 pointer_deref = { "*" ~ ( "(" ~ expr ~ ")" | complex_variable | identifier ) }
 address_of = { "&" ~ ( "(" ~ expr ~ ")" | complex_variable | identifier ) }
 

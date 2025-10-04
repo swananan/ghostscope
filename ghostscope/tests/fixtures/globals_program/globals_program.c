@@ -14,6 +14,9 @@ char g_bss_buffer[1024];                     // .bss
 // Complex global state
 GlobalState G_STATE = {"INIT", 0, {0, 0.0}, {1, 2, 3, 4}}; // .data
 
+// Top-level array of structs for arr[const].field tests
+Inner g_slots[2] = {{10, 1.0}, {20, 2.0}}; // .data
+
 static void tick_once(int i) {
     // Local aliases to globals to expose via DWARF at this PC
     GlobalState* s = &G_STATE;

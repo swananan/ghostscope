@@ -166,6 +166,146 @@ trace complex_types_program.c:7 {
 }
 
 #[tokio::test]
+async fn test_local_array_constant_index_format() -> anyhow::Result<()> {
+    init();
+
+    // Build and start complex_types_program (Debug)
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("complex_types_program", OptimizationLevel::Debug)?;
+    let mut prog = Command::new(&binary_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Format-print with local array constant indices
+    let script = r#"
+trace complex_types_program.c:25 {
+    print "ARR:{}|BRR:{}", a.arr[1], b.arr[0];
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    use regex::Regex;
+    let re_arr = Regex::new(r"ARR:(-?\d+)").unwrap();
+    let re_brr = Regex::new(r"BRR:(-?\d+)").unwrap();
+    let has_arr = stdout.lines().any(|l| re_arr.is_match(l));
+    let has_brr = stdout.lines().any(|l| re_brr.is_match(l));
+    assert!(
+        has_arr,
+        "Expected formatted ARR value from a.arr[1]. STDOUT: {}",
+        stdout
+    );
+    assert!(
+        has_brr,
+        "Expected formatted BRR value from b.arr[0]. STDOUT: {}",
+        stdout
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_local_chain_tail_array_index_format() -> anyhow::Result<()> {
+    init();
+
+    // Build and start complex_types_program (Debug)
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("complex_types_program", OptimizationLevel::Debug)?;
+    let mut prog = Command::new(&binary_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Member chain + constant index: b.friend_ref.arr[1] (friend_ref -> &a) and a.arr[2]
+    // Attach at main where a/b are locals
+    let script = r#"
+trace complex_types_program.c:25 {
+    print "CF:{}|AF:{}", b.friend_ref.arr[1], a.arr[2];
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    use regex::Regex;
+    let re_cf = Regex::new(r"CF:(-?\d+)").unwrap();
+    let re_af = Regex::new(r"AF:(-?\d+)").unwrap();
+    let has_cf = stdout.lines().any(|l| re_cf.is_match(l));
+    let has_af = stdout.lines().any(|l| re_af.is_match(l));
+    assert!(
+        has_cf,
+        "Expected CF value from b.friend_ref.arr[1]. STDOUT: {}",
+        stdout
+    );
+    assert!(
+        has_af,
+        "Expected AF value from a.arr[2]. STDOUT: {}",
+        stdout
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_local_array_constant_index_access() -> anyhow::Result<()> {
+    init();
+
+    // Build and start complex_types_program (Debug)
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("complex_types_program", OptimizationLevel::Debug)?;
+    let mut prog = Command::new(&binary_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Local array constant index on a struct local (a.arr[1]) and another (b.arr[0])
+    let script = r#"
+trace complex_types_program.c:25 {
+    print "AR:{}", a.arr[1];
+    print "BR:{}", b.arr[0];
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    use regex::Regex;
+    let re_ar = Regex::new(r"AR:(-?\d+)").unwrap();
+    let re_br = Regex::new(r"BR:(-?\d+)").unwrap();
+    let has_ar = stdout.lines().any(|l| re_ar.is_match(l));
+    let has_br = stdout.lines().any(|l| re_br.is_match(l));
+    assert!(
+        has_ar,
+        "Expected at least one numeric a.arr[1] sample. STDOUT: {}",
+        stdout
+    );
+    assert!(
+        has_br,
+        "Expected at least one numeric b.arr[0] sample. STDOUT: {}",
+        stdout
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_entry_pointer_values() -> anyhow::Result<()> {
     init();
 
