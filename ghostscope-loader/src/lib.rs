@@ -1,3 +1,20 @@
+//! GhostScope eBPF Loader
+//!
+//! This crate provides the `GhostScopeLoader` which manages the lifecycle of eBPF programs:
+//! - Loading eBPF bytecode into the kernel
+//! - Attaching/detaching uprobes to target binaries
+//! - Reading trace events from RingBuf or PerfEventArray
+//! - Managing BPF maps for process module offsets
+//!
+//! ## Architecture
+//!
+//! The loader supports two event output mechanisms:
+//! - **RingBuf**: Modern kernel (>= 5.8) continuous byte stream
+//! - **PerfEventArray**: Legacy kernel (< 5.8) per-CPU independent events
+//!
+//! Event parsing is handled by `ghostscope_protocol::StreamingTraceParser` which
+//! adapts to the event source type automatically.
+
 use aya::{
     maps::{perf::PerfEventArray, HashMap as AyaHashMap, MapData, RingBuf},
     programs::{
@@ -16,6 +33,19 @@ use tracing::{debug, error, info, warn};
 mod kernel_caps;
 pub use kernel_caps::KernelCapabilities;
 
+// Export error types
+mod error;
+pub use error::{LoaderError, Result};
+
+// Internal uprobe module
+mod uprobe;
+use uprobe::UprobeAttachmentParams;
+
+// Internal map module
+mod map;
+use map::ProcModuleKey;
+pub use map::ProcModuleOffsetsValue;
+
 /// Event output map type wrapper
 enum EventMap {
     RingBuf(RingBuf<MapData>),
@@ -30,42 +60,26 @@ pub fn hello() -> String {
     format!("Loader: {}", ghostscope_compiler::hello())
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum LoaderError {
-    #[error("Aya error: {0}")]
-    Aya(#[from] aya::EbpfError),
-
-    #[error("Program error: {0}")]
-    Program(#[from] aya::programs::ProgramError),
-
-    #[error("Map not found: {0}")]
-    MapNotFound(String),
-
-    #[error("Loader error: {0}")]
-    Generic(String),
-}
-
-pub type Result<T> = std::result::Result<T, LoaderError>;
-
+/// Main eBPF program loader and manager
+///
+/// Manages the lifecycle of eBPF programs and provides methods for:
+/// - Loading eBPF bytecode
+/// - Attaching/detaching uprobes
+/// - Reading trace events
+/// - Managing BPF maps
 pub struct GhostScopeLoader {
+    /// Loaded eBPF program
     bpf: Ebpf,
+    /// Event output map (RingBuf or PerfEventArray)
     event_map: Option<EventMap>,
+    /// Active uprobe link
     uprobe_link: Option<UProbeLinkId>,
-    // Store attachment parameters for re-enabling
+    /// Stored parameters for re-attaching uprobe
     attachment_params: Option<UprobeAttachmentParams>,
-    // Streaming parser for trace events
+    /// Streaming parser for trace events
     parser: StreamingTraceParser,
-    // String table for parsing trace events
+    /// String table and metadata for parsing trace events
     trace_context: Option<TraceContext>,
-}
-
-#[derive(Debug, Clone)]
-struct UprobeAttachmentParams {
-    target_binary: String,
-    function_name: String,
-    offset: Option<u64>,
-    pid: Option<i32>,
-    program_name: String,
 }
 
 impl std::fmt::Debug for GhostScopeLoader {
@@ -80,6 +94,10 @@ impl std::fmt::Debug for GhostScopeLoader {
 }
 
 impl GhostScopeLoader {
+    // ============================================================================
+    // Lifecycle Management
+    // ============================================================================
+
     /// Create a new loader instance from eBPF bytecode
     pub fn new(bytecode: &[u8]) -> Result<Self> {
         info!(
@@ -121,6 +139,10 @@ impl GhostScopeLoader {
             }
         }
     }
+
+    // ============================================================================
+    // Uprobe Management
+    // ============================================================================
 
     /// Attach to a uprobe at the specified function offset
     pub fn attach_uprobe(
@@ -596,6 +618,10 @@ impl GhostScopeLoader {
         }
     }
 
+    // ============================================================================
+    // Event Reading
+    // ============================================================================
+
     /// Wait for events asynchronously using AsyncFd
     pub async fn wait_for_events_async(&mut self) -> Result<Vec<ParsedTraceEvent>> {
         let trace_context = self.trace_context.as_ref().ok_or_else(|| {
@@ -699,60 +725,15 @@ impl GhostScopeLoader {
         Ok(events)
     }
 
-    /// Read events from RingBuf (deprecated, kept for reference)
-    #[allow(dead_code)]
-    async fn read_ringbuf_events(
-        &mut self,
-        ringbuf: &mut RingBuf<MapData>,
-    ) -> Result<Vec<ParsedTraceEvent>> {
-        // Create AsyncFd from the ringbuf's file descriptor
-        let async_fd = AsyncFd::new(ringbuf.as_raw_fd())
-            .map_err(|e| LoaderError::Generic(format!("Failed to create AsyncFd: {e}")))?;
-
-        // Wait for the file descriptor to become readable (events available)
-        let _guard = async_fd
-            .readable()
-            .await
-            .map_err(|e| LoaderError::Generic(format!("AsyncFd error: {e}")))?;
-
-        // Read all available events using streaming parser
-        let mut events = Vec::new();
-
-        // Check if we have a trace context for parsing
-        if let Some(trace_context) = &self.trace_context {
-            while let Some(item) = ringbuf.next() {
-                // Process segment with trace context
-                match self.parser.process_segment(&item, trace_context) {
-                    Ok(Some(parsed_event)) => {
-                        // Directly use ParsedTraceEvent
-                        events.push(parsed_event);
-                    }
-                    Ok(None) => {
-                        // Segment processed but no complete event yet
-                    }
-                    Err(e) => {
-                        return Err(LoaderError::Generic(format!(
-                            "Fatal: Failed to parse trace event from RingBuf (blocking): {e}"
-                        )));
-                    }
-                }
-            }
-        } else {
-            return Err(LoaderError::Generic(
-                "No trace context available - cannot parse trace events".to_string(),
-            ));
-        }
-
-        Ok(events)
-    }
-
     /// Set the trace context for parsing trace events
     pub fn set_trace_context(&mut self, trace_context: TraceContext) {
         info!("Setting trace context for trace event parsing");
         self.trace_context = Some(trace_context);
     }
 
-    // Helper functions removed - now using protocol parser
+    // ============================================================================
+    // Information and Debugging
+    // ============================================================================
 
     /// Get information about loaded maps
     pub fn get_map_info(&self) -> Vec<String> {
@@ -769,6 +750,10 @@ impl GhostScopeLoader {
             .map(|(name, _prog)| format!("Program: {name}"))
             .collect()
     }
+
+    // ============================================================================
+    // BPF Map Management
+    // ============================================================================
 
     /// Populate the proc_module_offsets map with computed offsets for a given PID
     /// items: iterator of (module_cookie, SectionOffsets {text, rodata, data, bss})
@@ -820,37 +805,5 @@ impl GhostScopeLoader {
         }
 
         Ok(())
-    }
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct ProcModuleKey {
-    pid: u32,
-    pad: u32,
-    cookie_lo: u32,
-    cookie_hi: u32,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct ProcModuleOffsetsValue {
-    text: u64,
-    rodata: u64,
-    data: u64,
-    bss: u64,
-}
-
-unsafe impl aya::Pod for ProcModuleKey {}
-unsafe impl aya::Pod for ProcModuleOffsetsValue {}
-
-impl ProcModuleOffsetsValue {
-    pub fn new(text: u64, rodata: u64, data: u64, bss: u64) -> Self {
-        Self {
-            text,
-            rodata,
-            data,
-            bss,
-        }
     }
 }
