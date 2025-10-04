@@ -1131,6 +1131,138 @@ impl<'ctx> EbpfContext<'ctx> {
         obj_expr: &crate::script::Expr,
         field_name: &str,
     ) -> Result<Option<VariableWithEvaluation>> {
+        // Generic path: try to resolve the base expression first and add constant member offset
+        if !matches!(obj_expr, crate::script::Expr::Variable(_)) {
+            if let Some(base_var) = self.query_dwarf_for_complex_expr(obj_expr)? {
+                if let Some(base_ty) = base_var.dwarf_type.as_ref() {
+                    fn find_member_offset_and_type(
+                        t: &ghostscope_dwarf::TypeInfo,
+                        field: &str,
+                    ) -> Option<(u64, ghostscope_dwarf::TypeInfo)> {
+                        match t {
+                            ghostscope_dwarf::TypeInfo::StructType { members, .. }
+                            | ghostscope_dwarf::TypeInfo::UnionType { members, .. } => {
+                                for m in members {
+                                    if m.name == field {
+                                        return Some((m.offset, m.member_type.clone()));
+                                    }
+                                }
+                                None
+                            }
+                            ghostscope_dwarf::TypeInfo::TypedefType {
+                                underlying_type, ..
+                            }
+                            | ghostscope_dwarf::TypeInfo::QualifiedType {
+                                underlying_type, ..
+                            } => find_member_offset_and_type(underlying_type, field),
+                            _ => None,
+                        }
+                    }
+                    // Optional auto-deref for pointer-to-aggregate
+                    let mut effective_ty = base_ty.clone();
+                    let mut effective_eval = base_var.evaluation_result.clone();
+                    // unwrap typedef/qualifier for pointer detection
+                    fn unwrap_typedef(
+                        mut t: &ghostscope_dwarf::TypeInfo,
+                    ) -> &ghostscope_dwarf::TypeInfo {
+                        while let ghostscope_dwarf::TypeInfo::TypedefType {
+                            underlying_type, ..
+                        }
+                        | ghostscope_dwarf::TypeInfo::QualifiedType {
+                            underlying_type,
+                            ..
+                        } = t
+                        {
+                            t = underlying_type.as_ref();
+                        }
+                        t
+                    }
+                    let unwrapped = unwrap_typedef(&effective_ty);
+                    if let ghostscope_dwarf::TypeInfo::PointerType { target_type, .. } = unwrapped {
+                        // Insert a dereference step into evaluation
+                        effective_eval = self.compute_pointer_dereference(&effective_eval)?;
+                        effective_ty = *target_type.clone();
+                    }
+
+                    if let Some((member_off, member_ty)) =
+                        find_member_offset_and_type(&effective_ty, field_name)
+                    {
+                        use ghostscope_dwarf::{
+                            ComputeStep as CS, EvaluationResult as ER, LocationResult as LR,
+                        };
+                        let new_eval = match &effective_eval {
+                            ER::MemoryLocation(LR::Address(a)) => {
+                                ER::MemoryLocation(LR::Address(a + member_off))
+                            }
+                            ER::MemoryLocation(LR::ComputedLocation { steps }) => {
+                                let mut s = steps.clone();
+                                s.push(CS::PushConstant(member_off as i64));
+                                s.push(CS::Add);
+                                ER::MemoryLocation(LR::ComputedLocation { steps: s })
+                            }
+                            ER::MemoryLocation(LR::RegisterAddress {
+                                register,
+                                offset,
+                                size,
+                            }) => {
+                                let new_off = offset.unwrap_or(0).saturating_add(member_off as i64);
+                                ER::MemoryLocation(LR::RegisterAddress {
+                                    register: *register,
+                                    offset: Some(new_off),
+                                    size: *size,
+                                })
+                            }
+                            _ => {
+                                return Err(CodeGenError::NotImplemented(
+                                    "Member access on non-addressable expression".to_string(),
+                                ))
+                            }
+                        };
+                        let name = format!("{}.{}", base_var.name, field_name);
+                        let v = VariableWithEvaluation {
+                            name,
+                            type_name: member_ty.type_name(),
+                            dwarf_type: Some(member_ty),
+                            evaluation_result: new_eval,
+                            scope_depth: base_var.scope_depth,
+                            is_parameter: base_var.is_parameter,
+                            is_artificial: base_var.is_artificial,
+                        };
+                        return Ok(Some(v));
+                    }
+                }
+            }
+            // Try a planner-based chain if generic path missed and base is a pure identifier chain
+            {
+                fn flatten_ident_chain<'a>(
+                    e: &'a crate::script::Expr,
+                    out: &mut Vec<&'a str>,
+                ) -> bool {
+                    match e {
+                        crate::script::Expr::Variable(name) => {
+                            out.push(name.as_str());
+                            true
+                        }
+                        crate::script::Expr::MemberAccess(obj, field) => {
+                            if flatten_ident_chain(obj, out) {
+                                out.push(field.as_str());
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        _ => false,
+                    }
+                }
+                let mut segs: Vec<&str> = Vec::new();
+                if flatten_ident_chain(obj_expr, &mut segs) && !segs.is_empty() {
+                    let mut chain: Vec<String> = segs.into_iter().map(|s| s.to_string()).collect();
+                    chain.push(field_name.to_string());
+                    return self.query_dwarf_for_chain_access(&chain);
+                }
+            }
+            // fall through to legacy variable-only behavior
+        }
         // Support simple variable base and fall back to global/static lowering
         if let crate::script::Expr::Variable(base_name) = obj_expr {
             let Some(analyzer_ptr) = self.process_analyzer else {
@@ -1236,12 +1368,63 @@ impl<'ctx> EbpfContext<'ctx> {
         array_expr: &crate::script::Expr,
         index_expr: &crate::script::Expr,
     ) -> Result<Option<VariableWithEvaluation>> {
-        // First, resolve the base array
+        // Prefer planner for simple identifier chains like a.b.c as array base to avoid nested member lookups
+        if let crate::script::Expr::MemberAccess(_, _) = array_expr {
+            // Try to flatten to a chain of identifiers
+            fn flatten_chain<'a>(e: &'a crate::script::Expr, out: &mut Vec<&'a str>) -> bool {
+                match e {
+                    crate::script::Expr::Variable(name) => {
+                        out.push(name.as_str());
+                        true
+                    }
+                    crate::script::Expr::MemberAccess(obj, field) => {
+                        if flatten_chain(obj, out) {
+                            out.push(field.as_str());
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    _ => false,
+                }
+            }
+            let mut segs: Vec<&str> = Vec::new();
+            if flatten_chain(array_expr, &mut segs) && !segs.is_empty() {
+                let Some(analyzer_ptr) = self.process_analyzer else {
+                    return Err(CodeGenError::DwarfError(
+                        "No DWARF analyzer available".to_string(),
+                    ));
+                };
+                let analyzer = unsafe { &mut *analyzer_ptr };
+                let ctx = self.get_compile_time_context()?;
+                let module_address = ghostscope_dwarf::ModuleAddress::new(
+                    std::path::PathBuf::from(ctx.module_path.clone()),
+                    ctx.pc_address,
+                );
+                let base = segs[0].to_string();
+                let rest: Vec<String> = segs[1..].iter().map(|s| s.to_string()).collect();
+                if let Ok(Some(var)) = analyzer.plan_chain_access(&module_address, &base, &rest) {
+                    // Use planner result as array base
+                    let base_var = var;
+                    return self.finish_array_access_from_base(base_var, index_expr);
+                }
+            }
+        }
+
+        // Fallback: resolve the base array via generic complex expr path
         let base_var = match self.query_dwarf_for_complex_expr(array_expr)? {
             Some(var) => var,
             None => return Ok(None),
         };
 
+        self.finish_array_access_from_base(base_var, index_expr)
+    }
+
+    fn finish_array_access_from_base(
+        &mut self,
+        base_var: VariableWithEvaluation,
+        index_expr: &crate::script::Expr,
+    ) -> Result<Option<VariableWithEvaluation>> {
         // Get the array's type
         let array_type = match &base_var.dwarf_type {
             Some(type_info) => type_info,
@@ -1273,12 +1456,27 @@ impl<'ctx> EbpfContext<'ctx> {
                 return Ok(None);
             }
             EvaluationResult::MemoryLocation(location) => {
-                // Create a computed location that includes the array indexing calculation
-                let array_access_steps =
-                    self.create_array_access_steps(location, element_size, index_value);
-                EvaluationResult::MemoryLocation(LocationResult::ComputedLocation {
-                    steps: array_access_steps,
-                })
+                match location {
+                    // Address(base): perform Address arithmetic so ASLR logic applies uniformly
+                    LocationResult::Address(addr) => {
+                        let offs = (index_value as i128) * (element_size as i128);
+                        let new_addr = (*addr as i128).saturating_add(offs);
+                        if new_addr < 0 {
+                            return Err(CodeGenError::LLVMError(
+                                "negative address after indexing".to_string(),
+                            ));
+                        }
+                        EvaluationResult::MemoryLocation(LocationResult::Address(new_addr as u64))
+                    }
+                    // Register/Computed: build compute steps at runtime
+                    _ => {
+                        let array_access_steps =
+                            self.create_array_access_steps(location, element_size, index_value);
+                        EvaluationResult::MemoryLocation(LocationResult::ComputedLocation {
+                            steps: array_access_steps,
+                        })
+                    }
+                }
             }
             EvaluationResult::Optimized => {
                 return Ok(None);
@@ -1289,8 +1487,10 @@ impl<'ctx> EbpfContext<'ctx> {
             }
         };
 
+        // Build readable element name: base_name[index]
+        let elem_name = format!("{}[{}]", base_var.name, index_value);
         let element_var = VariableWithEvaluation {
-            name: format!("{}[index]", self.expr_to_string(array_expr)),
+            name: elem_name,
             type_name: self.type_info_to_name(&element_type),
             dwarf_type: Some(element_type),
             evaluation_result: element_evaluation_result,

@@ -120,7 +120,7 @@ print arr[0].name;
 
 Note:
 - Auto-dereference is supported for locals, parameters, and globals. You don't need to write `*ptr` explicitly; when it is safe to do so, the pointer will be read and dereferenced at runtime (with null checks).
-- Array access in chains (e.g., `a.b[idx].c`) is not supported yet. This version will reject such expressions or return a clear error.
+- Array access: supported for top-level `arr[const]` and chain-tail `a.b.c[const]`. Not supported: chain-middle indices (e.g., `a.b[2].c`), dynamic indices (`arr[i]`), and multi-dimensional arrays.
 
 ## Print Statement
 

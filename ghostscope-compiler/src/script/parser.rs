@@ -371,6 +371,7 @@ fn parse_factor(pair: Pair<Rule>) -> Result<Expr> {
         Rule::factor => {
             let inner = pair.into_inner().next().unwrap();
             match inner.as_rule() {
+                Rule::chain_access => parse_chain_access(inner),
                 Rule::int => {
                     let value = inner.as_str().parse::<i64>().unwrap();
                     Ok(Expr::Int(value))
@@ -525,17 +526,22 @@ fn parse_complex_variable(pair: Pair<Rule>) -> Result<Expr> {
 
 // Parse chain access: person.name.first
 fn parse_chain_access(pair: Pair<Rule>) -> Result<Expr> {
-    let mut chain = Vec::new();
+    let mut chain: Vec<String> = Vec::new();
+    let mut opt_index: Option<Expr> = None;
     for inner_pair in pair.into_inner() {
         match inner_pair.as_rule() {
             Rule::identifier => {
                 chain.push(inner_pair.as_str().to_string());
             }
             Rule::expr => {
-                // Not supported for now: array access inside chain access
-                return Err(ParseError::UnsupportedFeature(
-                    "array access inside chain access is not supported yet (TODO)".to_string(),
-                ));
+                // Support array index only at the end of the chain (Phase 1: require literal int)
+                let parsed = parse_expr(inner_pair)?;
+                if !matches!(parsed, Expr::Int(_)) {
+                    return Err(ParseError::UnsupportedFeature(
+                        "array index must be a literal integer (TODO: dynamic index)".to_string(),
+                    ));
+                }
+                opt_index = Some(parsed);
             }
             _ => {}
         }
@@ -545,7 +551,18 @@ fn parse_chain_access(pair: Pair<Rule>) -> Result<Expr> {
         return Err(ParseError::InvalidExpression);
     }
 
-    Ok(Expr::ChainAccess(chain))
+    // Build base expression from the chain identifiers
+    let mut expr = Expr::Variable(chain[0].clone());
+    for seg in &chain[1..] {
+        expr = Expr::MemberAccess(Box::new(expr), seg.clone());
+    }
+
+    // If there's a trailing index, convert to ArrayAccess on the built base
+    if let Some(idx) = opt_index {
+        expr = Expr::ArrayAccess(Box::new(expr), Box::new(idx));
+    }
+
+    Ok(expr)
 }
 
 // Parse array access: arr[index]
@@ -554,7 +571,7 @@ fn parse_array_access(pair: Pair<Rule>) -> Result<Expr> {
     let array_name = inner_pairs.next().unwrap();
     let index_expr = inner_pairs.next().unwrap();
 
-    let array_expr = Box::new(Expr::Variable(array_name.as_str().to_string()));
+    let _array_expr = Box::new(Expr::Variable(array_name.as_str().to_string()));
     let parsed_index = parse_expr(index_expr)?;
 
     // Enforce: array index must be a literal integer at parse stage
@@ -564,9 +581,20 @@ fn parse_array_access(pair: Pair<Rule>) -> Result<Expr> {
         ));
     }
 
-    let index_expr = Box::new(parsed_index);
+    // Build base array access expression
+    let mut expr = Expr::ArrayAccess(
+        Box::new(Expr::Variable(array_name.as_str().to_string())),
+        Box::new(parsed_index),
+    );
 
-    Ok(Expr::ArrayAccess(array_expr, index_expr))
+    // Consume trailing .field segments if present
+    for next in inner_pairs {
+        // Any remaining tokens are member identifiers
+        let m = next.as_str().to_string();
+        expr = Expr::MemberAccess(Box::new(expr), m);
+    }
+
+    Ok(expr)
 }
 
 // Parse member access: person.name

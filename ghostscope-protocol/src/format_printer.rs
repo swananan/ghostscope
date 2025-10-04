@@ -748,8 +748,11 @@ impl FormatPrinter {
                 _ => format!("<UNSUPPORTED_UNSIGNED_SIZE_{size}>"),
             }
         } else {
-            // Handle char strings
-            if encoding == gimli::constants::DW_ATE_signed_char.0 as u16 && size == 1 {
+            // Handle char-like 1-byte integers as characters (signed or unsigned)
+            if (encoding == gimli::constants::DW_ATE_signed_char.0 as u16
+                || encoding == gimli::constants::DW_ATE_unsigned_char.0 as u16)
+                && size == 1
+            {
                 if !data.is_empty() {
                     if data[0] >= 32 && data[0] <= 126 {
                         format!("'{}'", data[0] as char)
@@ -1005,7 +1008,12 @@ impl FormatPrinter {
                 if variable.data.is_empty() {
                     "<EMPTY_CHAR>".to_string()
                 } else {
-                    char::from(variable.data[0]).to_string()
+                    let b = variable.data[0];
+                    let ch_repr = match b {
+                        0x20..=0x7E => format!("'{}'", b as char),
+                        _ => format!("'\\x{b:02x}'"),
+                    };
+                    format!("{b} ({ch_repr})")
                 }
             }
             TypeKind::Pointer => {
