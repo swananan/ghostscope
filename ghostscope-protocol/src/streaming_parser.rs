@@ -5,6 +5,18 @@ use crate::TypeKind;
 use tracing::{debug, warn};
 use zerocopy::FromBytes;
 
+/// Event source type for parser buffer management
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EventSource {
+    /// Continuous byte stream from RingBuf - may span multiple reads
+    /// Parser preserves residual bytes across events
+    #[default]
+    RingBuf,
+    /// Independent events from PerfEventArray - each event is complete
+    /// Parser clears buffer after each event to prevent pollution
+    PerfEventArray,
+}
+
 /// Parsed instruction from trace event
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ParsedInstruction {
@@ -149,6 +161,7 @@ pub enum ParseState {
 pub struct StreamingTraceParser {
     parse_state: ParseState,
     buffer: Vec<u8>,
+    event_source: EventSource,
 }
 
 impl Default for StreamingTraceParser {
@@ -158,12 +171,18 @@ impl Default for StreamingTraceParser {
 }
 
 impl StreamingTraceParser {
-    /// Create a new streaming parser
+    /// Create a new streaming parser with RingBuf mode (default)
     /// Note: TraceContext is provided by loader during parsing
     pub fn new() -> Self {
+        Self::with_event_source(EventSource::RingBuf)
+    }
+
+    /// Create a new streaming parser with specified event source
+    pub fn with_event_source(event_source: EventSource) -> Self {
         Self {
             parse_state: ParseState::WaitingForHeader,
             buffer: Vec::with_capacity(1024),
+            event_source,
         }
     }
 
@@ -277,8 +296,30 @@ impl StreamingTraceParser {
                                 // Reset state for next event
                                 self.parse_state = ParseState::WaitingForHeader;
 
-                                // Consume the instruction bytes
-                                self.buffer.drain(..consumed_bytes);
+                                // Handle buffer cleanup based on event source
+                                match self.event_source {
+                                    EventSource::RingBuf => {
+                                        // RingBuf: continuous stream, preserve residual bytes
+                                        self.buffer.drain(..consumed_bytes);
+                                        debug!(
+                                            "RingBuf mode: consumed {} bytes, {} bytes remain in buffer",
+                                            consumed_bytes,
+                                            self.buffer.len()
+                                        );
+                                    }
+                                    EventSource::PerfEventArray => {
+                                        // PerfEventArray: independent events, clear all to prevent pollution
+                                        let residual = self.buffer.len() - consumed_bytes;
+                                        if residual > 0 {
+                                            warn!(
+                                                "PerfEventArray mode: discarding {} residual bytes after event",
+                                                residual
+                                            );
+                                        }
+                                        self.buffer.clear();
+                                        debug!("PerfEventArray mode: cleared buffer after complete event");
+                                    }
+                                }
 
                                 return Ok(Some(complete_event));
                             } else {

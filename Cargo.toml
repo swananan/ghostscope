@@ -38,6 +38,7 @@ dirs = "5.0"
 
 gimli = { git = "https://github.com/gimli-rs/gimli", rev = "0c2a60c00792b4d3c31344d8b5d5c6e8d98b5dd5" }
 aya = { git = "https://github.com/aya-rs/aya", rev = "9261554e3c6ca37e401ec23a287a1ddf9cb1f26d" }
+aya-obj = { git = "https://github.com/aya-rs/aya", rev = "9261554e3c6ca37e401ec23a287a1ddf9cb1f26d" }
 aya-ebpf-bindings = { git = "https://github.com/aya-rs/aya", rev = "9261554e3c6ca37e401ec23a287a1ddf9cb1f26d" }
 
 # Test dependencies

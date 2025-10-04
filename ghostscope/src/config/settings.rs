@@ -80,6 +80,10 @@ pub struct Config {
     pub ui: UiConfigToml,
     #[serde(default)]
     pub ebpf: EbpfConfig,
+
+    /// Path to the config file that was loaded (not serialized)
+    #[serde(skip)]
+    pub loaded_from: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -118,6 +122,13 @@ pub struct EbpfConfig {
     ///   - High-frequency tracing: 524288 (512KB) or 1048576 (1MB)
     #[serde(default = "default_ringbuf_size")]
     pub ringbuf_size: u64,
+    /// PerfEventArray page count (must be power of 2, fallback when RingBuf not supported)
+    /// Recommended values:
+    ///   - Low-frequency tracing: 32 pages (~128KB per CPU)
+    ///   - Medium-frequency tracing: 64 pages (~256KB per CPU, default)
+    ///   - High-frequency tracing: 128-256 pages (512KB-1MB per CPU)
+    #[serde(default = "default_perf_page_count")]
+    pub perf_page_count: u32,
     /// Maximum number of (pid, module) offset entries for ASLR translation
     /// Recommended values:
     ///   - Single process: 1024
@@ -125,6 +136,11 @@ pub struct EbpfConfig {
     ///   - System-wide tracing: 8192 or 16384
     #[serde(default = "default_proc_module_offsets_max_entries")]
     pub proc_module_offsets_max_entries: u64,
+    /// Force use of PerfEventArray instead of RingBuf (for testing only)
+    /// WARNING: This is for testing purposes only. Set to true to force PerfEventArray
+    /// even on kernels that support RingBuf.
+    #[serde(default = "default_force_perf_event_array")]
+    pub force_perf_event_array: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -204,8 +220,16 @@ fn default_ringbuf_size() -> u64 {
     262144 // 256KB
 }
 
+fn default_perf_page_count() -> u32 {
+    64 // 64 pages = ~256KB per CPU
+}
+
 fn default_proc_module_offsets_max_entries() -> u64 {
     4096
+}
+
+fn default_force_perf_event_array() -> bool {
+    false
 }
 
 fn default_save_option() -> SaveOption {
@@ -264,7 +288,9 @@ impl Default for EbpfConfig {
     fn default() -> Self {
         Self {
             ringbuf_size: default_ringbuf_size(),
+            perf_page_count: default_perf_page_count(),
             proc_module_offsets_max_entries: default_proc_module_offsets_max_entries(),
+            force_perf_event_array: default_force_perf_event_array(),
         }
     }
 }
@@ -296,6 +322,33 @@ impl EbpfConfig {
                 Recommended: 262144 (256KB)",
                 file_path,
                 self.ringbuf_size
+            ));
+        }
+
+        // Validate perf_page_count is power of 2
+        if !self.perf_page_count.is_power_of_two() {
+            return Err(anyhow::anyhow!(
+                "❌ Invalid eBPF configuration in '{}':\n\n\
+                perf_page_count must be a power of 2, got {}\n\n\
+                💡 Fix: Use a power of 2 value (e.g., 32, 64, 128, 256)\n\
+                Recommended values:\n\
+                  - Low-frequency tracing: 32 pages (~128KB per CPU)\n\
+                  - Medium-frequency tracing: 64 pages (~256KB per CPU, default)\n\
+                  - High-frequency tracing: 128-256 pages (512KB-1MB per CPU)",
+                file_path,
+                self.perf_page_count
+            ));
+        }
+
+        // Validate perf_page_count is reasonable (between 8 and 1024)
+        if self.perf_page_count < 8 || self.perf_page_count > 1024 {
+            return Err(anyhow::anyhow!(
+                "❌ Invalid eBPF configuration in '{}':\n\n\
+                perf_page_count {} is out of reasonable range\n\n\
+                💡 Valid range: 8 to 1024 pages\n\
+                Recommended: 64 pages (~256KB per CPU)",
+                file_path,
+                self.perf_page_count
             ));
         }
 
@@ -366,7 +419,9 @@ impl Config {
         for path in &config_paths {
             if path.exists() {
                 info!("Loading configuration from: {}", path.display());
-                return Self::load_from_file(path);
+                let mut config = Self::load_from_file(path)?;
+                config.loaded_from = Some(path.clone());
+                return Ok(config);
             } else {
                 debug!("Configuration file not found: {}", path.display());
             }
@@ -538,6 +593,9 @@ impl Config {
                 path.display()
             ));
         }
-        Self::load_from_file(path)
+        info!("Loading configuration from: {}", path.display());
+        let mut config = Self::load_from_file(path)?;
+        config.loaded_from = Some(path.to_path_buf());
+        Ok(config)
     }
 }

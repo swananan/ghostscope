@@ -112,6 +112,14 @@ ghostscope --layout horizontal  # Panels side by side (default)
 ghostscope --layout vertical    # Panels top to bottom
 ```
 
+### Advanced eBPF Options
+
+```bash
+# Force PerfEventArray mode (for testing only)
+# WARNING: Testing purposes only. Forces PerfEventArray even on kernels >= 5.8
+ghostscope --force-perf-event-array
+```
+
 ### Complete Command Reference
 
 | Option | Short | Description | Default |
@@ -136,6 +144,7 @@ ghostscope --layout vertical    # Panels top to bottom
 | `--no-save-ast` | | Don't save AST | - |
 | `--layout <MODE>` | | TUI layout mode | horizontal |
 | `--config <PATH>` | | Custom config file | Auto-detect |
+| `--force-perf-event-array` | | Force PerfEventArray (testing) | Off |
 | `--args <PROGRAM> [ARGS...]` | | Launch program with args | None |
 
 ## Configuration File
@@ -218,6 +227,17 @@ ringbuf_size = 262144  # 256KB (default)
 #   - Medium-frequency tracing: 262144 (256KB)
 #   - High-frequency tracing: 524288 (512KB) or 1048576 (1MB)
 
+# PerfEventArray page count per CPU (for older kernels < 5.8)
+# Number of memory pages allocated per CPU for PerfEventArray buffers
+# Each page is typically 4KB, so 64 pages = 256KB per CPU
+# Must be a power of 2. Valid range: 8 to 1024 pages
+perf_page_count = 64  # Default (256KB per CPU)
+
+# Recommended values:
+#   - Low-frequency tracing: 32 pages (~128KB per CPU)
+#   - Medium-frequency tracing: 64 pages (~256KB per CPU)
+#   - High-frequency tracing: 128-256 pages (512KB-1MB per CPU)
+
 # Maximum number of (pid, module) offset entries for ASLR translation
 # Stores runtime address offsets for each loaded module in each process
 # Valid range: 64 to 65536
@@ -227,6 +247,12 @@ proc_module_offsets_max_entries = 4096  # Default
 #   - Single process: 1024
 #   - Multi-process: 4096
 #   - System-wide tracing: 8192 or 16384
+
+# Force use of PerfEventArray instead of RingBuf (TESTING ONLY)
+# WARNING: This is for testing purposes only. Set to true to force PerfEventArray
+# even on kernels that support RingBuf (>= 5.8). PerfEventArray has performance
+# overhead compared to RingBuf and should only be used for compatibility testing.
+force_perf_event_array = false  # Default (auto-detect based on kernel version)
 ```
 
 ### Configuration Examples
@@ -394,6 +420,7 @@ GhostScope validates configuration at startup:
 6. **Layout Mode**: Validates against allowed values (Horizontal, Vertical - capitalized)
 7. **eBPF Configuration**:
    - **ringbuf_size**: Must be power of 2, range 4096-16777216 bytes
+   - **perf_page_count**: Must be power of 2, range 8-1024 pages
    - **proc_module_offsets_max_entries**: Must be in range 64-65536
 
 Invalid configuration will produce clear error messages with suggestions for fixes.
@@ -406,6 +433,8 @@ Invalid configuration will produce clear error messages with suggestions for fix
 - **"Invalid log level"**: Use one of: error, warn, info, debug, trace.
 - **"ringbuf_size must be a power of 2"**: Use values like 131072, 262144, 524288, etc.
 - **"ringbuf_size X is out of reasonable range"**: Must be between 4KB and 16MB.
+- **"perf_page_count must be a power of 2"**: Use values like 32, 64, 128, 256, etc.
+- **"perf_page_count X is out of reasonable range"**: Must be between 8 and 1024 pages.
 - **"proc_module_offsets_max_entries X is out of reasonable range"**: Must be between 64 and 65536.
 
 ## Best Practices

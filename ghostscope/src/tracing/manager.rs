@@ -7,7 +7,7 @@ use ghostscope_loader::GhostScopeLoader;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Manager for all active trace instances
 #[derive(Debug)]
@@ -212,7 +212,7 @@ impl TraceManager {
     /// Wait for events from all active traces using futures::select_all
     pub async fn wait_for_all_events_async(
         &mut self,
-    ) -> Vec<ghostscope_protocol::ParsedTraceEvent> {
+    ) -> anyhow::Result<Vec<ghostscope_protocol::ParsedTraceEvent>> {
         loop {
             let futures: Vec<
                 BoxFuture<
@@ -249,7 +249,12 @@ impl TraceManager {
                     aggregated_events.extend(events);
                 }
                 Err(e) => {
-                    warn!("Error waiting for events from trace {}: {}", trace_id, e);
+                    // Fatal errors should be propagated to the caller
+                    error!(
+                        "Fatal error waiting for events from trace {}: {}",
+                        trace_id, e
+                    );
+                    return Err(e);
                 }
             }
 
@@ -260,14 +265,19 @@ impl TraceManager {
                             aggregated_events.extend(events);
                         }
                         Err(e) => {
-                            warn!("Error waiting for events from trace {}: {}", trace_id, e);
+                            // Fatal errors should be propagated to the caller
+                            error!(
+                                "Fatal error waiting for events from trace {}: {}",
+                                trace_id, e
+                            );
+                            return Err(e);
                         }
                     }
                 }
             }
 
             if !aggregated_events.is_empty() {
-                return aggregated_events;
+                return Ok(aggregated_events);
             }
             // No events received after draining ready traces, continue looping.
         }

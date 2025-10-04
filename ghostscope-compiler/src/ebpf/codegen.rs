@@ -1315,7 +1315,7 @@ impl<'ctx> EbpfContext<'ctx> {
         }
 
         // Send the complete instruction via ringbuf using existing method
-        self.create_ringbuf_output(buffer, total_instruction_size as u64)?;
+        self.write_to_accumulation_buffer_or_send(buffer, total_instruction_size as u64)?;
 
         info!(
             "Successfully generated true single PrintFormat instruction with {} variables",
@@ -1843,7 +1843,7 @@ impl<'ctx> EbpfContext<'ctx> {
         }
 
         // Send via ringbuf (reserved size is sufficient for worst-case payload)
-        self.create_ringbuf_output(buffer, total_size as u64)
+        self.write_to_accumulation_buffer_or_send(buffer, total_size as u64)
             .map_err(|e| CodeGenError::LLVMError(format!("Ringbuf output failed: {}", e)))?;
         Ok(())
     }
@@ -2761,7 +2761,7 @@ impl<'ctx> EbpfContext<'ctx> {
         })?;
 
         // Call the actual bpf_ringbuf_output helper function
-        self.create_ringbuf_output(inst_ptr, size_value)
+        self.write_to_accumulation_buffer_or_send(inst_ptr, size_value)
             .map_err(|e| CodeGenError::LLVMError(format!("Ringbuf output failed: {}", e)))?;
 
         debug!("Successfully queued instruction for ringbuf output");

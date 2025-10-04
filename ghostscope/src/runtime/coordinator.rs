@@ -37,6 +37,7 @@ pub async fn run_tui_coordinator_with_config(config: MergedConfig) -> Result<()>
         layout_mode: config.layout_mode,
         has_explicit_log_flag: false, // Not relevant for TUI conversion
         has_explicit_console_log_flag: false, // Not relevant for TUI conversion
+        force_perf_event_array: config.ebpf_config.force_perf_event_array,
     };
 
     run_tui_coordinator_with_ui_config_and_merged_config(parsed_args, ui_config, config_for_session)
@@ -100,6 +101,8 @@ async fn run_tui_coordinator_with_ui_config_and_merged_config(
         binary_path_hint: None, // Will be set later when we know the binary
         ringbuf_size: 262144,   // Default, will be overridden by config
         proc_module_offsets_max_entries: 4096, // Default, will be overridden by config
+        perf_page_count: 64,    // Default, will be overridden by config
+        event_map_type: ghostscope_compiler::EventMapType::RingBuf, // Will be overridden by config
     };
 
     // Start the runtime coordination task with session from DWARF processing
@@ -145,18 +148,26 @@ async fn run_runtime_coordinator(
     loop {
         tokio::select! {
             // Wait for events asynchronously from active traces' loaders
-            events = async {
+            result = async {
                 if let Some(ref mut session) = session {
                     // Use trace_manager's built-in event polling method
                     session.trace_manager.wait_for_all_events_async().await
                 } else {
                     // No session, return empty events and let the outer loop continue
-                    Vec::new()
+                    Ok(Vec::new())
                 }
             }, if session.is_some() => {
-                if let Some(ref _session) = session {
-                    for event_data in events {
-                        let _ = trace_sender.send(event_data);
+                match result {
+                    Ok(events) => {
+                        if let Some(ref _session) = session {
+                            for event_data in events {
+                                let _ = trace_sender.send(event_data);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Fatal error receiving trace events: {}", e);
+                        break;
                     }
                 }
             }

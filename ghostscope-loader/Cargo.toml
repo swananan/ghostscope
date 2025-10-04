@@ -7,6 +7,8 @@ edition = "2021"
 ghostscope-compiler = { path = "../ghostscope-compiler" }
 ghostscope-protocol = { path = "../ghostscope-protocol" }
 aya = { workspace = true }
+aya-obj = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["io-util", "mio"] }
+tokio = { workspace = true, features = ["io-util", "mio", "net"] }
+bytes = "1.5"

@@ -256,6 +256,28 @@ impl<'ctx> MapManager<'ctx> {
         )
     }
 
+    /// Create PerfEventArray map for event output (fallback when RingBuf not supported)
+    pub fn create_perf_event_array_map(
+        &mut self,
+        module: &Module<'ctx>,
+        di_builder: &DebugInfoBuilder<'ctx>,
+        compile_unit: &inkwell::debug_info::DICompileUnit<'ctx>,
+        name: &str,
+    ) -> Result<()> {
+        info!("Creating PerfEventArray map: {}", name);
+        self.create_map_definition(
+            module,
+            di_builder,
+            compile_unit,
+            name,
+            BpfMapType::PerfEventArray,
+            0, // max_entries = 0 means auto-detect number of CPUs
+            // PerfEventArray: key = u32 (CPU index), value = u32 (FD)
+            SizedType::integer(32),
+            SizedType::integer(32),
+        )
+    }
+
     /// Create the per-(pid,module) section offsets map used for ASLR address calculation
     pub fn create_proc_module_offsets_map(
         &mut self,
@@ -545,6 +567,11 @@ impl<'ctx> MapManager<'ctx> {
 
     /// Get ringbuf map by name
     pub fn get_ringbuf_map(&self, module: &Module<'ctx>, name: &str) -> Result<PointerValue<'ctx>> {
+        self.get_map(module, name)
+    }
+
+    /// Get a perf event array map by name
+    pub fn get_perf_map(&self, module: &Module<'ctx>, name: &str) -> Result<PointerValue<'ctx>> {
         self.get_map(module, name)
     }
 }

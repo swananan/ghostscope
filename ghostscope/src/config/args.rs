@@ -117,6 +117,12 @@ pub struct Args {
     #[arg(long, value_name = "MODE", value_enum, default_value = "horizontal")]
     pub layout: LayoutMode,
 
+    /// Force using PerfEventArray instead of RingBuf (for testing only)
+    /// WARNING: This is for testing purposes only. PerfEventArray has performance overhead
+    /// compared to RingBuf on kernels >= 5.8
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub force_perf_event_array: bool,
+
     /// Remaining arguments (when using --args)
     pub remaining: Vec<String>,
 }
@@ -142,6 +148,7 @@ pub struct ParsedArgs {
     pub should_save_ebpf: bool,
     pub should_save_ast: bool,
     pub layout_mode: LayoutMode,
+    pub force_perf_event_array: bool,
 }
 
 impl Args {
@@ -201,6 +208,7 @@ impl Args {
                 should_save_ebpf,
                 should_save_ast,
                 layout_mode: parsed.layout,
+                force_perf_event_array: parsed.force_perf_event_array,
             }
         } else {
             // Normal parsing without --args
@@ -239,6 +247,7 @@ impl Args {
                 should_save_ebpf,
                 should_save_ast,
                 layout_mode: parsed.layout,
+                force_perf_event_array: parsed.force_perf_event_array,
             }
         }
     }

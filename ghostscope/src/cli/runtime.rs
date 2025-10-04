@@ -118,8 +118,10 @@ pub async fn run_command_line_runtime(parsed_args: ParsedArgs) -> Result<()> {
                     .unwrap_or("unknown")
                     .to_string()
             }),
-        ringbuf_size: 262144,                  // Default
-        proc_module_offsets_max_entries: 4096, // Default
+        ringbuf_size: 262144,                                       // Default
+        proc_module_offsets_max_entries: 4096,                      // Default
+        perf_page_count: 64,                                        // Default
+        event_map_type: ghostscope_compiler::EventMapType::RingBuf, // Will be overridden by config
     };
 
     // Step 6: Compile and load script with graceful error handling
@@ -144,21 +146,29 @@ pub async fn run_command_line_runtime(parsed_args: ParsedArgs) -> Result<()> {
     let mut event_count = 0;
     loop {
         tokio::select! {
-            events = session.trace_manager.wait_for_all_events_async() => {
-                for event in events {
-                    event_count += 1;
+            result = session.trace_manager.wait_for_all_events_async() => {
+                match result {
+                    Ok(events) => {
+                        for event in events {
+                            event_count += 1;
 
-                    // Generate formatted output for better display
-                    let formatted_output = event.to_formatted_output();
-                    if !formatted_output.is_empty() {
-                        println!("[Event #{}] Output:", event_count);
-                        for line in formatted_output {
-                            println!("  {}", line);
+                            // Generate formatted output for better display
+                            let formatted_output = event.to_formatted_output();
+                            if !formatted_output.is_empty() {
+                                println!("[Event #{}] Output:", event_count);
+                                for line in formatted_output {
+                                    println!("  {}", line);
+                                }
+                            }
+
+                            // Also show raw debug info if needed (can be removed later)
+                            debug!("[Event #{}] Raw: {:?}", event_count, event);
                         }
                     }
-
-                    // Also show raw debug info if needed (can be removed later)
-                    debug!("[Event #{}] Raw: {:?}", event_count, event);
+                    Err(e) => {
+                        error!("Fatal error receiving trace events: {}", e);
+                        return Err(e);
+                    }
                 }
             }
 
@@ -286,21 +296,29 @@ async fn run_cli_with_session(
     let mut event_count = 0;
     loop {
         tokio::select! {
-            events = session.trace_manager.wait_for_all_events_async() => {
-                for event in events {
-                    event_count += 1;
+            result = session.trace_manager.wait_for_all_events_async() => {
+                match result {
+                    Ok(events) => {
+                        for event in events {
+                            event_count += 1;
 
-                    // Generate formatted output for better display
-                    let formatted_output = event.to_formatted_output();
-                    if !formatted_output.is_empty() {
-                        println!("[Event #{}] Output:", event_count);
-                        for line in formatted_output {
-                            println!("  {}", line);
+                            // Generate formatted output for better display
+                            let formatted_output = event.to_formatted_output();
+                            if !formatted_output.is_empty() {
+                                println!("[Event #{}] Output:", event_count);
+                                for line in formatted_output {
+                                    println!("  {}", line);
+                                }
+                            }
+
+                            // Also show raw debug info if needed (can be removed later)
+                            debug!("[Event #{}] Raw: {:?}", event_count, event);
                         }
                     }
-
-                    // Also show raw debug info if needed (can be removed later)
-                    debug!("[Event #{}] Raw: {:?}", event_count, event);
+                    Err(e) => {
+                        error!("Fatal error receiving trace events: {}", e);
+                        return Err(e);
+                    }
                 }
             }
 
