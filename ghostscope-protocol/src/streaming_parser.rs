@@ -3,6 +3,7 @@ use crate::trace_context::TraceContext;
 use crate::trace_event::*;
 use crate::TypeKind;
 use tracing::{debug, warn};
+use zerocopy::FromBytes;
 
 /// Parsed instruction from trace event
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -173,163 +174,195 @@ impl StreamingTraceParser {
         data: &[u8],
         trace_context: &TraceContext,
     ) -> Result<Option<ParsedTraceEvent>, String> {
+        // Append incoming data to buffer
+        self.buffer.extend_from_slice(data);
+
         debug!(
-            "Processing segment of {} bytes, current state: {:?}",
+            "Processing segment of {} bytes, buffer now has {} bytes, state: {:?}",
             data.len(),
+            self.buffer.len(),
             self.parse_state
         );
 
-        match &self.parse_state {
-            ParseState::WaitingForHeader => {
-                if data.len() < std::mem::size_of::<TraceEventHeader>() {
-                    return Err("Invalid header segment size".to_string());
-                }
-
-                let header =
-                    unsafe { std::ptr::read_unaligned(data.as_ptr() as *const TraceEventHeader) };
-
-                if header.magic != crate::consts::MAGIC {
-                    return Err("Invalid magic number in header".to_string());
-                }
-
-                // No msg_type check needed - TraceEventHeader is specifically for TraceEvent
-
-                let magic = header.magic;
-                debug!("Received valid header: magic=0x{:x}", magic);
-                self.parse_state = ParseState::WaitingForMessage { header };
-                Ok(None)
-            }
-
-            ParseState::WaitingForMessage { header } => {
-                if data.len() < std::mem::size_of::<TraceEventMessage>() {
-                    return Err("Invalid message segment size".to_string());
-                }
-
-                let message =
-                    unsafe { std::ptr::read_unaligned(data.as_ptr() as *const TraceEventMessage) };
-
-                let trace_id = message.trace_id;
-                let pid = message.pid;
-                let tid = message.tid;
-                debug!(
-                    "Received message: trace_id={}, pid={}, tid={}",
-                    trace_id, pid, tid
-                );
-
-                self.parse_state = ParseState::WaitingForInstructions {
-                    header: *header,
-                    message,
-                    instructions: Vec::new(),
-                };
-                Ok(None)
-            }
-
-            ParseState::WaitingForInstructions {
-                header,
-                message,
-                instructions,
-            } => {
-                // Parse instruction from segment
-                let parsed_instruction = self.parse_instruction_segment(data, trace_context)?;
-
-                let mut new_instructions = instructions.clone();
-
-                // Check if this is EndInstruction
-                if matches!(parsed_instruction, ParsedInstruction::EndInstruction { .. }) {
-                    new_instructions.push(parsed_instruction);
-
-                    // Complete trace event
-                    let complete_event = ParsedTraceEvent {
-                        trace_id: message.trace_id,
-                        timestamp: message.timestamp,
-                        pid: message.pid,
-                        tid: message.tid,
-                        instructions: new_instructions,
+        // Process buffer in a loop until we can't make progress
+        loop {
+            let consumed = match &self.parse_state {
+                ParseState::WaitingForHeader => {
+                    // Try to read header
+                    let (header, _rest) = match TraceEventHeader::read_from_prefix(&self.buffer) {
+                        Ok((h, r)) => (h, r),
+                        Err(_) => {
+                            debug!(
+                                "Waiting for more data for header (have {} bytes, need {})",
+                                self.buffer.len(),
+                                std::mem::size_of::<TraceEventHeader>()
+                            );
+                            return Ok(None);
+                        }
                     };
 
-                    debug!(
-                        "Completed trace event with {} instructions",
-                        complete_event.instructions.len()
-                    );
+                    // Copy packed fields to avoid unaligned reference
+                    let magic = header.magic;
+                    if magic != crate::consts::MAGIC {
+                        return Err(format!("Invalid magic number: 0x{magic:x}"));
+                    }
 
-                    // Reset state for next event
-                    self.parse_state = ParseState::WaitingForHeader;
-                    return Ok(Some(complete_event));
-                } else {
-                    // Add instruction and continue waiting
-                    new_instructions.push(parsed_instruction);
+                    debug!("Received valid header: magic=0x{magic:x}");
+                    self.parse_state = ParseState::WaitingForMessage { header };
+                    std::mem::size_of::<TraceEventHeader>()
+                }
+
+                ParseState::WaitingForMessage { header } => {
+                    // Try to read message
+                    let (message, _rest) = match TraceEventMessage::read_from_prefix(&self.buffer) {
+                        Ok((m, r)) => (m, r),
+                        Err(_) => {
+                            debug!(
+                                "Waiting for more data for message (have {} bytes, need {})",
+                                self.buffer.len(),
+                                std::mem::size_of::<TraceEventMessage>()
+                            );
+                            return Ok(None);
+                        }
+                    };
+
+                    // Copy packed fields to avoid unaligned reference
+                    let trace_id = message.trace_id;
+                    let pid = message.pid;
+                    let tid = message.tid;
+                    debug!(
+                        "Received message: trace_id={}, pid={}, tid={}",
+                        trace_id, pid, tid
+                    );
 
                     self.parse_state = ParseState::WaitingForInstructions {
                         header: *header,
-                        message: *message,
-                        instructions: new_instructions,
+                        message,
+                        instructions: Vec::new(),
                     };
+                    std::mem::size_of::<TraceEventMessage>()
                 }
 
-                Ok(None)
-            }
+                ParseState::WaitingForInstructions {
+                    header,
+                    message,
+                    instructions,
+                } => {
+                    // Try to parse instruction from buffer
+                    match self.try_parse_instruction(&self.buffer, trace_context)? {
+                        Some((parsed_instruction, consumed_bytes)) => {
+                            let mut new_instructions = instructions.clone();
 
-            ParseState::Complete => {
-                warn!("Received data while in Complete state, resetting");
-                self.parse_state = ParseState::WaitingForHeader;
-                self.process_segment(data, trace_context)
+                            // Check if this is EndInstruction
+                            if matches!(
+                                parsed_instruction,
+                                ParsedInstruction::EndInstruction { .. }
+                            ) {
+                                new_instructions.push(parsed_instruction);
+
+                                // Complete trace event
+                                let complete_event = ParsedTraceEvent {
+                                    trace_id: message.trace_id,
+                                    timestamp: message.timestamp,
+                                    pid: message.pid,
+                                    tid: message.tid,
+                                    instructions: new_instructions,
+                                };
+
+                                debug!(
+                                    "Completed trace event with {} instructions",
+                                    complete_event.instructions.len()
+                                );
+
+                                // Reset state for next event
+                                self.parse_state = ParseState::WaitingForHeader;
+
+                                // Consume the instruction bytes
+                                self.buffer.drain(..consumed_bytes);
+
+                                return Ok(Some(complete_event));
+                            } else {
+                                // Add instruction and continue waiting
+                                new_instructions.push(parsed_instruction);
+
+                                self.parse_state = ParseState::WaitingForInstructions {
+                                    header: *header,
+                                    message: *message,
+                                    instructions: new_instructions,
+                                };
+                                consumed_bytes
+                            }
+                        }
+                        None => {
+                            debug!("Waiting for more data for instruction");
+                            return Ok(None);
+                        }
+                    }
+                }
+
+                ParseState::Complete => {
+                    warn!("Received data while in Complete state, resetting");
+                    self.parse_state = ParseState::WaitingForHeader;
+                    continue;
+                }
+            };
+
+            // Consume processed bytes from buffer
+            if consumed > 0 {
+                self.buffer.drain(..consumed);
+                debug!(
+                    "Consumed {} bytes, buffer now has {} bytes",
+                    consumed,
+                    self.buffer.len()
+                );
             }
         }
     }
 
-    /// Parse a single instruction from segment data
-    fn parse_instruction_segment(
+    /// Try to parse a single instruction from buffer
+    /// Returns Some((instruction, consumed_bytes)) if successful, None if need more data
+    fn try_parse_instruction(
         &self,
         data: &[u8],
         trace_context: &TraceContext,
-    ) -> Result<ParsedInstruction, String> {
-        if data.len() < std::mem::size_of::<InstructionHeader>() {
-            return Err("Instruction segment too small for header".to_string());
-        }
-
-        let inst_header =
-            unsafe { std::ptr::read_unaligned(data.as_ptr() as *const InstructionHeader) };
+    ) -> Result<Option<(ParsedInstruction, usize)>, String> {
+        // Try to read instruction header
+        let (inst_header, _rest) = match InstructionHeader::read_from_prefix(data) {
+            Ok((h, r)) => (h, r),
+            Err(_) => return Ok(None),
+        };
 
         let expected_total_size =
             std::mem::size_of::<InstructionHeader>() + inst_header.data_length as usize;
         if data.len() < expected_total_size {
-            return Err(format!(
-                "Instruction segment size {} < expected {}",
+            debug!(
+                "Waiting for complete instruction: have {} bytes, need {} bytes",
                 data.len(),
                 expected_total_size
-            ));
+            );
+            return Ok(None);
         }
 
         let inst_data = &data[std::mem::size_of::<InstructionHeader>()..expected_total_size];
 
-        match inst_header.inst_type {
+        let instruction = match inst_header.inst_type {
             t if t == InstructionType::PrintStringIndex as u8 => {
-                if inst_data.len() < std::mem::size_of::<PrintStringIndexData>() {
-                    return Err("Invalid PrintStringIndex data".to_string());
-                }
-
-                let data_struct = unsafe {
-                    std::ptr::read_unaligned(inst_data.as_ptr() as *const PrintStringIndexData)
-                };
+                let (data_struct, _) = PrintStringIndexData::read_from_prefix(inst_data)
+                    .map_err(|_| "Invalid PrintStringIndex data".to_string())?;
 
                 let string_index = data_struct.string_index;
                 let string_content = trace_context
                     .get_string(string_index)
                     .ok_or_else(|| format!("Invalid string index: {string_index}"))?;
 
-                Ok(ParsedInstruction::PrintString {
+                ParsedInstruction::PrintString {
                     content: string_content.to_string(),
-                })
+                }
             }
 
             t if t == InstructionType::PrintVariableIndex as u8 => {
-                if inst_data.len() < std::mem::size_of::<PrintVariableIndexData>() {
-                    return Err("Invalid PrintVariableIndex data".to_string());
-                }
-
-                let data_struct = unsafe {
-                    std::ptr::read_unaligned(inst_data.as_ptr() as *const PrintVariableIndexData)
-                };
+                let (data_struct, _) = PrintVariableIndexData::read_from_prefix(inst_data)
+                    .map_err(|_| "Invalid PrintVariableIndex data".to_string())?;
 
                 let var_name_index = data_struct.var_name_index;
                 let var_name = trace_context
@@ -378,22 +411,17 @@ impl StreamingTraceParser {
                     }
                 };
 
-                Ok(ParsedInstruction::PrintVariable {
+                ParsedInstruction::PrintVariable {
                     name: var_name.to_string(),
                     type_encoding,
                     formatted_value,
                     raw_data: var_data.to_vec(),
-                })
+                }
             }
 
             t if t == InstructionType::PrintFormat as u8 => {
-                if inst_data.len() < std::mem::size_of::<PrintFormatData>() {
-                    return Err("Invalid PrintFormat data".to_string());
-                }
-
-                let format_data = unsafe {
-                    std::ptr::read_unaligned(inst_data.as_ptr() as *const PrintFormatData)
-                };
+                let (format_data, _) = PrintFormatData::read_from_prefix(inst_data)
+                    .map_err(|_| "Invalid PrintFormat data".to_string())?;
 
                 // Parse variable data
                 let mut variables = Vec::new();
@@ -445,17 +473,12 @@ impl StreamingTraceParser {
                     trace_context,
                 );
 
-                Ok(ParsedInstruction::PrintFormat { formatted_output })
+                ParsedInstruction::PrintFormat { formatted_output }
             }
 
             t if t == InstructionType::PrintComplexFormat as u8 => {
-                if inst_data.len() < std::mem::size_of::<PrintComplexFormatData>() {
-                    return Err("Invalid PrintComplexFormat data".to_string());
-                }
-
-                let format_data = unsafe {
-                    std::ptr::read_unaligned(inst_data.as_ptr() as *const PrintComplexFormatData)
-                };
+                let (format_data, _) = PrintComplexFormatData::read_from_prefix(inst_data)
+                    .map_err(|_| "Invalid PrintComplexFormat data".to_string())?;
 
                 // Parse complex variable data
                 let mut complex_variables = Vec::new();
@@ -517,7 +540,7 @@ impl StreamingTraceParser {
                         trace_context,
                     );
 
-                Ok(ParsedInstruction::PrintComplexFormat { formatted_output })
+                ParsedInstruction::PrintComplexFormat { formatted_output }
             }
 
             t if t == InstructionType::Backtrace as u8 => {
@@ -526,17 +549,12 @@ impl StreamingTraceParser {
                 }
 
                 let depth = inst_data[0];
-                Ok(ParsedInstruction::Backtrace { depth })
+                ParsedInstruction::Backtrace { depth }
             }
 
             t if t == InstructionType::PrintComplexVariable as u8 => {
-                if inst_data.len() < std::mem::size_of::<PrintComplexVariableData>() {
-                    return Err("Invalid PrintComplexVariable data".to_string());
-                }
-
-                let data_struct = unsafe {
-                    std::ptr::read_unaligned(inst_data.as_ptr() as *const PrintComplexVariableData)
-                };
+                let (data_struct, _) = PrintComplexVariableData::read_from_prefix(inst_data)
+                    .map_err(|_| "Invalid PrintComplexVariable data".to_string())?;
 
                 // Extract variable name
                 let var_name_index = data_struct.var_name_index;
@@ -574,35 +592,34 @@ impl StreamingTraceParser {
                     trace_context,
                 );
 
-                Ok(ParsedInstruction::PrintComplexVariable {
+                ParsedInstruction::PrintComplexVariable {
                     name: var_name.to_string(),
                     access_path: access_path.to_string(),
                     type_index: data_struct.type_index,
                     formatted_value,
                     raw_data: var_data.to_vec(),
-                })
+                }
             }
 
             t if t == InstructionType::EndInstruction as u8 => {
-                if inst_data.len() < std::mem::size_of::<EndInstructionData>() {
-                    return Err("Invalid EndInstruction data".to_string());
-                }
+                let (data_struct, _) = EndInstructionData::read_from_prefix(inst_data)
+                    .map_err(|_| "Invalid EndInstruction data".to_string())?;
 
-                let data_struct = unsafe {
-                    std::ptr::read_unaligned(inst_data.as_ptr() as *const EndInstructionData)
-                };
-
-                Ok(ParsedInstruction::EndInstruction {
+                ParsedInstruction::EndInstruction {
                     total_instructions: data_struct.total_instructions,
                     execution_status: data_struct.execution_status,
-                })
+                }
             }
 
-            _ => Err(format!(
-                "Unknown instruction type: {}",
-                inst_header.inst_type
-            )),
-        }
+            _ => {
+                return Err(format!(
+                    "Unknown instruction type: {}",
+                    inst_header.inst_type
+                ))
+            }
+        };
+
+        Ok(Some((instruction, expected_total_size)))
     }
 
     /// Reset parser state (useful for error recovery)
@@ -699,25 +716,15 @@ mod tests {
             tid: 2002,
         };
 
-        // Test header segment
-        let header_bytes = unsafe {
-            std::slice::from_raw_parts(
-                &header as *const _ as *const u8,
-                std::mem::size_of::<TraceEventHeader>(),
-            )
-        };
+        // Test header segment (using zerocopy to convert struct to bytes)
+        let header_bytes = zerocopy::IntoBytes::as_bytes(&header);
         let result = parser
             .process_segment(header_bytes, &trace_context)
             .unwrap();
         assert!(result.is_none()); // Not complete yet
 
-        // Test message segment
-        let message_bytes = unsafe {
-            std::slice::from_raw_parts(
-                &message as *const _ as *const u8,
-                std::mem::size_of::<TraceEventMessage>(),
-            )
-        };
+        // Test message segment (using zerocopy to convert struct to bytes)
+        let message_bytes = zerocopy::IntoBytes::as_bytes(&message);
         let result = parser
             .process_segment(message_bytes, &trace_context)
             .unwrap();
