@@ -21,12 +21,29 @@ async fn run_ghostscope_with_script_for_pid(
     timeout_secs: u64,
     pid: u32,
 ) -> anyhow::Result<(i32, String, String)> {
+    run_ghostscope_with_script_for_pid_impl(script_content, timeout_secs, pid, false).await
+}
+
+async fn run_ghostscope_with_script_for_pid_perf(
+    script_content: &str,
+    timeout_secs: u64,
+    pid: u32,
+) -> anyhow::Result<(i32, String, String)> {
+    run_ghostscope_with_script_for_pid_impl(script_content, timeout_secs, pid, true).await
+}
+
+async fn run_ghostscope_with_script_for_pid_impl(
+    script_content: &str,
+    timeout_secs: u64,
+    pid: u32,
+    force_perf_event_array: bool,
+) -> anyhow::Result<(i32, String, String)> {
     let mut script_file = NamedTempFile::new()?;
     script_file.write_all(script_content.as_bytes())?;
     let script_path = script_file.path();
 
     let binary_path = "../target/debug/ghostscope";
-    let args: Vec<OsString> = vec![
+    let mut args: Vec<OsString> = vec![
         OsString::from("-p"),
         OsString::from(pid.to_string()),
         OsString::from("--script-file"),
@@ -36,6 +53,10 @@ async fn run_ghostscope_with_script_for_pid(
         OsString::from("--no-save-ast"),
         OsString::from("--no-log"),
     ];
+
+    if force_perf_event_array {
+        args.push(OsString::from("--force-perf-event-array"));
+    }
 
     let mut command = Command::new(binary_path);
     command.args(&args);
@@ -859,6 +880,194 @@ trace complex_types_program.c:25 {
         "flags must equal i&7 (i={}, flags={})",
         i_val,
         flags_val
+    );
+
+    Ok(())
+}
+
+// ============================================================================
+// PerfEventArray Tests (--force-perf-event-array)
+// These tests verify the same functionality but with PerfEventArray backend
+// ============================================================================
+
+#[tokio::test]
+async fn test_entry_prints_perf() -> anyhow::Result<()> {
+    init();
+
+    // Build and start complex_types_program (Debug)
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("complex_types_program", OptimizationLevel::Debug)?;
+    let mut prog = Command::new(&binary_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Script based on t.gs semantics, but inlined (no file read)
+    let script = r#"
+trace complex_types_program.c:7 {
+    print &*&*c;        // pointer address of c (struct Complex*)
+    print c.friend_ref; // pointer value or NULL
+    print c.name;       // char[16] -> string
+    print *c.friend_ref; // dereferenced struct (or null-deref error)
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_pid_perf(script, 3, pid).await?;
+
+    assert_eq!(
+        exit_code, 0,
+        "ghostscope should run successfully (stderr={}, stdout={})",
+        stderr, stdout
+    );
+
+    // Validate pointer prints include type suffix and hex
+    let has_any_ptr = stdout.contains("0x") && stdout.contains("(Complex*)");
+    assert!(
+        has_any_ptr,
+        "Expected pointer print with type suffix. STDOUT: {}",
+        stdout
+    );
+
+    // Validate c.name renders as a quoted string
+    let has_name = stdout.contains("\"Alice\"") || stdout.contains("\"Bob\"");
+    assert!(has_name, "Expected c.name string. STDOUT: {}", stdout);
+
+    // Validate deref prints either a pretty struct or a null-deref error
+    let has_deref_struct = stdout.contains("*c.friend_ref")
+        && (stdout.contains("Complex {") || stdout.contains("<error: null pointer dereference>"));
+    assert!(
+        has_deref_struct,
+        "Expected deref output (struct or null-deref). STDOUT: {}",
+        stdout
+    );
+
+    let _ = prog.kill().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_local_array_constant_index_format_perf() -> anyhow::Result<()> {
+    init();
+
+    // Build and start complex_types_program (Debug)
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("complex_types_program", OptimizationLevel::Debug)?;
+    let mut prog = Command::new(&binary_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Format-print with local array constant indices
+    let script = r#"
+trace complex_types_program.c:25 {
+    print "ARR:{}|BRR:{}", a.arr[1], b.arr[0];
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_pid_perf(script, 3, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    use regex::Regex;
+    let re_arr = Regex::new(r"ARR:(-?\d+)").unwrap();
+    let re_brr = Regex::new(r"BRR:(-?\d+)").unwrap();
+    let has_arr = stdout.lines().any(|l| re_arr.is_match(l));
+    let has_brr = stdout.lines().any(|l| re_brr.is_match(l));
+    assert!(
+        has_arr,
+        "Expected formatted ARR value from a.arr[1]. STDOUT: {}",
+        stdout
+    );
+    assert!(
+        has_brr,
+        "Expected formatted BRR value from b.arr[0]. STDOUT: {}",
+        stdout
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_complex_types_formatting_perf() -> anyhow::Result<()> {
+    init();
+
+    // Build and start complex_types_program (Debug)
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("complex_types_program", OptimizationLevel::Debug)?;
+    let mut prog = Command::new(&binary_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    // Give it time to start
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Use source-line attach where 'a' (struct Complex) is in scope
+    // Avoid pointer deref on parameter 'c' (not supported yet)
+    let script_content = r#"
+trace complex_types_program.c:25 {
+    print a; // struct
+    print a.name; // char[N] as string
+    print "User: {} Age: {} {}", a.name, a.age, a.status;
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_pid_perf(script_content, 3, pid).await?;
+
+    // Cleanup program
+    let _ = prog.kill().await;
+
+    // Basic assertions (no fallback, attach failure is failure)
+    assert_eq!(
+        exit_code, 0,
+        "ghostscope should run successfully. stderr={} stdout={}",
+        stderr, stdout
+    );
+
+    // Check struct formatted line is present
+    let has_struct =
+        stdout.contains("Complex {") && stdout.contains("name:") && stdout.contains("age:");
+    assert!(
+        has_struct,
+        "Expected struct output with fields. STDOUT: {}",
+        stdout
+    );
+
+    // Ensure c.name renders as a quoted string (Alice/Bob)
+    let has_name_str = stdout.contains("\"Alice\"") || stdout.contains("\"Bob\"");
+    assert!(
+        has_name_str,
+        "Expected name string output. STDOUT: {}",
+        stdout
+    );
+
+    // Optional: struct print contains 'arr:' field (do not require arr index due to grammar limits)
+    let has_arr_field = stdout.contains("arr:");
+    assert!(
+        has_arr_field,
+        "Expected struct output contains arr field. STDOUT: {}",
+        stdout
+    );
+
+    // Ensure formatted print line exists
+    let has_formatted = stdout.contains("User:") && stdout.contains("Age:");
+    assert!(
+        has_formatted,
+        "Expected formatted print output. STDOUT: {}",
+        stdout
     );
 
     Ok(())

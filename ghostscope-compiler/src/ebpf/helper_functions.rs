@@ -6,7 +6,7 @@
 use super::context::{CodeGenError, EbpfContext, Result};
 use aya_ebpf_bindings::bindings::bpf_func_id::{
     BPF_FUNC_get_current_pid_tgid, BPF_FUNC_ktime_get_ns, BPF_FUNC_map_lookup_elem,
-    BPF_FUNC_probe_read_user, BPF_FUNC_ringbuf_output,
+    BPF_FUNC_perf_event_output, BPF_FUNC_probe_read_user, BPF_FUNC_ringbuf_output,
 };
 use ghostscope_dwarf::MemoryAccessSize;
 use ghostscope_platform::register_mapping;
@@ -596,8 +596,23 @@ impl<'ctx> EbpfContext<'ctx> {
         }
     }
 
-    /// Create ringbuf output using bpf_ringbuf_output
-    pub fn create_ringbuf_output(&mut self, data: PointerValue<'ctx>, size: u64) -> Result<()> {
+    /// Create event output using either RingBuf or PerfEventArray based on compile options
+    /// This is the unified interface that should be used for all event output
+    pub fn create_event_output(&mut self, data: PointerValue<'ctx>, size: u64) -> Result<()> {
+        match self.compile_options.event_map_type {
+            crate::EventMapType::RingBuf => self.create_ringbuf_output_internal(data, size),
+            crate::EventMapType::PerfEventArray => {
+                self.create_perf_event_output_internal(data, size)
+            }
+        }
+    }
+
+    /// Create ringbuf output using bpf_ringbuf_output (internal implementation)
+    fn create_ringbuf_output_internal(
+        &mut self,
+        data: PointerValue<'ctx>,
+        size: u64,
+    ) -> Result<()> {
         let i64_type = self.context.i64_type();
 
         // Get ringbuf map
@@ -621,6 +636,62 @@ impl<'ctx> EbpfContext<'ctx> {
             &args,
             i64_type.into(),
             "ringbuf_output",
+        )?;
+
+        Ok(())
+    }
+
+    /// Create perf event output using bpf_perf_event_output (internal implementation)
+    fn create_perf_event_output_internal(
+        &mut self,
+        data: PointerValue<'ctx>,
+        size: u64,
+    ) -> Result<()> {
+        let size_val = self.context.i64_type().const_int(size, false);
+        self.create_perf_event_output_dynamic(data, size_val)
+    }
+
+    /// Create perf event output with dynamic size (IntValue)
+    pub fn create_perf_event_output_dynamic(
+        &mut self,
+        data: PointerValue<'ctx>,
+        size: IntValue<'ctx>,
+    ) -> Result<()> {
+        let i64_type = self.context.i64_type();
+
+        // Get the current pt_regs pointer (first argument to eBPF program)
+        let ctx_param = self
+            .builder
+            .get_insert_block()
+            .and_then(|bb| bb.get_parent())
+            .and_then(|func| func.get_first_param())
+            .ok_or_else(|| {
+                CodeGenError::LLVMError("Failed to get context parameter".to_string())
+            })?;
+
+        // Get perf event array map
+        let events_global = self
+            .map_manager
+            .get_perf_map(&self.module, "events")
+            .map_err(|e| {
+                CodeGenError::MemoryAccessError(format!("Failed to get perf event map: {e}"))
+            })?;
+
+        // Arguments: ctx, map, flags, data, size
+        // flags = BPF_F_CURRENT_CPU (0xFFFFFFFF) means use current CPU
+        let args = [
+            ctx_param,
+            events_global.into(),
+            i64_type.const_int(0xFFFFFFFF_u64, false).into(), // BPF_F_CURRENT_CPU
+            data.into(),
+            size.into(),
+        ];
+
+        let _result = self.create_bpf_helper_call(
+            BPF_FUNC_perf_event_output as u64,
+            &args,
+            i64_type.into(),
+            "perf_event_output",
         )?;
 
         Ok(())

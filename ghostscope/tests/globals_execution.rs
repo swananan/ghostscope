@@ -22,12 +22,29 @@ async fn run_ghostscope_with_script_for_pid(
     timeout_secs: u64,
     pid: u32,
 ) -> anyhow::Result<(i32, String, String)> {
+    run_ghostscope_with_script_for_pid_impl(script_content, timeout_secs, pid, false).await
+}
+
+async fn run_ghostscope_with_script_for_pid_perf(
+    script_content: &str,
+    timeout_secs: u64,
+    pid: u32,
+) -> anyhow::Result<(i32, String, String)> {
+    run_ghostscope_with_script_for_pid_impl(script_content, timeout_secs, pid, true).await
+}
+
+async fn run_ghostscope_with_script_for_pid_impl(
+    script_content: &str,
+    timeout_secs: u64,
+    pid: u32,
+    force_perf_event_array: bool,
+) -> anyhow::Result<(i32, String, String)> {
     let mut script_file = NamedTempFile::new()?;
     script_file.write_all(script_content.as_bytes())?;
     let script_path = script_file.path();
 
     let binary_path = "../target/debug/ghostscope";
-    let args: Vec<OsString> = vec![
+    let mut args: Vec<OsString> = vec![
         OsString::from("-p"),
         OsString::from(pid.to_string()),
         OsString::from("--script-file"),
@@ -37,6 +54,10 @@ async fn run_ghostscope_with_script_for_pid(
         OsString::from("--no-save-ast"),
         OsString::from("--no-log"),
     ];
+
+    if force_perf_event_array {
+        args.push(OsString::from("--force-perf-event-array"));
+    }
 
     let mut command = Command::new(binary_path);
     command.args(&args);
@@ -1050,5 +1071,120 @@ trace globals_program.c:32 {
     );
     let d = ((vals[1] - vals[0]) * 100.0).round() as i64;
     assert_eq!(d, 125, "inner.y should +1.25 per tick. STDOUT: {}", stdout);
+    Ok(())
+}
+
+// ============================================================================
+// PerfEventArray Tests (--force-perf-event-array)
+// These tests verify the same functionality but with PerfEventArray backend
+// ============================================================================
+
+#[tokio::test]
+async fn test_print_format_current_global_member_leaf_perf() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Current-module leaf member via formatted print
+    let script = r#"
+trace globals_program.c:32 {
+    print "GY:{}", G_STATE.inner.y;
+}
+"#;
+    // Collect exactly 2 events for deterministic delta/null checks
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_pid_perf(script, 2, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    let re = Regex::new(r"GY:([0-9]+(?:\.[0-9]+)?)").unwrap();
+    let mut vals: Vec<f64> = Vec::new();
+    for line in stdout.lines() {
+        if let Some(c) = re.captures(line) {
+            // Ensure scalar print (no struct pretty-print)
+            assert!(
+                !line.contains("Inner {"),
+                "Expected scalar for G_STATE.inner.y, got struct: {}",
+                line
+            );
+            vals.push(c[1].parse().unwrap_or(0.0));
+        }
+    }
+    assert!(
+        vals.len() >= 2,
+        "Insufficient GY events. STDOUT: {}",
+        stdout
+    );
+    // inner.y increments by 0.5 per tick in globals_program
+    let d = ((vals[1] - vals[0]) * 100.0).round() as i64;
+    assert_eq!(
+        d, 50,
+        "G_STATE.inner.y should +0.5 per tick. STDOUT: {}",
+        stdout
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_tick_once_entry_strings_and_structs_perf() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Attach at a source line after local aliases are initialized (line 26 is first non-comment after 19..24)
+    let script = r#"
+trace globals_program.c:26 {
+    print s.name;       // char[32] -> string
+    print ls.name;      // from shared library
+    print s;            // struct GlobalState pretty print
+    print *ls;          // deref pointer to struct
+}
+"#;
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_pid_perf(script, 2, pid).await?;
+
+    let _ = prog.kill().await;
+
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    // s.name should be a quoted string (either "INIT" or updated value)
+    let has_s_name = stdout.contains("\"INIT\"") || stdout.contains("\"RUNNING\"");
+    assert!(has_s_name, "Expected s.name string. STDOUT: {}", stdout);
+
+    // ls.name (library) should be "LIB"
+    assert!(
+        stdout.contains("\"LIB\""),
+        "Expected ls.name == \"LIB\". STDOUT: {}",
+        stdout
+    );
+
+    // Pretty struct prints for s or *ls should be present
+    let has_struct = stdout.contains("GlobalState {") || stdout.contains("*ls = GlobalState {");
+    assert!(
+        has_struct,
+        "Expected pretty struct output. STDOUT: {}",
+        stdout
+    );
+
     Ok(())
 }

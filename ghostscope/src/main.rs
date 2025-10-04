@@ -13,6 +13,9 @@ use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, LeaveAlternateScreen};
 use std::io::{self, Write};
 
+// Use external tracing crate (not the local tracing module)
+use ::tracing::{info, warn};
+
 fn setup_panic_hook() {
     // Use existing RUST_BACKTRACE setting from environment
 
@@ -103,6 +106,45 @@ async fn main() -> Result<()> {
         return Err(anyhow::anyhow!("Failed to initialize logging: {}", e));
     }
 
+    // Log which configuration file was loaded (after logging is initialized)
+    if let Some(config_path) = &merged_config.config_file_path {
+        info!("Configuration loaded from: {}", config_path.display());
+    } else {
+        info!("Using default configuration (no config file found)");
+    }
+
+    // Log eBPF configuration settings
+    info!("eBPF Configuration:");
+    info!(
+        "  RingBuf size: {} bytes",
+        merged_config.ebpf_config.ringbuf_size
+    );
+    info!(
+        "  PerfEventArray page count: {}",
+        merged_config.ebpf_config.perf_page_count
+    );
+
+    // Detect kernel eBPF capabilities once at startup
+    if merged_config.ebpf_config.force_perf_event_array {
+        warn!("⚠️  TESTING MODE: force_perf_event_array=true - will use PerfEventArray");
+        info!("Skipping RingBuf detection, validating PerfEventArray support...");
+        let kernel_caps = ghostscope_loader::KernelCapabilities::get_perf_only();
+        info!("Kernel eBPF capabilities:");
+        info!(
+            "  PerfEventArray support: {}",
+            kernel_caps.supports_perf_event_array
+        );
+    } else {
+        let kernel_caps = ghostscope_loader::KernelCapabilities::get();
+        info!("Kernel eBPF capabilities:");
+        info!("  RingBuf support: {}", kernel_caps.supports_ringbuf);
+
+        if !kernel_caps.supports_ringbuf {
+            warn!("⚠️  Kernel does not support RingBuf (requires >= 5.8)");
+            warn!("⚠️  GhostScope will use PerfEventArray as fallback");
+        }
+    }
+
     // Validate core arguments (TODO: move validation to MergedConfig)
     // For now, create a temporary ParsedArgs for validation
     let temp_args = config::ParsedArgs {
@@ -125,6 +167,7 @@ async fn main() -> Result<()> {
         layout_mode: merged_config.layout_mode,
         has_explicit_log_flag: false, // Not needed for validation
         has_explicit_console_log_flag: false, // Not needed for validation
+        force_perf_event_array: merged_config.ebpf_config.force_perf_event_array,
     };
     temp_args.validate()?;
 

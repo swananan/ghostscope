@@ -42,6 +42,15 @@ impl From<ParseError> for CompileError {
 // Public re-exports from script::compiler module
 pub use script::compiler::{CompilationResult, UProbeConfig};
 
+/// Event output map type for eBPF tracing
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventMapType {
+    /// BPF_MAP_TYPE_RINGBUF (requires kernel >= 5.8)
+    RingBuf,
+    /// BPF_MAP_TYPE_PERF_EVENT_ARRAY (kernel >= 4.3, fallback)
+    PerfEventArray,
+}
+
 /// Compilation options including save options and eBPF map configuration
 #[derive(Debug, Clone)]
 pub struct CompileOptions {
@@ -51,6 +60,8 @@ pub struct CompileOptions {
     pub binary_path_hint: Option<String>,
     pub ringbuf_size: u64,
     pub proc_module_offsets_max_entries: u64,
+    pub perf_page_count: u32,
+    pub event_map_type: EventMapType,
 }
 
 impl Default for CompileOptions {
@@ -60,8 +71,10 @@ impl Default for CompileOptions {
             save_ebpf: false,
             save_ast: false,
             binary_path_hint: None,
-            ringbuf_size: 262144, // 256KB
-            proc_module_offsets_max_entries: 4096,
+            ringbuf_size: 262144,                  // 256KB
+            proc_module_offsets_max_entries: 4096, // Default
+            perf_page_count: 64,                   // 64 pages = 256KB per CPU
+            event_map_type: EventMapType::RingBuf, // Default to RingBuf
         }
     }
 }

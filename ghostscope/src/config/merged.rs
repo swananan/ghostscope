@@ -38,6 +38,9 @@ pub struct MergedConfig {
 
     // eBPF configuration
     pub ebpf_config: crate::config::settings::EbpfConfig,
+
+    // Config file metadata
+    pub config_file_path: Option<PathBuf>,
 }
 
 impl MergedConfig {
@@ -152,7 +155,15 @@ impl MergedConfig {
             history_enabled: config.ui.history.enabled,
             history_max_entries: config.ui.history.max_entries,
             dwarf_search_paths: config.dwarf.search_paths,
-            ebpf_config: config.ebpf,
+            ebpf_config: {
+                // Command line --force-perf-event-array overrides config file
+                let mut ebpf_config = config.ebpf;
+                if args.force_perf_event_array {
+                    ebpf_config.force_perf_event_array = true;
+                }
+                ebpf_config
+            },
+            config_file_path: config.loaded_from,
         }
     }
 
@@ -212,6 +223,21 @@ impl MergedConfig {
         save_ast: bool,
         binary_path_hint: Option<String>,
     ) -> ghostscope_compiler::CompileOptions {
+        use ghostscope_loader::KernelCapabilities;
+
+        // Select event map type based on kernel capabilities or config override
+        let event_map_type = if self.ebpf_config.force_perf_event_array {
+            // Force PerfEventArray for testing (config override)
+            ::tracing::warn!(
+                "⚠️  TESTING MODE: force_perf_event_array=true in config - using PerfEventArray"
+            );
+            ghostscope_compiler::EventMapType::PerfEventArray
+        } else if KernelCapabilities::ringbuf_supported() {
+            ghostscope_compiler::EventMapType::RingBuf
+        } else {
+            ghostscope_compiler::EventMapType::PerfEventArray
+        };
+
         ghostscope_compiler::CompileOptions {
             save_llvm_ir,
             save_ebpf,
@@ -219,6 +245,8 @@ impl MergedConfig {
             binary_path_hint,
             ringbuf_size: self.ebpf_config.ringbuf_size,
             proc_module_offsets_max_entries: self.ebpf_config.proc_module_offsets_max_entries,
+            perf_page_count: self.ebpf_config.perf_page_count,
+            event_map_type,
         }
     }
 }

@@ -312,16 +312,36 @@ impl<'ctx> EbpfContext<'ctx> {
             };
 
         // Create required maps - critical for eBPF loader
-        // Use configured ringbuf size directly (in bytes)
-        self.map_manager
-            .create_ringbuf_map(
-                &self.module,
-                &self.di_builder,
-                &self.compile_unit,
-                "ringbuf",
-                self.compile_options.ringbuf_size,
-            )
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to create ringbuf map: {e}")))?;
+        // Create event output map based on compile options
+        match self.compile_options.event_map_type {
+            crate::EventMapType::RingBuf => {
+                self.map_manager
+                    .create_ringbuf_map(
+                        &self.module,
+                        &self.di_builder,
+                        &self.compile_unit,
+                        "ringbuf",
+                        self.compile_options.ringbuf_size,
+                    )
+                    .map_err(|e| {
+                        CodeGenError::LLVMError(format!("Failed to create ringbuf map: {e}"))
+                    })?;
+            }
+            crate::EventMapType::PerfEventArray => {
+                self.map_manager
+                    .create_perf_event_array_map(
+                        &self.module,
+                        &self.di_builder,
+                        &self.compile_unit,
+                        "events",
+                    )
+                    .map_err(|e| {
+                        CodeGenError::LLVMError(format!(
+                            "Failed to create perf event array map: {e}"
+                        ))
+                    })?;
+            }
+        }
 
         // Create ASLR offsets map for (pid,module) → section offsets
         self.map_manager

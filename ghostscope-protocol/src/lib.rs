@@ -22,7 +22,9 @@ pub use trace_context::TraceContext;
 
 pub use format_printer::{FormatPrinter, ParsedVariable};
 
-pub use streaming_parser::{ParseState, ParsedInstruction, ParsedTraceEvent, StreamingTraceParser};
+pub use streaming_parser::{
+    EventSource, ParseState, ParsedInstruction, ParsedTraceEvent, StreamingTraceParser,
+};
 
 pub use type_info::{EnumVariant, StructMember, TypeCache, TypeInfo, TypeQualifier};
 

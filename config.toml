@@ -119,3 +119,21 @@ ringbuf_size = 262144
 #   - System-wide tracing: 8192 or 16384
 # Default: 4096
 proc_module_offsets_max_entries = 4096
+
+# PerfEventArray page count (number of pages per CPU for perf buffer)
+# This is only used when PerfEventArray is selected (kernel < 5.8 or when force_perf_event_array=true)
+# Must be power of 2. Each page is 4KB on most systems.
+# Valid range: 1 to 512 pages
+# Recommended values:
+#   - Low-frequency tracing: 8 pages (32KB per CPU)
+#   - Medium-frequency tracing: 32 pages (128KB per CPU)
+#   - High-frequency tracing: 64 pages (256KB per CPU)
+# Default: 32 (128KB per CPU)
+perf_page_count = 32
+
+# Force use of PerfEventArray instead of RingBuf (for testing only)
+# WARNING: This is for testing purposes only. Normally the system auto-detects
+# kernel capabilities and uses RingBuf (kernel >= 5.8) or falls back to PerfEventArray.
+# Set to true to force PerfEventArray even on kernels that support RingBuf.
+# Default: false
+force_perf_event_array = false

@@ -112,6 +112,14 @@ ghostscope --layout horizontal  # 面板横向排列（默认）
 ghostscope --layout vertical    # 面板纵向排列
 ```
 
+### 高级 eBPF 选项
+
+```bash
+# 强制使用 PerfEventArray 模式（仅用于测试）
+# 警告：仅用于测试目的。即使在内核 >= 5.8 上也强制使用 PerfEventArray
+ghostscope --force-perf-event-array
+```
+
 ### 完整命令参考
 
 | 选项 | 简写 | 说明 | 默认值 |
@@ -136,6 +144,7 @@ ghostscope --layout vertical    # 面板纵向排列
 | `--no-save-ast` | | 不保存 AST | - |
 | `--layout <MODE>` | | TUI 布局模式 | horizontal |
 | `--config <PATH>` | | 自定义配置文件 | 自动检测 |
+| `--force-perf-event-array` | | 强制 PerfEventArray（测试） | 关 |
 | `--args <PROGRAM> [ARGS...]` | | 启动程序并传递参数 | 无 |
 
 ## 配置文件
@@ -218,6 +227,17 @@ ringbuf_size = 262144  # 256KB（默认）
 #   - 中频跟踪：262144 (256KB)
 #   - 高频跟踪：524288 (512KB) 或 1048576 (1MB)
 
+# PerfEventArray 每 CPU 页面数（用于旧内核 < 5.8）
+# 每个 CPU 为 PerfEventArray 缓冲区分配的内存页数
+# 每页通常为 4KB，所以 64 页 = 每 CPU 256KB
+# 必须是 2 的幂。有效范围：8 到 1024 页
+perf_page_count = 64  # 默认（每 CPU 256KB）
+
+# 推荐值：
+#   - 低频跟踪：32 页（每 CPU ~128KB）
+#   - 中频跟踪：64 页（每 CPU ~256KB）
+#   - 高频跟踪：128-256 页（每 CPU 512KB-1MB）
+
 # ASLR 地址转换的 (pid, module) 偏移条目最大数量
 # 存储每个进程中每个加载模块的运行时地址偏移
 # 有效范围：64 到 65536
@@ -227,6 +247,12 @@ proc_module_offsets_max_entries = 4096  # 默认
 #   - 单进程：1024
 #   - 多进程：4096
 #   - 系统级跟踪：8192 或 16384
+
+# 强制使用 PerfEventArray 而非 RingBuf（仅用于测试）
+# 警告：这仅用于测试目的。设为 true 会强制使用 PerfEventArray
+# 即使在支持 RingBuf 的内核上（>= 5.8）。PerfEventArray 相比 RingBuf
+# 有性能开销，仅应用于兼容性测试。
+force_perf_event_array = false  # 默认（根据内核版本自动检测）
 ```
 
 ### 配置示例

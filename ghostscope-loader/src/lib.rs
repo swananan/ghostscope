@@ -1,5 +1,5 @@
 use aya::{
-    maps::{HashMap as AyaHashMap, MapData, RingBuf},
+    maps::{perf::PerfEventArray, HashMap as AyaHashMap, MapData, RingBuf},
     programs::{
         uprobe::{UProbeAttachLocation, UProbeLinkId},
         ProgramError, UProbe,
@@ -10,7 +10,21 @@ use ghostscope_protocol::{ParsedTraceEvent, StreamingTraceParser, TraceContext};
 use std::convert::TryInto;
 use std::os::unix::io::AsRawFd;
 use tokio::io::unix::AsyncFd;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
+
+// Export kernel capabilities detection
+mod kernel_caps;
+pub use kernel_caps::KernelCapabilities;
+
+/// Event output map type wrapper
+enum EventMap {
+    RingBuf(RingBuf<MapData>),
+    PerfEventArray {
+        _map: PerfEventArray<MapData>,
+        buffers: Vec<aya::maps::perf::PerfEventArrayBuffer<MapData>>,
+        cpu_ids: Vec<u32>,
+    },
+}
 
 pub fn hello() -> String {
     format!("Loader: {}", ghostscope_compiler::hello())
@@ -35,7 +49,7 @@ pub type Result<T> = std::result::Result<T, LoaderError>;
 
 pub struct GhostScopeLoader {
     bpf: Ebpf,
-    ringbuf: Option<RingBuf<aya::maps::MapData>>,
+    event_map: Option<EventMap>,
     uprobe_link: Option<UProbeLinkId>,
     // Store attachment parameters for re-enabling
     attachment_params: Option<UprobeAttachmentParams>,
@@ -58,7 +72,7 @@ impl std::fmt::Debug for GhostScopeLoader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GhostScopeLoader")
             .field("bpf", &"<eBPF object>")
-            .field("ringbuf", &self.ringbuf.is_some())
+            .field("event_map", &self.event_map.is_some())
             .field("uprobe_attached", &self.uprobe_link.is_some())
             .field("attachment_params", &self.attachment_params.is_some())
             .finish()
@@ -82,7 +96,7 @@ impl GhostScopeLoader {
                 info!("Successfully loaded eBPF program");
                 Ok(Self {
                     bpf,
-                    ringbuf: None,
+                    event_map: None,
                     uprobe_link: None,
                     attachment_params: None,
                     parser: StreamingTraceParser::new(),
@@ -329,17 +343,79 @@ impl GhostScopeLoader {
             }
         }
 
-        // Initialize ringbuf after successful attachment
-        // Use the same map name as generated in our codegen (ringbuf)
-        let ringbuf: RingBuf<_> = self
-            .bpf
-            .take_map("ringbuf")
-            .ok_or_else(|| LoaderError::MapNotFound("ringbuf".to_string()))?
-            .try_into()
-            .map_err(|e| LoaderError::Generic(format!("Failed to convert ringbuf map: {e}")))?;
+        // Initialize event map after successful attachment
+        // Try RingBuf first, fall back to PerfEventArray
+        let event_map = if let Some(map) = self.bpf.take_map("ringbuf") {
+            info!("Initializing RingBuf event map");
+            let ringbuf: RingBuf<_> = map
+                .try_into()
+                .map_err(|e| LoaderError::Generic(format!("Failed to convert ringbuf map: {e}")))?;
+            EventMap::RingBuf(ringbuf)
+        } else if let Some(map) = self.bpf.take_map("events") {
+            info!("Initializing PerfEventArray event map");
+            let mut perf_array: PerfEventArray<_> = map.try_into().map_err(|e| {
+                LoaderError::Generic(format!("Failed to convert perf event array map: {e}"))
+            })?;
 
-        self.ringbuf = Some(ringbuf);
-        info!("Ringbuf map initialized");
+            // Get online CPUs
+            let online_cpus = aya::util::online_cpus().map_err(|(_, e)| {
+                LoaderError::Generic(format!("Failed to get online CPUs: {e}"))
+            })?;
+
+            info!(
+                "Opening PerfEventArray buffers for {} online CPUs",
+                online_cpus.len()
+            );
+
+            // Open buffers for all online CPUs
+            let mut buffers = Vec::new();
+            let mut cpu_ids = Vec::new();
+
+            for cpu_id in online_cpus {
+                match perf_array.open(cpu_id, None) {
+                    Ok(buffer) => {
+                        info!("Opened PerfEventArray buffer for CPU {}", cpu_id);
+                        buffers.push(buffer);
+                        cpu_ids.push(cpu_id);
+                    }
+                    Err(e) => {
+                        warn!("Failed to open perf buffer for CPU {}: {}", cpu_id, e);
+                    }
+                }
+            }
+
+            if buffers.is_empty() {
+                return Err(LoaderError::Generic(
+                    "Failed to open any perf event buffers".to_string(),
+                ));
+            }
+
+            EventMap::PerfEventArray {
+                _map: perf_array,
+                buffers,
+                cpu_ids,
+            }
+        } else {
+            return Err(LoaderError::MapNotFound(
+                "Neither 'ringbuf' nor 'events' map found".to_string(),
+            ));
+        };
+
+        // Set parser event source based on map type
+        let event_source = match &event_map {
+            EventMap::RingBuf(_) => {
+                info!("Using RingBuf mode for parser");
+                ghostscope_protocol::EventSource::RingBuf
+            }
+            EventMap::PerfEventArray { .. } => {
+                info!("Using PerfEventArray mode for parser");
+                ghostscope_protocol::EventSource::PerfEventArray
+            }
+        };
+        self.parser = StreamingTraceParser::with_event_source(event_source);
+
+        self.event_map = Some(event_map);
+        info!("Event map initialized");
 
         Ok(())
     }
@@ -475,9 +551,9 @@ impl GhostScopeLoader {
         // Clear attachment parameters
         self.attachment_params = None;
 
-        // Clear ringbuf reference (this doesn't destroy the actual eBPF map,
+        // Clear event map reference (this doesn't destroy the actual eBPF map,
         // but removes our handle to it)
-        self.ringbuf = None;
+        self.event_map = None;
 
         // Note: The eBPF programs and maps will be automatically cleaned up
         // when the `bpf` field is dropped (when this struct is dropped)
@@ -522,10 +598,113 @@ impl GhostScopeLoader {
 
     /// Wait for events asynchronously using AsyncFd
     pub async fn wait_for_events_async(&mut self) -> Result<Vec<ParsedTraceEvent>> {
-        let ringbuf = self.ringbuf.as_mut().ok_or_else(|| {
-            LoaderError::Generic("Ringbuf not initialized. Call attach_uprobe first.".to_string())
+        let trace_context = self.trace_context.as_ref().ok_or_else(|| {
+            LoaderError::Generic(
+                "No trace context available - cannot parse trace events".to_string(),
+            )
         })?;
 
+        let event_map = self.event_map.as_mut().ok_or_else(|| {
+            LoaderError::Generic("Event map not initialized. Call attach_uprobe first.".to_string())
+        })?;
+
+        let mut events = Vec::new();
+
+        match event_map {
+            EventMap::RingBuf(ringbuf) => {
+                // Create AsyncFd and wait for readable
+                let async_fd = AsyncFd::new(ringbuf.as_raw_fd())
+                    .map_err(|e| LoaderError::Generic(format!("Failed to create AsyncFd: {e}")))?;
+                let _guard = async_fd
+                    .readable()
+                    .await
+                    .map_err(|e| LoaderError::Generic(format!("AsyncFd error: {e}")))?;
+
+                // Read all available events
+                while let Some(item) = ringbuf.next() {
+                    match self.parser.process_segment(&item, trace_context) {
+                        Ok(Some(parsed_event)) => events.push(parsed_event),
+                        Ok(None) => {}
+                        Err(e) => {
+                            return Err(LoaderError::Generic(format!(
+                                "Fatal: Failed to parse trace event from RingBuf (async): {e}"
+                            )));
+                        }
+                    }
+                }
+            }
+            EventMap::PerfEventArray {
+                buffers, cpu_ids, ..
+            } => {
+                use bytes::BytesMut;
+
+                // Poll all CPU buffers (non-blocking check)
+                for (idx, buffer) in buffers.iter_mut().enumerate() {
+                    // Check if buffer has events
+                    if !buffer.readable() {
+                        continue;
+                    }
+
+                    // Read events from this CPU's buffer
+                    let mut read_bufs = vec![BytesMut::with_capacity(4096)];
+                    match buffer.read_events(&mut read_bufs) {
+                        Ok(result) => {
+                            if result.read > 0 {
+                                info!(
+                                    "Read {} events from CPU {} buffer",
+                                    result.read, cpu_ids[idx]
+                                );
+                            }
+                            if result.lost > 0 {
+                                warn!(
+                                    "Lost {} events from CPU {} buffer",
+                                    result.lost, cpu_ids[idx]
+                                );
+                            }
+
+                            // Parse and collect each event
+                            for (i, data) in read_bufs.iter().enumerate().take(result.read) {
+                                debug!(
+                                    "PerfEvent {}: {} bytes - {:02x?}",
+                                    i,
+                                    data.len(),
+                                    &data[..data.len().min(32)]
+                                );
+
+                                match self.parser.process_segment(data, trace_context) {
+                                    Ok(Some(parsed_event)) => events.push(parsed_event),
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        return Err(LoaderError::Generic(
+                                            format!("Fatal: Failed to parse trace event from PerfEventArray CPU {}: {e}",
+                                                cpu_ids[idx])
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to read from CPU {} buffer: {}", cpu_ids[idx], e);
+                        }
+                    }
+                }
+
+                // If no events were collected, yield to avoid busy waiting
+                if events.is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+
+        Ok(events)
+    }
+
+    /// Read events from RingBuf (deprecated, kept for reference)
+    #[allow(dead_code)]
+    async fn read_ringbuf_events(
+        &mut self,
+        ringbuf: &mut RingBuf<MapData>,
+    ) -> Result<Vec<ParsedTraceEvent>> {
         // Create AsyncFd from the ringbuf's file descriptor
         let async_fd = AsyncFd::new(ringbuf.as_raw_fd())
             .map_err(|e| LoaderError::Generic(format!("Failed to create AsyncFd: {e}")))?;
@@ -552,13 +731,15 @@ impl GhostScopeLoader {
                         // Segment processed but no complete event yet
                     }
                     Err(e) => {
-                        warn!("Failed to parse trace event segment: {}", e);
+                        return Err(LoaderError::Generic(format!(
+                            "Fatal: Failed to parse trace event from RingBuf (blocking): {e}"
+                        )));
                     }
                 }
             }
         } else {
             return Err(LoaderError::Generic(
-                "No string table available - cannot parse trace events".to_string(),
+                "No trace context available - cannot parse trace events".to_string(),
             ));
         }
 
