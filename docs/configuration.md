@@ -206,6 +206,27 @@ enabled = true
 
 # Maximum history entries
 max_entries = 5000
+
+[ebpf]
+# RingBuf map size in bytes (must be power of 2)
+# Controls the size of the ring buffer for transferring trace events from kernel to userspace
+# Valid range: 4096 (4KB) to 16777216 (16MB)
+ringbuf_size = 262144  # 256KB (default)
+
+# Recommended values:
+#   - Low-frequency tracing: 131072 (128KB)
+#   - Medium-frequency tracing: 262144 (256KB)
+#   - High-frequency tracing: 524288 (512KB) or 1048576 (1MB)
+
+# Maximum number of (pid, module) offset entries for ASLR translation
+# Stores runtime address offsets for each loaded module in each process
+# Valid range: 64 to 65536
+proc_module_offsets_max_entries = 4096  # Default
+
+# Recommended values:
+#   - Single process: 1024
+#   - Multi-process: 4096
+#   - System-wide tracing: 8192 or 16384
 ```
 
 ### Configuration Examples
@@ -259,6 +280,40 @@ panel_ratios = [5, 2, 3]  # Larger source panel
 [ui.history]
 enabled = true
 max_entries = 10000
+```
+
+#### High-Frequency Tracing Configuration
+
+```toml
+# Optimized for high-frequency event tracing
+[ebpf]
+ringbuf_size = 1048576  # 1MB buffer for high event rates
+proc_module_offsets_max_entries = 8192  # Support many modules
+
+[general]
+log_level = "info"  # Reduce logging overhead
+enable_console_logging = false
+```
+
+#### Low-Overhead Configuration
+
+```toml
+# Minimal resource usage for production
+[ebpf]
+ringbuf_size = 131072  # 128KB minimal buffer
+proc_module_offsets_max_entries = 1024  # Single process only
+
+[general]
+log_level = "error"
+enable_logging = false
+
+[files]
+[files.save_llvm_ir]
+debug = false
+release = false
+[files.save_ebpf]
+debug = false
+release = false
 ```
 
 ## Environment Variables
@@ -337,6 +392,9 @@ GhostScope validates configuration at startup:
 4. **Panel Ratios**: Ensures all 3 values are positive (non-zero) integers
 5. **Log Level**: Validates against allowed values (error, warn, info, debug, trace)
 6. **Layout Mode**: Validates against allowed values (Horizontal, Vertical - capitalized)
+7. **eBPF Configuration**:
+   - **ringbuf_size**: Must be power of 2, range 4096-16777216 bytes
+   - **proc_module_offsets_max_entries**: Must be in range 64-65536
 
 Invalid configuration will produce clear error messages with suggestions for fixes.
 
@@ -346,6 +404,9 @@ Invalid configuration will produce clear error messages with suggestions for fix
 - **"Target file does not exist"**: Specified target path not found. Check the file path.
 - **"Script file does not exist"**: Specified script file not found.
 - **"Invalid log level"**: Use one of: error, warn, info, debug, trace.
+- **"ringbuf_size must be a power of 2"**: Use values like 131072, 262144, 524288, etc.
+- **"ringbuf_size X is out of reasonable range"**: Must be between 4KB and 16MB.
+- **"proc_module_offsets_max_entries X is out of reasonable range"**: Must be between 64 and 65536.
 
 ## Best Practices
 
@@ -354,3 +415,8 @@ Invalid configuration will produce clear error messages with suggestions for fix
 3. **Log Rotation**: Configure external log rotation for long-running sessions
 4. **Debug Output**: Disable debug file saving in production for performance
 5. **Panel Layout**: Use horizontal layout for wide screens, vertical for narrow displays
+6. **eBPF Tuning**:
+   - Start with default `ringbuf_size` (256KB) and increase if events are dropped
+   - Monitor kernel memory usage when using large ringbuf sizes
+   - Use smaller `proc_module_offsets_max_entries` for single-process debugging
+   - Increase buffer size for high-frequency tracing scenarios

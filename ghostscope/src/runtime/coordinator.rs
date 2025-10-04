@@ -12,6 +12,9 @@ pub async fn run_tui_coordinator_with_config(config: MergedConfig) -> Result<()>
     // Pass the UI configuration to the TUI system
     let ui_config = config.get_ui_config();
 
+    // Clone config for session creation before converting to ParsedArgs
+    let config_for_session = config.clone();
+
     // Convert MergedConfig back to ParsedArgs for existing code compatibility
     // TODO: Refactor to use MergedConfig directly throughout the TUI system
     let parsed_args = ParsedArgs {
@@ -36,10 +39,11 @@ pub async fn run_tui_coordinator_with_config(config: MergedConfig) -> Result<()>
         has_explicit_console_log_flag: false, // Not relevant for TUI conversion
     };
 
-    run_tui_coordinator_with_ui_config(parsed_args, ui_config).await
+    run_tui_coordinator_with_ui_config_and_merged_config(parsed_args, ui_config, config_for_session)
+        .await
 }
 
-/// Run GhostScope in TUI mode with tokio task coordination
+/// Run GhostScope in TUI mode with tokio task coordination (without merged config)
 #[allow(dead_code)]
 pub async fn run_tui_coordinator(parsed_args: ParsedArgs) -> Result<()> {
     // Use default UI configuration when no merged config is available
@@ -53,13 +57,21 @@ pub async fn run_tui_coordinator(parsed_args: ParsedArgs) -> Result<()> {
         history: ghostscope_ui::HistoryConfig::default(),
     };
 
-    run_tui_coordinator_with_ui_config(parsed_args, ui_config).await
+    // Create a default MergedConfig from ParsedArgs for compatibility
+    let default_config = MergedConfig::new(
+        parsed_args.clone(),
+        crate::config::settings::Config::default(),
+    );
+
+    run_tui_coordinator_with_ui_config_and_merged_config(parsed_args, ui_config, default_config)
+        .await
 }
 
 /// Internal function to run TUI coordinator with UI configuration
-async fn run_tui_coordinator_with_ui_config(
+async fn run_tui_coordinator_with_ui_config_and_merged_config(
     parsed_args: ParsedArgs,
     ui_config: ghostscope_ui::UiConfig,
+    merged_config: MergedConfig,
 ) -> Result<()> {
     info!("Starting GhostScope in TUI mode");
 
@@ -70,17 +82,24 @@ async fn run_tui_coordinator_with_ui_config(
     let dwarf_task = {
         let parsed_args_clone = parsed_args.clone();
         let status_sender = runtime_channels.create_status_sender();
+        let config_clone = merged_config.clone();
         tokio::spawn(async move {
-            dwarf_loader::initialize_dwarf_processing(parsed_args_clone, status_sender).await
+            let mut session =
+                dwarf_loader::initialize_dwarf_processing(parsed_args_clone, status_sender).await?;
+            // Inject MergedConfig into session for eBPF map configuration
+            session.config = Some(config_clone);
+            Ok::<_, anyhow::Error>(session)
         })
     };
 
-    // Create save options from command line arguments
-    let save_options = ghostscope_compiler::SaveOptions {
+    // Create compile options from command line arguments
+    let compile_options = ghostscope_compiler::CompileOptions {
         save_llvm_ir: parsed_args.should_save_llvm_ir,
         save_ast: parsed_args.should_save_ast,
         save_ebpf: parsed_args.should_save_ebpf,
         binary_path_hint: None, // Will be set later when we know the binary
+        ringbuf_size: 262144,   // Default, will be overridden by config
+        proc_module_offsets_max_entries: 4096, // Default, will be overridden by config
     };
 
     // Start the runtime coordination task with session from DWARF processing
@@ -88,15 +107,15 @@ async fn run_tui_coordinator_with_ui_config(
         // Wait for DWARF processing to complete and get the session
         match dwarf_task.await {
             Ok(Ok(session)) => {
-                run_runtime_coordinator(runtime_channels, Some(session), save_options).await
+                run_runtime_coordinator(runtime_channels, Some(session), compile_options).await
             }
             Ok(Err(e)) => {
                 error!("DWARF processing failed: {}", e);
-                run_runtime_coordinator(runtime_channels, None, save_options).await
+                run_runtime_coordinator(runtime_channels, None, compile_options).await
             }
             Err(e) => {
                 error!("DWARF task panicked: {}", e);
-                run_runtime_coordinator(runtime_channels, None, save_options).await
+                run_runtime_coordinator(runtime_channels, None, compile_options).await
             }
         }
     });
@@ -116,7 +135,7 @@ async fn run_tui_coordinator_with_ui_config(
 async fn run_runtime_coordinator(
     mut runtime_channels: RuntimeChannels,
     mut session: Option<GhostSession>,
-    save_options: ghostscope_compiler::SaveOptions,
+    compile_options: ghostscope_compiler::CompileOptions,
 ) -> Result<()> {
     info!("Runtime coordinator started");
 
@@ -146,7 +165,7 @@ async fn run_runtime_coordinator(
             Some(command) = runtime_channels.command_receiver.recv() => {
                 match command {
                     RuntimeCommand::ExecuteScript { command: script } => {
-                        handle_execute_script(&mut session, &mut runtime_channels, script, &save_options).await;
+                        handle_execute_script(&mut session, &mut runtime_channels, script, &compile_options).await;
                     }
                     RuntimeCommand::InfoTrace { trace_id } => {
                         match trace_id {
@@ -229,12 +248,14 @@ async fn handle_execute_script(
     session: &mut Option<GhostSession>,
     runtime_channels: &mut RuntimeChannels,
     script: String,
-    save_options: &ghostscope_compiler::SaveOptions,
+    compile_options: &ghostscope_compiler::CompileOptions,
 ) {
     info!("Executing script: {}", script);
 
     if let Some(ref mut session) = session {
-        match crate::script::compile_and_load_script_for_tui(&script, session, save_options).await {
+        match crate::script::compile_and_load_script_for_tui(&script, session, compile_options)
+            .await
+        {
             Ok(details) => {
                 info!(
                     "✓ Script compilation completed: {} total, {} success, {} failed",
@@ -354,11 +375,12 @@ async fn handle_load_traces(
         let script_command = format!("trace {} {{\n{}\n}}", trace.target, trace.script);
 
         // Execute the script (this sends the command but doesn't wait for result)
+        let default_compile_options = ghostscope_compiler::CompileOptions::default();
         handle_execute_script(
             session,
             runtime_channels,
             script_command,
-            &ghostscope_compiler::SaveOptions::default(),
+            &default_compile_options,
         )
         .await;
 
