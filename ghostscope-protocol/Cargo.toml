@@ -11,3 +11,4 @@ chrono = { workspace = true }
 aya-ebpf-bindings = { workspace = true }
 gimli = { workspace = true }
 ghostscope-platform = { path = "../ghostscope-platform" }
+zerocopy = { version = "0.8", features = ["derive"] }

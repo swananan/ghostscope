@@ -1,15 +1,16 @@
 use crate::TypeKind;
 use serde::{Deserialize, Serialize};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 /// Each trace event contains multiple instructions followed by EndInstruction
 #[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 pub struct TraceEventHeader {
     pub magic: u32,
 }
 
 #[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 pub struct TraceEventMessage {
     pub trace_id: u64,
     pub timestamp: u64,
@@ -35,7 +36,7 @@ pub enum InstructionType {
 
 /// Common instruction header
 #[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, KnownLayout, Immutable, Unaligned)]
 pub struct InstructionHeader {
     pub inst_type: u8,    // InstructionType
     pub data_length: u16, // Length of instruction data following this header
@@ -58,14 +59,14 @@ pub enum VariableStatus {
 
 /// Print string instruction data (most optimized)
 #[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, KnownLayout, Immutable, Unaligned)]
 pub struct PrintStringIndexData {
     pub string_index: u16, // Index into string table
 }
 
 /// Print variable instruction data (optimized with name index)
 #[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, KnownLayout, Immutable, Unaligned)]
 pub struct PrintVariableIndexData {
     pub var_name_index: u16, // Index into variable name table
     pub type_encoding: u8,   // TypeKind
@@ -77,7 +78,7 @@ pub struct PrintVariableIndexData {
 
 /// Print complex variable instruction data (enhanced with full type info)
 #[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, KnownLayout, Immutable, Unaligned)]
 pub struct PrintComplexVariableData {
     pub var_name_index: u16, // Index into variable name table
     pub type_index: u16,     // Index into type table for complete type information
@@ -89,7 +90,7 @@ pub struct PrintComplexVariableData {
 
 /// Format print instruction data
 #[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, KnownLayout, Immutable, Unaligned)]
 pub struct PrintFormatData {
     pub format_string_index: u16, // Index into string table for format string
     pub arg_count: u8,            // Number of arguments
@@ -101,7 +102,7 @@ pub struct PrintFormatData {
 
 /// Complex format print instruction data (with full type info)
 #[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, KnownLayout, Immutable, Unaligned)]
 pub struct PrintComplexFormatData {
     pub format_string_index: u16, // Index into string table for format string
     pub arg_count: u8,            // Number of arguments
@@ -116,7 +117,7 @@ pub struct PrintComplexFormatData {
 
 /// Backtrace instruction data
 #[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, KnownLayout, Immutable, Unaligned)]
 pub struct BacktraceData {
     pub depth: u8, // Maximum backtrace depth to capture
     pub flags: u8, // Backtrace options (0 = default)
@@ -126,7 +127,7 @@ pub struct BacktraceData {
 
 /// End instruction data - marks the end of instruction sequence
 #[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, KnownLayout, Immutable, Unaligned)]
 pub struct EndInstructionData {
     pub total_instructions: u16, // Total number of instructions before this EndInstruction
     pub execution_status: u8,    // 0=success, 1=partial_failure, 2=complete_failure
