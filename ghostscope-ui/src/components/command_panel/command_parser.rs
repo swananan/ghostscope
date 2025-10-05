@@ -60,6 +60,11 @@ impl CommandParser {
             return actions;
         }
 
+        // Handle srcpath command
+        if let Some(actions) = Self::parse_srcpath_command(state, cmd) {
+            return actions;
+        }
+
         // Handle quit/exit commands
         if cmd == "quit" || cmd == "exit" {
             return vec![Action::Quit];
@@ -86,16 +91,59 @@ impl CommandParser {
     fn handle_builtin_command(command: &str) -> Option<String> {
         match command {
             "help" => Some(Self::format_help_message()),
+            "help srcpath" => Some(Self::format_srcpath_help()),
             _ => None,
         }
+    }
+
+    /// Format detailed srcpath help message
+    fn format_srcpath_help() -> String {
+        [
+            "📘 Source Path Command - Detailed Help",
+            "",
+            "The 'srcpath' command helps resolve source files when DWARF debug info contains",
+            "compilation-time paths that differ from runtime paths (e.g., compiled on CI server).",
+            "",
+            "Commands:",
+            "  srcpath                      - Show current path mappings and search directories",
+            "  srcpath map <from> <to>      - Map DWARF compilation directory to local path (⭐ Recommended)",
+            "  srcpath add <dir>            - Add search directory (fallback, non-recursive)",
+            "  srcpath remove <path>        - Remove a mapping or search directory",
+            "  srcpath clear                - Clear all runtime rules (keep config file rules)",
+            "  srcpath reset                - Reset to config file rules only",
+            "",
+            "Resolution Strategy:",
+            "  1. Try exact path from DWARF",
+            "  2. Apply path substitutions (runtime rules first, then config file)",
+            "  3. Search by filename in additional directories (root only, non-recursive)",
+            "",
+            "⭐ Recommended Usage:",
+            "  Use 'srcpath map' to map DWARF compilation directory:",
+            "    srcpath map /home/build/nginx-1.27.1 /home/user/nginx-1.27.1",
+            "  This maps ALL relative paths automatically.",
+            "",
+            "Examples:",
+            "  srcpath map /build/project /home/user/project    # Map compilation directory",
+            "  srcpath add /usr/local/include                    # Add search directory (fallback)",
+            "  srcpath remove /build/project                     # Remove a rule",
+            "",
+            "Configuration:",
+            "  Rules can be persisted in config.toml under [source] section.",
+            "  Runtime rules (via commands) take priority over config file rules.",
+            "",
+            "💡 Tip: Check file loading errors for 'DWARF Directory', then map it directly.",
+            "   Type 'help srcpath' for more details.",
+        ]
+        .join("\n")
     }
 
     /// Format comprehensive help message
     fn format_help_message() -> String {
         format!(
-            "📘 Ghostscope Commands:\n\n{}\n\n{}\n\n{}\n\n{}\n\n{}",
+            "📘 Ghostscope Commands:\n\n{}\n\n{}\n\n{}\n\n{}\n\n{}\n\n{}",
             Self::format_tracing_commands(),
             Self::format_info_commands(),
+            Self::format_srcpath_commands(),
             Self::format_control_commands(),
             Self::format_navigation_commands(),
             Self::format_general_commands()
@@ -133,6 +181,22 @@ impl CommandParser {
             "  info function <name> - Show debug info for function (i f <name>)",
             "  info line <file:line>- Show debug info for source line (i l <file:line>)",
             "  info address <addr>  - Show debug info for address (i a <addr>) [TODO]",
+        ]
+        .join("\n")
+    }
+
+    /// Format source path command section
+    fn format_srcpath_commands() -> String {
+        [
+            "🗂️  Source Path Commands:",
+            "  srcpath                      - Show current path mappings and search directories",
+            "  srcpath map <from> <to>      - Map DWARF compilation directory (⭐ Recommended)",
+            "  srcpath add <dir>            - Add search directory (fallback, non-recursive)",
+            "  srcpath remove <path>        - Remove a mapping or search directory",
+            "  srcpath clear                - Clear all runtime rules",
+            "  srcpath reset                - Reset to config file rules",
+            "",
+            "  💡 Tip: Use 'help srcpath' for detailed usage and best practices",
         ]
         .join("\n")
     }
@@ -197,6 +261,7 @@ impl CommandParser {
             "clear",
             "quit",
             "exit",
+            "srcpath",
             // Abbreviations
             "t",
             "en",
@@ -218,6 +283,13 @@ impl CommandParser {
             "info function",
             "info line",
             "info address",
+            // Source path subcommands
+            "srcpath",
+            "srcpath add",
+            "srcpath map",
+            "srcpath remove",
+            "srcpath clear",
+            "srcpath reset",
             // Shortcut commands
             "i",
             "i s",
@@ -677,6 +749,95 @@ impl CommandParser {
             }
             Err(e) => Some(vec![Action::AddResponse {
                 content: format!("Failed to load {filename}: {e}"),
+                response_type: ResponseType::Error,
+            }]),
+        }
+    }
+
+    /// Parse srcpath command for source path configuration
+    fn parse_srcpath_command(state: &mut CommandPanelState, command: &str) -> Option<Vec<Action>> {
+        if !command.starts_with("srcpath") {
+            return None;
+        }
+
+        let parts: Vec<&str> = command.split_whitespace().collect();
+
+        if parts.len() == 1 {
+            // srcpath - show current configuration
+            state.input_state = InputState::WaitingResponse {
+                command: command.to_string(),
+                sent_time: Instant::now(),
+                command_type: CommandType::SrcPath,
+            };
+            return Some(vec![Action::SendRuntimeCommand(
+                RuntimeCommand::SrcPathList,
+            )]);
+        }
+
+        match parts.get(1) {
+            Some(&"add") if parts.len() == 3 => {
+                // srcpath add /path
+                let dir = parts[2].to_string();
+                state.input_state = InputState::WaitingResponse {
+                    command: command.to_string(),
+                    sent_time: Instant::now(),
+                    command_type: CommandType::SrcPathAdd,
+                };
+                Some(vec![Action::SendRuntimeCommand(
+                    RuntimeCommand::SrcPathAddDir { dir },
+                )])
+            }
+            Some(&"map") if parts.len() == 4 => {
+                // srcpath map /old /new
+                let from = parts[2].to_string();
+                let to = parts[3].to_string();
+                state.input_state = InputState::WaitingResponse {
+                    command: command.to_string(),
+                    sent_time: Instant::now(),
+                    command_type: CommandType::SrcPathMap,
+                };
+                Some(vec![Action::SendRuntimeCommand(
+                    RuntimeCommand::SrcPathAddMap { from, to },
+                )])
+            }
+            Some(&"remove") if parts.len() == 3 => {
+                // srcpath remove /path
+                let pattern = parts[2].to_string();
+                state.input_state = InputState::WaitingResponse {
+                    command: command.to_string(),
+                    sent_time: Instant::now(),
+                    command_type: CommandType::SrcPathRemove,
+                };
+                Some(vec![Action::SendRuntimeCommand(
+                    RuntimeCommand::SrcPathRemove { pattern },
+                )])
+            }
+            Some(&"clear") if parts.len() == 2 => {
+                // srcpath clear
+                state.input_state = InputState::WaitingResponse {
+                    command: command.to_string(),
+                    sent_time: Instant::now(),
+                    command_type: CommandType::SrcPathClear,
+                };
+                Some(vec![Action::SendRuntimeCommand(
+                    RuntimeCommand::SrcPathClear,
+                )])
+            }
+            Some(&"reset") if parts.len() == 2 => {
+                // srcpath reset
+                state.input_state = InputState::WaitingResponse {
+                    command: command.to_string(),
+                    sent_time: Instant::now(),
+                    command_type: CommandType::SrcPathReset,
+                };
+                Some(vec![Action::SendRuntimeCommand(
+                    RuntimeCommand::SrcPathReset,
+                )])
+            }
+            _ => Some(vec![Action::AddResponse {
+                content:
+                    "Usage: srcpath [add <dir> | map <from> <to> | remove <path> | clear | reset]"
+                        .to_string(),
                 response_type: ResponseType::Error,
             }]),
         }

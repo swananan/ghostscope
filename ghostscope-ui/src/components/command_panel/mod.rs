@@ -10,6 +10,7 @@ pub mod syntax_highlighter;
 pub mod trace_persistence;
 
 pub use command_parser::CommandParser;
+pub use file_completion::FileCompletionCache;
 pub use history_manager::{AutoSuggestionState, CommandHistory, HistorySearchState};
 pub use input_handler::InputHandler;
 pub use optimized_input::OptimizedInputHandler;

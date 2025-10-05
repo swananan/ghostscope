@@ -31,9 +31,10 @@ pub struct SourcePanelState {
     pub is_searching: bool,
 
     // File search state
+    // Note: File list is stored in command_panel.file_completion_cache (single source of truth)
+    // This panel only maintains filtering/selection state
     pub file_search_query: String,
     pub file_search_cursor_pos: usize, // Cursor position in the search query
-    pub file_search_results: Vec<String>,
     pub file_search_filtered_indices: Vec<usize>,
     pub file_search_selected: usize,
     pub file_search_scroll: usize,
@@ -82,7 +83,6 @@ impl SourcePanelState {
             is_searching: false,
             file_search_query: String::new(),
             file_search_cursor_pos: 0,
-            file_search_results: Vec::new(),
             file_search_filtered_indices: Vec::new(),
             file_search_selected: 0,
             file_search_scroll: 0,
@@ -419,6 +419,12 @@ pub enum CommandType {
     InfoShare,
     SaveTraces,
     LoadTraces,
+    SrcPath,
+    SrcPathAdd,
+    SrcPathMap,
+    SrcPathRemove,
+    SrcPathClear,
+    SrcPathReset,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

@@ -90,21 +90,44 @@ Search for text within the current file.
 
 ### Mode: File Search
 
-Search and switch between source files.
+Search and quickly switch between source files. File list comes from all source files in DWARF debug information.
+
+#### Search & Filtering
 
 | Shortcut | Function |
 |----------|----------|
-| `[char]` | Type to filter file list |
+| `[char]` | Type to filter file list (real-time filtering) |
 | `Backspace` | Delete character from search query |
-| `Tab` or `Ctrl+N` | Select next file in results |
-| `Shift+Tab` or `Ctrl+P` | Select previous file in results |
+| `Ctrl+U` | Clear entire search query |
+| `Ctrl+W` | Delete previous word |
+
+**Notes**:
+- **Substring matching**: Type any part to match (e.g., `nginx` matches `/path/to/nginx.c`)
+- **Path search**: Search in paths (e.g., `core/nginx` matches `src/core/nginx.c`)
+- **Real-time filtering**: File list updates as you type
+- Shows up to 10 matching results
+
+#### Navigation & Selection
+
+| Shortcut | Function |
+|----------|----------|
+| `↓` or `Ctrl+N` | Select next file |
+| `↑` or `Ctrl+P` | Select previous file |
 | `Enter` | Open selected file |
 | `Esc` or `Ctrl+C` | Cancel and return to Normal mode |
+
+#### Cursor Control
+
+| Shortcut | Function |
+|----------|----------|
 | `Ctrl+A` | Move cursor to beginning of search input |
 | `Ctrl+E` | Move cursor to end of search input |
-| `Ctrl+B` or `←` | Move cursor left |
-| `Ctrl+F` or `→` | Move cursor right |
-| `Ctrl+W` | Delete previous word |
+| `Ctrl+B` or `←` | Move cursor left one character |
+| `Ctrl+F` or `→` | Move cursor right one character |
+
+**Tips**:
+- File list shares cache with command panel's file completion, automatically updates when `srcpath` mappings change
+- If file paths cannot be found, use `srcpath map` command to configure path mappings (see [input-commands.md](input-commands.md#srcpath))
 
 ---
 

@@ -1,4 +1,5 @@
 use crate::action::Action;
+use crate::components::command_panel::FileCompletionCache;
 use crate::model::panel_state::{SourcePanelMode, SourcePanelState};
 
 /// Handles source panel search functionality
@@ -109,7 +110,6 @@ impl SourceSearch {
         state.mode = SourcePanelMode::FileSearch;
         state.file_search_query.clear();
         state.file_search_cursor_pos = 0;
-        state.file_search_results.clear();
         state.file_search_filtered_indices.clear();
         state.file_search_selected = 0;
         state.file_search_scroll = 0;
@@ -122,7 +122,6 @@ impl SourceSearch {
         state.mode = SourcePanelMode::Normal;
         state.file_search_query.clear();
         state.file_search_cursor_pos = 0;
-        state.file_search_results.clear();
         state.file_search_filtered_indices.clear();
         state.file_search_selected = 0;
         state.file_search_scroll = 0;
@@ -131,41 +130,54 @@ impl SourceSearch {
     }
 
     /// Add character to file search query
-    pub fn push_file_search_char(state: &mut SourcePanelState, ch: char) -> Vec<Action> {
+    pub fn push_file_search_char(
+        state: &mut SourcePanelState,
+        cache: &FileCompletionCache,
+        ch: char,
+    ) -> Vec<Action> {
         if state.mode == SourcePanelMode::FileSearch {
             let mut chars: Vec<char> = state.file_search_query.chars().collect();
             chars.insert(state.file_search_cursor_pos, ch);
             state.file_search_query = chars.into_iter().collect();
             state.file_search_cursor_pos += 1;
-            Self::update_file_search_results(state);
+            Self::update_file_search_results(state, cache);
         }
         Vec::new()
     }
 
     /// Remove character from file search query
-    pub fn backspace_file_search(state: &mut SourcePanelState) -> Vec<Action> {
+    pub fn backspace_file_search(
+        state: &mut SourcePanelState,
+        cache: &FileCompletionCache,
+    ) -> Vec<Action> {
         if state.mode == SourcePanelMode::FileSearch && state.file_search_cursor_pos > 0 {
             let mut chars: Vec<char> = state.file_search_query.chars().collect();
             chars.remove(state.file_search_cursor_pos - 1);
             state.file_search_query = chars.into_iter().collect();
             state.file_search_cursor_pos -= 1;
-            Self::update_file_search_results(state);
+            Self::update_file_search_results(state, cache);
         }
         Vec::new()
     }
 
     /// Clear entire file search query (Ctrl+U)
-    pub fn clear_file_search_query(state: &mut SourcePanelState) -> Vec<Action> {
+    pub fn clear_file_search_query(
+        state: &mut SourcePanelState,
+        cache: &FileCompletionCache,
+    ) -> Vec<Action> {
         if state.mode == SourcePanelMode::FileSearch {
             state.file_search_query.clear();
             state.file_search_cursor_pos = 0;
-            Self::update_file_search_results(state);
+            Self::update_file_search_results(state, cache);
         }
         Vec::new()
     }
 
     /// Delete previous word from file search query (Ctrl+W)
-    pub fn delete_word_file_search(state: &mut SourcePanelState) -> Vec<Action> {
+    pub fn delete_word_file_search(
+        state: &mut SourcePanelState,
+        cache: &FileCompletionCache,
+    ) -> Vec<Action> {
         if state.mode == SourcePanelMode::FileSearch && state.file_search_cursor_pos > 0 {
             let chars: Vec<char> = state.file_search_query.chars().collect();
             let mut start_pos = state.file_search_cursor_pos;
@@ -191,7 +203,7 @@ impl SourceSearch {
 
             state.file_search_query = new_chars.into_iter().collect();
             state.file_search_cursor_pos = start_pos;
-            Self::update_file_search_results(state);
+            Self::update_file_search_results(state, cache);
         }
         Vec::new()
     }
@@ -259,12 +271,15 @@ impl SourceSearch {
     }
 
     /// Confirm file search selection
-    pub fn confirm_file_search(state: &mut SourcePanelState) -> Option<String> {
+    pub fn confirm_file_search(
+        state: &mut SourcePanelState,
+        cache: &FileCompletionCache,
+    ) -> Option<String> {
         if state.mode == SourcePanelMode::FileSearch
             && !state.file_search_filtered_indices.is_empty()
         {
             let real_idx = state.file_search_filtered_indices[state.file_search_selected];
-            let selected_file = state.file_search_results.get(real_idx).cloned();
+            let selected_file = cache.get_all_files().get(real_idx).cloned();
             Self::exit_file_search_mode(state);
             selected_file
         } else {
@@ -272,18 +287,21 @@ impl SourceSearch {
         }
     }
 
-    /// Set file search results
-    pub fn set_file_search_files(state: &mut SourcePanelState, files: Vec<String>) -> Vec<Action> {
-        state.file_search_results = files;
+    /// Set file search results (updates cache)
+    pub fn set_file_search_files(
+        state: &mut SourcePanelState,
+        cache: &mut FileCompletionCache,
+        files: Vec<String>,
+    ) -> Vec<Action> {
+        cache.set_all_files(files);
         state.file_search_message = None;
-        Self::update_file_search_results(state);
+        Self::update_file_search_results(state, cache);
         Vec::new()
     }
 
     /// Set file search error
     pub fn set_file_search_error(state: &mut SourcePanelState, error: String) -> Vec<Action> {
         state.file_search_message = Some(format!("✗ {error}"));
-        state.file_search_results.clear();
         state.file_search_filtered_indices.clear();
         Vec::new()
     }
@@ -384,18 +402,19 @@ impl SourceSearch {
     }
 
     /// Update file search filtered results based on query
-    fn update_file_search_results(state: &mut SourcePanelState) {
+    fn update_file_search_results(state: &mut SourcePanelState, cache: &FileCompletionCache) {
         state.file_search_filtered_indices.clear();
         state.file_search_selected = 0;
         state.file_search_scroll = 0;
 
+        let all_files = cache.get_all_files();
         if state.file_search_query.is_empty() {
-            // Show all files
-            state.file_search_filtered_indices = (0..state.file_search_results.len()).collect();
+            // Show all files from cache
+            state.file_search_filtered_indices = (0..all_files.len()).collect();
         } else {
-            // Filter files based on query
+            // Filter files from cache based on query
             let query = state.file_search_query.to_lowercase();
-            for (idx, file) in state.file_search_results.iter().enumerate() {
+            for (idx, file) in all_files.iter().enumerate() {
                 if file.to_lowercase().contains(&query) {
                     state.file_search_filtered_indices.push(idx);
                 }

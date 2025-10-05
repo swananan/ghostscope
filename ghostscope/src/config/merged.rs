@@ -39,6 +39,9 @@ pub struct MergedConfig {
     // eBPF configuration
     pub ebpf_config: crate::config::settings::EbpfConfig,
 
+    // Source path configuration
+    pub source: crate::config::settings::SourceConfig,
+
     // Config file metadata
     pub config_file_path: Option<PathBuf>,
 }
@@ -163,6 +166,7 @@ impl MergedConfig {
                 }
                 ebpf_config
             },
+            source: config.source,
             config_file_path: config.loaded_from,
         }
     }

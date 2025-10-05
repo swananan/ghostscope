@@ -405,14 +405,30 @@ impl SourceNavigation {
                 state.mode = SourcePanelMode::Normal;
             }
             Err(e) => {
-                // Show error if file cannot be read
-                Self::show_error(
-                    state,
-                    format!(
-                        "Cannot read source file '{file_path}': {e}. \
-                        Ensure source files are accessible at the paths recorded in debug info."
-                    ),
+                // Show error if file cannot be read with helpful srcpath suggestion
+                let error_kind = if e.kind() == std::io::ErrorKind::NotFound {
+                    "File not found"
+                } else {
+                    "Cannot read file"
+                };
+
+                // Extract DWARF directory for better error suggestion
+                let (dwarf_dir, _, _) = Self::split_dwarf_path(&file_path);
+
+                let error_message = format!(
+                    "{error_kind}: {file_path}\n\
+                    Error: {e}\n\n\
+                    💡 Possible solution:\n\n\
+                    If source was compiled on a different machine or moved,\n\
+                    configure path mapping with 'srcpath' command:\n\n\
+                      srcpath map {dwarf_dir} /your/local/path\n\
+                      srcpath add /additional/search/directory\n\n\
+                    This will map the DWARF compilation directory to your local path,\n\
+                    and all files under it will be resolved correctly.\n\n\
+                    Type 'help srcpath' for more information."
                 );
+
+                Self::show_error(state, &file_path, error_message);
             }
         }
         Vec::new()
@@ -451,38 +467,91 @@ impl SourceNavigation {
         Vec::new()
     }
 
-    /// Show error message in source panel
-    fn show_error(state: &mut SourcePanelState, error_message: String) {
-        let (path_display, dir_display) = match &state.file_path {
-            Some(p) if p != "Error" => {
-                let dir = std::path::Path::new(p)
-                    .parent()
-                    .and_then(|d| d.to_str())
-                    .unwrap_or("")
-                    .to_string();
-                (p.clone(), dir)
-            }
-            _ => ("<unknown>".to_string(), "".to_string()),
-        };
+    /// Split file path into DWARF directory and relative path
+    /// Strategy: Find common source directory markers (src, include, lib, etc.)
+    /// and split the path there to show meaningful DWARF directory
+    /// Split DWARF path into directory, relative path, and basename
+    /// Handles invalid paths gracefully
+    fn split_dwarf_path(file_path: &str) -> (String, String, String) {
+        use std::path::Path;
 
-        state.content = vec![
+        // Handle empty or invalid paths
+        if file_path.is_empty() {
+            return (
+                "<unknown>".to_string(),
+                "<unknown>".to_string(),
+                "<unknown>".to_string(),
+            );
+        }
+
+        let path = Path::new(file_path);
+        let basename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        // Common source directory markers
+        let source_markers = ["src", "include", "lib", "source", "sources", "inc", "libs"];
+
+        // Try to find a source directory marker in the path
+        let components: Vec<_> = path.components().collect();
+
+        // Handle paths with no components (invalid paths)
+        if components.is_empty() {
+            return ("<unknown>".to_string(), file_path.to_string(), basename);
+        }
+
+        for (idx, component) in components.iter().enumerate() {
+            if let Some(comp_str) = component.as_os_str().to_str() {
+                if source_markers.contains(&comp_str) {
+                    // Found a source marker, split here
+                    let dwarf_dir: std::path::PathBuf = components[..idx].iter().collect();
+                    let relative: std::path::PathBuf = components[idx..].iter().collect();
+
+                    return (
+                        dwarf_dir.to_string_lossy().to_string(),
+                        relative.to_string_lossy().to_string(),
+                        basename,
+                    );
+                }
+            }
+        }
+
+        // Fallback: use parent directory as DWARF dir
+        let dwarf_dir = path
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
+
+        (dwarf_dir, basename.clone(), basename)
+    }
+
+    /// Show error message in source panel
+    fn show_error(state: &mut SourcePanelState, file_path: &str, error_message: String) {
+        let (dwarf_dir, relative_path, basename) = Self::split_dwarf_path(file_path);
+
+        // Split error message by newlines and format each line with comment prefix
+        let mut content = vec![
             "// Source code loading failed".to_string(),
             "//".to_string(),
-            format!("// File: {path_display}"),
-            if dir_display.is_empty() {
-                "// Dir: <unknown>".to_string()
-            } else {
-                format!("// Dir: {dir_display}")
-            },
+            format!("// DWARF Directory: {}", dwarf_dir),
+            format!("// Relative Path: {}", relative_path),
+            format!("// Basename: {}", basename),
             "//".to_string(),
-            format!("// Error: {error_message}"),
-            "//".to_string(),
-            "// To fix this issue:".to_string(),
-            "// 1. Ensure the binary was compiled with debug symbols (-g flag)".to_string(),
-            "// 2. Run from the directory containing source files".to_string(),
-            "// 3. Check that source files are accessible".to_string(),
         ];
-        state.file_path = Some("Error".to_string());
+
+        // Add error message lines (split by newlines)
+        for line in error_message.lines() {
+            if line.is_empty() {
+                content.push("//".to_string());
+            } else {
+                content.push(format!("// {line}"));
+            }
+        }
+
+        state.content = content;
+        state.file_path = Some(file_path.to_string());
         state.cursor_line = 0;
         state.cursor_col = 0;
         state.scroll_offset = 0;

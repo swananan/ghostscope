@@ -1,3 +1,4 @@
+use crate::components::command_panel::FileCompletionCache;
 use crate::model::panel_state::{SourcePanelMode, SourcePanelState};
 use crate::ui::themes::UIThemes;
 use ratatui::{
@@ -14,7 +15,13 @@ pub struct SourceRenderer;
 
 impl SourceRenderer {
     /// Render the source panel
-    pub fn render(f: &mut Frame, area: Rect, state: &mut SourcePanelState, is_focused: bool) {
+    pub fn render(
+        f: &mut Frame,
+        area: Rect,
+        state: &mut SourcePanelState,
+        cache: &FileCompletionCache,
+        is_focused: bool,
+    ) {
         state.area_height = area.height;
         state.area_width = area.width;
 
@@ -27,7 +34,7 @@ impl SourceRenderer {
 
         // If in file search mode, render only the overlay
         if state.mode == SourcePanelMode::FileSearch {
-            Self::render_file_search_overlay(f, area, state);
+            Self::render_file_search_overlay(f, area, state, cache);
             return;
         }
 
@@ -154,7 +161,12 @@ impl SourceRenderer {
     }
 
     /// Render file search overlay
-    fn render_file_search_overlay(f: &mut Frame, area: Rect, state: &SourcePanelState) {
+    fn render_file_search_overlay(
+        f: &mut Frame,
+        area: Rect,
+        state: &SourcePanelState,
+        cache: &FileCompletionCache,
+    ) {
         // Clear the entire area
         f.render_widget(ratatui::widgets::Clear, area);
 
@@ -219,19 +231,25 @@ impl SourceRenderer {
                 );
             }
         } else {
-            Self::render_file_list(f, inner, state);
+            Self::render_file_list(f, inner, state, cache);
         }
     }
 
     /// Render file list in file search overlay
-    fn render_file_list(f: &mut Frame, area: Rect, state: &SourcePanelState) {
+    fn render_file_list(
+        f: &mut Frame,
+        area: Rect,
+        state: &SourcePanelState,
+        cache: &FileCompletionCache,
+    ) {
         let mut items: Vec<ListItem> = Vec::new();
         let start = state.file_search_scroll;
         let end = (start + 10).min(state.file_search_filtered_indices.len());
 
+        let all_files = cache.get_all_files();
         for idx in start..end {
             let real_idx = state.file_search_filtered_indices[idx];
-            let path = &state.file_search_results[real_idx];
+            let path = &all_files[real_idx];
 
             // Get file icon based on extension
             let icon = Self::get_file_icon(path);

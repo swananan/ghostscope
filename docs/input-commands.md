@@ -322,6 +322,216 @@ i a <addr>          # Short form
 
 ---
 
+## 🗂️ Source Path Commands
+
+Commands for managing source code path mappings when DWARF debug information contains compilation-time paths that differ from runtime paths.
+
+### srcpath - Show Path Mappings
+
+**Syntax:**
+```
+srcpath
+```
+
+**Description:**
+Display current path substitution rules and search directories. Shows both runtime-added rules and config file rules.
+
+### srcpath add - Add Search Directory
+
+**Syntax:**
+```
+srcpath add <directory>
+```
+
+**Parameters:**
+- `<directory>`: Directory path to search for source files
+
+**Examples:**
+```
+srcpath add /usr/local/src           # Add search directory
+srcpath add /home/user/sources       # Add user sources directory
+```
+
+**Description:**
+When a source file cannot be found via exact path or substitution, GhostScope will search in the **root** of these directories by filename (basename matching, non-recursive). For example, after adding `/usr/local/src`, it can find `/usr/local/src/foo.c` but not `/usr/local/src/subdir/bar.c`.
+
+### srcpath map - Map Compilation Path to Runtime Path
+
+**Syntax:**
+```
+srcpath map <from> <to>
+```
+
+**Parameters:**
+- `<from>`: Compilation-time path prefix (from DWARF debug info)
+- `<to>`: Runtime path prefix (actual location on this machine)
+
+**Examples:**
+```
+srcpath map /build/project /home/user/project          # CI build path to local
+srcpath map /usr/src/linux-5.15 /home/user/kernel     # Kernel sources moved
+srcpath map /buildroot/arm /local/embedded            # Cross-compilation paths
+```
+
+**Description:**
+Replaces path prefixes from compilation time with runtime paths. If you run the same mapping twice with different `<to>` paths, the second one will update the existing mapping.
+
+### srcpath remove - Remove Mapping or Directory
+
+**Syntax:**
+```
+srcpath remove <path>
+```
+
+**Parameters:**
+- `<path>`: Path prefix of a mapping or search directory to remove
+
+**Examples:**
+```
+srcpath remove /build/project        # Remove mapping with this 'from' prefix
+srcpath remove /usr/local/src        # Remove search directory
+```
+
+**Description:**
+Removes a runtime-added rule (mapping or search directory). Config file rules cannot be removed via this command.
+
+### srcpath clear - Clear All Runtime Rules
+
+**Syntax:**
+```
+srcpath clear
+```
+
+**Description:**
+Clears all runtime-added rules (both mappings and search directories). Config file rules are preserved.
+
+### srcpath reset - Reset to Config Rules
+
+**Syntax:**
+```
+srcpath reset
+```
+
+**Description:**
+Removes all runtime-added rules and resets to config file rules only. Same as `srcpath clear`.
+
+---
+
+### Path Resolution Mechanism
+
+GhostScope uses a **relative path + directory prefix** approach to locate source files:
+
+1. **DWARF Information Contains**:
+   - Compilation directory (comp_dir): e.g., `/home/build/nginx-1.27.1`
+   - Source file relative path: e.g., `src/core/nginx.c`
+
+2. **Path Composition**:
+   - Full path = Compilation directory + Relative path
+   - Example: `/home/build/nginx-1.27.1/src/core/nginx.c`
+
+3. **Resolution Order**:
+   - **First**: Try original full path
+   - **Then**: Apply `map` substitution rules (recommended)
+   - **Last**: Search in `add` directories by filename
+
+### Recommended Usage
+
+#### 🌟 Recommended: Use `srcpath map` to Map DWARF Directory
+
+Map the compilation directory from DWARF to your local source directory. This makes **all relative path files automatically resolve**:
+
+```bash
+# Check file loading error message for DWARF directory
+# Error displays:
+# DWARF Directory: /home/build/nginx-1.27.1
+# Relative Path: src/core/nginx.c
+
+# Map DWARF directory to local path
+srcpath map /home/build/nginx-1.27.1 /home/user/nginx-1.27.1
+
+# Now all files can be found:
+# /home/build/nginx-1.27.1/src/core/nginx.c → /home/user/nginx-1.27.1/src/core/nginx.c
+# /home/build/nginx-1.27.1/src/http/ngx_http.c → /home/user/nginx-1.27.1/src/http/ngx_http.c
+```
+
+**Advantages**:
+- ✅ One-time setup, works for all files
+- ✅ Preserves directory structure, easy to understand
+- ✅ Supports multi-level directories and complex projects
+- ✅ File search (`o` key) automatically updates paths
+
+#### Auxiliary: Use `srcpath add` for Search Directories
+
+Only use when `map` cannot solve the problem (e.g., header files scattered across multiple locations):
+
+```bash
+# Add additional search directories
+srcpath add /usr/local/include
+srcpath add /opt/vendor/include
+```
+
+**Note**: `add` searches by **filename** (basename) only in directory root (non-recursive), cannot handle subdirectories, and may not find the correct file when names conflict.
+
+### Configuration File Support
+
+Path mappings can be persisted in `config.toml` to avoid manual configuration each time:
+
+```toml
+[source]
+# Recommended: DWARF directory mappings
+substitutions = [
+    { from = "/home/build/myproject", to = "/home/user/work/myproject" },
+    { from = "/usr/src/linux-5.15", to = "/home/user/kernel/linux-5.15" },
+]
+
+# Auxiliary: Additional search directories (searches by filename)
+search_dirs = [
+    "/usr/local/include",
+    "/opt/local/src",
+]
+```
+
+Runtime rules (via commands) take priority over config file rules.
+
+### Common Use Cases
+
+**Scenario 1: Source compiled on CI server** ⭐ Recommended
+```bash
+# Check DWARF Directory in error message
+# Then map it to your local source root
+srcpath map /home/jenkins/workspace/myproject /home/user/myproject
+```
+
+**Scenario 2: Compiled in container, debugging locally** ⭐ Recommended
+```bash
+# Docker container compilation directory: /build/app
+# Local source at: /home/user/app
+srcpath map /build/app /home/user/app
+```
+
+**Scenario 3: Multiple independent header directories**
+```bash
+# System headers and third-party library headers
+srcpath add /usr/local/include
+srcpath add /opt/project/vendor
+```
+
+**Scenario 4: Correcting a wrong mapping**
+```bash
+srcpath map /build /wrong/path        # First attempt (wrong)
+srcpath map /build /correct/path      # Second attempt (updates existing mapping)
+```
+
+### Best Practices
+
+1. **Prefer `map`**: Map DWARF compilation directory, not individual files
+2. **Check error messages**: File loading failures display DWARF Directory, map it directly
+3. **Preserve directory structure**: Keep same relative path structure as during compilation
+4. **Save to config**: Save common mappings to `config.toml` to avoid repeated configuration
+5. **Use `add` cautiously**: Only use when `map` cannot solve the problem, as it only searches by filename in directory root (non-recursive), cannot handle subdirectories, and may find wrong files with same names
+
+---
+
 ## ⚙️ Control Commands
 
 General control and utility commands.
@@ -376,16 +586,98 @@ Exit GhostScope. You can also use `Ctrl+C` twice to quit.
 | `info address` | `i a` | View address info |
 | `save traces` | `s t` | Save trace points |
 | `source` | `s` | Load script (except "s t") |
+| `srcpath` | - | Manage source path mappings |
 
 ---
 
-## Command Completion
+## Command Completion & History
 
-GhostScope provides intelligent command completion in Input Mode:
+### Command Completion
 
-1. **Tab Completion**: Press `Tab` to auto-complete commands and filenames
-2. **Auto-suggestion**: Gray suggestion text appears as you type, press `→` or `Ctrl+E` to accept
-3. **Smart Matching**: Completion works for both full commands and shortcuts
+GhostScope provides a multi-layered intelligent completion system:
+
+#### 1. Tab Command Completion
+
+Press `Tab` to trigger command and parameter completion:
+
+- **Command Completion**: Auto-complete GhostScope commands (trace, enable, info, etc.)
+- **File Path Completion**: Auto-complete file paths for source command
+- **Parameter Completion**: Context-aware parameter suggestions
+
+**Examples**:
+```
+gs > t<Tab>          → trace
+gs > info s<Tab>     → info source
+gs > source /pa<Tab> → source /path/to/script.gs
+```
+
+#### 2. Auto-suggestion (Gray Hints)
+
+As you type, GhostScope displays gray suggestion text based on command history:
+
+- **Trigger Condition**: After typing 3+ characters
+- **Source**: Matches prefix from command history
+- **Accept Suggestion**: Press `→` (Right arrow) or `Ctrl+E`
+- **Ignore Suggestion**: Continue typing or move cursor
+
+**Example**:
+```
+gs > trace main<typing>
+     trace main -s "print(a, b, c)"  ← Gray suggestion
+
+     Press → to accept the entire suggestion
+```
+
+#### 3. File Name Completion
+
+For commands requiring file paths, Tab completion supports:
+
+- **Relative Paths**: From current directory
+- **Absolute Paths**: From root directory
+- **Multi-level Navigation**: Navigate through directory hierarchies
+- **Smart Filtering**: Only show relevant file types (.gs script files)
+
+### Command History
+
+GhostScope automatically saves command history for quick reuse and search:
+
+#### History Navigation
+
+| Shortcut | Function |
+|----------|----------|
+| `↑` or `Ctrl+P` | Previous history command |
+| `↓` or `Ctrl+N` | Next history command |
+
+#### History Persistence
+
+- **Auto-save**: Commands automatically saved to `.ghostscope_history` file
+- **Cross-session**: History shared across different GhostScope sessions
+- **Deduplication**: Consecutive duplicate commands not recorded
+- **Capacity Limit**: Stores up to 1000 recent commands by default
+
+#### History Management
+
+Use `clear` command to clear history:
+
+```bash
+gs > clear          # Clear command history
+```
+
+**Note**: Clearing history deletes all records in `.ghostscope_history` file.
+
+### Completion Configuration
+
+History and completion behavior can be adjusted in config file (see [Configuration](configuration.md)):
+
+```toml
+[history]
+enabled = true          # Enable history recording
+max_entries = 1000     # Maximum history entries
+
+[auto_suggestion]
+enabled = true         # Enable auto-suggestion
+min_chars = 3         # Minimum chars to trigger suggestion
+```
 
 ---
 
@@ -394,10 +686,9 @@ GhostScope provides intelligent command completion in Input Mode:
 1. **Use Shortcuts**: Master command shortcuts (`t`, `en`, `dis`) for faster workflow
 2. **Tab Completion**: Use `Tab` extensively for completion and command discovery
 3. **History Navigation**: Use `Ctrl+P`/`Ctrl+N` or `↑`/`↓` to quickly reuse commands
-4. **History Search**: Press `Ctrl+R` to search through command history
-5. **Batch Operations**: Use `all` parameter to operate on all traces at once
-6. **Save Sessions**: Regularly save your trace configuration with `save traces`
-7. **Script Reuse**: Save common trace patterns in files and load with `source`
+4. **Batch Operations**: Use `all` parameter to operate on all traces at once
+5. **Save Sessions**: Regularly save your trace configuration with `save traces`
+6. **Script Reuse**: Save common trace patterns in files and load with `source`
 
 ---
 

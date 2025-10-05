@@ -137,3 +137,45 @@ perf_page_count = 32
 # Set to true to force PerfEventArray even on kernels that support RingBuf.
 # Default: false
 force_perf_event_array = false
+
+# Source code path configuration
+# When DWARF debug info contains compilation-time paths that differ from runtime paths,
+# use these settings to help ghostscope locate the actual source files.
+
+[source]
+# Path substitution rules (applied first, highest priority)
+# Replaces compilation-time path prefixes with runtime path prefixes.
+# Useful when source code was compiled on a different machine or moved to a new location.
+# 
+# Example scenarios:
+#   - Compiled on CI server: /home/build/project -> /home/user/work/project
+#   - Kernel sources moved: /usr/src/linux-5.15 -> /home/user/kernel/linux-5.15
+#   - Cross-compilation: /buildroot/arm/src -> /local/embedded/src
+#
+# Format: array of { from = "compile_path_prefix", to = "runtime_path_prefix" }
+substitutions = [
+    # { from = "/home/build/myproject", to = "/home/user/work/myproject" },
+    # { from = "/usr/src/linux", to = "/home/user/kernel/linux" },
+]
+
+# Additional search directories (fallback when substitution fails)
+# When a source file cannot be found via substitution, ghostscope will search
+# these directories by filename (basename matching).
+# Similar to GDB's "directory" command.
+#
+# Format: array of directory paths
+search_dirs = [
+    # "/home/user/sources",
+    # "/opt/local/src",
+]
+
+# Runtime configuration:
+# You can also configure source paths interactively using the 'srcpath' command:
+#   srcpath                              - Show current configuration
+#   srcpath map <from> <to>              - Add path substitution rule
+#   srcpath add <directory>              - Add search directory
+#   srcpath remove <path>                - Remove a rule
+#   srcpath clear                        - Clear all runtime rules
+#   srcpath reset                        - Reset to config file rules
+#
+# Runtime rules take precedence over config file rules and are not persisted.

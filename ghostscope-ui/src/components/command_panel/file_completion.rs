@@ -23,18 +23,23 @@ pub struct FileCompletionCache {
     last_used: Instant,
 }
 
-impl FileCompletionCache {
-    /// Create new file completion cache from source files
-    pub fn new(source_files: &[String]) -> Self {
-        let mut cache = Self {
+impl Default for FileCompletionCache {
+    fn default() -> Self {
+        Self {
             all_files: Vec::new(),
             by_basename: HashMap::new(),
             by_directory: HashMap::new(),
             quick_hash: 0,
             cached_count: 0,
             last_used: Instant::now(),
-        };
+        }
+    }
+}
 
+impl FileCompletionCache {
+    /// Create new file completion cache from source files
+    pub fn new(source_files: &[String]) -> Self {
+        let mut cache = Self::default();
         cache.rebuild_cache(source_files);
         cache
     }
@@ -96,6 +101,21 @@ impl FileCompletionCache {
     /// Get all cached file paths (for source panel reuse)
     pub fn get_all_files(&self) -> &[String] {
         &self.all_files
+    }
+
+    /// Set all files and rebuild cache
+    pub fn set_all_files(&mut self, files: Vec<String>) {
+        self.rebuild_cache(&files);
+    }
+
+    /// Get number of cached files
+    pub fn len(&self) -> usize {
+        self.all_files.len()
+    }
+
+    /// Check if cache is empty
+    pub fn is_empty(&self) -> bool {
+        self.all_files.is_empty()
     }
 
     /// Rebuild the entire cache
