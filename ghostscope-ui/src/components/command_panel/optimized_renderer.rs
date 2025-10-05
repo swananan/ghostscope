@@ -166,7 +166,7 @@ impl OptimizedRenderer {
 
             // Response lines
             if let Some(ref response) = item.response {
-                let response_lines = self.split_response_lines(response);
+                let response_lines: Vec<String> = response.lines().map(String::from).collect();
                 for response_line in response_lines {
                     let wrapped_responses = self.wrap_text(&response_line, width);
                     for wrapped_response in wrapped_responses {
@@ -1326,11 +1326,6 @@ impl OptimizedRenderer {
         }
 
         result_lines
-    }
-
-    /// Split response into lines
-    fn split_response_lines(&self, response: &str) -> Vec<String> {
-        response.lines().map(String::from).collect()
     }
 
     /// Scroll methods for API compatibility

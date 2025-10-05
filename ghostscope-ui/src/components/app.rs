@@ -1597,11 +1597,10 @@ impl App {
                     // Focus command panel
                     self.state.ui.focus.current_panel = PanelType::InteractiveCommand;
 
-                    // Add command to both history managers
+                    // Add command to history manager (for Ctrl+R search)
                     self.state
                         .command_panel
-                        .command_history_manager
-                        .add_command(&trace_command);
+                        .add_command_to_history(&trace_command);
 
                     // Add to command_history for proper response handling
                     self.state.command_panel.command_history.push(
@@ -1614,30 +1613,7 @@ impl App {
                         },
                     );
 
-                    // Add the command to static lines for display
-                    self.state.command_panel.static_lines.push(
-                        crate::model::panel_state::StaticTextLine {
-                            content: format!(
-                                "{} {}",
-                                crate::ui::strings::UIStrings::GHOSTSCOPE_PROMPT,
-                                trace_command
-                            ),
-                            line_type: crate::model::panel_state::LineType::Command,
-                            history_index: Some(
-                                self.state
-                                    .command_panel
-                                    .command_history
-                                    .len()
-                                    .saturating_sub(1),
-                            ),
-                            response_type: None,
-                            styled_content: None,
-                        },
-                    );
-
-                    // Don't store trace line here - will be determined from trace info response
-
-                    // Clear input and directly enter script mode
+                    // Clear input
                     self.state.command_panel.input_text.clear();
                     self.state.command_panel.cursor_position = 0;
 

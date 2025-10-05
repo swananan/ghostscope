@@ -751,6 +751,7 @@ impl OptimizedInputHandler {
         if state.command_history.len() > MAX_HISTORY {
             state.command_history.remove(0);
         }
+        // Note: Renderer will display command_history directly
     }
 }
 
