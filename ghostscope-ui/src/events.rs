@@ -624,14 +624,8 @@ impl TraceDetailInfo {
             .unwrap_or(&self.binary_path);
 
         format!(
-            "{} [{}] {}@{}+0x{:x} - {} ({})",
-            self.status.to_emoji(),
-            self.trace_id,
-            self.target_display,
-            binary_name,
-            self.pc,
-            self.status,
-            self.duration
+            "#{} | {}+0x{:x} | {} ({}) ",
+            self.trace_id, binary_name, self.pc, self.target_display, self.status
         )
     }
 }
