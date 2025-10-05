@@ -556,30 +556,24 @@ impl OptimizedInputHandler {
             InteractionMode::Input => {
                 // Submit the current input as a command
                 let command = state.input_text.clone();
+
+                // Always add command to history (even if empty) to show user feedback
+                self.add_command_to_history(state, &command);
+
+                // Reset history navigation to start from newest command next time
+                state.history_index = None;
+
+                // Clear input after command submission
+                state.input_text.clear();
+                state.cursor_position = 0;
+                state.auto_suggestion.clear();
+
                 if !command.trim().is_empty() {
-                    // First add the command to history
-                    self.add_command_to_history(state, &command);
-
-                    // Reset history navigation to start from newest command next time
-                    state.history_index = None;
-
-                    // Then parse and execute the command
+                    // Parse and execute non-empty commands
                     use crate::components::command_panel::CommandParser;
-                    let actions = CommandParser::parse_command(state, &command);
-
-                    // Clear input after command submission
-                    state.input_text.clear();
-                    state.cursor_position = 0;
-
-                    // Clear auto-suggestion since input is cleared
-                    state.auto_suggestion.clear();
-
-                    actions
+                    CommandParser::parse_command(state, &command)
                 } else {
-                    // Even for empty commands, clear the input line
-                    state.input_text.clear();
-                    state.cursor_position = 0;
-                    state.auto_suggestion.clear();
+                    // Empty command - no action needed, just shows empty line in history
                     Vec::new()
                 }
             }
