@@ -3264,10 +3264,10 @@ impl App {
                 if self.state.command_panel.is_in_history_search() {
                     // In history search mode - exit search directly
                     self.state.command_panel.exit_history_search();
-                    vec![Action::AddResponse {
-                        content: String::new(),
-                        response_type: crate::action::ResponseType::Info,
-                    }]
+                    self.state.command_panel.input_text.clear();
+                    self.state.command_panel.cursor_position = 0;
+                    // Don't add empty response - would overwrite previous command's response
+                    vec![]
                 } else {
                     match self.state.command_panel.mode {
                         crate::model::panel_state::InteractionMode::ScriptEditor => {
