@@ -97,6 +97,66 @@ readelf -S your_program | grep debug
 
 **注意**：没有调试符号，GhostScope 无法解析函数名、变量或源代码行信息。
 
+#### 独立调试文件（GNU debuglink）
+
+GhostScope 支持使用 `.gnu_debuglink` 机制从独立的调试文件加载调试信息。这在生产环境中处理 stripped 二进制文件时非常有用。
+
+**检查 debuglink 段：**
+```bash
+# 检查二进制文件是否有指向独立调试文件的 .gnu_debuglink
+readelf -x .gnu_debuglink your_program
+
+# 示例输出：
+# Hex dump of section '.gnu_debuglink':
+#   0x00000000 6d795f70 726f6772 616d2e64 65627567 my_program.debug
+#   0x00000010 00000000 12345678                   ....4Vx
+```
+
+**为 stripped 二进制创建独立调试文件：**
+```bash
+# 1. 提取调试信息到独立文件
+objcopy --only-keep-debug your_program your_program.debug
+
+# 2. 从二进制文件中删除调试信息
+objcopy --strip-debug your_program
+
+# 3. 在二进制文件中添加指向调试文件的链接
+objcopy --add-gnu-debuglink=your_program.debug your_program
+
+# 验证 debuglink 已添加
+readelf -x .gnu_debuglink your_program
+```
+
+**调试文件搜索路径（遵循 GDB 约定）：**
+
+GhostScope 会自动在以下位置搜索调试文件：
+1. 二进制文件同目录：`/path/to/your_program.debug`
+2. `.debug` 子目录：`/path/to/.debug/your_program.debug`
+3. 全局调试目录：`/usr/lib/debug/path/to/your_program.debug`
+
+**安装系统调试包：**
+```bash
+# Ubuntu/Debian - 安装 libc 的调试符号
+sudo apt install libc6-dbg
+
+# Fedora/RHEL - 安装调试符号
+sudo dnf debuginfo-install glibc
+
+# 调试文件通常安装在 /usr/lib/debug/ 目录下
+```
+
+**验证：**
+
+GhostScope 会自动检测并使用独立调试文件。你可以通过日志验证：
+```bash
+# 启用调试日志以查看 debuglink 解析过程
+RUST_LOG=debug sudo ghostscope -p $(pidof your_program)
+
+# 查找类似以下的消息：
+# "Looking for debug file 'your_program.debug' for binary '/path/to/your_program'"
+# "Found matching debug file: /path/to/your_program.debug (CRC: 0x12345678)"
+```
+
 ## 故障排除
 
 ### 权限被拒绝错误

@@ -8,6 +8,7 @@ pub mod core;
 
 // Internal implementation modules
 pub(crate) mod data;
+pub(crate) mod debuglink;
 pub(crate) mod loader;
 pub(crate) mod module;
 pub(crate) mod parser;

@@ -24,3 +24,6 @@ num_cpus = "1.0"
 # For proc mapping parsing (temporary, will extract from ghostscope-binary)
 libc = "0.2"
 
+# For .gnu_debuglink CRC validation
+crc32fast = "1.4"
+

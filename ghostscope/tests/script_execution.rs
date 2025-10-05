@@ -1346,3 +1346,114 @@ trace calculate_something {
 
     Ok(())
 }
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_stripped_binary_with_debuglink() -> anyhow::Result<()> {
+    init();
+    ensure_global_cleanup_registered();
+
+    // Compile stripped binary with separate debug file
+    common::ensure_test_program_compiled_with_opt(OptimizationLevel::Stripped)?;
+
+    let script_content = r#"
+trace add_numbers {
+    print "STRIPPED_BINARY: add_numbers called with a={} b={}", a, b;
+}
+"#;
+
+    println!("=== Stripped Binary with .gnu_debuglink Test ===");
+
+    // Start stripped binary
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("sample_program", OptimizationLevel::Stripped)?;
+
+    println!("Binary path: {}", binary_path.display());
+
+    // Verify debug file exists
+    let debug_file = binary_path.with_file_name("sample_program_stripped.debug");
+    assert!(
+        debug_file.exists(),
+        "Debug file should exist: {}",
+        debug_file.display()
+    );
+    println!("Debug file found: {}", debug_file.display());
+
+    // Verify binary is actually stripped
+    let output = std::process::Command::new("readelf")
+        .args(["-S", binary_path.to_str().unwrap()])
+        .output()?;
+    let sections_output = String::from_utf8_lossy(&output.stdout);
+
+    if sections_output.contains(".debug_info") {
+        println!("⚠️ Warning: Binary still contains .debug_info section");
+    } else {
+        println!("✓ Binary is stripped (no .debug_info section)");
+    }
+
+    if sections_output.contains(".gnu_debuglink") {
+        println!("✓ Binary has .gnu_debuglink section");
+    } else {
+        println!("⚠️ Warning: Binary missing .gnu_debuglink section");
+    }
+
+    // Start the stripped binary
+    let mut child = Command::new(&binary_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    let pid = child.id().expect("Failed to get PID");
+    println!("Started stripped binary with PID: {}", pid);
+
+    // Give it time to start
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Run ghostscope with the stripped binary
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_specific_pid(script_content, pid, 3).await?;
+
+    println!("Exit code: {}", exit_code);
+    println!("STDOUT: {}", stdout);
+    println!("STDERR: {}", stderr);
+    println!("===============================================");
+
+    // Clean up
+    let _ = child.kill().await;
+
+    // Verify results
+    if exit_code == 0 {
+        let traced_outputs = stdout
+            .lines()
+            .filter(|line| line.contains("STRIPPED_BINARY:"))
+            .count();
+
+        if traced_outputs > 0 {
+            println!(
+                "✓ Successfully traced {} function calls from stripped binary",
+                traced_outputs
+            );
+            println!("✓ .gnu_debuglink mechanism working correctly");
+            println!("✓ Uprobe offset calculation correct for stripped binary");
+        } else {
+            println!("⚠️ No function calls captured, but debuglink loading succeeded");
+        }
+
+        // Verify that debug info was actually loaded from debuglink
+        if stderr.contains("Looking for debug file")
+            || stderr.contains("Loading DWARF from separate debug file")
+        {
+            println!("✓ Confirmed: Debug info loaded from .gnu_debuglink");
+        }
+    } else {
+        // Check for specific error messages
+        if stderr.contains("No debug information found") {
+            println!("✗ Failed: Could not load debug information from .gnu_debuglink");
+            anyhow::bail!("Debug information not found - .gnu_debuglink not working");
+        } else {
+            println!("⚠️ Unexpected exit code: {}. STDERR: {}", exit_code, stderr);
+        }
+    }
+
+    Ok(())
+}

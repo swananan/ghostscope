@@ -54,8 +54,10 @@ pub(crate) struct ModuleData {
     cfi_index: Option<CfiIndex>,
     /// On-demand resolver (for detailed parsing)
     resolver: OnDemandResolver,
-    /// Memory mapped file (keep alive)
-    _mapped_file: MappedFile,
+    /// Memory mapped file for DWARF data (may be debug file via .gnu_debuglink)
+    _dwarf_mapped_file: std::sync::Arc<MappedFile>,
+    /// Memory mapped file for binary (used for vaddr to file offset calculation)
+    _binary_mapped_file: std::sync::Arc<MappedFile>,
     /// Per-function block/variable index (blockvector-like)
     block_index: crate::data::BlockIndex,
     /// Type name index for cross-CU completion
@@ -193,11 +195,70 @@ impl ModuleData {
             module_mapping.path.display()
         );
 
-        // Memory map the file once
-        let mapped_file = std::sync::Arc::new(Self::map_file(&module_mapping.path)?);
+        // Memory map the binary file
+        let binary_mapped = std::sync::Arc::new(Self::map_file(&module_mapping.path)?);
 
-        // Load DWARF sections (now returns Dwarf<EndianArcSlice>)
-        let dwarf = std::sync::Arc::new(Self::load_dwarf_sections(&mapped_file)?);
+        // Try to load DWARF sections from the binary file first
+        let dwarf_result = Self::load_dwarf_sections(&binary_mapped);
+
+        // Check if we need to search for separate debug file
+        let (dwarf, mapped_file_for_dwarf) = match dwarf_result {
+            Ok(dwarf_data) => {
+                // Check if we actually have debug info sections
+                if Self::has_debug_info(&dwarf_data) {
+                    tracing::debug!(
+                        "Found debug info in binary: {}",
+                        module_mapping.path.display()
+                    );
+                    (
+                        std::sync::Arc::new(dwarf_data),
+                        std::sync::Arc::clone(&binary_mapped),
+                    )
+                } else {
+                    // No debug info, try to find separate debug file
+                    tracing::info!(
+                        "No debug info in binary, searching for .gnu_debuglink: {}",
+                        module_mapping.path.display()
+                    );
+                    match crate::debuglink::try_load_debug_file(&module_mapping.path)? {
+                        Some((debug_path, debug_mmap)) => {
+                            tracing::info!(
+                                "Loading DWARF from separate debug file: {}",
+                                debug_path.display()
+                            );
+                            let debug_mapped = std::sync::Arc::new(MappedFile {
+                                data: debug_mmap,
+                                path: debug_path.clone(),
+                            });
+                            let debug_dwarf = Self::load_dwarf_sections(&debug_mapped)?;
+                            (std::sync::Arc::new(debug_dwarf), debug_mapped)
+                        }
+                        None => {
+                            // No debug file found, use original (possibly empty) dwarf
+                            tracing::warn!(
+                                "No separate debug file found for: {}",
+                                module_mapping.path.display()
+                            );
+                            (
+                                std::sync::Arc::new(dwarf_data),
+                                std::sync::Arc::clone(&binary_mapped),
+                            )
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Failed to parse DWARF from {}: {}",
+                    module_mapping.path.display(),
+                    e
+                );
+                return Err(e);
+            }
+        };
+
+        // Use mapped_file_for_dwarf which is either binary or debug file
+        let mapped_file = mapped_file_for_dwarf;
 
         tracing::debug!(
             "Starting parallel DWARF parsing with true debug_line || debug_info parallelism..."
@@ -223,13 +284,13 @@ impl ModuleData {
                     parser.parse_debug_info(&module_path)
                 }
             }),
-            // Parse CFI independently (now using Arc-based data, no unsafe!)
+            // Parse CFI independently from binary file (not debug file)
             tokio::task::spawn_blocking({
-                let mapped_file = std::sync::Arc::clone(&mapped_file);
+                let binary_for_cfi = std::sync::Arc::clone(&binary_mapped);
                 let module_path = module_mapping.path.clone();
                 move || -> Result<Option<crate::data::CfiIndex>> {
                     // Convert MappedFile data to Arc<[u8]>
-                    let file_data_arc: std::sync::Arc<[u8]> = mapped_file.data[..].into();
+                    let file_data_arc: std::sync::Arc<[u8]> = binary_for_cfi.data[..].into();
                     match crate::data::CfiIndex::from_arc_data(file_data_arc) {
                         Ok(cfi) => {
                             tracing::info!(
@@ -330,8 +391,8 @@ impl ModuleData {
             resolver,
             block_index: crate::data::BlockIndex::new(),
             type_name_index,
-            _mapped_file: std::sync::Arc::try_unwrap(mapped_file)
-                .map_err(|_| anyhow::anyhow!("Failed to unwrap MappedFile Arc"))?,
+            _dwarf_mapped_file: mapped_file,
+            _binary_mapped_file: binary_mapped,
         })
     }
 
@@ -345,6 +406,17 @@ impl ModuleData {
             data: mmap,
             path: path.clone(),
         })
+    }
+
+    /// Check if DWARF data contains debug information
+    ///
+    /// Returns true if .debug_info section has at least one compilation unit
+    fn has_debug_info(dwarf: &gimli::Dwarf<gimli::EndianArcSlice<LittleEndian>>) -> bool {
+        // Try to get the first unit header - need to check if it actually exists
+        match dwarf.units().next() {
+            Ok(Some(_)) => true, // Has at least one unit
+            _ => false,          // No units or error
+        }
     }
 
     /// Load DWARF sections using gimli with Arc-based data
@@ -385,11 +457,11 @@ impl ModuleData {
     /// Convert a virtual address (DWARF PC) to an ELF file offset using PT_LOAD segments
     /// Returns None if no containing segment is found
     pub(crate) fn vaddr_to_file_offset(&self, vaddr: u64) -> Option<u64> {
-        // Re-parse the object file on-demand from the mapped file
-        if self._mapped_file.data.is_empty() {
+        // Use binary file (not debug file) for segment calculation
+        if self._binary_mapped_file.data.is_empty() {
             return None;
         }
-        let data: &[u8] = &self._mapped_file.data;
+        let data: &[u8] = &self._binary_mapped_file.data;
         let obj = match object::File::parse(data) {
             Ok(f) => f,
             Err(_) => return None,
@@ -1374,7 +1446,7 @@ impl ModuleData {
         let entries = self.lightweight_index.find_variables_by_name(name);
 
         // Parse object file once for section classification
-        let obj = match object::File::parse(&self._mapped_file.data[..]) {
+        let obj = match object::File::parse(&self._binary_mapped_file.data[..]) {
             Ok(f) => f,
             Err(_) => {
                 // Cannot classify sections, but still return entries with link_address
@@ -1443,7 +1515,7 @@ impl ModuleData {
 
     /// Public helper: classify a virtual address to a section type by parsing the module object
     pub(crate) fn classify_section_for_vaddr(&self, addr: u64) -> Option<SectionType> {
-        match object::File::parse(&self._mapped_file.data[..]) {
+        match object::File::parse(&self._binary_mapped_file.data[..]) {
             Ok(obj) => self.classify_section(&obj, addr),
             Err(_) => None,
         }
@@ -1453,7 +1525,7 @@ impl ModuleData {
     pub(crate) fn list_all_global_variables(&self) -> Vec<GlobalVariableInfo> {
         let mut out = Vec::new();
         // Parse object once for section classification
-        let _obj = match object::File::parse(&self._mapped_file.data[..]) {
+        let _obj = match object::File::parse(&self._binary_mapped_file.data[..]) {
             Ok(f) => f,
             Err(_) => {
                 return out;
