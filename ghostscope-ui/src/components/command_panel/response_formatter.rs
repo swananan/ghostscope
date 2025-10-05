@@ -38,7 +38,7 @@ impl ResponseFormatter {
                 state.command_history.len()
             );
         }
-        // Note: Optimized renderer will handle display updates via cache rebuild
+        // Note: Renderer will display command_history directly
     }
 
     // Removed add_welcome_message - now using direct styled approach
@@ -83,18 +83,8 @@ impl ResponseFormatter {
             }
         }
 
-        // Add current input line if should show prompt
-        if Self::should_show_input_prompt(state) {
-            let prompt = Self::get_prompt(state);
-            let input_line = format!("{prompt}{input}", input = state.input_text);
-            state.static_lines.push(StaticTextLine {
-                content: input_line,
-                line_type: LineType::CurrentInput,
-                history_index: None,
-                response_type: None,
-                styled_content: None,
-            });
-        }
+        // Note: Current input line is rendered separately by the renderer (render_normal_input)
+        // Don't add it to static_lines to avoid duplication
     }
 
     /// Split response into individual lines for display
@@ -325,22 +315,6 @@ impl ResponseFormatter {
         } else {
             lines
         }
-    }
-
-    /// Check if input prompt should be shown
-    fn should_show_input_prompt(state: &CommandPanelState) -> bool {
-        matches!(
-            state.input_state,
-            crate::model::panel_state::InputState::Ready
-        )
-    }
-
-    /// Get the current prompt string
-    fn get_prompt(state: &CommandPanelState) -> String {
-        if !Self::should_show_input_prompt(state) {
-            return String::new();
-        }
-        UIStrings::GHOSTSCOPE_PROMPT.to_string()
     }
 
     /// Format file information display
