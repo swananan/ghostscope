@@ -16,7 +16,7 @@ pub struct OptimizedInputHandler {
 impl OptimizedInputHandler {
     pub fn new() -> Self {
         Self {
-            jk_timeout_ms: 100,
+            jk_timeout_ms: 150,
             last_input_time: Instant::now(),
         }
     }

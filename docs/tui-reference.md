@@ -225,7 +225,7 @@ After pressing `Ctrl+R`:
 
 | Shortcut | Function |
 |----------|----------|
-| `Esc` or `jk` | Enter Command Mode (jk must be pressed within 100ms) |
+| `Esc` or `jk` | Enter Command Mode (jk must be pressed within 150ms) |
 
 ### Mode: Command Mode
 
