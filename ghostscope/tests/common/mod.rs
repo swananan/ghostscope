@@ -17,6 +17,7 @@ static REGISTER_CLEANUP: Once = Once::new();
 lazy_static! {
     static ref COMPILE_DEBUG_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
     static ref COMPILE_OPT_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
+    static ref COMPILE_STRIPPED_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
     static ref COMPILE_COMPLEX_DEBUG_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
     static ref COMPILE_COMPLEX_OPT_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
     static ref COMPILE_COMPLEX_NOPIE_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
@@ -63,6 +64,7 @@ pub fn init() {
 }
 
 static COMPILE_OPTIMIZED: Once = Once::new();
+static COMPILE_STRIPPED: Once = Once::new();
 
 /// Optimization level for test program compilation
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -73,6 +75,8 @@ pub enum OptimizationLevel {
     O2,    // -O2
     #[allow(dead_code)]
     O3, // -O3
+    #[allow(dead_code)]
+    Stripped, // -O0 with separate debug file (.gnu_debuglink)
 }
 
 impl OptimizationLevel {
@@ -82,6 +86,7 @@ impl OptimizationLevel {
             OptimizationLevel::O1 => "sample_program_o1",
             OptimizationLevel::O2 => "sample_program_o2",
             OptimizationLevel::O3 => "sample_program_o3",
+            OptimizationLevel::Stripped => "sample_program_stripped",
         }
     }
 
@@ -91,6 +96,7 @@ impl OptimizationLevel {
             OptimizationLevel::O1 => "sample_program_o1",
             OptimizationLevel::O2 => "sample_program_o2",
             OptimizationLevel::O3 => "sample_program_o3",
+            OptimizationLevel::Stripped => "sample_program_stripped",
         }
     }
 
@@ -100,6 +106,7 @@ impl OptimizationLevel {
             OptimizationLevel::O1 => "Optimized (O1)",
             OptimizationLevel::O2 => "Optimized (O2)",
             OptimizationLevel::O3 => "Highly Optimized (O3)",
+            OptimizationLevel::Stripped => "Stripped with .gnu_debuglink",
         }
     }
 }
@@ -118,6 +125,17 @@ pub fn ensure_test_program_compiled_with_opt(opt_level: OptimizationLevel) -> an
                 *COMPILE_DEBUG_RESULT.lock().unwrap() = Some(compile_result);
             });
             match COMPILE_DEBUG_RESULT.lock().unwrap().as_ref() {
+                Some(Ok(())) => Ok(()),
+                Some(Err(e)) => Err(anyhow::anyhow!("{}", e)),
+                None => panic!("Compilation result should be set after call_once"),
+            }
+        }
+        OptimizationLevel::Stripped => {
+            COMPILE_STRIPPED.call_once(|| {
+                let compile_result = compile_sample_program(opt_level);
+                *COMPILE_STRIPPED_RESULT.lock().unwrap() = Some(compile_result);
+            });
+            match COMPILE_STRIPPED_RESULT.lock().unwrap().as_ref() {
                 Some(Ok(())) => Ok(()),
                 Some(Err(e)) => Err(anyhow::anyhow!("{}", e)),
                 None => panic!("Compilation result should be set after call_once"),
@@ -222,6 +240,9 @@ fn compile_complex_program(opt_level: OptimizationLevel) -> anyhow::Result<()> {
         OptimizationLevel::O1 => "complex_types_program_o1",
         OptimizationLevel::O2 => "complex_types_program_o2",
         OptimizationLevel::O3 => "complex_types_program_o3",
+        OptimizationLevel::Stripped => {
+            anyhow::bail!("Stripped optimization level not supported for complex_types_program")
+        }
     };
 
     let output = Command::new("make")
@@ -285,6 +306,11 @@ impl TestFixtures {
                 OptimizationLevel::O1 => "complex_types_program_o1",
                 OptimizationLevel::O2 => "complex_types_program_o2",
                 OptimizationLevel::O3 => "complex_types_program_o3",
+                OptimizationLevel::Stripped => {
+                    anyhow::bail!(
+                        "Stripped optimization level not supported for complex_types_program"
+                    )
+                }
             };
             self.base_path.join("complex_types_program").join(bin_name)
         } else if name == "globals_program" {

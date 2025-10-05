@@ -408,8 +408,40 @@ pub async fn compile_and_load_script_for_cli(
     }
 
     if uprobe_configs.is_empty() {
+        // Check if we have debug info - this is checked during module loading
+        let available_functions = session.list_functions();
+
+        if available_functions.is_empty() {
+            return Err(anyhow::anyhow!(
+                "No debug information found in any module!\n\
+                \n\
+                The target binary and its libraries are stripped or compiled without debug symbols.\n\
+                GhostScope requires debug information (DWARF) to:\n\
+                - Locate functions by name\n\
+                - Analyze variable types and locations\n\
+                - Map source lines to addresses\n\
+                \n\
+                Solutions:\n\
+                1. Recompile your target with -g flag: gcc -g your_program.c -o your_program\n\
+                2. Install debug symbol packages (e.g., libc6-dbg on Debian/Ubuntu)\n\
+                3. For stripped binaries, use objcopy to create separate debug files:\n\
+                   objcopy --only-keep-debug binary binary.debug\n\
+                   objcopy --add-gnu-debuglink=binary.debug binary"
+            ));
+        }
+
         return Err(anyhow::anyhow!(
-            "No uprobe configurations created - nothing to attach"
+            "No uprobe configurations created - the functions referenced in your script were not found.\n\
+            \n\
+            Possible reasons:\n\
+            - Function names are misspelled (check available functions below)\n\
+            - Functions don't exist in the target binary\n\
+            - Functions are from libraries that aren't loaded yet\n\
+            \n\
+            Available functions (first 10):\n{}\n\
+            \n\
+            Tip: Run GhostScope in TUI mode to browse all available functions",
+            available_functions.iter().take(10).map(|f| format!("  - {}", f)).collect::<Vec<_>>().join("\n")
         ));
     }
 

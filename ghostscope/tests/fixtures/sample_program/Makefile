@@ -15,6 +15,16 @@ sample_program.o: sample_program.c sample_lib.h
 sample_lib.o: sample_lib.c sample_lib.h
 	$(CC) $(CFLAGS) -c -o $@ sample_lib.c
 
+# Build stripped binary with separate debug file (.gnu_debuglink)
+sample_program_stripped: sample_program.o sample_lib.o
+	$(CC) $(CFLAGS) -o sample_program_stripped sample_program.o sample_lib.o
+	objcopy --only-keep-debug sample_program_stripped sample_program_stripped.debug
+	objcopy --strip-debug sample_program_stripped
+	objcopy --add-gnu-debuglink=sample_program_stripped.debug sample_program_stripped
+	@echo "Created stripped binary: sample_program_stripped"
+	@echo "Debug info in: sample_program_stripped.debug"
+	@readelf -x .gnu_debuglink sample_program_stripped 2>/dev/null || true
+
 # Optimized builds with different levels
 sample_program_o1: sample_program_o1.o sample_lib_o1.o
 	$(CC) $(BASE_CFLAGS) -O1 -o $@ $^
@@ -44,10 +54,10 @@ sample_lib_o2.o: sample_lib.c sample_lib.h
 sample_lib_o3.o: sample_lib.c sample_lib.h
 	$(CC) $(BASE_CFLAGS) -O3 -DNDEBUG -c -o $@ sample_lib.c
 
-# Build all optimization levels
-all: sample_program sample_program_o1 sample_program_o2 sample_program_o3
+# Build all optimization levels (including stripped version for .gnu_debuglink testing)
+all: sample_program sample_program_o1 sample_program_o2 sample_program_o3 sample_program_stripped
 
 clean:
-	rm -f *.o sample_program sample_program_o*
+	rm -f *.o sample_program sample_program_o* sample_program_stripped sample_program_stripped.debug
 
-.PHONY: clean all sample_program_o1 sample_program_o2 sample_program_o3
+.PHONY: clean all sample_program_o1 sample_program_o2 sample_program_o3 sample_program_stripped

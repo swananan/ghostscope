@@ -689,6 +689,7 @@ name = "ghostscope-dwarf"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "crc32fast",
  "futures",
  "ghostscope-platform",
  "ghostscope-protocol",

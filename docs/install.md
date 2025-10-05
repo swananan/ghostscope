@@ -97,6 +97,66 @@ If no `.debug_*` sections are found, the binary must be recompiled with debug sy
 
 **Note**: Without debug symbols, GhostScope cannot resolve function names, variables, or source line information.
 
+#### Separate Debug Files (GNU debuglink)
+
+GhostScope also supports loading debug information from separate debug files using the `.gnu_debuglink` mechanism. This is useful when working with stripped binaries in production environments.
+
+**Check for debuglink section:**
+```bash
+# Check if binary has .gnu_debuglink pointing to a separate debug file
+readelf -x .gnu_debuglink your_program
+
+# Example output:
+# Hex dump of section '.gnu_debuglink':
+#   0x00000000 6d795f70 726f6772 616d2e64 65627567 my_program.debug
+#   0x00000010 00000000 12345678                   ....4Vx
+```
+
+**Create separate debug file for a stripped binary:**
+```bash
+# 1. Extract debug information to a separate file
+objcopy --only-keep-debug your_program your_program.debug
+
+# 2. Strip debug information from the binary
+objcopy --strip-debug your_program
+
+# 3. Add a link from the binary to the debug file
+objcopy --add-gnu-debuglink=your_program.debug your_program
+
+# Verify the debuglink was added
+readelf -x .gnu_debuglink your_program
+```
+
+**Debug file search paths (following GDB conventions):**
+
+GhostScope automatically searches for debug files in the following locations:
+1. Same directory as the binary: `/path/to/your_program.debug`
+2. `.debug` subdirectory: `/path/to/.debug/your_program.debug`
+3. Global debug directory: `/usr/lib/debug/path/to/your_program.debug`
+
+**Installing system debug packages:**
+```bash
+# Ubuntu/Debian - install debug symbols for libc
+sudo apt install libc6-dbg
+
+# Fedora/RHEL - install debug symbols
+sudo dnf debuginfo-install glibc
+
+# The debug files are typically installed in /usr/lib/debug/
+```
+
+**Verification:**
+
+GhostScope will automatically detect and use separate debug files. You can verify this in the logs:
+```bash
+# Run with debug logging to see debuglink resolution
+RUST_LOG=debug sudo ghostscope -p $(pidof your_program)
+
+# Look for messages like:
+# "Looking for debug file 'your_program.debug' for binary '/path/to/your_program'"
+# "Found matching debug file: /path/to/your_program.debug (CRC: 0x12345678)"
+```
+
 ## Troubleshooting
 
 ### Permission Denied Errors

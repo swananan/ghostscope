@@ -552,3 +552,48 @@ async fn test_dwarf_tool_text_output_format() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_stripped_binary_with_debuglink() -> anyhow::Result<()> {
+    init();
+
+    // Compile stripped binary with separate debug file
+    common::ensure_test_program_compiled_with_opt(common::OptimizationLevel::Stripped)?;
+
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("sample_program", common::OptimizationLevel::Stripped)?;
+
+    println!(
+        "Testing stripped binary with .gnu_debuglink: {}",
+        binary_path.display()
+    );
+
+    // Verify debug file exists
+    let debug_file = binary_path.with_file_name("sample_program_stripped.debug");
+    assert!(
+        debug_file.exists(),
+        "Debug file should exist: {}",
+        debug_file.display()
+    );
+
+    // Test that we can still read function info from stripped binary via .gnu_debuglink
+    // Test main function
+    let main_info = run_dwarf_tool_json(&binary_path, "function", &["main"]).await?;
+    assert!(
+        main_info.is_array() || main_info.is_object(),
+        "Should get function info for main"
+    );
+
+    // Test add_numbers function
+    let add_numbers_info = run_dwarf_tool_json(&binary_path, "function", &["add_numbers"]).await?;
+    assert!(
+        add_numbers_info.is_array() || add_numbers_info.is_object(),
+        "Should get function info for add_numbers"
+    );
+
+    println!("✓ Successfully loaded debug info from .gnu_debuglink");
+    println!("  Found main function");
+    println!("  Found add_numbers function");
+
+    Ok(())
+}
