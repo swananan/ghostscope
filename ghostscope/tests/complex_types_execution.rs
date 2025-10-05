@@ -306,6 +306,259 @@ trace complex_types_program.c:25 {
 }
 
 #[tokio::test]
+async fn test_cross_type_comparisons_local() -> anyhow::Result<()> {
+    init();
+
+    // Build and start complex_types_program (Debug)
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("complex_types_program", OptimizationLevel::Debug)?;
+    let mut prog = Command::new(&binary_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Cross-type comparisons（剔除字符串等值，单独用例）
+    // - a.age > 26（DWARF int vs 脚本 int）
+    // - a.status == 0（DWARF enum-as-int vs 脚本 int）
+    // - a.friend_ref == 0（DWARF 指针 vs 脚本 int）
+    // - let t = 100; a.age < t（DWARF int vs 脚本变量）
+    let script = r#"
+trace complex_types_program.c:25 {
+    let t = 100;
+    print "GT:{} EQ:{} PZ:{} LT:{}",
+        a.age > 26,
+        a.status == 0,
+        a.friend_ref == 0,
+        a.age < t;
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    use regex::Regex;
+    let re =
+        Regex::new(r"GT:(true|false) EQ:(true|false) PZ:(true|false) LT:(true|false)").unwrap();
+    let mut saw_line = false;
+    let mut saw_pz_true = false;
+    for line in stdout.lines() {
+        if let Some(c) = re.captures(line) {
+            saw_line = true;
+            if &c[3] == "true" {
+                saw_pz_true = true; // friend_ref == 0
+            }
+        }
+    }
+    assert!(
+        saw_line,
+        "Expected at least one comparison line. STDOUT: {}",
+        stdout
+    );
+    assert!(
+        saw_pz_true,
+        "Expected PZ:1 for pointer==0. STDOUT: {}",
+        stdout
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_if_else_if_and_bare_expr_local() -> anyhow::Result<()> {
+    init();
+
+    // Build and start complex_types_program (Debug)
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("complex_types_program", OptimizationLevel::Debug)?;
+    let mut prog = Command::new(&binary_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Verify: print expr; and if / else if with expression conditions
+    let script = r#"
+trace complex_types_program.c:25 {
+    // bare expression print should render name = value
+    print a.status == 0;
+    if a.status == 0 {
+        print "wtf";
+    } else if a.status == 1 {
+        print a.age == 0;
+    }
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    // Expect at least one bare expr line for (a.status==0) = true/false
+    let has_status_line = stdout
+        .lines()
+        .any(|l| l.contains("(a.status==0) = true") || l.contains("(a.status==0) = false"));
+    assert!(
+        has_status_line,
+        "Expected bare expression output for a.status==0. STDOUT: {}",
+        stdout
+    );
+
+    // Expect either the then branch literal or the else-if branch expr at least once across samples
+    let has_then = stdout.lines().any(|l| l.contains("wtf"));
+    let has_elseif_expr = stdout
+        .lines()
+        .any(|l| l.contains("(a.age==0) = true") || l.contains("(a.age==0) = false"));
+    assert!(
+        has_then || has_elseif_expr,
+        "Expected either then-branch 'wtf' or else-if expr output. STDOUT: {}",
+        stdout
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_if_else_if_logical_ops_local() -> anyhow::Result<()> {
+    init();
+
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("complex_types_program", OptimizationLevel::Debug)?;
+    let mut prog = Command::new(&binary_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let script = r#"
+trace complex_types_program.c:25 {
+    // Truthiness check for script ints
+    let x = 2; let y = 1; let z = 0;
+    print "AND:{} OR:{}", x && y, x || z;
+    // DWARF-backed locals with logical ops
+    if a.age > 26 && a.status == 0 { print "AND"; }
+    else if a.age < 100 || a.friend_ref == 0 { print "OR"; }
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    use regex::Regex;
+    let re = Regex::new(r"AND:(true|false) OR:(true|false)").unwrap();
+    let mut saw_fmt = false;
+    for line in stdout.lines() {
+        if re.is_match(line) {
+            saw_fmt = true;
+            break;
+        }
+    }
+    assert!(saw_fmt, "Expected logical fmt line. STDOUT: {}", stdout);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_address_of_and_comparisons_local() -> anyhow::Result<()> {
+    init();
+
+    // Build and start complex_types_program (Debug)
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("complex_types_program", OptimizationLevel::Debug)?;
+    let mut prog = Command::new(&binary_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Exercise address-of as top-level print (pointer formatting) and as rvalue in comparisons
+    let script = r#"
+trace complex_types_program.c:25 {
+    // top-level &expr should print as pointer with hex and type suffix
+    print &a;
+    // address-of in expression should print name=value
+    print (&a != 0);
+    if &a != 0 {
+        print "ADDR";
+    }
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    // Top-level &a should produce a hex pointer
+    let has_hex_ptr = stdout.contains("0x");
+    assert!(
+        has_hex_ptr,
+        "Expected hex pointer for &a. STDOUT: {}",
+        stdout
+    );
+
+    // (&a != 0) should produce bare expr with name and boolean value
+    let has_expr_bool = stdout
+        .lines()
+        .any(|l| l.contains("(&a!=0) = true") || l.contains("(&a!=0) = false"));
+    assert!(
+        has_expr_bool,
+        "Expected bare expr output for (&a!=0). STDOUT: {}",
+        stdout
+    );
+
+    // Then-branch literal
+    let has_then = stdout.lines().any(|l| l.contains("ADDR"));
+    assert!(
+        has_then,
+        "Expected then-branch ADDR line. STDOUT: {}",
+        stdout
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "CString equality (DWARF char*/char[]) not implemented yet"]
+async fn test_string_equality_local() -> anyhow::Result<()> {
+    init();
+
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("complex_types_program", OptimizationLevel::Debug)?;
+    let mut prog = Command::new(&binary_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let script = r#"
+trace complex_types_program.c:25 {
+    print "SE:{}", a.name == "Alice";
+}
+"#;
+
+    let (_exit_code, _stdout, _stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
+    let _ = prog.kill().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_entry_pointer_values() -> anyhow::Result<()> {
     init();
 

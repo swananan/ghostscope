@@ -1330,6 +1330,43 @@ mod tests {
     }
 
     #[test]
+    fn test_complex_format_char_array() {
+        use crate::type_info::TypeInfo;
+
+        let mut trace_context = TraceContext::new();
+        let var_name_idx = trace_context.add_variable_name("name".to_string());
+        // Define char array type: char name[16]
+        let char_type = TypeInfo::BaseType {
+            name: "char".to_string(),
+            size: 1,
+            encoding: gimli::constants::DW_ATE_unsigned_char.0 as u16,
+        };
+        let arr_type = TypeInfo::ArrayType {
+            element_type: Box::new(char_type),
+            element_count: Some(16),
+            total_size: Some(16),
+        };
+        let type_idx = trace_context.add_type(arr_type);
+
+        // Data buffer with "Alice\0" and padding
+        let mut data = b"Alice\0".to_vec();
+        data.resize(16, 0u8);
+
+        let fmt_idx = trace_context.add_string("{}".to_string());
+        let complex_vars = vec![ParsedComplexVariable {
+            var_name_index: var_name_idx,
+            type_index: type_idx,
+            access_path: String::new(),
+            status: 0,
+            data,
+        }];
+
+        let result =
+            FormatPrinter::format_complex_print_data(fmt_idx, &complex_vars, &trace_context);
+        assert_eq!(result, "\"Alice\"");
+    }
+
+    #[test]
     fn test_format_data_with_type_info_array() {
         let array_type = TypeInfo::ArrayType {
             element_type: Box::new(TypeInfo::BaseType {

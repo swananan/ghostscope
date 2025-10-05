@@ -21,10 +21,9 @@ impl<'ctx> EbpfContext<'ctx> {
                 );
                 Ok(int_value.into())
             }
-            Expr::Float(value) => {
-                let float_value = self.context.f64_type().const_float(*value);
-                Ok(float_value.into())
-            }
+            Expr::Float(_value) => Err(CodeGenError::TypeError(
+                "Floating point expressions are not supported".to_string(),
+            )),
             Expr::String(value) => {
                 // Create string constant using a simpler approach
                 let string_value = self.context.const_string(value.as_bytes(), true);
@@ -270,18 +269,38 @@ impl<'ctx> EbpfContext<'ctx> {
                             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
                         return Ok(result.into());
                     }
-                    // Logical operators (for boolean values represented as i1 or i64)
+                    // Logical operators with boolean semantics (non-zero is true)
                     BinaryOp::LogicalAnd => {
+                        let lz = left_int.get_type().const_zero();
+                        let rz = right_int.get_type().const_zero();
+                        let lbool = self
+                            .builder
+                            .build_int_compare(inkwell::IntPredicate::NE, left_int, lz, "lhs_nz")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        let rbool = self
+                            .builder
+                            .build_int_compare(inkwell::IntPredicate::NE, right_int, rz, "rhs_nz")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
                         let result = self
                             .builder
-                            .build_and(left_int, right_int, "and")
+                            .build_and(lbool, rbool, "and_bool")
                             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
                         return Ok(result.into());
                     }
                     BinaryOp::LogicalOr => {
+                        let lz = left_int.get_type().const_zero();
+                        let rz = right_int.get_type().const_zero();
+                        let lbool = self
+                            .builder
+                            .build_int_compare(inkwell::IntPredicate::NE, left_int, lz, "lhs_nz")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        let rbool = self
+                            .builder
+                            .build_int_compare(inkwell::IntPredicate::NE, right_int, rz, "rhs_nz")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
                         let result = self
                             .builder
-                            .build_or(left_int, right_int, "or")
+                            .build_or(lbool, rbool, "or_bool")
                             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
                         return Ok(result.into());
                     }

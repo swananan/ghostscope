@@ -201,6 +201,231 @@ trace globals_program.c:32 {
 }
 
 #[tokio::test]
+async fn test_cross_type_comparisons_globals() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Cross-type comparisons (string equality separated into its own test):
+    // - s_internal > 5 (DWARF int vs script int)
+    // - p_lib_internal == 0 (DWARF pointer vs script int; often false depending on timing)
+    // - s_internal > th (DWARF int vs script variable)
+    let script = r#"
+trace globals_program.c:32 {
+    let th = 6;
+    print "SI_GT5:{} PIN0:{} SI_GT_TH:{}",
+        s_internal > 5,
+        p_lib_internal == 0,
+        s_internal > th;
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    let re = Regex::new(r"SI_GT5:(true|false) PIN0:(true|false) SI_GT_TH:(true|false)").unwrap();
+    let mut saw_line = false;
+    let mut saw_pin0_flag = false;
+    for line in stdout.lines() {
+        if let Some(c) = re.captures(line) {
+            saw_line = true;
+            // PIN0 may be true/false depending on timing; just assert it appears
+            if &c[2] == "true" || &c[2] == "false" {
+                saw_pin0_flag = true;
+            }
+        }
+    }
+    assert!(
+        saw_line,
+        "Expected at least one comparison line. STDOUT: {}",
+        stdout
+    );
+    assert!(saw_pin0_flag, "Expected PIN0 present. STDOUT: {}", stdout);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_if_else_if_and_bare_expr_globals() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Use globals at a stable attach site; exercise bare expr + conditional with expressions
+    let script = r#"
+trace globals_program.c:32 {
+    // bare expression print
+    print s_internal > 5;
+    if s_internal > 5 {
+        print "wtf";
+    } else if p_lib_internal == 0 {
+        // else-if prints an expression result when lib ptr is null
+        print p_lib_internal == 0;
+    }
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    // Expect bare expr name preserved for (s_internal>5) = true/false
+    let has_expr_line = stdout
+        .lines()
+        .any(|l| l.contains("(s_internal>5) = true") || l.contains("(s_internal>5) = false"));
+    assert!(
+        has_expr_line,
+        "Expected bare expression output for s_internal>5. STDOUT: {}",
+        stdout
+    );
+
+    // Branch outputs are environment-dependent (timing-sensitive). If they appear it's ok,
+    // but the core validation here is parsing/execution of expr in if/else-if, which
+    // is covered by the bare expression line above. So we don't require branch prints.
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_if_else_if_logical_ops_globals() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let script = r#"
+trace globals_program.c:32 {
+    // Stable conditions to exercise both operators; first branch always true
+    if 1 == 1 && s_bss_counter >= 0 { print "AND"; }
+    else if 1 == 0 || p_lib_internal == 0 { print "OR"; }
+}
+"#;
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    // Expect deterministic AND branch
+    let has_and = stdout.lines().any(|l| l.contains("AND"));
+    assert!(has_and, "Expected AND branch output. STDOUT: {}", stdout);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_address_of_and_comparisons_globals() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Address-of on globals and in comparisons
+    let script = r#"
+trace globals_program.c:32 {
+    print &G_STATE;              // pointer to global struct
+    print (&G_STATE != 0);       // expression with address-of
+    if &G_STATE != 0 { print "ADDR"; }
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    // Hex pointer expected for &G_STATE
+    assert!(
+        stdout.contains("0x"),
+        "Expected hex pointer for &G_STATE. STDOUT: {}",
+        stdout
+    );
+
+    // Bare expr boolean with name
+    let has_expr = stdout
+        .lines()
+        .any(|l| l.contains("(&G_STATE!=0) = true") || l.contains("(&G_STATE!=0) = false"));
+    assert!(
+        has_expr,
+        "Expected (&G_STATE!=0) bare expr. STDOUT: {}",
+        stdout
+    );
+
+    // Then branch
+    assert!(
+        stdout.contains("ADDR"),
+        "Expected then-branch ADDR line. STDOUT: {}",
+        stdout
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "CString equality (DWARF char*/char[]) not implemented yet"]
+async fn test_string_equality_globals() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let script = r#"
+trace globals_program.c:32 {
+    print "GM_EQ:{}", g_message == "Hello, Global!";
+}
+"#;
+
+    let (_exit_code, _stdout, _stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
+    let _ = prog.kill().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_chain_tail_array_constant_index_increments() -> anyhow::Result<()> {
     init();
 

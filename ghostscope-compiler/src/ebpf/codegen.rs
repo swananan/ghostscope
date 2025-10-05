@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use tracing::{debug, info, warn};
 
 /// Information about a variable in formatted print
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct FormatVariableInfo {
     var_name: String,
@@ -27,6 +28,7 @@ struct FormatVariableInfo {
 }
 
 /// Source of the value for a format variable
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 enum FormatValueSource {
     Variable,       // Read from DWARF/register
@@ -36,7 +38,7 @@ enum FormatValueSource {
 
 /// Source for complex formatted argument data
 #[derive(Debug, Clone)]
-enum ComplexArgSource {
+enum ComplexArgSource<'ctx> {
     RuntimeRead {
         eval_result: ghostscope_dwarf::EvaluationResult,
         dwarf_type: ghostscope_dwarf::TypeInfo,
@@ -49,19 +51,374 @@ enum ComplexArgSource {
         eval_result: ghostscope_dwarf::EvaluationResult,
         module_for_offsets: Option<String>,
     },
+    // Newly added: a value computed in LLVM at runtime (e.g., expression result)
+    ComputedInt {
+        value: inkwell::values::IntValue<'ctx>,
+        byte_len: usize, // typically 8
+    },
 }
 
 /// Argument descriptor for PrintComplexFormat
 #[derive(Debug, Clone)]
-struct ComplexArg {
+struct ComplexArg<'ctx> {
     var_name_index: u16,
     type_index: u16,
     access_path: Vec<u8>,
     data_len: usize,
-    source: ComplexArgSource,
+    source: ComplexArgSource<'ctx>,
 }
 
 impl<'ctx> EbpfContext<'ctx> {
+    /// Generate PrintComplexVariable instruction that embeds a computed integer value (no runtime read)
+    /// This is used for `print expr;` where expr is an rvalue computed in eBPF.
+    fn generate_print_complex_variable_computed(
+        &mut self,
+        var_name_index: u16,
+        type_index: u16,
+        byte_len: usize,
+        value: IntValue<'ctx>,
+    ) -> Result<()> {
+        // Build sizes
+        let header_size = std::mem::size_of::<InstructionHeader>();
+        let data_struct_size = std::mem::size_of::<PrintComplexVariableData>();
+        let access_path_len: usize = 0; // computed expr has no access path
+        let total_data_length = data_struct_size + access_path_len + byte_len;
+        let total_size = header_size + total_data_length;
+
+        // Create instruction buffer
+        let inst_buffer = self.create_instruction_buffer();
+
+        // Write InstructionHeader.inst_type
+        let inst_type_val = self
+            .context
+            .i8_type()
+            .const_int(InstructionType::PrintComplexVariable as u64, false);
+        self.builder
+            .build_store(inst_buffer, inst_type_val)
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store inst_type: {}", e)))?;
+
+        // Write data_length (u16) at offset 1
+        let data_length_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    inst_buffer,
+                    &[self.context.i32_type().const_int(1, false)],
+                    "data_length_ptr",
+                )
+                .map_err(|e| {
+                    CodeGenError::LLVMError(format!("Failed to get data_length GEP: {}", e))
+                })?
+        };
+        let data_length_ptr_cast = self
+            .builder
+            .build_pointer_cast(
+                data_length_ptr,
+                self.context.ptr_type(AddressSpace::default()),
+                "data_length_ptr_cast",
+            )
+            .map_err(|e| {
+                CodeGenError::LLVMError(format!("Failed to cast data_length ptr: {}", e))
+            })?;
+        self.builder
+            .build_store(
+                data_length_ptr_cast,
+                self.context
+                    .i16_type()
+                    .const_int(total_data_length as u64, false),
+            )
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_length: {}", e)))?;
+
+        // Data pointer (after header)
+        let data_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    inst_buffer,
+                    &[self.context.i32_type().const_int(header_size as u64, false)],
+                    "data_ptr",
+                )
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get data GEP: {}", e)))?
+        };
+
+        // var_name_index (u16)
+        let var_name_index_val = self
+            .context
+            .i16_type()
+            .const_int(var_name_index as u64, false);
+        let var_name_index_off =
+            std::mem::offset_of!(PrintComplexVariableData, var_name_index) as u64;
+        let var_name_index_ptr_i8 = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    data_ptr,
+                    &[self.context.i32_type().const_int(var_name_index_off, false)],
+                    "var_name_index_ptr_i8",
+                )
+                .map_err(|e| {
+                    CodeGenError::LLVMError(format!("Failed to get var_name_index GEP: {}", e))
+                })?
+        };
+        let var_name_index_ptr_i16 = self
+            .builder
+            .build_pointer_cast(
+                var_name_index_ptr_i8,
+                self.context.ptr_type(AddressSpace::default()),
+                "var_name_index_ptr_i16",
+            )
+            .map_err(|e| {
+                CodeGenError::LLVMError(format!("Failed to cast var_name_index ptr: {}", e))
+            })?;
+        self.builder
+            .build_store(var_name_index_ptr_i16, var_name_index_val)
+            .map_err(|e| {
+                CodeGenError::LLVMError(format!("Failed to store var_name_index: {}", e))
+            })?;
+
+        // type_index (u16)
+        let type_index_offset = std::mem::offset_of!(PrintComplexVariableData, type_index) as u64;
+        let type_index_ptr_i8 = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    data_ptr,
+                    &[self.context.i32_type().const_int(type_index_offset, false)],
+                    "type_index_ptr_i8",
+                )
+                .map_err(|e| {
+                    CodeGenError::LLVMError(format!("Failed to get type_index GEP: {}", e))
+                })?
+        };
+        let type_index_ptr = self
+            .builder
+            .build_pointer_cast(
+                type_index_ptr_i8,
+                self.context.ptr_type(AddressSpace::default()),
+                "type_index_ptr_i16",
+            )
+            .map_err(|e| {
+                CodeGenError::LLVMError(format!("Failed to cast type_index ptr: {}", e))
+            })?;
+        let type_index_val = self.context.i16_type().const_int(type_index as u64, false);
+        self.builder
+            .build_store(type_index_ptr, type_index_val)
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store type_index: {}", e)))?;
+
+        // access_path_len (u8) = 0
+        let access_path_len_off =
+            std::mem::offset_of!(PrintComplexVariableData, access_path_len) as u64;
+        let access_path_len_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    data_ptr,
+                    &[self
+                        .context
+                        .i32_type()
+                        .const_int(access_path_len_off, false)],
+                    "access_path_len_ptr",
+                )
+                .map_err(|e| {
+                    CodeGenError::LLVMError(format!("Failed to get access_path_len GEP: {}", e))
+                })?
+        };
+        self.builder
+            .build_store(access_path_len_ptr, self.context.i8_type().const_zero())
+            .map_err(|e| {
+                CodeGenError::LLVMError(format!("Failed to store access_path_len: {}", e))
+            })?;
+
+        // status (u8) = 0
+        let status_off = std::mem::offset_of!(PrintComplexVariableData, status) as u64;
+        let status_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    data_ptr,
+                    &[self.context.i32_type().const_int(status_off, false)],
+                    "status_ptr",
+                )
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get status GEP: {}", e)))?
+        };
+        self.builder
+            .build_store(status_ptr, self.context.i8_type().const_zero())
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store status: {}", e)))?;
+
+        // data_len (u16)
+        let data_len_off = std::mem::offset_of!(PrintComplexVariableData, data_len) as u64;
+        let data_len_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    data_ptr,
+                    &[self.context.i32_type().const_int(data_len_off, false)],
+                    "data_len_ptr",
+                )
+                .map_err(|e| {
+                    CodeGenError::LLVMError(format!("Failed to get data_len GEP: {}", e))
+                })?
+        };
+        let data_len_ptr_cast = self
+            .builder
+            .build_pointer_cast(
+                data_len_ptr,
+                self.context.ptr_type(AddressSpace::default()),
+                "data_len_ptr_cast",
+            )
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast data_len ptr: {}", e)))?;
+        self.builder
+            .build_store(
+                data_len_ptr_cast,
+                self.context.i16_type().const_int(byte_len as u64, false),
+            )
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_len: {}", e)))?;
+
+        // variable data starts right after PrintComplexVariableData (no access path)
+        let var_data_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    data_ptr,
+                    &[self
+                        .context
+                        .i32_type()
+                        .const_int(data_struct_size as u64, false)],
+                    "var_data_ptr",
+                )
+                .map_err(|e| {
+                    CodeGenError::LLVMError(format!("Failed to get var_data GEP: {}", e))
+                })?
+        };
+
+        // Store computed integer value into payload according to byte_len
+        match byte_len {
+            1 => {
+                let bitw = value.get_type().get_bit_width();
+                let v = if bitw < 8 {
+                    self.builder
+                        .build_int_z_extend(value, self.context.i8_type(), "expr_zext_i8")
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                } else if bitw > 8 {
+                    self.builder
+                        .build_int_truncate(value, self.context.i8_type(), "expr_trunc_i8")
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                } else {
+                    value
+                };
+                self.builder
+                    .build_store(var_data_ptr, v)
+                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            }
+            2 => {
+                let bitw = value.get_type().get_bit_width();
+                let v = if bitw < 16 {
+                    self.builder
+                        .build_int_z_extend(value, self.context.i16_type(), "expr_zext_i16")
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                } else if bitw > 16 {
+                    self.builder
+                        .build_int_truncate(value, self.context.i16_type(), "expr_trunc_i16")
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                } else {
+                    value
+                };
+                let i16_ptr_ty = self.context.ptr_type(AddressSpace::default());
+                let cast_ptr = self
+                    .builder
+                    .build_pointer_cast(var_data_ptr, i16_ptr_ty, "expr_i16_ptr")
+                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                self.builder
+                    .build_store(cast_ptr, v)
+                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            }
+            4 => {
+                let bitw = value.get_type().get_bit_width();
+                let v = if bitw < 32 {
+                    self.builder
+                        .build_int_z_extend(value, self.context.i32_type(), "expr_zext_i32")
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                } else if bitw > 32 {
+                    self.builder
+                        .build_int_truncate(value, self.context.i32_type(), "expr_trunc_i32")
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                } else {
+                    value
+                };
+                let i32_ptr_ty = self.context.ptr_type(AddressSpace::default());
+                let cast_ptr = self
+                    .builder
+                    .build_pointer_cast(var_data_ptr, i32_ptr_ty, "expr_i32_ptr")
+                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                self.builder
+                    .build_store(cast_ptr, v)
+                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            }
+            8 => {
+                let v64 = if value.get_type().get_bit_width() < 64 {
+                    self.builder
+                        .build_int_z_extend(value, self.context.i64_type(), "expr_zext_i64")
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                } else {
+                    value
+                };
+                let i64_ptr_ty = self.context.ptr_type(AddressSpace::default());
+                let cast_ptr = self
+                    .builder
+                    .build_pointer_cast(var_data_ptr, i64_ptr_ty, "expr_i64_ptr")
+                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                self.builder
+                    .build_store(cast_ptr, v64)
+                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            }
+            n => {
+                // Fallback: write lowest n bytes little-endian
+                let v64 = if value.get_type().get_bit_width() < 64 {
+                    self.builder
+                        .build_int_z_extend(value, self.context.i64_type(), "expr_zext_fallback")
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                } else {
+                    value
+                };
+                for i in 0..n {
+                    let shift = self.context.i64_type().const_int((i * 8) as u64, false);
+                    let shifted = self
+                        .builder
+                        .build_right_shift(v64, shift, false, &format!("expr_shr_{i}"))
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    let byte = self
+                        .builder
+                        .build_int_truncate(
+                            shifted,
+                            self.context.i8_type(),
+                            &format!("expr_byte_{i}"),
+                        )
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    let byte_ptr = unsafe {
+                        self.builder
+                            .build_gep(
+                                self.context.i8_type(),
+                                var_data_ptr,
+                                &[self.context.i32_type().const_int(i as u64, false)],
+                                &format!("expr_byte_ptr_{i}"),
+                            )
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                    };
+                    self.builder
+                        .build_store(byte_ptr, byte)
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                }
+            }
+        }
+
+        // Send via ringbuf
+        self.send_instruction_via_ringbuf(
+            inst_buffer,
+            self.context.i64_type().const_int(total_size as u64, false),
+        )?;
+
+        Ok(())
+    }
     /// Determine if a TypeInfo qualifies as a "simple variable" for PrintVariableIndex
     /// Simple: base types (bool/int/float/char), enums (with base type 1/2/4/8), pointers;
     /// Complex: arrays, structs, unions, functions
@@ -119,6 +476,81 @@ impl<'ctx> EbpfContext<'ctx> {
     }
 
     // (No implicit char[] fallback here; rely on DWARF/type resolver to provide sizes.)
+
+    fn expr_to_name(&self, expr: &crate::script::ast::Expr) -> String {
+        use crate::script::ast::Expr as E;
+        fn inner(e: &E) -> String {
+            match e {
+                E::Variable(s) => s.clone(),
+                E::MemberAccess(obj, field) => format!("{}.{field}", inner(obj)),
+                E::ArrayAccess(arr, idx) => format!("{}[{}]", inner(arr), inner(idx)),
+                E::PointerDeref(p) => format!("*{}", inner(p)),
+                E::AddressOf(p) => format!("&{}", inner(p)),
+                E::ChainAccess(v) => v.join("."),
+                E::Int(v) => v.to_string(),
+                E::String(s) => format!("\"{}\"", s),
+                E::Float(v) => format!("{}", v),
+                E::SpecialVar(s) => format!("${}", s),
+                E::BinaryOp { left, op, right } => {
+                    let op_str = match op {
+                        crate::script::ast::BinaryOp::Add => "+",
+                        crate::script::ast::BinaryOp::Subtract => "-",
+                        crate::script::ast::BinaryOp::Multiply => "*",
+                        crate::script::ast::BinaryOp::Divide => "/",
+                        crate::script::ast::BinaryOp::Equal => "==",
+                        crate::script::ast::BinaryOp::NotEqual => "!=",
+                        crate::script::ast::BinaryOp::LessThan => "<",
+                        crate::script::ast::BinaryOp::LessEqual => "<=",
+                        crate::script::ast::BinaryOp::GreaterThan => ">",
+                        crate::script::ast::BinaryOp::GreaterEqual => ">=",
+                        crate::script::ast::BinaryOp::LogicalAnd => "&&",
+                        crate::script::ast::BinaryOp::LogicalOr => "||",
+                    };
+                    format!("({}{}{})", inner(left), op_str, inner(right))
+                }
+            }
+        }
+        let mut s = inner(expr);
+        const MAX_NAME: usize = 96;
+        if s.len() > MAX_NAME {
+            s.truncate(MAX_NAME.saturating_sub(3));
+            s.push_str("...");
+        }
+        s
+    }
+
+    fn is_pure_lvalue(expr: &crate::script::ast::Expr) -> bool {
+        use crate::script::ast::Expr as E;
+        match expr {
+            E::Variable(_) => true,
+            E::MemberAccess(obj, _) => Self::is_pure_lvalue(obj),
+            E::ArrayAccess(arr, idx) => matches!(**idx, E::Int(_)) && Self::is_pure_lvalue(arr),
+            E::PointerDeref(inner) => Self::is_pure_lvalue(inner),
+            E::ChainAccess(_) => true,
+            // Treat address-of as lvalue-related (we handle it separately where needed)
+            E::AddressOf(_) => true,
+            _ => false,
+        }
+    }
+
+    fn contains_binary_op(expr: &crate::script::ast::Expr) -> bool {
+        use crate::script::ast::Expr as E;
+        match expr {
+            E::BinaryOp { .. } => true,
+            E::MemberAccess(obj, _) => Self::contains_binary_op(obj),
+            E::ArrayAccess(arr, idx) => {
+                Self::contains_binary_op(arr) || Self::contains_binary_op(idx)
+            }
+            E::PointerDeref(inner) => Self::contains_binary_op(inner),
+            E::AddressOf(inner) => Self::contains_binary_op(inner),
+            E::ChainAccess(_)
+            | E::Variable(_)
+            | E::Int(_)
+            | E::String(_)
+            | E::SpecialVar(_)
+            | E::Float(_) => false,
+        }
+    }
 
     /// Main entry point: compile program with staged transmission system
     pub fn compile_program_with_staged_transmission(
@@ -346,7 +778,16 @@ impl<'ctx> EbpfContext<'ctx> {
             }
             PrintStatement::ComplexVariable(expr) => {
                 info!("Processing complex variable: {:?}", expr);
-                // Special-case address-of: print pointer value with type info
+                // Prefer DWARF-backed formatting when the expression resolves to a program variable/field
+                if self.query_dwarf_for_complex_expr(expr)?.is_some() {
+                    let n = self.process_complex_variable_print(expr)?;
+                    tracing::trace!(
+                        instructions = n,
+                        "compile_print_statement: DWARF-backed complex expr emitted"
+                    );
+                    return Ok(n);
+                }
+                // Special-case address-of before computed path to preserve pointer formatting
                 if let crate::script::Expr::AddressOf(inner) = expr {
                     let var = self
                         .query_dwarf_for_complex_expr(inner)?
@@ -379,6 +820,32 @@ impl<'ctx> EbpfContext<'ctx> {
                     tracing::trace!(
                         "compile_print_statement: address-of emitted via ComplexFormat"
                     );
+                    return Ok(1);
+                }
+                // Fast path only for pure script expressions (non-DWARF backed)
+                if let Ok(BasicValueEnum::IntValue(iv)) = self.compile_expr(expr) {
+                    let bitw = iv.get_type().get_bit_width();
+                    let (kind, byte_len) = if bitw == 1 {
+                        (TypeKind::Bool, 1)
+                    } else if bitw <= 8 {
+                        (TypeKind::U8, 1)
+                    } else if bitw <= 16 {
+                        (TypeKind::U16, 2)
+                    } else if bitw <= 32 {
+                        (TypeKind::U32, 4)
+                    } else {
+                        (TypeKind::I64, 8)
+                    };
+                    // Route to PrintComplexVariable so the name is preserved in output
+                    let var_name = self.expr_to_name(expr);
+                    let var_name_index = self.trace_context.add_variable_name(var_name);
+                    let type_index = self.add_synthesized_type_index_for_kind(kind);
+                    self.generate_print_complex_variable_computed(
+                        var_name_index,
+                        type_index,
+                        byte_len,
+                        iv,
+                    )?;
                     return Ok(1);
                 }
                 let n = self.process_complex_variable_print(expr)?;
@@ -481,66 +948,186 @@ impl<'ctx> EbpfContext<'ctx> {
             false
         };
 
-        let use_complex = has_complex_shape || has_complex_dwarf_var || has_global_link_addr;
+        // If any arg is a pure script expression (not a simple variable/string/int literal),
+        // route to complex path so we can embed a ComputedInt at runtime.
+        let has_script_expr = args.iter().any(|arg| {
+            !matches!(
+                arg,
+                crate::script::ast::Expr::Variable(_)
+                    | crate::script::ast::Expr::String(_)
+                    | crate::script::ast::Expr::Int(_)
+                    | crate::script::ast::Expr::MemberAccess(_, _)
+                    | crate::script::ast::Expr::ArrayAccess(_, _)
+                    | crate::script::ast::Expr::PointerDeref(_)
+                    | crate::script::ast::Expr::ChainAccess(_)
+                    | crate::script::ast::Expr::AddressOf(_)
+            )
+        });
 
-        if !use_complex {
-            // Simple fast path: variables + literals via PrintFormat
-            let mut variable_infos = Vec::new();
-            for (i, arg) in args.iter().enumerate() {
-                match arg {
-                    crate::script::ast::Expr::Variable(var_name) => {
-                        info!("Processing argument {}: variable '{}'", i, var_name);
-                        let (var_name_index, type_encoding) =
-                            self.resolve_variable_with_priority(var_name)?;
-                        let data_size = self.get_type_size(type_encoding);
-                        variable_infos.push(FormatVariableInfo {
-                            var_name: var_name.clone(),
-                            var_name_index,
-                            type_encoding,
-                            data_size,
-                            value_source: FormatValueSource::Variable,
-                        });
-                    }
-                    crate::script::ast::Expr::String(s) => {
-                        info!("Processing argument {}: string literal '{}'", i, s);
-                        let var_name = format!("__str_literal_{}", i);
-                        let var_name_index = self.trace_context.add_variable_name(var_name.clone());
-                        variable_infos.push(FormatVariableInfo {
-                            var_name,
-                            var_name_index,
-                            type_encoding: TypeKind::CString,
-                            data_size: s.len() + 1,
-                            value_source: FormatValueSource::StringLiteral,
-                        });
-                    }
-                    crate::script::ast::Expr::Int(_) => {
-                        info!("Processing argument {}: integer literal", i);
-                        let var_name = format!("__int_literal_{}", i);
-                        let var_name_index = self.trace_context.add_variable_name(var_name.clone());
-                        variable_infos.push(FormatVariableInfo {
-                            var_name,
-                            var_name_index,
-                            type_encoding: TypeKind::I64,
-                            data_size: 8,
-                            value_source: FormatValueSource::IntegerLiteral,
-                        });
-                    }
-                    other => {
-                        return Err(CodeGenError::NotImplemented(format!(
-                            "Expression type {:?} not supported in formatted print",
-                            other
-                        )));
+        let _use_complex =
+            has_complex_shape || has_complex_dwarf_var || has_global_link_addr || has_script_expr;
+
+        // Complex path: build PrintComplexFormat with DWARF-resolved arguments (and embed literals/expressions)
+        let mut complex_args: Vec<ComplexArg<'ctx>> = Vec::with_capacity(args.len());
+        for (i, arg) in args.iter().enumerate() {
+            // If expression contains any binary op, compile to computed value first
+            if Self::contains_binary_op(arg) && !Self::is_pure_lvalue(arg) {
+                let compiled = self.compile_expr(arg)?;
+                if let BasicValueEnum::IntValue(iv) = compiled {
+                    let bitw = iv.get_type().get_bit_width();
+                    let (kind, byte_len) = if bitw == 1 {
+                        (TypeKind::Bool, 1)
+                    } else if bitw <= 8 {
+                        (TypeKind::U8, 1)
+                    } else if bitw <= 16 {
+                        (TypeKind::U16, 2)
+                    } else if bitw <= 32 {
+                        (TypeKind::U32, 4)
+                    } else {
+                        (TypeKind::I64, 8)
+                    };
+                    let var_name = self.expr_to_name(arg);
+                    complex_args.push(ComplexArg {
+                        var_name_index: self.trace_context.add_variable_name(var_name),
+                        type_index: self.add_synthesized_type_index_for_kind(kind),
+                        access_path: Vec::new(),
+                        data_len: byte_len,
+                        source: ComplexArgSource::ComputedInt {
+                            value: iv,
+                            byte_len,
+                        },
+                    });
+                    continue;
+                }
+            }
+            // Fast path for DWARF-backed simple scalar variables (register/stack value):
+            // only apply when DWARF type is a simple scalar/pointer; avoid treating char[] arrays as integers.
+            if let crate::script::ast::Expr::Variable(name) = arg {
+                if !self.variable_exists(name) {
+                    if let Some(v) = self.query_dwarf_for_variable(name)? {
+                        if let Some(ref t) = v.dwarf_type {
+                            // Only use computed fast-path for simple scalars that are not link-time addresses
+                            let is_simple = Self::is_simple_typeinfo(t);
+                            let is_link_addr = matches!(
+                                v.evaluation_result,
+                                ghostscope_dwarf::EvaluationResult::MemoryLocation(
+                                    ghostscope_dwarf::LocationResult::Address(_)
+                                )
+                            );
+                            if is_simple && !is_link_addr {
+                                if let Ok(BasicValueEnum::IntValue(iv)) = self.compile_expr(arg) {
+                                    let bitw = iv.get_type().get_bit_width();
+                                    let (kind, byte_len) = if bitw == 1 {
+                                        (TypeKind::Bool, 1)
+                                    } else if bitw <= 8 {
+                                        (TypeKind::U8, 1)
+                                    } else if bitw <= 16 {
+                                        (TypeKind::U16, 2)
+                                    } else if bitw <= 32 {
+                                        (TypeKind::U32, 4)
+                                    } else {
+                                        (TypeKind::I64, 8)
+                                    };
+                                    let var_name = self.expr_to_name(arg);
+                                    complex_args.push(ComplexArg {
+                                        var_name_index: self
+                                            .trace_context
+                                            .add_variable_name(var_name),
+                                        type_index: self.add_synthesized_type_index_for_kind(kind),
+                                        access_path: Vec::new(),
+                                        data_len: byte_len,
+                                        source: ComplexArgSource::ComputedInt {
+                                            value: iv,
+                                            byte_len,
+                                        },
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
                     }
                 }
             }
-            self.generate_print_format_instruction(format_string_index, &variable_infos)?;
-            return Ok(1);
-        }
-
-        // Complex path: build PrintComplexFormat with DWARF-resolved arguments (and embed literals)
-        let mut complex_args: Vec<ComplexArg> = Vec::with_capacity(args.len());
-        for (i, arg) in args.iter().enumerate() {
             match arg {
+                // Script variable: prefer script scope value over DWARF
+                crate::script::ast::Expr::Variable(name) if self.variable_exists(name) => {
+                    let loaded = self.load_variable(name)?;
+                    // Normalize to integer payloads for transport
+                    let (iv, kind, byte_len) = match loaded {
+                        BasicValueEnum::IntValue(v) => {
+                            let bitw = v.get_type().get_bit_width();
+                            let (k, bl) = if bitw == 1 {
+                                (TypeKind::Bool, 1)
+                            } else if bitw <= 8 {
+                                (TypeKind::U8, 1)
+                            } else if bitw <= 16 {
+                                (TypeKind::U16, 2)
+                            } else if bitw <= 32 {
+                                (TypeKind::U32, 4)
+                            } else {
+                                (TypeKind::I64, 8)
+                            };
+                            (v, k, bl)
+                        }
+                        BasicValueEnum::PointerValue(pv) => {
+                            // Cast pointer to i64 for transport
+                            let v = self
+                                .builder
+                                .build_ptr_to_int(pv, self.context.i64_type(), "ptr_as_i64")
+                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                            (v, TypeKind::Pointer, 8)
+                        }
+                        _ => {
+                            return Err(CodeGenError::NotImplemented(
+                                "Only integer/pointer script variables supported in formatted print"
+                                    .to_string(),
+                            ));
+                        }
+                    };
+                    complex_args.push(ComplexArg {
+                        var_name_index: self.trace_context.add_variable_name(name.to_string()),
+                        type_index: self.add_synthesized_type_index_for_kind(kind),
+                        access_path: Vec::new(),
+                        data_len: byte_len,
+                        source: ComplexArgSource::ComputedInt {
+                            value: iv,
+                            byte_len,
+                        },
+                    });
+                }
+                // Expressions: compile to computed runtime value and send as variable
+                crate::script::ast::Expr::BinaryOp { .. } => {
+                    let compiled = self.compile_expr(arg)?;
+                    if let BasicValueEnum::IntValue(iv) = compiled {
+                        let bitw = iv.get_type().get_bit_width();
+                        let (kind, byte_len) = if bitw == 1 {
+                            (TypeKind::Bool, 1)
+                        } else if bitw <= 8 {
+                            (TypeKind::U8, 1)
+                        } else if bitw <= 16 {
+                            (TypeKind::U16, 2)
+                        } else if bitw <= 32 {
+                            (TypeKind::U32, 4)
+                        } else {
+                            (TypeKind::I64, 8)
+                        };
+                        let var_name = self.expr_to_name(arg);
+                        complex_args.push(ComplexArg {
+                            var_name_index: self.trace_context.add_variable_name(var_name),
+                            type_index: self.add_synthesized_type_index_for_kind(kind),
+                            access_path: Vec::new(),
+                            data_len: byte_len,
+                            source: ComplexArgSource::ComputedInt {
+                                value: iv,
+                                byte_len,
+                            },
+                        });
+                    } else {
+                        return Err(CodeGenError::NotImplemented(
+                            "Non-integer expression not supported in formatted print".to_string(),
+                        ));
+                    }
+                }
                 crate::script::ast::Expr::String(s) => {
                     // Treat as char array type with immediate bytes
                     let var_name = format!("__str_literal_{}", i);
@@ -648,11 +1235,37 @@ impl<'ctx> EbpfContext<'ctx> {
                         },
                     });
                 }
-                other => {
-                    return Err(CodeGenError::NotImplemented(format!(
-                        "Expression type {:?} not supported in formatted print",
-                        other
-                    )));
+                // Fallback: compile arbitrary expression into an integer and embed as computed data
+                other_expr => {
+                    let compiled = self.compile_expr(other_expr)?;
+                    if let BasicValueEnum::IntValue(iv) = compiled {
+                        let bitw = iv.get_type().get_bit_width();
+                        let (kind, byte_len) = if bitw <= 8 {
+                            (TypeKind::U8, 1)
+                        } else if bitw <= 16 {
+                            (TypeKind::U16, 2)
+                        } else if bitw <= 32 {
+                            (TypeKind::U32, 4)
+                        } else {
+                            (TypeKind::I64, 8)
+                        };
+                        let var_name = self.expr_to_name(other_expr);
+                        complex_args.push(ComplexArg {
+                            var_name_index: self.trace_context.add_variable_name(var_name),
+                            type_index: self.add_synthesized_type_index_for_kind(kind),
+                            access_path: Vec::new(),
+                            data_len: byte_len,
+                            source: ComplexArgSource::ComputedInt {
+                                value: iv,
+                                byte_len,
+                            },
+                        });
+                    } else {
+                        return Err(CodeGenError::NotImplemented(format!(
+                            "Expression {:?} not supported in formatted print",
+                            other_expr
+                        )));
+                    }
                 }
             }
         }
@@ -662,6 +1275,7 @@ impl<'ctx> EbpfContext<'ctx> {
     }
 
     /// Get the size in bytes for a given type encoding
+    #[allow(dead_code)]
     fn get_type_size(&self, type_encoding: TypeKind) -> usize {
         match type_encoding {
             TypeKind::U8 | TypeKind::I8 | TypeKind::Bool | TypeKind::Char => 1,
@@ -847,6 +1461,7 @@ impl<'ctx> EbpfContext<'ctx> {
     }
 
     /// Generate eBPF code for PrintFormat instruction (true single instruction implementation)
+    #[allow(dead_code)]
     fn generate_print_format_instruction(
         &mut self,
         format_string_index: u16,
@@ -1328,7 +1943,7 @@ impl<'ctx> EbpfContext<'ctx> {
     fn generate_print_complex_format_instruction(
         &mut self,
         format_string_index: u16,
-        complex_args: &[ComplexArg],
+        complex_args: &[ComplexArg<'ctx>],
     ) -> Result<()> {
         use ghostscope_protocol::trace_event::PrintComplexFormatData;
         use InstructionType::PrintComplexFormat as IT;
@@ -1344,6 +1959,7 @@ impl<'ctx> EbpfContext<'ctx> {
                 ComplexArgSource::ImmediateBytes { bytes } => bytes.len(),
                 ComplexArgSource::AddressValue { .. } => 8,
                 ComplexArgSource::RuntimeRead { .. } => std::cmp::max(a.data_len, 12),
+                ComplexArgSource::ComputedInt { byte_len, .. } => *byte_len,
             };
             total_args_payload += header_len + reserved_payload;
             arg_count = arg_count.saturating_add(1);
@@ -1450,6 +2066,7 @@ impl<'ctx> EbpfContext<'ctx> {
                 ComplexArgSource::ImmediateBytes { bytes } => bytes.len(),
                 ComplexArgSource::AddressValue { .. } => 8,
                 ComplexArgSource::RuntimeRead { .. } => std::cmp::max(a.data_len, 12),
+                ComplexArgSource::ComputedInt { byte_len, .. } => *byte_len,
             };
 
             // Base pointer = data_ptr + offset
@@ -1648,6 +2265,169 @@ impl<'ctx> EbpfContext<'ctx> {
                             })?;
                     }
                     // data_len already set to reserved_len
+                }
+                ComplexArgSource::ComputedInt { value, byte_len } => {
+                    // Write computed integer into payload buffer based on requested byte_len
+                    // Ensure the destination pointer element type matches the stored value type.
+                    match *byte_len {
+                        1 => {
+                            let bitw = value.get_type().get_bit_width();
+                            let v = if bitw < 8 {
+                                // i1..i7 -> zext to i8
+                                self.builder
+                                    .build_int_z_extend(
+                                        *value,
+                                        self.context.i8_type(),
+                                        "expr_zext_i8",
+                                    )
+                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                            } else if bitw > 8 {
+                                // wider than i8 -> truncate
+                                self.builder
+                                    .build_int_truncate(
+                                        *value,
+                                        self.context.i8_type(),
+                                        "expr_trunc_i8",
+                                    )
+                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                            } else {
+                                // exactly i8
+                                *value
+                            };
+                            // var_data_ptr is i8* already; store directly
+                            self.builder
+                                .build_store(var_data_ptr, v)
+                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        }
+                        2 => {
+                            let bitw = value.get_type().get_bit_width();
+                            let v = if bitw < 16 {
+                                self.builder
+                                    .build_int_z_extend(
+                                        *value,
+                                        self.context.i16_type(),
+                                        "expr_zext_i16",
+                                    )
+                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                            } else if bitw > 16 {
+                                self.builder
+                                    .build_int_truncate(
+                                        *value,
+                                        self.context.i16_type(),
+                                        "expr_trunc_i16",
+                                    )
+                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                            } else {
+                                // equal width: i16
+                                *value
+                            };
+                            let i16_ptr_ty = self.context.ptr_type(AddressSpace::default());
+                            let cast_ptr = self
+                                .builder
+                                .build_pointer_cast(var_data_ptr, i16_ptr_ty, "expr_i16_ptr")
+                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                            self.builder
+                                .build_store(cast_ptr, v)
+                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        }
+                        4 => {
+                            let bitw = value.get_type().get_bit_width();
+                            let v = if bitw < 32 {
+                                self.builder
+                                    .build_int_z_extend(
+                                        *value,
+                                        self.context.i32_type(),
+                                        "expr_zext_i32",
+                                    )
+                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                            } else if bitw > 32 {
+                                self.builder
+                                    .build_int_truncate(
+                                        *value,
+                                        self.context.i32_type(),
+                                        "expr_trunc_i32",
+                                    )
+                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                            } else {
+                                // equal width: i32
+                                *value
+                            };
+                            let i32_ptr_ty = self.context.ptr_type(AddressSpace::default());
+                            let cast_ptr = self
+                                .builder
+                                .build_pointer_cast(var_data_ptr, i32_ptr_ty, "expr_i32_ptr")
+                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                            self.builder
+                                .build_store(cast_ptr, v)
+                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        }
+                        8 => {
+                            let v64 = if value.get_type().get_bit_width() < 64 {
+                                self.builder
+                                    .build_int_z_extend(
+                                        *value,
+                                        self.context.i64_type(),
+                                        "expr_zext",
+                                    )
+                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                            } else {
+                                *value
+                            };
+                            let i64_ptr_ty = self.context.ptr_type(AddressSpace::default());
+                            let cast_ptr = self
+                                .builder
+                                .build_pointer_cast(var_data_ptr, i64_ptr_ty, "expr_i64_ptr")
+                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                            self.builder
+                                .build_store(cast_ptr, v64)
+                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        }
+                        n => {
+                            // Fallback: write the lowest n bytes little-endian
+                            // Truncate/extend to 64-bit, then emit byte stores
+                            let v64 = if value.get_type().get_bit_width() < 64 {
+                                self.builder
+                                    .build_int_z_extend(
+                                        *value,
+                                        self.context.i64_type(),
+                                        "expr_zext_fallback",
+                                    )
+                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                            } else {
+                                *value
+                            };
+                            for i in 0..n {
+                                // Extract byte i
+                                let shift =
+                                    self.context.i64_type().const_int((i * 8) as u64, false);
+                                let shifted = self
+                                    .builder
+                                    .build_right_shift(v64, shift, false, &format!("expr_shr_{i}"))
+                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                                let byte = self
+                                    .builder
+                                    .build_int_truncate(
+                                        shifted,
+                                        self.context.i8_type(),
+                                        &format!("expr_byte_{i}"),
+                                    )
+                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                                let byte_ptr = unsafe {
+                                    self.builder
+                                        .build_gep(
+                                            self.context.i8_type(),
+                                            var_data_ptr,
+                                            &[self.context.i32_type().const_int(i as u64, false)],
+                                            &format!("expr_byte_ptr_{i}"),
+                                        )
+                                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                                };
+                                self.builder
+                                    .build_store(byte_ptr, byte)
+                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                            }
+                        }
+                    }
                 }
                 ComplexArgSource::RuntimeRead {
                     eval_result,
@@ -1849,6 +2629,7 @@ impl<'ctx> EbpfContext<'ctx> {
     }
 
     /// Store variable data at the specified pointer location
+    #[allow(dead_code)]
     fn store_variable_data(
         &mut self,
         var_data_ptr: PointerValue<'ctx>,
@@ -3883,5 +4664,51 @@ impl<'ctx> EbpfContext<'ctx> {
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::CompileOptions;
+
+    #[test]
+    fn computed_int_store_i64_compiles() {
+        let context = inkwell::context::Context::create();
+        let opts = CompileOptions::default();
+        let mut ctx =
+            EbpfContext::new(&context, "test_mod", Some(0), &opts).expect("create EbpfContext");
+        // print {} with a pure script integer expression triggers ComputedInt path
+        let expr = crate::script::Expr::BinaryOp {
+            left: Box::new(crate::script::Expr::Int(41)),
+            op: crate::script::BinaryOp::Add,
+            right: Box::new(crate::script::Expr::Int(1)),
+        };
+        let stmt =
+            crate::script::Statement::Print(crate::script::PrintStatement::ComplexVariable(expr));
+        let program = crate::script::Program::new();
+        let res = ctx.compile_program(&program, "test_func", &[stmt], None, None, None);
+        assert!(res.is_ok(), "Compilation failed: {:?}", res.err());
+    }
+
+    #[test]
+    fn computed_int_in_format_compiles() {
+        let context = inkwell::context::Context::create();
+        let opts = CompileOptions::default();
+        let mut ctx =
+            EbpfContext::new(&context, "test_mod", Some(0), &opts).expect("create EbpfContext");
+        // formatted print with expression argument should also route into ComputedInt path
+        let expr = crate::script::Expr::BinaryOp {
+            left: Box::new(crate::script::Expr::Int(1)),
+            op: crate::script::BinaryOp::Add,
+            right: Box::new(crate::script::Expr::Int(2)),
+        };
+        let stmt = crate::script::Statement::Print(crate::script::PrintStatement::Formatted {
+            format: "sum:{}".to_string(),
+            args: vec![expr],
+        });
+        let program = crate::script::Program::new();
+        let res = ctx.compile_program(&program, "test_fmt", &[stmt], None, None, None);
+        assert!(res.is_ok(), "Compilation failed: {:?}", res.err());
     }
 }
