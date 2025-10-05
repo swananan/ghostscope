@@ -2436,10 +2436,8 @@ impl App {
                     summary.total, summary.active
                 );
                 for trace in &traces {
-                    response.push_str(&format!(
-                        "  #{} - {} ({})\n",
-                        trace.trace_id, trace.target_display, trace.status
-                    ));
+                    // Use format_line() to show detailed info including address and module
+                    response.push_str(&format!("  {}\n", trace.format_line()));
                 }
                 let action = Action::AddResponse {
                     content: response,
