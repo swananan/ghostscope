@@ -209,6 +209,8 @@ let quotient = a / b;  // Division
 4. Multiplication `/`, Division `/`
 5. Addition `+`, Subtraction `-`
 6. Comparisons `==`, `!=`, `<`, `<=`, `>`, `>=`
+7. Logical AND `&&`
+8. Logical OR `||`
 
 ### Expression Grouping
 
@@ -216,6 +218,69 @@ let quotient = a / b;  // Division
 // Use parentheses for explicit precedence
 let result = (a + b) * c;
 let complex = (x + y) / (a - b);
+```
+
+### Logical Operators
+
+- `&&` (logical AND), `||` (logical OR)
+- Operands are treated as booleans with "non-zero is true" semantics
+- Current implementation evaluates both sides (no short-circuit yet)
+
+Examples
+
+```ghostscope
+trace main:entry {
+    if a > 10 && b == 0 {
+        print "AND";
+    } else if a < 100 || p == 0 {
+        print "OR";
+    }
+}
+```
+
+### Cross-type Operations With DWARF Values
+
+- Arithmetic (+, -, *, /)
+  - Supported: script int/bool with DWARF integer-like scalars
+    - BaseType (signed/unsigned 1/2/4/8 bytes), Enum (as underlying integer), Bitfield (extracted integer), char/unsigned char (1 byte)
+  - Not supported: aggregates (struct/union/array), pointers, floats at runtime
+- Comparisons (==, !=, <, <=, >, >=)
+  - Supported: script int/bool with the DWARF integer-like types above (after width/sign unification)
+  - Pointer: only equality/inequality (pointer==pointer, pointer==0)
+  - CString equality: DWARF char* or char[] vs script string literal (==, !=) with bounded read/compare
+  - Not supported: relational string compares; aggregates; floats with DWARF
+- Floats
+  - Not supported: eBPF does not support floating-point runtime operations. GhostScope scripts do not support float literals or float arithmetic.
+
+Error semantics: If a read fails (null deref/read error/offsets unavailable), comparisons return false and arithmetic returns 0; the event status carries the error code.
+
+Examples
+
+```ghostscope
+// Integer arithmetic and comparisons with DWARF locals/globals
+trace foo.c:42 {
+    // DWARF int (e.g., s.counter) mixed with script int
+    if s.counter > 100 {
+        print "hot";
+    }
+    print "sum:{}", s.counter + 5;
+
+    // Enum/bitfield compare (treated as integer)
+    print "active:{}", a.active == 1;
+}
+
+// Pointer equality (no ordering compares)
+trace foo.c:50 {
+    print "isNull:{}", p == 0;       // pointer vs NULL
+    // print "same:{}", p == q;     // pointer vs pointer (if both in scope)
+}
+
+// CString equality: DWARF char*/char[] vs script string literal
+trace foo.c:60 {
+    print "greet-ok:{}", gm == "Hello, Global!"; // gm: const char* or char[]
+}
+
+// Floats are not supported in GhostScope scripts.
 ```
 
 ### Special Variables (In Progress)

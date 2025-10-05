@@ -32,8 +32,7 @@ print_stmt = { "print" ~ print_content ~ ";" }
 print_content = {
     format_expr |      // print "format {} {}", arg1, arg2 (must be first to match)
     string |           // print "hello world"
-    complex_variable | // print person.name or arr[0] (new: support complex expressions)
-    identifier         // print variable_name
+    expr               // print expression (covers variable, member, array, pointer, etc.)
 }
 format_expr = { string ~ "," ~ expr ~ ("," ~ expr)* }
 backtrace_stmt = { ("backtrace" | "bt") ~ ";" }
@@ -45,11 +44,20 @@ if_stmt = { "if" ~ condition ~ "{" ~ statement* ~ "}" ~ else_clause? }
 else_clause = { "else" ~ ( if_stmt | ("{" ~ statement* ~ "}") ) }
 
 // Condition for if statements
-condition = { expr ~ compare_op ~ expr }
+condition = { expr }
 compare_op = { "==" | "!=" | "<=" | ">=" | "<" | ">" }
 
-// Expression system
-expr = { term ~ (add_op ~ term)* }
+// Expression system with comparison support
+expr = { logical_or }
+or_op = { "||" }
+and_op = { "&&" }
+logical_or = { logical_and ~ (or_op ~ logical_and)* }
+logical_and = { equality ~ (and_op ~ equality)* }
+eq_op = { "==" | "!=" }
+rel_op = { "<=" | ">=" | "<" | ">" }
+equality = { relational ~ (eq_op ~ relational)* }
+relational = { additive ~ (rel_op ~ additive)* }
+additive = { term ~ (add_op ~ term)* }
 term = { factor ~ (mul_op ~ factor)* }
 factor = {
     string |

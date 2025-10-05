@@ -45,14 +45,10 @@ fn chunks_of_two<'a, T: RuleType>(pairs: Pairs<'a, T>) -> Vec<Vec<Pair<'a, T>>> 
     let mut result = Vec::new();
 
     let mut i = 0;
+    // Only produce full (op, rhs) pairs; ignore any trailing leftover defensively
     while i + 1 < pairs_vec.len() {
         result.push(vec![pairs_vec[i].clone(), pairs_vec[i + 1].clone()]);
         i += 2;
-    }
-
-    // Handle remaining elements
-    if i < pairs_vec.len() {
-        result.push(vec![pairs_vec[i].clone()]);
     }
 
     result
@@ -185,38 +181,180 @@ fn parse_statement(pair: Pair<Rule>) -> Result<Statement> {
 fn parse_expr(pair: Pair<Rule>) -> Result<Expr> {
     match pair.as_rule() {
         Rule::expr => {
+            let inner = pair
+                .into_inner()
+                .next()
+                .ok_or(ParseError::InvalidExpression)?;
+            parse_logical_or(inner)
+        }
+        _ => Err(ParseError::UnexpectedToken(pair.as_rule())),
+    }
+}
+
+fn parse_logical_or(pair: Pair<Rule>) -> Result<Expr> {
+    match pair.as_rule() {
+        Rule::logical_or => {
             let mut pairs = pair.into_inner();
-            let first = pairs.next().unwrap();
+            let first = pairs.next().ok_or(ParseError::InvalidExpression)?;
+            let mut left = parse_logical_and(first)?;
+
+            for chunk in chunks_of_two(pairs) {
+                if chunk.len() != 2 {
+                    return Err(ParseError::InvalidExpression);
+                }
+                if chunk[0].as_rule() != Rule::or_op {
+                    return Err(ParseError::UnexpectedToken(chunk[0].as_rule()));
+                }
+                let right = parse_logical_and(chunk[1].clone())?;
+                let expr = Expr::BinaryOp {
+                    left: Box::new(left),
+                    op: BinaryOp::LogicalOr,
+                    right: Box::new(right),
+                };
+                if let Err(err) = infer_type(&expr) {
+                    return Err(ParseError::TypeError(err));
+                }
+                left = expr;
+            }
+            Ok(left)
+        }
+        _ => Err(ParseError::UnexpectedToken(pair.as_rule())),
+    }
+}
+
+fn parse_logical_and(pair: Pair<Rule>) -> Result<Expr> {
+    match pair.as_rule() {
+        Rule::logical_and => {
+            let mut pairs = pair.into_inner();
+            let first = pairs.next().ok_or(ParseError::InvalidExpression)?;
+            let mut left = parse_equality(first)?;
+
+            for chunk in chunks_of_two(pairs) {
+                if chunk.len() != 2 {
+                    return Err(ParseError::InvalidExpression);
+                }
+                if chunk[0].as_rule() != Rule::and_op {
+                    return Err(ParseError::UnexpectedToken(chunk[0].as_rule()));
+                }
+                let right = parse_equality(chunk[1].clone())?;
+                let expr = Expr::BinaryOp {
+                    left: Box::new(left),
+                    op: BinaryOp::LogicalAnd,
+                    right: Box::new(right),
+                };
+                if let Err(err) = infer_type(&expr) {
+                    return Err(ParseError::TypeError(err));
+                }
+                left = expr;
+            }
+            Ok(left)
+        }
+        _ => Err(ParseError::UnexpectedToken(pair.as_rule())),
+    }
+}
+
+fn parse_equality(pair: Pair<Rule>) -> Result<Expr> {
+    match pair.as_rule() {
+        Rule::equality => {
+            let mut pairs = pair.into_inner();
+            let first = pairs.next().ok_or(ParseError::InvalidExpression)?;
+            let mut left = parse_relational(first)?;
+
+            for chunk in chunks_of_two(pairs) {
+                if chunk.len() != 2 {
+                    return Err(ParseError::InvalidExpression);
+                }
+                if chunk[0].as_rule() != Rule::eq_op {
+                    return Err(ParseError::UnexpectedToken(chunk[0].as_rule()));
+                }
+                let op = match chunk[0].as_str() {
+                    "==" => BinaryOp::Equal,
+                    "!=" => BinaryOp::NotEqual,
+                    _ => return Err(ParseError::UnexpectedToken(chunk[0].as_rule())),
+                };
+                let right = parse_relational(chunk[1].clone())?;
+                let expr = Expr::BinaryOp {
+                    left: Box::new(left),
+                    op,
+                    right: Box::new(right),
+                };
+                // Type check literals only
+                if let Err(err) = infer_type(&expr) {
+                    return Err(ParseError::TypeError(err));
+                }
+                left = expr;
+            }
+            Ok(left)
+        }
+        _ => Err(ParseError::UnexpectedToken(pair.as_rule())),
+    }
+}
+
+fn parse_relational(pair: Pair<Rule>) -> Result<Expr> {
+    match pair.as_rule() {
+        Rule::relational => {
+            let mut pairs = pair.into_inner();
+            let first = pairs.next().ok_or(ParseError::InvalidExpression)?;
+            let mut left = parse_additive(first)?;
+
+            for chunk in chunks_of_two(pairs) {
+                if chunk.len() != 2 {
+                    return Err(ParseError::InvalidExpression);
+                }
+                if chunk[0].as_rule() != Rule::rel_op {
+                    return Err(ParseError::UnexpectedToken(chunk[0].as_rule()));
+                }
+                let op = match chunk[0].as_str() {
+                    "<" => BinaryOp::LessThan,
+                    "<=" => BinaryOp::LessEqual,
+                    ">" => BinaryOp::GreaterThan,
+                    ">=" => BinaryOp::GreaterEqual,
+                    _ => return Err(ParseError::UnexpectedToken(chunk[0].as_rule())),
+                };
+                let right = parse_additive(chunk[1].clone())?;
+                let expr = Expr::BinaryOp {
+                    left: Box::new(left),
+                    op,
+                    right: Box::new(right),
+                };
+                if let Err(err) = infer_type(&expr) {
+                    return Err(ParseError::TypeError(err));
+                }
+                left = expr;
+            }
+            Ok(left)
+        }
+        _ => Err(ParseError::UnexpectedToken(pair.as_rule())),
+    }
+}
+
+fn parse_additive(pair: Pair<Rule>) -> Result<Expr> {
+    match pair.as_rule() {
+        Rule::additive => {
+            let mut pairs = pair.into_inner();
+            let first = pairs.next().ok_or(ParseError::InvalidExpression)?;
             let mut left = parse_term(first)?;
 
             for chunk in chunks_of_two(pairs) {
                 if chunk.len() != 2 {
                     return Err(ParseError::InvalidExpression);
                 }
-
                 let op = match chunk[0].as_str() {
                     "+" => BinaryOp::Add,
                     "-" => BinaryOp::Subtract,
                     _ => return Err(ParseError::UnexpectedToken(chunk[0].as_rule())),
                 };
-
                 let right = parse_term(chunk[1].clone())?;
-
-                // Check type consistency for binary operations
                 let expr = Expr::BinaryOp {
                     left: Box::new(left),
                     op,
                     right: Box::new(right),
                 };
-
-                // Only check type consistency for literals here
                 if let Err(err) = infer_type(&expr) {
                     return Err(ParseError::TypeError(err));
                 }
-
                 left = expr;
             }
-
             Ok(left)
         }
         _ => Err(ParseError::UnexpectedToken(pair.as_rule())),
@@ -231,45 +369,16 @@ fn parse_condition(pair: Pair<Rule>) -> Result<Expr> {
     );
     match pair.as_rule() {
         Rule::condition => {
-            let mut pairs = pair.into_inner();
-            let left_expr = pairs.next().unwrap();
-            debug!(
-                "condition left_expr: {:?} = '{}'",
-                left_expr.as_rule(),
-                left_expr.as_str().trim()
-            );
-            let left = parse_expr(left_expr)?;
-
-            let op_pair = pairs.next().unwrap();
-            debug!(
-                "condition op_pair: {:?} = '{}'",
-                op_pair.as_rule(),
-                op_pair.as_str().trim()
-            );
-            let op = match op_pair.as_str() {
-                "==" => BinaryOp::Equal,
-                "!=" => BinaryOp::NotEqual,
-                "<" => BinaryOp::LessThan,
-                "<=" => BinaryOp::LessEqual,
-                ">" => BinaryOp::GreaterThan,
-                ">=" => BinaryOp::GreaterEqual,
-                _ => return Err(ParseError::UnexpectedToken(op_pair.as_rule())),
-            };
-
-            let right_expr = pairs.next().unwrap();
-            let right = parse_expr(right_expr)?;
-
-            let expr = Expr::BinaryOp {
-                left: Box::new(left),
-                op,
-                right: Box::new(right),
-            };
-
-            // Check type consistency for comparison operations
+            // Condition now accepts a full expression (equality/relational/additive/etc.)
+            let inner_expr_pair = pair
+                .into_inner()
+                .next()
+                .ok_or(ParseError::InvalidExpression)?;
+            let expr = parse_expr(inner_expr_pair)?;
+            // Basic type check of the resulting expression
             if let Err(err) = infer_type(&expr) {
                 return Err(ParseError::TypeError(err));
             }
-
             Ok(expr)
         }
         _ => Err(ParseError::UnexpectedToken(pair.as_rule())),
@@ -372,6 +481,8 @@ fn parse_factor(pair: Pair<Rule>) -> Result<Expr> {
             let inner = pair.into_inner().next().unwrap();
             match inner.as_rule() {
                 Rule::chain_access => parse_chain_access(inner),
+                Rule::pointer_deref => parse_pointer_deref(inner),
+                Rule::address_of => parse_address_of(inner),
                 Rule::int => {
                     let value = inner.as_str().parse::<i64>().unwrap();
                     Ok(Expr::Int(value))
@@ -392,10 +503,6 @@ fn parse_factor(pair: Pair<Rule>) -> Result<Expr> {
                 }
                 Rule::array_access => parse_array_access(inner),
                 Rule::member_access => parse_member_access(inner),
-                Rule::pointer_deref => {
-                    let var = inner.into_inner().next().unwrap().as_str().to_string();
-                    Ok(Expr::PointerDeref(Box::new(Expr::Variable(var))))
-                }
                 Rule::special_var => {
                     let var_name = inner.as_str().to_string();
                     Ok(Expr::SpecialVar(var_name))
@@ -467,14 +574,9 @@ fn parse_print_content(pair: Pair<Rule>) -> Result<PrintStatement> {
             let content = &content[1..content.len() - 1]; // Remove surrounding quotes
             Ok(PrintStatement::String(content.to_string()))
         }
-        Rule::identifier => {
-            // Variable name
-            let var_name = inner.as_str().to_string();
-            Ok(PrintStatement::Variable(var_name))
-        }
-        Rule::complex_variable => {
-            // Parse complex variable expression (person.name, arr[0], etc.)
-            let expr = parse_complex_variable(inner)?;
+        Rule::expr => {
+            // Generic expression printing
+            let expr = parse_expr(inner)?;
             Ok(PrintStatement::ComplexVariable(expr))
         }
         Rule::format_expr => {
