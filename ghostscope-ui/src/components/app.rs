@@ -3335,11 +3335,9 @@ impl App {
                             self.state.command_panel.cursor_position = 4;
                             // Clear auto-suggestion to prevent suggestions after "quit"
                             self.state.command_panel.auto_suggestion.clear();
-                            vec![Action::AddResponse {
-                                content: "Press Ctrl+C again to quit or modify the command"
-                                    .to_string(),
-                                response_type: crate::action::ResponseType::Info,
-                            }]
+                            // Don't add response here - it would attach to previous command in history
+                            // User will see "quit" in input box, which is clear enough
+                            vec![]
                         }
                         _ => {
                             // Other modes - no action needed
