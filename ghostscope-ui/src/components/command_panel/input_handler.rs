@@ -140,20 +140,16 @@ impl InputHandler {
                 };
 
                 state.exit_history_search_with_selection(&selected_command);
-                vec![Action::AddResponse {
-                    content: String::new(),
-                    response_type: crate::action::ResponseType::Info,
-                }]
+                // Don't add empty response - would overwrite previous command's response
+                vec![]
             }
             // Ctrl+C: Exit search mode and clear input
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 state.exit_history_search();
                 state.input_text.clear();
                 state.cursor_position = 0;
-                vec![Action::AddResponse {
-                    content: String::new(),
-                    response_type: crate::action::ResponseType::Info,
-                }]
+                // Don't add empty response - would overwrite previous command's response
+                vec![]
             }
             // Enter: Execute the current search result
             (KeyCode::Enter, _) => {
