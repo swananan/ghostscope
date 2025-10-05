@@ -2872,48 +2872,21 @@ impl App {
                 self.clear_waiting_state();
 
                 // Check if compilation actually succeeded
-                if details.success_count > 0 {
-                    // Find the first successful result
-                    let first_success = details
-                        .results
-                        .iter()
-                        .find(|r| matches!(r.status, crate::events::ExecutionStatus::Success));
+                if details.success_count > 0 || details.failed_count > 0 {
+                    // Get script content from the current cache for better display
+                    let script_content = self
+                        .state
+                        .command_panel
+                        .script_cache
+                        .as_ref()
+                        .map(|cache| cache.lines.join("\n"));
 
-                    if let Some(result) = first_success {
-                        // Get the corresponding trace ID from details.trace_ids
-                        let trace_id = if !details.trace_ids.is_empty() {
-                            Some(details.trace_ids[0]) // Use the first trace ID
-                        } else {
-                            None
-                        };
-
-                        let trace_details =
-                            crate::components::command_panel::script_editor::TraceDetails {
-                                trace_id,
-                                binary_path: Some(result.binary_path.clone()),
-                                address: Some(result.pc_address),
-                                source_file: None, // Not available in current structure
-                                line_number: None, // Not available in current structure
-                                function_name: Some(result.target_name.clone()),
-                            };
-
-                        // Get script content from the current cache for better display
-                        let script_content = self
-                            .state
-                            .command_panel
-                            .script_cache
-                            .as_ref()
-                            .map(|cache| cache.lines.join("\n"));
-
-                        Some(crate::components::command_panel::script_editor::ScriptEditor::format_trace_success_response_with_script(
-                            &result.target_name,
-                            Some(&trace_details),
-                            script_content.as_deref(),
-                            &self.state.emoji_config,
-                        ))
-                    } else {
-                        None // No successful results found
-                    }
+                    // Use new format_compilation_results to show all traces
+                    Some(crate::components::command_panel::script_editor::ScriptEditor::format_compilation_results(
+                        details,
+                        script_content.as_deref(),
+                        &self.state.emoji_config,
+                    ))
                 } else {
                     // All compilations failed - find the first failed result for error details
                     let first_failed = details.results.first();

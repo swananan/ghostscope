@@ -582,6 +582,84 @@ impl ScriptEditor {
         result.join("\n")
     }
 
+    /// Format compilation results with all successful and failed traces
+    pub fn format_compilation_results(
+        compilation_details: &crate::events::ScriptCompilationDetails,
+        script_content: Option<&str>,
+        emoji_config: &EmojiConfig,
+    ) -> String {
+        let mut result = Vec::new();
+
+        // 📝 Script section
+        if let Some(script) = script_content {
+            let script_lines = Self::format_script_display_section(script, emoji_config);
+            result.extend(script_lines);
+        }
+
+        // 🎯 Target line (use first result's target or generic message)
+        let target_emoji = emoji_config.get_trace_element(crate::ui::emoji::TraceElement::Target);
+        let target = compilation_details
+            .results
+            .first()
+            .map(|r| r.target_name.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        result.push(format!("{target_emoji} Target: {target}"));
+
+        // Empty line for separation
+        result.push("".to_string());
+
+        // ✅ Results summary
+        let success_emoji = emoji_config.get_script_status(crate::ui::emoji::ScriptStatus::Success);
+        let error_emoji = emoji_config.get_script_status(crate::ui::emoji::ScriptStatus::Error);
+
+        let summary_emoji = if compilation_details.failed_count > 0 {
+            error_emoji
+        } else {
+            success_emoji
+        };
+
+        result.push(format!(
+            "{} Trace Results: {} successful, {} failed",
+            summary_emoji, compilation_details.success_count, compilation_details.failed_count
+        ));
+
+        // List all successful traces
+        let mut trace_idx = 0;
+        for exec_result in &compilation_details.results {
+            match &exec_result.status {
+                crate::events::ExecutionStatus::Success => {
+                    let trace_id = compilation_details.trace_ids.get(trace_idx).copied();
+                    if let Some(tid) = trace_id {
+                        result.push(format!(
+                            "  • {} (0x{:x}) → trace_id: {}",
+                            exec_result.target_name, exec_result.pc_address, tid
+                        ));
+                        trace_idx += 1;
+                    } else {
+                        result.push(format!(
+                            "  • {} (0x{:x}) → trace attached",
+                            exec_result.target_name, exec_result.pc_address
+                        ));
+                    }
+                }
+                crate::events::ExecutionStatus::Failed(error) => {
+                    result.push(format!(
+                        "  ✗ {} (0x{:x}): {}",
+                        exec_result.target_name, exec_result.pc_address, error
+                    ));
+                }
+                crate::events::ExecutionStatus::Skipped(reason) => {
+                    result.push(format!(
+                        "  ⊘ {} (0x{:x}): {}",
+                        exec_result.target_name, exec_result.pc_address, reason
+                    ));
+                }
+            }
+        }
+
+        result.join("\n")
+    }
+
     /// Format trace error response with detailed information
     pub fn format_trace_error_response(
         target: &str,
