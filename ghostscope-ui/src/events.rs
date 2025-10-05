@@ -425,11 +425,7 @@ pub enum RuntimeStatus {
     },
     DwarfLoadingFailed(String),
     ScriptCompilationCompleted {
-        details: ScriptCompilationDetails, // Now required, contains trace_ids
-    },
-    ScriptCompilationFailed {
-        error: String,
-        target: String, // Target instead of trace_id since we don't have trace_ids for failed compilations
+        details: ScriptCompilationDetails, // Contains trace_ids, success/failed counts and results
     },
     UprobeAttached {
         function: String,
@@ -448,9 +444,11 @@ pub enum RuntimeStatus {
     },
     AllTracesEnabled {
         count: usize,
+        error: Option<String>, // Error message if operation completely failed
     },
     AllTracesDisabled {
         count: usize,
+        error: Option<String>, // Error message if operation completely failed
     },
     TraceEnableFailed {
         trace_id: u32,
@@ -465,6 +463,7 @@ pub enum RuntimeStatus {
     },
     AllTracesDeleted {
         count: usize,
+        error: Option<String>, // Error message if operation completely failed
     },
     TraceDeleteFailed {
         trace_id: u32,
@@ -585,7 +584,6 @@ pub enum RuntimeStatus {
     SrcPathFailed {
         error: String,
     },
-    Error(String),
 }
 
 /// Statistics for a loaded module

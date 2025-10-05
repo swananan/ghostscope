@@ -740,6 +740,11 @@ impl OptimizedInputHandler {
         };
 
         state.command_history.push(item);
+        tracing::debug!(
+            "add_command_to_history: Added command '{}', history length now: {}",
+            command,
+            state.command_history.len()
+        );
 
         // Limit history size
         const MAX_HISTORY: usize = 1000;

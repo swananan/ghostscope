@@ -113,6 +113,7 @@ impl<'a> AstCompiler<'a> {
         // Continue processing even if some trace points fail
         let mut successful_trace_points = 0;
         let mut failed_trace_points = 0;
+        let mut first_error: Option<String> = None;
 
         for (index, stmt) in program.statements.iter().enumerate() {
             match stmt {
@@ -128,11 +129,46 @@ impl<'a> AstCompiler<'a> {
                         }
                         Err(e) => {
                             failed_trace_points += 1;
+                            let error_msg = e.to_string();
                             error!(
                                 "❌ Failed to process trace point {}: {:?} - Error: {}",
-                                index, pattern, e
+                                index, pattern, error_msg
                             );
-                            // Continue processing other trace points
+
+                            // Save first error for detailed error message
+                            if first_error.is_none() {
+                                first_error = Some(error_msg.clone());
+                            }
+
+                            // Check if failed_targets was already populated by process_trace_point
+                            // (e.g., when all addresses failed for a function)
+                            // If not, add a general failed target entry
+                            let has_failed_for_this_pattern =
+                                self.failed_targets.iter().any(|ft| match pattern {
+                                    TracePattern::FunctionName(name) => ft.target_name == *name,
+                                    TracePattern::SourceLine {
+                                        file_path,
+                                        line_number,
+                                    } => ft.target_name == format!("{}:{}", file_path, line_number),
+                                    _ => false,
+                                });
+
+                            if !has_failed_for_this_pattern {
+                                let target_name = match pattern {
+                                    TracePattern::FunctionName(name) => name.clone(),
+                                    TracePattern::SourceLine {
+                                        file_path,
+                                        line_number,
+                                    } => format!("{}:{}", file_path, line_number),
+                                    _ => format!("trace_point_{}", index),
+                                };
+
+                                self.failed_targets.push(FailedTarget {
+                                    target_name,
+                                    pc_address: 0,
+                                    error_message: error_msg,
+                                });
+                            }
                         }
                     }
                 }
@@ -153,12 +189,12 @@ impl<'a> AstCompiler<'a> {
                 "Partial success: {} trace points successful, {} failed",
                 successful_trace_points, failed_trace_points
             );
-        } else {
+        } else if failed_trace_points > 0 {
+            // All trace points failed - return error with first failure reason
             error!("All {} trace points failed to process", failed_trace_points);
-            return Err(CompileError::Other(format!(
-                "All {} trace points failed to process",
-                failed_trace_points
-            )));
+            return Err(CompileError::Other(
+                first_error.unwrap_or_else(|| "All trace points failed".to_string()),
+            ));
         }
 
         // Generate target info summary
@@ -291,11 +327,11 @@ impl<'a> AstCompiler<'a> {
                 };
 
                 if module_addresses.is_empty() {
-                    warn!(
-                        "No addresses resolved for function '{}'; skipping",
+                    // Strict behavior: fail this trace point immediately instead of skipping silently
+                    return Err(CompileError::Other(format!(
+                        "No addresses resolved for function '{}' - function not found in debug symbols",
                         func_name
-                    );
-                    return Ok(());
+                    )));
                 }
 
                 let total_addresses: usize = module_addresses.len();
@@ -359,19 +395,20 @@ impl<'a> AstCompiler<'a> {
                         "All {} addresses for function '{}' processed successfully",
                         successful_addresses, func_name
                     );
+                    Ok(())
                 } else if successful_addresses > 0 && failed_addresses > 0 {
                     warn!(
                         "Partial success for function '{}': {} successful, {} failed addresses",
                         func_name, successful_addresses, failed_addresses
                     );
+                    Ok(())
                 } else {
-                    error!(
+                    // All addresses failed to process - this is an error
+                    Err(CompileError::Other(format!(
                         "All {} addresses for function '{}' failed to process",
                         failed_addresses, func_name
-                    );
-                    // Don't return error here - let the caller decide based on overall results
+                    )))
                 }
-                Ok(())
             }
             _ => {
                 unimplemented!();

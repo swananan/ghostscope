@@ -27,7 +27,7 @@ pub enum CompileError {
     #[error("LLVM error: {0}")]
     LLVM(String),
 
-    #[error("Error: {0}")]
+    #[error("{0}")]
     Other(String),
 }
 

@@ -370,36 +370,58 @@ async fn handle_execute_script(
     info!("Executing script: {}", script);
 
     if let Some(ref mut session) = session {
-        match crate::script::compile_and_load_script_for_tui(&script, session, compile_options)
-            .await
-        {
-            Ok(details) => {
-                info!(
-                    "✓ Script compilation completed: {} total, {} success, {} failed",
-                    details.total_count, details.success_count, details.failed_count
-                );
-                let _ = runtime_channels
-                    .status_sender
-                    .send(RuntimeStatus::ScriptCompilationCompleted { details });
-            }
-            Err(e) => {
-                error!("❌ Script compilation failed: {}", e);
-                let _ =
-                    runtime_channels
-                        .status_sender
-                        .send(RuntimeStatus::ScriptCompilationFailed {
-                            error: format!("Script compilation failed: {}", e),
-                            target: script.clone(),
-                        });
-            }
-        }
-    } else {
+        let details =
+            match crate::script::compile_and_load_script_for_tui(&script, session, compile_options)
+                .await
+            {
+                Ok(details) => {
+                    info!(
+                        "✓ Script compilation completed: {} total, {} success, {} failed",
+                        details.total_count, details.success_count, details.failed_count
+                    );
+                    details
+                }
+                Err(e) => {
+                    error!("❌ Script compilation failed: {}", e);
+                    // Return details with all failures
+                    ghostscope_ui::events::ScriptCompilationDetails {
+                        trace_ids: vec![],
+                        results: vec![ghostscope_ui::events::ScriptExecutionResult {
+                            pc_address: 0,
+                            target_name: script.clone(),
+                            binary_path: String::new(),
+                            status: ghostscope_ui::events::ExecutionStatus::Failed(e.to_string()),
+                        }],
+                        total_count: 1,
+                        success_count: 0,
+                        failed_count: 1,
+                    }
+                }
+            };
+
         let _ = runtime_channels
             .status_sender
-            .send(RuntimeStatus::ScriptCompilationFailed {
-                error: "No debug session available".to_string(),
-                target: script,
-            });
+            .send(RuntimeStatus::ScriptCompilationCompleted { details });
+    } else {
+        // No session available - return details with failure
+        let details = ghostscope_ui::events::ScriptCompilationDetails {
+            trace_ids: vec![],
+            results: vec![ghostscope_ui::events::ScriptExecutionResult {
+                pc_address: 0,
+                target_name: script.clone(),
+                binary_path: String::new(),
+                status: ghostscope_ui::events::ExecutionStatus::Failed(
+                    "No debug session available".to_string(),
+                ),
+            }],
+            total_count: 1,
+            success_count: 0,
+            failed_count: 1,
+        };
+
+        let _ = runtime_channels
+            .status_sender
+            .send(RuntimeStatus::ScriptCompilationCompleted { details });
     }
 }
 

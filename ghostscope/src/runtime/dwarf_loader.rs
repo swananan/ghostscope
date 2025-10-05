@@ -106,15 +106,15 @@ pub async fn initialize_dwarf_processing_with_progress(
                     let symbols_count = functions.len();
 
                     // Send success status
-                    let _ =
-                        status_sender.send(RuntimeStatus::DwarfLoadingCompleted { symbols_count });
-
+                    // If no debug information was found, treat it as a loading failure
                     if stats.modules_with_debug_info == 0 {
-                        let _ = status_sender.send(
-                            RuntimeStatus::Error(
-                                "No debug information available. Compile with -g for full functionality".to_string()
-                            )
-                        );
+                        let _ = status_sender.send(RuntimeStatus::DwarfLoadingFailed(
+                            "No debug information available. Compile with -g for full functionality"
+                                .to_string(),
+                        ));
+                    } else {
+                        let _ = status_sender
+                            .send(RuntimeStatus::DwarfLoadingCompleted { symbols_count });
                     }
 
                     // Return the session for use by runtime coordinator

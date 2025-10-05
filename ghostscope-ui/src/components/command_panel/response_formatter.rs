@@ -24,6 +24,19 @@ impl ResponseFormatter {
         if let Some(last_item) = state.command_history.last_mut() {
             last_item.response = Some(content);
             last_item.response_type = Some(response_type);
+            tracing::debug!(
+                "add_response: Added response to command '{}'",
+                last_item.command
+            );
+        } else {
+            tracing::warn!(
+                "add_response: No command in history to attach response to! Response content: '{}'",
+                content
+            );
+            tracing::warn!(
+                "add_response: command_history length: {}",
+                state.command_history.len()
+            );
         }
         // Note: Optimized renderer will handle display updates via cache rebuild
     }
