@@ -316,6 +316,218 @@ i a <addr>          # 缩写形式
 
 **状态：** 尚未实现
 
+---
+
+## 🗂️ 源码路径命令
+
+用于管理源代码路径映射的命令，解决 DWARF 调试信息中的编译时路径与运行时路径不一致的问题。
+
+### srcpath - 显示路径映射
+
+**语法：**
+```
+srcpath
+```
+
+**说明：**
+显示当前的路径替换规则和搜索目录，包括运行时添加的规则和配置文件规则。
+
+### srcpath add - 添加搜索目录
+
+**语法：**
+```
+srcpath add <directory>
+```
+
+**参数：**
+- `<directory>`: 用于搜索源文件的目录路径
+
+**示例：**
+```
+srcpath add /usr/local/src           # 添加搜索目录
+srcpath add /home/user/sources       # 添加用户源码目录
+```
+
+**说明：**
+当无法通过精确路径或替换规则找到源文件时，GhostScope 会在这些目录的**根目录**下按文件名（basename）搜索（不递归子目录）。例如，添加 `/usr/local/src` 后，可以找到 `/usr/local/src/foo.c`，但无法找到 `/usr/local/src/subdir/bar.c`。
+
+### srcpath map - 映射编译路径到运行时路径
+
+**语法：**
+```
+srcpath map <from> <to>
+```
+
+**参数：**
+- `<from>`: 编译时路径前缀（来自 DWARF 调试信息）
+- `<to>`: 运行时路径前缀（本机实际位置）
+
+**示例：**
+```
+srcpath map /build/project /home/user/project          # CI 构建路径映射到本地
+srcpath map /usr/src/linux-5.15 /home/user/kernel     # 内核源码已移动
+srcpath map /buildroot/arm /local/embedded            # 交叉编译路径
+```
+
+**说明：**
+将编译时的路径前缀替换为运行时路径。如果对同一个 `<from>` 路径运行两次映射并使用不同的 `<to>` 路径，第二次会更新现有映射。
+
+### srcpath remove - 删除映射或目录
+
+**语法：**
+```
+srcpath remove <path>
+```
+
+**参数：**
+- `<path>`: 要删除的映射的路径前缀或搜索目录
+
+**示例：**
+```
+srcpath remove /build/project        # 删除此 'from' 前缀的映射
+srcpath remove /usr/local/src        # 删除搜索目录
+```
+
+**说明：**
+删除运行时添加的规则（映射或搜索目录）。配置文件中的规则无法通过此命令删除。
+
+### srcpath clear - 清除所有运行时规则
+
+**语法：**
+```
+srcpath clear
+```
+
+**说明：**
+清除所有运行时添加的规则（包括映射和搜索目录）。配置文件规则会保留。
+
+### srcpath reset - 重置为配置文件规则
+
+**语法：**
+```
+srcpath reset
+```
+
+**说明：**
+删除所有运行时添加的规则，仅保留配置文件规则。与 `srcpath clear` 相同。
+
+---
+
+### 路径解析原理
+
+GhostScope 使用**相对路径 + 目录前缀**的方式查找源文件：
+
+1. **DWARF 信息包含**：
+   - 编译目录（compilation directory/comp_dir）：如 `/home/build/nginx-1.27.1`
+   - 源文件相对路径：如 `src/core/nginx.c`
+
+2. **路径组合**：
+   - 完整路径 = 编译目录 + 相对路径
+   - 示例：`/home/build/nginx-1.27.1/src/core/nginx.c`
+
+3. **解析顺序**：
+   - **首先**：尝试原始完整路径
+   - **然后**：应用 `map` 替换规则（推荐方式）
+   - **最后**：在 `add` 搜索目录中按文件名查找
+
+### 推荐使用方式
+
+#### 🌟 推荐：使用 `srcpath map` 映射 DWARF 目录
+
+将 DWARF 中的编译目录映射到本地源码目录，这样**所有相对路径文件都会自动解析**：
+
+```bash
+# 查看文件加载失败的错误信息，找到 DWARF 目录
+# 错误会显示：
+# DWARF Directory: /home/build/nginx-1.27.1
+# Relative Path: src/core/nginx.c
+
+# 映射 DWARF 目录到本地路径
+srcpath map /home/build/nginx-1.27.1 /home/user/nginx-1.27.1
+
+# 现在所有文件都能找到：
+# /home/build/nginx-1.27.1/src/core/nginx.c → /home/user/nginx-1.27.1/src/core/nginx.c
+# /home/build/nginx-1.27.1/src/http/ngx_http.c → /home/user/nginx-1.27.1/src/http/ngx_http.c
+```
+
+**优点**：
+- ✅ 一次配置，所有文件生效
+- ✅ 保持目录结构，便于理解
+- ✅ 支持多级目录和复杂项目
+- ✅ 文件搜索（`o` 键）自动更新路径
+
+#### 辅助：使用 `srcpath add` 添加搜索目录
+
+仅在无法用 `map` 解决时使用（如头文件分散在多个位置）：
+
+```bash
+# 添加额外的搜索目录
+srcpath add /usr/local/include
+srcpath add /opt/vendor/include
+```
+
+**注意**：`add` 只在目录根目录下按**文件名**（basename）搜索，不递归子目录，也不保证找到正确的同名文件。
+
+### 配置文件支持
+
+路径映射可以保存在 `config.toml` 中，避免每次手动配置：
+
+```toml
+[source]
+# 推荐：DWARF 目录映射
+substitutions = [
+    { from = "/home/build/myproject", to = "/home/user/work/myproject" },
+    { from = "/usr/src/linux-5.15", to = "/home/user/kernel/linux-5.15" },
+]
+
+# 辅助：额外搜索目录（按文件名查找）
+search_dirs = [
+    "/usr/local/include",
+    "/opt/local/src",
+]
+```
+
+运行时规则（通过命令添加）优先于配置文件规则。
+
+### 常见使用场景
+
+**场景 1：源码在 CI 服务器上编译** ⭐ 推荐
+```bash
+# 查看错误提示中的 DWARF Directory
+# 然后映射到本地源码根目录
+srcpath map /home/jenkins/workspace/myproject /home/user/myproject
+```
+
+**场景 2：容器内编译，本地调试** ⭐ 推荐
+```bash
+# Docker 容器中编译目录为 /build/app
+# 本地源码在 /home/user/app
+srcpath map /build/app /home/user/app
+```
+
+**场景 3：多个独立的头文件目录**
+```bash
+# 系统头文件和第三方库头文件
+srcpath add /usr/local/include
+srcpath add /opt/project/vendor
+```
+
+**场景 4：纠正错误的映射**
+```bash
+srcpath map /build /wrong/path        # 第一次尝试（错误）
+srcpath map /build /correct/path      # 第二次尝试（更新现有映射）
+```
+
+### 最佳实践
+
+1. **优先使用 `map`**：映射 DWARF 编译目录，而不是映射单个文件
+2. **查看错误提示**：文件加载失败时会显示 DWARF Directory，直接映射它
+3. **保持目录结构**：本地源码保持与编译时相同的相对路径结构
+4. **保存到配置**：常用映射保存到 `config.toml`，避免重复配置
+5. **谨慎使用 `add`**：只在无法用 `map` 解决时使用，因为只在根目录按文件名搜索，无法处理子目录，且可能找错同名文件
+
+---
+
 ## ⚙️ 控制命令
 
 通用控制和实用命令。
@@ -399,14 +611,96 @@ exit
 | `info address` | `i a` | 查看地址信息 |
 | `save traces` | `s t` | 保存追踪点 |
 | `source` | `s` | 加载脚本（除了"s t"）|
+| `srcpath` | - | 管理源码路径映射 |
 
-## 命令补全
+## 命令补全与历史
 
-GhostScope 提供智能命令补全：
+### 命令补全
 
-1. **Tab 补全**：按 Tab 键自动补全命令和文件名
-2. **自动建议**：输入时显示灰色建议文本，按 `→` 或 `Ctrl+E` 接受
-3. **智能匹配**：补全支持完整命令和缩写
+GhostScope 提供多层次的智能补全系统：
+
+#### 1. Tab 命令补全
+
+按 `Tab` 键触发命令和参数补全：
+
+- **命令补全**：自动补全 GhostScope 命令（trace、enable、info 等）
+- **文件路径补全**：支持 source 命令的文件路径自动补全
+- **参数补全**：根据命令上下文提供智能参数建议
+
+**示例**：
+```
+gs > t<Tab>          → trace
+gs > info s<Tab>     → info source
+gs > source /pa<Tab> → source /path/to/script.gs
+```
+
+#### 2. 自动建议（灰色提示）
+
+在您输入时，GhostScope 会根据命令历史显示灰色建议文本：
+
+- **触发条件**：输入 3 个或更多字符
+- **建议来源**：从历史命令中匹配前缀
+- **接受建议**：按 `→`（右方向键）或 `Ctrl+E`
+- **忽略建议**：继续输入或移动光标
+
+**示例**：
+```
+gs > trace main<输入中>
+     trace main -s "print(a, b, c)"  ← 灰色建议文本
+
+     按 → 接受整条建议
+```
+
+#### 3. 文件名补全
+
+对于需要文件路径的命令，Tab 补全支持：
+
+- **相对路径**：从当前目录开始
+- **绝对路径**：从根目录开始
+- **多级目录**：支持多级目录导航
+- **智能过滤**：只显示相关文件类型（.gs 脚本文件）
+
+### 命令历史
+
+GhostScope 自动保存命令历史，支持快速重用和搜索：
+
+#### 历史导航
+
+| 快捷键 | 功能 |
+|--------|------|
+| `↑` 或 `Ctrl+P` | 上一条历史命令 |
+| `↓` 或 `Ctrl+N` | 下一条历史命令 |
+
+#### 历史持久化
+
+- **自动保存**：命令自动保存到 `.ghostscope_history` 文件
+- **跨会话**：历史在不同 GhostScope 会话间共享
+- **去重机制**：连续重复的命令不会重复记录
+- **容量限制**：默认保存最近 1000 条命令
+
+#### 历史管理
+
+使用 `clear` 命令清除历史：
+
+```bash
+gs > clear          # 清除命令历史
+```
+
+**注意**：清除历史会删除 `.ghostscope_history` 文件中的所有记录。
+
+### 补全配置
+
+可在配置文件中调整历史和补全行为（参见 [配置文档](configuration.md)）：
+
+```toml
+[history]
+enabled = true          # 启用历史记录
+max_entries = 1000     # 最大历史条数
+
+[auto_suggestion]
+enabled = true         # 启用自动建议
+min_chars = 3         # 触发建议的最小字符数
+```
 
 ## 技巧与最佳实践
 

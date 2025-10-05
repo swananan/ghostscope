@@ -347,6 +347,19 @@ pub enum RuntimeCommand {
         filename: String,
         traces: Vec<TraceDefinition>,
     }, // Load traces from a file
+    SrcPathList,
+    SrcPathAddDir {
+        dir: String,
+    },
+    SrcPathAddMap {
+        from: String,
+        to: String,
+    },
+    SrcPathRemove {
+        pattern: String,
+    },
+    SrcPathClear,
+    SrcPathReset,
     Shutdown,
 }
 
@@ -563,6 +576,15 @@ pub enum RuntimeStatus {
         current: usize,
         total: usize,
     },
+    SrcPathInfo {
+        info: SourcePathInfo,
+    },
+    SrcPathUpdated {
+        message: String,
+    },
+    SrcPathFailed {
+        error: String,
+    },
     Error(String),
 }
 
@@ -732,4 +754,76 @@ impl RuntimeStatus {
             _ => None,
         }
     }
+}
+
+/// Source path information for display (shared between UI and runtime)
+#[derive(Debug, Clone)]
+pub struct SourcePathInfo {
+    pub substitutions: Vec<PathSubstitution>,
+    pub search_dirs: Vec<String>,
+    pub runtime_substitution_count: usize,
+    pub runtime_search_dir_count: usize,
+    pub config_substitution_count: usize,
+    pub config_search_dir_count: usize,
+}
+
+impl SourcePathInfo {
+    /// Format for display in command panel
+    pub fn format_for_display(&self) -> String {
+        let mut output = String::new();
+
+        output.push_str("🗂️  Source Path Configuration:\n\n");
+
+        // Path substitutions
+        if self.substitutions.is_empty() {
+            output.push_str("Path Substitutions: (none)\n");
+        } else {
+            output.push_str(&format!(
+                "Path Substitutions ({}):\n",
+                self.substitutions.len()
+            ));
+            for (i, sub) in self.substitutions.iter().enumerate() {
+                let marker = if i < self.runtime_substitution_count {
+                    "[runtime]"
+                } else {
+                    "[config] "
+                };
+                output.push_str(&format!("  {} {} -> {}\n", marker, sub.from, sub.to));
+            }
+        }
+
+        output.push('\n');
+
+        // Search directories
+        if self.search_dirs.is_empty() {
+            output.push_str("Search Directories: (none)\n");
+        } else {
+            output.push_str(&format!(
+                "Search Directories ({}):\n",
+                self.search_dirs.len()
+            ));
+            for (i, dir) in self.search_dirs.iter().enumerate() {
+                let marker = if i < self.runtime_search_dir_count {
+                    "[runtime]"
+                } else {
+                    "[config] "
+                };
+                output.push_str(&format!("  {marker} {dir}\n"));
+            }
+        }
+
+        output.push_str("\n💡 Runtime rules take precedence over config file rules.\n");
+        output.push_str(
+            "💡 Use 'srcpath clear' to remove runtime rules, 'srcpath reset' to reset to config.\n",
+        );
+
+        output
+    }
+}
+
+/// Path substitution rule (shared definition)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathSubstitution {
+    pub from: String,
+    pub to: String,
 }

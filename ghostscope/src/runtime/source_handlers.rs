@@ -48,12 +48,24 @@ fn try_get_main_source_info(session: &mut Option<GhostSession>) -> Result<Source
     match process_analyzer.lookup_source_location(&module_address) {
         Some(source_location) => {
             info!(
-                "Main function source location: {}:{}",
+                "Main function source location (DWARF): {}:{}",
                 source_location.file_path, source_location.line_number
             );
 
+            // Apply source path resolution
+            let resolved_path = session
+                .source_path_resolver
+                .resolve(&source_location.file_path)
+                .unwrap_or_else(|| std::path::PathBuf::from(&source_location.file_path));
+
+            info!(
+                "Resolved source path: {} -> {}",
+                source_location.file_path,
+                resolved_path.display()
+            );
+
             Ok(SourceCodeInfo {
-                file_path: source_location.file_path,
+                file_path: resolved_path.to_string_lossy().to_string(),
                 current_line: Some(source_location.line_number as usize),
             })
         }
@@ -100,6 +112,8 @@ pub async fn handle_request_source_code(
 
 /// Get grouped source files information by module for UI
 fn get_grouped_source_files_info(session: &GhostSession) -> anyhow::Result<Vec<SourceFileGroup>> {
+    use crate::runtime::source_path_resolver::apply_substitutions_to_directory;
+
     let mut groups = Vec::new();
 
     if let Some(ref process_analyzer) = session.process_analyzer {
@@ -110,11 +124,40 @@ fn get_grouped_source_files_info(session: &GhostSession) -> anyhow::Result<Vec<S
             let mut seen = HashSet::new();
             let mut ui_files = Vec::new();
             for file in files {
-                let key = format!("{}:{}", file.directory, file.basename);
+                // Construct full DWARF path and resolve it using all strategies:
+                // 1. Exact path match
+                // 2. Path substitution rules (srcpath map)
+                // 3. Search directories by basename (srcpath add)
+                let dwarf_full_path = format!("{}/{}", file.directory, file.basename);
+
+                let (resolved_dir, resolved_basename) = if let Some(resolved_path) =
+                    session.source_path_resolver.resolve(&dwarf_full_path)
+                {
+                    // Successfully resolved - extract directory and basename from resolved path
+                    let resolved_str = resolved_path.to_string_lossy().to_string();
+                    if let Some(last_slash) = resolved_str.rfind('/') {
+                        let dir = resolved_str[..last_slash].to_string();
+                        let basename = resolved_str[last_slash + 1..].to_string();
+                        (dir, basename)
+                    } else {
+                        // No directory separator - use current dir
+                        (".".to_string(), resolved_str)
+                    }
+                } else {
+                    // Resolution failed - use substitution-only fallback for directory
+                    // This maintains backward compatibility with pure substitution approach
+                    let resolved_dir = apply_substitutions_to_directory(
+                        &session.source_path_resolver,
+                        &file.directory,
+                    );
+                    (resolved_dir, file.basename.clone())
+                };
+
+                let key = format!("{}:{}", resolved_dir, resolved_basename);
                 if seen.insert(key) {
                     ui_files.push(SourceFileInfo {
-                        path: file.basename,
-                        directory: file.directory,
+                        path: resolved_basename,
+                        directory: resolved_dir,
                     });
                 }
             }

@@ -80,6 +80,8 @@ pub struct Config {
     pub ui: UiConfigToml,
     #[serde(default)]
     pub ebpf: EbpfConfig,
+    #[serde(default)]
+    pub source: SourceConfig,
 
     /// Path to the config file that was loaded (not serialized)
     #[serde(skip)]
@@ -111,6 +113,29 @@ pub struct DwarfConfig {
     /// DWARF debug information search paths (for future --debug-file auto-discovery)
     #[serde(default = "default_debug_search_paths")]
     pub search_paths: Vec<String>,
+}
+
+/// Source code path configuration
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct SourceConfig {
+    /// Path substitution rules (highest priority)
+    /// Replaces compilation-time path prefix with runtime path
+    #[serde(default)]
+    pub substitutions: Vec<PathSubstitution>,
+
+    /// Additional search directories (fallback)
+    /// When file not found via substitution, search these dirs by basename
+    #[serde(default)]
+    pub search_dirs: Vec<String>,
+}
+
+/// Path substitution rule for source code location
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PathSubstitution {
+    /// Compilation-time path prefix
+    pub from: String,
+    /// Runtime path prefix
+    pub to: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

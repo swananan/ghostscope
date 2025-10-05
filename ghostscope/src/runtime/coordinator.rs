@@ -89,6 +89,8 @@ async fn run_tui_coordinator_with_ui_config_and_merged_config(
                 dwarf_loader::initialize_dwarf_processing(parsed_args_clone, status_sender).await?;
             // Inject MergedConfig into session for eBPF map configuration
             session.config = Some(config_clone);
+            // Update source path resolver with config after setting it
+            session.update_source_resolver_from_config();
             Ok::<_, anyhow::Error>(session)
         })
     };
@@ -240,6 +242,110 @@ async fn run_runtime_coordinator(
                     }
                     RuntimeCommand::LoadTraces { filename, traces } => {
                         handle_load_traces(&mut session, &mut runtime_channels, filename, traces).await;
+                    }
+                    RuntimeCommand::SrcPathList => {
+                        if let Some(ref session) = session {
+                            let info = session.source_path_resolver.get_all_rules();
+                            let _ = runtime_channels.status_sender.send(RuntimeStatus::SrcPathInfo { info });
+                        } else {
+                            let _ = runtime_channels.status_sender.send(RuntimeStatus::SrcPathFailed {
+                                error: "No debug session available".to_string(),
+                            });
+                        }
+                    }
+                    RuntimeCommand::SrcPathAddDir { dir } => {
+                        if let Some(ref mut sess) = session {
+                            sess.source_path_resolver.add_search_dir(dir.clone());
+                            let _ = runtime_channels.status_sender.send(RuntimeStatus::SrcPathUpdated {
+                                message: format!("Added search directory: {}", dir),
+                            });
+                        } else {
+                            let _ = runtime_channels.status_sender.send(RuntimeStatus::SrcPathFailed {
+                                error: "No debug session available".to_string(),
+                            });
+                            continue;
+                        }
+                        // Auto-reload source code and file list (outside the if-let to avoid borrow issues)
+                        info!("Reloading source code and file list after srcpath change");
+                        source_handlers::handle_main_source_request(&mut session, &mut runtime_channels).await;
+                        source_handlers::handle_request_source_code(&session, &mut runtime_channels).await;
+                    }
+                    RuntimeCommand::SrcPathAddMap { from, to } => {
+                        if let Some(ref mut sess) = session {
+                            sess.source_path_resolver.add_substitution(from.clone(), to.clone());
+                            let _ = runtime_channels.status_sender.send(RuntimeStatus::SrcPathUpdated {
+                                message: format!("Added path mapping: {} -> {}", from, to),
+                            });
+                        } else {
+                            let _ = runtime_channels.status_sender.send(RuntimeStatus::SrcPathFailed {
+                                error: "No debug session available".to_string(),
+                            });
+                            continue;
+                        }
+                        // Auto-reload source code and file list (outside the if-let to avoid borrow issues)
+                        info!("Reloading source code and file list after srcpath change");
+                        source_handlers::handle_main_source_request(&mut session, &mut runtime_channels).await;
+                        source_handlers::handle_request_source_code(&session, &mut runtime_channels).await;
+                    }
+                    RuntimeCommand::SrcPathRemove { pattern } => {
+                        let should_reload = if let Some(ref mut sess) = session {
+                            if sess.source_path_resolver.remove(&pattern) {
+                                let _ = runtime_channels.status_sender.send(RuntimeStatus::SrcPathUpdated {
+                                    message: format!("Removed path rule: {}", pattern),
+                                });
+                                true
+                            } else {
+                                let _ = runtime_channels.status_sender.send(RuntimeStatus::SrcPathFailed {
+                                    error: format!("No matching path rule found: {}", pattern),
+                                });
+                                false
+                            }
+                        } else {
+                            let _ = runtime_channels.status_sender.send(RuntimeStatus::SrcPathFailed {
+                                error: "No debug session available".to_string(),
+                            });
+                            false
+                        };
+                        if should_reload {
+                            // Auto-reload source code and file list (outside the if-let to avoid borrow issues)
+                            info!("Reloading source code and file list after srcpath change");
+                            source_handlers::handle_main_source_request(&mut session, &mut runtime_channels).await;
+                            source_handlers::handle_request_source_code(&session, &mut runtime_channels).await;
+                        }
+                    }
+                    RuntimeCommand::SrcPathClear => {
+                        if let Some(ref mut sess) = session {
+                            sess.source_path_resolver.clear_runtime();
+                            let _ = runtime_channels.status_sender.send(RuntimeStatus::SrcPathUpdated {
+                                message: "Cleared all runtime path rules".to_string(),
+                            });
+                        } else {
+                            let _ = runtime_channels.status_sender.send(RuntimeStatus::SrcPathFailed {
+                                error: "No debug session available".to_string(),
+                            });
+                            continue;
+                        }
+                        // Auto-reload source code and file list (outside the if-let to avoid borrow issues)
+                        info!("Reloading source code and file list after srcpath clear");
+                        source_handlers::handle_main_source_request(&mut session, &mut runtime_channels).await;
+                        source_handlers::handle_request_source_code(&session, &mut runtime_channels).await;
+                    }
+                    RuntimeCommand::SrcPathReset => {
+                        if let Some(ref mut sess) = session {
+                            sess.source_path_resolver.reset();
+                            let _ = runtime_channels.status_sender.send(RuntimeStatus::SrcPathUpdated {
+                                message: "Reset to config file path rules".to_string(),
+                            });
+                        } else {
+                            let _ = runtime_channels.status_sender.send(RuntimeStatus::SrcPathFailed {
+                                error: "No debug session available".to_string(),
+                            });
+                            continue;
+                        }
+                        // Auto-reload source code and file list (outside the if-let to avoid borrow issues)
+                        info!("Reloading source code and file list after srcpath reset");
+                        source_handlers::handle_main_source_request(&mut session, &mut runtime_channels).await;
+                        source_handlers::handle_request_source_code(&session, &mut runtime_channels).await;
                     }
                     RuntimeCommand::Shutdown => {
                         info!("Shutdown requested");

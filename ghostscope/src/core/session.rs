@@ -1,4 +1,5 @@
 use crate::config::{MergedConfig, ParsedArgs};
+use crate::runtime::source_path_resolver::SourcePathResolver;
 use crate::tracing::TraceManager;
 use anyhow::Result;
 use ghostscope_dwarf::{DwarfAnalyzer, ModuleStats};
@@ -22,6 +23,7 @@ pub struct GhostSession {
     pub target_args: Vec<String>,
     pub target_pid: Option<u32>,
     pub trace_manager: TraceManager, // Manages all trace instances with their loaders
+    pub source_path_resolver: SourcePathResolver, // Resolves DWARF paths to actual filesystem paths
     #[allow(dead_code)]
     pub debug_file: Option<String>, // Optional debug file path
     #[allow(dead_code)]
@@ -45,6 +47,7 @@ impl GhostSession {
                 .as_ref()
                 .map(|p| p.to_string_lossy().to_string()),
             trace_manager: TraceManager::new(),
+            source_path_resolver: SourcePathResolver::new(&config.source),
             is_attached: false,
             config: Some(config.clone()),
         }
@@ -64,6 +67,7 @@ impl GhostSession {
                 .as_ref()
                 .map(|p| p.to_string_lossy().to_string()),
             trace_manager: TraceManager::new(),
+            source_path_resolver: SourcePathResolver::new(&Default::default()),
             is_attached: false,
             config: None,
         }
@@ -192,5 +196,104 @@ impl GhostSession {
     /// Check if session was started with target path (target file mode)
     pub fn is_target_mode(&self) -> bool {
         self.target_pid.is_none() && self.target_binary.is_some()
+    }
+
+    /// Update source path resolver from merged config
+    /// This should be called after setting session.config to ensure resolver has correct config
+    pub fn update_source_resolver_from_config(&mut self) {
+        if let Some(ref config) = self.config {
+            self.source_path_resolver = SourcePathResolver::new(&config.source);
+            info!(
+                "Source path resolver updated from config: {} substitutions, {} search dirs",
+                config.source.substitutions.len(),
+                config.source.search_dirs.len()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::settings::{PathSubstitution, SourceConfig};
+
+    #[test]
+    fn test_update_source_resolver_from_config() {
+        // Create a session with default (empty) resolver
+        let args = ParsedArgs {
+            binary_path: None,
+            target_path: None,
+            binary_args: vec![],
+            pid: None,
+            log_file: None,
+            enable_logging: false,
+            enable_console_logging: false,
+            has_explicit_log_flag: false,
+            has_explicit_console_log_flag: false,
+            log_level: crate::config::settings::LogLevel::Warn,
+            config: None,
+            debug_file: None,
+            script: None,
+            script_file: None,
+            tui_mode: false,
+            should_save_llvm_ir: false,
+            should_save_ebpf: false,
+            should_save_ast: false,
+            layout_mode: crate::config::LayoutMode::Horizontal,
+            force_perf_event_array: false,
+        };
+
+        let mut session = GhostSession::new(&args);
+
+        // Initially resolver should have no rules
+        let initial_rules = session.source_path_resolver.get_all_rules();
+        assert_eq!(initial_rules.config_substitution_count, 0);
+        assert_eq!(initial_rules.config_search_dir_count, 0);
+
+        // Create a merged config with source settings
+        let config = crate::config::Config {
+            source: SourceConfig {
+                substitutions: vec![
+                    PathSubstitution {
+                        from: "/build/path".to_string(),
+                        to: "/local/path".to_string(),
+                    },
+                    PathSubstitution {
+                        from: "/usr/src".to_string(),
+                        to: "/home/src".to_string(),
+                    },
+                ],
+                search_dirs: vec!["/home/user/sources".to_string()],
+            },
+            ..Default::default()
+        };
+
+        let merged_config = MergedConfig::new(args, config);
+
+        // Set the config on the session
+        session.config = Some(merged_config);
+
+        // Update the resolver from config
+        session.update_source_resolver_from_config();
+
+        // Now resolver should have the config rules
+        let updated_rules = session.source_path_resolver.get_all_rules();
+        assert_eq!(updated_rules.config_substitution_count, 2);
+        assert_eq!(updated_rules.config_search_dir_count, 1);
+
+        // Verify the substitutions are present
+        assert!(updated_rules
+            .substitutions
+            .iter()
+            .any(|s| s.from == "/build/path" && s.to == "/local/path"));
+        assert!(updated_rules
+            .substitutions
+            .iter()
+            .any(|s| s.from == "/usr/src" && s.to == "/home/src"));
+
+        // Verify search dir is present
+        assert!(updated_rules
+            .search_dirs
+            .contains(&"/home/user/sources".to_string()));
     }
 }

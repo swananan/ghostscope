@@ -302,10 +302,15 @@ impl App {
                                     == crate::model::panel_state::SourcePanelMode::FileSearch
                             {
                                 // HIGHEST PRIORITY: File search delete word
-                                let delete_actions = crate::components::source_panel::SourceSearch::delete_word_file_search(
-                                    &mut self.state.source_panel,
-                                );
-                                actions_to_process.extend(delete_actions);
+                                if let Some(ref cache) =
+                                    self.state.command_panel.file_completion_cache
+                                {
+                                    let delete_actions = crate::components::source_panel::SourceSearch::delete_word_file_search(
+                                        &mut self.state.source_panel,
+                                        cache,
+                                    );
+                                    actions_to_process.extend(delete_actions);
+                                }
                             } else if self.state.ui.focus.current_panel
                                 == crate::action::PanelType::InteractiveCommand
                             {
@@ -970,10 +975,15 @@ impl App {
                                     }
                                     'u' => {
                                         // Ctrl+U - clear entire query
-                                        let clear_actions = crate::components::source_panel::SourceSearch::clear_file_search_query(
-                                            &mut self.state.source_panel,
-                                        );
-                                        actions.extend(clear_actions);
+                                        if let Some(ref cache) =
+                                            self.state.command_panel.file_completion_cache
+                                        {
+                                            let clear_actions = crate::components::source_panel::SourceSearch::clear_file_search_query(
+                                                &mut self.state.source_panel,
+                                                cache,
+                                            );
+                                            actions.extend(clear_actions);
+                                        }
                                     }
                                     'a' => {
                                         // Ctrl+A - move cursor to beginning
@@ -991,10 +1001,15 @@ impl App {
                                     }
                                     'w' => {
                                         // Ctrl+W - delete previous word
-                                        let delete_actions = crate::components::source_panel::SourceSearch::delete_word_file_search(
-                                            &mut self.state.source_panel,
-                                        );
-                                        actions.extend(delete_actions);
+                                        if let Some(ref cache) =
+                                            self.state.command_panel.file_completion_cache
+                                        {
+                                            let delete_actions = crate::components::source_panel::SourceSearch::delete_word_file_search(
+                                                &mut self.state.source_panel,
+                                                cache,
+                                            );
+                                            actions.extend(delete_actions);
+                                        }
                                     }
                                     'b' => {
                                         // Ctrl+B - move cursor left
@@ -1446,17 +1461,20 @@ impl App {
                 );
                 additional_actions.extend(actions);
 
-                // Use cached file list if available, otherwise request from runtime
-                if let Some(cache) = &self.state.command_panel.file_completion_cache {
-                    // Use existing file cache to populate source panel search
-                    tracing::debug!("Using cached file list for source panel search");
-                    let files = cache.get_all_files().to_vec();
-                    let actions =
-                        crate::components::source_panel::SourceSearch::set_file_search_files(
-                            &mut self.state.source_panel,
-                            files,
-                        );
-                    additional_actions.extend(actions);
+                // Use file cache to populate source panel search
+                if let Some(ref mut cache) = self.state.command_panel.file_completion_cache {
+                    if !cache.is_empty() {
+                        // Use existing file cache
+                        tracing::debug!("Using cached file list for source panel search");
+                        let files = cache.get_all_files().to_vec();
+                        let actions =
+                            crate::components::source_panel::SourceSearch::set_file_search_files(
+                                &mut self.state.source_panel,
+                                cache,
+                                files,
+                            );
+                        additional_actions.extend(actions);
+                    }
                 } else {
                     // Fallback: request file information from runtime
                     tracing::debug!("No cached files available, requesting from runtime");
@@ -1505,29 +1523,40 @@ impl App {
                 additional_actions.extend(actions);
             }
             Action::SourceFileSearchInput(ch) => {
-                let actions = crate::components::source_panel::SourceSearch::push_file_search_char(
-                    &mut self.state.source_panel,
-                    ch,
-                );
-                additional_actions.extend(actions);
+                if let Some(ref cache) = self.state.command_panel.file_completion_cache {
+                    let actions =
+                        crate::components::source_panel::SourceSearch::push_file_search_char(
+                            &mut self.state.source_panel,
+                            cache,
+                            ch,
+                        );
+                    additional_actions.extend(actions);
+                }
             }
             Action::SourceFileSearchBackspace => {
-                let actions = crate::components::source_panel::SourceSearch::backspace_file_search(
-                    &mut self.state.source_panel,
-                );
-                additional_actions.extend(actions);
+                if let Some(ref cache) = self.state.command_panel.file_completion_cache {
+                    let actions =
+                        crate::components::source_panel::SourceSearch::backspace_file_search(
+                            &mut self.state.source_panel,
+                            cache,
+                        );
+                    additional_actions.extend(actions);
+                }
             }
             Action::SourceFileSearchConfirm => {
-                if let Some(selected_file) =
-                    crate::components::source_panel::SourceSearch::confirm_file_search(
-                        &mut self.state.source_panel,
-                    )
-                {
-                    // Load the selected file
-                    additional_actions.push(Action::LoadSource {
-                        path: selected_file,
-                        line: None,
-                    });
+                if let Some(ref cache) = self.state.command_panel.file_completion_cache {
+                    if let Some(selected_file) =
+                        crate::components::source_panel::SourceSearch::confirm_file_search(
+                            &mut self.state.source_panel,
+                            cache,
+                        )
+                    {
+                        // Load the selected file
+                        additional_actions.push(Action::LoadSource {
+                            path: selected_file,
+                            line: None,
+                        });
+                    }
                 }
             }
             Action::SourceNumberInput(ch) => {
@@ -1941,10 +1970,20 @@ impl App {
         let is_focused = state.ui.focus.is_focused(PanelType::Source);
         // Create a mutable copy for rendering (area update)
         let mut source_state = state.source_panel.clone();
+
+        // Get cache reference (create empty cache if None)
+        let empty_cache = crate::components::command_panel::FileCompletionCache::default();
+        let cache = state
+            .command_panel
+            .file_completion_cache
+            .as_ref()
+            .unwrap_or(&empty_cache);
+
         crate::components::source_panel::SourceRenderer::render(
             f,
             area,
             &mut source_state,
+            cache,
             is_focused,
         );
     }
@@ -2122,15 +2161,21 @@ impl App {
                     }
                 }
 
+                // Always sync file list to command panel first
+                self.sync_files_to_command_panel(files.clone());
+
                 if self.state.route_file_info_to_file_search {
                     // Route to source panel file search
-                    let actions =
-                        crate::components::source_panel::SourceSearch::set_file_search_files(
-                            &mut self.state.source_panel,
-                            files.clone(),
-                        );
-                    for action in actions {
-                        let _ = self.handle_action(action);
+                    if let Some(ref mut cache) = self.state.command_panel.file_completion_cache {
+                        let actions =
+                            crate::components::source_panel::SourceSearch::set_file_search_files(
+                                &mut self.state.source_panel,
+                                cache,
+                                files.clone(),
+                            );
+                        for action in actions {
+                            let _ = self.handle_action(action);
+                        }
                     }
 
                     // Reset routing flag
@@ -2148,9 +2193,6 @@ impl App {
                     };
                     let _ = self.handle_action(action);
                 }
-
-                // Always sync file list to command panel for file completion
-                self.sync_files_to_command_panel(files);
             }
             RuntimeStatus::FileInfoFailed { error } => {
                 if self.state.route_file_info_to_file_search {
@@ -2245,6 +2287,36 @@ impl App {
                 self.clear_waiting_state();
                 let action = Action::AddResponse {
                     content: format!("Failed to get shared library information: {error}"),
+                    response_type: crate::action::ResponseType::Error,
+                };
+                let _ = self.handle_action(action);
+            }
+            RuntimeStatus::SrcPathInfo { info } => {
+                self.clear_waiting_state();
+                let formatted = info.format_for_display();
+                let action = Action::AddResponse {
+                    content: formatted,
+                    response_type: crate::action::ResponseType::Info,
+                };
+                let _ = self.handle_action(action);
+            }
+            RuntimeStatus::SrcPathUpdated { message } => {
+                self.clear_waiting_state();
+
+                // Set flag to route upcoming FileInfo to file search panel
+                // This ensures file search list is updated with new path mappings
+                self.state.route_file_info_to_file_search = true;
+
+                let action = Action::AddResponse {
+                    content: format!("✓ {message}\n💡 Source code and file list reloading..."),
+                    response_type: crate::action::ResponseType::Success,
+                };
+                let _ = self.handle_action(action);
+            }
+            RuntimeStatus::SrcPathFailed { error } => {
+                self.clear_waiting_state();
+                let action = Action::AddResponse {
+                    content: format!("✗ {error}"),
                     response_type: crate::action::ResponseType::Error,
                 };
                 let _ = self.handle_action(action);
