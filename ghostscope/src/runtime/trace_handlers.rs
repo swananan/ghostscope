@@ -22,7 +22,7 @@ pub async fn handle_disable_trace(
                     .status_sender
                     .send(RuntimeStatus::TraceDisableFailed {
                         trace_id,
-                        error: format!("Failed to disable trace: {}", e),
+                        error: e.to_string(),
                     });
             }
         }
@@ -56,7 +56,7 @@ pub async fn handle_enable_trace(
                     .status_sender
                     .send(RuntimeStatus::TraceEnableFailed {
                         trace_id,
-                        error: format!("Failed to enable trace: {}", e),
+                        error: e.to_string(),
                     });
             }
         }
@@ -82,22 +82,28 @@ pub async fn handle_disable_all_traces(
                 info!("✓ Disabled all traces (count: {})", trace_count);
                 let _ = runtime_channels
                     .status_sender
-                    .send(RuntimeStatus::AllTracesDisabled { count: trace_count });
+                    .send(RuntimeStatus::AllTracesDisabled {
+                        count: trace_count,
+                        error: None,
+                    });
             }
             Err(e) => {
                 error!("❌ Failed to disable all traces: {}", e);
                 let _ = runtime_channels
                     .status_sender
-                    .send(RuntimeStatus::Error(format!(
-                        "Failed to disable all traces: {}",
-                        e
-                    )));
+                    .send(RuntimeStatus::AllTracesDisabled {
+                        count: 0,
+                        error: Some(format!("Failed to disable all traces: {}", e)),
+                    });
             }
         }
     } else {
-        let _ = runtime_channels.status_sender.send(RuntimeStatus::Error(
-            "No debug session available".to_string(),
-        ));
+        let _ = runtime_channels
+            .status_sender
+            .send(RuntimeStatus::AllTracesDisabled {
+                count: 0,
+                error: Some("No debug session available".to_string()),
+            });
     }
 }
 
@@ -113,22 +119,28 @@ pub async fn handle_enable_all_traces(
                 info!("✓ Enabled all traces (count: {})", trace_count);
                 let _ = runtime_channels
                     .status_sender
-                    .send(RuntimeStatus::AllTracesEnabled { count: trace_count });
+                    .send(RuntimeStatus::AllTracesEnabled {
+                        count: trace_count,
+                        error: None,
+                    });
             }
             Err(e) => {
                 error!("❌ Failed to enable all traces: {}", e);
                 let _ = runtime_channels
                     .status_sender
-                    .send(RuntimeStatus::Error(format!(
-                        "Failed to enable all traces: {}",
-                        e
-                    )));
+                    .send(RuntimeStatus::AllTracesEnabled {
+                        count: 0,
+                        error: Some(format!("Failed to enable all traces: {}", e)),
+                    });
             }
         }
     } else {
-        let _ = runtime_channels.status_sender.send(RuntimeStatus::Error(
-            "No debug session available".to_string(),
-        ));
+        let _ = runtime_channels
+            .status_sender
+            .send(RuntimeStatus::AllTracesEnabled {
+                count: 0,
+                error: Some("No debug session available".to_string()),
+            });
     }
 }
 
@@ -152,7 +164,7 @@ pub async fn handle_delete_trace(
                     .status_sender
                     .send(RuntimeStatus::TraceDeleteFailed {
                         trace_id,
-                        error: format!("Failed to delete trace: {}", e),
+                        error: e.to_string(),
                     });
             }
         }
@@ -177,21 +189,24 @@ pub async fn handle_delete_all_traces(
                 info!("✓ Deleted all traces (count: {})", count);
                 let _ = runtime_channels
                     .status_sender
-                    .send(RuntimeStatus::AllTracesDeleted { count });
+                    .send(RuntimeStatus::AllTracesDeleted { count, error: None });
             }
             Err(e) => {
                 error!("❌ Failed to delete all traces: {}", e);
                 let _ = runtime_channels
                     .status_sender
-                    .send(RuntimeStatus::Error(format!(
-                        "Failed to delete all traces: {}",
-                        e
-                    )));
+                    .send(RuntimeStatus::AllTracesDeleted {
+                        count: 0,
+                        error: Some(format!("Failed to delete all traces: {}", e)),
+                    });
             }
         }
     } else {
-        let _ = runtime_channels.status_sender.send(RuntimeStatus::Error(
-            "No debug session available".to_string(),
-        ));
+        let _ = runtime_channels
+            .status_sender
+            .send(RuntimeStatus::AllTracesDeleted {
+                count: 0,
+                error: Some("No debug session available".to_string()),
+            });
     }
 }
