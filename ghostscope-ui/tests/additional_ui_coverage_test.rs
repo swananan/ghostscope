@@ -101,7 +101,8 @@ mod history_search_tests {
         let actions = InputHandler::handle_key_event(&mut state, esc_key);
 
         assert!(!state.is_in_history_search());
-        assert!(actions
+        // Should NOT add empty response - would overwrite previous command's response
+        assert!(!actions
             .iter()
             .any(|a| matches!(a, Action::AddResponse { .. })));
     }
