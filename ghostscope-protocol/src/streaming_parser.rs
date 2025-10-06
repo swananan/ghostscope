@@ -29,9 +29,6 @@ pub enum ParsedInstruction {
         formatted_value: String,
         raw_data: Vec<u8>,
     },
-    PrintFormat {
-        formatted_output: String,
-    },
     PrintComplexFormat {
         formatted_output: String,
     },
@@ -84,11 +81,7 @@ impl ParsedTraceEvent {
                         i += 1;
                     }
                 }
-                ParsedInstruction::PrintFormat { formatted_output } => {
-                    // Already formatted, just add it
-                    output.push(formatted_output.clone());
-                    i += 1;
-                }
+
                 ParsedInstruction::EndInstruction { .. } => {
                     // Skip EndInstruction - it's for protocol control, not user output
                     i += 1;
@@ -460,63 +453,6 @@ impl StreamingTraceParser {
                 }
             }
 
-            t if t == InstructionType::PrintFormat as u8 => {
-                let (format_data, _) = PrintFormatData::read_from_prefix(inst_data)
-                    .map_err(|_| "Invalid PrintFormat data".to_string())?;
-
-                // Parse variable data
-                let mut variables = Vec::new();
-                let mut offset = std::mem::size_of::<PrintFormatData>();
-
-                for _ in 0..format_data.arg_count {
-                    // Header: var_name_index:u16 (2), type_encoding:u8 (1), data_len:u16 (2), type_index:u16 (2), status:u8 (1)
-                    if offset + 8 > inst_data.len() {
-                        return Err("Invalid PrintFormat variable header".to_string());
-                    }
-
-                    // Read variable header fields in struct order
-                    let var_name_index =
-                        u16::from_le_bytes([inst_data[offset], inst_data[offset + 1]]);
-                    let type_encoding_byte = inst_data[offset + 2];
-                    let data_len =
-                        u16::from_le_bytes([inst_data[offset + 3], inst_data[offset + 4]]);
-                    let type_index =
-                        u16::from_le_bytes([inst_data[offset + 5], inst_data[offset + 6]]);
-                    let status = inst_data[offset + 7];
-
-                    offset += 8;
-
-                    if offset + data_len as usize > inst_data.len() {
-                        return Err("Invalid PrintFormat variable data".to_string());
-                    }
-
-                    let var_data = inst_data[offset..offset + data_len as usize].to_vec();
-                    offset += data_len as usize;
-
-                    // Convert type encoding byte to enum
-                    let type_encoding =
-                        TypeKind::from_u8(type_encoding_byte).unwrap_or(TypeKind::Unknown);
-
-                    variables.push(crate::format_printer::ParsedVariable {
-                        var_name_index,
-                        type_encoding,
-                        // Preserve zero-based indices; 0 is a valid type_index
-                        type_index: Some(type_index),
-                        status,
-                        data: var_data,
-                    });
-                }
-
-                // Use FormatPrinter to generate formatted output
-                let formatted_output = crate::format_printer::FormatPrinter::format_print_data(
-                    format_data.format_string_index,
-                    &variables,
-                    trace_context,
-                );
-
-                ParsedInstruction::PrintFormat { formatted_output }
-            }
-
             t if t == InstructionType::PrintComplexFormat as u8 => {
                 let (format_data, _) = PrintComplexFormatData::read_from_prefix(inst_data)
                     .map_err(|_| "Invalid PrintComplexFormat data".to_string())?;
@@ -690,7 +626,7 @@ impl ParsedInstruction {
             } => {
                 format!("{name} ({type_encoding:?}): {formatted_value}")
             }
-            ParsedInstruction::PrintFormat { formatted_output } => formatted_output.clone(),
+
             ParsedInstruction::PrintComplexFormat { formatted_output } => formatted_output.clone(),
             ParsedInstruction::PrintComplexVariable {
                 name: _,
@@ -725,7 +661,7 @@ impl ParsedInstruction {
         match self {
             ParsedInstruction::PrintString { .. } => "PrintString".to_string(),
             ParsedInstruction::PrintVariable { .. } => "PrintVariable".to_string(),
-            ParsedInstruction::PrintFormat { .. } => "PrintFormat".to_string(),
+
             ParsedInstruction::PrintComplexFormat { .. } => "PrintComplexFormat".to_string(),
             ParsedInstruction::PrintComplexVariable { .. } => "PrintComplexVariable".to_string(),
             ParsedInstruction::Backtrace { .. } => "Backtrace".to_string(),

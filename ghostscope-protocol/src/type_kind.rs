@@ -166,10 +166,6 @@ pub mod consts {
     pub const PRINT_VARIABLE_INDEX_DATA_SIZE: usize =
         std::mem::size_of::<crate::trace_event::PrintVariableIndexData>();
 
-    /// Print format data size
-    pub const PRINT_FORMAT_DATA_SIZE: usize =
-        std::mem::size_of::<crate::trace_event::PrintFormatData>();
-
     // TraceEventMessage field offsets
     pub const TRACE_EVENT_MESSAGE_TRACE_ID_OFFSET: usize = 0;
     pub const TRACE_EVENT_MESSAGE_TIMESTAMP_OFFSET: usize = 8;

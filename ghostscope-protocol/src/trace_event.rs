@@ -26,7 +26,6 @@ pub enum InstructionType {
     PrintStringIndex = 0x01,     // print "string" (using string table index)
     PrintVariableIndex = 0x02,   // print variable (using variable name index)
     PrintComplexVariable = 0x03, // print complex variable (with full type info)
-    PrintFormat = 0x04,          // print "format {} {}", var1, var2 (formatted print)
     PrintComplexFormat = 0x05,   // print with complex variables in format args
     Backtrace = 0x10,            // backtrace instruction
 
@@ -88,18 +87,6 @@ pub struct PrintComplexVariableData {
                              // Followed by access_path (UTF-8 string) then variable data
 }
 
-/// Format print instruction data
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy, FromBytes, KnownLayout, Immutable, Unaligned)]
-pub struct PrintFormatData {
-    pub format_string_index: u16, // Index into string table for format string
-    pub arg_count: u8,            // Number of arguments
-    pub reserved: u8,             // Padding for alignment
-                                  // Followed by argument data in struct order (8 bytes header):
-                                  // [var_name_index:u16, type_encoding:u8, data_len:u16, type_index:u16, status:u8, data:bytes] * arg_count
-                                  // Note: In fast path (script variables/literals), status is always 0 (VariableStatus::Ok)
-}
-
 /// Complex format print instruction data (with full type info)
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy, FromBytes, KnownLayout, Immutable, Unaligned)]
@@ -113,7 +100,7 @@ pub struct PrintComplexFormatData {
 }
 
 // Note: historical PrintVariableError has been removed; per-variable errors
-// are carried via status in PrintVariableIndex/Format/ComplexFormat.
+// are carried via status in PrintVariableIndex/ComplexFormat.
 
 /// Backtrace instruction data
 #[repr(C, packed)]
@@ -146,10 +133,6 @@ pub enum Instruction {
         type_index: u16, // Index into type table (new field)
         data: Vec<u8>,
     },
-    PrintFormat {
-        format_string_index: u16,
-        variables: Vec<VariableData>,
-    },
     Backtrace {
         depth: u8,
         flags: u8,
@@ -161,22 +144,12 @@ pub enum Instruction {
     },
 }
 
-/// Variable data for PrintFormat instruction
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VariableData {
-    pub var_name_index: u16,
-    pub type_encoding: TypeKind,
-    pub type_index: u16, // Index into type table (new field)
-    pub data: Vec<u8>,
-}
-
 impl Instruction {
     /// Get the instruction type
     pub fn instruction_type(&self) -> InstructionType {
         match self {
             Instruction::PrintStringIndex { .. } => InstructionType::PrintStringIndex,
             Instruction::PrintVariableIndex { .. } => InstructionType::PrintVariableIndex,
-            Instruction::PrintFormat { .. } => InstructionType::PrintFormat,
             Instruction::Backtrace { .. } => InstructionType::Backtrace,
             Instruction::EndInstruction { .. } => InstructionType::EndInstruction,
         }
@@ -191,12 +164,6 @@ mod tests {
     fn test_instruction_types() {
         let inst1 = Instruction::PrintStringIndex { string_index: 0 };
         assert_eq!(inst1.instruction_type(), InstructionType::PrintStringIndex);
-
-        let inst2 = Instruction::PrintFormat {
-            format_string_index: 0,
-            variables: vec![],
-        };
-        assert_eq!(inst2.instruction_type(), InstructionType::PrintFormat);
     }
 
     #[test]

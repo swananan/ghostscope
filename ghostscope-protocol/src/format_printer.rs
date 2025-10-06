@@ -1,22 +1,12 @@
-//! Format printer for PrintFormat instructions
+//! Format printer for complex print instructions
 //!
-//! This module handles the parsing and formatting of PrintFormat instructions
-//! in the user space, converting raw variable data into formatted strings.
+//! Converts PrintComplexVariable/PrintComplexFormat payloads into formatted text in user space.
 
 use crate::trace_context::TraceContext;
 use crate::trace_event::VariableStatus;
 use crate::type_info::TypeInfo;
-use crate::TypeKind;
 
-/// A parsed variable from PrintFormat instruction data
-#[derive(Debug, Clone)]
-pub struct ParsedVariable {
-    pub var_name_index: u16,
-    pub type_encoding: TypeKind,
-    pub type_index: Option<u16>, // Optional index into type table for perfect formatting
-    pub status: u8,              // 0 OK; non-zero means error payload in data
-    pub data: Vec<u8>,
-}
+// Removed legacy simple variable wrapper; use complex paths only.
 
 /// A parsed complex variable from PrintComplexVariable instruction data
 #[derive(Debug, Clone)]
@@ -28,35 +18,10 @@ pub struct ParsedComplexVariable {
     pub data: Vec<u8>,
 }
 
-/// Format printer for converting PrintFormat data to formatted strings
+/// Format printer for converting PrintComplexFormat data to formatted strings
 pub struct FormatPrinter;
 
 impl FormatPrinter {
-    /// Simple formatting helper: replace placeholders with variable values using TypeKind-based formatting
-    /// Note: This path does not use TraceContext type table; kept for unit tests and legacy behavior.
-    pub fn apply_format(format_string: &str, variables: &[ParsedVariable]) -> String {
-        let rendered: Vec<String> = variables.iter().map(Self::format_variable_value).collect();
-        Self::apply_format_strings(format_string, &rendered)
-    }
-    /// Convert PrintFormat instruction data into a formatted string
-    /// This is the main entry point for format printing
-    pub fn format_print_data(
-        format_string_index: u16,
-        variables: &[ParsedVariable],
-        trace_context: &TraceContext,
-    ) -> String {
-        // Get the format string from the trace context
-        let format_string = match trace_context.get_string(format_string_index) {
-            Some(s) => s,
-            None => {
-                return format!("<INVALID_FORMAT_INDEX_{format_string_index}>");
-            }
-        };
-
-        // Replace placeholders with variable values, preferring type_index formatting when available
-        Self::apply_format_with_context(format_string, variables, trace_context)
-    }
-
     /// Format printer for converting PrintComplexFormat data to formatted strings
     pub fn format_complex_print_data(
         format_string_index: u16,
@@ -92,121 +57,6 @@ impl FormatPrinter {
 
         // Apply formatting with the converted variables
         Self::apply_format_strings(format_string, &formatted_vars)
-    }
-
-    /// Apply formatting with type-aware variables using TraceContext when available
-    fn apply_format_with_context(
-        format_string: &str,
-        variables: &[ParsedVariable],
-        trace_context: &TraceContext,
-    ) -> String {
-        let mut result = String::new();
-        let mut chars = format_string.chars().peekable();
-        let mut var_index = 0;
-
-        while let Some(ch) = chars.next() {
-            match ch {
-                '{' => {
-                    if chars.peek() == Some(&'{') {
-                        chars.next();
-                        result.push('{');
-                    } else {
-                        let mut found_closing = false;
-                        for inner_ch in chars.by_ref() {
-                            if inner_ch == '}' {
-                                found_closing = true;
-                                break;
-                            }
-                        }
-                        if found_closing {
-                            if var_index < variables.len() {
-                                let var = &variables[var_index];
-                                let formatted_value = if var.status != 0 {
-                                    // Status-aware error formatting. Prefer type_index when available for pointer suffix.
-                                    if let Some(type_index) = var.type_index {
-                                        if let Some(type_info) = trace_context.get_type(type_index)
-                                        {
-                                            let type_suffix = type_info.type_name();
-                                            match var.status {
-                                                1 => format!("<error: null pointer dereference> ({type_suffix}*)"),
-                                                2 => {
-                                                    let (errno, addr) = if var.data.len() >= 12 {
-                                                        let errno = i32::from_le_bytes([
-                                                            var.data[0],
-                                                            var.data[1],
-                                                            var.data[2],
-                                                            var.data[3],
-                                                        ]);
-                                                        let addr = u64::from_le_bytes([
-                                                            var.data[4],
-                                                            var.data[5],
-                                                            var.data[6],
-                                                            var.data[7],
-                                                            var.data[8],
-                                                            var.data[9],
-                                                            var.data[10],
-                                                            var.data[11],
-                                                        ]);
-                                                        (Some(errno), Some(addr))
-                                                    } else {
-                                                        (None, None)
-                                                    };
-                                                    match (errno, addr) {
-                                                        (Some(e), Some(a)) => {
-                                                            format!("<read_user failed errno={e} at 0x{a:x}> ({type_suffix}*)")
-                                                        }
-                                                        _ => {
-                                                            format!("<read_user failed> ({type_suffix}*)")
-                                                        }
-                                                    }
-                                                }
-                                                3 => format!("<address compute failed> ({type_suffix}*)"),
-                                                4 => format!("<truncated> ({type_suffix}*)"),
-                                                5 => format!("<proc offsets unavailable> ({type_suffix}*)"),
-                                                s => format!("<error status={s}> ({type_suffix}*)"),
-                                            }
-                                        } else {
-                                            format!("<error status={}>", var.status)
-                                        }
-                                    } else {
-                                        format!("<error status={}>", var.status)
-                                    }
-                                } else if let Some(type_index) = var.type_index {
-                                    // Use perfect formatting via type info
-                                    match trace_context.get_type(type_index) {
-                                        Some(type_info) => {
-                                            Self::format_data_with_type_info(&var.data, type_info)
-                                        }
-                                        None => format!(
-                                            "<COMPILER_ERROR: type_index {type_index} not found>",
-                                        ),
-                                    }
-                                } else {
-                                    // Fallback to simple TypeKind path
-                                    Self::format_variable_value(var)
-                                };
-                                result.push_str(&formatted_value);
-                                var_index += 1;
-                            } else {
-                                result.push_str("<MISSING_ARG>");
-                            }
-                        } else {
-                            result.push_str("<MALFORMED_PLACEHOLDER>");
-                        }
-                    }
-                }
-                '}' => {
-                    if chars.peek() == Some(&'}') {
-                        chars.next();
-                        result.push('}');
-                    } else {
-                        result.push('}');
-                    }
-                }
-                _ => result.push(ch),
-            }
-        }
-        result
     }
 
     /// Apply formatting: replace {} placeholders with string values
@@ -769,284 +619,6 @@ impl FormatPrinter {
         }
     }
 
-    /// Format multiple instructions with context (main entry point for enhanced formatting)
-    pub fn format_with_context(
-        instructions: &[crate::streaming_parser::ParsedInstruction],
-        trace_context: &TraceContext,
-    ) -> String {
-        let mut output = String::new();
-
-        for instruction in instructions {
-            match instruction {
-                crate::streaming_parser::ParsedInstruction::PrintVariable {
-                    name,
-                    type_encoding: _,
-                    formatted_value,
-                    raw_data,
-                } => {
-                    // Use existing formatted value or reformat with context if available
-                    if formatted_value.is_empty() && !raw_data.is_empty() {
-                        // Try to reformat with better type information
-                        let var_data = ParsedVariable {
-                            var_name_index: 0,           // dummy value
-                            type_encoding: TypeKind::U8, // fallback
-                            type_index: None,
-                            status: 0,
-                            data: raw_data.clone(),
-                        };
-                        let reformatted =
-                            Self::format_variable_with_context(&var_data, trace_context);
-                        output.push_str(&format!("{name} = {reformatted}"));
-                    } else {
-                        output.push_str(&format!("{name} = {formatted_value}"));
-                    }
-                }
-                crate::streaming_parser::ParsedInstruction::PrintComplexVariable {
-                    name,
-                    access_path,
-                    type_index,
-                    formatted_value,
-                    raw_data,
-                } => {
-                    // Use existing formatted value or reformat with context
-                    if formatted_value.is_empty() && !raw_data.is_empty() {
-                        let reformatted = Self::format_complex_variable(
-                            0, // dummy var_name_index
-                            *type_index,
-                            access_path,
-                            raw_data,
-                            trace_context,
-                        );
-                        output.push_str(&reformatted);
-                    } else if access_path.is_empty() {
-                        output.push_str(&format!("{name} = {formatted_value}"));
-                    } else {
-                        output.push_str(&format!("{name}.{access_path} = {formatted_value}"));
-                    }
-                }
-                crate::streaming_parser::ParsedInstruction::PrintString { content } => {
-                    output.push_str(content);
-                }
-                crate::streaming_parser::ParsedInstruction::PrintFormat { formatted_output } => {
-                    output.push_str(formatted_output);
-                }
-                crate::streaming_parser::ParsedInstruction::PrintComplexFormat {
-                    formatted_output,
-                } => {
-                    output.push_str(formatted_output);
-                }
-                // Add other instruction types as needed
-                _ => {
-                    output.push_str("<UNSUPPORTED_INSTRUCTION_TYPE>");
-                }
-            }
-            output.push('\n');
-        }
-
-        output
-    }
-
-    /// Format a variable with context-aware perfect formatting
-    /// NOTE: This method should not be used in normal operations.
-    /// Direct formatting is handled in streaming_parser.rs for better performance.
-    fn format_variable_with_context(
-        variable: &ParsedVariable,
-        trace_context: &TraceContext,
-    ) -> String {
-        // If we have type_index, use perfect formatting
-        if let Some(type_index) = variable.type_index {
-            match trace_context.get_type(type_index) {
-                Some(type_info) => {
-                    return Self::format_data_with_type_info(&variable.data, type_info);
-                }
-                None => {
-                    return format!(
-                        "<COMPILER_ERROR: type_index {type_index} not found in TraceContext>"
-                    );
-                }
-            }
-        }
-
-        // No type_index available - this should not happen in normal operations
-        format!(
-            "<COMPILER_ERROR: no type_index for variable with TypeKind::{:?}>",
-            variable.type_encoding
-        )
-    }
-
-    /// Format a single variable value as a string based on its type
-    pub(crate) fn format_variable_value(variable: &ParsedVariable) -> String {
-        match variable.type_encoding {
-            TypeKind::U8 => {
-                if variable.data.is_empty() {
-                    "<EMPTY_U8>".to_string()
-                } else {
-                    variable.data[0].to_string()
-                }
-            }
-            TypeKind::U16 => {
-                if variable.data.len() < 2 {
-                    "<INVALID_U16>".to_string()
-                } else {
-                    let bytes: [u8; 2] = [variable.data[0], variable.data[1]];
-                    u16::from_le_bytes(bytes).to_string()
-                }
-            }
-            TypeKind::U32 => {
-                if variable.data.len() < 4 {
-                    "<INVALID_U32>".to_string()
-                } else {
-                    let bytes: [u8; 4] = [
-                        variable.data[0],
-                        variable.data[1],
-                        variable.data[2],
-                        variable.data[3],
-                    ];
-                    u32::from_le_bytes(bytes).to_string()
-                }
-            }
-            TypeKind::U64 => {
-                if variable.data.len() < 8 {
-                    "<INVALID_U64>".to_string()
-                } else {
-                    let bytes: [u8; 8] = [
-                        variable.data[0],
-                        variable.data[1],
-                        variable.data[2],
-                        variable.data[3],
-                        variable.data[4],
-                        variable.data[5],
-                        variable.data[6],
-                        variable.data[7],
-                    ];
-                    u64::from_le_bytes(bytes).to_string()
-                }
-            }
-            TypeKind::I8 => {
-                if variable.data.is_empty() {
-                    "<EMPTY_I8>".to_string()
-                } else {
-                    (variable.data[0] as i8).to_string()
-                }
-            }
-            TypeKind::I16 => {
-                if variable.data.len() < 2 {
-                    "<INVALID_I16>".to_string()
-                } else {
-                    let bytes: [u8; 2] = [variable.data[0], variable.data[1]];
-                    i16::from_le_bytes(bytes).to_string()
-                }
-            }
-            TypeKind::I32 => {
-                if variable.data.len() < 4 {
-                    "<INVALID_I32>".to_string()
-                } else {
-                    let bytes: [u8; 4] = [
-                        variable.data[0],
-                        variable.data[1],
-                        variable.data[2],
-                        variable.data[3],
-                    ];
-                    i32::from_le_bytes(bytes).to_string()
-                }
-            }
-            TypeKind::I64 => {
-                if variable.data.len() < 8 {
-                    "<INVALID_I64>".to_string()
-                } else {
-                    let bytes: [u8; 8] = [
-                        variable.data[0],
-                        variable.data[1],
-                        variable.data[2],
-                        variable.data[3],
-                        variable.data[4],
-                        variable.data[5],
-                        variable.data[6],
-                        variable.data[7],
-                    ];
-                    i64::from_le_bytes(bytes).to_string()
-                }
-            }
-            TypeKind::F32 => {
-                if variable.data.len() < 4 {
-                    "<INVALID_F32>".to_string()
-                } else {
-                    let bytes: [u8; 4] = [
-                        variable.data[0],
-                        variable.data[1],
-                        variable.data[2],
-                        variable.data[3],
-                    ];
-                    f32::from_le_bytes(bytes).to_string()
-                }
-            }
-            TypeKind::F64 => {
-                if variable.data.len() < 8 {
-                    "<INVALID_F64>".to_string()
-                } else {
-                    let bytes: [u8; 8] = [
-                        variable.data[0],
-                        variable.data[1],
-                        variable.data[2],
-                        variable.data[3],
-                        variable.data[4],
-                        variable.data[5],
-                        variable.data[6],
-                        variable.data[7],
-                    ];
-                    f64::from_le_bytes(bytes).to_string()
-                }
-            }
-            TypeKind::Bool => {
-                if variable.data.is_empty() {
-                    "<EMPTY_BOOL>".to_string()
-                } else {
-                    (variable.data[0] != 0).to_string()
-                }
-            }
-            TypeKind::Char => {
-                if variable.data.is_empty() {
-                    "<EMPTY_CHAR>".to_string()
-                } else {
-                    let b = variable.data[0];
-                    let ch_repr = match b {
-                        0x20..=0x7E => format!("'{}'", b as char),
-                        _ => format!("'\\x{b:02x}'"),
-                    };
-                    format!("{b} ({ch_repr})")
-                }
-            }
-            TypeKind::Pointer => {
-                if variable.data.len() < 8 {
-                    "<INVALID_POINTER>".to_string()
-                } else {
-                    let bytes: [u8; 8] = [
-                        variable.data[0],
-                        variable.data[1],
-                        variable.data[2],
-                        variable.data[3],
-                        variable.data[4],
-                        variable.data[5],
-                        variable.data[6],
-                        variable.data[7],
-                    ];
-                    let addr = u64::from_le_bytes(bytes);
-                    format!("0x{addr:x}")
-                }
-            }
-            TypeKind::NullPointer => "null".to_string(),
-            TypeKind::CString | TypeKind::String => {
-                match String::from_utf8(variable.data.clone()) {
-                    Ok(s) => s.trim_end_matches('\0').to_string(), // Remove null terminator
-                    Err(_) => "<INVALID_UTF8>".to_string(),
-                }
-            }
-            TypeKind::Unknown => format!("<UNKNOWN_TYPE_{}_BYTES>", variable.data.len()),
-            TypeKind::OptimizedOut => "<OPTIMIZED_OUT>".to_string(),
-            _ => format!("<UNSUPPORTED_TYPE_{:?}>", variable.type_encoding),
-        }
-    }
-
     /// Determine if a type is a single-byte character type (signed/unsigned char)
     fn is_char_byte_type(t: &TypeInfo) -> bool {
         match t {
@@ -1155,94 +727,23 @@ mod tests {
 
     #[test]
     fn test_apply_format_basic() {
-        let variables = vec![
-            ParsedVariable {
-                var_name_index: 0,
-                type_encoding: TypeKind::I32,
-                type_index: None,
-                status: 0,
-                data: vec![42, 0, 0, 0], // 42 in little-endian
-            },
-            ParsedVariable {
-                var_name_index: 1,
-                type_encoding: TypeKind::CString,
-                type_index: None,
-                status: 0,
-                data: b"hello\0".to_vec(),
-            },
-        ];
-
-        let result = FormatPrinter::apply_format("pid: {}, name: {}", &variables);
+        let fmt = "pid: {}, name: {}";
+        let rendered: Vec<String> = vec!["42".to_string(), "hello".to_string()];
+        let result = FormatPrinter::apply_format_strings(fmt, &rendered);
         assert_eq!(result, "pid: 42, name: hello");
     }
 
     #[test]
     fn test_apply_format_escape_sequences() {
-        let variables = vec![ParsedVariable {
-            var_name_index: 0,
-            type_encoding: TypeKind::I32,
-            type_index: None,
-            status: 0,
-            data: vec![123, 0, 0, 0], // 123 in little-endian
-        }];
-
-        let result = FormatPrinter::apply_format("use {{}} for braces, value: {}", &variables);
+        let rendered: Vec<String> = vec!["123".to_string()];
+        let result =
+            FormatPrinter::apply_format_strings("use {{}} for braces, value: {}", &rendered);
         assert_eq!(result, "use {} for braces, value: 123");
     }
 
     #[test]
-    fn test_format_different_types() {
-        // Test U64
-        let var_u64 = ParsedVariable {
-            var_name_index: 0,
-            type_encoding: TypeKind::U64,
-            type_index: None,
-            status: 0,
-            data: vec![255, 255, 255, 255, 255, 255, 255, 255], // u64::MAX
-        };
-        assert_eq!(
-            FormatPrinter::format_variable_value(&var_u64),
-            "18446744073709551615"
-        );
-
-        // Test Pointer
-        let var_ptr = ParsedVariable {
-            var_name_index: 0,
-            type_encoding: TypeKind::Pointer,
-            type_index: None,
-            status: 0,
-            data: vec![0xef, 0xbe, 0xad, 0xde, 0, 0, 0, 0], // 0xdeadbeef in little-endian
-        };
-        assert_eq!(FormatPrinter::format_variable_value(&var_ptr), "0xdeadbeef");
-
-        // Test Bool
-        let var_bool_true = ParsedVariable {
-            var_name_index: 0,
-            type_encoding: TypeKind::Bool,
-            type_index: None,
-            status: 0,
-            data: vec![1],
-        };
-        assert_eq!(FormatPrinter::format_variable_value(&var_bool_true), "true");
-
-        let var_bool_false = ParsedVariable {
-            var_name_index: 0,
-            type_encoding: TypeKind::Bool,
-            type_index: None,
-            status: 0,
-            data: vec![0],
-        };
-        assert_eq!(
-            FormatPrinter::format_variable_value(&var_bool_false),
-            "false"
-        );
-    }
-
-    #[test]
     fn test_missing_arguments() {
-        let variables = vec![]; // No variables
-
-        let result = FormatPrinter::apply_format("need arg: {}", &variables);
+        let result = FormatPrinter::apply_format_strings("need arg: {}", &[]);
         assert_eq!(result, "need arg: <MISSING_ARG>");
     }
 
@@ -1250,25 +751,9 @@ mod tests {
     fn test_format_print_data_with_trace_context() {
         let mut trace_context = TraceContext::new();
         let format_index = trace_context.add_string("Hello {}, you are {} years old!".to_string());
-
-        let variables = vec![
-            ParsedVariable {
-                var_name_index: 0,
-                type_encoding: TypeKind::CString,
-                type_index: None,
-                status: 0,
-                data: b"Alice\0".to_vec(),
-            },
-            ParsedVariable {
-                var_name_index: 1,
-                type_encoding: TypeKind::U32,
-                type_index: None,
-                status: 0,
-                data: vec![25, 0, 0, 0], // 25 in little-endian
-            },
-        ];
-
-        let result = FormatPrinter::format_print_data(format_index, &variables, &trace_context);
+        let rendered: Vec<String> = vec!["Alice".to_string(), "25".to_string()];
+        let fmt = trace_context.get_string(format_index).unwrap();
+        let result = FormatPrinter::apply_format_strings(fmt, &rendered);
         assert_eq!(result, "Hello Alice, you are 25 years old!");
     }
 
