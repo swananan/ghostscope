@@ -5,7 +5,9 @@ use crate::model::ui_state::LayoutMode;
 use crate::model::AppState;
 use anyhow::Result;
 use crossterm::{
-    event::{Event, EventStream, KeyCode, KeyEventKind},
+    event::{
+        DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -33,6 +35,8 @@ impl App {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen)?;
+        // Enable bracketed paste to detect paste events (does not affect mouse selection copy)
+        execute!(stdout, EnableBracketedPaste)?;
         // Mouse capture disabled to allow standard copy/paste functionality
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
@@ -67,6 +71,8 @@ impl App {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen)?;
+        // Enable bracketed paste to detect paste events (does not affect mouse selection copy)
+        execute!(stdout, EnableBracketedPaste)?;
         // Mouse capture disabled to allow standard copy/paste functionality
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
@@ -204,10 +210,6 @@ impl App {
 
     /// Handle terminal events and convert to actions
     async fn handle_event(&mut self, event: Event) -> Result<bool> {
-        // Only log non-mouse events to reduce noise
-        if !matches!(event, Event::Mouse(_)) {
-            tracing::debug!("handle_event called with: {:?}", event);
-        }
         let mut actions_to_process = Vec::new();
 
         match event {
@@ -394,6 +396,39 @@ impl App {
             }
             Event::Resize(width, height) => {
                 actions_to_process.push(Action::Resize(width, height));
+            }
+            Event::Paste(pasted) => {
+                tracing::debug!("Event received: paste_len={}", pasted.len());
+                // Batch insert pasted text depending on focused panel and mode
+                match self.state.ui.focus.current_panel {
+                    PanelType::InteractiveCommand => {
+                        match self.state.command_panel.mode {
+                            crate::model::panel_state::InteractionMode::Input => {
+                                let actions = self
+                                    .state
+                                    .command_input_handler
+                                    .insert_str(&mut self.state.command_panel, &pasted);
+                                actions_to_process.extend(actions);
+                                self.state.command_renderer.mark_pending_updates();
+                            }
+                            crate::model::panel_state::InteractionMode::ScriptEditor => {
+                                let actions =
+                                    crate::components::command_panel::ScriptEditor::insert_text(
+                                        &mut self.state.command_panel,
+                                        &pasted,
+                                    );
+                                actions_to_process.extend(actions);
+                                self.state.command_renderer.mark_pending_updates();
+                            }
+                            crate::model::panel_state::InteractionMode::Command => {
+                                // Ignore paste in command mode
+                            }
+                        }
+                    }
+                    _ => {
+                        // Ignore paste in other panels
+                    }
+                }
             }
             _ => {}
         }
@@ -3357,6 +3392,8 @@ impl App {
     /// Cleanup terminal
     async fn cleanup(&mut self) -> Result<()> {
         disable_raw_mode()?;
+        // Disable bracketed paste before leaving alternate screen
+        execute!(self.terminal.backend_mut(), DisableBracketedPaste)?;
         execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
         // Mouse capture was not enabled, so no need to disable it
         self.terminal.show_cursor()?;
