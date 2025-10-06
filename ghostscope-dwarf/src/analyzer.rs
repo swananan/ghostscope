@@ -643,6 +643,10 @@ impl DwarfAnalyzer {
             .filter(|(path, _)| self.is_shared_library(path))
             .map(|(path, module_data)| {
                 let mapping = module_data.module_mapping();
+                let debug_file_path = module_data
+                    .get_debug_file_path()
+                    .map(|p| p.to_string_lossy().to_string());
+
                 SharedLibraryInfo {
                     from_address: mapping.loaded_address.unwrap_or(0),
                     to_address: mapping.loaded_address.map_or(0, |addr| addr + mapping.size),
@@ -650,9 +654,103 @@ impl DwarfAnalyzer {
                     debug_info_available: true, // DWARF modules always have debug info
                     library_path: path.to_string_lossy().to_string(),
                     size: mapping.size,
+                    debug_file_path,
                 }
             })
             .collect()
+    }
+
+    /// Get executable file information (for "info file" command)
+    pub fn get_executable_file_info(&self) -> Option<ExecutableFileInfo> {
+        // Find the primary executable (not a shared library)
+        let executable = self
+            .modules
+            .iter()
+            .find(|(path, _)| !self.is_shared_library(path))?;
+
+        let (exe_path, module_data) = executable;
+        let file_path = exe_path.to_string_lossy().to_string();
+
+        // Parse the ELF file to get detailed information
+        let file_bytes = std::fs::read(exe_path).ok()?;
+        let obj = object::File::parse(&file_bytes[..]).ok()?;
+
+        // Get file type
+        let file_type = match obj.format() {
+            object::BinaryFormat::Elf => {
+                if obj.is_64() {
+                    "ELF 64-bit executable"
+                } else {
+                    "ELF 32-bit executable"
+                }
+            }
+            _ => "Unknown format",
+        }
+        .to_string();
+
+        // Check if has symbols
+        let has_symbols = !module_data.get_function_names().is_empty()
+            || obj.symbols().count() > 0
+            || obj.dynamic_symbols().count() > 0;
+
+        // Check if has debug info - check if DWARF was successfully loaded
+        // This includes both embedded DWARF and debug link external files
+        let has_debug_info = module_data.has_dwarf_info();
+
+        // Get debug file path if using separate debug file (e.g., via .gnu_debuglink)
+        let debug_file_path = module_data.get_debug_file_path();
+
+        // Get load bias for PID mode (ASLR offset)
+        // In PID mode, we need to add the runtime load address to ELF VMAs
+        let load_bias = if self.pid != 0 {
+            module_data.module_mapping().loaded_address.unwrap_or(0)
+        } else {
+            0
+        };
+
+        // Get entry point (add load bias in PID mode)
+        let entry_point = Some(obj.entry() + load_bias);
+
+        // Get .text section info (add load bias in PID mode)
+        let text_section = obj.section_by_name(".text").map(|section| {
+            let addr = section.address() + load_bias;
+            let size = section.size();
+            SectionInfo {
+                start_address: addr,
+                end_address: addr + size,
+                size,
+            }
+        });
+
+        // Get .data section info (add load bias in PID mode)
+        let data_section = obj.section_by_name(".data").map(|section| {
+            let addr = section.address() + load_bias;
+            let size = section.size();
+            SectionInfo {
+                start_address: addr,
+                end_address: addr + size,
+                size,
+            }
+        });
+
+        // Determine mode description based on pid
+        let mode_description = if self.pid != 0 {
+            format!("Attached to process {} (PID mode)", self.pid)
+        } else {
+            "Static analysis mode (target file specified with -t)".to_string()
+        };
+
+        Some(ExecutableFileInfo {
+            file_path,
+            file_type,
+            entry_point,
+            has_symbols,
+            has_debug_info,
+            debug_file_path: debug_file_path.map(|p| p.to_string_lossy().to_string()),
+            text_section,
+            data_section,
+            mode_description,
+        })
     }
 
     /// Compute per-module section offsets (runtime bias) using /proc/[pid]/maps
@@ -889,12 +987,35 @@ pub struct AnalyzerStats {
 /// Shared library information (compatible with ghostscope-ui)
 #[derive(Debug, Clone)]
 pub struct SharedLibraryInfo {
-    pub from_address: u64,          // Starting address in memory
-    pub to_address: u64,            // Ending address in memory
-    pub symbols_read: bool,         // Whether symbols were successfully read
-    pub debug_info_available: bool, // Whether debug information is available
-    pub library_path: String,       // Full path to the library file
-    pub size: u64,                  // Size of the library in memory
+    pub from_address: u64,               // Starting address in memory
+    pub to_address: u64,                 // Ending address in memory
+    pub symbols_read: bool,              // Whether symbols were successfully read
+    pub debug_info_available: bool,      // Whether debug information is available
+    pub library_path: String,            // Full path to the library file
+    pub size: u64,                       // Size of the library in memory
+    pub debug_file_path: Option<String>, // Path to separate debug file (if via .gnu_debuglink)
+}
+
+/// Executable file information (for "info file" command)
+#[derive(Debug, Clone)]
+pub struct ExecutableFileInfo {
+    pub file_path: String,
+    pub file_type: String,
+    pub entry_point: Option<u64>,
+    pub has_symbols: bool,
+    pub has_debug_info: bool,
+    pub debug_file_path: Option<String>,
+    pub text_section: Option<SectionInfo>,
+    pub data_section: Option<SectionInfo>,
+    pub mode_description: String,
+}
+
+/// Section information for executable files
+#[derive(Debug, Clone)]
+pub struct SectionInfo {
+    pub start_address: u64,
+    pub end_address: u64,
+    pub size: u64,
 }
 
 /// Simple file information compatible with ghostscope-binary

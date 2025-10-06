@@ -339,6 +339,7 @@ pub enum RuntimeCommand {
     InfoTraceAll,
     InfoSource, // Get all source files information
     InfoShare,  // Get shared library information (like GDB's "info share")
+    InfoFile,   // Get executable file information and sections (like GDB's "info file")
     SaveTraces {
         filename: Option<String>,
         filter: crate::components::command_panel::trace_persistence::SaveFilter,
@@ -553,6 +554,22 @@ pub enum RuntimeStatus {
     ShareInfoFailed {
         error: String,
     },
+    /// Executable file information response
+    ExecutableFileInfo {
+        file_path: String,
+        file_type: String,
+        entry_point: Option<u64>,
+        has_symbols: bool,
+        has_debug_info: bool,
+        debug_file_path: Option<String>,
+        text_section: Option<SectionInfo>,
+        data_section: Option<SectionInfo>,
+        mode_description: String,
+    },
+    /// Failed to get executable file information
+    ExecutableFileInfoFailed {
+        error: String,
+    },
     // Module-level loading progress (new)
     DwarfModuleDiscovered {
         module_path: String,
@@ -647,12 +664,21 @@ pub struct SourceFileGroup {
 /// Shared library information (similar to GDB's "info share" output)
 #[derive(Debug, Clone)]
 pub struct SharedLibraryInfo {
-    pub from_address: u64,          // Starting address in memory
-    pub to_address: u64,            // Ending address in memory
-    pub symbols_read: bool,         // Whether symbols were successfully read
-    pub debug_info_available: bool, // Whether debug information is available
-    pub library_path: String,       // Full path to the library file
-    pub size: u64,                  // Size of the library in memory
+    pub from_address: u64,               // Starting address in memory
+    pub to_address: u64,                 // Ending address in memory
+    pub symbols_read: bool,              // Whether symbols were successfully read
+    pub debug_info_available: bool,      // Whether debug information is available
+    pub library_path: String,            // Full path to the library file
+    pub size: u64,                       // Size of the library in memory
+    pub debug_file_path: Option<String>, // Path to separate debug file (if via .gnu_debuglink)
+}
+
+/// Section information for executable files
+#[derive(Debug, Clone)]
+pub struct SectionInfo {
+    pub start_address: u64, // Starting address of the section
+    pub end_address: u64,   // Ending address of the section
+    pub size: u64,          // Size of the section in bytes
 }
 
 impl EventRegistry {

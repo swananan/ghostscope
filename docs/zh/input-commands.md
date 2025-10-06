@@ -258,6 +258,36 @@ i s                 # 缩写形式
 **说明：**
 显示所有已加载的带调试信息的源文件。
 
+### info file - 可执行文件信息
+
+**语法：**
+```
+info file
+i file              # 缩写形式
+i f                 # 最短形式（无参数）
+```
+
+**说明：**
+显示可执行文件的详细信息，包括：
+- 文件路径和类型（ELF 64位/32位）
+- 入口点地址
+- 符号表状态
+- 调试信息状态（包括 .gnu_debuglink 检测）
+- 段地址（.text、.data）
+- 启动模式（PID 模式或静态分析模式）
+
+**输出说明：**
+- **ELF 虚拟地址**：`-t` 模式（静态分析）
+- **运行时加载地址**：`-p` 模式（附加到进程）
+- **调试链接**：使用 .gnu_debuglink 时显示独立调试文件路径
+
+**示例：**
+```
+info file           # 显示可执行文件信息
+i file              # 缩写形式
+i f                 # 最短形式
+```
+
 ### info share - 列出共享库
 
 **语法：**
@@ -267,7 +297,24 @@ i sh                # 缩写形式
 ```
 
 **说明：**
-显示所有已加载的共享库（动态库）。
+显示所有已加载的共享库（动态库），包括：
+- 内存地址范围（起始/结束）
+- 符号表状态
+- 调试信息状态
+- 库文件路径
+- 独立调试文件（使用 .gnu_debuglink 时）
+
+**输出格式：**
+```
+📚 Shared Libraries (N):
+
+From               To                 Syms  Debug      Shared Object
+──────────────────────────────────────────────────────────────────────
+0x00007f...        0x00007f...        ✓     ✓          /lib/libc.so.6
+
+Debug files (.gnu_debuglink):
+  /lib/libc.so.6 → /usr/lib/debug/.build-id/ab/cdef.debug
+```
 
 ### info function - 函数调试信息
 
@@ -603,10 +650,11 @@ exit
 | `disable` | `dis` | 禁用追踪 |
 | `delete` | `del` | 删除追踪 |
 | `info` | `i` | 查看信息 |
+| `info file` | `i f`, `i file` | 查看可执行文件信息 |
 | `info trace` | `i t` | 查看追踪状态 |
 | `info source` | `i s` | 查看源文件 |
 | `info share` | `i sh` | 查看共享库 |
-| `info function` | `i f` | 查看函数信息 |
+| `info function` | `i f <name>` | 查看函数信息 |
 | `info line` | `i l` | 查看行信息 |
 | `info address` | `i a` | 查看地址信息 |
 | `save traces` | `s t` | 保存追踪点 |

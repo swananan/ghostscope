@@ -199,6 +199,9 @@ async fn run_runtime_coordinator(
                     RuntimeCommand::InfoShare => {
                         info_handlers::handle_info_share(&session, &mut runtime_channels).await;
                     }
+                    RuntimeCommand::InfoFile => {
+                        info_handlers::handle_info_file(&session, &mut runtime_channels).await;
+                    }
                     RuntimeCommand::RequestSourceCode => {
                         source_handlers::handle_main_source_request(&mut session, &mut runtime_channels).await;
                     }

@@ -175,6 +175,7 @@ impl CommandParser {
         [
             "🔍 Information Commands:",
             "  info                 - Show available info commands",
+            "  info file            - Show executable file info and sections (i f, i file)",
             "  info trace [id]      - Show trace status (i t [id])",
             "  info source          - Show all source files (i s)",
             "  info share           - Show loaded shared libraries (i sh)",
@@ -277,6 +278,7 @@ impl CommandParser {
             "stop output",
             "stop session",
             // Info subcommands
+            "info file",
             "info trace",
             "info source",
             "info share",
@@ -292,6 +294,7 @@ impl CommandParser {
             "srcpath reset",
             // Shortcut commands
             "i",
+            "i file",
             "i s",
             "i sh",
             "i t",
@@ -476,6 +479,15 @@ impl CommandParser {
                 content: Self::format_info_help(),
                 response_type: ResponseType::Info,
             }]);
+        }
+
+        if command == "info file" {
+            state.input_state = InputState::WaitingResponse {
+                command: command.to_string(),
+                sent_time: Instant::now(),
+                command_type: CommandType::InfoFile,
+            };
+            return Some(vec![Action::SendRuntimeCommand(RuntimeCommand::InfoFile)]);
         }
 
         if command == "info source" {
@@ -910,6 +922,16 @@ impl CommandParser {
             return Some(vec![Action::SendRuntimeCommand(RuntimeCommand::InfoShare)]);
         }
 
+        // Handle "i file" or "i f" (no args) -> "info file"
+        if command == "i file" || command == "i f" {
+            state.input_state = InputState::WaitingResponse {
+                command: "info file".to_string(),
+                sent_time: Instant::now(),
+                command_type: CommandType::InfoFile,
+            };
+            return Some(vec![Action::SendRuntimeCommand(RuntimeCommand::InfoFile)]);
+        }
+
         // Handle "i t" -> "info trace"
         if command == "i t" {
             return Some(Self::parse_info_trace_command(state, None));
@@ -944,7 +966,7 @@ impl CommandParser {
                 )]);
             } else {
                 return Some(vec![Action::AddResponse {
-                    content: "Usage: i f <function_name>".to_string(),
+                    content: "Usage: i f <function_name> (or 'i f' for file info)".to_string(),
                     response_type: ResponseType::Error,
                 }]);
             }
@@ -1013,6 +1035,7 @@ impl CommandParser {
             "🔍 Info Commands Usage:",
             "",
             "  info                  - Show this help message",
+            "  info file             - Show executable file info and sections (i f, i file)",
             "  info trace [id]       - Show trace status (i t [id])",
             "  info source           - Show all source files by module (i s)",
             "  info share            - Show loaded shared libraries (i sh)",
@@ -1021,6 +1044,7 @@ impl CommandParser {
             "  info address <addr>   - Show debug info for address (i a <addr>) [TODO]",
             "",
             "💡 Shortcuts:",
+            "  i f / i file          - Same as 'info file'",
             "  i s                   - Same as 'info source'",
             "  i sh                  - Same as 'info share'",
             "  i t [id]              - Same as 'info trace [id]'",
@@ -1029,6 +1053,7 @@ impl CommandParser {
             "  i a <addr>            - Same as 'info address <addr>' [TODO]",
             "",
             "Examples:",
+            "  info file             - Show executable file information",
             "  info trace            - Show all traces",
             "  i t 1                 - Show specific trace info",
             "  i f main              - Show debug info for 'main' function",

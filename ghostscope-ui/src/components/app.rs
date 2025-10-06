@@ -2267,6 +2267,48 @@ impl App {
                 };
                 let _ = self.handle_action(action);
             }
+            RuntimeStatus::ExecutableFileInfo {
+                file_path,
+                file_type,
+                entry_point,
+                has_symbols,
+                has_debug_info,
+                debug_file_path,
+                text_section,
+                data_section,
+                mode_description,
+            } => {
+                self.clear_waiting_state();
+                let info_display =
+                    crate::components::command_panel::response_formatter::ExecutableFileInfoDisplay {
+                        file_path: &file_path,
+                        file_type: &file_type,
+                        entry_point,
+                        has_symbols,
+                        has_debug_info,
+                        debug_file_path: &debug_file_path,
+                        text_section: &text_section,
+                        data_section: &data_section,
+                        mode_description: &mode_description,
+                    };
+                let formatted_info =
+                    crate::components::command_panel::ResponseFormatter::format_executable_file_info(
+                        &info_display,
+                    );
+                let action = Action::AddResponse {
+                    content: formatted_info,
+                    response_type: crate::action::ResponseType::Success,
+                };
+                let _ = self.handle_action(action);
+            }
+            RuntimeStatus::ExecutableFileInfoFailed { error } => {
+                self.clear_waiting_state();
+                let action = Action::AddResponse {
+                    content: format!("Failed to get executable file information: {error}"),
+                    response_type: crate::action::ResponseType::Error,
+                };
+                let _ = self.handle_action(action);
+            }
             RuntimeStatus::SrcPathInfo { info } => {
                 self.clear_waiting_state();
                 let formatted = info.format_for_display();
@@ -2682,6 +2724,7 @@ impl App {
                         | RuntimeStatus::TraceInfoFailed { .. }
                         | RuntimeStatus::FileInfoFailed { .. }
                         | RuntimeStatus::ShareInfoFailed { .. }
+                        | RuntimeStatus::ExecutableFileInfoFailed { .. }
                         | RuntimeStatus::SrcPathFailed { .. }
                 );
 
