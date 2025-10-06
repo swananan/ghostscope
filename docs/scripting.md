@@ -88,7 +88,19 @@ let message = "hello";
 let result = a + b;
 ```
 
-Script variables currently support integers, floats, and strings.
+Script variable types and capabilities:
+
+| Type | Literal/Example | Description | Ops/Comparisons |
+| --- | --- | --- | --- |
+| Integer (int, internally i64) | `123`, `-42` | Signed 64-bit integer | +, -, *, /; can mix with DWARF integer-like scalars |
+| Boolean (bool) | from comparisons: `a < b` | Produced by comparisons/logical expressions | logical AND/OR (script only); when mixing with DWARF integers, treated as 0/1 |
+| String | `"hello"` | UTF-8 string literal | Equality `==`, `!=` with DWARF C strings; no ordering comparisons |
+
+Notes:
+1. Script variables do not support user-defined structs/arrays/pointers; access such data via DWARF variables (member access, deref, constant index) to obtain scalars first.
+2. Floating-point arithmetic is not supported.
+3. Unary minus `-` is supported and can be nested (e.g., `-1`, `-(-1)`), parsed as `0 - expr`.
+4. Transport encodes booleans as a single byte 0/1; the renderer displays `true`/`false`.
 
 ### Local Variables, Parameters, and Global Variables
 
@@ -205,7 +217,7 @@ let quotient = a / b;  // Division
 
 1. Parentheses `()`
 2. Member access `.`, Array access `[]`
-3. Pointer dereference `*`, Address of `&`
+3. Pointer dereference `*`, Address of `&`, Unary minus `-`
 4. Multiplication `/`, Division `/`
 5. Addition `+`, Subtraction `-`
 6. Comparisons `==`, `!=`, `<`, `<=`, `>`, `>=`
@@ -226,6 +238,11 @@ let complex = (x + y) / (a - b);
 - Operands are treated as booleans with "non-zero is true" semantics
 - Current implementation evaluates both sides (no short-circuit yet)
 
+Boolean values
+
+- Comparisons and logical operators produce boolean results.
+- Transport encodes booleans as a single byte 0/1. The renderer displays them as `true`/`false`.
+
 Examples
 
 ```ghostscope
@@ -235,6 +252,20 @@ trace main:entry {
     } else if a < 100 || p == 0 {
         print "OR";
     }
+}
+```
+
+### Unary Minus
+
+- Semantics: negate an expression; recursive nesting is supported.
+- Parsing: treated as `0 - expr`, ensuring `-1`, `-x`, and `-(-1)` evaluate as signed integers.
+
+```ghostscope
+trace foo.c:42 {
+    let a = -1;          // a = -1
+    let b = -(-1);       // b = 1
+    print a;             // Output: a = -1
+    print "X:{}", b;     // Output: X:1
 }
 ```
 

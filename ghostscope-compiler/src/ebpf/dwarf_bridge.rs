@@ -62,16 +62,6 @@ impl<'ctx> EbpfContext<'ctx> {
         }
     }
 
-    /// Convert an EvaluationResult into a concrete address (IntValue) when possible
-    /// Returns error for unsupported cases (e.g., direct values without an address)
-    pub fn evaluation_result_to_address(
-        &mut self,
-        evaluation_result: &EvaluationResult,
-        status_ptr: Option<PointerValue<'ctx>>,
-    ) -> Result<IntValue<'ctx>> {
-        self.evaluation_result_to_address_with_hint(evaluation_result, status_ptr, None)
-    }
-
     /// Variant that allows passing an explicit module hint for offsets lookup
     pub fn evaluation_result_to_address_with_hint(
         &mut self,
@@ -1286,75 +1276,22 @@ impl<'ctx> EbpfContext<'ctx> {
                 }
             }
 
-            // Fallback: globals across modules (prefer static-offset lowering)
-            let matches = analyzer.find_global_variables_by_name(base_name);
-            if matches.is_empty() {
-                return Ok(None);
-            }
-            // Build preferred order (current module first)
-            let cur_mod = ctx.module_path.clone();
-            let mut ordered: Vec<(
-                &std::path::PathBuf,
-                &ghostscope_dwarf::core::GlobalVariableInfo,
-            )> = Vec::new();
-            if let Some((mpath, info)) = matches
-                .iter()
-                .find(|(p, _)| p.to_string_lossy() == cur_mod.as_str())
+            // Strict cross-module chain planning via analyzer API
+            match analyzer
+                .plan_global_chain_access(
+                    &std::path::PathBuf::from(ctx.module_path.clone()),
+                    base_name,
+                    &[field_name.to_string()],
+                )
+                .map_err(|e| CodeGenError::DwarfError(e.to_string()))?
             {
-                ordered.push((mpath, info));
-            }
-            for (mpath, info) in &matches {
-                if mpath.to_string_lossy() != cur_mod.as_str() {
-                    ordered.push((mpath, info));
+                Some((mpath, v)) => {
+                    self.current_resolved_var_module_path =
+                        Some(mpath.to_string_lossy().to_string());
+                    Ok(Some(v))
                 }
+                None => Ok(None),
             }
-
-            for (mpath, info) in &ordered {
-                if let Some(link) = info.link_address {
-                    if let Ok(Some((off, final_ty))) = analyzer.compute_global_member_static_offset(
-                        mpath,
-                        link,
-                        info.unit_offset,
-                        info.die_offset,
-                        &[field_name.to_string()],
-                    ) {
-                        let name = format!("{}.{}", base_name, field_name);
-                        let v = VariableWithEvaluation {
-                            name,
-                            type_name: final_ty.type_name(),
-                            dwarf_type: Some(final_ty),
-                            evaluation_result: ghostscope_dwarf::EvaluationResult::MemoryLocation(
-                                ghostscope_dwarf::LocationResult::Address(link + off),
-                            ),
-                            scope_depth: 0,
-                            is_parameter: false,
-                            is_artificial: false,
-                        };
-                        self.current_resolved_var_module_path =
-                            Some(mpath.to_string_lossy().to_string());
-                        return Ok(Some(v));
-                    }
-                }
-                // Planner fallback inside module (addr=0)
-                let ma = ghostscope_dwarf::ModuleAddress::new((*mpath).clone(), 0);
-                match analyzer.plan_chain_access(&ma, base_name, &[field_name.to_string()]) {
-                    Ok(Some(v)) => {
-                        self.current_resolved_var_module_path =
-                            Some(mpath.to_string_lossy().to_string());
-                        return Ok(Some(v));
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        tracing::debug!(
-                            "member planner miss in module '{}': {}",
-                            mpath.display(),
-                            e
-                        );
-                    }
-                }
-            }
-
-            Ok(None)
         } else {
             Err(CodeGenError::NotImplemented(
                 "MemberAccess base must be a simple variable (use chain access)".to_string(),
@@ -1536,78 +1473,22 @@ impl<'ctx> EbpfContext<'ctx> {
             }
         }
 
-        // Fallback: global base across modules. Prefer static-offset lowering for globals.
         let base = &chain[0];
         let rest = &chain[1..];
-        let matches = analyzer.find_global_variables_by_name(base);
-        if matches.is_empty() {
-            return Ok(None);
-        }
-        // Build preferred order with metadata (current module first)
-        let cur_mod = ctx.module_path.clone();
-        let mut ordered: Vec<(
-            &std::path::PathBuf,
-            &ghostscope_dwarf::core::GlobalVariableInfo,
-        )> = Vec::new();
-        if let Some((mpath, info)) = matches
-            .iter()
-            .find(|(p, _)| p.to_string_lossy() == cur_mod.as_str())
+        match analyzer
+            .plan_global_chain_access(
+                &std::path::PathBuf::from(ctx.module_path.clone()),
+                base,
+                rest,
+            )
+            .map_err(|e| CodeGenError::DwarfError(e.to_string()))?
         {
-            ordered.push((mpath, info));
-        }
-        for (mpath, info) in &matches {
-            if mpath.to_string_lossy() != cur_mod.as_str() {
-                ordered.push((mpath, info));
+            Some((mpath, v)) => {
+                self.current_resolved_var_module_path = Some(mpath.to_string_lossy().to_string());
+                Ok(Some(v))
             }
+            None => Ok(None),
         }
-
-        // Try static-offset lowering first; fall back to planner if needed
-        for (mpath, info) in &ordered {
-            if let Some(link) = info.link_address {
-                if let Ok(Some((off, final_ty))) = analyzer.compute_global_member_static_offset(
-                    mpath,
-                    link,
-                    info.unit_offset,
-                    info.die_offset,
-                    rest,
-                ) {
-                    let name = if rest.is_empty() {
-                        base.clone()
-                    } else {
-                        format!("{base}.{}", rest.join("."))
-                    };
-                    let v = VariableWithEvaluation {
-                        name,
-                        type_name: final_ty.type_name(),
-                        dwarf_type: Some(final_ty),
-                        evaluation_result: ghostscope_dwarf::EvaluationResult::MemoryLocation(
-                            ghostscope_dwarf::LocationResult::Address(link + off),
-                        ),
-                        scope_depth: 0,
-                        is_parameter: false,
-                        is_artificial: false,
-                    };
-                    self.current_resolved_var_module_path =
-                        Some(mpath.to_string_lossy().to_string());
-                    return Ok(Some(v));
-                }
-            }
-            // Planner fallback (addr=0 inside module)
-            let ma = ghostscope_dwarf::ModuleAddress::new((*mpath).clone(), 0);
-            match analyzer.plan_chain_access(&ma, base, rest) {
-                Ok(Some(v)) => {
-                    self.current_resolved_var_module_path =
-                        Some(mpath.to_string_lossy().to_string());
-                    return Ok(Some(v));
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::debug!("chain planner miss in module '{}': {}", mpath.display(), e);
-                }
-            }
-        }
-
-        Ok(None)
         // unreachable
     }
 
@@ -1636,7 +1517,7 @@ impl<'ctx> EbpfContext<'ctx> {
 
         // Upgrade UnknownType(target_name) using analyzer/type index to get a shallow type.
         // 1) Struct/union/class/enum: try analyzer shallow lookup by name (module-scoped first)
-        // 2) Do NOT猜测内建类型大小 — 仅使用 DWARF 基础类型条目
+        // 2) Do not guess builtin type sizes — rely only on DWARF base type entries
         if let TypeInfo::UnknownType { name } = &pointed_type {
             let mut candidate_names: Vec<String> = Vec::new();
             if !name.is_empty() && name != "void" {

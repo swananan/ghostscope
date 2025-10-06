@@ -58,7 +58,10 @@ rel_op = { "<=" | ">=" | "<" | ">" }
 equality = { relational ~ (eq_op ~ relational)* }
 relational = { additive ~ (rel_op ~ additive)* }
 additive = { term ~ (add_op ~ term)* }
-term = { factor ~ (mul_op ~ factor)* }
+// Support unary minus by introducing a 'unary' level
+term = { unary ~ (mul_op ~ unary)* }
+// Note: use recursive definition so multiple '-' nest correctly and parser can detect '-' branch
+unary = { "-" ~ unary | factor }
 factor = {
     string |
     float |

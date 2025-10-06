@@ -123,6 +123,136 @@ async fn run_ghostscope_with_script_for_pid_impl(
 }
 
 #[tokio::test]
+async fn test_script_signed_ints_regression() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Regression: script ints should keep signed semantics (I8/I16/I32), not U*
+    let script = r#"
+trace globals_program.c:32 {
+    let a = -1;
+    let b = -2;
+    let c = -3;
+    print a;
+    print b;
+    print c;
+    print "FMT:{}|{}|{}", a, b, c;
+}
+"#;
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 2, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    // Variable prints
+    assert!(
+        stdout.contains("a = -1"),
+        "Expected a = -1. STDOUT: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("b = -2"),
+        "Expected b = -2. STDOUT: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("c = -3"),
+        "Expected c = -3. STDOUT: {}",
+        stdout
+    );
+    // Formatted prints
+    assert!(
+        stdout.contains("FMT:-1|-2|-3"),
+        "Expected formatted signed values. STDOUT: {}",
+        stdout
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_address_of_with_hint_regression() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Ensure &LIB_STATE is computed with the correct module hint (prints as hex pointer)
+    let script = r#"
+trace globals_program.c:32 {
+    print &LIB_STATE;
+}
+"#;
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 1, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    assert!(
+        stdout.contains("0x"),
+        "Expected hex address. STDOUT: {}",
+        stdout
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_unary_minus_nested() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Nested unary minus should work: -(-1) == 1
+    let script = r#"
+trace globals_program.c:32 {
+    let d = -(-1);
+    print d;
+    print "X:{}", d;
+}
+"#;
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 1, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    assert!(
+        stdout.contains("d = 1"),
+        "Expected d = 1. STDOUT: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("X:1"),
+        "Expected formatted 1. STDOUT: {}",
+        stdout
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_print_format_current_global_member_leaf() -> anyhow::Result<()> {
     init();
 
