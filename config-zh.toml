@@ -30,7 +30,7 @@ enable_logging = true
 # 日志级别过滤（可通过 --log-level 覆盖）
 # 可选值："error", "warn", "info", "debug", "trace"
 # 默认值："warn"
-log_level = "trace"
+log_level = "warn"
 
 [dwarf]
 # DWARF 调试信息搜索路径（用于 .gnu_debuglink 文件）

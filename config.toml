@@ -30,7 +30,7 @@ enable_logging = true
 # Log level filter (overridden by --log-level)
 # Options: "error", "warn", "info", "debug", "trace"
 # Default: "warn"
-log_level = "trace"
+log_level = "warn"
 
 [dwarf]
 # DWARF debug information search paths for .gnu_debuglink files
