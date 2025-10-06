@@ -195,6 +195,9 @@ pub struct UiConfigToml {
     /// Command history configuration
     #[serde(default)]
     pub history: HistoryConfigToml,
+    /// Maximum number of eBPF trace messages to keep in the output panel
+    #[serde(default = "default_ebpf_max_messages")]
+    pub ebpf_max_messages: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -286,6 +289,10 @@ fn default_history_enabled() -> bool {
 
 fn default_history_max_entries() -> usize {
     5000
+}
+
+fn default_ebpf_max_messages() -> usize {
+    2000
 }
 
 // Default implementations for each config section
@@ -414,7 +421,31 @@ impl Default for UiConfigToml {
             default_focus: PanelType::default(),
             panel_ratios: default_panel_ratios(),
             history: HistoryConfigToml::default(),
+            ebpf_max_messages: default_ebpf_max_messages(),
         }
+    }
+}
+
+impl UiConfigToml {
+    /// Validate UI configuration values
+    pub fn validate(&self, file_path: &str) -> Result<()> {
+        // Validate ebpf_max_messages is reasonable (at least 100)
+        if self.ebpf_max_messages < 100 {
+            return Err(anyhow::anyhow!(
+                "❌ Invalid UI configuration in '{}':\n\n\
+                ebpf_max_messages {} is too small\n\n\
+                💡 Minimum value: 100\n\
+                Recommended values:\n\
+                  - Low-frequency tracing: 1000-2000\n\
+                  - Medium-frequency tracing: 2000-5000 (default: 2000)\n\
+                  - High-frequency tracing: 5000-10000\n\
+                Note: Larger values consume more memory",
+                file_path,
+                self.ebpf_max_messages
+            ));
+        }
+
+        Ok(())
     }
 }
 
@@ -476,6 +507,9 @@ impl Config {
 
         // Validate eBPF configuration
         config.ebpf.validate(&path.display().to_string())?;
+
+        // Validate UI configuration
+        config.ui.validate(&path.display().to_string())?;
 
         Ok(config)
     }

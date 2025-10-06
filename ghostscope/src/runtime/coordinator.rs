@@ -56,6 +56,7 @@ pub async fn run_tui_coordinator(parsed_args: ParsedArgs) -> Result<()> {
         default_focus: ghostscope_ui::PanelType::InteractiveCommand, // Default
         panel_ratios: [4, 3, 3],                                     // Default
         history: ghostscope_ui::HistoryConfig::default(),
+        ebpf_max_messages: 2000, // Default
     };
 
     // Create a default MergedConfig from ParsedArgs for compatibility

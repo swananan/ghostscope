@@ -240,6 +240,16 @@ default_focus = "InteractiveCommand"
 # 必须是 3 个正整数
 panel_ratios = [4, 3, 3]
 
+# eBPF 输出面板保留的最大跟踪消息数量
+# 超过限制时，旧消息会自动丢弃
+# 最小值：100
+# 推荐值：
+#   - 低频跟踪：1000-2000
+#   - 中频跟踪：2000-5000（默认：2000）
+#   - 高频跟踪：5000-10000
+# 注意：较大的值会消耗更多内存
+ebpf_max_messages = 2000
+
 [ui.history]
 # 启用命令历史
 enabled = true
@@ -421,6 +431,7 @@ export LLVM_SYS_170_PREFIX=/usr/lib/llvm-17
 - **布局**：Horizontal（面板横向排列）
 - **面板比例**：4:3:3（Source:EbpfInfo:Command）
 - **默认焦点**：InteractiveCommand 面板
+- **eBPF 最大消息数**：2000 条消息
 - **历史记录**：启用，5000 条条目限制
 
 ## 文件输出命名
@@ -449,7 +460,9 @@ GhostScope 在启动时验证配置：
 4. **面板比例**：确保所有 3 个值都是正（非零）整数
 5. **日志级别**：验证是否为允许的值（error, warn, info, debug, trace）
 6. **布局模式**：验证是否为允许的值（Horizontal, Vertical - 首字母大写）
-7. **eBPF 配置**：
+7. **UI 配置**：
+   - **ebpf_max_messages**：必须至少为 100
+8. **eBPF 配置**：
    - **ringbuf_size**：必须是 2 的幂，范围 4096-16777216 字节
    - **proc_module_offsets_max_entries**：必须在 64-65536 范围内
 
@@ -464,6 +477,7 @@ GhostScope 在启动时验证配置：
 - **"ringbuf_size must be a power of 2"**：使用 2 的幂值，如 131072、262144、524288 等。
 - **"ringbuf_size X is out of reasonable range"**：必须在 4KB 到 16MB 之间。
 - **"proc_module_offsets_max_entries X is out of reasonable range"**：必须在 64 到 65536 之间。
+- **"ebpf_max_messages X is too small"**：必须至少为 100。在配置文件中增加该值。
 
 ## 最佳实践
 

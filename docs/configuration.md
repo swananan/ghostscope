@@ -241,6 +241,16 @@ default_focus = "InteractiveCommand"
 # Must be 3 positive (non-zero) integers
 panel_ratios = [4, 3, 3]
 
+# Maximum number of eBPF trace messages to keep in the output panel
+# Older messages are automatically discarded when this limit is reached
+# Minimum value: 100
+# Recommended values:
+#   - Low-frequency tracing: 1000-2000
+#   - Medium-frequency tracing: 2000-5000 (default: 2000)
+#   - High-frequency tracing: 5000-10000
+# Note: Larger values consume more memory
+ebpf_max_messages = 2000
+
 [ui.history]
 # Enable command history
 enabled = true
@@ -422,6 +432,7 @@ export LLVM_SYS_170_PREFIX=/usr/lib/llvm-17
 - **Layout**: Horizontal (panels side by side)
 - **Panel Ratios**: 4:3:3 (Source:EbpfInfo:Command)
 - **Default Focus**: InteractiveCommand panel
+- **eBPF Max Messages**: 2000 messages
 - **History**: Enabled with 5000 entry limit
 
 ## File Output Naming
@@ -450,7 +461,9 @@ GhostScope validates configuration at startup:
 4. **Panel Ratios**: Ensures all 3 values are positive (non-zero) integers
 5. **Log Level**: Validates against allowed values (error, warn, info, debug, trace)
 6. **Layout Mode**: Validates against allowed values (Horizontal, Vertical - capitalized)
-7. **eBPF Configuration**:
+7. **UI Configuration**:
+   - **ebpf_max_messages**: Must be at least 100
+8. **eBPF Configuration**:
    - **ringbuf_size**: Must be power of 2, range 4096-16777216 bytes
    - **perf_page_count**: Must be power of 2, range 8-1024 pages
    - **proc_module_offsets_max_entries**: Must be in range 64-65536
@@ -468,6 +481,7 @@ Invalid configuration will produce clear error messages with suggestions for fix
 - **"perf_page_count must be a power of 2"**: Use values like 32, 64, 128, 256, etc.
 - **"perf_page_count X is out of reasonable range"**: Must be between 8 and 1024 pages.
 - **"proc_module_offsets_max_entries X is out of reasonable range"**: Must be between 64 and 65536.
+- **"ebpf_max_messages X is too small"**: Must be at least 100. Increase the value in your config file.
 
 ## Best Practices
 
