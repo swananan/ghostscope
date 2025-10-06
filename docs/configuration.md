@@ -59,11 +59,18 @@ ghostscope --debug-file /path/to/binary.debug
 
 # Auto-detection searches in order:
 # 1. Binary itself (.debug_info sections)
-# 2. .gnu_debuglink section
+# 2. .gnu_debuglink section (see search paths below)
 # 3. .gnu_debugdata section (Android/compressed)
-# 4. /usr/lib/debug, /usr/local/lib/debug
-# 5. Build-ID based paths
-# 6. binary.debug, binary.dbg
+# 4. Build-ID based paths
+
+# .gnu_debuglink search paths (configurable in config.toml):
+# 1. Absolute path (if .gnu_debuglink contains absolute path - rare)
+# 2. User-configured search_paths + basename (highest priority)
+# 3. Same directory as the binary + basename
+# 4. .debug subdirectory next to the binary + basename
+#
+# Note: To use system-wide debug directories like /usr/lib/debug,
+# add them to search_paths in config.toml
 ```
 
 ### Logging Configuration
@@ -176,10 +183,35 @@ enable_console_logging = false
 log_level = "warn"
 
 [dwarf]
-# Debug information search paths
+# Debug information search paths for .gnu_debuglink files
+# When a binary uses .gnu_debuglink to reference separate debug files,
+# GhostScope searches these paths to locate the debug file.
+#
+# Search order (highest priority first):
+# 1. Absolute path (if .gnu_debuglink contains an absolute path - rare)
+# 2. User-configured search_paths + basename (configured here)
+# 3. Same directory as the binary + basename
+# 4. .debug subdirectory next to the binary + basename
+#
+# For each user-configured path, both direct and .debug subdirectory are checked:
+#   - <path>/debug_filename
+#   - <path>/.debug/debug_filename
+#
+# Features:
+# - Home directory expansion: "~/" is replaced with your home directory
+# - Duplicate paths are automatically removed to avoid redundant checks
+# - Paths are tried in order until a matching debug file is found
+#
+# Note: .gnu_debuglink typically uses basename (relative path), but absolute paths
+# are also supported. If you need system-wide debug directories like /usr/lib/debug,
+# add them to search_paths.
+#
+# Examples:
 search_paths = [
-    "/usr/lib/debug",
-    "/usr/local/lib/debug"
+    "/usr/lib/debug",           # System debug symbols (for installed packages)
+    "/usr/local/lib/debug",     # Local debug symbols
+    "~/.local/lib/debug",       # User debug symbols (~ expands to home)
+    "/opt/debug-symbols"        # Custom debug symbol server
 ]
 
 [files]

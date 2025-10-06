@@ -14,12 +14,15 @@ use tokio::task;
 pub struct LoadConfig {
     /// Maximum number of concurrent module loads
     pub max_module_concurrency: usize,
+    /// Debug file search paths (for .gnu_debuglink)
+    pub debug_search_paths: Vec<String>,
 }
 
 impl Default for LoadConfig {
     fn default() -> Self {
         Self {
             max_module_concurrency: num_cpus::get(),
+            debug_search_paths: Vec::new(),
         }
     }
 }
@@ -29,6 +32,7 @@ impl LoadConfig {
     pub fn fast() -> Self {
         Self {
             max_module_concurrency: num_cpus::get(),
+            debug_search_paths: Vec::new(),
         }
     }
 }
@@ -51,6 +55,12 @@ impl ModuleLoader {
     /// Use predefined parallel configuration
     pub fn parallel(mut self) -> Self {
         self.config = LoadConfig::fast();
+        self
+    }
+
+    /// Set debug search paths for .gnu_debuglink files
+    pub fn with_debug_search_paths(mut self, paths: Vec<String>) -> Self {
+        self.config.debug_search_paths = paths;
         self
     }
 
@@ -89,6 +99,7 @@ impl ModuleLoader {
 
         let total_modules = self.mappings.len();
         let progress_callback = Arc::new(progress_callback);
+        let debug_search_paths = Arc::new(self.config.debug_search_paths.clone());
 
         let tasks: Vec<_> = self
             .mappings
@@ -97,6 +108,7 @@ impl ModuleLoader {
             .map(|(index, mapping)| {
                 let semaphore = semaphore.clone();
                 let progress_callback = progress_callback.clone();
+                let debug_search_paths = debug_search_paths.clone();
 
                 task::spawn(async move {
                     let _permit = semaphore.acquire().await.unwrap();
@@ -112,7 +124,7 @@ impl ModuleLoader {
 
                     let start_time = std::time::Instant::now();
 
-                    let result = ModuleData::load_parallel(mapping).await;
+                    let result = ModuleData::load_parallel(mapping, &debug_search_paths).await;
 
                     let load_time_ms = start_time.elapsed().as_millis() as u64;
 

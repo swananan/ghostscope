@@ -66,9 +66,12 @@ pub(crate) struct ModuleData {
 
 impl ModuleData {
     /// Parallel loading: debug_info || debug_line || CFI simultaneously
-    pub(crate) async fn load_parallel(module_mapping: ModuleMapping) -> Result<Self> {
+    pub(crate) async fn load_parallel(
+        module_mapping: ModuleMapping,
+        debug_search_paths: &[String],
+    ) -> Result<Self> {
         tracing::info!("Parallel loading for: {}", module_mapping.path.display());
-        Self::load_internal_parallel(module_mapping).await
+        Self::load_internal_parallel(module_mapping, debug_search_paths).await
     }
 
     /// Resolve a struct/class type by name using only indexes + shallow resolution (no scanning).
@@ -189,7 +192,10 @@ impl ModuleData {
     }
 
     /// Parallel internal load implementation - true parallelism for debug_info || debug_line || CFI
-    async fn load_internal_parallel(module_mapping: ModuleMapping) -> Result<Self> {
+    async fn load_internal_parallel(
+        module_mapping: ModuleMapping,
+        debug_search_paths: &[String],
+    ) -> Result<Self> {
         tracing::debug!(
             "Loading module in parallel: {}",
             module_mapping.path.display()
@@ -220,7 +226,10 @@ impl ModuleData {
                         "No debug info in binary, searching for .gnu_debuglink: {}",
                         module_mapping.path.display()
                     );
-                    match crate::debuglink::try_load_debug_file(&module_mapping.path)? {
+                    match crate::debuglink::try_load_debug_file(
+                        &module_mapping.path,
+                        debug_search_paths,
+                    )? {
                         Some((debug_path, debug_mmap)) => {
                             tracing::info!(
                                 "Loading DWARF from separate debug file: {}",

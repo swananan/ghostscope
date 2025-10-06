@@ -33,8 +33,35 @@ enable_logging = true
 log_level = "trace"
 
 [dwarf]
-# DWARF 调试信息搜索路径（用于未来的 --debug-file 自动发现功能）
-# 目前未实现，为未来使用保留
+# DWARF 调试信息搜索路径（用于 .gnu_debuglink 文件）
+#
+# 当二进制文件使用 .gnu_debuglink 引用独立的调试文件时，
+# GhostScope 会在这些路径中搜索调试文件。
+#
+# 搜索顺序（优先级从高到低）：
+# 1. 绝对路径（如果 .gnu_debuglink 包含绝对路径 - 罕见）
+# 2. 用户配置的 search_paths + basename（此处配置）
+# 3. 二进制文件所在目录 + basename
+# 4. 二进制文件所在目录的 .debug 子目录 + basename
+#
+# 对于每个用户配置的路径，会检查两种位置：
+#   - <路径>/debug_文件名
+#   - <路径>/.debug/debug_文件名
+#
+# 特性：
+# - 主目录展开："~/" 会被替换为你的主目录
+# - 自动去除重复路径以避免冗余检查
+# - 按顺序尝试路径，直到找到匹配的调试文件
+#
+# 常用搜索路径：
+#   - 系统调试符号："/usr/lib/debug"（用于已安装的调试包）
+#   - 本地调试符号："/usr/local/lib/debug"
+#   - 用户特定：    "~/.local/lib/debug"
+#   - 自定义构建输出："/path/to/build/debug"
+#
+# 注意：.gnu_debuglink 通常使用 basename（相对路径），但也支持绝对路径。
+# 如需使用系统范围的调试目录（如 /usr/lib/debug），请添加到 search_paths。
+#
 # 默认值：["/usr/lib/debug", "/usr/local/lib/debug"]
 search_paths = [
     "/usr/lib/debug",
@@ -96,3 +123,86 @@ output_dir = "."
 # 自动生成的实时日志文件的默认文件名前缀
 # 默认值："ghostscope_session"
 filename_prefix = "ghostscope_session"
+
+[ebpf]
+# RingBuf 映射大小（字节，必须是 2 的幂）
+# 控制用于从内核向用户空间传输跟踪事件的环形缓冲区大小。
+# 较大的尺寸允许缓冲更多事件，但会消耗更多内核内存。
+# 有效范围：4096 (4KB) 到 16777216 (16MB)
+# 推荐值：
+#   - 低频追踪：131072 (128KB)
+#   - 中频追踪：262144 (256KB)
+#   - 高频追踪：524288 (512KB) 或 1048576 (1MB)
+# 默认值：262144 (256KB)
+ringbuf_size = 262144
+
+# ASLR 地址转换的最大 (pid, module) 偏移条目数
+# 此映射存储每个进程中每个已加载模块的运行时地址偏移。
+# 每个条目存储 text/rodata/data/bss 段的偏移量。
+# 有效范围：64 到 65536
+# 推荐值：
+#   - 单进程：1024
+#   - 多进程：4096
+#   - 系统范围追踪：8192 或 16384
+# 默认值：4096
+proc_module_offsets_max_entries = 4096
+
+# PerfEventArray 页数（每个 CPU 的 perf 缓冲区页数）
+# 仅在选择 PerfEventArray 时使用（内核 < 5.8 或 force_perf_event_array=true 时）
+# 必须是 2 的幂。大多数系统上每页为 4KB。
+# 有效范围：1 到 512 页
+# 推荐值：
+#   - 低频追踪：8 页 (每 CPU 32KB)
+#   - 中频追踪：32 页 (每 CPU 128KB)
+#   - 高频追踪：64 页 (每 CPU 256KB)
+# 默认值：32 (每 CPU 128KB)
+perf_page_count = 32
+
+# 强制使用 PerfEventArray 而不是 RingBuf（仅用于测试）
+# 警告：仅用于测试目的。正常情况下系统会自动检测内核能力，
+# 并使用 RingBuf（内核 >= 5.8）或回退到 PerfEventArray。
+# 设置为 true 可在支持 RingBuf 的内核上强制使用 PerfEventArray。
+# 默认值：false
+force_perf_event_array = false
+
+# 源代码路径配置
+# 当 DWARF 调试信息中包含的编译时路径与运行时路径不同时，
+# 使用这些设置帮助 ghostscope 定位实际的源文件。
+
+[source]
+# 路径替换规则（首先应用，优先级最高）
+# 将编译时路径前缀替换为运行时路径前缀。
+# 适用于源代码在不同机器上编译或移动到新位置的情况。
+#
+# 使用场景示例：
+#   - 在 CI 服务器上编译：/home/build/project -> /home/user/work/project
+#   - 内核源码移动：/usr/src/linux-5.15 -> /home/user/kernel/linux-5.15
+#   - 交叉编译：/buildroot/arm/src -> /local/embedded/src
+#
+# 格式：数组，包含 { from = "编译路径前缀", to = "运行时路径前缀" }
+substitutions = [
+    # { from = "/home/build/myproject", to = "/home/user/work/myproject" },
+    # { from = "/usr/src/linux", to = "/home/user/kernel/linux" },
+]
+
+# 附加搜索目录（替换失败时的回退方案）
+# 当通过替换无法找到源文件时，ghostscope 将在这些目录中
+# 按文件名（basename 匹配）进行搜索。
+# 类似于 GDB 的 "directory" 命令。
+#
+# 格式：目录路径数组
+search_dirs = [
+    # "/home/user/sources",
+    # "/opt/local/src",
+]
+
+# 运行时配置：
+# 你也可以使用 'srcpath' 命令交互式配置源路径：
+#   srcpath                              - 显示当前配置
+#   srcpath map <from> <to>              - 添加路径替换规则
+#   srcpath add <directory>              - 添加搜索目录
+#   srcpath remove <path>                - 移除规则
+#   srcpath clear                        - 清除所有运行时规则
+#   srcpath reset                        - 重置为配置文件规则
+#
+# 运行时规则优先于配置文件规则，且不会持久化保存。

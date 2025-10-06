@@ -81,16 +81,12 @@ async fn run_tui_coordinator_with_ui_config_and_merged_config(
 
     // Initialize DWARF information processing in background
     let dwarf_task = {
-        let parsed_args_clone = parsed_args.clone();
         let status_sender = runtime_channels.create_status_sender();
         let config_clone = merged_config.clone();
         tokio::spawn(async move {
-            let mut session =
-                dwarf_loader::initialize_dwarf_processing(parsed_args_clone, status_sender).await?;
-            // Inject MergedConfig into session for eBPF map configuration
-            session.config = Some(config_clone);
-            // Update source path resolver with config after setting it
-            session.update_source_resolver_from_config();
+            // Pass MergedConfig directly to ensure search_paths are available during DWARF loading
+            let session =
+                dwarf_loader::initialize_dwarf_processing(&config_clone, status_sender).await?;
             Ok::<_, anyhow::Error>(session)
         })
     };

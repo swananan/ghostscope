@@ -27,3 +27,6 @@ libc = "0.2"
 # For .gnu_debuglink CRC validation
 crc32fast = "1.4"
 
+# For home directory expansion in debug search paths
+dirs = "5.0"
+

@@ -134,6 +134,8 @@ GhostScope 会自动在以下位置搜索调试文件：
 2. `.debug` 子目录：`/path/to/.debug/your_program.debug`
 3. 全局调试目录：`/usr/lib/debug/path/to/your_program.debug`
 
+> **📝 自定义搜索路径**：你可以在配置文件中配置额外的搜索路径（包括用户特定目录如 `~/.local/lib/debug`）。详细信息请参阅 [配置参考 - DWARF 调试搜索路径](configuration.md#dwarf)。
+
 **安装系统调试包：**
 ```bash
 # Ubuntu/Debian - 安装 libc 的调试符号
