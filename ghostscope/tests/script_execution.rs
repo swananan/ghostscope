@@ -375,6 +375,100 @@ async fn run_ghostscope_with_script(
 }
 
 #[tokio::test]
+async fn test_logical_or_short_circuit_chain() -> anyhow::Result<()> {
+    init();
+    ensure_global_cleanup_registered();
+
+    // Attach to a hot function so we get a few events quickly
+    let script_content = r#"
+trace calculate_something {
+    // Exercise chained OR; final should be true
+    print (0 || 0 || 1);
+    // Exercise chained OR; final should be false
+    print (0 || 0 || 0);
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script(script_content, 5).await?;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    // Expect to observe both true and false lines at least once
+    let saw_true = stdout.contains("true");
+    let saw_false = stdout.contains("false");
+    assert!(
+        saw_true,
+        "Expected at least one true result. STDOUT: {}",
+        stdout
+    );
+    assert!(
+        saw_false,
+        "Expected at least one false result. STDOUT: {}",
+        stdout
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_logical_mixed_precedence() -> anyhow::Result<()> {
+    init();
+    ensure_global_cleanup_registered();
+
+    // Validate precedence: && has higher precedence than ||
+    // (1 || 0 && 0) => 1 || (0 && 0) => true
+    // (0 || 1 && 0) => 0 || (1 && 0) => false
+    let script_content = r#"
+trace calculate_something {
+    print "MIX:{}|{}", (1 || 0 && 0), (0 || 1 && 0);
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script(script_content, 5).await?;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    // Look for a line like: MIX:true|false
+    let expected = "MIX:true|false";
+    assert!(
+        stdout.contains(expected),
+        "Expected \"{}\". STDOUT: {}",
+        expected,
+        stdout
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_logical_and_short_circuit_chain() -> anyhow::Result<()> {
+    init();
+    ensure_global_cleanup_registered();
+
+    let script_content = r#"
+trace calculate_something {
+    // true && true && false => false
+    print (1 && 1 && 0);
+    // true && true && true => true
+    print (1 && 1 && 1);
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script(script_content, 5).await?;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    let saw_true = stdout.contains("true");
+    let saw_false = stdout.contains("false");
+    assert!(
+        saw_true,
+        "Expected at least one true result. STDOUT: {}",
+        stdout
+    );
+    assert!(
+        saw_false,
+        "Expected at least one false result. STDOUT: {}",
+        stdout
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_syntax_error() -> anyhow::Result<()> {
     init();
     ensure_global_cleanup_registered();

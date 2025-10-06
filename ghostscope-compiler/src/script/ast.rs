@@ -212,19 +212,39 @@ pub fn infer_type(expr: &Expr) -> Result<VarType, String> {
                     return Ok(VarType::Bool);
                 }
 
-                // Logical operations expect boolean operands and return boolean
+                // Logical operations return boolean; allow Int literals as truthy (non-zero)
                 if matches!(*op, BinaryOp::LogicalAnd | BinaryOp::LogicalOr) {
-                    if left_type != VarType::Bool || right_type != VarType::Bool {
-                        return Err("Logical operations require boolean operands".to_string());
+                    match (left_type, right_type) {
+                        (VarType::Bool, VarType::Bool)
+                        | (VarType::Bool, VarType::Int)
+                        | (VarType::Int, VarType::Bool)
+                        | (VarType::Int, VarType::Int) => return Ok(VarType::Bool),
+                        _ => {
+                            return Err("Logical operations require boolean or integer operands"
+                                .to_string())
+                        }
                     }
-                    return Ok(VarType::Bool);
                 }
 
                 Ok(left_type)
             } else {
                 // If there are variable references, assume type compatibility to let parsing pass
                 // Actual type checking will be done in code generation phase
-                Ok(VarType::Int)
+                if matches!(*op, BinaryOp::LogicalAnd | BinaryOp::LogicalOr)
+                    || matches!(
+                        *op,
+                        BinaryOp::Equal
+                            | BinaryOp::NotEqual
+                            | BinaryOp::LessThan
+                            | BinaryOp::LessEqual
+                            | BinaryOp::GreaterThan
+                            | BinaryOp::GreaterEqual
+                    )
+                {
+                    Ok(VarType::Bool)
+                } else {
+                    Ok(VarType::Int)
+                }
             }
         }
     }
