@@ -307,7 +307,6 @@ GhostScope uses an **instruction-based protocol** for flexible trace event repre
 | **PrintStringIndex** | 0x01 | Print static string (indexed) |
 | **PrintVariableIndex** | 0x02 | Print simple variable with type info |
 | **PrintComplexVariable** | 0x03 | Print struct/array with access path |
-| **PrintFormat** | 0x04 | Formatted print with multiple arguments |
 | **PrintComplexFormat** | 0x05 | Formatted print with complex variables |
 | **Backtrace** | 0x10 | Stack backtrace with frame addresses |
 | **EndInstruction** | 0xFF | Marks end of instruction sequence |

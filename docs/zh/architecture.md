@@ -307,7 +307,6 @@ GhostScope 使用**基于指令的协议**实现灵活的追踪事件表示：
 | **PrintStringIndex** | 0x01 | 打印静态字符串（索引化） |
 | **PrintVariableIndex** | 0x02 | 打印带类型信息的简单变量 |
 | **PrintComplexVariable** | 0x03 | 打印带访问路径的结构体/数组 |
-| **PrintFormat** | 0x04 | 带多个参数的格式化打印 |
 | **PrintComplexFormat** | 0x05 | 带复杂变量的格式化打印 |
 | **Backtrace** | 0x10 | 带栈帧地址的栈回溯 |
 | **EndInstruction** | 0xFF | 标记指令序列结束 |

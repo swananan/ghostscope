@@ -14,13 +14,13 @@ pub mod type_info;
 pub use type_kind::{consts, TypeKind};
 
 pub use trace_event::{
-    EndInstructionData, InstructionHeader, InstructionType, PrintFormatData, PrintStringIndexData,
-    PrintVariableIndexData, TraceEventHeader, TraceEventMessage, VariableData, VariableStatus,
+    EndInstructionData, InstructionHeader, InstructionType, PrintStringIndexData,
+    PrintVariableIndexData, TraceEventHeader, TraceEventMessage, VariableStatus,
 };
 
 pub use trace_context::TraceContext;
 
-pub use format_printer::{FormatPrinter, ParsedVariable};
+pub use format_printer::FormatPrinter;
 
 pub use streaming_parser::{
     EventSource, ParseState, ParsedInstruction, ParsedTraceEvent, StreamingTraceParser,
