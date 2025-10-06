@@ -11,6 +11,7 @@ mod common;
 
 use common::{init, OptimizationLevel, FIXTURES};
 use lazy_static::lazy_static;
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::Write;
 use std::process::Stdio;
@@ -24,8 +25,9 @@ use tokio::time::timeout;
 
 // Global test program management
 lazy_static! {
-    static ref GLOBAL_TEST_MANAGER: Arc<RwLock<Option<GlobalTestProcess>>> =
-        Arc::new(RwLock::new(None));
+    // Maintain one process per optimization level to avoid cross-test interference.
+    static ref GLOBAL_TEST_MANAGER: Arc<RwLock<HashMap<OptimizationLevel, GlobalTestProcess>>> =
+        Arc::new(RwLock::new(HashMap::new()));
 }
 
 struct GlobalTestProcess {
@@ -111,58 +113,47 @@ impl GlobalTestProcess {
 async fn get_global_test_pid_with_opt(opt_level: OptimizationLevel) -> anyhow::Result<u32> {
     let manager = GLOBAL_TEST_MANAGER.clone();
 
-    // Read lock first to check if process exists and matches optimization level
+    // Fast path: check if we already have a live process for this opt level
     {
         let read_guard = manager.read().await;
-        if let Some(process) = &*read_guard {
-            // Check if optimization level matches and process is still running
-            if process.optimization_level == opt_level {
-                let status = std::process::Command::new("kill")
-                    .args(&["-0", &process.pid.to_string()])
-                    .status();
-
-                if status.map(|s| s.success()).unwrap_or(false) {
-                    return Ok(process.pid);
-                }
-            }
-            // Either wrong opt level or process is dead, we'll need to start a new one
-        }
-    }
-
-    // Write lock to start new process
-    let mut write_guard = manager.write().await;
-
-    // Double-check in case another thread started it
-    if let Some(process) = &*write_guard {
-        if process.optimization_level == opt_level {
+        if let Some(process) = read_guard.get(&opt_level) {
             let status = std::process::Command::new("kill")
                 .args(&["-0", &process.pid.to_string()])
                 .status();
-
             if status.map(|s| s.success()).unwrap_or(false) {
                 return Ok(process.pid);
             }
         }
     }
 
-    // Terminate existing process if it has different optimization level
-    if let Some(old_process) = write_guard.take() {
-        if old_process.optimization_level != opt_level {
-            println!(
-                "🔄 Switching from {} to {}, terminating old process",
-                old_process.optimization_level.description(),
-                opt_level.description()
-            );
-            let _ = old_process.terminate().await;
+    // Slow path: create or replace the entry for this opt level
+    let mut write_guard = manager.write().await;
+
+    // Double-check under write lock in case another task started it
+    if let Some(process) = write_guard.get(&opt_level) {
+        let status = std::process::Command::new("kill")
+            .args(&["-0", &process.pid.to_string()])
+            .status();
+        if status.map(|s| s.success()).unwrap_or(false) {
+            return Ok(process.pid);
         }
+    }
+
+    // If an old process exists for this opt level, remove it first (drop lock before awaiting)
+    let old_proc = write_guard.remove(&opt_level);
+    drop(write_guard);
+
+    if let Some(old) = old_proc {
+        let _ = old.terminate().await;
     }
 
     // Start new process with the requested optimization level
     let new_process = GlobalTestProcess::start_with_opt(opt_level).await?;
     let pid = new_process.get_pid();
 
-    *write_guard = Some(new_process);
-
+    // Re-acquire write lock to insert the new process
+    let mut write_guard = manager.write().await;
+    write_guard.insert(opt_level, new_process);
     Ok(pid)
 }
 
@@ -172,8 +163,12 @@ pub async fn cleanup_global_test_process() -> anyhow::Result<()> {
     let manager = GLOBAL_TEST_MANAGER.clone();
     let mut write_guard = manager.write().await;
 
-    if let Some(process) = write_guard.take() {
-        process.terminate().await?;
+    // Terminate all managed processes (for every optimization level)
+    let processes: Vec<GlobalTestProcess> = write_guard.drain().map(|(_, p)| p).collect();
+    drop(write_guard);
+
+    for proc in processes.into_iter() {
+        let _ = proc.terminate().await;
     }
 
     Ok(())
@@ -259,7 +254,6 @@ async fn run_ghostscope_with_script_opt(
         OsString::from("--no-save-llvm-ir"),
         OsString::from("--no-save-ebpf"),
         OsString::from("--no-save-ast"),
-        OsString::from("--no-log"),
     ];
     let command_display = format!(
         "{} {}",
