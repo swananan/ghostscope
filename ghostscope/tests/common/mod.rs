@@ -67,7 +67,7 @@ static COMPILE_OPTIMIZED: Once = Once::new();
 static COMPILE_STRIPPED: Once = Once::new();
 
 /// Optimization level for test program compilation
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OptimizationLevel {
     Debug, // -O0 (default)
     #[allow(dead_code)]
