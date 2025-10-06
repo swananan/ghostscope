@@ -14,7 +14,7 @@ pub enum LayoutMode {
 #[derive(Parser, Debug)]
 #[command(name = "ghostscope")]
 #[command(
-    about = "A DWARF-friendly eBPF userspace probe with gdb-like TUI, built in 100% safe Rust"
+    about = "A DWARF-aware eBPF tracer with cgdb-like TUI - explore live processes at runtime"
 )]
 #[command(version = "0.1.0")]
 pub struct Args {

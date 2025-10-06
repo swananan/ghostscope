@@ -71,7 +71,7 @@ impl LoadingUI {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Fill(1),
-                Constraint::Length(18), // Height for loading box - increased for more content
+                Constraint::Length(19), // Height for loading box - increased for wrap support
                 Constraint::Fill(1),
             ])
             .split(f.area());
@@ -107,7 +107,7 @@ impl LoadingUI {
         let content_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1), // Header line
+                Constraint::Length(2), // Header line (2 lines for potential wrap)
                 Constraint::Length(1), // Copyright line
                 Constraint::Length(1), // License line
                 Constraint::Length(1), // Empty line
@@ -121,17 +121,22 @@ impl LoadingUI {
             ])
             .split(inner_area);
 
-        // Header
-        let header_line = Line::from(vec![
+        // Header - with wrap support for narrow terminals
+        use ratatui::text::Text;
+        use ratatui::widgets::Wrap;
+
+        let header_text = Text::from(vec![Line::from(vec![
             Span::styled("🔍 ", Style::default().fg(Color::Yellow)),
             Span::styled(
-                "Ghostscope v0.1.0 - A DWARF-friendly eBPF userspace probe with gdb-like TUI",
+                "Ghostscope v0.1.0 - A DWARF-aware eBPF tracer with cgdb-like TUI - explore live processes at runtime",
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             ),
-        ]);
-        let header_paragraph = Paragraph::new(header_line).alignment(Alignment::Center);
+        ])]);
+        let header_paragraph = Paragraph::new(header_text)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true });
         f.render_widget(header_paragraph, content_chunks[0]);
 
         // Copyright
