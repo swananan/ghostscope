@@ -59,11 +59,18 @@ ghostscope --debug-file /path/to/binary.debug
 
 # 自动检测按以下顺序搜索：
 # 1. 二进制文件本身（.debug_info 节）
-# 2. .gnu_debuglink 节
+# 2. .gnu_debuglink 节（参见下方搜索路径）
 # 3. .gnu_debugdata 节（Android/压缩格式）
-# 4. /usr/lib/debug, /usr/local/lib/debug
-# 5. 基于 Build-ID 的路径
-# 6. binary.debug, binary.dbg
+# 4. 基于 Build-ID 的路径
+
+# .gnu_debuglink 搜索路径（可在 config.toml 中配置）：
+# 1. 绝对路径（如果 .gnu_debuglink 包含绝对路径 - 罕见）
+# 2. 用户配置的 search_paths + basename（最高优先级）
+# 3. 二进制文件同目录 + basename
+# 4. 二进制文件同目录的 .debug 子目录 + basename
+#
+# 注意：如需使用系统范围的调试目录（如 /usr/lib/debug），
+# 请在 config.toml 的 search_paths 中添加
 ```
 
 ### 日志配置
@@ -176,10 +183,34 @@ enable_console_logging = false
 log_level = "warn"
 
 [dwarf]
-# 调试信息搜索路径
+# DWARF 调试信息搜索路径（用于 .gnu_debuglink 文件）
+# 当二进制文件使用 .gnu_debuglink 引用独立的调试文件时，
+# GhostScope 会在这些路径中搜索调试文件。
+#
+# 搜索顺序（优先级从高到低）：
+# 1. 绝对路径（如果 .gnu_debuglink 包含绝对路径 - 罕见）
+# 2. 用户配置的 search_paths + basename（此处配置）
+# 3. 二进制文件所在目录 + basename
+# 4. 二进制文件所在目录的 .debug 子目录 + basename
+#
+# 对于每个用户配置的路径，会检查两种位置：
+#   - <路径>/debug_文件名
+#   - <路径>/.debug/debug_文件名
+#
+# 特性：
+# - 主目录展开："~/" 会被替换为你的主目录
+# - 自动去除重复路径以避免冗余检查
+# - 按顺序尝试路径，直到找到匹配的调试文件
+#
+# 注意：.gnu_debuglink 通常使用 basename（相对路径），但也支持绝对路径。
+# 如需使用系统范围的调试目录（如 /usr/lib/debug），请添加到 search_paths。
+#
+# 示例：
 search_paths = [
-    "/usr/lib/debug",
-    "/usr/local/lib/debug"
+    "/usr/lib/debug",           # 系统调试符号（用于已安装的软件包）
+    "/usr/local/lib/debug",     # 本地调试符号
+    "~/.local/lib/debug",       # 用户调试符号（~ 会展开为主目录）
+    "/opt/debug-symbols"        # 自定义调试符号服务器
 ]
 
 [files]

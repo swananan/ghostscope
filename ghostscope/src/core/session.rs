@@ -73,16 +73,29 @@ impl GhostSession {
         }
     }
 
+    /// Get debug search paths from configuration
+    fn get_debug_search_paths(&self) -> Vec<String> {
+        self.config
+            .as_ref()
+            .map(|c| c.dwarf_search_paths.clone())
+            .unwrap_or_default()
+    }
+
     /// Load binary and perform DWARF analysis using parallel loading (TUI mode)
     pub async fn load_binary_parallel(&mut self) -> Result<()> {
         info!("Loading binary and performing DWARF analysis (parallel mode)");
 
+        let debug_search_paths = self.get_debug_search_paths();
+
         let process_analyzer = if let Some(pid) = self.target_pid {
             info!("Loading binary from PID: {} (parallel)", pid);
-            Some(DwarfAnalyzer::from_pid_parallel(pid).await?)
+            Some(
+                DwarfAnalyzer::from_pid_parallel_with_config(pid, &debug_search_paths, |_| {})
+                    .await?,
+            )
         } else if let Some(ref binary_path) = self.target_binary {
             info!("Loading binary from executable path: {}", binary_path);
-            Some(DwarfAnalyzer::from_exec_path(binary_path).await?)
+            Some(DwarfAnalyzer::from_exec_path_with_config(binary_path, &debug_search_paths).await?)
         } else {
             warn!("No PID or binary path specified - running without binary analysis");
             None
@@ -102,13 +115,21 @@ impl GhostSession {
     {
         info!("Loading binary and performing DWARF analysis (parallel mode with progress)");
 
+        let debug_search_paths = self.get_debug_search_paths();
+
         let process_analyzer = if let Some(pid) = self.target_pid {
             info!("Loading binary from PID: {} (parallel with progress)", pid);
-            Some(DwarfAnalyzer::from_pid_parallel_with_progress(pid, progress_callback).await?)
+            Some(
+                DwarfAnalyzer::from_pid_parallel_with_config(
+                    pid,
+                    &debug_search_paths,
+                    progress_callback,
+                )
+                .await?,
+            )
         } else if let Some(ref binary_path) = self.target_binary {
             info!("Loading binary from executable path: {}", binary_path);
-            // Note: from_exec_path doesn't support progress callbacks yet
-            Some(DwarfAnalyzer::from_exec_path(binary_path).await?)
+            Some(DwarfAnalyzer::from_exec_path_with_config(binary_path, &debug_search_paths).await?)
         } else {
             warn!("No PID or binary path specified - running without binary analysis");
             None
@@ -137,15 +158,15 @@ impl GhostSession {
         Ok(session)
     }
 
-    /// Create a new session with binary loading in parallel mode with progress callback
-    pub async fn new_with_binary_parallel_with_progress<F>(
-        args: &ParsedArgs,
+    /// Create a new session with config and binary loading in parallel mode with progress callback
+    pub async fn new_with_config_and_progress<F>(
+        config: &MergedConfig,
         progress_callback: F,
     ) -> Result<Self>
     where
         F: Fn(ghostscope_dwarf::ModuleLoadingEvent) + Send + Sync + 'static,
     {
-        let mut session = Self::new(args);
+        let mut session = Self::new_with_config(config);
         session
             .load_binary_parallel_with_progress(progress_callback)
             .await?;
@@ -197,19 +218,6 @@ impl GhostSession {
     pub fn is_target_mode(&self) -> bool {
         self.target_pid.is_none() && self.target_binary.is_some()
     }
-
-    /// Update source path resolver from merged config
-    /// This should be called after setting session.config to ensure resolver has correct config
-    pub fn update_source_resolver_from_config(&mut self) {
-        if let Some(ref config) = self.config {
-            self.source_path_resolver = SourcePathResolver::new(&config.source);
-            info!(
-                "Source path resolver updated from config: {} substitutions, {} search dirs",
-                config.source.substitutions.len(),
-                config.source.search_dirs.len()
-            );
-        }
-    }
 }
 
 #[cfg(test)]
@@ -218,8 +226,8 @@ mod tests {
     use crate::config::settings::{PathSubstitution, SourceConfig};
 
     #[test]
-    fn test_update_source_resolver_from_config() {
-        // Create a session with default (empty) resolver
+    fn test_new_with_config_sets_source_resolver() {
+        // Create a merged config with source settings
         let args = ParsedArgs {
             binary_path: None,
             target_path: None,
@@ -243,14 +251,6 @@ mod tests {
             force_perf_event_array: false,
         };
 
-        let mut session = GhostSession::new(&args);
-
-        // Initially resolver should have no rules
-        let initial_rules = session.source_path_resolver.get_all_rules();
-        assert_eq!(initial_rules.config_substitution_count, 0);
-        assert_eq!(initial_rules.config_search_dir_count, 0);
-
-        // Create a merged config with source settings
         let config = crate::config::Config {
             source: SourceConfig {
                 substitutions: vec![
@@ -270,29 +270,26 @@ mod tests {
 
         let merged_config = MergedConfig::new(args, config);
 
-        // Set the config on the session
-        session.config = Some(merged_config);
+        // Create session with config - should automatically set resolver
+        let session = GhostSession::new_with_config(&merged_config);
 
-        // Update the resolver from config
-        session.update_source_resolver_from_config();
-
-        // Now resolver should have the config rules
-        let updated_rules = session.source_path_resolver.get_all_rules();
-        assert_eq!(updated_rules.config_substitution_count, 2);
-        assert_eq!(updated_rules.config_search_dir_count, 1);
+        // Verify resolver was set correctly from config
+        let rules = session.source_path_resolver.get_all_rules();
+        assert_eq!(rules.config_substitution_count, 2);
+        assert_eq!(rules.config_search_dir_count, 1);
 
         // Verify the substitutions are present
-        assert!(updated_rules
+        assert!(rules
             .substitutions
             .iter()
             .any(|s| s.from == "/build/path" && s.to == "/local/path"));
-        assert!(updated_rules
+        assert!(rules
             .substitutions
             .iter()
             .any(|s| s.from == "/usr/src" && s.to == "/home/src"));
 
         // Verify search dir is present
-        assert!(updated_rules
+        assert!(rules
             .search_dirs
             .contains(&"/home/user/sources".to_string()));
     }

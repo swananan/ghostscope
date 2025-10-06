@@ -1,4 +1,4 @@
-use crate::config::ParsedArgs;
+use crate::config::MergedConfig;
 use crate::core::GhostSession;
 use anyhow::Result;
 use ghostscope_dwarf::ModuleLoadingEvent;
@@ -60,15 +60,15 @@ fn convert_loading_event_to_runtime_status(event: ModuleLoadingEvent) -> Runtime
 
 /// Initialize DWARF processing in background
 pub async fn initialize_dwarf_processing(
-    parsed_args: ParsedArgs,
+    config: &MergedConfig,
     status_sender: tokio::sync::mpsc::UnboundedSender<RuntimeStatus>,
 ) -> Result<GhostSession> {
-    initialize_dwarf_processing_with_progress(parsed_args, status_sender).await
+    initialize_dwarf_processing_with_progress(config, status_sender).await
 }
 
 /// Initialize DWARF processing in background with detailed progress reporting
 pub async fn initialize_dwarf_processing_with_progress(
-    parsed_args: ParsedArgs,
+    config: &MergedConfig,
     status_sender: tokio::sync::mpsc::UnboundedSender<RuntimeStatus>,
 ) -> Result<GhostSession> {
     // Send status update: starting DWARF loading
@@ -84,9 +84,8 @@ pub async fn initialize_dwarf_processing_with_progress(
     };
 
     // Create debug session for DWARF processing with parallel loading and progress
-    match GhostSession::new_with_binary_parallel_with_progress(&parsed_args, progress_callback)
-        .await
-    {
+    // Use config to ensure search_paths are available during DWARF loading
+    match GhostSession::new_with_config_and_progress(config, progress_callback).await {
         Ok(session) => {
             // Validate that we have process analysis information
             match session.get_module_stats() {
@@ -123,8 +122,8 @@ pub async fn initialize_dwarf_processing_with_progress(
                 None => {
                     let error_msg = format!(
                         "Binary analysis failed! Cannot load DWARF information for PID {} or binary path {:?}",
-                        parsed_args.pid.unwrap_or(0),
-                        parsed_args.binary_path
+                        config.pid.unwrap_or(0),
+                        config.binary_path
                     );
                     let _ =
                         status_sender.send(RuntimeStatus::DwarfLoadingFailed(error_msg.clone()));

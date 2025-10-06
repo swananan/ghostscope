@@ -690,6 +690,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "crc32fast",
+ "dirs",
  "futures",
  "ghostscope-platform",
  "ghostscope-protocol",

@@ -134,6 +134,8 @@ GhostScope automatically searches for debug files in the following locations:
 2. `.debug` subdirectory: `/path/to/.debug/your_program.debug`
 3. Global debug directory: `/usr/lib/debug/path/to/your_program.debug`
 
+> **📝 Custom Search Paths**: You can configure additional search paths (including user-specific directories like `~/.local/lib/debug`) in the configuration file. See the [Configuration Reference - DWARF Debug Search Paths](configuration.md#dwarf) for detailed information.
+
 **Installing system debug packages:**
 ```bash
 # Ubuntu/Debian - install debug symbols for libc
