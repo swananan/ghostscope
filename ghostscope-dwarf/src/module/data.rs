@@ -1331,6 +1331,24 @@ impl ModuleData {
         self.scoped_file_manager.get_stats().1
     }
 
+    /// Check if DWARF debug information is available (including debug link)
+    pub(crate) fn has_dwarf_info(&self) -> bool {
+        self.get_line_header_count() > 0
+    }
+
+    /// Get debug file path (if different from binary, e.g., via .gnu_debuglink)
+    pub(crate) fn get_debug_file_path(&self) -> Option<PathBuf> {
+        let dwarf_path = &self._dwarf_mapped_file.path;
+        let binary_path = &self._binary_mapped_file.path;
+
+        // If DWARF file path is different from binary path, it's a separate debug file
+        if dwarf_path != binary_path {
+            Some(dwarf_path.clone())
+        } else {
+            None
+        }
+    }
+
     /// Get cache statistics
     pub(crate) fn get_cache_stats(&self) -> (usize, usize) {
         self.resolver.get_cache_stats()

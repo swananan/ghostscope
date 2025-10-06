@@ -11,6 +11,19 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthChar;
 
+/// Parameter struct for format_executable_file_info to avoid too many function arguments
+pub struct ExecutableFileInfoDisplay<'a> {
+    pub file_path: &'a str,
+    pub file_type: &'a str,
+    pub entry_point: Option<u64>,
+    pub has_symbols: bool,
+    pub has_debug_info: bool,
+    pub debug_file_path: &'a Option<String>,
+    pub text_section: &'a Option<crate::events::SectionInfo>,
+    pub data_section: &'a Option<crate::events::SectionInfo>,
+    pub mode_description: &'a str,
+}
+
 /// Handles response formatting and display for the command panel
 pub struct ResponseFormatter;
 
@@ -538,6 +551,9 @@ impl ResponseFormatter {
             response.push_str(&UIStrings::SCRIPT_SEPARATOR.repeat(90));
             response.push('\n');
 
+            // Collect libraries with debug links for later display
+            let mut debug_links = Vec::new();
+
             for lib in libraries {
                 let from_str = format!("0x{:016x}", lib.from_address);
                 let to_str = format!("0x{:016x}", lib.to_address);
@@ -549,6 +565,11 @@ impl ResponseFormatter {
                     "{}  {}  {}         {}         {}\n",
                     from_str, to_str, syms_read, debug_read, lib.library_path
                 ));
+
+                // Collect debug link info
+                if let Some(ref debug_path) = lib.debug_file_path {
+                    debug_links.push((lib.library_path.clone(), debug_path.clone()));
+                }
 
                 if !lib.debug_info_available {
                     let library_name = lib
@@ -562,9 +583,102 @@ impl ResponseFormatter {
                     ));
                 }
             }
+
+            // Show debug links section if any
+            if !debug_links.is_empty() {
+                response.push('\n');
+                response.push_str("Debug files (.gnu_debuglink):\n");
+                for (lib_path, debug_path) in debug_links {
+                    response.push_str(&format!("  {lib_path} → {debug_path}\n"));
+                }
+            }
         } else {
             response.push_str(&format!("  {}\n", UIStrings::NO_SHARED_LIBRARIES));
         }
+
+        response
+    }
+
+    /// Format executable file information for display
+    pub fn format_executable_file_info(info: &ExecutableFileInfoDisplay) -> String {
+        let ExecutableFileInfoDisplay {
+            file_path,
+            file_type,
+            entry_point,
+            has_symbols,
+            has_debug_info,
+            debug_file_path,
+            text_section,
+            data_section,
+            mode_description,
+        } = info;
+        let mut response = String::new();
+
+        // Header
+        response.push_str("📄 Executable File Information:\n\n");
+
+        // File path
+        response.push_str(&format!("  File: {file_path}\n"));
+
+        // File type
+        response.push_str(&format!("  Type: {file_type}\n"));
+
+        // Entry point
+        if let Some(entry) = entry_point {
+            response.push_str(&format!("  Entry point: 0x{entry:x}\n"));
+        }
+
+        response.push('\n');
+
+        // Symbol and debug information status
+        response.push_str("  Symbols:      ");
+        if *has_symbols {
+            response.push_str("✓ Available\n");
+        } else {
+            response.push_str("✗ Not available\n");
+        }
+
+        response.push_str("  Debug info:   ");
+        if *has_debug_info {
+            response.push_str("✓ Available");
+            if let Some(ref debug_path) = debug_file_path {
+                response.push_str(&format!(" (via debug link: {debug_path})"));
+            }
+            response.push('\n');
+        } else {
+            response.push_str("✗ Not available\n");
+        }
+
+        response.push('\n');
+
+        // Determine if this is static analysis mode
+        let is_static_mode = mode_description.contains("Static analysis mode");
+
+        // Sections
+        if is_static_mode {
+            response.push_str("  Sections (ELF virtual addresses):\n");
+        } else {
+            response.push_str("  Sections (runtime loaded addresses):\n");
+        }
+
+        if let Some(text) = text_section {
+            response.push_str(&format!(
+                "    .text:  0x{:016x} - 0x{:016x}  (size: {} bytes)\n",
+                text.start_address, text.end_address, text.size
+            ));
+        }
+
+        if let Some(data) = data_section {
+            response.push_str(&format!(
+                "    .data:  0x{:016x} - 0x{:016x}  (size: {} bytes)\n",
+                data.start_address, data.end_address, data.size
+            ));
+        }
+
+        response.push('\n');
+
+        // Mode description
+        response.push_str(&format!("  Mode: {mode_description}\n"));
 
         response
     }

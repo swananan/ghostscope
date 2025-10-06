@@ -262,6 +262,36 @@ i s                 # Short form
 **Description:**
 Display all loaded source files with debug information.
 
+### info file - Executable File Information
+
+**Syntax:**
+```
+info file
+i file              # Short form
+i f                 # Shortest form (no args)
+```
+
+**Description:**
+Display executable file information including:
+- File path and type (ELF 64-bit/32-bit)
+- Entry point address
+- Symbol table status
+- Debug information status (includes .gnu_debuglink detection)
+- Section addresses (.text, .data)
+- Launch mode (PID mode or static analysis mode)
+
+**Output:**
+- **ELF virtual addresses**: For `-t` mode (static analysis)
+- **Runtime loaded addresses**: For `-p` mode (attached to process)
+- **Debug link**: Shows separate debug file path if using .gnu_debuglink
+
+**Examples:**
+```
+info file           # Show executable info
+i file              # Short form
+i f                 # Shortest form
+```
+
 ### info share - List Shared Libraries
 
 **Syntax:**
@@ -271,7 +301,24 @@ i sh                # Short form
 ```
 
 **Description:**
-Display all loaded shared libraries (dynamic libraries).
+Display all loaded shared libraries (dynamic libraries) with:
+- Memory address ranges (from/to)
+- Symbol table status
+- Debug information status
+- Library file paths
+- Separate debug files (if using .gnu_debuglink)
+
+**Output Format:**
+```
+📚 Shared Libraries (N):
+
+From               To                 Syms  Debug      Shared Object
+──────────────────────────────────────────────────────────────────────
+0x00007f...        0x00007f...        ✓     ✓          /lib/libc.so.6
+
+Debug files (.gnu_debuglink):
+  /lib/libc.so.6 → /usr/lib/debug/.build-id/ab/cdef.debug
+```
 
 ### info function - Function Debug Info
 
@@ -578,10 +625,11 @@ Exit GhostScope. You can also use `Ctrl+C` twice to quit.
 | `disable` | `dis` | Disable trace |
 | `delete` | `del` | Delete trace |
 | `info` | `i` | View information |
+| `info file` | `i f`, `i file` | View executable file info |
 | `info trace` | `i t` | View trace status |
 | `info source` | `i s` | View source files |
 | `info share` | `i sh` | View shared libraries |
-| `info function` | `i f` | View function info |
+| `info function` | `i f <name>` | View function info |
 | `info line` | `i l` | View line info |
 | `info address` | `i a` | View address info |
 | `save traces` | `s t` | Save trace points |

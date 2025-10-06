@@ -106,6 +106,73 @@ pub async fn handle_info_source(
     crate::runtime::source_handlers::handle_request_source_code(session, runtime_channels).await;
 }
 
+/// Handle InfoFile command
+pub async fn handle_info_file(
+    session: &Option<GhostSession>,
+    runtime_channels: &mut RuntimeChannels,
+) {
+    if let Some(ref session) = session {
+        // Get executable file information from ProcessAnalyzer
+        if let Some(ref analyzer) = session.process_analyzer {
+            // Get primary executable file information
+            let file_info = analyzer.get_executable_file_info();
+
+            if let Some(info) = file_info {
+                // Convert SectionInfo from ghostscope-dwarf to ghostscope-ui
+                let text_section =
+                    info.text_section
+                        .map(|section| ghostscope_ui::events::SectionInfo {
+                            start_address: section.start_address,
+                            end_address: section.end_address,
+                            size: section.size,
+                        });
+
+                let data_section =
+                    info.data_section
+                        .map(|section| ghostscope_ui::events::SectionInfo {
+                            start_address: section.start_address,
+                            end_address: section.end_address,
+                            size: section.size,
+                        });
+
+                let _ = runtime_channels
+                    .status_sender
+                    .send(RuntimeStatus::ExecutableFileInfo {
+                        file_path: info.file_path,
+                        file_type: info.file_type,
+                        entry_point: info.entry_point,
+                        has_symbols: info.has_symbols,
+                        has_debug_info: info.has_debug_info,
+                        debug_file_path: info.debug_file_path,
+                        text_section,
+                        data_section,
+                        mode_description: info.mode_description,
+                    });
+            } else {
+                let _ =
+                    runtime_channels
+                        .status_sender
+                        .send(RuntimeStatus::ExecutableFileInfoFailed {
+                            error: "No executable file information available".to_string(),
+                        });
+            }
+        } else {
+            let _ = runtime_channels
+                .status_sender
+                .send(RuntimeStatus::ExecutableFileInfoFailed {
+                    error: "No process analyzer available".to_string(),
+                });
+        }
+    } else {
+        let _ = runtime_channels
+            .status_sender
+            .send(RuntimeStatus::ExecutableFileInfoFailed {
+                error: "No active debugging session. Target process may not be attached or initialization failed."
+                    .to_string(),
+            });
+    }
+}
+
 /// Handle InfoShare command
 pub async fn handle_info_share(
     session: &Option<GhostSession>,
@@ -136,6 +203,7 @@ pub async fn handle_info_share(
                     debug_info_available: lib.debug_info_available,
                     library_path: lib.library_path,
                     size: lib.size,
+                    debug_file_path: lib.debug_file_path,
                 })
                 .collect();
 
