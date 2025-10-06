@@ -78,6 +78,161 @@ impl<'ctx> EbpfContext<'ctx> {
             }
             Expr::SpecialVar(name) => self.handle_special_variable(name),
             Expr::BinaryOp { left, op, right } => {
+                // Implement short-circuit for logical OR (||) and logical AND (&&)
+                if matches!(op, BinaryOp::LogicalOr) {
+                    // Evaluate LHS to boolean (non-zero => true)
+                    let lhs_val = self.compile_expr(left)?;
+                    let lhs_int = match lhs_val {
+                        BasicValueEnum::IntValue(iv) => iv,
+                        _ => {
+                            return Err(CodeGenError::TypeError(
+                                "Logical OR requires integer operands".to_string(),
+                            ))
+                        }
+                    };
+                    let lhs_zero = lhs_int.get_type().const_zero();
+                    let lhs_bool = self
+                        .builder
+                        .build_int_compare(
+                            inkwell::IntPredicate::NE,
+                            lhs_int,
+                            lhs_zero,
+                            "lor_lhs_nz",
+                        )
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+                    // Prepare control flow blocks
+                    let curr_block = self.builder.get_insert_block().ok_or_else(|| {
+                        CodeGenError::LLVMError("No current basic block".to_string())
+                    })?;
+                    let func = curr_block
+                        .get_parent()
+                        .ok_or_else(|| CodeGenError::LLVMError("No parent function".to_string()))?;
+                    let rhs_block = self.context.append_basic_block(func, "lor_rhs");
+                    let merge_block = self.context.append_basic_block(func, "lor_merge");
+
+                    // If lhs is true, jump directly to merge (short-circuit)
+                    self.builder
+                        .build_conditional_branch(lhs_bool, merge_block, rhs_block)
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+                    // RHS path: compute boolean only if needed
+                    self.builder.position_at_end(rhs_block);
+                    let rhs_val = self.compile_expr(right)?;
+                    let rhs_int = match rhs_val {
+                        BasicValueEnum::IntValue(iv) => iv,
+                        _ => {
+                            return Err(CodeGenError::TypeError(
+                                "Logical OR requires integer operands".to_string(),
+                            ))
+                        }
+                    };
+                    let rhs_zero = rhs_int.get_type().const_zero();
+                    let rhs_bool = self
+                        .builder
+                        .build_int_compare(
+                            inkwell::IntPredicate::NE,
+                            rhs_int,
+                            rhs_zero,
+                            "lor_rhs_nz",
+                        )
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                    // Capture the actual block where RHS computation ended
+                    let rhs_end_block = self.builder.get_insert_block().ok_or_else(|| {
+                        CodeGenError::LLVMError("No current basic block after RHS".to_string())
+                    })?;
+                    self.builder
+                        .build_unconditional_branch(merge_block)
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+                    // Merge: phi of i1: true from LHS-true, RHS bool from rhs_block
+                    self.builder.position_at_end(merge_block);
+                    let i1 = self.context.bool_type();
+                    let phi = self
+                        .builder
+                        .build_phi(i1, "lor_phi")
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    let one = i1.const_int(1, false);
+                    phi.add_incoming(&[(&one, curr_block), (&rhs_bool, rhs_end_block)]);
+                    return Ok(phi.as_basic_value());
+                } else if matches!(op, BinaryOp::LogicalAnd) {
+                    // Evaluate LHS to boolean (non-zero => true)
+                    let lhs_val = self.compile_expr(left)?;
+                    let lhs_int = match lhs_val {
+                        BasicValueEnum::IntValue(iv) => iv,
+                        _ => {
+                            return Err(CodeGenError::TypeError(
+                                "Logical AND requires integer operands".to_string(),
+                            ))
+                        }
+                    };
+                    let lhs_zero = lhs_int.get_type().const_zero();
+                    let lhs_bool = self
+                        .builder
+                        .build_int_compare(
+                            inkwell::IntPredicate::NE,
+                            lhs_int,
+                            lhs_zero,
+                            "land_lhs_nz",
+                        )
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+                    // Prepare control flow: if lhs is true, evaluate rhs; else short-circuit to false
+                    let curr_block = self.builder.get_insert_block().ok_or_else(|| {
+                        CodeGenError::LLVMError("No current basic block".to_string())
+                    })?;
+                    let func = curr_block
+                        .get_parent()
+                        .ok_or_else(|| CodeGenError::LLVMError("No parent function".to_string()))?;
+                    let rhs_block = self.context.append_basic_block(func, "land_rhs");
+                    let merge_block = self.context.append_basic_block(func, "land_merge");
+
+                    // If lhs is true, go compute rhs; else jump to merge with false
+                    self.builder
+                        .build_conditional_branch(lhs_bool, rhs_block, merge_block)
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+                    // RHS path
+                    self.builder.position_at_end(rhs_block);
+                    let rhs_val = self.compile_expr(right)?;
+                    let rhs_int = match rhs_val {
+                        BasicValueEnum::IntValue(iv) => iv,
+                        _ => {
+                            return Err(CodeGenError::TypeError(
+                                "Logical AND requires integer operands".to_string(),
+                            ))
+                        }
+                    };
+                    let rhs_zero = rhs_int.get_type().const_zero();
+                    let rhs_bool = self
+                        .builder
+                        .build_int_compare(
+                            inkwell::IntPredicate::NE,
+                            rhs_int,
+                            rhs_zero,
+                            "land_rhs_nz",
+                        )
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                    let rhs_end_block = self.builder.get_insert_block().ok_or_else(|| {
+                        CodeGenError::LLVMError("No current basic block after RHS".to_string())
+                    })?;
+                    self.builder
+                        .build_unconditional_branch(merge_block)
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+                    // Merge: phi(i1) with false from LHS=false path, RHS bool from rhs path
+                    self.builder.position_at_end(merge_block);
+                    let i1 = self.context.bool_type();
+                    let phi = self
+                        .builder
+                        .build_phi(i1, "land_phi")
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    let zero = i1.const_zero();
+                    phi.add_incoming(&[(&rhs_bool, rhs_end_block), (&zero, curr_block)]);
+                    return Ok(phi.as_basic_value());
+                }
+
+                // Default eager evaluation for other binary ops
                 let left_val = self.compile_expr(left)?;
                 let right_val = self.compile_expr(right)?;
                 self.compile_binary_op(left_val, op.clone(), right_val)

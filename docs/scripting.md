@@ -236,7 +236,9 @@ let complex = (x + y) / (a - b);
 
 - `&&` (logical AND), `||` (logical OR)
 - Operands are treated as booleans with "non-zero is true" semantics
-- Current implementation evaluates both sides (no short-circuit yet)
+- `||` and `&&` use short-circuit evaluation
+  - `||`: if LHS is true, RHS is not evaluated
+  - `&&`: if LHS is false, RHS is not evaluated
 
 Boolean values
 

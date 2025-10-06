@@ -491,6 +491,87 @@ trace complex_types_program.c:25 {
 }
 
 #[tokio::test]
+async fn test_or_short_circuit_avoids_null_deref() -> anyhow::Result<()> {
+    init();
+
+    // Start complex_types_program (Debug)
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("complex_types_program", OptimizationLevel::Debug)?;
+    let mut prog = Command::new(&binary_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // The RHS would deref c.friend_ref, which is NULL for 'a' iterations.
+    // Since LHS is true, RHS must not be evaluated and no null-deref error should appear.
+    let script = r#"
+trace update_complex {
+    print (1 || *c.friend_ref);
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    assert!(
+        stdout.contains("true"),
+        "Expected true result. STDOUT: {}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("<error: null pointer dereference>"),
+        "Short-circuit should avoid null-deref RHS. STDOUT: {}",
+        stdout
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_and_short_circuit_avoids_null_deref() -> anyhow::Result<()> {
+    init();
+
+    // Start complex_types_program (Debug)
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("complex_types_program", OptimizationLevel::Debug)?;
+    let mut prog = Command::new(&binary_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // LHS is false, RHS would deref c.friend_ref which can be NULL. Short-circuit must avoid RHS.
+    let script = r#"
+trace update_complex {
+    print (0 && *c.friend_ref);
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    assert!(
+        stdout.contains("false"),
+        "Expected false result. STDOUT: {}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("<error: null pointer dereference>"),
+        "Short-circuit should avoid null-deref RHS. STDOUT: {}",
+        stdout
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_address_of_and_comparisons_local() -> anyhow::Result<()> {
     init();
 
