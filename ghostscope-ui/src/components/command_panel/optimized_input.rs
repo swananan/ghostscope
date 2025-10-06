@@ -57,6 +57,43 @@ impl OptimizedInputHandler {
         result
     }
 
+    /// Insert a full string at the current cursor position efficiently (batch paste)
+    /// - In Input mode: inserts as single line (newlines converted to spaces), updates suggestion once
+    /// - In ScriptEditor: delegates to ScriptEditor for multi-line aware insertion
+    pub fn insert_str(&mut self, state: &mut CommandPanelState, text: &str) -> Vec<Action> {
+        self.last_input_time = Instant::now();
+
+        match state.mode {
+            InteractionMode::Input => {
+                // Cancel any pending jk escape
+                state.jk_escape_state = JkEscapeState::None;
+                state.jk_timer = None;
+
+                // Normalize pasted text to a single line for command input
+                // Convert CRLF/CR to LF, then LF to space
+                let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+                let sanitized = normalized.replace('\n', " ");
+                if sanitized.is_empty() {
+                    return Vec::new();
+                }
+
+                let byte_pos = self.char_pos_to_byte_pos(&state.input_text, state.cursor_position);
+                state.input_text.insert_str(byte_pos, &sanitized);
+                state.cursor_position += sanitized.chars().count();
+
+                // Update auto suggestion once after batch insert
+                state.update_auto_suggestion();
+                Vec::new()
+            }
+            InteractionMode::ScriptEditor => {
+                // Delegate to script editor for multi-line aware insertion
+                use crate::components::command_panel::ScriptEditor;
+                ScriptEditor::insert_text(state, text)
+            }
+            InteractionMode::Command => Vec::new(),
+        }
+    }
+
     /// Handle character input in Input mode (normal typing)
     fn handle_input_mode_char(&mut self, state: &mut CommandPanelState, ch: char) -> Vec<Action> {
         // Handle jk escape sequence first

@@ -195,6 +195,52 @@ impl ScriptEditor {
         Vec::new()
     }
 
+    /// Insert a string at the cursor position (supports newlines)
+    pub fn insert_text(state: &mut CommandPanelState, text: &str) -> Vec<Action> {
+        if let Some(ref mut cache) = state.script_cache {
+            // Normalize line endings to LF
+            let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+            let mut iter = normalized.split('\n');
+
+            if cache.cursor_line >= cache.lines.len() {
+                cache.lines.push(String::new());
+                cache.cursor_line = cache.lines.len() - 1;
+                cache.cursor_col = 0;
+            }
+
+            // Insert first segment into current line
+            if let Some(first) = iter.next() {
+                let line = &mut cache.lines[cache.cursor_line];
+                let byte_pos = Self::char_pos_to_byte_pos(line, cache.cursor_col);
+                line.insert_str(byte_pos, first);
+                cache.cursor_col += first.chars().count();
+            }
+
+            // Remaining segments: create new lines
+            let mut is_first_newline = true;
+            for seg in iter {
+                // Split current line at cursor once to move the right part down
+                if is_first_newline {
+                    let byte_pos = Self::char_pos_to_byte_pos(
+                        &cache.lines[cache.cursor_line],
+                        cache.cursor_col,
+                    );
+                    let right = cache.lines[cache.cursor_line].split_off(byte_pos);
+                    let new_line = format!("{seg}{right}");
+                    cache.cursor_line += 1;
+                    cache.lines.insert(cache.cursor_line, new_line);
+                    cache.cursor_col = seg.chars().count();
+                    is_first_newline = false;
+                } else {
+                    cache.cursor_line += 1;
+                    cache.lines.insert(cache.cursor_line, seg.to_string());
+                    cache.cursor_col = seg.chars().count();
+                }
+            }
+        }
+        Vec::new()
+    }
+
     /// Insert a newline at the cursor position
     pub fn insert_newline(state: &mut CommandPanelState) -> Vec<Action> {
         if let Some(ref mut cache) = state.script_cache {
