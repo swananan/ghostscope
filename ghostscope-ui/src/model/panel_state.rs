@@ -130,10 +130,14 @@ pub enum DisplayMode {
 
 impl EbpfPanelState {
     pub fn new() -> Self {
+        Self::new_with_max_messages(2000)
+    }
+
+    pub fn new_with_max_messages(max_messages: usize) -> Self {
         Self {
             trace_events: VecDeque::new(),
             scroll_offset: 0,
-            max_messages: 2000, // TODO: Make this configurable in the future
+            max_messages,
             auto_scroll: true,
             cursor_trace_index: 0,
             show_cursor: false,

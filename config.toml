@@ -104,6 +104,17 @@ default_focus = "InteractiveCommand"
 # Default: [4, 3, 3]
 panel_ratios = [3, 3, 3]
 
+# Maximum number of eBPF trace messages to keep in the output panel
+# Older messages are automatically discarded when this limit is reached
+# Recommended values:
+#   - Low-frequency tracing: 1000-2000
+#   - Medium-frequency tracing: 2000-5000 (default: 2000)
+#   - High-frequency tracing: 5000-10000
+# Minimum value: 100
+# Note: Larger values consume more memory
+# Default: 2000
+ebpf_max_messages = 2000
+
 # Command history configuration
 [ui.history]
 # Enable/disable command history file functionality

@@ -31,6 +31,7 @@ pub struct UiConfig {
     pub panel_ratios: [u16; 3], // [Source, EbpfInfo, InteractiveCommand]
     pub default_focus: crate::action::PanelType,
     pub history: HistoryConfig,
+    pub ebpf_max_messages: usize,
 }
 
 /// UI-specific state management
@@ -57,6 +58,7 @@ impl UIState {
             panel_ratios: [4, 3, 3], // Default ratios
             default_focus: crate::action::PanelType::InteractiveCommand,
             history: HistoryConfig::default(),
+            ebpf_max_messages: 2000, // Default value
         })
     }
 }

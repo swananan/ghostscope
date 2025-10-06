@@ -31,6 +31,7 @@ pub struct MergedConfig {
     pub panel_ratios: [u16; 3],
     pub history_enabled: bool,
     pub history_max_entries: usize,
+    pub ebpf_max_messages: usize,
 
     // DWARF configuration
     #[allow(dead_code)]
@@ -157,6 +158,7 @@ impl MergedConfig {
             panel_ratios: config.ui.panel_ratios, // UI config from file
             history_enabled: config.ui.history.enabled,
             history_max_entries: config.ui.history.max_entries,
+            ebpf_max_messages: config.ui.ebpf_max_messages,
             dwarf_search_paths: config.dwarf.search_paths,
             ebpf_config: {
                 // Command line --force-perf-event-array overrides config file
@@ -216,6 +218,7 @@ impl MergedConfig {
                 enabled: self.history_enabled,
                 max_entries: self.history_max_entries,
             },
+            ebpf_max_messages: self.ebpf_max_messages,
         }
     }
 

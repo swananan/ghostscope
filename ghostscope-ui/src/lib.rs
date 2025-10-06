@@ -21,6 +21,7 @@ pub async fn run_tui_mode(event_registry: EventRegistry, layout_mode: LayoutMode
         panel_ratios: [4, 3, 3], // Default ratios for backward compatibility
         default_focus: crate::action::PanelType::InteractiveCommand,
         history: HistoryConfig::default(),
+        ebpf_max_messages: 2000, // Default
     };
     run_tui_mode_with_config(event_registry, ui_config).await
 }

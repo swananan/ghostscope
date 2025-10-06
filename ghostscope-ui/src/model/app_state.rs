@@ -203,7 +203,7 @@ impl AppState {
             loading_state: LoadingState::Initializing, // Start with loading, wait for runtime response
             loading_ui: LoadingUI::new(),
             source_panel: SourcePanelState::new(),
-            ebpf_panel: EbpfPanelState::new(),
+            ebpf_panel: EbpfPanelState::new_with_max_messages(ui_config.ebpf_max_messages),
             command_panel: CommandPanelState::new_with_config(&ui_config.history),
             command_renderer: OptimizedRenderer::new(),
             command_input_handler: OptimizedInputHandler::new(),
