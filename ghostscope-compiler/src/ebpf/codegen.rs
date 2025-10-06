@@ -4,7 +4,7 @@
 //! and generates LLVM IR for individual instructions.
 
 use super::context::{CodeGenError, EbpfContext, Result};
-use crate::script::{Expr, PrintStatement, Program, Statement};
+use crate::script::{PrintStatement, Program, Statement};
 use aya_ebpf_bindings::bindings::bpf_func_id::BPF_FUNC_probe_read_user;
 use ghostscope_protocol::trace_event::{
     BacktraceData, InstructionHeader, PrintComplexVariableData, PrintFormatData,
@@ -15,6 +15,15 @@ use inkwell::values::{BasicValueEnum, IntValue, PointerValue};
 use inkwell::AddressSpace;
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
+
+/// Parameters for generating a PrintComplexVariable with runtime read
+#[derive(Debug, Clone)]
+struct PrintVarRuntimeMeta {
+    var_name_index: u16,
+    type_index: u16,
+    access_path: String,
+    data_len_limit: usize,
+}
 
 /// Information about a variable in formatted print
 #[allow(dead_code)]
@@ -69,6 +78,367 @@ struct ComplexArg<'ctx> {
 }
 
 impl<'ctx> EbpfContext<'ctx> {
+    /// Unified expression resolver: returns a ComplexArg carrying
+    /// a consistent var_name_index/type_index/access_path/data_len/source
+    /// with strict priority: script variables -> DWARF (locals/params/globals).
+    fn resolve_expr_to_arg(&mut self, expr: &crate::script::ast::Expr) -> Result<ComplexArg<'ctx>> {
+        use crate::script::ast::Expr as E;
+        match expr {
+            // 1) Script variables first
+            E::Variable(name) if self.variable_exists(name) => {
+                let val = self.load_variable(name)?;
+                let var_name_index = self.trace_context.add_variable_name(name.clone());
+                match val {
+                    BasicValueEnum::IntValue(iv) => {
+                        // Preserve signedness for display: map bit width to I8/I16/I32/I64
+                        let bitw = iv.get_type().get_bit_width();
+                        let (kind, byte_len) = if bitw == 1 {
+                            (TypeKind::Bool, 1)
+                        } else if bitw <= 8 {
+                            (TypeKind::I8, 1)
+                        } else if bitw <= 16 {
+                            (TypeKind::I16, 2)
+                        } else if bitw <= 32 {
+                            (TypeKind::I32, 4)
+                        } else {
+                            (TypeKind::I64, 8)
+                        };
+                        Ok(ComplexArg {
+                            var_name_index,
+                            type_index: self.add_synthesized_type_index_for_kind(kind),
+                            access_path: Vec::new(),
+                            data_len: byte_len,
+                            source: ComplexArgSource::ComputedInt {
+                                value: iv,
+                                byte_len,
+                            },
+                        })
+                    }
+                    BasicValueEnum::PointerValue(pv) => {
+                        // Treat as pointer value (rendered as hex). Cast to i64 payload.
+                        let iv = self
+                            .builder
+                            .build_ptr_to_int(pv, self.context.i64_type(), "ptr_to_i64")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        Ok(ComplexArg {
+                            var_name_index,
+                            type_index: self.add_synthesized_type_index_for_kind(TypeKind::Pointer),
+                            access_path: Vec::new(),
+                            data_len: 8,
+                            source: ComplexArgSource::ComputedInt {
+                                value: iv,
+                                byte_len: 8,
+                            },
+                        })
+                    }
+                    _ => Err(CodeGenError::TypeError(
+                        "Unsupported script variable type for print".to_string(),
+                    )),
+                }
+            }
+
+            // 2) String literal -> Immediate bytes (for formatted args)
+            E::String(s) => {
+                let mut bytes = s.as_bytes().to_vec();
+                bytes.push(0);
+                let char_type = ghostscope_dwarf::TypeInfo::BaseType {
+                    name: "char".to_string(),
+                    size: 1,
+                    encoding: ghostscope_dwarf::constants::DW_ATE_unsigned_char.0 as u16,
+                };
+                let array_type = ghostscope_dwarf::TypeInfo::ArrayType {
+                    element_type: Box::new(char_type),
+                    element_count: Some(bytes.len() as u64),
+                    total_size: Some(bytes.len() as u64),
+                };
+                Ok(ComplexArg {
+                    var_name_index: self
+                        .trace_context
+                        .add_variable_name("__str_literal".to_string()),
+                    type_index: self.trace_context.add_type(array_type),
+                    access_path: Vec::new(),
+                    data_len: bytes.len(),
+                    source: ComplexArgSource::ImmediateBytes { bytes },
+                })
+            }
+
+            // 3) Integer literal -> Immediate i64 bytes
+            E::Int(v) => {
+                let mut bytes = Vec::with_capacity(8);
+                bytes.extend_from_slice(&(*v).to_le_bytes());
+                let int_type = ghostscope_dwarf::TypeInfo::BaseType {
+                    name: "i64".to_string(),
+                    size: 8,
+                    encoding: ghostscope_dwarf::constants::DW_ATE_signed.0 as u16,
+                };
+                Ok(ComplexArg {
+                    var_name_index: self
+                        .trace_context
+                        .add_variable_name("__int_literal".to_string()),
+                    type_index: self.trace_context.add_type(int_type),
+                    access_path: Vec::new(),
+                    data_len: 8,
+                    source: ComplexArgSource::ImmediateBytes { bytes },
+                })
+            }
+
+            // 4) AddressOf: return AddressValue (pointer payload will be produced)
+            E::AddressOf(inner) => {
+                let var = self
+                    .query_dwarf_for_complex_expr(inner)?
+                    .ok_or_else(|| CodeGenError::VariableNotFound(format!("{:?}", inner)))?;
+                let inner_ty = var.dwarf_type.as_ref().ok_or_else(|| {
+                    CodeGenError::DwarfError("Expression has no DWARF type information".to_string())
+                })?;
+                let ptr_ty = ghostscope_dwarf::TypeInfo::PointerType {
+                    target_type: Box::new(inner_ty.clone()),
+                    size: 8,
+                };
+                let module_hint = self.take_module_hint();
+                Ok(ComplexArg {
+                    var_name_index: self
+                        .trace_context
+                        .add_variable_name(self.expr_to_name(expr)),
+                    type_index: self.trace_context.add_type(ptr_ty),
+                    access_path: Vec::new(),
+                    data_len: 8,
+                    source: ComplexArgSource::AddressValue {
+                        eval_result: var.evaluation_result.clone(),
+                        module_for_offsets: module_hint,
+                    },
+                })
+            }
+
+            // 5) Complex lvalue shapes -> DWARF runtime read
+            expr @ (E::MemberAccess(_, _)
+            | E::ArrayAccess(_, _)
+            | E::PointerDeref(_)
+            | E::ChainAccess(_)) => {
+                let var = self
+                    .query_dwarf_for_complex_expr(expr)?
+                    .ok_or_else(|| CodeGenError::VariableNotFound(format!("{:?}", expr)))?;
+                let dwarf_type = var.dwarf_type.as_ref().ok_or_else(|| {
+                    CodeGenError::DwarfError("Expression has no DWARF type information".to_string())
+                })?;
+                let mut data_len = Self::compute_read_size_for_type(dwarf_type);
+                if data_len == 0 {
+                    return Err(CodeGenError::TypeSizeNotAvailable(var.name));
+                }
+                data_len = std::cmp::min(data_len, 1993);
+                let module_hint = self.take_module_hint();
+                Ok(ComplexArg {
+                    var_name_index: self.trace_context.add_variable_name(var.name.clone()),
+                    type_index: self.trace_context.add_type(dwarf_type.clone()),
+                    access_path: Vec::new(),
+                    data_len,
+                    source: ComplexArgSource::RuntimeRead {
+                        eval_result: var.evaluation_result.clone(),
+                        dwarf_type: dwarf_type.clone(),
+                        module_for_offsets: module_hint,
+                    },
+                })
+            }
+
+            // 6) Variable not in script scope → DWARF variable or computed fast-path for simple scalars
+            E::Variable(name) => {
+                if let Some(v) = self.query_dwarf_for_variable(name)? {
+                    if let Some(ref t) = v.dwarf_type {
+                        let is_link_addr = matches!(
+                            v.evaluation_result,
+                            ghostscope_dwarf::EvaluationResult::MemoryLocation(
+                                ghostscope_dwarf::LocationResult::Address(_)
+                            )
+                        );
+                        if Self::is_simple_typeinfo(t) && !is_link_addr {
+                            // Prefer computed value to avoid runtime reads
+                            let compiled = self.compile_expr(expr)?;
+                            match compiled {
+                                BasicValueEnum::IntValue(iv) => {
+                                    // Respect DWARF pointer types to keep pointer formatting
+                                    let (kind, byte_len) = if matches!(
+                                        t,
+                                        ghostscope_dwarf::TypeInfo::PointerType { .. }
+                                    ) {
+                                        (TypeKind::Pointer, 8)
+                                    } else {
+                                        let bitw = iv.get_type().get_bit_width();
+                                        if bitw == 1 {
+                                            (TypeKind::Bool, 1)
+                                        } else if bitw <= 8 {
+                                            (TypeKind::I8, 1)
+                                        } else if bitw <= 16 {
+                                            (TypeKind::I16, 2)
+                                        } else if bitw <= 32 {
+                                            (TypeKind::I32, 4)
+                                        } else {
+                                            (TypeKind::I64, 8)
+                                        }
+                                    };
+                                    Ok(ComplexArg {
+                                        var_name_index: self
+                                            .trace_context
+                                            .add_variable_name(self.expr_to_name(expr)),
+                                        type_index: self.add_synthesized_type_index_for_kind(kind),
+                                        access_path: Vec::new(),
+                                        data_len: byte_len,
+                                        source: ComplexArgSource::ComputedInt {
+                                            value: iv,
+                                            byte_len,
+                                        },
+                                    })
+                                }
+                                BasicValueEnum::PointerValue(pv) => {
+                                    // Pointer register-backed → cast to i64 with pointer typeindex
+                                    let iv = self
+                                        .builder
+                                        .build_ptr_to_int(pv, self.context.i64_type(), "ptr_to_i64")
+                                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                                    Ok(ComplexArg {
+                                        var_name_index: self
+                                            .trace_context
+                                            .add_variable_name(self.expr_to_name(expr)),
+                                        type_index: self
+                                            .add_synthesized_type_index_for_kind(TypeKind::Pointer),
+                                        access_path: Vec::new(),
+                                        data_len: 8,
+                                        source: ComplexArgSource::ComputedInt {
+                                            value: iv,
+                                            byte_len: 8,
+                                        },
+                                    })
+                                }
+                                _ => {
+                                    // Fall back to runtime read path
+                                    let mut data_len = Self::compute_read_size_for_type(t);
+                                    if data_len == 0 {
+                                        return Err(CodeGenError::TypeSizeNotAvailable(v.name));
+                                    }
+                                    data_len = std::cmp::min(data_len, 1993);
+                                    let module_hint = self.take_module_hint();
+                                    Ok(ComplexArg {
+                                        var_name_index: self
+                                            .trace_context
+                                            .add_variable_name(v.name.clone()),
+                                        type_index: self.trace_context.add_type(t.clone()),
+                                        access_path: Vec::new(),
+                                        data_len,
+                                        source: ComplexArgSource::RuntimeRead {
+                                            eval_result: v.evaluation_result.clone(),
+                                            dwarf_type: t.clone(),
+                                            module_for_offsets: module_hint,
+                                        },
+                                    })
+                                }
+                            }
+                        } else {
+                            // Complex types or link-time addresses: use RuntimeRead
+                            // (globals/statics need memory read; not an address print unless AddressOf)
+                            let mut data_len = Self::compute_read_size_for_type(t);
+                            if data_len == 0 {
+                                return Err(CodeGenError::TypeSizeNotAvailable(v.name));
+                            }
+                            data_len = std::cmp::min(data_len, 1993);
+                            let module_hint = self.take_module_hint();
+                            Ok(ComplexArg {
+                                var_name_index: self
+                                    .trace_context
+                                    .add_variable_name(v.name.clone()),
+                                type_index: self.trace_context.add_type(t.clone()),
+                                access_path: Vec::new(),
+                                data_len,
+                                source: ComplexArgSource::RuntimeRead {
+                                    eval_result: v.evaluation_result.clone(),
+                                    dwarf_type: t.clone(),
+                                    module_for_offsets: module_hint,
+                                },
+                            })
+                        }
+                    } else {
+                        Err(CodeGenError::DwarfError(
+                            "Variable has no DWARF type information".to_string(),
+                        ))
+                    }
+                } else {
+                    Err(CodeGenError::VariableNotFound(name.clone()))
+                }
+            }
+
+            // 7) Binary and other rvalue expressions → compile to computed int
+            other => {
+                let compiled = self.compile_expr(other)?;
+                if let BasicValueEnum::IntValue(iv) = compiled {
+                    let bitw = iv.get_type().get_bit_width();
+                    let (kind, byte_len) = if bitw == 1 {
+                        (TypeKind::Bool, 1)
+                    } else if bitw <= 8 {
+                        (TypeKind::I8, 1)
+                    } else if bitw <= 16 {
+                        (TypeKind::I16, 2)
+                    } else if bitw <= 32 {
+                        (TypeKind::I32, 4)
+                    } else {
+                        (TypeKind::I64, 8)
+                    };
+                    Ok(ComplexArg {
+                        var_name_index: self
+                            .trace_context
+                            .add_variable_name(self.expr_to_name(other)),
+                        type_index: self.add_synthesized_type_index_for_kind(kind),
+                        access_path: Vec::new(),
+                        data_len: byte_len,
+                        source: ComplexArgSource::ComputedInt {
+                            value: iv,
+                            byte_len,
+                        },
+                    })
+                } else {
+                    Err(CodeGenError::TypeError(
+                        "Non-integer expression not supported in print".to_string(),
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Emit a single PrintComplexVariable or a single-arg PrintComplexFormat depending on the arg source.
+    fn emit_print_from_arg(&mut self, arg: ComplexArg<'ctx>) -> Result<u16> {
+        match arg.source {
+            ComplexArgSource::ComputedInt { value, byte_len } => {
+                self.generate_print_complex_variable_computed(
+                    arg.var_name_index,
+                    arg.type_index,
+                    byte_len,
+                    value,
+                )?;
+                Ok(1)
+            }
+            ComplexArgSource::RuntimeRead {
+                eval_result,
+                ref dwarf_type,
+                module_for_offsets,
+            } => {
+                let meta = PrintVarRuntimeMeta {
+                    var_name_index: arg.var_name_index,
+                    type_index: arg.type_index,
+                    access_path: String::new(),
+                    data_len_limit: arg.data_len,
+                };
+                self.generate_print_complex_variable_runtime(
+                    meta,
+                    &eval_result,
+                    dwarf_type,
+                    module_for_offsets.as_deref(),
+                )?;
+                Ok(1)
+            }
+            ComplexArgSource::AddressValue { .. } | ComplexArgSource::ImmediateBytes { .. } => {
+                // Use ComplexFormat with "{}" to render address/immediate nicely
+                let fmt_idx = self.trace_context.add_string("{}".to_string());
+                self.generate_print_complex_format_instruction(fmt_idx, &[arg])?;
+                Ok(1)
+            }
+        }
+    }
     /// Generate PrintComplexVariable instruction that embeds a computed integer value (no runtime read)
     /// This is used for `print expr;` where expr is an rvalue computed in eBPF.
     fn generate_print_complex_variable_computed(
@@ -295,9 +665,14 @@ impl<'ctx> EbpfContext<'ctx> {
         match byte_len {
             1 => {
                 let bitw = value.get_type().get_bit_width();
-                let v = if bitw < 8 {
+                let v = if bitw == 1 {
+                    // Booleans must serialize as 0/1
                     self.builder
-                        .build_int_z_extend(value, self.context.i8_type(), "expr_zext_i8")
+                        .build_int_z_extend(value, self.context.i8_type(), "expr_zext_bool_i8")
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                } else if bitw < 8 {
+                    self.builder
+                        .build_int_s_extend(value, self.context.i8_type(), "expr_sext_i8")
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
                 } else if bitw > 8 {
                     self.builder
@@ -314,7 +689,7 @@ impl<'ctx> EbpfContext<'ctx> {
                 let bitw = value.get_type().get_bit_width();
                 let v = if bitw < 16 {
                     self.builder
-                        .build_int_z_extend(value, self.context.i16_type(), "expr_zext_i16")
+                        .build_int_s_extend(value, self.context.i16_type(), "expr_sext_i16")
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
                 } else if bitw > 16 {
                     self.builder
@@ -336,7 +711,7 @@ impl<'ctx> EbpfContext<'ctx> {
                 let bitw = value.get_type().get_bit_width();
                 let v = if bitw < 32 {
                     self.builder
-                        .build_int_z_extend(value, self.context.i32_type(), "expr_zext_i32")
+                        .build_int_s_extend(value, self.context.i32_type(), "expr_sext_i32")
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
                 } else if bitw > 32 {
                     self.builder
@@ -357,7 +732,7 @@ impl<'ctx> EbpfContext<'ctx> {
             8 => {
                 let v64 = if value.get_type().get_bit_width() < 64 {
                     self.builder
-                        .build_int_z_extend(value, self.context.i64_type(), "expr_zext_i64")
+                        .build_int_s_extend(value, self.context.i64_type(), "expr_sext_i64")
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
                 } else {
                     value
@@ -375,7 +750,7 @@ impl<'ctx> EbpfContext<'ctx> {
                 // Fallback: write lowest n bytes little-endian
                 let v64 = if value.get_type().get_bit_width() < 64 {
                     self.builder
-                        .build_int_z_extend(value, self.context.i64_type(), "expr_zext_fallback")
+                        .build_int_s_extend(value, self.context.i64_type(), "expr_sext_fallback")
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
                 } else {
                     value
@@ -519,38 +894,7 @@ impl<'ctx> EbpfContext<'ctx> {
         s
     }
 
-    fn is_pure_lvalue(expr: &crate::script::ast::Expr) -> bool {
-        use crate::script::ast::Expr as E;
-        match expr {
-            E::Variable(_) => true,
-            E::MemberAccess(obj, _) => Self::is_pure_lvalue(obj),
-            E::ArrayAccess(arr, idx) => matches!(**idx, E::Int(_)) && Self::is_pure_lvalue(arr),
-            E::PointerDeref(inner) => Self::is_pure_lvalue(inner),
-            E::ChainAccess(_) => true,
-            // Treat address-of as lvalue-related (we handle it separately where needed)
-            E::AddressOf(_) => true,
-            _ => false,
-        }
-    }
-
-    fn contains_binary_op(expr: &crate::script::ast::Expr) -> bool {
-        use crate::script::ast::Expr as E;
-        match expr {
-            E::BinaryOp { .. } => true,
-            E::MemberAccess(obj, _) => Self::contains_binary_op(obj),
-            E::ArrayAccess(arr, idx) => {
-                Self::contains_binary_op(arr) || Self::contains_binary_op(idx)
-            }
-            E::PointerDeref(inner) => Self::contains_binary_op(inner),
-            E::AddressOf(inner) => Self::contains_binary_op(inner),
-            E::ChainAccess(_)
-            | E::Variable(_)
-            | E::Int(_)
-            | E::String(_)
-            | E::SpecialVar(_)
-            | E::Float(_) => false,
-        }
-    }
+    // removed old helpers (pure lvalue/binary_op detection) — unified resolver handles shapes
 
     /// Main entry point: compile program with staged transmission system
     pub fn compile_program_with_staged_transmission(
@@ -728,130 +1072,23 @@ impl<'ctx> EbpfContext<'ctx> {
             }
             PrintStatement::Variable(var_name) => {
                 info!("Processing variable: {}", var_name);
-                // Resolve display name index and type encoding first
-                let (var_name_index, type_encoding) =
-                    self.resolve_variable_with_priority(var_name)?;
-
-                // If DWARF type exists and is complex, or it's a link-time address (global), route to complex path
-                let mut route_complex = false;
-                if let Some(v) = self.query_dwarf_for_variable(var_name)? {
-                    if let Some(ref t) = v.dwarf_type {
-                        if !Self::is_simple_typeinfo(t) {
-                            route_complex = true;
-                        }
-                    }
-                    if let ghostscope_dwarf::EvaluationResult::MemoryLocation(
-                        ghostscope_dwarf::LocationResult::Address(_),
-                    ) = v.evaluation_result
-                    {
-                        route_complex = true;
-                    }
-                }
+                let expr = crate::script::Expr::Variable(var_name.clone());
+                let arg = self.resolve_expr_to_arg(&expr)?;
+                let n = self.emit_print_from_arg(arg)?;
                 tracing::trace!(
                     var_name = %var_name,
-                    var_name_index = var_name_index,
-                    ?type_encoding,
-                    route_complex,
-                    "compile_print_statement: routing decision"
+                    instructions = n,
+                    "compile_print_statement: emitted via unified resolver"
                 );
-                if route_complex {
-                    // Use complex var pipeline for better formatting and correct sizing
-                    let expr = crate::script::Expr::Variable(var_name.clone());
-                    let n = self.process_complex_variable_print(&expr)?;
-                    tracing::trace!(
-                        var_name = %var_name,
-                        instructions = n,
-                        "compile_print_statement: complex variable emitted"
-                    );
-                    Ok(n)
-                } else {
-                    // Simple variable - use PrintVariableIndex with type_index
-                    self.generate_print_variable_index(var_name_index, type_encoding, var_name)?;
-                    tracing::trace!(
-                        var_name = %var_name,
-                        var_name_index = var_name_index,
-                        ?type_encoding,
-                        "compile_print_statement: simple variable emitted (PrintVariableIndex)"
-                    );
-                    Ok(1)
-                }
+                Ok(n)
             }
             PrintStatement::ComplexVariable(expr) => {
                 info!("Processing complex variable: {:?}", expr);
-                // Prefer DWARF-backed formatting when the expression resolves to a program variable/field
-                if self.query_dwarf_for_complex_expr(expr)?.is_some() {
-                    let n = self.process_complex_variable_print(expr)?;
-                    tracing::trace!(
-                        instructions = n,
-                        "compile_print_statement: DWARF-backed complex expr emitted"
-                    );
-                    return Ok(n);
-                }
-                // Special-case address-of before computed path to preserve pointer formatting
-                if let crate::script::Expr::AddressOf(inner) = expr {
-                    let var = self
-                        .query_dwarf_for_complex_expr(inner)?
-                        .ok_or_else(|| CodeGenError::VariableNotFound(format!("{:?}", inner)))?;
-                    let inner_ty = var.dwarf_type.as_ref().ok_or_else(|| {
-                        CodeGenError::DwarfError(
-                            "Expression has no DWARF type information".to_string(),
-                        )
-                    })?;
-                    let ptr_ty = ghostscope_dwarf::TypeInfo::PointerType {
-                        target_type: Box::new(inner_ty.clone()),
-                        size: 8,
-                    };
-                    let type_index = self.trace_context.add_type(ptr_ty);
-                    let var_name_index = self.trace_context.add_variable_name("&expr".to_string());
-
-                    let module_hint = self.take_module_hint();
-                    let one_arg = vec![ComplexArg {
-                        var_name_index,
-                        type_index,
-                        access_path: Vec::new(),
-                        data_len: 8,
-                        source: ComplexArgSource::AddressValue {
-                            eval_result: var.evaluation_result.clone(),
-                            module_for_offsets: module_hint,
-                        },
-                    }];
-                    let fmt_idx = self.trace_context.add_string("{}".to_string());
-                    self.generate_print_complex_format_instruction(fmt_idx, &one_arg)?;
-                    tracing::trace!(
-                        "compile_print_statement: address-of emitted via ComplexFormat"
-                    );
-                    return Ok(1);
-                }
-                // Fast path only for pure script expressions (non-DWARF backed)
-                if let Ok(BasicValueEnum::IntValue(iv)) = self.compile_expr(expr) {
-                    let bitw = iv.get_type().get_bit_width();
-                    let (kind, byte_len) = if bitw == 1 {
-                        (TypeKind::Bool, 1)
-                    } else if bitw <= 8 {
-                        (TypeKind::U8, 1)
-                    } else if bitw <= 16 {
-                        (TypeKind::U16, 2)
-                    } else if bitw <= 32 {
-                        (TypeKind::U32, 4)
-                    } else {
-                        (TypeKind::I64, 8)
-                    };
-                    // Route to PrintComplexVariable so the name is preserved in output
-                    let var_name = self.expr_to_name(expr);
-                    let var_name_index = self.trace_context.add_variable_name(var_name);
-                    let type_index = self.add_synthesized_type_index_for_kind(kind);
-                    self.generate_print_complex_variable_computed(
-                        var_name_index,
-                        type_index,
-                        byte_len,
-                        iv,
-                    )?;
-                    return Ok(1);
-                }
-                let n = self.process_complex_variable_print(expr)?;
+                let arg = self.resolve_expr_to_arg(expr)?;
+                let n = self.emit_print_from_arg(arg)?;
                 tracing::trace!(
                     instructions = n,
-                    "compile_print_statement: complex expr emitted"
+                    "compile_print_statement: emitted via unified resolver"
                 );
                 Ok(n)
             }
@@ -877,399 +1114,11 @@ impl<'ctx> EbpfContext<'ctx> {
             format,
             args.len()
         );
-
-        // 1. Add format string to TraceContext
         let format_string_index = self.trace_context.add_string(format.to_string());
-        info!(
-            "Added format string to TraceContext at index {}",
-            format_string_index
-        );
-
-        // 2. Decide path:
-        //    - If any arg has a complex shape (MemberAccess/ArrayAccess/PointerDeref/ChainAccess/AddressOf),
-        //      emit PrintComplexFormat.
-        //    - Otherwise, only use complex path when a DWARF variable is not a simple base/pointer type.
-        //      Simple DWARF variables (including register or computed values) can go through the fast path
-        //      which evaluates values directly (no memory address needed).
-        let has_complex_shape = args.iter().any(|arg| {
-            matches!(
-                arg,
-                crate::script::ast::Expr::MemberAccess(_, _)
-                    | crate::script::ast::Expr::ArrayAccess(_, _)
-                    | crate::script::ast::Expr::PointerDeref(_)
-                    | crate::script::ast::Expr::ChainAccess(_)
-                    | crate::script::ast::Expr::AddressOf(_)
-            )
-        });
-        // Refined check for DWARF-backed variables: only mark complex if the DWARF type
-        // itself is complex (arrays/structs/unions/func). Base/enums/pointers are simple.
-        let has_complex_dwarf_var = if !has_complex_shape {
-            let mut complex = false;
-            for arg in args.iter() {
-                if let crate::script::ast::Expr::Variable(name) = arg {
-                    if !self.variable_exists(name) {
-                        if let Some(v) = self.query_dwarf_for_variable(name)? {
-                            if let Some(ref t) = v.dwarf_type {
-                                if !Self::is_simple_typeinfo(t) {
-                                    complex = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            complex
-        } else {
-            false
-        };
-
-        // Additional rule: if any argument resolves to a link-time address (global/static),
-        // route to complex path to apply ASLR offsets at runtime.
-        let has_global_link_addr = if !has_complex_shape {
-            let mut has = false;
-            for arg in args.iter() {
-                if let crate::script::ast::Expr::Variable(name) = arg {
-                    if !self.variable_exists(name) {
-                        if let Some(v) = self.query_dwarf_for_variable(name)? {
-                            if let ghostscope_dwarf::EvaluationResult::MemoryLocation(
-                                ghostscope_dwarf::LocationResult::Address(_),
-                            ) = v.evaluation_result
-                            {
-                                has = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            has
-        } else {
-            false
-        };
-
-        // If any arg is a pure script expression (not a simple variable/string/int literal),
-        // route to complex path so we can embed a ComputedInt at runtime.
-        let has_script_expr = args.iter().any(|arg| {
-            !matches!(
-                arg,
-                crate::script::ast::Expr::Variable(_)
-                    | crate::script::ast::Expr::String(_)
-                    | crate::script::ast::Expr::Int(_)
-                    | crate::script::ast::Expr::MemberAccess(_, _)
-                    | crate::script::ast::Expr::ArrayAccess(_, _)
-                    | crate::script::ast::Expr::PointerDeref(_)
-                    | crate::script::ast::Expr::ChainAccess(_)
-                    | crate::script::ast::Expr::AddressOf(_)
-            )
-        });
-
-        let _use_complex =
-            has_complex_shape || has_complex_dwarf_var || has_global_link_addr || has_script_expr;
-
-        // Complex path: build PrintComplexFormat with DWARF-resolved arguments (and embed literals/expressions)
         let mut complex_args: Vec<ComplexArg<'ctx>> = Vec::with_capacity(args.len());
-        for (i, arg) in args.iter().enumerate() {
-            // If expression contains any binary op, compile to computed value first
-            if Self::contains_binary_op(arg) && !Self::is_pure_lvalue(arg) {
-                let compiled = self.compile_expr(arg)?;
-                if let BasicValueEnum::IntValue(iv) = compiled {
-                    let bitw = iv.get_type().get_bit_width();
-                    let (kind, byte_len) = if bitw == 1 {
-                        (TypeKind::Bool, 1)
-                    } else if bitw <= 8 {
-                        (TypeKind::U8, 1)
-                    } else if bitw <= 16 {
-                        (TypeKind::U16, 2)
-                    } else if bitw <= 32 {
-                        (TypeKind::U32, 4)
-                    } else {
-                        (TypeKind::I64, 8)
-                    };
-                    let var_name = self.expr_to_name(arg);
-                    complex_args.push(ComplexArg {
-                        var_name_index: self.trace_context.add_variable_name(var_name),
-                        type_index: self.add_synthesized_type_index_for_kind(kind),
-                        access_path: Vec::new(),
-                        data_len: byte_len,
-                        source: ComplexArgSource::ComputedInt {
-                            value: iv,
-                            byte_len,
-                        },
-                    });
-                    continue;
-                }
-            }
-            // Fast path for DWARF-backed simple scalar variables (register/stack value):
-            // only apply when DWARF type is a simple scalar/pointer; avoid treating char[] arrays as integers.
-            if let crate::script::ast::Expr::Variable(name) = arg {
-                if !self.variable_exists(name) {
-                    if let Some(v) = self.query_dwarf_for_variable(name)? {
-                        if let Some(ref t) = v.dwarf_type {
-                            // Only use computed fast-path for simple scalars that are not link-time addresses
-                            let is_simple = Self::is_simple_typeinfo(t);
-                            let is_link_addr = matches!(
-                                v.evaluation_result,
-                                ghostscope_dwarf::EvaluationResult::MemoryLocation(
-                                    ghostscope_dwarf::LocationResult::Address(_)
-                                )
-                            );
-                            if is_simple && !is_link_addr {
-                                if let Ok(BasicValueEnum::IntValue(iv)) = self.compile_expr(arg) {
-                                    let bitw = iv.get_type().get_bit_width();
-                                    let (kind, byte_len) = if bitw == 1 {
-                                        (TypeKind::Bool, 1)
-                                    } else if bitw <= 8 {
-                                        (TypeKind::U8, 1)
-                                    } else if bitw <= 16 {
-                                        (TypeKind::U16, 2)
-                                    } else if bitw <= 32 {
-                                        (TypeKind::U32, 4)
-                                    } else {
-                                        (TypeKind::I64, 8)
-                                    };
-                                    let var_name = self.expr_to_name(arg);
-                                    complex_args.push(ComplexArg {
-                                        var_name_index: self
-                                            .trace_context
-                                            .add_variable_name(var_name),
-                                        type_index: self.add_synthesized_type_index_for_kind(kind),
-                                        access_path: Vec::new(),
-                                        data_len: byte_len,
-                                        source: ComplexArgSource::ComputedInt {
-                                            value: iv,
-                                            byte_len,
-                                        },
-                                    });
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            match arg {
-                // Script variable: prefer script scope value over DWARF
-                crate::script::ast::Expr::Variable(name) if self.variable_exists(name) => {
-                    let loaded = self.load_variable(name)?;
-                    // Normalize to integer payloads for transport
-                    let (iv, kind, byte_len) = match loaded {
-                        BasicValueEnum::IntValue(v) => {
-                            let bitw = v.get_type().get_bit_width();
-                            let (k, bl) = if bitw == 1 {
-                                (TypeKind::Bool, 1)
-                            } else if bitw <= 8 {
-                                (TypeKind::U8, 1)
-                            } else if bitw <= 16 {
-                                (TypeKind::U16, 2)
-                            } else if bitw <= 32 {
-                                (TypeKind::U32, 4)
-                            } else {
-                                (TypeKind::I64, 8)
-                            };
-                            (v, k, bl)
-                        }
-                        BasicValueEnum::PointerValue(pv) => {
-                            // Cast pointer to i64 for transport
-                            let v = self
-                                .builder
-                                .build_ptr_to_int(pv, self.context.i64_type(), "ptr_as_i64")
-                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                            (v, TypeKind::Pointer, 8)
-                        }
-                        _ => {
-                            return Err(CodeGenError::NotImplemented(
-                                "Only integer/pointer script variables supported in formatted print"
-                                    .to_string(),
-                            ));
-                        }
-                    };
-                    complex_args.push(ComplexArg {
-                        var_name_index: self.trace_context.add_variable_name(name.to_string()),
-                        type_index: self.add_synthesized_type_index_for_kind(kind),
-                        access_path: Vec::new(),
-                        data_len: byte_len,
-                        source: ComplexArgSource::ComputedInt {
-                            value: iv,
-                            byte_len,
-                        },
-                    });
-                }
-                // Expressions: compile to computed runtime value and send as variable
-                crate::script::ast::Expr::BinaryOp { .. } => {
-                    let compiled = self.compile_expr(arg)?;
-                    if let BasicValueEnum::IntValue(iv) = compiled {
-                        let bitw = iv.get_type().get_bit_width();
-                        let (kind, byte_len) = if bitw == 1 {
-                            (TypeKind::Bool, 1)
-                        } else if bitw <= 8 {
-                            (TypeKind::U8, 1)
-                        } else if bitw <= 16 {
-                            (TypeKind::U16, 2)
-                        } else if bitw <= 32 {
-                            (TypeKind::U32, 4)
-                        } else {
-                            (TypeKind::I64, 8)
-                        };
-                        let var_name = self.expr_to_name(arg);
-                        complex_args.push(ComplexArg {
-                            var_name_index: self.trace_context.add_variable_name(var_name),
-                            type_index: self.add_synthesized_type_index_for_kind(kind),
-                            access_path: Vec::new(),
-                            data_len: byte_len,
-                            source: ComplexArgSource::ComputedInt {
-                                value: iv,
-                                byte_len,
-                            },
-                        });
-                    } else {
-                        return Err(CodeGenError::NotImplemented(
-                            "Non-integer expression not supported in formatted print".to_string(),
-                        ));
-                    }
-                }
-                crate::script::ast::Expr::String(s) => {
-                    // Treat as char array type with immediate bytes
-                    let var_name = format!("__str_literal_{}", i);
-                    let var_name_index = self.trace_context.add_variable_name(var_name);
-                    let mut bytes = s.as_bytes().to_vec();
-                    bytes.push(0); // null-terminate like C string
-                    let char_type = ghostscope_dwarf::TypeInfo::BaseType {
-                        name: "char".to_string(),
-                        size: 1,
-                        encoding: ghostscope_dwarf::constants::DW_ATE_unsigned_char.0 as u16,
-                    };
-                    let array_type = ghostscope_dwarf::TypeInfo::ArrayType {
-                        element_type: Box::new(char_type),
-                        element_count: Some(bytes.len() as u64),
-                        total_size: Some(bytes.len() as u64),
-                    };
-                    let type_index = self.trace_context.add_type(array_type.clone());
-                    complex_args.push(ComplexArg {
-                        var_name_index,
-                        type_index,
-                        access_path: Vec::new(),
-                        data_len: bytes.len(),
-                        source: ComplexArgSource::ImmediateBytes { bytes },
-                    });
-                }
-                crate::script::ast::Expr::Int(v) => {
-                    // Treat as i64 base type with immediate bytes
-                    let var_name = format!("__int_literal_{}", i);
-                    let var_name_index = self.trace_context.add_variable_name(var_name);
-                    let mut bytes = Vec::with_capacity(8);
-                    bytes.extend_from_slice(&(*v).to_le_bytes());
-                    let int_type = ghostscope_dwarf::TypeInfo::BaseType {
-                        name: "i64".to_string(),
-                        size: 8,
-                        encoding: ghostscope_dwarf::constants::DW_ATE_signed.0 as u16,
-                    };
-                    let type_index = self.trace_context.add_type(int_type.clone());
-                    complex_args.push(ComplexArg {
-                        var_name_index,
-                        type_index,
-                        access_path: Vec::new(),
-                        data_len: 8,
-                        source: ComplexArgSource::ImmediateBytes { bytes },
-                    });
-                }
-                // Variables and complex expressions -> resolve via DWARF
-                expr @ (crate::script::ast::Expr::Variable(_)
-                | crate::script::ast::Expr::MemberAccess(_, _)
-                | crate::script::ast::Expr::ArrayAccess(_, _)
-                | crate::script::ast::Expr::PointerDeref(_)
-                | crate::script::ast::Expr::ChainAccess(_)) => {
-                    let var = self
-                        .query_dwarf_for_complex_expr(expr)?
-                        .ok_or_else(|| CodeGenError::VariableNotFound(format!("{:?}", expr)))?;
-                    let dwarf_type = var.dwarf_type.as_ref().ok_or_else(|| {
-                        CodeGenError::DwarfError(
-                            "Expression has no DWARF type information".to_string(),
-                        )
-                    })?;
-                    let var_name_index = self.trace_context.add_variable_name(var.name.clone());
-                    let type_index = self.trace_context.add_type(dwarf_type.clone());
-                    let mut data_len = Self::compute_read_size_for_type(dwarf_type);
-                    if data_len == 0 {
-                        return Err(CodeGenError::TypeSizeNotAvailable(var.name));
-                    }
-                    // Avoid over-reading: cap upper bound only.
-                    data_len = std::cmp::min(data_len, 1993);
-                    let module_hint = self.take_module_hint();
-                    complex_args.push(ComplexArg {
-                        var_name_index,
-                        type_index,
-                        access_path: Vec::new(), // The raw data already points to the final member
-                        data_len,
-                        source: ComplexArgSource::RuntimeRead {
-                            eval_result: var.evaluation_result.clone(),
-                            dwarf_type: dwarf_type.clone(),
-                            module_for_offsets: module_hint,
-                        },
-                    });
-                }
-                crate::script::ast::Expr::AddressOf(inner) => {
-                    let var = self
-                        .query_dwarf_for_complex_expr(inner)?
-                        .ok_or_else(|| CodeGenError::VariableNotFound(format!("{:?}", inner)))?;
-                    let inner_ty = var.dwarf_type.as_ref().ok_or_else(|| {
-                        CodeGenError::DwarfError(
-                            "Expression has no DWARF type information".to_string(),
-                        )
-                    })?;
-                    let ptr_ty = ghostscope_dwarf::TypeInfo::PointerType {
-                        target_type: Box::new(inner_ty.clone()),
-                        size: 8,
-                    };
-                    let type_index = self.trace_context.add_type(ptr_ty);
-
-                    let module_hint = self.take_module_hint();
-                    complex_args.push(ComplexArg {
-                        var_name_index: self.trace_context.add_variable_name("&expr".to_string()),
-                        type_index,
-                        access_path: Vec::new(),
-                        data_len: 8,
-                        source: ComplexArgSource::AddressValue {
-                            eval_result: var.evaluation_result.clone(),
-                            module_for_offsets: module_hint,
-                        },
-                    });
-                }
-                // Fallback: compile arbitrary expression into an integer and embed as computed data
-                other_expr => {
-                    let compiled = self.compile_expr(other_expr)?;
-                    if let BasicValueEnum::IntValue(iv) = compiled {
-                        let bitw = iv.get_type().get_bit_width();
-                        let (kind, byte_len) = if bitw <= 8 {
-                            (TypeKind::U8, 1)
-                        } else if bitw <= 16 {
-                            (TypeKind::U16, 2)
-                        } else if bitw <= 32 {
-                            (TypeKind::U32, 4)
-                        } else {
-                            (TypeKind::I64, 8)
-                        };
-                        let var_name = self.expr_to_name(other_expr);
-                        complex_args.push(ComplexArg {
-                            var_name_index: self.trace_context.add_variable_name(var_name),
-                            type_index: self.add_synthesized_type_index_for_kind(kind),
-                            access_path: Vec::new(),
-                            data_len: byte_len,
-                            source: ComplexArgSource::ComputedInt {
-                                value: iv,
-                                byte_len,
-                            },
-                        });
-                    } else {
-                        return Err(CodeGenError::NotImplemented(format!(
-                            "Expression {:?} not supported in formatted print",
-                            other_expr
-                        )));
-                    }
-                }
-            }
+        for a in args.iter() {
+            complex_args.push(self.resolve_expr_to_arg(a)?);
         }
-
         self.generate_print_complex_format_instruction(format_string_index, &complex_args)?;
         Ok(1)
     }
@@ -2272,13 +2121,21 @@ impl<'ctx> EbpfContext<'ctx> {
                     match *byte_len {
                         1 => {
                             let bitw = value.get_type().get_bit_width();
-                            let v = if bitw < 8 {
-                                // i1..i7 -> zext to i8
+                            let v = if bitw == 1 {
+                                // Bool: zero-extend to keep 0/1 in payload
                                 self.builder
                                     .build_int_z_extend(
                                         *value,
                                         self.context.i8_type(),
-                                        "expr_zext_i8",
+                                        "expr_zext_bool_i8",
+                                    )
+                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                            } else if bitw < 8 {
+                                self.builder
+                                    .build_int_s_extend(
+                                        *value,
+                                        self.context.i8_type(),
+                                        "expr_sext_i8",
                                     )
                                     .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
                             } else if bitw > 8 {
@@ -2303,10 +2160,10 @@ impl<'ctx> EbpfContext<'ctx> {
                             let bitw = value.get_type().get_bit_width();
                             let v = if bitw < 16 {
                                 self.builder
-                                    .build_int_z_extend(
+                                    .build_int_s_extend(
                                         *value,
                                         self.context.i16_type(),
-                                        "expr_zext_i16",
+                                        "expr_sext_i16",
                                     )
                                     .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
                             } else if bitw > 16 {
@@ -2334,10 +2191,10 @@ impl<'ctx> EbpfContext<'ctx> {
                             let bitw = value.get_type().get_bit_width();
                             let v = if bitw < 32 {
                                 self.builder
-                                    .build_int_z_extend(
+                                    .build_int_s_extend(
                                         *value,
                                         self.context.i32_type(),
-                                        "expr_zext_i32",
+                                        "expr_sext_i32",
                                     )
                                     .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
                             } else if bitw > 32 {
@@ -2364,10 +2221,10 @@ impl<'ctx> EbpfContext<'ctx> {
                         8 => {
                             let v64 = if value.get_type().get_bit_width() < 64 {
                                 self.builder
-                                    .build_int_z_extend(
+                                    .build_int_s_extend(
                                         *value,
                                         self.context.i64_type(),
-                                        "expr_zext",
+                                        "expr_sext",
                                     )
                                     .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
                             } else {
@@ -3601,79 +3458,7 @@ impl<'ctx> EbpfContext<'ctx> {
         }
     }
 
-    /// Process complex variable for print statement with full DWARF support
-    fn process_complex_variable_print(&mut self, expr: &Expr) -> Result<u16> {
-        info!(
-            "Processing complex variable with full DWARF support: {:?}",
-            expr
-        );
-        tracing::trace!(?expr, "process_complex_variable_print: start");
-        // Query DWARF for the complex expression
-        let variable_with_eval = match self.query_dwarf_for_complex_expr(expr)? {
-            Some(var) => var,
-            None => {
-                let expr_str = format!("{:?}", expr);
-                warn!("Complex expression '{}' not found in DWARF", expr_str);
-                return Err(CodeGenError::VariableNotFound(expr_str));
-            }
-        };
-        tracing::trace!(
-            var_name = %variable_with_eval.name,
-            type_name = %variable_with_eval.type_name,
-            scope_depth = variable_with_eval.scope_depth,
-            is_parameter = variable_with_eval.is_parameter,
-            is_artificial = variable_with_eval.is_artificial,
-            eval = ?variable_with_eval.evaluation_result,
-            "process_complex_variable_print: resolved DWARF variable"
-        );
-        let dwarf_type = variable_with_eval.dwarf_type.as_ref().ok_or_else(|| {
-            CodeGenError::DwarfError("Complex expression has no DWARF type information".to_string())
-        })?;
-
-        // Add variable name to TraceContext
-        let var_name_index = self
-            .trace_context
-            .add_variable_name(variable_with_eval.name.clone());
-
-        // Add type information to TraceContext
-        let type_index = self.trace_context.add_type(dwarf_type.clone());
-
-        // Compute data size with truncation cap
-        let mut data_size = Self::compute_read_size_for_type(dwarf_type);
-        tracing::trace!(
-            var_name_index,
-            type_index,
-            data_size,
-            type_size = dwarf_type.size(),
-            "process_complex_variable_print: sizing"
-        );
-        if data_size == 0 {
-            return Err(CodeGenError::TypeSizeNotAvailable(
-                variable_with_eval.name.clone(),
-            ));
-        }
-        // Avoid over-reading: cap upper bound only.
-        data_size = std::cmp::min(data_size, 1993);
-
-        // Build and emit PrintComplexVariable with runtime memory copy
-        tracing::trace!(
-            var_name_index,
-            type_index,
-            data_size,
-            "process_complex_variable_print: emitting PrintComplexVariable(runtime)"
-        );
-        self.generate_print_complex_variable_runtime(
-            var_name_index,
-            type_index,
-            "",
-            &variable_with_eval.evaluation_result,
-            dwarf_type,
-            data_size,
-        )?;
-        tracing::trace!("process_complex_variable_print: emitted successfully");
-
-        Ok(1)
-    }
+    // removed legacy process_complex_variable_print — unified resolver path is used
 
     /// Generate print instruction with both legacy type encoding and new type info
     #[allow(dead_code)]
@@ -3701,19 +3486,17 @@ impl<'ctx> EbpfContext<'ctx> {
     /// Generate PrintComplexVariable instruction and copy data at runtime using probe_read_user
     fn generate_print_complex_variable_runtime(
         &mut self,
-        var_name_index: u16,
-        type_index: u16,
-        access_path: &str,
+        meta: PrintVarRuntimeMeta,
         eval_result: &ghostscope_dwarf::EvaluationResult,
         dwarf_type: &ghostscope_dwarf::TypeInfo,
-        data_len_limit: usize,
+        module_hint: Option<&str>,
     ) -> Result<()> {
         tracing::trace!(
-            var_name_index,
-            type_index,
-            access_path = %access_path,
+            var_name_index = meta.var_name_index,
+            type_index = meta.type_index,
+            access_path = %meta.access_path,
             type_size = dwarf_type.size(),
-            data_len_limit,
+            data_len_limit = meta.data_len_limit,
             eval = ?eval_result,
             "generate_print_complex_variable_runtime: begin"
         );
@@ -3721,10 +3504,10 @@ impl<'ctx> EbpfContext<'ctx> {
         let inst_buffer = self.create_instruction_buffer();
 
         // Compute sizes
-        let access_path_bytes = access_path.as_bytes();
+        let access_path_bytes = meta.access_path.as_bytes();
         let access_path_len = std::cmp::min(access_path_bytes.len(), 255); // u8 max
         let type_size = dwarf_type.size() as usize;
-        let mut data_len = std::cmp::min(type_size, data_len_limit);
+        let mut data_len = std::cmp::min(type_size, meta.data_len_limit);
         if data_len > u16::MAX as usize {
             data_len = u16::MAX as usize;
         }
@@ -3812,7 +3595,7 @@ impl<'ctx> EbpfContext<'ctx> {
         let var_name_index_val = self
             .context
             .i16_type()
-            .const_int(var_name_index as u64, false);
+            .const_int(meta.var_name_index as u64, false);
         // Store var_name_index at offset offsetof(PrintComplexVariableData, var_name_index)
         let var_name_index_off =
             std::mem::offset_of!(PrintComplexVariableData, var_name_index) as u64;
@@ -3844,7 +3627,7 @@ impl<'ctx> EbpfContext<'ctx> {
                 CodeGenError::LLVMError(format!("Failed to store var_name_index: {}", e))
             })?;
         tracing::trace!(
-            var_name_index,
+            var_name_index = meta.var_name_index,
             "generate_print_complex_variable_runtime: wrote var_name_index"
         );
 
@@ -3873,12 +3656,15 @@ impl<'ctx> EbpfContext<'ctx> {
             .map_err(|e| {
                 CodeGenError::LLVMError(format!("Failed to cast type_index ptr: {}", e))
             })?;
-        let type_index_val = self.context.i16_type().const_int(type_index as u64, false);
+        let type_index_val = self
+            .context
+            .i16_type()
+            .const_int(meta.type_index as u64, false);
         self.builder
             .build_store(type_index_ptr, type_index_val)
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store type_index: {}", e)))?;
         tracing::trace!(
-            type_index,
+            type_index = meta.type_index,
             "generate_print_complex_variable_runtime: wrote type_index"
         );
 
@@ -4030,8 +3816,13 @@ impl<'ctx> EbpfContext<'ctx> {
                 })?
         };
 
-        // Compute source address with ASLR-aware helper
-        let src_addr = self.evaluation_result_to_address(eval_result, Some(status_ptr))?;
+        // Compute source address with ASLR-aware helper, honoring module hint
+        // Prefer a previously recorded module path for offsets; fall back handled in helper
+        let src_addr = self.evaluation_result_to_address_with_hint(
+            eval_result,
+            Some(status_ptr),
+            module_hint,
+        )?;
         tracing::trace!(src_addr = %{src_addr}, "generate_print_complex_variable_runtime: computed src_addr");
 
         // Setup common types and casts

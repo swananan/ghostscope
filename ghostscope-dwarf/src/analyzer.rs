@@ -340,6 +340,99 @@ impl DwarfAnalyzer {
         results
     }
 
+    /// Plan a member/chain access across modules focusing on global/static variables.
+    /// Strict policy and order:
+    /// 1) Query globals index by base name (prefer current module first).
+    /// 2) For each candidate: try static-offset lowering when link-time address exists.
+    /// 3) Fallback to per-module planner at addr=0.
+    ///
+    ///    Returns None if unresolved; never falls back to unrelated globals.
+    pub fn plan_global_chain_access(
+        &mut self,
+        prefer_module: &PathBuf,
+        base: &str,
+        fields: &[String],
+    ) -> Result<Option<(PathBuf, crate::data::VariableWithEvaluation)>> {
+        // 1) Globals across modules (strict)
+        let matches = self.find_global_variables_by_name(base);
+        if matches.is_empty() {
+            // Strict policy: if no global/base by name exists anywhere, stop here
+            return Ok(None);
+        }
+
+        // Build preferred order: prefer current module first
+        let mut ordered: Vec<(PathBuf, GlobalVariableInfo)> = Vec::new();
+        for (mpath, info) in matches.iter() {
+            if *mpath == *prefer_module {
+                ordered.push((mpath.clone(), info.clone()));
+            }
+        }
+        for (mpath, info) in matches.into_iter() {
+            if mpath != *prefer_module {
+                ordered.push((mpath, info));
+            }
+        }
+
+        for (mpath, info) in ordered.into_iter() {
+            // 2a) Static-offset lowering when link-time address is available
+            if let Some(link) = info.link_address {
+                if let Ok(Some((off, final_ty))) = self.compute_global_member_static_offset(
+                    &mpath,
+                    link,
+                    info.unit_offset,
+                    info.die_offset,
+                    fields,
+                ) {
+                    let name = if fields.is_empty() {
+                        base.to_string()
+                    } else {
+                        format!("{base}.{}", fields.join("."))
+                    };
+                    let var = crate::data::VariableWithEvaluation {
+                        name,
+                        type_name: final_ty.type_name(),
+                        dwarf_type: Some(final_ty),
+                        evaluation_result: crate::core::EvaluationResult::MemoryLocation(
+                            crate::core::LocationResult::Address(link + off),
+                        ),
+                        scope_depth: 0,
+                        is_parameter: false,
+                        is_artificial: false,
+                    };
+                    tracing::info!(
+                        "plan_global_chain_access: resolved '{}' in module '{}' via static-offset",
+                        base,
+                        mpath.display()
+                    );
+                    return Ok(Some((mpath, var)));
+                }
+            }
+
+            // 2b) Module planner fallback at addr=0
+            let ma = ModuleAddress::new(mpath.clone(), 0);
+            match self.plan_chain_access(&ma, base, fields) {
+                Ok(Some(v)) => {
+                    tracing::info!(
+                        "plan_global_chain_access: resolved '{}' in module '{}' via planner",
+                        base,
+                        ma.module_display()
+                    );
+                    return Ok(Some((mpath, v)));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::debug!(
+                        "plan_global_chain_access: planner miss in module '{}': {}",
+                        ma.module_display(),
+                        e
+                    );
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Resolve a variable by CU/DIE offsets in a specific module at an arbitrary address context (for globals)
     pub fn resolve_variable_by_offsets_in_module<P: AsRef<Path>>(
         &mut self,

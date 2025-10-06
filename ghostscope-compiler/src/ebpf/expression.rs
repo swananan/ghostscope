@@ -13,7 +13,8 @@ impl<'ctx> EbpfContext<'ctx> {
     pub fn compile_expr(&mut self, expr: &Expr) -> Result<BasicValueEnum<'ctx>> {
         match expr {
             Expr::Int(value) => {
-                let int_value = self.context.i64_type().const_int(*value as u64, false);
+                // Treat script integer literals as signed i64 constants
+                let int_value = self.context.i64_type().const_int(*value as u64, true);
                 debug!(
                     "compile_expr: Int literal {} compiled to IntValue with bit width {}",
                     value,
@@ -90,16 +91,27 @@ impl<'ctx> EbpfContext<'ctx> {
                 self.compile_dwarf_expression(expr)
             }
             Expr::AddressOf(inner) => {
-                // Take address of an lvalue expression via DWARF evaluation result
-                // 1) Resolve complex expr to get EvaluationResult
+                // Address-of with ASLR-aware hint: compute runtime address using module hint
                 let var = self.query_dwarf_for_complex_expr(inner)?.ok_or_else(|| {
                     super::context::CodeGenError::TypeError(
                         "cannot take address of unresolved expression".to_string(),
                     )
                 })?;
-                // 2) Convert evaluation result to an address (i64)
-                match self.evaluation_result_to_address(&var.evaluation_result, None) {
-                    Ok(addr) => Ok(addr.into()),
+                // Use current resolved hint if available (set during DWARF resolution)
+                let module_hint = self.current_resolved_var_module_path.clone();
+                match self.evaluation_result_to_address_with_hint(
+                    &var.evaluation_result,
+                    None,
+                    module_hint.as_deref(),
+                ) {
+                    Ok(addr_i64) => {
+                        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                        let as_ptr = self
+                            .builder
+                            .build_int_to_ptr(addr_i64, ptr_ty, "addr_as_ptr")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        Ok(as_ptr.into())
+                    }
                     Err(_) => Err(super::context::CodeGenError::TypeError(
                         "cannot take address of rvalue".to_string(),
                     )),
@@ -307,6 +319,70 @@ impl<'ctx> EbpfContext<'ctx> {
                 };
                 Ok(result.into())
             }
+            // Pointer equality/inequality comparisons
+            (PointerValue(lp), IntValue(ri)) | (IntValue(ri), PointerValue(lp)) => {
+                match op {
+                    BinaryOp::Equal | BinaryOp::NotEqual => {
+                        let lpi64 = self
+                            .builder
+                            .build_ptr_to_int(lp, self.context.i64_type(), "ptr_as_i64")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        // Normalize RHS to i64
+                        let rbw = ri.get_type().get_bit_width();
+                        let ri64 = if rbw < 64 {
+                            self.builder
+                                .build_int_z_extend(ri, self.context.i64_type(), "rhs_zext_i64")
+                                .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                        } else if rbw > 64 {
+                            self.builder
+                                .build_int_truncate(ri, self.context.i64_type(), "rhs_trunc_i64")
+                                .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                        } else {
+                            ri
+                        };
+                        let pred = if matches!(op, BinaryOp::Equal) {
+                            inkwell::IntPredicate::EQ
+                        } else {
+                            inkwell::IntPredicate::NE
+                        };
+                        let cmp = self
+                            .builder
+                            .build_int_compare(pred, lpi64, ri64, "ptr_cmp")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        Ok(cmp.into())
+                    }
+                    _ => Err(CodeGenError::TypeError(format!(
+                        "Type mismatch in binary operation {:?}",
+                        op
+                    ))),
+                }
+            }
+            (PointerValue(lp), PointerValue(rp)) => match op {
+                BinaryOp::Equal | BinaryOp::NotEqual => {
+                    let lpi64 = self
+                        .builder
+                        .build_ptr_to_int(lp, self.context.i64_type(), "l_ptr_as_i64")
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                    let rpi64 = self
+                        .builder
+                        .build_ptr_to_int(rp, self.context.i64_type(), "r_ptr_as_i64")
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                    let pred = if matches!(op, BinaryOp::Equal) {
+                        inkwell::IntPredicate::EQ
+                    } else {
+                        inkwell::IntPredicate::NE
+                    };
+                    let cmp = self
+                        .builder
+                        .build_int_compare(pred, lpi64, rpi64, "ptr_ptr_cmp")
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                    Ok(cmp.into())
+                }
+                _ => Err(CodeGenError::TypeError(format!(
+                    "Type mismatch in binary operation {:?}",
+                    op
+                ))),
+            },
             (FloatValue(left_float), FloatValue(right_float)) => match op {
                 BinaryOp::Add => {
                     let result = self

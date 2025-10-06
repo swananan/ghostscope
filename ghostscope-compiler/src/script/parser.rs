@@ -439,7 +439,7 @@ fn parse_term(pair: Pair<Rule>) -> Result<Expr> {
         Rule::term => {
             let mut pairs = pair.into_inner();
             let first = pairs.next().unwrap();
-            let mut left = parse_factor(first)?;
+            let mut left = parse_unary(first)?;
 
             for chunk in chunks_of_two(pairs) {
                 if chunk.len() != 2 {
@@ -452,7 +452,7 @@ fn parse_term(pair: Pair<Rule>) -> Result<Expr> {
                     _ => return Err(ParseError::UnexpectedToken(chunk[0].as_rule())),
                 };
 
-                let right = parse_factor(chunk[1].clone())?;
+                let right = parse_unary(chunk[1].clone())?;
 
                 // Check type consistency for binary operations
                 let expr = Expr::BinaryOp {
@@ -470,6 +470,33 @@ fn parse_term(pair: Pair<Rule>) -> Result<Expr> {
             }
 
             Ok(left)
+        }
+        _ => Err(ParseError::UnexpectedToken(pair.as_rule())),
+    }
+}
+
+fn parse_unary(pair: Pair<Rule>) -> Result<Expr> {
+    match pair.as_rule() {
+        Rule::unary => {
+            let mut inner = pair.into_inner();
+            let first = inner.next().ok_or(ParseError::InvalidExpression)?;
+            match first.as_rule() {
+                Rule::factor => parse_factor(first),
+                // Recursive unary: '-' ~ unary
+                Rule::unary => {
+                    let right = parse_unary(first)?;
+                    let expr = Expr::BinaryOp {
+                        left: Box::new(Expr::Int(0)),
+                        op: BinaryOp::Subtract,
+                        right: Box::new(right),
+                    };
+                    if let Err(err) = infer_type(&expr) {
+                        return Err(ParseError::TypeError(err));
+                    }
+                    Ok(expr)
+                }
+                _ => Err(ParseError::UnexpectedToken(first.as_rule())),
+            }
         }
         _ => Err(ParseError::UnexpectedToken(pair.as_rule())),
     }

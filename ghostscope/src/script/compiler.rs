@@ -163,6 +163,22 @@ pub async fn compile_and_load_script_for_tui(
     if let Some(pid) = session.target_pid {
         match process_analyzer.compute_section_offsets() {
             Ok(items) => {
+                // Log cookie ↔ module path mapping for clarity
+                for (path, cookie, off) in &items {
+                    let cookie_hi = (*cookie >> 32) as u32;
+                    let cookie_lo = (*cookie & 0xffff_ffff) as u32;
+                    info!(
+                        "Offsets entry: pid={} module='{}' cookie=0x{:08x}{:08x} text=0x{:x} rodata=0x{:x} data=0x{:x} bss=0x{:x}",
+                        pid,
+                        path.display(),
+                        cookie_hi,
+                        cookie_lo,
+                        off.text,
+                        off.rodata,
+                        off.data,
+                        off.bss
+                    );
+                }
                 offsets_items = items
                     .into_iter()
                     .map(|(_path, cookie, off)| {

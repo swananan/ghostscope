@@ -705,11 +705,6 @@ impl<'a> DwarfParser<'a> {
                                 .map(|addr| vec![(addr, addr)])
                                 .unwrap_or_default();
 
-                            // Only index variables with usable addresses
-                            if address_ranges.is_empty() {
-                                continue;
-                            }
-
                             let index_entry = IndexEntry {
                                 name: name.clone(),
                                 die_offset: entry.offset(),
