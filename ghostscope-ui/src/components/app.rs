@@ -112,6 +112,10 @@ impl App {
             tokio::time::sleep(tokio::time::Duration::from_secs(LOADING_TIMEOUT_SECS));
         tokio::pin!(loading_timeout);
 
+        // Create a 1-second interval for loading UI updates (elapsed time, spinner, etc.)
+        let mut loading_ui_ticker = tokio::time::interval(tokio::time::Duration::from_secs(1));
+        loading_ui_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         // Initial render
         self.terminal.draw(|f| Self::draw_ui(f, &mut self.state))?;
 
@@ -153,6 +157,13 @@ impl App {
                 () = &mut loading_timeout, if !self.state.loading_state.is_ready() && !self.state.loading_state.is_failed() => {
                     tracing::info!("No runtime response after {} seconds, connection timeout", LOADING_TIMEOUT_SECS);
                     self.state.set_loading_state(LoadingState::Failed("Connection timeout - no runtime response".to_string()));
+                    needs_render = true;
+                }
+
+                // Update loading UI periodically (elapsed time, spinner animation)
+                _ = loading_ui_ticker.tick(), if self.state.is_loading() => {
+                    // Just trigger a redraw to update elapsed time and spinner
+                    // No state changes needed - the UI will read fresh elapsed time on render
                     needs_render = true;
                 }
 
