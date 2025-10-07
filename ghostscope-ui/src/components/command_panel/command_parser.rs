@@ -1043,11 +1043,8 @@ impl CommandParser {
         }
 
         if parts.len() < 2 {
-            let plain = "Usage: stop <output|session>".to_string();
-            let styled = Self::styled_usage(&plain);
-            return Some(vec![Action::AddResponseWithStyle {
-                content: plain,
-                styled_lines: Some(styled),
+            return Some(vec![Action::AddResponse {
+                content: "Usage: stop <output|session>".to_string(),
                 response_type: ResponseType::Error,
             }]);
         }
@@ -1055,24 +1052,13 @@ impl CommandParser {
         match parts[1] {
             "output" => Some(vec![Action::StopSaveOutput]),
             "session" => Some(vec![Action::StopSaveSession]),
-            _ => {
-                Some(vec![{
-                    let plain = format!(
-                        "Unknown stop target: '{}'. Use 'stop output' or 'stop session'",
-                        parts[1]
-                    );
-                    let styled = vec![
-                    crate::components::command_panel::style_builder::StyledLineBuilder::new()
-                        .styled(plain.clone(), crate::components::command_panel::style_builder::StylePresets::ERROR)
-                        .build(),
-                ];
-                    Action::AddResponseWithStyle {
-                        content: plain,
-                        styled_lines: Some(styled),
-                        response_type: ResponseType::Error,
-                    }
-                }])
-            }
+            _ => Some(vec![Action::AddResponse {
+                content: format!(
+                    "Unknown stop target: '{}'. Use 'stop output' or 'stop session'",
+                    parts[1]
+                ),
+                response_type: ResponseType::Error,
+            }]),
         }
     }
 
