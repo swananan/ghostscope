@@ -6,7 +6,8 @@
 use super::context::{CodeGenError, EbpfContext, Result};
 use aya_ebpf_bindings::bindings::bpf_func_id::{
     BPF_FUNC_get_current_pid_tgid, BPF_FUNC_ktime_get_ns, BPF_FUNC_map_lookup_elem,
-    BPF_FUNC_perf_event_output, BPF_FUNC_probe_read_user, BPF_FUNC_ringbuf_output,
+    BPF_FUNC_perf_event_output, BPF_FUNC_probe_read_user, BPF_FUNC_probe_read_user_str,
+    BPF_FUNC_ringbuf_output,
 };
 use ghostscope_dwarf::MemoryAccessSize;
 use ghostscope_platform::register_mapping;
@@ -16,6 +17,126 @@ use inkwell::AddressSpace;
 use tracing::info;
 
 impl<'ctx> EbpfContext<'ctx> {
+    /// Get or create a static i8 buffer global of a given size, returning its ArrayType and pointer
+    pub fn get_or_create_i8_buffer(
+        &mut self,
+        size: u32,
+        name_prefix: &str,
+    ) -> (
+        inkwell::types::ArrayType<'ctx>,
+        inkwell::values::PointerValue<'ctx>,
+    ) {
+        let array_ty = self.context.i8_type().array_type(size);
+        let name = format!("{}_{}", name_prefix, size);
+        let global_ptr = match self.module.get_global(&name) {
+            Some(g) => g.as_pointer_value(),
+            None => {
+                let g = self
+                    .module
+                    .add_global(array_ty, Some(AddressSpace::default()), &name);
+                g.set_initializer(&array_ty.const_zero());
+                g.as_pointer_value()
+            }
+        };
+        (array_ty, global_ptr)
+    }
+
+    /// Read a user C-string into a static buffer using bpf_probe_read_user_str.
+    /// Returns (buffer_ptr, len_including_nul).
+    pub fn read_user_cstr_into_buffer(
+        &mut self,
+        src_addr: inkwell::values::IntValue<'ctx>,
+        size: u32,
+        name_prefix: &str,
+    ) -> Result<(
+        inkwell::values::PointerValue<'ctx>,
+        inkwell::values::IntValue<'ctx>,
+        inkwell::types::ArrayType<'ctx>,
+    )> {
+        let (arr_ty, buf_global) = self.get_or_create_i8_buffer(size, name_prefix);
+
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        // Cast addresses to void pointers
+        let dst_ptr = self
+            .builder
+            .build_bit_cast(buf_global, ptr_ty, "dst_ptr")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let src_ptr = self
+            .builder
+            .build_int_to_ptr(src_addr, ptr_ty, "src_ptr")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        // Helper signature: long fn(void *dst, u32 size, const void *src)
+        let i64_ty = self.context.i64_type();
+        let i32_ty = self.context.i32_type();
+        let args: [inkwell::values::BasicValueEnum; 3] = [
+            dst_ptr,
+            i32_ty.const_int(size as u64, false).into(),
+            inkwell::values::BasicValueEnum::PointerValue(src_ptr),
+        ];
+        let ret = self.create_bpf_helper_call(
+            BPF_FUNC_probe_read_user_str as u64,
+            &args,
+            i64_ty.into(),
+            "probe_read_user_str",
+        )?;
+        let len = if let inkwell::values::BasicValueEnum::IntValue(iv) = ret {
+            iv
+        } else {
+            return Err(CodeGenError::LLVMError(
+                "probe_read_user_str did not return integer".to_string(),
+            ));
+        };
+        Ok((buf_global, len, arr_ty))
+    }
+
+    /// Read raw user bytes into a static buffer using bpf_probe_read_user.
+    /// Returns (buffer_ptr, status==0?).
+    pub fn read_user_bytes_into_buffer(
+        &mut self,
+        src_addr: inkwell::values::IntValue<'ctx>,
+        size: u32,
+        name_prefix: &str,
+    ) -> Result<(
+        inkwell::values::PointerValue<'ctx>,
+        inkwell::values::IntValue<'ctx>,
+        inkwell::types::ArrayType<'ctx>,
+    )> {
+        let (arr_ty, buf_global) = self.get_or_create_i8_buffer(size, name_prefix);
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i32_ty = self.context.i32_type();
+        let i64_ty = self.context.i64_type();
+        // Cast addresses to void pointers
+        let dst_ptr = self
+            .builder
+            .build_bit_cast(buf_global, ptr_ty, "dst_ptr")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let src_ptr = self
+            .builder
+            .build_int_to_ptr(src_addr, ptr_ty, "src_ptr")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        let args: [inkwell::values::BasicValueEnum; 3] = [
+            dst_ptr,
+            i32_ty.const_int(size as u64, false).into(),
+            inkwell::values::BasicValueEnum::PointerValue(src_ptr),
+        ];
+        // Helper returns long (0 on success, -errno on failure)
+        let ret = self.create_bpf_helper_call(
+            BPF_FUNC_probe_read_user as u64,
+            &args,
+            i64_ty.into(),
+            "probe_read_user",
+        )?;
+        let status = if let inkwell::values::BasicValueEnum::IntValue(iv) = ret {
+            iv
+        } else {
+            return Err(CodeGenError::LLVMError(
+                "probe_read_user did not return integer".to_string(),
+            ));
+        };
+        Ok((buf_global, status, arr_ty))
+    }
     /// Compute runtime address from link-time address using proc_module_offsets map
     /// section_type: 0=text, 1=rodata, 2=data, 3=bss; other values fallback to data
     pub fn generate_runtime_address_from_offsets(

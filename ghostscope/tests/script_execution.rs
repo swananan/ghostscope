@@ -1316,6 +1316,57 @@ trace calculate_something {
 }
 
 #[tokio::test]
+async fn test_string_comparison_char_ptr() -> anyhow::Result<()> {
+    init();
+    ensure_global_cleanup_registered();
+
+    // Compare const char* parameter against a script literal
+    let script_content = r#"
+trace log_activity {
+    if (activity == "main_loop") {
+        print "CSTR_EQ";
+    }
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script(script_content, 5).await?;
+
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    assert!(
+        stdout.contains("CSTR_EQ"),
+        "Expected to see CSTR_EQ when activity == 'main_loop'. STDOUT: {}",
+        stdout
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_string_comparison_char_array() -> anyhow::Result<()> {
+    init();
+    ensure_global_cleanup_registered();
+
+    // Compare char[32] field inside DataRecord against a script literal
+    // Use process_record (called every loop) to shorten wait time
+    let script_content = r#"
+trace process_record {
+    if (record.name == "test_record") {
+        print "ARR_EQ";
+    }
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script(script_content, 6).await?;
+
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    assert!(
+        stdout.contains("ARR_EQ"),
+        "Expected to see ARR_EQ when record.name == 'test_record'. STDOUT: {}",
+        stdout
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_correct_pid_filtering() -> anyhow::Result<()> {
     init();
     ensure_global_cleanup_registered();

@@ -78,6 +78,22 @@ impl<'ctx> EbpfContext<'ctx> {
             }
             Expr::SpecialVar(name) => self.handle_special_variable(name),
             Expr::BinaryOp { left, op, right } => {
+                // String comparison fast-path: script string vs DWARF char*/char[N]
+                if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual) {
+                    if let (Expr::String(lit), other) = (&**left, &**right) {
+                        return self.compile_string_comparison(
+                            other,
+                            lit,
+                            matches!(op, BinaryOp::Equal),
+                        );
+                    } else if let (other, Expr::String(lit)) = (&**left, &**right) {
+                        return self.compile_string_comparison(
+                            other,
+                            lit,
+                            matches!(op, BinaryOp::Equal),
+                        );
+                    }
+                }
                 // Implement short-circuit for logical OR (||) and logical AND (&&)
                 if matches!(op, BinaryOp::LogicalOr) {
                     // Evaluate LHS to boolean (non-zero => true)
@@ -742,5 +758,542 @@ impl<'ctx> EbpfContext<'ctx> {
             Expr::PointerDeref(expr) => format!("*{}", self.expr_to_debug_string(expr)),
             _ => "expr".to_string(),
         }
+    }
+}
+
+impl<'ctx> EbpfContext<'ctx> {
+    /// Compile comparison between a DWARF-side expression and a script string literal.
+    /// Supports char* and char[N] according to design in string_comparison.md.
+    fn compile_string_comparison(
+        &mut self,
+        dwarf_expr: &Expr,
+        lit: &str,
+        is_equal: bool,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        use ghostscope_dwarf::TypeInfo as TI;
+
+        // Query DWARF for the non-string side to obtain evaluation and type info
+        let var = self
+            .query_dwarf_for_complex_expr(dwarf_expr)?
+            .ok_or_else(|| {
+                CodeGenError::TypeError(
+                    "string comparison requires DWARF variable/expression".into(),
+                )
+            })?;
+        // Try DWARF type first; if unavailable, fall back to type_name string parsing
+        let dwarf_type_opt = var.dwarf_type.as_ref();
+
+        enum ParsedKind {
+            PtrChar,
+            ArrChar(Option<u32>),
+            Other,
+        }
+        fn parse_type_name(name: &str) -> ParsedKind {
+            let lower = name.to_lowercase();
+            let has_char = lower.contains("char");
+            let is_ptr = lower.contains('*');
+            if has_char && is_ptr {
+                return ParsedKind::PtrChar;
+            }
+            if has_char && lower.contains('[') {
+                // Try to extract N inside brackets
+                let mut n: Option<u32> = None;
+                if let Some(start) = lower.find('[') {
+                    if let Some(end) = lower[start + 1..].find(']') {
+                        let inside = &lower[start + 1..start + 1 + end];
+                        let digits: String =
+                            inside.chars().filter(|c| c.is_ascii_digit()).collect();
+                        if !digits.is_empty() {
+                            if let Ok(v) = digits.parse::<u32>() {
+                                n = Some(v);
+                            }
+                        }
+                    }
+                }
+                return ParsedKind::ArrChar(n);
+            }
+            ParsedKind::Other
+        }
+
+        // Helper to peel typedef/qualifier wrappers
+        fn unwrap_aliases(t: &TI) -> &TI {
+            let mut cur = t;
+            loop {
+                match cur {
+                    TI::TypedefType {
+                        underlying_type, ..
+                    } => cur = underlying_type.as_ref(),
+                    TI::QualifiedType {
+                        underlying_type, ..
+                    } => cur = underlying_type.as_ref(),
+                    _ => break,
+                }
+            }
+            cur
+        }
+
+        // Compute runtime address of the DWARF expression
+        let module_hint = self.current_resolved_var_module_path.clone();
+        let addr = self.evaluation_result_to_address_with_hint(
+            &var.evaluation_result,
+            None,
+            module_hint.as_deref(),
+        )?;
+
+        let lit_bytes = lit.as_bytes();
+        let lit_len = lit_bytes.len() as u32;
+        let one = self.context.bool_type().const_int(1, false);
+        let zero = self.context.bool_type().const_zero();
+
+        // Build final boolean accumulator
+        let result = match dwarf_type_opt.map(unwrap_aliases) {
+            // char* / const char*
+            Some(TI::PointerType { target_type, .. }) => {
+                // Ensure pointee is char-like
+                let base = unwrap_aliases(target_type.as_ref());
+                let is_char_like = matches!(base, TI::BaseType { name, size, .. } if name.contains("char") && *size == 1);
+                if !is_char_like {
+                    return Err(CodeGenError::TypeError(
+                        "automatic string comparison only supports char*".into(),
+                    ));
+                }
+
+                // Evaluate expression to pointer value and read up to L+1 bytes
+                let val_any = self.evaluate_result_to_llvm_value(
+                    &var.evaluation_result,
+                    var.dwarf_type.as_ref().unwrap(),
+                    &var.name,
+                    self.get_compile_time_context()?.pc_address,
+                )?;
+                let ptr_i64 = match val_any {
+                    BasicValueEnum::IntValue(iv) => iv,
+                    BasicValueEnum::PointerValue(pv) => self
+                        .builder
+                        .build_ptr_to_int(pv, self.context.i64_type(), "ptr_as_i64")
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?,
+                    _ => {
+                        return Err(CodeGenError::TypeError(
+                            "pointer value must be integer or pointer".into(),
+                        ))
+                    }
+                };
+                let need = lit_len + 1;
+                let (buf_global, ret_len, arr_ty) =
+                    self.read_user_cstr_into_buffer(ptr_i64, need, "_gs_strbuf")?;
+
+                // ret_len must equal L+1
+                let i64_ty = self.context.i64_type();
+                let expect_len = i64_ty.const_int(need as u64, false);
+                let len_ok = self
+                    .builder
+                    .build_int_compare(inkwell::IntPredicate::EQ, ret_len, expect_len, "str_len_ok")
+                    .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+                // buf[L] must be '\0'
+                let i32_ty = self.context.i32_type();
+                let idx0 = i32_ty.const_zero();
+                let idx_l = i32_ty.const_int(lit_len as u64, false);
+                let char_ptr = unsafe {
+                    self.builder
+                        .build_gep(arr_ty, buf_global, &[idx0, idx_l], "nul_ptr")
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                };
+                let c = self
+                    .builder
+                    .build_load(self.context.i8_type(), char_ptr, "c_l")
+                    .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                let c = match c {
+                    BasicValueEnum::IntValue(iv) => iv,
+                    _ => return Err(CodeGenError::LLVMError("load did not return i8".into())),
+                };
+                let nul_ok = self
+                    .builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::EQ,
+                        c,
+                        self.context.i8_type().const_zero(),
+                        "nul_ok",
+                    )
+                    .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+                // Compare first L bytes using XOR/OR accumulation to reduce branchiness
+                let mut acc = self.context.i8_type().const_zero();
+                for (i, b) in lit_bytes.iter().enumerate() {
+                    let idx_i = i32_ty.const_int(i as u64, false);
+                    let ptr_i = unsafe {
+                        self.builder
+                            .build_gep(arr_ty, buf_global, &[idx0, idx_i], "ch_ptr")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                    };
+                    let ch = self
+                        .builder
+                        .build_load(self.context.i8_type(), ptr_i, "ch")
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                    let ch = match ch {
+                        BasicValueEnum::IntValue(iv) => iv,
+                        _ => return Err(CodeGenError::LLVMError("load did not return i8".into())),
+                    };
+                    let expect = self.context.i8_type().const_int(*b as u64, false);
+                    let diff = self
+                        .builder
+                        .build_xor(ch, expect, "diff")
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                    acc = self
+                        .builder
+                        .build_or(acc, diff, "acc_or")
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                }
+                let eq_bytes = self
+                    .builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::EQ,
+                        acc,
+                        self.context.i8_type().const_zero(),
+                        "acc_zero",
+                    )
+                    .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                let ok1 = self
+                    .builder
+                    .build_and(len_ok, nul_ok, "ok_len_nul")
+                    .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                self.builder
+                    .build_and(ok1, eq_bytes, "str_eq")
+                    .map_err(|e| CodeGenError::Builder(e.to_string()))?
+            }
+            // char[N]
+            Some(TI::ArrayType {
+                element_type,
+                element_count,
+                total_size,
+            }) => {
+                let elem = unwrap_aliases(element_type.as_ref());
+                let is_char_like = matches!(elem, TI::BaseType { name, size, .. } if name.contains("char") && *size == 1);
+                if !is_char_like {
+                    return Err(CodeGenError::TypeError(
+                        "automatic string comparison only supports char[N]".into(),
+                    ));
+                }
+                // Determine N (element count)
+                let n_opt = element_count.or_else(|| total_size.map(|ts| ts));
+                let n = if let Some(nv) = n_opt { nv as u32 } else { 0 };
+                if n == 0 {
+                    return Err(CodeGenError::TypeError(
+                        "array size unknown for char[N] comparison".into(),
+                    ));
+                }
+                // If L+1 > N, compile-time false
+                if lit_len + 1 > n {
+                    // Return const false (or true if '!=' requested)
+                    return Ok((if is_equal { zero } else { one }).into());
+                }
+                // Read exactly L+1 bytes
+                let (buf_global, status, arr_ty) =
+                    self.read_user_bytes_into_buffer(addr, lit_len + 1, "_gs_arrbuf")?;
+                // status == 0
+                let status_ok = self
+                    .builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::EQ,
+                        status,
+                        self.context.i64_type().const_zero(),
+                        "rd_ok",
+                    )
+                    .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                // buf[L] must be '\0'
+                let i32_ty = self.context.i32_type();
+                let idx0 = i32_ty.const_zero();
+                let idx_l = i32_ty.const_int(lit_len as u64, false);
+                let char_ptr = unsafe {
+                    self.builder
+                        .build_gep(arr_ty, buf_global, &[idx0, idx_l], "nul_ptr")
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                };
+                let c = self
+                    .builder
+                    .build_load(self.context.i8_type(), char_ptr, "c_l")
+                    .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                let c = match c {
+                    BasicValueEnum::IntValue(iv) => iv,
+                    _ => return Err(CodeGenError::LLVMError("load did not return i8".into())),
+                };
+                let nul_ok = self
+                    .builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::EQ,
+                        c,
+                        self.context.i8_type().const_zero(),
+                        "nul_ok",
+                    )
+                    .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                // Compare first L bytes using XOR/OR accumulation
+                let mut acc = self.context.i8_type().const_zero();
+                for (i, b) in lit_bytes.iter().enumerate() {
+                    let idx_i = i32_ty.const_int(i as u64, false);
+                    let ptr_i = unsafe {
+                        self.builder
+                            .build_gep(arr_ty, buf_global, &[idx0, idx_i], "ch_ptr")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                    };
+                    let ch = self
+                        .builder
+                        .build_load(self.context.i8_type(), ptr_i, "ch")
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                    let ch = match ch {
+                        BasicValueEnum::IntValue(iv) => iv,
+                        _ => return Err(CodeGenError::LLVMError("load did not return i8".into())),
+                    };
+                    let expect = self.context.i8_type().const_int(*b as u64, false);
+                    let diff = self
+                        .builder
+                        .build_xor(ch, expect, "diff")
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                    acc = self
+                        .builder
+                        .build_or(acc, diff, "acc_or")
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                }
+                let eq_bytes = self
+                    .builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::EQ,
+                        acc,
+                        self.context.i8_type().const_zero(),
+                        "acc_zero",
+                    )
+                    .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                let ok1 = self
+                    .builder
+                    .build_and(status_ok, nul_ok, "ok_len_nul")
+                    .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                self.builder
+                    .build_and(ok1, eq_bytes, "arr_eq")
+                    .map_err(|e| CodeGenError::Builder(e.to_string()))?
+            }
+            None => {
+                // Fallback using type_name string
+                match parse_type_name(&var.type_name) {
+                    ParsedKind::PtrChar => {
+                        // Load pointer value from variable location (assume 64-bit)
+                        let ptr_any = self
+                            .generate_memory_read(addr, ghostscope_dwarf::MemoryAccessSize::U64)?;
+                        let ptr_i64 = match ptr_any {
+                            BasicValueEnum::IntValue(iv) => iv,
+                            _ => {
+                                return Err(CodeGenError::LLVMError(
+                                    "pointer load did not return integer".to_string(),
+                                ))
+                            }
+                        };
+                        let need = lit_len + 1;
+                        let (buf_global, ret_len, arr_ty) =
+                            self.read_user_cstr_into_buffer(ptr_i64, need, "_gs_strbuf")?;
+
+                        let i64_ty = self.context.i64_type();
+                        let expect_len = i64_ty.const_int(need as u64, false);
+                        let len_ok = self
+                            .builder
+                            .build_int_compare(
+                                inkwell::IntPredicate::EQ,
+                                ret_len,
+                                expect_len,
+                                "str_len_ok",
+                            )
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+                        let i32_ty = self.context.i32_type();
+                        let idx0 = i32_ty.const_zero();
+                        let idx_l = i32_ty.const_int(lit_len as u64, false);
+                        let char_ptr = unsafe {
+                            self.builder
+                                .build_gep(arr_ty, buf_global, &[idx0, idx_l], "nul_ptr")
+                                .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                        };
+                        let c = self
+                            .builder
+                            .build_load(self.context.i8_type(), char_ptr, "c_l")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        let c = match c {
+                            BasicValueEnum::IntValue(iv) => iv,
+                            _ => {
+                                return Err(CodeGenError::LLVMError(
+                                    "load did not return i8".into(),
+                                ))
+                            }
+                        };
+                        let nul_ok = self
+                            .builder
+                            .build_int_compare(
+                                inkwell::IntPredicate::EQ,
+                                c,
+                                self.context.i8_type().const_zero(),
+                                "nul_ok",
+                            )
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+                        let mut acc = self.context.i8_type().const_zero();
+                        for (i, b) in lit_bytes.iter().enumerate() {
+                            let idx_i = i32_ty.const_int(i as u64, false);
+                            let ptr_i = unsafe {
+                                self.builder
+                                    .build_gep(arr_ty, buf_global, &[idx0, idx_i], "ch_ptr")
+                                    .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                            };
+                            let ch = self
+                                .builder
+                                .build_load(self.context.i8_type(), ptr_i, "ch")
+                                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                            let ch = match ch {
+                                BasicValueEnum::IntValue(iv) => iv,
+                                _ => {
+                                    return Err(CodeGenError::LLVMError(
+                                        "load did not return i8".into(),
+                                    ))
+                                }
+                            };
+                            let expect = self.context.i8_type().const_int(*b as u64, false);
+                            let diff = self
+                                .builder
+                                .build_xor(ch, expect, "diff")
+                                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                            acc = self
+                                .builder
+                                .build_or(acc, diff, "acc_or")
+                                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        }
+                        let eq_bytes = self
+                            .builder
+                            .build_int_compare(
+                                inkwell::IntPredicate::EQ,
+                                acc,
+                                self.context.i8_type().const_zero(),
+                                "acc_zero",
+                            )
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        let ok1 = self
+                            .builder
+                            .build_and(len_ok, nul_ok, "ok_len_nul")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        self.builder
+                            .build_and(ok1, eq_bytes, "str_eq")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                    }
+                    ParsedKind::ArrChar(n_opt) => {
+                        // If we know N and L+1>N, return false; else read L+1 bytes
+                        if let Some(n) = n_opt {
+                            if lit_len + 1 > n {
+                                return Ok((if is_equal { zero } else { one }).into());
+                            }
+                        }
+                        let (buf_global, status, arr_ty) =
+                            self.read_user_bytes_into_buffer(addr, lit_len + 1, "_gs_arrbuf")?;
+                        let status_ok = self
+                            .builder
+                            .build_int_compare(
+                                inkwell::IntPredicate::EQ,
+                                status,
+                                self.context.i64_type().const_zero(),
+                                "rd_ok",
+                            )
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        let i32_ty = self.context.i32_type();
+                        let idx0 = i32_ty.const_zero();
+                        let idx_l = i32_ty.const_int(lit_len as u64, false);
+                        let char_ptr = unsafe {
+                            self.builder
+                                .build_gep(arr_ty, buf_global, &[idx0, idx_l], "nul_ptr")
+                                .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                        };
+                        let c = self
+                            .builder
+                            .build_load(self.context.i8_type(), char_ptr, "c_l")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        let c = match c {
+                            BasicValueEnum::IntValue(iv) => iv,
+                            _ => {
+                                return Err(CodeGenError::LLVMError(
+                                    "load did not return i8".into(),
+                                ))
+                            }
+                        };
+                        let nul_ok = self
+                            .builder
+                            .build_int_compare(
+                                inkwell::IntPredicate::EQ,
+                                c,
+                                self.context.i8_type().const_zero(),
+                                "nul_ok",
+                            )
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        let mut acc = self.context.i8_type().const_zero();
+                        for (i, b) in lit_bytes.iter().enumerate() {
+                            let idx_i = i32_ty.const_int(i as u64, false);
+                            let ptr_i = unsafe {
+                                self.builder
+                                    .build_gep(arr_ty, buf_global, &[idx0, idx_i], "ch_ptr")
+                                    .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                            };
+                            let ch = self
+                                .builder
+                                .build_load(self.context.i8_type(), ptr_i, "ch")
+                                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                            let ch = match ch {
+                                BasicValueEnum::IntValue(iv) => iv,
+                                _ => {
+                                    return Err(CodeGenError::LLVMError(
+                                        "load did not return i8".into(),
+                                    ))
+                                }
+                            };
+                            let expect = self.context.i8_type().const_int(*b as u64, false);
+                            let diff = self
+                                .builder
+                                .build_xor(ch, expect, "diff")
+                                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                            acc = self
+                                .builder
+                                .build_or(acc, diff, "acc_or")
+                                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        }
+                        let eq_bytes = self
+                            .builder
+                            .build_int_compare(
+                                inkwell::IntPredicate::EQ,
+                                acc,
+                                self.context.i8_type().const_zero(),
+                                "acc_zero",
+                            )
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        let ok1 = self
+                            .builder
+                            .build_and(status_ok, nul_ok, "ok_len_nul")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        self.builder
+                            .build_and(ok1, eq_bytes, "arr_eq")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                    }
+                    ParsedKind::Other => {
+                        return Err(CodeGenError::TypeError(format!(
+                            "string comparison unsupported for type name '{}' without DWARF type",
+                            var.type_name
+                        )));
+                    }
+                }
+            }
+            Some(_) => {
+                return Err(CodeGenError::TypeError(
+                    "string comparison only supports char* or char[N]".into(),
+                ));
+            }
+        };
+
+        // Apply == / !=
+        let final_bool = if is_equal {
+            result
+        } else {
+            self.builder
+                .build_not(result, "not_eq")
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?
+        };
+        Ok(final_bool.into())
     }
 }

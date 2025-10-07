@@ -187,6 +187,46 @@ trace complex_types_program.c:7 {
 }
 
 #[tokio::test]
+async fn test_string_comparison_struct_char_array() -> anyhow::Result<()> {
+    init();
+
+    // Build and start complex_types_program (Debug)
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("complex_types_program", OptimizationLevel::Debug)?;
+    let mut prog = Command::new(&binary_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Compare embedded char[16] field c.name against script literals
+    // update_complex(&a, i) and update_complex(&b, i) are both called each second
+    let script = r#"
+trace update_complex {
+    if (c.name == "Alice") { print "CNAME_A"; }
+    if (c.name == "Bob") { print "CNAME_B"; }
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    // We expect to see at least one of the names captured within the window
+    let saw_a = stdout.contains("CNAME_A");
+    let saw_b = stdout.contains("CNAME_B");
+    assert!(
+        saw_a || saw_b,
+        "Expected to see at least Alice or Bob. STDOUT: {}",
+        stdout
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_local_array_constant_index_format() -> anyhow::Result<()> {
     init();
 

@@ -253,6 +253,56 @@ trace globals_program.c:32 {
 }
 
 #[tokio::test]
+async fn test_string_comparison_globals_char_ptr_and_array() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // In tick_once, gm/lm are aliases to global rodata strings,
+    // and s is alias to &G_STATE with name[32].
+    let script = r#"
+trace globals_program.c:32 {
+    if (gm == "Hello, Global!") { print "GM_OK"; }
+    if (lm == "LIB_MESSAGE") { print "LM_OK"; }
+    if (s.name == "RUNNING") { print "GNAME_RUN"; }
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    // Expect to see both char* matches (gm,lm)
+    assert!(
+        stdout.contains("GM_OK"),
+        "Expected GM_OK for g_message. STDOUT: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("LM_OK"),
+        "Expected LM_OK for lib_message. STDOUT: {}",
+        stdout
+    );
+    // And ideally G_STATE.name comparison as RUNNING
+    assert!(
+        stdout.contains("GNAME_RUN"),
+        "Expected GNAME_RUN for G_STATE.name. STDOUT: {}",
+        stdout
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_print_format_current_global_member_leaf() -> anyhow::Result<()> {
     init();
 
