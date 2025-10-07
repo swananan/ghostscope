@@ -82,7 +82,7 @@ pub struct TargetDebugInfo {
 
 impl TargetDebugInfo {
     /// Format target debug info with tree-style layout for display
-    pub fn format_for_display(&self) -> String {
+    pub fn format_for_display(&self, verbose: bool) -> String {
         let mut result = String::new();
 
         // Calculate statistics
@@ -106,6 +106,7 @@ impl TargetDebugInfo {
                 is_last_module,
                 &self.file_path,
                 self.line_number,
+                verbose,
             ));
         }
 
@@ -113,7 +114,7 @@ impl TargetDebugInfo {
     }
 
     /// Styled version for display (pre-styled lines for UI rendering)
-    pub fn format_for_display_styled(&self) -> Vec<ratatui::text::Line<'static>> {
+    pub fn format_for_display_styled(&self, verbose: bool) -> Vec<ratatui::text::Line<'static>> {
         use crate::components::command_panel::style_builder::StyledLineBuilder;
         use ratatui::text::Line;
 
@@ -139,6 +140,7 @@ impl TargetDebugInfo {
                 is_last,
                 &self.file_path,
                 self.line_number,
+                verbose,
             ));
         }
 
@@ -160,6 +162,7 @@ impl ModuleDebugInfo {
         is_last_module: bool,
         source_file: &Option<String>,
         source_line: Option<u32>,
+        verbose: bool,
     ) -> String {
         let mut result = String::new();
 
@@ -216,7 +219,7 @@ impl ModuleDebugInfo {
                         (false, false, false) => "│  │  │  ├─",
                     };
 
-                    let param_line = Self::format_variable_line(param);
+                    let param_line = Self::format_variable_line(param, verbose);
 
                     result.push_str(&Self::wrap_long_line(
                         &format!("{item_prefix} {param_line}"),
@@ -250,7 +253,7 @@ impl ModuleDebugInfo {
                         (false, false, false) => "│  │     ├─",
                     };
 
-                    let var_line = Self::format_variable_line(var);
+                    let var_line = Self::format_variable_line(var, verbose);
 
                     result.push_str(&Self::wrap_long_line(
                         &format!("{item_prefix} {var_line}"),
@@ -265,7 +268,7 @@ impl ModuleDebugInfo {
     }
 
     /// Overload helper: build from VariableDebugInfo
-    pub fn format_variable_line(var: &VariableDebugInfo) -> String {
+    pub fn format_variable_line(var: &VariableDebugInfo, verbose: bool) -> String {
         // Use enhanced DWARF type display (includes type name and size)
         let type_display = var
             .type_pretty
@@ -275,7 +278,7 @@ impl ModuleDebugInfo {
             .unwrap_or_else(|| "unknown".to_string());
 
         let name = &var.name;
-        if var.location_description.is_empty() || var.location_description == "None" {
+        if !verbose || var.location_description.is_empty() || var.location_description == "None" {
             format!("{name} ({type_display})")
         } else {
             let location = &var.location_description;
@@ -321,6 +324,7 @@ impl ModuleDebugInfo {
         is_last_module: bool,
         source_file: &Option<String>,
         source_line: Option<u32>,
+        verbose: bool,
     ) -> Vec<ratatui::text::Line<'static>> {
         use crate::components::command_panel::style_builder::{StylePresets, StyledLineBuilder};
 
@@ -345,7 +349,7 @@ impl ModuleDebugInfo {
 
         for (addr_idx, mapping) in self.address_mappings.iter().enumerate() {
             let is_last_addr = addr_idx + 1 == self.address_mappings.len();
-            lines.extend(mapping.format_for_display_styled(is_last_module, is_last_addr));
+            lines.extend(mapping.format_for_display_styled(is_last_module, is_last_addr, verbose));
         }
 
         lines
@@ -368,6 +372,7 @@ impl AddressMapping {
         &self,
         is_last_module: bool,
         is_last_addr: bool,
+        verbose: bool,
     ) -> Vec<ratatui::text::Line<'static>> {
         use crate::components::command_panel::style_builder::{StylePresets, StyledLineBuilder};
 
@@ -417,7 +422,7 @@ impl AddressMapping {
                     (false, false, false) => "│  │  │  ├─",
                 };
 
-                lines.push(Self::format_variable_styled(item_prefix, param));
+                lines.push(Self::format_variable_styled(item_prefix, param, verbose));
             }
         }
 
@@ -449,7 +454,7 @@ impl AddressMapping {
                     (false, false, false) => "│  │     ├─",
                 };
 
-                lines.push(Self::format_variable_styled(item_prefix, var));
+                lines.push(Self::format_variable_styled(item_prefix, var, verbose));
             }
         }
 
@@ -459,6 +464,7 @@ impl AddressMapping {
     fn format_variable_styled(
         indent_prefix: &str,
         var: &VariableDebugInfo,
+        verbose: bool,
     ) -> ratatui::text::Line<'static> {
         use crate::components::command_panel::style_builder::{StylePresets, StyledLineBuilder};
 
@@ -480,7 +486,7 @@ impl AddressMapping {
             builder = builder.text(" ").text(format!("({size} bytes)"));
         }
 
-        if !var.location_description.is_empty() && var.location_description != "None" {
+        if verbose && !var.location_description.is_empty() && var.location_description != "None" {
             builder = builder
                 .text(" ")
                 .key("@")
@@ -527,12 +533,15 @@ pub enum RuntimeCommand {
     DeleteAllTraces,   // Delete all traces and resources
     InfoFunction {
         target: String,
+        verbose: bool,
     }, // Get debug info for a function by name
     InfoLine {
         target: String,
+        verbose: bool,
     }, // Get debug info for a source line (file:line)
     InfoAddress {
         target: String,
+        verbose: bool,
     }, // Get debug info for a memory address (TODO: not implemented yet)
     InfoTrace {
         trace_id: Option<u32>,
@@ -674,6 +683,7 @@ pub enum RuntimeStatus {
     InfoFunctionResult {
         target: String,
         info: TargetDebugInfo,
+        verbose: bool,
     },
     InfoFunctionFailed {
         target: String,
@@ -682,6 +692,7 @@ pub enum RuntimeStatus {
     InfoLineResult {
         target: String,
         info: TargetDebugInfo,
+        verbose: bool,
     },
     InfoLineFailed {
         target: String,
@@ -690,6 +701,7 @@ pub enum RuntimeStatus {
     InfoAddressResult {
         target: String,
         info: TargetDebugInfo,
+        verbose: bool,
     },
     InfoAddressFailed {
         target: String,

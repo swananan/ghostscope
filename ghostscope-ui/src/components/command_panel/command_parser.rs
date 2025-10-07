@@ -497,9 +497,9 @@ impl CommandParser {
             "  info trace [id]      - Show trace status (i t [id])",
             "  info source          - Show all source files (i s)",
             "  info share           - Show loaded shared libraries (i sh)",
-            "  info function <name> - Show debug info for function (i f <name>)",
-            "  info line <file:line>- Show debug info for source line (i l <file:line>)",
-            "  info address <addr>  - Show debug info for address (i a <addr>) [TODO]",
+            "  info function <name> [verbose|v] - Show debug info for function (i f <name> [v])",
+            "  info line <file:line> [verbose|v] - Show debug info for line (i l <file:line> [v])",
+            "  info address <addr> [verbose|v]   - Show debug info for address (i a <addr> [v]) [TODO]",
         ]
         .join("\n")
     }
@@ -565,6 +565,12 @@ impl CommandParser {
     /// Get command completion for the given input
     pub fn get_command_completion(input: &str) -> Option<String> {
         let input = input.trim();
+
+        // Check if we're completing the verbose parameter for info commands
+        // e.g., "info function main v<Tab>" -> "info function main verbose"
+        if let Some(verbose_completion) = Self::complete_verbose_parameter(input) {
+            return Some(verbose_completion);
+        }
 
         // All available commands (full commands + abbreviations)
         let commands = [
@@ -643,6 +649,50 @@ impl CommandParser {
                 Self::find_common_prefix(&matches, input.len())
             }
         }
+    }
+
+    /// Complete the verbose parameter for info commands
+    /// Returns the completion suffix if input matches an info command pattern with partial verbose
+    fn complete_verbose_parameter(input: &str) -> Option<String> {
+        // Split input into words
+        let parts: Vec<&str> = input.split_whitespace().collect();
+
+        // Need at least 3 parts: command + subcommand + target [+ partial_verbose]
+        if parts.len() < 3 {
+            return None;
+        }
+
+        // Check if this is an info command
+        let is_info_cmd = matches!(
+            (parts[0], parts.get(1)),
+            ("info", Some(&"function"))
+                | ("info", Some(&"line"))
+                | ("info", Some(&"address"))
+                | ("i", Some(&"f"))
+                | ("i", Some(&"l"))
+                | ("i", Some(&"a"))
+        );
+
+        if !is_info_cmd {
+            return None;
+        }
+
+        // Check if last part could be start of "verbose"
+        let last_part = parts.last()?;
+
+        // If it already says "verbose" or "v", no completion needed
+        if *last_part == "verbose" || *last_part == "v" {
+            return None;
+        }
+
+        // Check if last part is a prefix of "verbose" or is "v"
+        if "verbose".starts_with(last_part) && last_part.len() < "verbose".len() {
+            // Calculate how much of "verbose" remains to be completed
+            let remaining = &"verbose"[last_part.len()..];
+            return Some(remaining.to_string());
+        }
+
+        None
     }
 
     /// Find the longest common prefix among multiple command matches
@@ -856,25 +906,16 @@ impl CommandParser {
         }
 
         // Handle info function command
-        if command.starts_with("info function ") {
-            let target = command
-                .strip_prefix("info function ")
-                .unwrap()
-                .trim()
-                .to_string();
-            if !target.is_empty() {
-                state.input_state = InputState::WaitingResponse {
-                    command: command.to_string(),
-                    sent_time: Instant::now(),
-                    command_type: CommandType::InfoFunction {
-                        target: target.clone(),
-                    },
-                };
-                return Some(vec![Action::SendRuntimeCommand(
-                    RuntimeCommand::InfoFunction { target },
-                )]);
+        if command.starts_with("info function ") || command.starts_with("i f ") {
+            let args = if command.starts_with("info function ") {
+                command.strip_prefix("info function ").unwrap()
             } else {
-                let plain = "Usage: info function <function_name>".to_string();
+                command.strip_prefix("i f ").unwrap()
+            };
+
+            let parts: Vec<&str> = args.split_whitespace().collect();
+            if parts.is_empty() {
+                let plain = "Usage: info function <function_name> [verbose|v]".to_string();
                 let styled = Self::styled_usage(&plain);
                 return Some(vec![Action::AddResponseWithStyle {
                     content: plain,
@@ -882,28 +923,34 @@ impl CommandParser {
                     response_type: ResponseType::Error,
                 }]);
             }
+
+            let target = parts[0].to_string();
+            let verbose = parts.len() > 1 && (parts[1] == "verbose" || parts[1] == "v");
+
+            state.input_state = InputState::WaitingResponse {
+                command: command.to_string(),
+                sent_time: Instant::now(),
+                command_type: CommandType::InfoFunction {
+                    target: target.clone(),
+                    verbose,
+                },
+            };
+            return Some(vec![Action::SendRuntimeCommand(
+                RuntimeCommand::InfoFunction { target, verbose },
+            )]);
         }
 
         // Handle info line command
-        if command.starts_with("info line ") {
-            let target = command
-                .strip_prefix("info line ")
-                .unwrap()
-                .trim()
-                .to_string();
-            if !target.is_empty() {
-                state.input_state = InputState::WaitingResponse {
-                    command: command.to_string(),
-                    sent_time: Instant::now(),
-                    command_type: CommandType::InfoLine {
-                        target: target.clone(),
-                    },
-                };
-                return Some(vec![Action::SendRuntimeCommand(RuntimeCommand::InfoLine {
-                    target,
-                })]);
+        if command.starts_with("info line ") || command.starts_with("i l ") {
+            let args = if command.starts_with("info line ") {
+                command.strip_prefix("info line ").unwrap()
             } else {
-                let plain = "Usage: info line <file:line>".to_string();
+                command.strip_prefix("i l ").unwrap()
+            };
+
+            let parts: Vec<&str> = args.split_whitespace().collect();
+            if parts.is_empty() {
+                let plain = "Usage: info line <file:line> [verbose|v]".to_string();
                 let styled = Self::styled_usage(&plain);
                 return Some(vec![Action::AddResponseWithStyle {
                     content: plain,
@@ -911,10 +958,26 @@ impl CommandParser {
                     response_type: ResponseType::Error,
                 }]);
             }
+
+            let target = parts[0].to_string();
+            let verbose = parts.len() > 1 && (parts[1] == "verbose" || parts[1] == "v");
+
+            state.input_state = InputState::WaitingResponse {
+                command: command.to_string(),
+                sent_time: Instant::now(),
+                command_type: CommandType::InfoLine {
+                    target: target.clone(),
+                    verbose,
+                },
+            };
+            return Some(vec![Action::SendRuntimeCommand(RuntimeCommand::InfoLine {
+                target,
+                verbose,
+            })]);
         }
 
         // Handle info address command (TODO)
-        if command.starts_with("info address ") {
+        if command.starts_with("info address ") || command.starts_with("i a ") {
             let plain = "TODO: info address command not implemented yet".to_string();
             let styled = vec![
                 crate::components::command_panel::style_builder::StyledLineBuilder::new()
@@ -1353,74 +1416,6 @@ impl CommandParser {
                     response_type: ResponseType::Error,
                 }]);
             }
-        }
-
-        // Handle "i f <name>" -> "info function <name>"
-        if command.starts_with("i f ") {
-            let target = command.strip_prefix("i f ").unwrap().trim().to_string();
-            if !target.is_empty() {
-                state.input_state = InputState::WaitingResponse {
-                    command: format!("info function {target}"),
-                    sent_time: Instant::now(),
-                    command_type: CommandType::InfoFunction {
-                        target: target.clone(),
-                    },
-                };
-                return Some(vec![Action::SendRuntimeCommand(
-                    RuntimeCommand::InfoFunction { target },
-                )]);
-            } else {
-                let plain = "Usage: i f <function_name> (or 'i f' for file info)".to_string();
-                let styled = Self::styled_usage(&plain);
-                return Some(vec![Action::AddResponseWithStyle {
-                    content: plain,
-                    styled_lines: Some(styled),
-                    response_type: ResponseType::Error,
-                }]);
-            }
-        }
-
-        // Handle "i l <target>" -> "info line <target>"
-        if command.starts_with("i l ") {
-            let target = command.strip_prefix("i l ").unwrap().trim().to_string();
-            if !target.is_empty() {
-                state.input_state = InputState::WaitingResponse {
-                    command: format!("info line {target}"),
-                    sent_time: Instant::now(),
-                    command_type: CommandType::InfoLine {
-                        target: target.clone(),
-                    },
-                };
-                return Some(vec![Action::SendRuntimeCommand(RuntimeCommand::InfoLine {
-                    target,
-                })]);
-            } else {
-                let plain = "Usage: i l <file:line>".to_string();
-                let styled = Self::styled_usage(&plain);
-                return Some(vec![Action::AddResponseWithStyle {
-                    content: plain,
-                    styled_lines: Some(styled),
-                    response_type: ResponseType::Error,
-                }]);
-            }
-        }
-
-        // Handle "i a <target>" -> "info address <target>" (TODO)
-        if command.starts_with("i a ") {
-            let plain = "TODO: i a (info address) command not implemented yet".to_string();
-            let styled = vec![
-                crate::components::command_panel::style_builder::StyledLineBuilder::new()
-                    .styled(
-                        plain.clone(),
-                        crate::components::command_panel::style_builder::StylePresets::WARNING,
-                    )
-                    .build(),
-            ];
-            return Some(vec![Action::AddResponseWithStyle {
-                content: plain,
-                styled_lines: Some(styled),
-                response_type: ResponseType::Error,
-            }]);
         }
 
         None

@@ -220,14 +220,14 @@ async fn run_runtime_coordinator(
                     RuntimeCommand::DeleteAllTraces => {
                         trace_handlers::handle_delete_all_traces(&mut session, &mut runtime_channels).await;
                     }
-                    RuntimeCommand::InfoFunction { target } => {
-                        info_handlers::handle_info_function(&mut session, &mut runtime_channels, target).await;
+                    RuntimeCommand::InfoFunction { target, verbose } => {
+                        info_handlers::handle_info_function(&mut session, &mut runtime_channels, target, verbose).await;
                     }
-                    RuntimeCommand::InfoLine { target } => {
-                        info_handlers::handle_info_line(&mut session, &mut runtime_channels, target).await;
+                    RuntimeCommand::InfoLine { target, verbose } => {
+                        info_handlers::handle_info_line(&mut session, &mut runtime_channels, target, verbose).await;
                     }
-                    RuntimeCommand::InfoAddress { target } => {
-                        info_handlers::handle_info_address(&mut session, &mut runtime_channels, target).await;
+                    RuntimeCommand::InfoAddress { target, verbose } => {
+                        info_handlers::handle_info_address(&mut session, &mut runtime_channels, target, verbose).await;
                     }
                     RuntimeCommand::SaveTraces { filename, filter } => {
                         if let Some(ref session) = session {
