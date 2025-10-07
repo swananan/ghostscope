@@ -558,6 +558,11 @@ impl SourceNavigation {
         state.horizontal_scroll_offset = 0;
     }
 
+    /// Public method to display error message in source panel (for initialization errors)
+    pub fn show_error_message(state: &mut SourcePanelState, error_message: String) {
+        Self::show_error(state, "(no file)", error_message);
+    }
+
     /// Detect programming language from file extension
     fn detect_language(file_path: &str) -> String {
         if let Some(extension) = file_path.rsplit('.').next() {
