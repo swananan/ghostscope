@@ -5,6 +5,7 @@ use inkwell::context::Context;
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::path::Path;
 use tracing::{debug, error, info, warn};
 
 /// Resolved target information from DWARF queries
@@ -214,6 +215,109 @@ impl<'a> AstCompiler<'a> {
         })
     }
 
+    /// Build a detailed error message for SourceLine resolution failures
+    fn describe_source_line_failure(&mut self, file_path: &str, line_number: u32) -> String {
+        let default_msg = format!(
+            "No addresses resolved for source line {}:{}",
+            file_path, line_number
+        );
+
+        let analyzer = match &mut self.process_analyzer {
+            Some(a) => a,
+            None => return default_msg,
+        };
+
+        let grouped = match analyzer.get_grouped_file_info_by_module() {
+            Ok(g) => g,
+            Err(_) => return default_msg,
+        };
+
+        // Collect all full paths and those sharing the basename
+        let mut all_full_paths: Vec<String> = Vec::new();
+        let mut same_basename_paths: Vec<String> = Vec::new();
+        let has_sep = file_path.contains('/') || file_path.contains('\\');
+        let basename = Path::new(file_path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(file_path);
+
+        for (_module, files) in &grouped {
+            for f in files {
+                all_full_paths.push(f.full_path.clone());
+                if f.basename == basename {
+                    same_basename_paths.push(f.full_path.clone());
+                }
+            }
+        }
+
+        if all_full_paths.is_empty() {
+            return default_msg;
+        }
+
+        let exact_match = all_full_paths.iter().any(|p| p == file_path);
+        let suffix_matches: Vec<String> = all_full_paths
+            .iter()
+            .filter(|p| p.ends_with(file_path) || file_path.ends_with(p.as_str()))
+            .cloned()
+            .collect();
+
+        if same_basename_paths.is_empty() {
+            return format!(
+                "Source file not found in DWARF: {}.\n- Tips: use 'srcpath map <dwf_comp_dir> <local_dir>' or pass full DWARF path.\n- List files with: dwarf-tool source-files or 'info source-files'",
+                file_path
+            );
+        }
+
+        if !exact_match && suffix_matches.is_empty() && has_sep && same_basename_paths.len() > 1 {
+            let mut samples = same_basename_paths.clone();
+            samples.sort();
+            samples.dedup();
+            if samples.len() > 3 {
+                samples.truncate(3);
+            }
+            let sample_list = samples.join("\n  - ");
+            return format!(
+                "Multiple files named '{}' found; the given path '{}' did not uniquely match by suffix.\nTry a more specific path or add a path mapping (srcpath map).\nExamples:\n  - {}",
+                basename, file_path, sample_list
+            );
+        }
+
+        // Probe a few candidate paths to see if any has addresses on this line
+        let mut hit_candidates: Vec<String> = Vec::new();
+        let probe_list: Vec<String> = if !suffix_matches.is_empty() {
+            suffix_matches
+        } else {
+            let mut v = same_basename_paths.clone();
+            v.sort();
+            v.dedup();
+            v.truncate(20);
+            v
+        };
+
+        for cand in &probe_list {
+            let addrs = analyzer.lookup_addresses_by_source_line(cand, line_number);
+            if !addrs.is_empty() {
+                hit_candidates.push(cand.clone());
+                if hit_candidates.len() >= 3 {
+                    break;
+                }
+            }
+        }
+
+        if !hit_candidates.is_empty() {
+            let list = hit_candidates.join("\n  - ");
+            return format!(
+                "Ambiguous path: '{}' did not resolve, but found addresses for the same line in:\n  - {}\nPlease use a more specific path (full DWARF path) or add a mapping (srcpath map).",
+                file_path, list
+            );
+        }
+
+        format!(
+            "No executable addresses for {}:{} (file exists in DWARF but this line has no statement).\nTry a nearby line, or rebuild with debug info and lower optimization (e.g., -g -O0).",
+            file_path, line_number
+        )
+    }
+
     /// Process a trace point: resolve target + generate eBPF in one step
     fn process_trace_point(
         &mut self,
@@ -235,11 +339,8 @@ impl<'a> AstCompiler<'a> {
                 };
 
                 if module_addresses.is_empty() {
-                    // Strict behavior: fail this trace point immediately instead of skipping silently
-                    return Err(CompileError::Other(format!(
-                        "No addresses resolved for source line {}:{}",
-                        file_path, line_number
-                    )));
+                    let detailed = self.describe_source_line_failure(file_path, *line_number);
+                    return Err(CompileError::Other(detailed));
                 }
 
                 debug!(

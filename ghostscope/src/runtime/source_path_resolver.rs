@@ -206,6 +206,27 @@ impl SourcePathResolver {
             config_search_dir_count: self.config_search_dirs.len(),
         }
     }
+
+    /// Attempt to reverse-map a filesystem path back to the original DWARF path using substitutions.
+    /// This helps when users provide a local path (after srcpath map) but the DWARF lookup
+    /// requires the original compilation directory path. We only invert substitution rules; search
+    /// directories are not invertible.
+    pub fn reverse_map_to_dwarf(&self, fs_path: &str) -> Option<String> {
+        // Try runtime substitutions first, then config substitutions (mirror forward priority)
+        for sub in self
+            .runtime_substitutions
+            .iter()
+            .chain(self.config_substitutions.iter())
+        {
+            if let Some(suffix) = fs_path.strip_prefix(&sub.to) {
+                // Boundary check: suffix must be empty or start with path separator
+                if suffix.is_empty() || suffix.starts_with('/') {
+                    return Some(format!("{}{}", sub.from, suffix));
+                }
+            }
+        }
+        None
+    }
 }
 
 /// Apply substitutions to directory path only (for info source)

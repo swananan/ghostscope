@@ -356,7 +356,71 @@ fn try_get_line_debug_info(
         .as_mut()
         .ok_or_else(|| "Debug information not available. DWARF symbols may not be loaded or initialization failed.".to_string())?;
 
-    handle_source_location_target(process_analyzer, target)
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    // Parse original input once
+    let (orig_file, line_part) = target.rsplit_once(':').ok_or_else(|| {
+        format!(
+            "Invalid target format '{}'. Expected format: file:line",
+            target
+        )
+    })?;
+    let line_number = line_part
+        .parse::<u32>()
+        .map_err(|_| format!("Invalid line number '{}' in target '{}'", line_part, target))?;
+
+    // Build candidate DWARF file paths in priority order
+    let mut candidates: Vec<String> = Vec::new();
+
+    // 1) Reverse-map absolute local paths to DWARF paths (if applicable)
+    if let Some(dwarf_path) = session.source_path_resolver.reverse_map_to_dwarf(orig_file) {
+        candidates.push(dwarf_path);
+    }
+
+    // 2) If user provided a relative path, combine with each substitution's 'from' (DWARF comp_dir)
+    if !orig_file.starts_with('/') {
+        let rules = session.source_path_resolver.get_all_rules();
+        for sub in rules.substitutions {
+            let joined = PathBuf::from(&sub.from).join(orig_file);
+            candidates.push(joined.to_string_lossy().to_string());
+        }
+
+        // 2b) Also combine with all DWARF-reported directories (comp_dir) from analyzer's file index
+        if let Ok(grouped) = process_analyzer.get_grouped_file_info_by_module() {
+            for (_module_path, files) in grouped {
+                for f in files {
+                    let joined = PathBuf::from(&f.directory).join(orig_file);
+                    candidates.push(joined.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+
+    // 3) Always try original input (might already be full DWARF path)
+    candidates.push(orig_file.to_string());
+
+    // Deduplicate while preserving order
+    let mut seen = HashSet::new();
+    candidates.retain(|c| seen.insert(c.clone()));
+
+    // Probe candidates until we find addresses
+    for cand in &candidates {
+        let addrs = process_analyzer.lookup_addresses_by_source_line(cand, line_number);
+        if !addrs.is_empty() {
+            let cand_target = format!("{cand}:{line_number}");
+            return handle_source_location_target(process_analyzer, &cand_target);
+        }
+    }
+
+    // Fallback to previous behavior (with reverse-map if available)
+    let final_target =
+        if let Some(dwarf_path) = session.source_path_resolver.reverse_map_to_dwarf(orig_file) {
+            format!("{dwarf_path}:{line_number}")
+        } else {
+            target.to_string()
+        };
+    handle_source_location_target(process_analyzer, &final_target)
 }
 
 /// Process module addresses and extract variable information
