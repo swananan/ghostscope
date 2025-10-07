@@ -529,6 +529,109 @@ impl CommandPanelState {
         self.cached_panel_width = width;
     }
 
+    /// Reflow command-mode cursor after width changes to keep it within valid bounds
+    pub fn reflow_command_cursor_after_width_change(&mut self) {
+        if self.mode != InteractionMode::Command {
+            return;
+        }
+
+        let wrapped = self.get_command_mode_wrapped_lines(self.cached_panel_width);
+        if wrapped.is_empty() {
+            self.command_cursor_line = 0;
+            self.command_cursor_column = 0;
+            return;
+        }
+
+        if self.command_cursor_line >= wrapped.len() {
+            self.command_cursor_line = wrapped.len().saturating_sub(1);
+        }
+
+        // Clamp cursor column to the current line's length (unicode-aware by chars)
+        let line_len = wrapped[self.command_cursor_line].chars().count();
+        if self.command_cursor_column > line_len {
+            self.command_cursor_column = line_len;
+        }
+    }
+
+    /// Remap command-mode cursor from old wrapped coordinates to new width-aware coordinates
+    pub fn remap_command_cursor_on_width_change(&mut self, old_width: u16, new_width: u16) {
+        if self.mode != InteractionMode::Command {
+            return;
+        }
+
+        // Build mapping from wrapped (old) to logical (line index + char offset)
+        let logical_lines = self.get_command_mode_lines();
+        if logical_lines.is_empty() {
+            self.command_cursor_line = 0;
+            self.command_cursor_column = 0;
+            return;
+        }
+
+        // Find which logical line the current wrapped cursor line falls into (under old width)
+        let mut acc_old = 0usize;
+        let mut target_logical_idx = 0usize;
+        let mut logical_char_offset = 0usize;
+        let mut found = false;
+
+        for (i, line) in logical_lines.iter().enumerate() {
+            let wraps_old = self.wrap_text_unicode(line, old_width);
+            let wrap_count = wraps_old.len();
+            if self.command_cursor_line < acc_old + wrap_count {
+                let within = self.command_cursor_line - acc_old;
+                // Sum lengths of previous wraps to get char offset, then add current column (clamped)
+                let offset: usize = wraps_old
+                    .iter()
+                    .take(within)
+                    .map(|s| s.chars().count())
+                    .sum();
+                let this_len = wraps_old[within].chars().count();
+                let col = self.command_cursor_column.min(this_len);
+                logical_char_offset = offset + col;
+                target_logical_idx = i;
+                found = true;
+                break;
+            }
+            acc_old += wrap_count;
+        }
+
+        if !found {
+            // Fallback to simple clamp with new width
+            self.cached_panel_width = new_width;
+            self.reflow_command_cursor_after_width_change();
+            return;
+        }
+
+        // Map back into wrapped coordinates under the new width
+        let mut acc_new = 0usize;
+        for (i, line) in logical_lines.iter().enumerate() {
+            let wraps_new = self.wrap_text_unicode(line, new_width);
+            if i == target_logical_idx {
+                let mut remaining = logical_char_offset;
+                let mut widx = 0usize;
+                while widx < wraps_new.len() {
+                    let seg_len = wraps_new[widx].chars().count();
+                    if remaining <= seg_len {
+                        self.command_cursor_line = acc_new + widx;
+                        self.command_cursor_column = remaining.min(seg_len);
+                        break;
+                    }
+                    remaining -= seg_len;
+                    widx += 1;
+                }
+
+                if widx >= wraps_new.len() {
+                    // Place at end of logical line if offset exceeds
+                    self.command_cursor_line = acc_new + wraps_new.len().saturating_sub(1);
+                    self.command_cursor_column =
+                        wraps_new.last().map(|s| s.chars().count()).unwrap_or(0);
+                }
+                break;
+            } else {
+                acc_new += wraps_new.len();
+            }
+        }
+    }
+
     /// Clean up file completion cache if unused for too long
     pub fn cleanup_file_completion_cache(&mut self) {
         if let Some(cache) = &self.file_completion_cache {

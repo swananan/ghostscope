@@ -2023,7 +2023,15 @@ impl App {
     /// Draw command panel
     fn draw_command_panel(f: &mut Frame, area: Rect, state: &mut AppState) {
         // Cache panel width for navigation calculations
+        let old_width = state.command_panel.cached_panel_width;
         state.command_panel_width = area.width.saturating_sub(2); // Subtract borders
+
+        // Remap command cursor from old wraps to new wraps (before updating cached width)
+        state
+            .command_panel
+            .remap_command_cursor_on_width_change(old_width, state.command_panel_width);
+
+        // Update cached width afterward to keep state consistent
         state
             .command_panel
             .update_panel_width(state.command_panel_width);
