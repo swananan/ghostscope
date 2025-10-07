@@ -2155,6 +2155,12 @@ impl App {
             RuntimeStatus::SourceCodeLoadFailed(error) => {
                 self.state
                     .set_loading_state(LoadingState::Failed(error.clone()));
+
+                // Also display the error in the source panel
+                crate::components::source_panel::SourceNavigation::show_error_message(
+                    &mut self.state.source_panel,
+                    error.clone(),
+                );
             }
             _ => {
                 // For other status messages, if we're still initializing, move to connecting state

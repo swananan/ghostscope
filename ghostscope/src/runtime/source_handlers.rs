@@ -33,20 +33,17 @@ fn try_get_main_source_info(session: &mut Option<GhostSession>) -> Result<Source
         .as_mut()
         .ok_or("Process analyzer not available. Try reloading the process.")?;
 
-    let module_address = process_analyzer
-        .lookup_function_address_by_name("main")
-        .ok_or(
-            "Main function not found in any loaded module. Ensure the binary has debug symbols.",
-        )?;
+    // Try to find main function first
+    let module_address_opt = process_analyzer.lookup_function_address_by_name("main");
 
-    info!(
-        "Found main function at address 0x{:x} in module: {}",
-        module_address.address,
-        module_address.module_display()
-    );
+    if let Some(addr) = module_address_opt {
+        info!(
+            "Found main function at address 0x{:x} in module: {}",
+            addr.address,
+            addr.module_display()
+        );
 
-    match process_analyzer.lookup_source_location(&module_address) {
-        Some(source_location) => {
+        if let Some(source_location) = process_analyzer.lookup_source_location(&addr) {
             info!(
                 "Main function source location (DWARF): {}:{}",
                 source_location.file_path, source_location.line_number
@@ -64,19 +61,120 @@ fn try_get_main_source_info(session: &mut Option<GhostSession>) -> Result<Source
                 resolved_path.display()
             );
 
-            Ok(SourceCodeInfo {
+            return Ok(SourceCodeInfo {
                 file_path: resolved_path.to_string_lossy().to_string(),
                 current_line: Some(source_location.line_number as usize),
-            })
-        }
-        None => {
-            info!("No source location available for main function, using module info");
-            Ok(SourceCodeInfo {
-                file_path: format!("main function found in {}", module_address.module_display()),
-                current_line: Some(1),
-            })
+            });
         }
     }
+
+    // Main not found or has no source, try fallback
+    info!("Main function not found or has no source info, trying fallback");
+
+    // Try to find any function with source location
+    if let Some(module_address) = try_find_any_function_with_source(process_analyzer) {
+        if let Some(source_location) = process_analyzer.lookup_source_location(&module_address) {
+            info!(
+                "Fallback function source location (DWARF): {}:{}",
+                source_location.file_path, source_location.line_number
+            );
+
+            let resolved_path = session
+                .source_path_resolver
+                .resolve(&source_location.file_path)
+                .unwrap_or_else(|| std::path::PathBuf::from(&source_location.file_path));
+
+            return Ok(SourceCodeInfo {
+                file_path: resolved_path.to_string_lossy().to_string(),
+                current_line: Some(source_location.line_number as usize),
+            });
+        }
+    }
+
+    // Last resort: if we have any file info at all, just show the first file
+    if let Ok(grouped) = process_analyzer.get_grouped_file_info_by_module() {
+        for (_module_path, files) in grouped {
+            if let Some(file) = files.first() {
+                let full_path = format!("{}/{}", file.directory, file.basename);
+                info!(
+                    "Last resort fallback: using first available file: {}",
+                    full_path
+                );
+
+                let resolved_path = session
+                    .source_path_resolver
+                    .resolve(&full_path)
+                    .unwrap_or_else(|| std::path::PathBuf::from(&full_path));
+
+                return Ok(SourceCodeInfo {
+                    file_path: resolved_path.to_string_lossy().to_string(),
+                    current_line: Some(1),
+                });
+            }
+        }
+    }
+
+    // Absolutely no source information available
+    Err(
+        "No source code information available. This may be due to:\n\
+         1. Binary was compiled without debug symbols (-g flag)\n\
+         2. Using stripped binary without separate debug file\n\
+         3. Analyzing a library without entry point\n\
+         \n\
+         💡 Try: Recompile with debug symbols or load a binary with DWARF information"
+            .to_string(),
+    )
+}
+
+/// Try to find any function that has source location information
+/// Used as fallback when main function is not available
+fn try_find_any_function_with_source(
+    process_analyzer: &mut ghostscope_dwarf::DwarfAnalyzer,
+) -> Option<ghostscope_dwarf::ModuleAddress> {
+    // Try common entry point function names first
+    let common_entry_points = [
+        "_start", // C/C++ actual entry point
+        "__libc_start_main",
+        "start",    // Some languages
+        "_main",    // Alternative naming
+        "WinMain",  // Windows entry
+        "wWinMain", // Windows Unicode entry
+    ];
+
+    for name in &common_entry_points {
+        if let Some(addr) = process_analyzer.lookup_function_address_by_name(name) {
+            if process_analyzer.lookup_source_location(&addr).is_some() {
+                info!("Fallback: found {} with source info", name);
+                return Some(addr);
+            }
+        }
+    }
+
+    // If no common entry point found, try to get any function with source info
+    // Get all available functions from the file info
+    if let Ok(grouped) = process_analyzer.get_grouped_file_info_by_module() {
+        for (_module_path, files) in grouped {
+            if let Some(file) = files.first() {
+                // Try to find a function at the first line of the first file
+                let full_path = format!("{}/{}", file.directory, file.basename);
+
+                // Try to look up addresses for the first few lines (expanded range for libraries)
+                for line in 1..100 {
+                    let addrs = process_analyzer.lookup_addresses_by_source_line(&full_path, line);
+                    if let Some(addr) = addrs.first() {
+                        info!(
+                            "Fallback: using first available source location at {}:{}",
+                            full_path, line
+                        );
+                        return Some(addr.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    info!("Fallback: no address mapping with source information found");
+    None
 }
 
 /// Handle request source code - for compatibility with InfoSource command
