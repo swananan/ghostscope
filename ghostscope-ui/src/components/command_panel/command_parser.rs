@@ -1,6 +1,7 @@
 use crate::action::{Action, ResponseType, RuntimeCommand};
 use crate::model::panel_state::{CommandPanelState, CommandType, InputState};
 use crate::ui::strings::UIStrings;
+use ratatui::style::Modifier;
 use std::time::Instant;
 
 /// Handles command parsing and built-in command execution
@@ -11,10 +12,22 @@ impl CommandParser {
     pub fn parse_command(state: &mut CommandPanelState, command: &str) -> Vec<Action> {
         let cmd = command.trim();
 
-        // Handle built-in commands first
-        if let Some(response) = Self::handle_builtin_command(cmd) {
-            return vec![Action::AddResponse {
-                content: response,
+        // Handle built-in help commands with styled responses
+        if cmd == "help" {
+            let plain = Self::format_help_message();
+            let styled = Self::format_help_message_styled();
+            return vec![Action::AddResponseWithStyle {
+                content: plain,
+                styled_lines: Some(styled),
+                response_type: ResponseType::Info,
+            }];
+        }
+        if cmd == "help srcpath" {
+            let plain = Self::format_srcpath_help();
+            let styled = Self::format_srcpath_help_styled();
+            return vec![Action::AddResponseWithStyle {
+                content: plain,
+                styled_lines: Some(styled),
                 response_type: ResponseType::Info,
             }];
         }
@@ -74,25 +87,34 @@ impl CommandParser {
         if cmd == "clear" {
             // Clear command history
             state.command_history.clear();
-            return vec![Action::AddResponse {
-                content: "Command history cleared.".to_string(),
+            let plain = "✅ Command history cleared.".to_string();
+            let styled = vec![
+                crate::components::command_panel::style_builder::StyledLineBuilder::new()
+                    .styled(
+                        plain.clone(),
+                        crate::components::command_panel::style_builder::StylePresets::SUCCESS,
+                    )
+                    .build(),
+            ];
+            return vec![Action::AddResponseWithStyle {
+                content: plain,
+                styled_lines: Some(styled),
                 response_type: ResponseType::Info,
             }];
         }
 
         // Unknown command
-        vec![Action::AddResponse {
-            content: format!("{} {}", UIStrings::ERROR_PREFIX, UIStrings::UNKNOWN_COMMAND),
-            response_type: ResponseType::Error,
-        }]
-    }
-
-    /// Handle built-in commands that don't require runtime communication
-    fn handle_builtin_command(command: &str) -> Option<String> {
-        match command {
-            "help" => Some(Self::format_help_message()),
-            "help srcpath" => Some(Self::format_srcpath_help()),
-            _ => None,
+        {
+            let plain = format!("{} {}", UIStrings::ERROR_PREFIX, UIStrings::UNKNOWN_COMMAND);
+            let styled =
+                crate::components::command_panel::ResponseFormatter::style_generic_message_lines(
+                    &plain,
+                );
+            vec![Action::AddResponseWithStyle {
+                content: plain,
+                styled_lines: Some(styled),
+                response_type: ResponseType::Error,
+            }]
         }
     }
 
@@ -148,6 +170,302 @@ impl CommandParser {
             Self::format_navigation_commands(),
             Self::format_general_commands()
         )
+    }
+
+    /// Styled comprehensive help message
+    fn format_help_message_styled() -> Vec<ratatui::text::Line<'static>> {
+        use crate::components::command_panel::style_builder::StyledLineBuilder;
+        use ratatui::text::Line;
+
+        let mut lines = Vec::new();
+        // Title
+        lines.push(
+            StyledLineBuilder::new()
+                .title("📘 Ghostscope Commands:")
+                .build(),
+        );
+        lines.push(Line::from(""));
+
+        // Sections
+        lines.extend(Self::format_section_styled(&Self::format_tracing_commands()));
+        lines.push(Line::from(""));
+        lines.extend(Self::format_section_styled(&Self::format_info_commands()));
+        lines.push(Line::from(""));
+        lines.extend(Self::format_section_styled(&Self::format_srcpath_commands()));
+        lines.push(Line::from(""));
+        lines.extend(Self::format_section_styled(&Self::format_control_commands()));
+        lines.push(Line::from(""));
+        lines.extend(Self::format_section_styled(
+            &Self::format_navigation_commands(),
+        ));
+        lines.push(Line::from(""));
+        lines.extend(Self::format_section_styled(&Self::format_general_commands()));
+        lines
+    }
+
+    /// Helper: format a single help section's text into styled lines
+    fn format_section_styled(section_text: &str) -> Vec<ratatui::text::Line<'static>> {
+        use crate::components::command_panel::style_builder::{StylePresets, StyledLineBuilder};
+        let mut out = Vec::new();
+        for raw in section_text.lines() {
+            if raw.is_empty() {
+                out.push(ratatui::text::Line::from(""));
+                continue;
+            }
+            if matches!(
+                raw.chars().next(),
+                Some('📊' | '🔍' | '🗂' | '⚙' | '🧭' | '🔧')
+            ) {
+                out.push(
+                    StyledLineBuilder::new()
+                        .styled(raw, StylePresets::SECTION)
+                        .build(),
+                );
+                continue;
+            }
+            if raw.starts_with("  ") {
+                out.push(Self::build_help_command_line(raw));
+                continue;
+            }
+            if raw.contains("💡") {
+                out.push(
+                    StyledLineBuilder::new()
+                        .styled(raw, StylePresets::TIP)
+                        .build(),
+                );
+                continue;
+            }
+            out.push(StyledLineBuilder::new().value(raw).build());
+        }
+        out
+    }
+
+    /// Styled srcpath detailed help
+    fn format_srcpath_help_styled() -> Vec<ratatui::text::Line<'static>> {
+        use crate::components::command_panel::style_builder::{StylePresets, StyledLineBuilder};
+        use ratatui::text::Line;
+
+        let mut lines = Vec::new();
+        lines.push(
+            StyledLineBuilder::new()
+                .title("📘 Source Path Command - Detailed Help")
+                .build(),
+        );
+        lines.push(Line::from(""));
+
+        for raw in Self::format_srcpath_help().lines() {
+            if raw.is_empty() {
+                lines.push(Line::from(""));
+                continue;
+            }
+            if raw.starts_with("📘") {
+                continue; // already handled as title
+            }
+            if matches!(
+                raw,
+                "Commands:"
+                    | "Resolution Strategy:"
+                    | "⭐ Recommended Usage:"
+                    | "Examples:"
+                    | "Configuration:"
+            ) {
+                lines.push(
+                    StyledLineBuilder::new()
+                        .styled(raw, StylePresets::SECTION)
+                        .build(),
+                );
+                continue;
+            }
+            if raw.starts_with("  ") {
+                lines.push(Self::build_help_command_line(raw));
+                continue;
+            }
+            if raw.contains("💡") {
+                lines.push(
+                    StyledLineBuilder::new()
+                        .styled(raw, StylePresets::TIP)
+                        .build(),
+                );
+                continue;
+            }
+            lines.push(StyledLineBuilder::new().value(raw).build());
+        }
+
+        lines
+    }
+
+    /// Styled info help (info commands usage)
+    fn format_info_help_styled() -> Vec<ratatui::text::Line<'static>> {
+        use crate::components::command_panel::style_builder::{StylePresets, StyledLineBuilder};
+        let mut lines = Vec::new();
+        for raw in Self::format_info_help().lines() {
+            if raw.is_empty() {
+                lines.push(ratatui::text::Line::from(""));
+                continue;
+            }
+            if raw.starts_with("🔍 Info") {
+                lines.push(StyledLineBuilder::new().title(raw).build());
+                continue;
+            }
+            if raw.starts_with("  ") {
+                lines.push(Self::build_help_command_line(raw));
+                continue;
+            }
+            if raw.contains("💡") {
+                lines.push(
+                    StyledLineBuilder::new()
+                        .styled(raw, StylePresets::TIP)
+                        .build(),
+                );
+                continue;
+            }
+            lines.push(StyledLineBuilder::new().value(raw).build());
+        }
+        lines
+    }
+
+    /// Helper: convert a single help command line into styled spans
+    fn build_help_command_line(line: &str) -> ratatui::text::Line<'static> {
+        use ratatui::{
+            style::{Color, Style},
+            text::{Line, Span},
+        };
+
+        // Preserve leading spaces
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let trimmed = line.trim_start();
+        let leading = line.len() - trimmed.len();
+        if leading > 0 {
+            spans.push(Span::raw(" ".repeat(leading)));
+        }
+
+        // Split into command part and description
+        let (cmd_part, desc_part) = match trimmed.find(" - ") {
+            Some(pos) => (&trimmed[..pos], Some(&trimmed[pos..])),
+            None => (trimmed, None),
+        };
+
+        // Walk cmd_part and style parameters in <...> as Yellow, others as White+Bold
+        let mut current = String::new();
+        let mut in_param = false;
+        for ch in cmd_part.chars() {
+            match ch {
+                '<' => {
+                    if !current.is_empty() {
+                        spans.push(Span::styled(
+                            current.clone(),
+                            Style::default()
+                                .fg(Color::White)
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                        current.clear();
+                    }
+                    in_param = true;
+                    current.push('<');
+                }
+                '>' => {
+                    current.push('>');
+                    spans.push(Span::styled(
+                        current.clone(),
+                        Style::default().fg(Color::Yellow),
+                    ));
+                    current.clear();
+                    in_param = false;
+                }
+                _ => current.push(ch),
+            }
+        }
+        if !current.is_empty() {
+            if in_param {
+                spans.push(Span::styled(current, Style::default().fg(Color::Yellow)));
+            } else {
+                spans.push(Span::styled(
+                    current,
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+        }
+
+        // Description part in dark gray
+        if let Some(desc) = desc_part {
+            spans.push(Span::styled(
+                desc.to_string(),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+
+        Line::from(spans)
+    }
+
+    /// Styled 'Usage: ...' helper: highlights 'Usage:' and parameters in <...>
+    fn styled_usage(usage: &str) -> Vec<ratatui::text::Line<'static>> {
+        use ratatui::{
+            style::{Color, Style},
+            text::{Line, Span},
+        };
+
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let trimmed = usage.trim_start();
+        // Preserve indent if any
+        let leading = usage.len() - trimmed.len();
+        if leading > 0 {
+            spans.push(Span::raw(" ".repeat(leading)));
+        }
+
+        let prefix = "Usage:";
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            spans.push(Span::styled(
+                prefix.to_string(),
+                Style::default().fg(Color::Cyan),
+            ));
+            spans.push(Span::raw(" "));
+            // Highlight parameters between <...>
+            let mut current = String::new();
+            let mut in_param = false;
+            for ch in rest.chars() {
+                match ch {
+                    '<' => {
+                        if !current.is_empty() {
+                            spans.push(Span::styled(
+                                current.clone(),
+                                Style::default().fg(Color::White),
+                            ));
+                            current.clear();
+                        }
+                        in_param = true;
+                        current.push('<');
+                    }
+                    '>' => {
+                        current.push('>');
+                        spans.push(Span::styled(
+                            current.clone(),
+                            Style::default().fg(Color::Yellow),
+                        ));
+                        current.clear();
+                        in_param = false;
+                    }
+                    _ => current.push(ch),
+                }
+            }
+            if !current.is_empty() {
+                let style = if in_param {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                spans.push(Span::styled(current, style));
+            }
+        } else {
+            // No prefix, color whole line white
+            spans.push(Span::styled(
+                trimmed.to_string(),
+                Style::default().fg(Color::White),
+            ));
+        }
+
+        vec![Line::from(spans)]
     }
 
     /// Format tracing command section
@@ -413,8 +731,11 @@ impl CommandParser {
                 trace_id,
             ))]
         } else {
-            vec![Action::AddResponse {
-                content: "Usage: disable <trace_id|all>".to_string(),
+            let plain = "Usage: disable <trace_id|all>".to_string();
+            let styled = Self::styled_usage(&plain);
+            vec![Action::AddResponseWithStyle {
+                content: plain,
+                styled_lines: Some(styled),
                 response_type: ResponseType::Error,
             }]
         }
@@ -439,8 +760,11 @@ impl CommandParser {
                 trace_id,
             ))]
         } else {
-            vec![Action::AddResponse {
-                content: "Usage: enable <trace_id|all>".to_string(),
+            let plain = "Usage: enable <trace_id|all>".to_string();
+            let styled = Self::styled_usage(&plain);
+            vec![Action::AddResponseWithStyle {
+                content: plain,
+                styled_lines: Some(styled),
                 response_type: ResponseType::Error,
             }]
         }
@@ -465,8 +789,11 @@ impl CommandParser {
                 trace_id,
             ))]
         } else {
-            vec![Action::AddResponse {
-                content: "Usage: delete <trace_id|all>".to_string(),
+            let plain = "Usage: delete <trace_id|all>".to_string();
+            let styled = Self::styled_usage(&plain);
+            vec![Action::AddResponseWithStyle {
+                content: plain,
+                styled_lines: Some(styled),
                 response_type: ResponseType::Error,
             }]
         }
@@ -475,8 +802,9 @@ impl CommandParser {
     /// Parse info commands
     fn parse_info_command(state: &mut CommandPanelState, command: &str) -> Option<Vec<Action>> {
         if command == "info" {
-            return Some(vec![Action::AddResponse {
+            return Some(vec![Action::AddResponseWithStyle {
                 content: Self::format_info_help(),
+                styled_lines: Some(Self::format_info_help_styled()),
                 response_type: ResponseType::Info,
             }]);
         }
@@ -517,8 +845,11 @@ impl CommandParser {
             if let Ok(trace_id) = id_str.parse::<u32>() {
                 return Some(Self::parse_info_trace_command(state, Some(trace_id)));
             } else {
-                return Some(vec![Action::AddResponse {
-                    content: "Usage: info trace [trace_id]".to_string(),
+                let plain = "Usage: info trace [trace_id]".to_string();
+                let styled = Self::styled_usage(&plain);
+                return Some(vec![Action::AddResponseWithStyle {
+                    content: plain,
+                    styled_lines: Some(styled),
                     response_type: ResponseType::Error,
                 }]);
             }
@@ -543,8 +874,11 @@ impl CommandParser {
                     RuntimeCommand::InfoFunction { target },
                 )]);
             } else {
-                return Some(vec![Action::AddResponse {
-                    content: "Usage: info function <function_name>".to_string(),
+                let plain = "Usage: info function <function_name>".to_string();
+                let styled = Self::styled_usage(&plain);
+                return Some(vec![Action::AddResponseWithStyle {
+                    content: plain,
+                    styled_lines: Some(styled),
                     response_type: ResponseType::Error,
                 }]);
             }
@@ -569,8 +903,11 @@ impl CommandParser {
                     target,
                 })]);
             } else {
-                return Some(vec![Action::AddResponse {
-                    content: "Usage: info line <file:line>".to_string(),
+                let plain = "Usage: info line <file:line>".to_string();
+                let styled = Self::styled_usage(&plain);
+                return Some(vec![Action::AddResponseWithStyle {
+                    content: plain,
+                    styled_lines: Some(styled),
                     response_type: ResponseType::Error,
                 }]);
             }
@@ -578,9 +915,19 @@ impl CommandParser {
 
         // Handle info address command (TODO)
         if command.starts_with("info address ") {
-            return Some(vec![Action::AddResponse {
-                content: "TODO: info address command not implemented yet".to_string(),
-                response_type: ResponseType::Error,
+            let plain = "TODO: info address command not implemented yet".to_string();
+            let styled = vec![
+                crate::components::command_panel::style_builder::StyledLineBuilder::new()
+                    .styled(
+                        plain.clone(),
+                        crate::components::command_panel::style_builder::StylePresets::WARNING,
+                    )
+                    .build(),
+            ];
+            return Some(vec![Action::AddResponseWithStyle {
+                content: plain,
+                styled_lines: Some(styled),
+                response_type: ResponseType::Warning,
             }]);
         }
 
@@ -596,8 +943,11 @@ impl CommandParser {
         }
 
         if parts.len() < 2 {
-            return Some(vec![Action::AddResponse {
-                content: "Usage: save <traces|output|session> [filename]".to_string(),
+            let plain = "Usage: save <traces|output|session> [filename]".to_string();
+            let styled = Self::styled_usage(&plain);
+            return Some(vec![Action::AddResponseWithStyle {
+                content: plain,
+                styled_lines: Some(styled),
                 response_type: ResponseType::Error,
             }]);
         }
@@ -606,13 +956,24 @@ impl CommandParser {
             "traces" => Self::parse_save_traces_command(state, command),
             "output" => Self::parse_save_output_command(state, command),
             "session" => Self::parse_save_session_command(state, command),
-            _ => Some(vec![Action::AddResponse {
-                content: format!(
+            _ => {
+                Some(vec![{
+                    let plain = format!(
                     "Unknown save target: '{}'. Use 'save traces', 'save output', or 'save session'",
                     parts[1]
-                ),
-                response_type: ResponseType::Error,
-            }]),
+                );
+                    let styled = vec![
+                    crate::components::command_panel::style_builder::StyledLineBuilder::new()
+                        .styled(plain.clone(), crate::components::command_panel::style_builder::StylePresets::ERROR)
+                        .build(),
+                ];
+                    Action::AddResponseWithStyle {
+                        content: plain,
+                        styled_lines: Some(styled),
+                        response_type: ResponseType::Error,
+                    }
+                }])
+            }
         }
     }
 
@@ -682,8 +1043,11 @@ impl CommandParser {
         }
 
         if parts.len() < 2 {
-            return Some(vec![Action::AddResponse {
-                content: "Usage: stop <output|session>".to_string(),
+            let plain = "Usage: stop <output|session>".to_string();
+            let styled = Self::styled_usage(&plain);
+            return Some(vec![Action::AddResponseWithStyle {
+                content: plain,
+                styled_lines: Some(styled),
                 response_type: ResponseType::Error,
             }]);
         }
@@ -691,13 +1055,24 @@ impl CommandParser {
         match parts[1] {
             "output" => Some(vec![Action::StopSaveOutput]),
             "session" => Some(vec![Action::StopSaveSession]),
-            _ => Some(vec![Action::AddResponse {
-                content: format!(
-                    "Unknown stop target: '{}'. Use 'stop output' or 'stop session'",
-                    parts[1]
-                ),
-                response_type: ResponseType::Error,
-            }]),
+            _ => {
+                Some(vec![{
+                    let plain = format!(
+                        "Unknown stop target: '{}'. Use 'stop output' or 'stop session'",
+                        parts[1]
+                    );
+                    let styled = vec![
+                    crate::components::command_panel::style_builder::StyledLineBuilder::new()
+                        .styled(plain.clone(), crate::components::command_panel::style_builder::StylePresets::ERROR)
+                        .build(),
+                ];
+                    Action::AddResponseWithStyle {
+                        content: plain,
+                        styled_lines: Some(styled),
+                        response_type: ResponseType::Error,
+                    }
+                }])
+            }
         }
     }
 
@@ -759,10 +1134,21 @@ impl CommandParser {
                     },
                 )])
             }
-            Err(e) => Some(vec![Action::AddResponse {
-                content: format!("Failed to load {filename}: {e}"),
-                response_type: ResponseType::Error,
-            }]),
+            Err(e) => {
+                Some(vec![{
+                    let plain = format!("✗ Failed to load {filename}: {e}");
+                    let styled = vec![
+                    crate::components::command_panel::style_builder::StyledLineBuilder::new()
+                        .styled(plain.clone(), crate::components::command_panel::style_builder::StylePresets::ERROR)
+                        .build(),
+                ];
+                    Action::AddResponseWithStyle {
+                        content: plain,
+                        styled_lines: Some(styled),
+                        response_type: ResponseType::Error,
+                    }
+                }])
+            }
         }
     }
 
@@ -846,12 +1232,17 @@ impl CommandParser {
                     RuntimeCommand::SrcPathReset,
                 )])
             }
-            _ => Some(vec![Action::AddResponse {
-                content:
-                    "Usage: srcpath [add <dir> | map <from> <to> | remove <path> | clear | reset]"
-                        .to_string(),
-                response_type: ResponseType::Error,
-            }]),
+            _ => {
+                Some(vec![{
+                    let plain = "Usage: srcpath [add <dir> | map <from> <to> | remove <path> | clear | reset]".to_string();
+                    let styled = Self::styled_usage(&plain);
+                    Action::AddResponseWithStyle {
+                        content: plain,
+                        styled_lines: Some(styled),
+                        response_type: ResponseType::Error,
+                    }
+                }])
+            }
         }
     }
 
@@ -943,8 +1334,11 @@ impl CommandParser {
             if let Ok(trace_id) = id_str.parse::<u32>() {
                 return Some(Self::parse_info_trace_command(state, Some(trace_id)));
             } else {
-                return Some(vec![Action::AddResponse {
-                    content: "Usage: i t [trace_id]".to_string(),
+                let plain = "Usage: i t [trace_id]".to_string();
+                let styled = Self::styled_usage(&plain);
+                return Some(vec![Action::AddResponseWithStyle {
+                    content: plain,
+                    styled_lines: Some(styled),
                     response_type: ResponseType::Error,
                 }]);
             }
@@ -965,8 +1359,11 @@ impl CommandParser {
                     RuntimeCommand::InfoFunction { target },
                 )]);
             } else {
-                return Some(vec![Action::AddResponse {
-                    content: "Usage: i f <function_name> (or 'i f' for file info)".to_string(),
+                let plain = "Usage: i f <function_name> (or 'i f' for file info)".to_string();
+                let styled = Self::styled_usage(&plain);
+                return Some(vec![Action::AddResponseWithStyle {
+                    content: plain,
+                    styled_lines: Some(styled),
                     response_type: ResponseType::Error,
                 }]);
             }
@@ -987,8 +1384,11 @@ impl CommandParser {
                     target,
                 })]);
             } else {
-                return Some(vec![Action::AddResponse {
-                    content: "Usage: i l <file:line>".to_string(),
+                let plain = "Usage: i l <file:line>".to_string();
+                let styled = Self::styled_usage(&plain);
+                return Some(vec![Action::AddResponseWithStyle {
+                    content: plain,
+                    styled_lines: Some(styled),
                     response_type: ResponseType::Error,
                 }]);
             }

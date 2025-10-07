@@ -11,6 +11,11 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthChar;
 
+// Help message dynamic detection removed after pre-styled migration
+
+// Help styling handled upstream; no local emoji-based parsing
+// Info dynamic styling removed; titles are generated pre-styled upstream
+
 /// Parameter struct for format_executable_file_info to avoid too many function arguments
 pub struct ExecutableFileInfoDisplay<'a> {
     pub file_path: &'a str,
@@ -51,7 +56,162 @@ impl ResponseFormatter {
                 state.command_history.len()
             );
         }
-        // Note: Renderer will display command_history directly
+
+        // Update static_lines with pre-styled content for performance
+        Self::update_static_lines(state);
+    }
+
+    /// Create enhanced styled lines for generic messages.
+    /// - Leading symbols: ✓ (success), ✗ (error), ⚠ (warning)
+    /// - Numbers/hex addresses: Yellow
+    /// - Keywords (trace/function/line/file/pid/pc/enabled/disabled/deleted/saved/loaded): Cyan
+    /// - Error tokens (failed/error/unknown/not/found/cannot/missing): Red
+    pub fn style_generic_message_lines(text: &str) -> Vec<Line<'static>> {
+        text.lines().map(Self::style_generic_message_line).collect()
+    }
+
+    fn style_generic_message_line(line: &str) -> Line<'static> {
+        use crate::components::command_panel::style_builder::StylePresets;
+        use ratatui::style::{Color, Style};
+        use ratatui::text::Span;
+
+        if line.trim().is_empty() {
+            return Line::from("");
+        }
+
+        // Detect leading status after indentation
+        let trimmed = line.trim_start();
+        let indent_len = line.len() - trimmed.len();
+        let indent = &line[..indent_len];
+
+        if trimmed.starts_with('✗') {
+            // Replace leading ✗ with ❌ and paint whole line red
+            let mut without = &trimmed['✗'.len_utf8()..];
+            // Consume optional variation selector U+FE0F if present
+            if without.starts_with('\u{FE0F}') {
+                let vs = '\u{FE0F}'.len_utf8();
+                without = &without[vs..];
+            }
+            let replaced = format!("{}{}{}", indent, "❌", without);
+            return Line::from(Span::styled(replaced, StylePresets::ERROR));
+        }
+
+        // Otherwise, keep semantic token styling
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut rest = line;
+
+        // Leading symbol without trimming (✓/⚠)
+        if let Some(first) = rest.chars().next() {
+            let mut style = Style::default();
+            let mut consumed: Option<usize> = None;
+            let mut sym: Option<&str> = None;
+            match first {
+                '✓' => {
+                    style = StylePresets::SUCCESS;
+                    consumed = Some('✓'.len_utf8());
+                    sym = Some("✅");
+                }
+                '⚠' => {
+                    style = StylePresets::WARNING;
+                    consumed = Some('⚠'.len_utf8());
+                    sym = Some("⚠️");
+                }
+                _ => {}
+            }
+            if let Some(mut n) = consumed {
+                // Consume optional variation selector U+FE0F if present right after the symbol
+                if rest[n..].starts_with('\u{FE0F}') {
+                    n += '\u{FE0F}'.len_utf8();
+                }
+                let rendered = sym.unwrap_or("");
+                let rendered = if rendered.is_empty() {
+                    first.to_string()
+                } else {
+                    rendered.to_string()
+                };
+                spans.push(Span::styled(rendered, style));
+                rest = &rest[n..];
+            }
+        }
+
+        // Tokenize remaining by simple boundaries, preserving punctuation as separate tokens
+        let mut token = String::new();
+        for ch in rest.chars() {
+            let is_sep = ch.is_whitespace() || ",.:()[]{}".contains(ch);
+            if is_sep {
+                if !token.is_empty() {
+                    spans.push(Self::style_token(&token));
+                    token.clear();
+                }
+                if ch.is_whitespace() {
+                    spans.push(Span::raw(ch.to_string()));
+                } else {
+                    spans.push(Span::styled(
+                        ch.to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+            } else {
+                token.push(ch);
+            }
+        }
+        if !token.is_empty() {
+            spans.push(Self::style_token(&token));
+        }
+
+        Line::from(spans)
+    }
+
+    fn style_token(tok: &str) -> Span<'static> {
+        use ratatui::style::{Color, Style};
+        let lower = tok.to_ascii_lowercase();
+
+        // Hex or number
+        if tok.starts_with("0x") || tok.chars().all(|c| c.is_ascii_hexdigit()) && tok.len() > 1 {
+            return Span::styled(tok.to_string(), Style::default().fg(Color::Yellow));
+        }
+
+        // Keywords for structure
+        const KEYS: &[&str] = &[
+            "trace", "function", "line", "file", "pid", "pc", "saved", "loaded", "deleted",
+            "enabled", "disabled",
+        ];
+        if KEYS.iter().any(|k| lower == *k) {
+            return Span::styled(tok.to_string(), Style::default().fg(Color::Cyan));
+        }
+
+        // Error tokens
+        const ERR: &[&str] = &[
+            "failed", "error", "unknown", "not", "found", "cannot", "missing",
+        ];
+        if ERR.iter().any(|k| lower == *k) {
+            return Span::styled(tok.to_string(), Style::default().fg(Color::Red));
+        }
+
+        // Default
+        Span::styled(tok.to_string(), Style::default().fg(Color::White))
+    }
+
+    /// Add a response with pre-styled lines (preferred when available)
+    pub fn add_response_with_style(
+        state: &mut CommandPanelState,
+        content: String,
+        styled_lines: Option<Vec<Line<'static>>>,
+        response_type: ResponseType,
+    ) {
+        if let Some(last_item) = state.command_history.last_mut() {
+            last_item.response = Some(content);
+            last_item.response_styled = styled_lines;
+            last_item.response_type = Some(response_type);
+            tracing::debug!(
+                "add_response_with_style: Added styled response to command '{}'",
+                last_item.command
+            );
+        } else {
+            tracing::warn!("add_response_with_style: No command in history to attach response to!");
+        }
+
+        Self::update_static_lines(state);
     }
 
     // Removed add_welcome_message - now using direct styled approach
@@ -82,9 +242,21 @@ impl ResponseFormatter {
             });
 
             // Add response lines if they exist
-            if let Some(ref response) = item.response {
-                let response_lines = Self::split_response_lines(response);
-                for response_line in response_lines {
+            if let Some(ref styled) = item.response_styled {
+                // Preferred path: use pre-styled lines when available
+                for line in styled.iter() {
+                    let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                    state.static_lines.push(StaticTextLine {
+                        content: plain,
+                        line_type: LineType::Response,
+                        history_index: Some(index),
+                        response_type: item.response_type,
+                        styled_content: Some(line.clone()),
+                    });
+                }
+            } else if let Some(ref response) = item.response {
+                // Fallback path: plain only (all help/info are pre-styled upstream now)
+                for response_line in Self::split_response_lines(response) {
                     state.static_lines.push(StaticTextLine {
                         content: response_line,
                         line_type: LineType::Response,
@@ -104,6 +276,8 @@ impl ResponseFormatter {
     fn split_response_lines(response: &str) -> Vec<String> {
         response.lines().map(String::from).collect()
     }
+
+    // Removed: all dynamic help/info styling helpers (pre-styled upstream)
 
     /// Format a line for display with proper styling
     pub fn format_line_for_display(
@@ -370,6 +544,118 @@ impl ResponseFormatter {
         }
 
         response
+    }
+
+    /// Styled: Format file information display
+    pub fn format_file_info_styled(
+        groups: &[crate::events::SourceFileGroup],
+        use_ascii: bool,
+    ) -> Vec<Line<'static>> {
+        use crate::components::command_panel::style_builder::{StylePresets, StyledLineBuilder};
+        use std::collections::BTreeMap;
+
+        let total_files: usize = groups.iter().map(|g| g.files.len()).sum();
+        let mut lines = Vec::new();
+
+        // Title
+        lines.push(
+            StyledLineBuilder::new()
+                .title(format!(
+                    "{} ({} modules, {} files):",
+                    UIStrings::SOURCE_FILES_HEADER,
+                    groups.len(),
+                    total_files
+                ))
+                .build(),
+        );
+        lines.push(Line::from(""));
+
+        if groups.is_empty() {
+            lines.push(
+                StyledLineBuilder::new()
+                    .text("  ")
+                    .value(UIStrings::NO_SOURCE_FILES)
+                    .build(),
+            );
+            return lines;
+        }
+
+        for group in groups {
+            // Module path as section
+            lines.push(
+                StyledLineBuilder::new()
+                    .styled(format!("📦 {}", group.module_path), StylePresets::SECTION)
+                    .build(),
+            );
+
+            if group.files.is_empty() {
+                lines.push(
+                    StyledLineBuilder::new()
+                        .styled("   └─", StylePresets::TREE)
+                        .value("(no files)")
+                        .build(),
+                );
+                lines.push(Line::from(""));
+                continue;
+            }
+
+            // Group by directory (same logic as plain)
+            let mut dir_map: BTreeMap<String, Vec<&crate::events::SourceFileInfo>> =
+                BTreeMap::new();
+            for f in &group.files {
+                dir_map.entry(f.directory.clone()).or_default().push(f);
+            }
+
+            let dir_count = dir_map.len();
+            for (didx, (dir, files)) in dir_map.into_iter().enumerate() {
+                let last_dir = didx + 1 == dir_count;
+                let dir_prefix = if last_dir {
+                    if use_ascii {
+                        "   └-"
+                    } else {
+                        "   └─"
+                    }
+                } else if use_ascii {
+                    "   |-"
+                } else {
+                    "   ├─"
+                };
+
+                lines.push(
+                    StyledLineBuilder::new()
+                        .styled(dir_prefix, StylePresets::TREE)
+                        .text(" ")
+                        .key(&dir)
+                        .text(format!(" ({} files)", files.len()))
+                        .build(),
+                );
+
+                for (fidx, file) in files.iter().enumerate() {
+                    let last_file = fidx + 1 == files.len();
+                    let file_prefix = if last_dir {
+                        if last_file {
+                            "      └─"
+                        } else {
+                            "      ├─"
+                        }
+                    } else if last_file {
+                        "   │  └─"
+                    } else {
+                        "   │  ├─"
+                    };
+                    lines.push(
+                        StyledLineBuilder::new()
+                            .styled(file_prefix, StylePresets::TREE)
+                            .text(" ")
+                            .value(&file.path)
+                            .build(),
+                    );
+                }
+            }
+            lines.push(Line::from(""));
+        }
+
+        lines
     }
 
     /// Format file information in summary mode for large datasets
@@ -683,6 +969,244 @@ impl ResponseFormatter {
         response
     }
 
+    /// Styled shared library information (new)
+    pub fn format_shared_library_info_styled(
+        libraries: &[crate::events::SharedLibraryInfo],
+        _use_ascii: bool,
+    ) -> Vec<Line<'static>> {
+        use crate::components::command_panel::style_builder::{StylePresets, StyledLineBuilder};
+        let mut lines = Vec::new();
+        lines.push(
+            StyledLineBuilder::new()
+                .title(format!(
+                    "📚 {} ({})",
+                    UIStrings::SHARED_LIBRARIES_HEADER,
+                    libraries.len()
+                ))
+                .build(),
+        );
+        lines.push(Line::from(""));
+
+        if libraries.is_empty() {
+            lines.push(
+                StyledLineBuilder::new()
+                    .text("  ")
+                    .value(UIStrings::NO_SHARED_LIBRARIES)
+                    .build(),
+            );
+            return lines;
+        }
+
+        for lib in libraries {
+            let from_str = format!("0x{:016x}", lib.from_address);
+            let to_str = format!("0x{:016x}", lib.to_address);
+            let syms = if lib.symbols_read { "✅" } else { "❌" };
+            let dbg = if lib.debug_info_available {
+                "✅"
+            } else {
+                "❌"
+            };
+
+            let mut b = StyledLineBuilder::new().text("  ");
+            b = b
+                .text(from_str)
+                .text("  ")
+                .text(to_str)
+                .text("  ")
+                .key("sym:")
+                .text(" ")
+                .styled(
+                    syms,
+                    if lib.symbols_read {
+                        StylePresets::SUCCESS
+                    } else {
+                        StylePresets::ERROR
+                    },
+                )
+                .text("  ")
+                .key("dbg:")
+                .text(" ")
+                .styled(
+                    dbg,
+                    if lib.debug_info_available {
+                        StylePresets::SUCCESS
+                    } else {
+                        StylePresets::ERROR
+                    },
+                )
+                .text("  ")
+                .value(&lib.library_path);
+            lines.push(b.build());
+
+            if !lib.debug_info_available {
+                let library_name = lib
+                    .library_path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(lib.library_path.as_str());
+                lines.push(
+                    StyledLineBuilder::new()
+                        .text("  ")
+                        .styled(
+                            format!(
+                                "⚠️  Warning: {} {}",
+                                library_name,
+                                UIStrings::NO_DEBUG_INFO_WARNING
+                            ),
+                            StylePresets::WARNING,
+                        )
+                        .build(),
+                );
+            }
+
+            if let Some(ref debug_path) = lib.debug_file_path {
+                lines.push(
+                    StyledLineBuilder::new()
+                        .text("    ")
+                        .key("Debug file:")
+                        .text(" ")
+                        .value(debug_path)
+                        .build(),
+                );
+            }
+        }
+
+        lines
+    }
+
+    /// Styled executable file information (new)
+    pub fn format_executable_file_info_styled(
+        info: &ExecutableFileInfoDisplay,
+    ) -> Vec<Line<'static>> {
+        use crate::components::command_panel::style_builder::{StylePresets, StyledLineBuilder};
+        let mut lines = vec![
+            StyledLineBuilder::new()
+                .title("📄 Executable File Information:")
+                .build(),
+            Line::from(""),
+        ];
+
+        lines.push(
+            StyledLineBuilder::new()
+                .text("  ")
+                .key("File:")
+                .text(" ")
+                .value(info.file_path)
+                .build(),
+        );
+        lines.push(
+            StyledLineBuilder::new()
+                .text("  ")
+                .key("Type:")
+                .text(" ")
+                .value(info.file_type)
+                .build(),
+        );
+        if let Some(entry) = info.entry_point {
+            lines.push(
+                StyledLineBuilder::new()
+                    .text("  ")
+                    .key("Entry point:")
+                    .text(" ")
+                    .address(entry)
+                    .build(),
+            );
+        }
+
+        lines.push(Line::from(""));
+
+        lines.push(
+            StyledLineBuilder::new()
+                .text("  ")
+                .key("Symbols:")
+                .text(" ")
+                .styled(
+                    if info.has_symbols {
+                        "✅ Available"
+                    } else {
+                        "❌ Not available"
+                    },
+                    if info.has_symbols {
+                        StylePresets::SUCCESS
+                    } else {
+                        StylePresets::ERROR
+                    },
+                )
+                .build(),
+        );
+
+        let mut dbg_line = StyledLineBuilder::new()
+            .text("  ")
+            .key("Debug info:")
+            .text(" ");
+        if info.has_debug_info {
+            dbg_line = dbg_line.styled("✅ Available", StylePresets::SUCCESS);
+            if let Some(ref dbg_path) = info.debug_file_path {
+                dbg_line = dbg_line
+                    .text(" (via debug link: ")
+                    .value(dbg_path)
+                    .text(")");
+            }
+        } else {
+            dbg_line = dbg_line.styled("❌ Not available", StylePresets::ERROR);
+        }
+        lines.push(dbg_line.build());
+
+        lines.push(Line::from(""));
+        let is_static_mode = info.mode_description.contains("Static analysis mode");
+        lines.push(
+            StyledLineBuilder::new()
+                .text("  ")
+                .styled(
+                    if is_static_mode {
+                        "Sections (ELF virtual addresses):"
+                    } else {
+                        "Sections (runtime loaded addresses):"
+                    },
+                    StylePresets::SECTION,
+                )
+                .build(),
+        );
+        if let Some(text) = info.text_section {
+            lines.push(
+                StyledLineBuilder::new()
+                    .text("    ")
+                    .key(".text:")
+                    .text("  ")
+                    .text(format!(
+                        "0x{:016x} - 0x{:016x}  (size: {} bytes)",
+                        text.start_address, text.end_address, text.size
+                    ))
+                    .build(),
+            );
+        }
+        if let Some(data) = info.data_section {
+            lines.push(
+                StyledLineBuilder::new()
+                    .text("    ")
+                    .key(".data:")
+                    .text("  ")
+                    .text(format!(
+                        "0x{:016x} - 0x{:016x}  (size: {} bytes)",
+                        data.start_address, data.end_address, data.size
+                    ))
+                    .build(),
+            );
+        }
+
+        lines.push(Line::from(""));
+        lines.push(
+            StyledLineBuilder::new()
+                .text("  ")
+                .key("Mode:")
+                .text(" ")
+                .value(info.mode_description)
+                .build(),
+        );
+
+        lines
+    }
+
     /// Render the command panel content
     pub fn render_panel(f: &mut Frame, area: Rect, state: &CommandPanelState) {
         // Calculate inner area (excluding borders)
@@ -732,3 +1256,5 @@ impl ResponseFormatter {
         f.render_widget(paragraph, inner_area);
     }
 }
+
+// Removed tests for dynamic help styling (now pre-styled upstream)

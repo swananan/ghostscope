@@ -56,9 +56,9 @@ impl UIStrings {
 
     // Error prefixes (keeping ASCII for better compatibility)
     pub const ERROR_PREFIX: &'static str = "✗";
-    pub const SUCCESS_PREFIX: &'static str = "✓";
-    pub const WARNING_PREFIX: &'static str = "⚠";
-    pub const INFO_PREFIX: &'static str = "ℹ";
+    pub const SUCCESS_PREFIX: &'static str = "✅";
+    pub const WARNING_PREFIX: &'static str = "⚠️";
+    pub const INFO_PREFIX: &'static str = "ℹ️";
     pub const PROGRESS_PREFIX: &'static str = "⏳";
 
     // ASCII alternatives for better compatibility

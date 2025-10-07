@@ -461,6 +461,7 @@ pub struct ScriptCache {
 pub struct CommandHistoryItem {
     pub command: String,
     pub response: Option<String>,
+    pub response_styled: Option<Vec<ratatui::text::Line<'static>>>,
     pub timestamp: std::time::Instant,
     pub prompt: String,
     pub response_type: Option<ResponseType>,
@@ -615,15 +616,8 @@ impl CommandPanelState {
 
     /// Get script start line offset in unified view
     fn get_script_start_line(&self) -> usize {
-        let mut offset = 0;
-
-        // Count history lines
-        for item in &self.command_history {
-            offset += 1; // Command line
-            if let Some(ref response) = item.response {
-                offset += response.lines().count();
-            }
-        }
+        // Use static_lines count (same as renderer) to ensure consistency
+        let mut offset = self.static_lines.len();
 
         offset += 3; // Header + separator + prompt
         offset
@@ -633,19 +627,9 @@ impl CommandPanelState {
     pub fn get_command_mode_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
 
-        // First, add static lines (including welcome messages)
+        // Use static_lines directly (same as renderer) to ensure consistency
         for static_line in &self.static_lines {
             lines.push(static_line.content.clone());
-        }
-
-        // Then add history lines
-        for item in &self.command_history {
-            lines.push(format!("(ghostscope) {}", item.command));
-            if let Some(ref response) = item.response {
-                for response_line in response.lines() {
-                    lines.push(response_line.to_string());
-                }
-            }
         }
 
         // Add current content based on mode
@@ -1019,6 +1003,41 @@ impl CommandPanelState {
     /// Add command to history when executed
     pub fn add_command_to_history(&mut self, command: &str) {
         self.command_history_manager.add_command(command);
+    }
+
+    /// Add command entry to both history manager and command_history, then update static_lines
+    /// This is the unified method for adding commands that ensures data consistency
+    pub fn add_command_entry(&mut self, command: &str) {
+        use std::time::Instant;
+
+        // Add to history manager (for Ctrl+R search)
+        self.command_history_manager.add_command(command);
+
+        // Add to command_history (for display)
+        let item = CommandHistoryItem {
+            command: command.to_string(),
+            response: None, // Will be filled when response arrives
+            response_styled: None,
+            timestamp: Instant::now(),
+            prompt: "(ghostscope) ".to_string(),
+            response_type: None,
+        };
+        self.command_history.push(item);
+
+        tracing::debug!(
+            "add_command_entry: Added command '{}', history length: {}",
+            command,
+            self.command_history.len()
+        );
+
+        // Limit history size
+        const MAX_HISTORY: usize = 1000;
+        if self.command_history.len() > MAX_HISTORY {
+            self.command_history.remove(0);
+        }
+
+        // Update static_lines for command mode navigation
+        crate::components::command_panel::ResponseFormatter::update_static_lines(self);
     }
 
     /// Check if currently in history search mode

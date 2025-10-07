@@ -55,7 +55,7 @@ impl ProgressRenderer {
                     if let Some(stats) = &module.stats {
                         let load_time = module.load_time.unwrap_or(0.0);
                         let line = Line::from(vec![
-                            Span::styled("✓ ", Style::default().fg(Color::Green)),
+                            Span::styled("✅ ", Style::default().fg(Color::Green)),
                             Span::styled(path, Style::default().fg(Color::White)),
                             Span::styled(
                                 format!(

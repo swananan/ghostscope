@@ -63,6 +63,12 @@ pub enum Action {
         content: String,
         response_type: ResponseType,
     },
+    // New: Add response with optional pre-styled lines
+    AddResponseWithStyle {
+        content: String,
+        styled_lines: Option<Vec<ratatui::text::Line<'static>>>,
+        response_type: ResponseType,
+    },
     AddStyledWelcomeMessage {
         styled_lines: Vec<ratatui::text::Line<'static>>,
         response_type: ResponseType,

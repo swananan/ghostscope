@@ -6,6 +6,7 @@ pub mod optimized_input;
 pub mod optimized_renderer;
 pub mod response_formatter;
 pub mod script_editor;
+pub mod style_builder;
 pub mod syntax_highlighter;
 pub mod trace_persistence;
 
