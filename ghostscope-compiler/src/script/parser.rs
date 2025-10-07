@@ -507,6 +507,8 @@ fn parse_factor(pair: Pair<Rule>) -> Result<Expr> {
         Rule::factor => {
             let inner = pair.into_inner().next().unwrap();
             match inner.as_rule() {
+                Rule::strncmp_call => parse_builtin_call(inner),
+                Rule::starts_with_call => parse_builtin_call(inner),
                 Rule::chain_access => parse_chain_access(inner),
                 Rule::pointer_deref => parse_pointer_deref(inner),
                 Rule::address_of => parse_address_of(inner),
@@ -539,6 +541,62 @@ fn parse_factor(pair: Pair<Rule>) -> Result<Expr> {
             }
         }
         _ => Err(ParseError::UnexpectedToken(pair.as_rule())),
+    }
+}
+
+fn parse_builtin_call(pair: Pair<Rule>) -> Result<Expr> {
+    // pair is strncmp_call or starts_with_call
+    let rule = pair.as_rule();
+    let mut it = pair.into_inner();
+    // First token inside is the function name as identifier within the rule text; easier approach: use rule to select
+    match rule {
+        Rule::strncmp_call => {
+            // grammar: strncmp "(" expr "," string "," int ")"
+            let expr_node = it.next().ok_or(ParseError::InvalidExpression)?; // expr
+            let arg0 = parse_expr(expr_node)?;
+            let lit_node = it.next().ok_or(ParseError::InvalidExpression)?; // string
+            if lit_node.as_rule() != Rule::string {
+                return Err(ParseError::TypeError(
+                    "strncmp second argument must be a string literal".to_string(),
+                ));
+            }
+            let raw = lit_node.as_str();
+            let lit = raw[1..raw.len() - 1].to_string();
+            let n_node = it.next().ok_or(ParseError::InvalidExpression)?; // int
+            if n_node.as_rule() != Rule::int {
+                return Err(ParseError::TypeError(
+                    "strncmp third argument must be a non-negative integer literal".to_string(),
+                ));
+            }
+            let n_val: i64 = n_node.as_str().parse().unwrap_or(0);
+            if n_val < 0 {
+                return Err(ParseError::TypeError(
+                    "strncmp length must be non-negative".to_string(),
+                ));
+            }
+            Ok(Expr::BuiltinCall {
+                name: "strncmp".to_string(),
+                args: vec![arg0, Expr::String(lit), Expr::Int(n_val)],
+            })
+        }
+        Rule::starts_with_call => {
+            // grammar: starts_with "(" expr "," string ")"
+            let expr_node = it.next().ok_or(ParseError::InvalidExpression)?;
+            let arg0 = parse_expr(expr_node)?;
+            let lit_node = it.next().ok_or(ParseError::InvalidExpression)?;
+            if lit_node.as_rule() != Rule::string {
+                return Err(ParseError::TypeError(
+                    "starts_with second argument must be a string literal".to_string(),
+                ));
+            }
+            let raw = lit_node.as_str();
+            let lit = raw[1..raw.len() - 1].to_string();
+            Ok(Expr::BuiltinCall {
+                name: "starts_with".to_string(),
+                args: vec![arg0, Expr::String(lit)],
+            })
+        }
+        _ => Err(ParseError::UnexpectedToken(rule)),
     }
 }
 

@@ -1356,11 +1356,64 @@ trace process_record {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script(script_content, 6).await?;
-
     assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
     assert!(
         stdout.contains("ARR_EQ"),
-        "Expected to see ARR_EQ when record.name == 'test_record'. STDOUT: {}",
+        "Expected to see ARR_EQ when record.name == \"test_record\". STDOUT: {}",
+        stdout
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_builtins_strncmp_starts_with_activity() -> anyhow::Result<()> {
+    init();
+    ensure_global_cleanup_registered();
+
+    // Validate builtins on DWARF char* parameter in a hot function
+    let script_content = r#"
+trace log_activity {
+    print "SN:{}", strncmp(activity, "main", 4);
+    print "SW:{}", starts_with(activity, "main");
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script(script_content, 6).await?;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    // Expect at least one true for both builtins
+    assert!(
+        stdout.lines().any(|l| l.contains("SN:true")),
+        "Expected SN:true for strncmp(activity, \"main\", 4). STDOUT: {}",
+        stdout
+    );
+    assert!(
+        stdout.lines().any(|l| l.contains("SW:true")),
+        "Expected SW:true for starts_with(activity, \"main\"). STDOUT: {}",
+        stdout
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_builtin_strncmp_on_struct_pointer_mismatch() -> anyhow::Result<()> {
+    init();
+    ensure_global_cleanup_registered();
+
+    // Negative case: pass a non-string pointer (DataRecord*) to strncmp; should be false
+    // Use a hot function for quick events
+    let script_content = r#"
+trace process_record {
+    print "REC_SN:{}", strncmp(record, "HTTP", 4);
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script(script_content, 6).await?;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    assert!(
+        stdout.lines().any(|l| l.contains("REC_SN:false")),
+        "Expected REC_SN:false for non-string pointer compare. STDOUT: {}",
         stdout
     );
     Ok(())
