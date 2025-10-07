@@ -313,6 +313,23 @@ trace foo.c:60 {
     print "greet-ok:{}", gm == "Hello, Global!"; // gm: const char* or char[]
 }
 
+#### CString Equality Details (char*/char[])
+
+GhostScope supports comparing a script string literal with a DWARF-side C string:
+
+- Supported forms: `const char*` / `char*` and fixed-size `char[N]`.
+- Operators: `==` and `!=`.
+- Semantics (strict NUL): let the literal length be `L`.
+  - For `char*`: GhostScope performs a bounded `bpf_probe_read_user_str` of up to `L+1` bytes. Equality requires the helper to return exactly `L+1`, the last byte to be `\0`, and all preceding `L` bytes to match the literal.
+  - For `char[N]`: GhostScope performs a bounded `bpf_probe_read_user` of `min(N, L+1)` bytes. Equality requires `L+1 <= N`, the byte at index `L` to be `\0`, and all preceding `L` bytes to match the literal.
+  - Any read failure (invalid address, permission, etc.) evaluates to `false`.
+
+Performance and safety notes:
+
+- Comparisons are compiled into bounded, branch-light checks to be verifier-friendly on most kernels. Still, placing many string comparisons in a single probe or attaching at extremely hot sites may add CPU and verifier load.
+- Prefer attaching at less-hot lines/functions if you only need occasional confirmation (e.g., update sites for a string field), or split multiple heavy comparisons into separate trace points.
+- GhostScope limits read sizes internally; very long literals may be truncated by an internal cap for safety.
+
 // Floats are not supported in GhostScope scripts.
 ```
 
