@@ -285,6 +285,13 @@ perf_page_count = 64  # Default (256KB per CPU)
 # Valid range: 64 to 65536
 proc_module_offsets_max_entries = 4096  # Default
 
+# Per-argument memory dump cap for extended format specifiers ({:x}/{:s}).
+# Increase to dump more bytes per argument.
+mem_dump_cap = 4096
+
+# Maximum size of a single trace event (bytes). Applies to PerfEventArray accumulation buffer.
+max_trace_event_size = 32768
+
 # Recommended values:
 #   - Single process: 1024
 #   - Multi-process: 4096
@@ -356,6 +363,8 @@ max_entries = 10000
 # Optimized for high-frequency event tracing
 [ebpf]
 ringbuf_size = 1048576  # 1MB buffer for high event rates
+mem_dump_cap = 4096     # Larger per-arg dump
+max_trace_event_size = 65536  # Larger event size for big formatted prints
 proc_module_offsets_max_entries = 8192  # Support many modules
 
 [general]
@@ -369,6 +378,8 @@ enable_console_logging = false
 # Minimal resource usage for production
 [ebpf]
 ringbuf_size = 131072  # 128KB minimal buffer
+mem_dump_cap = 512
+max_trace_event_size = 16384
 proc_module_offsets_max_entries = 1024  # Single process only
 
 [general]
@@ -466,6 +477,8 @@ GhostScope validates configuration at startup:
 8. **eBPF Configuration**:
    - **ringbuf_size**: Must be power of 2, range 4096-16777216 bytes
    - **perf_page_count**: Must be power of 2, range 8-1024 pages
+   - **mem_dump_cap**: Per-argument memory dump cap (bytes), e.g., 1024/2048/4096
+   - **max_trace_event_size**: Max bytes per trace event (PerfEventArray accumulation buffer)
    - **proc_module_offsets_max_entries**: Must be in range 64-65536
 
 Invalid configuration will produce clear error messages with suggestions for fixes.

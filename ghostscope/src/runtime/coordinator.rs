@@ -102,6 +102,8 @@ async fn run_tui_coordinator_with_ui_config_and_merged_config(
         proc_module_offsets_max_entries: 4096, // Default, will be overridden by config
         perf_page_count: 64,    // Default, will be overridden by config
         event_map_type: ghostscope_compiler::EventMapType::RingBuf, // Will be overridden by config
+        mem_dump_cap: 1024,
+        max_trace_event_size: 32768,
     };
 
     // Start the runtime coordination task with session from DWARF processing

@@ -19,7 +19,7 @@ impl<'ctx> EbpfContext<'ctx> {
         }
 
         // Create buffer for accumulating all trace data (size from protocol)
-        let buffer_size = ghostscope_protocol::consts::MAX_TRACE_EVENT_SIZE as u32;
+        let buffer_size = self.compile_options.max_trace_event_size;
         let i8_type = self.context.i8_type();
         let buffer_type = i8_type.array_type(buffer_size);
 
@@ -73,10 +73,10 @@ impl<'ctx> EbpfContext<'ctx> {
                     .map_err(|e| CodeGenError::LLVMError(format!("Failed to load offset: {}", e)))?
                     .into_int_value();
 
-                let buffer_size = self.context.i32_type().const_int(
-                    ghostscope_protocol::consts::MAX_TRACE_EVENT_SIZE as u64,
-                    false,
-                );
+                let buffer_size = self
+                    .context
+                    .i32_type()
+                    .const_int(self.compile_options.max_trace_event_size as u64, false);
 
                 // Get current block and parent function for branching
                 let current_block = self.builder.get_insert_block().unwrap();

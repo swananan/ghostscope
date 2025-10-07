@@ -62,6 +62,10 @@ pub struct CompileOptions {
     pub proc_module_offsets_max_entries: u64,
     pub perf_page_count: u32,
     pub event_map_type: EventMapType,
+    /// Max bytes to read per memory-dump argument (format {:x}/{:s}).
+    pub mem_dump_cap: u32,
+    /// Max total bytes in a single trace event (used for PerfEventArray accumulation buffer size).
+    pub max_trace_event_size: u32,
 }
 
 impl Default for CompileOptions {
@@ -75,6 +79,8 @@ impl Default for CompileOptions {
             proc_module_offsets_max_entries: 4096, // Default
             perf_page_count: 64,                   // 64 pages = 256KB per CPU
             event_map_type: EventMapType::RingBuf, // Default to RingBuf
+            mem_dump_cap: 4096,                    // Default per-arg dump cap (bytes)
+            max_trace_event_size: 32768,           // Default event size cap (32KB)
         }
     }
 }

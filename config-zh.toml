@@ -158,6 +158,15 @@ proc_module_offsets_max_entries = 4096
 # 默认值：32 (每 CPU 128KB)
 perf_page_count = 32
 
+# 扩展格式占位符（{:x}/{:s}）单个参数的内存转储上限（字节数）。
+# 可根据需要增大，例如 8192 或 16384。
+mem_dump_cap = 4096
+
+# 单条 trace 事件消息的最大大小（字节）。
+# 适用于 PerfEventArray 模式的累计缓冲区，也作为内核端构造打印指令时的上界。
+# 如需在单个事件中打印较多/较大的变量，可适当增大。
+max_trace_event_size = 32768
+
 # 强制使用 PerfEventArray 而不是 RingBuf（仅用于测试）
 # 警告：仅用于测试目的。正常情况下系统会自动检测内核能力，
 # 并使用 RingBuf（内核 >= 5.8）或回退到 PerfEventArray。

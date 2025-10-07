@@ -284,6 +284,12 @@ perf_page_count = 64  # 默认（每 CPU 256KB）
 # 有效范围：64 到 65536
 proc_module_offsets_max_entries = 4096  # 默认
 
+# 扩展格式占位符（{:x}/{:s}）单个参数的内存转储上限（字节）。
+mem_dump_cap = 4096
+
+# 单条 trace 事件的最大大小（字节）。适用于 PerfEventArray 累计缓冲区。
+max_trace_event_size = 32768
+
 # 推荐值：
 #   - 单进程：1024
 #   - 多进程：4096
