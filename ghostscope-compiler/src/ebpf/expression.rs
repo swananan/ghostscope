@@ -175,8 +175,29 @@ impl<'ctx> EbpfContext<'ctx> {
             }
             Expr::Bool(value) => {
                 // Represent booleans as i1 for logical/compare consistency
-                let b = self.context.bool_type().const_int(if *value { 1 } else { 0 }, false);
+                let b = self
+                    .context
+                    .bool_type()
+                    .const_int(if *value { 1 } else { 0 }, false);
                 Ok(b.into())
+            }
+            Expr::UnaryNot(inner) => {
+                // Compile operand to integer and compare EQ to zero to produce boolean not
+                let v = self.compile_expr(inner)?;
+                let iv = match v {
+                    BasicValueEnum::IntValue(iv) => iv,
+                    _ => {
+                        return Err(CodeGenError::TypeError(
+                            "Logical NOT requires integer/boolean operand".to_string(),
+                        ))
+                    }
+                };
+                let zero = iv.get_type().const_zero();
+                let res = self
+                    .builder
+                    .build_int_compare(inkwell::IntPredicate::EQ, iv, zero, "not_eq0")
+                    .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                Ok(res.into())
             }
             Expr::Variable(var_name) => {
                 debug!("compile_expr: Compiling variable expression: {}", var_name);

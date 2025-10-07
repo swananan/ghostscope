@@ -482,9 +482,13 @@ fn parse_unary(pair: Pair<Rule>) -> Result<Expr> {
             let first = inner.next().ok_or(ParseError::InvalidExpression)?;
             match first.as_rule() {
                 Rule::factor => parse_factor(first),
-                // Recursive unary: '-' ~ unary
-                Rule::unary => {
-                    let right = parse_unary(first)?;
+                // '-' ~ unary
+                Rule::neg_unary => {
+                    let u = first
+                        .into_inner()
+                        .next()
+                        .ok_or(ParseError::InvalidExpression)?;
+                    let right = parse_unary(u)?;
                     let expr = Expr::BinaryOp {
                         left: Box::new(Expr::Int(0)),
                         op: BinaryOp::Subtract,
@@ -494,6 +498,15 @@ fn parse_unary(pair: Pair<Rule>) -> Result<Expr> {
                         return Err(ParseError::TypeError(err));
                     }
                     Ok(expr)
+                }
+                // '!' ~ unary
+                Rule::not_unary => {
+                    let u = first
+                        .into_inner()
+                        .next()
+                        .ok_or(ParseError::InvalidExpression)?;
+                    let right = parse_unary(u)?;
+                    Ok(Expr::UnaryNot(Box::new(right)))
                 }
                 _ => Err(ParseError::UnexpectedToken(first.as_rule())),
             }

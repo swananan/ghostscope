@@ -1430,6 +1430,8 @@ trace log_activity {
     // positive cases
     print "B1:{}", starts_with(activity, "main") == true;
     print "B4:{}", true == starts_with(activity, "main");
+    // unary not
+    print "BN1:{}", !starts_with(activity, "main");
     // negative (non-match literal)
     print "B6:{}", starts_with(activity, "zzz") == false;
 }
@@ -1438,6 +1440,8 @@ trace process_record {
     // positive cases
     print "B2:{}", strncmp(record, "HTTP", 4) == false;
     print "B3:{}", false == strncmp(record, "HTTP", 4);
+    // unary not
+    print "BN2:{}", !strncmp(record, "HTTP", 4);
     // negative case (should be false)
     print "B5:{}", strncmp(record, "HTTP", 4) == true;
 }
@@ -1447,13 +1451,47 @@ trace process_record {
     assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
 
     // positives
-    assert!(stdout.lines().any(|l| l.contains("B1:true")), "Expected B1:true. STDOUT: {}", stdout);
-    assert!(stdout.lines().any(|l| l.contains("B2:true")), "Expected B2:true. STDOUT: {}", stdout);
-    assert!(stdout.lines().any(|l| l.contains("B3:true")), "Expected B3:true. STDOUT: {}", stdout);
-    assert!(stdout.lines().any(|l| l.contains("B4:true")), "Expected B4:true. STDOUT: {}", stdout);
-    assert!(stdout.lines().any(|l| l.contains("B6:true")), "Expected B6:true. STDOUT: {}", stdout);
-    // negative
-    assert!(stdout.lines().any(|l| l.contains("B5:false")), "Expected B5:false. STDOUT: {}", stdout);
+    assert!(
+        stdout.lines().any(|l| l.contains("B1:true")),
+        "Expected B1:true. STDOUT: {}",
+        stdout
+    );
+    assert!(
+        stdout.lines().any(|l| l.contains("B2:true")),
+        "Expected B2:true. STDOUT: {}",
+        stdout
+    );
+    assert!(
+        stdout.lines().any(|l| l.contains("B3:true")),
+        "Expected B3:true. STDOUT: {}",
+        stdout
+    );
+    assert!(
+        stdout.lines().any(|l| l.contains("B4:true")),
+        "Expected B4:true. STDOUT: {}",
+        stdout
+    );
+    assert!(
+        stdout.lines().any(|l| l.contains("B6:true")),
+        "Expected B6:true. STDOUT: {}",
+        stdout
+    );
+    // negative and unary not checks
+    assert!(
+        stdout.lines().any(|l| l.contains("B5:false")),
+        "Expected B5:false. STDOUT: {}",
+        stdout
+    );
+    assert!(
+        stdout.lines().any(|l| l.contains("BN1:false")),
+        "Expected BN1:false. STDOUT: {}",
+        stdout
+    );
+    assert!(
+        stdout.lines().any(|l| l.contains("BN2:true")),
+        "Expected BN2:true. STDOUT: {}",
+        stdout
+    );
     Ok(())
 }
 
