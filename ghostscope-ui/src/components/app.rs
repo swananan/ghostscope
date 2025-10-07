@@ -1644,12 +1644,7 @@ impl App {
                     // Build the trace command
                     let trace_command = format!("trace {file_path}:{line_num}");
 
-                    // Exit fullscreen mode if enabled
-                    if self.state.ui.layout.is_fullscreen {
-                        self.state.ui.layout.is_fullscreen = false;
-                    }
-
-                    // Focus command panel
+                    // Focus command panel (keep fullscreen state if enabled)
                     self.state.ui.focus.current_panel = PanelType::InteractiveCommand;
 
                     // Add command to history (unified method)
