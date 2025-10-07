@@ -169,9 +169,10 @@ impl App {
                         if sent_time.elapsed().as_secs() >= COMMAND_TIMEOUT_SECS {
                             let timeout_msg = format!("Command timeout: '{command}' - no response after {COMMAND_TIMEOUT_SECS} seconds");
                             self.clear_waiting_state();
-                            crate::components::command_panel::ResponseFormatter::add_response(
+                            crate::components::command_panel::ResponseFormatter::add_simple_styled_response(
                                 &mut self.state.command_panel,
                                 timeout_msg,
+                                crate::components::command_panel::style_builder::StylePresets::ERROR,
                                 crate::action::ResponseType::Error,
                             );
                             needs_render = true;
@@ -1294,24 +1295,6 @@ impl App {
                 );
                 additional_actions.extend(actions);
             }
-            Action::AddResponse {
-                content,
-                response_type,
-            } => {
-                // Realtime logging: write response to file if enabled (before moving content)
-                if self.state.realtime_session_logger.enabled {
-                    if let Err(e) = self.write_response_to_session_log(&content) {
-                        tracing::error!("Failed to write response to session log: {}", e);
-                    }
-                }
-
-                crate::components::command_panel::ResponseFormatter::add_response(
-                    &mut self.state.command_panel,
-                    content,
-                    response_type,
-                );
-                self.state.command_renderer.mark_pending_updates();
-            }
             Action::AddResponseWithStyle {
                 content,
                 styled_lines,
@@ -1671,90 +1654,106 @@ impl App {
             }
             Action::SaveEbpfOutput { filename } => {
                 // Start realtime eBPF output logging
-                let (content, response_type) = match self.start_realtime_output_logging(filename) {
-                    Ok(file_path) => (
-                        format!(
-                            "✅ Realtime eBPF output logging started: {}",
-                            file_path.display()
+                let (content, response_type, style_preset) =
+                    match self.start_realtime_output_logging(filename) {
+                        Ok(file_path) => (
+                            format!(
+                                "✅ Realtime eBPF output logging started: {}",
+                                file_path.display()
+                            ),
+                            crate::action::ResponseType::Success,
+                            crate::components::command_panel::style_builder::StylePresets::SUCCESS,
                         ),
-                        crate::action::ResponseType::Success,
-                    ),
-                    Err(e) => (
-                        format!("✗ Failed to start output logging: {e}"),
-                        crate::action::ResponseType::Error,
-                    ),
-                };
+                        Err(e) => (
+                            format!("✗ Failed to start output logging: {e}"),
+                            crate::action::ResponseType::Error,
+                            crate::components::command_panel::style_builder::StylePresets::ERROR,
+                        ),
+                    };
 
                 // Directly add response to command history
-                crate::components::command_panel::ResponseFormatter::add_response(
+                crate::components::command_panel::ResponseFormatter::add_simple_styled_response(
                     &mut self.state.command_panel,
                     content,
+                    style_preset,
                     response_type,
                 );
                 self.state.command_renderer.mark_pending_updates();
             }
             Action::SaveCommandSession { filename } => {
                 // Start realtime command session logging
-                let (content, response_type) = match self.start_realtime_session_logging(filename) {
-                    Ok(file_path) => (
-                        format!(
-                            "✅ Realtime session logging started: {}",
-                            file_path.display()
+                let (content, response_type, style_preset) =
+                    match self.start_realtime_session_logging(filename) {
+                        Ok(file_path) => (
+                            format!(
+                                "✅ Realtime session logging started: {}",
+                                file_path.display()
+                            ),
+                            crate::action::ResponseType::Success,
+                            crate::components::command_panel::style_builder::StylePresets::SUCCESS,
                         ),
-                        crate::action::ResponseType::Success,
-                    ),
-                    Err(e) => (
-                        format!("✗ Failed to start session logging: {e}"),
-                        crate::action::ResponseType::Error,
-                    ),
-                };
+                        Err(e) => (
+                            format!("✗ Failed to start session logging: {e}"),
+                            crate::action::ResponseType::Error,
+                            crate::components::command_panel::style_builder::StylePresets::ERROR,
+                        ),
+                    };
 
                 // Directly add response to command history
-                crate::components::command_panel::ResponseFormatter::add_response(
+                crate::components::command_panel::ResponseFormatter::add_simple_styled_response(
                     &mut self.state.command_panel,
                     content,
+                    style_preset,
                     response_type,
                 );
                 self.state.command_renderer.mark_pending_updates();
             }
             Action::StopSaveOutput => {
                 // Stop realtime eBPF output logging
-                let (content, response_type) = match self.state.realtime_output_logger.stop() {
-                    Ok(()) => (
-                        "✅ Realtime eBPF output logging stopped".to_string(),
-                        crate::action::ResponseType::Success,
-                    ),
-                    Err(e) => (
-                        format!("✗ Failed to stop output logging: {e}"),
-                        crate::action::ResponseType::Error,
-                    ),
-                };
+                let (content, response_type, style_preset) =
+                    match self.state.realtime_output_logger.stop() {
+                        Ok(()) => (
+                            "✅ Realtime eBPF output logging stopped".to_string(),
+                            crate::action::ResponseType::Success,
+                            crate::components::command_panel::style_builder::StylePresets::SUCCESS,
+                        ),
+                        Err(e) => (
+                            format!("✗ Failed to stop output logging: {e}"),
+                            crate::action::ResponseType::Error,
+                            crate::components::command_panel::style_builder::StylePresets::ERROR,
+                        ),
+                    };
 
                 // Directly add response to command history
-                crate::components::command_panel::ResponseFormatter::add_response(
+                crate::components::command_panel::ResponseFormatter::add_simple_styled_response(
                     &mut self.state.command_panel,
                     content,
+                    style_preset,
                     response_type,
                 );
                 self.state.command_renderer.mark_pending_updates();
             }
             Action::StopSaveSession => {
                 // Stop realtime command session logging
-                let (content, response_type) = match self.state.realtime_session_logger.stop() {
-                    Ok(()) => (
-                        "✅ Realtime session logging stopped".to_string(),
-                        crate::action::ResponseType::Success,
-                    ),
-                    Err(e) => (
-                        format!("✗ Failed to stop session logging: {e}"),
-                        crate::action::ResponseType::Error,
-                    ),
-                };
+                let (content, response_type, style_preset) =
+                    match self.state.realtime_session_logger.stop() {
+                        Ok(()) => (
+                            "✅ Realtime session logging stopped".to_string(),
+                            crate::action::ResponseType::Success,
+                            crate::components::command_panel::style_builder::StylePresets::SUCCESS,
+                        ),
+                        Err(e) => (
+                            format!("✗ Failed to stop session logging: {e}"),
+                            crate::action::ResponseType::Error,
+                            crate::components::command_panel::style_builder::StylePresets::ERROR,
+                        ),
+                    };
 
                 // Directly add response to command history
-                crate::components::command_panel::ResponseFormatter::add_response(
+                crate::components::command_panel::ResponseFormatter::add_simple_styled_response(
                     &mut self.state.command_panel,
                     content,
+                    style_preset,
                     response_type,
                 );
                 self.state.command_renderer.mark_pending_updates();
@@ -3182,8 +3181,20 @@ impl App {
                             }
                         }
 
-                        let action = Action::AddResponse {
+                        // Create styled version using helper method
+                        let styled_lines =
+                            crate::components::command_panel::ResponseFormatter::format_batch_load_summary_styled(
+                                &filename,
+                                total_count,
+                                success_count,
+                                failed_count,
+                                disabled_count,
+                                &details,
+                            );
+
+                        let action = Action::AddResponseWithStyle {
                             content: response,
+                            styled_lines: Some(styled_lines),
                             response_type: if failed_count > 0 {
                                 crate::action::ResponseType::Warning
                             } else {

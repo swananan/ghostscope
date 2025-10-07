@@ -104,7 +104,7 @@ mod history_search_tests {
         // Should NOT add empty response - would overwrite previous command's response
         assert!(!actions
             .iter()
-            .any(|a| matches!(a, Action::AddResponse { .. })));
+            .any(|a| matches!(a, Action::AddResponseWithStyle { .. })));
     }
 }
 

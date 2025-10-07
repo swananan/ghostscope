@@ -31,8 +31,18 @@ impl ScriptEditor {
         let target = command.trim_start_matches("trace").trim();
 
         if target.is_empty() {
-            return vec![Action::AddResponse {
-                content: "Usage: trace <function_name|file:line>".to_string(),
+            let plain = "Usage: trace <function_name|file:line>".to_string();
+            let styled = vec![
+                crate::components::command_panel::style_builder::StyledLineBuilder::new()
+                    .styled(
+                        plain.clone(),
+                        crate::components::command_panel::style_builder::StylePresets::ERROR,
+                    )
+                    .build(),
+            ];
+            return vec![Action::AddResponseWithStyle {
+                content: plain,
+                styled_lines: Some(styled),
                 response_type: ResponseType::Error,
             }];
         }
@@ -78,8 +88,18 @@ impl ScriptEditor {
             format!("📝 Script editor opened for '{target}'\nPress Ctrl+S to submit, ESC to cancel, F3 to clear")
         };
 
-        vec![Action::AddResponse {
+        let styled = vec![
+            crate::components::command_panel::style_builder::StyledLineBuilder::new()
+                .styled(
+                    message.clone(),
+                    crate::components::command_panel::style_builder::StylePresets::TIP,
+                )
+                .build(),
+        ];
+
+        vec![Action::AddResponseWithStyle {
             content: message,
+            styled_lines: Some(styled),
             response_type: ResponseType::Info,
         }]
     }
@@ -104,8 +124,19 @@ impl ScriptEditor {
 
         state.mode = InteractionMode::Input;
 
-        vec![Action::AddResponse {
-            content: "Script editing cancelled".to_string(),
+        let plain = "Script editing cancelled".to_string();
+        let styled = vec![
+            crate::components::command_panel::style_builder::StyledLineBuilder::new()
+                .styled(
+                    plain.clone(),
+                    crate::components::command_panel::style_builder::StylePresets::WARNING,
+                )
+                .build(),
+        ];
+
+        vec![Action::AddResponseWithStyle {
+            content: plain,
+            styled_lines: Some(styled),
             response_type: ResponseType::Warning,
         }]
     }
@@ -164,8 +195,19 @@ impl ScriptEditor {
             )];
         }
 
-        vec![Action::AddResponse {
-            content: "No script to submit".to_string(),
+        let plain = "No script to submit".to_string();
+        let styled = vec![
+            crate::components::command_panel::style_builder::StyledLineBuilder::new()
+                .styled(
+                    plain.clone(),
+                    crate::components::command_panel::style_builder::StylePresets::ERROR,
+                )
+                .build(),
+        ];
+
+        vec![Action::AddResponseWithStyle {
+            content: plain,
+            styled_lines: Some(styled),
             response_type: ResponseType::Error,
         }]
     }
@@ -514,8 +556,19 @@ impl ScriptEditor {
                 cache.status = ScriptStatus::Draft;
                 state.mode = InteractionMode::ScriptEditor;
 
-                return vec![Action::AddResponse {
-                    content: format!("📝 Re-editing script for '{}'", cache.target),
+                let plain = format!("📝 Re-editing script for '{}'", cache.target);
+                let styled = vec![
+                    crate::components::command_panel::style_builder::StyledLineBuilder::new()
+                        .styled(
+                            plain.clone(),
+                            crate::components::command_panel::style_builder::StylePresets::TIP,
+                        )
+                        .build(),
+                ];
+
+                return vec![Action::AddResponseWithStyle {
+                    content: plain,
+                    styled_lines: Some(styled),
                     response_type: ResponseType::Info,
                 }];
             }

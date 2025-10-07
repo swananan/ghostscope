@@ -33,34 +33,6 @@ pub struct ExecutableFileInfoDisplay<'a> {
 pub struct ResponseFormatter;
 
 impl ResponseFormatter {
-    /// Add a response to the command history and update display
-    pub fn add_response(
-        state: &mut CommandPanelState,
-        content: String,
-        response_type: ResponseType,
-    ) {
-        if let Some(last_item) = state.command_history.last_mut() {
-            last_item.response = Some(content);
-            last_item.response_type = Some(response_type);
-            tracing::debug!(
-                "add_response: Added response to command '{}'",
-                last_item.command
-            );
-        } else {
-            tracing::warn!(
-                "add_response: No command in history to attach response to! Response content: '{}'",
-                content
-            );
-            tracing::warn!(
-                "add_response: command_history length: {}",
-                state.command_history.len()
-            );
-        }
-
-        // Update static_lines with pre-styled content for performance
-        Self::update_static_lines(state);
-    }
-
     /// Create enhanced styled lines for generic messages.
     /// - Leading symbols: ✓ (success), ✗ (error), ⚠ (warning)
     /// - Numbers/hex addresses: Yellow
@@ -212,6 +184,113 @@ impl ResponseFormatter {
         }
 
         Self::update_static_lines(state);
+    }
+
+    /// Helper method to create a simple single-line styled response
+    /// This reduces code duplication for common response patterns
+    pub fn add_simple_styled_response(
+        state: &mut CommandPanelState,
+        content: String,
+        style: ratatui::style::Style,
+        response_type: ResponseType,
+    ) {
+        let styled = vec![
+            crate::components::command_panel::style_builder::StyledLineBuilder::new()
+                .styled(&content, style)
+                .build(),
+        ];
+        Self::add_response_with_style(state, content, Some(styled), response_type);
+    }
+
+    /// Format styled lines for batch trace loading summary
+    /// This reduces code duplication in app.rs for source command responses
+    pub fn format_batch_load_summary_styled(
+        filename: &str,
+        total_count: usize,
+        success_count: usize,
+        failed_count: usize,
+        disabled_count: usize,
+        details: &[crate::events::TraceLoadDetail],
+    ) -> Vec<Line<'static>> {
+        use crate::components::command_panel::style_builder::{StylePresets, StyledLineBuilder};
+        let mut lines = Vec::new();
+
+        // Title line
+        lines.push(
+            StyledLineBuilder::new()
+                .styled(
+                    format!("📂 Loaded traces from {filename}"),
+                    StylePresets::TITLE,
+                )
+                .build(),
+        );
+
+        // Summary line
+        let summary = if disabled_count > 0 {
+            format!(
+                "  Total: {total_count}, Success: {success_count}, Failed: {failed_count}, Disabled: {disabled_count}"
+            )
+        } else {
+            format!("  Total: {total_count}, Success: {success_count}, Failed: {failed_count}")
+        };
+        lines.push(StyledLineBuilder::new().value(&summary).build());
+
+        // Details
+        if !details.is_empty() {
+            lines.push(
+                StyledLineBuilder::new()
+                    .styled("", StylePresets::VALUE)
+                    .build(),
+            );
+            lines.push(
+                StyledLineBuilder::new()
+                    .styled("📊 Details:", StylePresets::SECTION)
+                    .build(),
+            );
+            for detail in details {
+                match detail.status {
+                    crate::events::LoadStatus::Created => {
+                        let text = if let Some(id) = detail.trace_id {
+                            format!("  ✓ {} → trace #{}", detail.target, id)
+                        } else {
+                            format!("  ✓ {}", detail.target)
+                        };
+                        lines.push(
+                            StyledLineBuilder::new()
+                                .styled(text, StylePresets::SUCCESS)
+                                .build(),
+                        );
+                    }
+                    crate::events::LoadStatus::CreatedDisabled => {
+                        let text = if let Some(id) = detail.trace_id {
+                            format!("  ⊘ {} → trace #{} (disabled)", detail.target, id)
+                        } else {
+                            format!("  ⊘ {} (disabled)", detail.target)
+                        };
+                        lines.push(
+                            StyledLineBuilder::new()
+                                .styled(text, StylePresets::WARNING)
+                                .build(),
+                        );
+                    }
+                    crate::events::LoadStatus::Failed => {
+                        let text = if let Some(ref error) = detail.error {
+                            format!("  ✗ {}: {}", detail.target, error)
+                        } else {
+                            format!("  ✗ {}", detail.target)
+                        };
+                        lines.push(
+                            StyledLineBuilder::new()
+                                .styled(text, StylePresets::ERROR)
+                                .build(),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        lines
     }
 
     // Removed add_welcome_message - now using direct styled approach
