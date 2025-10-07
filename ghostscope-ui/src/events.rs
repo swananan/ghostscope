@@ -111,6 +111,39 @@ impl TargetDebugInfo {
 
         result
     }
+
+    /// Styled version for display (pre-styled lines for UI rendering)
+    pub fn format_for_display_styled(&self) -> Vec<ratatui::text::Line<'static>> {
+        use crate::components::command_panel::style_builder::StyledLineBuilder;
+        use ratatui::text::Line;
+
+        let mut lines = Vec::new();
+
+        // Title line
+        let total_addresses: usize = self.modules.iter().map(|m| m.address_mappings.len()).sum();
+        lines.push(
+            StyledLineBuilder::new()
+                .title(format!(
+                    "🔧 Function Debug Info: {} ({} modules, {} addresses)",
+                    self.target,
+                    self.modules.len(),
+                    total_addresses
+                ))
+                .build(),
+        );
+        lines.push(Line::from(""));
+
+        for (idx, module) in self.modules.iter().enumerate() {
+            let is_last = idx + 1 == self.modules.len();
+            lines.extend(module.format_for_display_styled(
+                is_last,
+                &self.file_path,
+                self.line_number,
+            ));
+        }
+
+        lines
+    }
 }
 
 /// Debug information for a module (binary) containing one or more addresses
@@ -281,6 +314,44 @@ impl ModuleDebugInfo {
     }
 }
 
+impl ModuleDebugInfo {
+    /// Styled module info lines
+    pub fn format_for_display_styled(
+        &self,
+        is_last_module: bool,
+        source_file: &Option<String>,
+        source_line: Option<u32>,
+    ) -> Vec<ratatui::text::Line<'static>> {
+        use crate::components::command_panel::style_builder::{StylePresets, StyledLineBuilder};
+
+        let mut lines = Vec::new();
+
+        let mut builder = StyledLineBuilder::new()
+            .styled("📦 ", StylePresets::SECTION)
+            .styled(&self.binary_path, StylePresets::SECTION);
+
+        if let Some(ref file) = source_file {
+            builder = builder.text(" @ ").styled(
+                if let Some(line) = source_line {
+                    format!("{file}:{line}")
+                } else {
+                    file.clone()
+                },
+                StylePresets::LOCATION,
+            );
+        }
+
+        lines.push(builder.build());
+
+        for (addr_idx, mapping) in self.address_mappings.iter().enumerate() {
+            let is_last_addr = addr_idx + 1 == self.address_mappings.len();
+            lines.extend(mapping.format_for_display_styled(is_last_module, is_last_addr));
+        }
+
+        lines
+    }
+}
+
 /// Debug information for a specific address within a module
 #[derive(Debug, Clone)]
 pub struct AddressMapping {
@@ -289,6 +360,136 @@ pub struct AddressMapping {
     pub function_name: Option<String>,
     pub variables: Vec<VariableDebugInfo>,
     pub parameters: Vec<VariableDebugInfo>,
+}
+
+impl AddressMapping {
+    /// Styled address mapping lines with tree prefixes
+    pub fn format_for_display_styled(
+        &self,
+        is_last_module: bool,
+        is_last_addr: bool,
+    ) -> Vec<ratatui::text::Line<'static>> {
+        use crate::components::command_panel::style_builder::{StylePresets, StyledLineBuilder};
+
+        let mut lines = Vec::new();
+
+        let prefix = match (is_last_module, is_last_addr) {
+            (true, true) => "   └─",
+            (true, false) => "   ├─",
+            (false, true) => "│  └─",
+            (false, false) => "│  ├─",
+        };
+
+        lines.push(
+            StyledLineBuilder::new()
+                .styled(prefix, StylePresets::TREE)
+                .text(" 🎯 ")
+                .address(self.address)
+                .build(),
+        );
+
+        if !self.parameters.is_empty() {
+            let param_prefix = match (is_last_module, is_last_addr) {
+                (true, true) => "      ├─",
+                (true, false) => "   │  ├─",
+                (false, true) => "│     ├─",
+                (false, false) => "│  │  ├─",
+            };
+
+            lines.push(
+                StyledLineBuilder::new()
+                    .styled(param_prefix, StylePresets::TREE)
+                    .styled(" 📥 Parameters", StylePresets::SECTION)
+                    .build(),
+            );
+
+            for (param_idx, param) in self.parameters.iter().enumerate() {
+                let is_last_param =
+                    param_idx + 1 == self.parameters.len() && self.variables.is_empty();
+                let item_prefix = match (is_last_module, is_last_addr, is_last_param) {
+                    (true, true, true) => "      │  └─",
+                    (true, true, false) => "      │  ├─",
+                    (true, false, true) => "   │  │  └─",
+                    (true, false, false) => "   │  │  ├─",
+                    (false, true, true) => "│     │  └─",
+                    (false, true, false) => "│     │  ├─",
+                    (false, false, true) => "│  │  │  └─",
+                    (false, false, false) => "│  │  │  ├─",
+                };
+
+                lines.push(Self::format_variable_styled(item_prefix, param));
+            }
+        }
+
+        if !self.variables.is_empty() {
+            let var_prefix = match (is_last_module, is_last_addr) {
+                (true, true) => "      └─",
+                (true, false) => "   │  └─",
+                (false, true) => "│     └─",
+                (false, false) => "│  │  └─",
+            };
+
+            lines.push(
+                StyledLineBuilder::new()
+                    .styled(var_prefix, StylePresets::TREE)
+                    .styled(" 📦 Variables", StylePresets::SECTION)
+                    .build(),
+            );
+
+            for (var_idx, var) in self.variables.iter().enumerate() {
+                let is_last_var = var_idx + 1 == self.variables.len();
+                let item_prefix = match (is_last_module, is_last_addr, is_last_var) {
+                    (true, true, true) => "         └─",
+                    (true, true, false) => "         ├─",
+                    (true, false, true) => "   │     └─",
+                    (true, false, false) => "   │     ├─",
+                    (false, true, true) => "│        └─",
+                    (false, true, false) => "│        ├─",
+                    (false, false, true) => "│  │     └─",
+                    (false, false, false) => "│  │     ├─",
+                };
+
+                lines.push(Self::format_variable_styled(item_prefix, var));
+            }
+        }
+
+        lines
+    }
+
+    fn format_variable_styled(
+        indent_prefix: &str,
+        var: &VariableDebugInfo,
+    ) -> ratatui::text::Line<'static> {
+        use crate::components::command_panel::style_builder::{StylePresets, StyledLineBuilder};
+
+        let type_display = var
+            .type_pretty
+            .as_ref()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.as_str())
+            .unwrap_or("unknown");
+
+        let mut builder = StyledLineBuilder::new()
+            .styled(indent_prefix, StylePresets::TREE)
+            .text(" ")
+            .value(&var.name)
+            .key(": ")
+            .styled(type_display, StylePresets::TYPE);
+
+        if let Some(size) = var.size {
+            builder = builder.text(" ").text(format!("({size} bytes)"));
+        }
+
+        if !var.location_description.is_empty() && var.location_description != "None" {
+            builder = builder
+                .text(" ")
+                .key("@")
+                .text(" ")
+                .styled(&var.location_description, StylePresets::LOCATION);
+        }
+
+        builder.build()
+    }
 }
 
 /// Type of target being inspected
@@ -772,6 +973,123 @@ impl RuntimeStatus {
             _ => None,
         }
     }
+
+    /// Styled version of TraceInfo for display
+    pub fn format_trace_info_styled(&self) -> Option<Vec<ratatui::text::Line<'static>>> {
+        use crate::components::command_panel::style_builder::{StylePresets, StyledLineBuilder};
+        use ratatui::text::Line;
+
+        match self {
+            RuntimeStatus::TraceInfo {
+                trace_id,
+                target,
+                status,
+                pid,
+                binary,
+                script_preview: _,
+                pc,
+            } => {
+                let mut lines = Vec::new();
+
+                // Title
+                lines.push(
+                    StyledLineBuilder::new()
+                        .title(format!(
+                            "🔎 Trace [{}] {} {}",
+                            trace_id,
+                            status.to_emoji(),
+                            status
+                        ))
+                        .build(),
+                );
+
+                let binary_name = std::path::Path::new(binary)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(binary)
+                    .to_string();
+
+                lines.push(
+                    StyledLineBuilder::new()
+                        .text("  ")
+                        .key("🎯 Target:")
+                        .text(" ")
+                        .value(target)
+                        .build(),
+                );
+                lines.push(
+                    StyledLineBuilder::new()
+                        .text("  ")
+                        .key("📦 Binary:")
+                        .text(" ")
+                        .value(binary)
+                        .build(),
+                );
+                lines.push(
+                    StyledLineBuilder::new()
+                        .text("  ")
+                        .key("📍 Address:")
+                        .text(" ")
+                        .value(format!("{binary_name}+0x{pc:x}"))
+                        .build(),
+                );
+
+                if let Some(p) = pid {
+                    lines.push(
+                        StyledLineBuilder::new()
+                            .text("  ")
+                            .key("🏷️ PID:")
+                            .text(" ")
+                            .value(p.to_string())
+                            .build(),
+                    );
+                }
+
+                Some(lines)
+            }
+            RuntimeStatus::TraceInfoAll { summary, traces } => {
+                let mut lines = Vec::new();
+                // Title
+                lines.push(
+                    StyledLineBuilder::new()
+                        .title(format!(
+                            "🔍 All Traces ({} total, {} active):",
+                            summary.total, summary.active
+                        ))
+                        .build(),
+                );
+                lines.push(Line::from(""));
+
+                for t in traces {
+                    let binary_name = std::path::Path::new(&t.binary_path)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or(&t.binary_path)
+                        .to_string();
+                    let status_style = match t.status {
+                        TraceStatus::Active => StylePresets::SUCCESS,
+                        TraceStatus::Disabled => StylePresets::LOCATION,
+                        TraceStatus::Failed => StylePresets::ERROR,
+                    };
+                    let line = StyledLineBuilder::new()
+                        .text("  ")
+                        .styled(format!("#{}", t.trace_id), StylePresets::ADDRESS)
+                        .text("  | ")
+                        .styled(format!("{}+0x{:x}", binary_name, t.pc), StylePresets::KEY)
+                        .text("  | ")
+                        .value(&t.target_display)
+                        .text("  (")
+                        .styled(t.status.to_string(), status_style)
+                        .text(")")
+                        .build();
+                    lines.push(line);
+                }
+
+                Some(lines)
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Source path information for display (shared between UI and runtime)
@@ -836,6 +1154,111 @@ impl SourcePathInfo {
         );
 
         output
+    }
+
+    /// Styled version for display
+    pub fn format_for_display_styled(&self) -> Vec<ratatui::text::Line<'static>> {
+        use crate::components::command_panel::style_builder::{StylePresets, StyledLineBuilder};
+        use ratatui::text::Line;
+
+        let mut lines = Vec::new();
+
+        // Title
+        lines.push(
+            StyledLineBuilder::new()
+                .title("🗂️  Source Path Configuration:")
+                .build(),
+        );
+        lines.push(Line::from(""));
+
+        // Path substitutions
+        if self.substitutions.is_empty() {
+            lines.push(
+                StyledLineBuilder::new()
+                    .key("Path Substitutions:")
+                    .text(" (none)")
+                    .build(),
+            );
+        } else {
+            lines.push(
+                StyledLineBuilder::new()
+                    .key(format!(
+                        "Path Substitutions ({}):",
+                        self.substitutions.len()
+                    ))
+                    .build(),
+            );
+            for (i, sub) in self.substitutions.iter().enumerate() {
+                let marker = if i < self.runtime_substitution_count {
+                    "[runtime]"
+                } else {
+                    "[config] "
+                };
+                lines.push(
+                    StyledLineBuilder::new()
+                        .text("  ")
+                        .styled(marker, StylePresets::MARKER)
+                        .text(" ")
+                        .value(&sub.from)
+                        .styled(" -> ", StylePresets::TREE)
+                        .styled(&sub.to, StylePresets::KEY)
+                        .build(),
+                );
+            }
+        }
+
+        lines.push(Line::from(""));
+
+        // Search directories
+        if self.search_dirs.is_empty() {
+            lines.push(
+                StyledLineBuilder::new()
+                    .key("Search Directories:")
+                    .text(" (none)")
+                    .build(),
+            );
+        } else {
+            lines.push(
+                StyledLineBuilder::new()
+                    .key(format!("Search Directories ({}):", self.search_dirs.len()))
+                    .build(),
+            );
+            for (i, dir) in self.search_dirs.iter().enumerate() {
+                let marker = if i < self.runtime_search_dir_count {
+                    "[runtime]"
+                } else {
+                    "[config] "
+                };
+                lines.push(
+                    StyledLineBuilder::new()
+                        .text("  ")
+                        .styled(marker, StylePresets::MARKER)
+                        .text(" ")
+                        .value(dir)
+                        .build(),
+                );
+            }
+        }
+
+        lines.push(Line::from(""));
+        lines.push(
+            StyledLineBuilder::new()
+                .styled(
+                    "💡 Runtime rules take precedence over config file rules.",
+                    StylePresets::TIP,
+                )
+                .build(),
+        );
+        lines.push(
+            StyledLineBuilder::new()
+                .styled(
+                    "💡 Use 'srcpath clear' to remove runtime rules, 'srcpath reset' to reset to config.",
+                    StylePresets::TIP,
+                )
+                .build(),
+        );
+
+        lines
     }
 }
 

@@ -127,56 +127,42 @@ impl OptimizedRenderer {
                         }
                     }
                 }
-                _ => {
+                LineType::Response => {
+                    // Check if we have pre-styled content
+                    if let Some(ref styled_content) = static_line.styled_content {
+                        let wrapped_lines = self.wrap_styled_line(styled_content, width as usize);
+                        lines.extend(wrapped_lines);
+                    } else {
+                        // Fallback to old logic
+                        let wrapped_lines = self.wrap_text(&static_line.content, width);
+                        for wrapped_line in wrapped_lines {
+                            lines.push(
+                                self.create_response_line(&wrapped_line, static_line.response_type),
+                            );
+                        }
+                    }
+                }
+                LineType::Command => {
                     let wrapped_lines = self.wrap_text(&static_line.content, width);
                     for wrapped_line in wrapped_lines {
-                        let styled_line = match static_line.line_type {
-                            LineType::Response => {
-                                self.create_response_line(&wrapped_line, static_line.response_type)
-                            }
-                            LineType::Command => self.create_command_line(&wrapped_line),
-                            LineType::CurrentInput => Line::from(Span::styled(
-                                wrapped_line,
-                                Style::default().fg(Color::White),
-                            )),
-                            _ => unreachable!(),
-                        };
-                        lines.push(styled_line);
+                        lines.push(self.create_command_line(&wrapped_line));
+                    }
+                }
+                LineType::CurrentInput => {
+                    let wrapped_lines = self.wrap_text(&static_line.content, width);
+                    for wrapped_line in wrapped_lines {
+                        lines.push(Line::from(Span::styled(
+                            wrapped_line,
+                            Style::default().fg(Color::White),
+                        )));
                     }
                 }
             }
         }
 
-        // Render command history
-        for item in &state.command_history {
-            // Command line
-            let command_content = format!("(ghostscope) {}", item.command);
-            let wrapped_commands = self.wrap_text(&command_content, width);
-            for (line_idx, wrapped_line) in wrapped_commands.iter().enumerate() {
-                let command_line = if line_idx == 0 {
-                    self.create_command_line(wrapped_line)
-                } else {
-                    Line::from(Span::styled(
-                        wrapped_line.clone(),
-                        Style::default().fg(Color::White),
-                    ))
-                };
-                lines.push(command_line);
-            }
-
-            // Response lines
-            if let Some(ref response) = item.response {
-                let response_lines: Vec<String> = response.lines().map(String::from).collect();
-                for response_line in response_lines {
-                    let wrapped_responses = self.wrap_text(&response_line, width);
-                    for wrapped_response in wrapped_responses {
-                        let styled_line =
-                            self.create_response_line(&wrapped_response, item.response_type);
-                        lines.push(styled_line);
-                    }
-                }
-            }
-        }
+        // Note: command_history is now rendered via static_lines above
+        // (see ResponseFormatter::update_static_lines which is called in add_response)
+        // This eliminates redundant parsing and styling on every frame
 
         // Render current input
         match state.mode {
@@ -1251,78 +1237,60 @@ impl OptimizedRenderer {
         lines
     }
 
-    /// Wrap styled line preserving spans
+    /// Wrap styled line preserving spans - uses same logic as wrap_text() for consistency
     fn wrap_styled_line(&self, styled_line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
-        let full_text: String = styled_line
+        // Extract plain text from styled line
+        let plain_text: String = styled_line
             .spans
             .iter()
             .map(|span| span.content.as_ref())
             .collect();
 
-        if full_text.len() <= width {
+        // Use wrap_text to get line breaks (same logic as cursor calculation)
+        let wrapped_texts = self.wrap_text(&plain_text, width as u16);
+
+        if wrapped_texts.len() <= 1 {
             return vec![styled_line.clone()];
         }
 
+        // Now split styled_line according to wrapped_texts
         let mut result_lines = Vec::new();
-        let mut current_line_spans = Vec::new();
-        let mut current_line_length = 0;
+        let mut span_index = 0;
+        let mut span_char_offset = 0;
 
-        for span in &styled_line.spans {
-            let span_text = span.content.as_ref();
-            let span_style = span.style;
+        for wrapped_text in wrapped_texts {
+            let mut current_line_spans = Vec::new();
+            let mut chars_needed = wrapped_text.chars().count();
 
-            if current_line_length + span_text.len() <= width {
-                current_line_spans.push(span.clone());
-                current_line_length += span_text.len();
-            } else {
-                let remaining_width = width - current_line_length;
+            while chars_needed > 0 && span_index < styled_line.spans.len() {
+                let span = &styled_line.spans[span_index];
+                let span_text = span.content.as_ref();
+                let span_chars: Vec<char> = span_text.chars().collect();
 
-                if remaining_width > 0 {
-                    let (first_part, remaining_part) =
-                        span_text.split_at(remaining_width.min(span_text.len()));
-                    if !first_part.is_empty() {
-                        current_line_spans.push(Span::styled(first_part.to_string(), span_style));
-                    }
+                let available_chars = span_chars.len() - span_char_offset;
+                let chars_to_take = chars_needed.min(available_chars);
 
-                    if !current_line_spans.is_empty() {
-                        result_lines.push(Line::from(current_line_spans));
-                        current_line_spans = Vec::new();
-                        current_line_length = 0;
-                    }
+                let taken_text: String = span_chars
+                    [span_char_offset..span_char_offset + chars_to_take]
+                    .iter()
+                    .collect();
 
-                    let mut remaining = remaining_part;
-                    while !remaining.is_empty() {
-                        let chunk_size = width.min(remaining.len());
-                        let (chunk, rest) = remaining.split_at(chunk_size);
-                        result_lines.push(Line::from(vec![Span::styled(
-                            chunk.to_string(),
-                            span_style,
-                        )]));
-                        remaining = rest;
-                    }
-                } else {
-                    if !current_line_spans.is_empty() {
-                        result_lines.push(Line::from(current_line_spans));
-                        current_line_spans = Vec::new();
-                        current_line_length = 0;
-                    }
+                if !taken_text.is_empty() {
+                    current_line_spans.push(Span::styled(taken_text, span.style));
+                }
 
-                    let mut remaining = span_text;
-                    while !remaining.is_empty() {
-                        let chunk_size = width.min(remaining.len());
-                        let (chunk, rest) = remaining.split_at(chunk_size);
-                        result_lines.push(Line::from(vec![Span::styled(
-                            chunk.to_string(),
-                            span_style,
-                        )]));
-                        remaining = rest;
-                    }
+                span_char_offset += chars_to_take;
+                chars_needed -= chars_to_take;
+
+                if span_char_offset >= span_chars.len() {
+                    span_index += 1;
+                    span_char_offset = 0;
                 }
             }
-        }
 
-        if !current_line_spans.is_empty() {
-            result_lines.push(Line::from(current_line_spans));
+            if !current_line_spans.is_empty() {
+                result_lines.push(Line::from(current_line_spans));
+            }
         }
 
         result_lines

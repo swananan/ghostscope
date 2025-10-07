@@ -1277,6 +1277,25 @@ impl App {
                 );
                 self.state.command_renderer.mark_pending_updates();
             }
+            Action::AddResponseWithStyle {
+                content,
+                styled_lines,
+                response_type,
+            } => {
+                // Realtime logging: write response to file if enabled (before moving content)
+                if self.state.realtime_session_logger.enabled {
+                    if let Err(e) = self.write_response_to_session_log(&content) {
+                        tracing::error!("Failed to write response to session log: {}", e);
+                    }
+                }
+                crate::components::command_panel::ResponseFormatter::add_response_with_style(
+                    &mut self.state.command_panel,
+                    content,
+                    styled_lines,
+                    response_type,
+                );
+                self.state.command_renderer.mark_pending_updates();
+            }
             // Removed old AddWelcomeMessage - now using AddStyledWelcomeMessage
             Action::AddStyledWelcomeMessage {
                 styled_lines,
@@ -1294,8 +1313,15 @@ impl App {
                 if let Err(e) = self.state.event_registry.command_sender.send(cmd) {
                     tracing::error!("Failed to send runtime command: {}", e);
                     // Add error response to command panel
-                    let error_action = Action::AddResponse {
-                        content: format!("Failed to send command to runtime: {e}"),
+                    let plain = format!("✗ Failed to send command to runtime: {e}");
+                    let styled = vec![
+                        crate::components::command_panel::style_builder::StyledLineBuilder::new()
+                            .styled(plain.clone(), crate::components::command_panel::style_builder::StylePresets::ERROR)
+                            .build(),
+                    ];
+                    let error_action = Action::AddResponseWithStyle {
+                        content: plain,
+                        styled_lines: Some(styled),
                         response_type: crate::action::ResponseType::Error,
                     };
                     additional_actions.push(error_action);
@@ -1597,21 +1623,8 @@ impl App {
                     // Focus command panel
                     self.state.ui.focus.current_panel = PanelType::InteractiveCommand;
 
-                    // Add command to history manager (for Ctrl+R search)
-                    self.state
-                        .command_panel
-                        .add_command_to_history(&trace_command);
-
-                    // Add to command_history for proper response handling
-                    self.state.command_panel.command_history.push(
-                        crate::model::panel_state::CommandHistoryItem {
-                            command: trace_command.clone(),
-                            response: None,
-                            timestamp: std::time::Instant::now(),
-                            prompt: crate::ui::strings::UIStrings::GHOSTSCOPE_PROMPT.to_string(),
-                            response_type: None,
-                        },
-                    );
+                    // Add command to history (unified method)
+                    self.state.command_panel.add_command_entry(&trace_command);
 
                     // Clear input
                     self.state.command_panel.input_text.clear();
@@ -1626,7 +1639,7 @@ impl App {
                 let (content, response_type) = match self.start_realtime_output_logging(filename) {
                     Ok(file_path) => (
                         format!(
-                            "✓ Realtime eBPF output logging started: {}",
+                            "✅ Realtime eBPF output logging started: {}",
                             file_path.display()
                         ),
                         crate::action::ResponseType::Success,
@@ -1650,7 +1663,7 @@ impl App {
                 let (content, response_type) = match self.start_realtime_session_logging(filename) {
                     Ok(file_path) => (
                         format!(
-                            "✓ Realtime session logging started: {}",
+                            "✅ Realtime session logging started: {}",
                             file_path.display()
                         ),
                         crate::action::ResponseType::Success,
@@ -1673,7 +1686,7 @@ impl App {
                 // Stop realtime eBPF output logging
                 let (content, response_type) = match self.state.realtime_output_logger.stop() {
                     Ok(()) => (
-                        "✓ Realtime eBPF output logging stopped".to_string(),
+                        "✅ Realtime eBPF output logging stopped".to_string(),
                         crate::action::ResponseType::Success,
                     ),
                     Err(e) => (
@@ -1694,7 +1707,7 @@ impl App {
                 // Stop realtime command session logging
                 let (content, response_type) = match self.state.realtime_session_logger.stop() {
                     Ok(()) => (
-                        "✓ Realtime session logging stopped".to_string(),
+                        "✅ Realtime session logging stopped".to_string(),
                         crate::action::ResponseType::Success,
                     ),
                     Err(e) => (
@@ -2163,8 +2176,12 @@ impl App {
                         crate::components::command_panel::ResponseFormatter::format_file_info(
                             &groups, false,
                         );
-                    let action = Action::AddResponse {
+                    let styled_lines = crate::components::command_panel::ResponseFormatter::format_file_info_styled(
+                        &groups, false,
+                    );
+                    let action = Action::AddResponseWithStyle {
                         content: response,
+                        styled_lines: Some(styled_lines),
                         response_type: crate::action::ResponseType::Info,
                     };
                     let _ = self.handle_action(action);
@@ -2183,8 +2200,15 @@ impl App {
                     self.state.route_file_info_to_file_search = false;
                 } else {
                     self.clear_waiting_state();
-                    let action = Action::AddResponse {
-                        content: format!("Failed to get file information: {error}"),
+                    let plain = format!("✗ Failed to get file information: {error}");
+                    let styled = vec![
+                        crate::components::command_panel::style_builder::StyledLineBuilder::new()
+                            .styled(plain.clone(), crate::components::command_panel::style_builder::StylePresets::ERROR)
+                            .build(),
+                    ];
+                    let action = Action::AddResponseWithStyle {
+                        content: plain,
+                        styled_lines: Some(styled),
                         response_type: crate::action::ResponseType::Error,
                     };
                     let _ = self.handle_action(action);
@@ -2195,16 +2219,21 @@ impl App {
                 self.clear_waiting_state();
                 // Format and display function debug info
                 let formatted_info = info.format_for_display();
-                let action = Action::AddResponse {
+                let styled_lines = info.format_for_display_styled();
+                let action = Action::AddResponseWithStyle {
                     content: formatted_info,
+                    styled_lines: Some(styled_lines),
                     response_type: crate::action::ResponseType::Success,
                 };
                 let _ = self.handle_action(action);
             }
             RuntimeStatus::InfoFunctionFailed { target, error } => {
                 self.clear_waiting_state();
-                let action = Action::AddResponse {
-                    content: format!("Failed to get debug info for function '{target}': {error}"),
+                let text = format!("✗ Failed to get debug info for function '{target}': {error}");
+                let styled = crate::components::command_panel::ResponseFormatter::style_generic_message_lines(&text);
+                let action = Action::AddResponseWithStyle {
+                    content: text,
+                    styled_lines: Some(styled),
                     response_type: crate::action::ResponseType::Error,
                 };
                 let _ = self.handle_action(action);
@@ -2214,16 +2243,21 @@ impl App {
                 self.clear_waiting_state();
                 // Format and display line debug info
                 let formatted_info = info.format_for_display();
-                let action = Action::AddResponse {
+                let styled_lines = info.format_for_display_styled();
+                let action = Action::AddResponseWithStyle {
                     content: formatted_info,
+                    styled_lines: Some(styled_lines),
                     response_type: crate::action::ResponseType::Success,
                 };
                 let _ = self.handle_action(action);
             }
             RuntimeStatus::InfoLineFailed { target, error } => {
                 self.clear_waiting_state();
-                let action = Action::AddResponse {
-                    content: format!("Failed to get debug info for line '{target}': {error}"),
+                let text = format!("✗ Failed to get debug info for line '{target}': {error}");
+                let styled = crate::components::command_panel::ResponseFormatter::style_generic_message_lines(&text);
+                let action = Action::AddResponseWithStyle {
+                    content: text,
+                    styled_lines: Some(styled),
                     response_type: crate::action::ResponseType::Error,
                 };
                 let _ = self.handle_action(action);
@@ -2233,16 +2267,21 @@ impl App {
                 self.clear_waiting_state();
                 // Format and display address debug info
                 let formatted_info = info.format_for_display();
-                let action = Action::AddResponse {
+                let styled_lines = info.format_for_display_styled();
+                let action = Action::AddResponseWithStyle {
                     content: formatted_info,
+                    styled_lines: Some(styled_lines),
                     response_type: crate::action::ResponseType::Success,
                 };
                 let _ = self.handle_action(action);
             }
             RuntimeStatus::InfoAddressFailed { target, error } => {
                 self.clear_waiting_state();
-                let action = Action::AddResponse {
-                    content: format!("Failed to get debug info for address '{target}': {error}"),
+                let text = format!("✗ Failed to get debug info for address '{target}': {error}");
+                let styled = crate::components::command_panel::ResponseFormatter::style_generic_message_lines(&text);
+                let action = Action::AddResponseWithStyle {
+                    content: text,
+                    styled_lines: Some(styled),
                     response_type: crate::action::ResponseType::Error,
                 };
                 let _ = self.handle_action(action);
@@ -2253,16 +2292,25 @@ impl App {
                     crate::components::command_panel::ResponseFormatter::format_shared_library_info(
                         &libraries, false,
                     );
-                let action = Action::AddResponse {
+                let styled_lines =
+                    crate::components::command_panel::ResponseFormatter::format_shared_library_info_styled(
+                        &libraries,
+                        false,
+                    );
+                let action = Action::AddResponseWithStyle {
                     content: formatted_info,
+                    styled_lines: Some(styled_lines),
                     response_type: crate::action::ResponseType::Success,
                 };
                 let _ = self.handle_action(action);
             }
             RuntimeStatus::ShareInfoFailed { error } => {
                 self.clear_waiting_state();
-                let action = Action::AddResponse {
-                    content: format!("Failed to get shared library information: {error}"),
+                let text = format!("✗ Failed to get shared library information: {error}");
+                let styled = crate::components::command_panel::ResponseFormatter::style_generic_message_lines(&text);
+                let action = Action::AddResponseWithStyle {
+                    content: text,
+                    styled_lines: Some(styled),
                     response_type: crate::action::ResponseType::Error,
                 };
                 let _ = self.handle_action(action);
@@ -2295,16 +2343,24 @@ impl App {
                     crate::components::command_panel::ResponseFormatter::format_executable_file_info(
                         &info_display,
                     );
-                let action = Action::AddResponse {
+                let styled_lines =
+                    crate::components::command_panel::ResponseFormatter::format_executable_file_info_styled(
+                        &info_display,
+                    );
+                let action = Action::AddResponseWithStyle {
                     content: formatted_info,
+                    styled_lines: Some(styled_lines),
                     response_type: crate::action::ResponseType::Success,
                 };
                 let _ = self.handle_action(action);
             }
             RuntimeStatus::ExecutableFileInfoFailed { error } => {
                 self.clear_waiting_state();
-                let action = Action::AddResponse {
-                    content: format!("Failed to get executable file information: {error}"),
+                let text = format!("✗ Failed to get executable file information: {error}");
+                let styled = crate::components::command_panel::ResponseFormatter::style_generic_message_lines(&text);
+                let action = Action::AddResponseWithStyle {
+                    content: text,
+                    styled_lines: Some(styled),
                     response_type: crate::action::ResponseType::Error,
                 };
                 let _ = self.handle_action(action);
@@ -2312,8 +2368,10 @@ impl App {
             RuntimeStatus::SrcPathInfo { info } => {
                 self.clear_waiting_state();
                 let formatted = info.format_for_display();
-                let action = Action::AddResponse {
+                let styled_lines = info.format_for_display_styled();
+                let action = Action::AddResponseWithStyle {
                     content: formatted,
+                    styled_lines: Some(styled_lines),
                     response_type: crate::action::ResponseType::Info,
                 };
                 let _ = self.handle_action(action);
@@ -2325,16 +2383,35 @@ impl App {
                 // This ensures file search list is updated with new path mappings
                 self.state.route_file_info_to_file_search = true;
 
-                let action = Action::AddResponse {
-                    content: format!("✓ {message}\n💡 Source code and file list reloading..."),
+                let plain = format!("✅ {message}\n💡 Source code and file list reloading...");
+                let styled = vec![
+                    crate::components::command_panel::style_builder::StyledLineBuilder::new()
+                        .styled(
+                            format!("✅ {message}"),
+                            crate::components::command_panel::style_builder::StylePresets::SUCCESS,
+                        )
+                        .build(),
+                    crate::components::command_panel::style_builder::StyledLineBuilder::new()
+                        .styled(
+                            "💡 Source code and file list reloading...",
+                            crate::components::command_panel::style_builder::StylePresets::TIP,
+                        )
+                        .build(),
+                ];
+                let action = Action::AddResponseWithStyle {
+                    content: plain,
+                    styled_lines: Some(styled),
                     response_type: crate::action::ResponseType::Success,
                 };
                 let _ = self.handle_action(action);
             }
             RuntimeStatus::SrcPathFailed { error } => {
                 self.clear_waiting_state();
-                let action = Action::AddResponse {
-                    content: format!("✗ {error}"),
+                let text = format!("✗ {error}");
+                let styled = crate::components::command_panel::ResponseFormatter::style_generic_message_lines(&text);
+                let action = Action::AddResponseWithStyle {
+                    content: text,
+                    styled_lines: Some(styled),
                     response_type: crate::action::ResponseType::Error,
                 };
                 let _ = self.handle_action(action);
@@ -2403,8 +2480,36 @@ impl App {
                 if let Some(ref preview) = script_preview {
                     response.push_str(&format!("  Script:\n{preview}\n"));
                 }
-                let action = Action::AddResponse {
+                // Also create styled version
+                let styled_lines = {
+                    let temp = crate::events::RuntimeStatus::TraceInfo {
+                        trace_id,
+                        target: target.clone(),
+                        status: status.clone(),
+                        pid,
+                        binary: binary.clone(),
+                        script_preview: None,
+                        pc,
+                    };
+                    if let Some(mut base) = temp.format_trace_info_styled() {
+                        if let Some(ref preview) = script_preview {
+                            use crate::components::command_panel::style_builder::StyledLineBuilder;
+                            use ratatui::text::Line;
+                            base.push(Line::from(""));
+                            base.push(StyledLineBuilder::new().key("📝 Script:").build());
+                            for line in preview.lines() {
+                                base.push(StyledLineBuilder::new().text("  ").value(line).build());
+                            }
+                        }
+                        Some(base)
+                    } else {
+                        None
+                    }
+                };
+
+                let action = Action::AddResponseWithStyle {
                     content: response,
+                    styled_lines,
                     response_type: crate::action::ResponseType::Info,
                 };
                 let _ = self.handle_action(action);
@@ -2457,16 +2562,31 @@ impl App {
                     // Use format_line() to show detailed info including address and module
                     response.push_str(&format!("  {}\n", trace.format_line()));
                 }
-                let action = Action::AddResponse {
+                // Styled version
+                let styled_lines = (crate::events::RuntimeStatus::TraceInfoAll {
+                    summary: summary.clone(),
+                    traces: traces.clone(),
+                })
+                .format_trace_info_styled()
+                .unwrap_or_default();
+                let action = Action::AddResponseWithStyle {
                     content: response,
+                    styled_lines: if styled_lines.is_empty() {
+                        None
+                    } else {
+                        Some(styled_lines)
+                    },
                     response_type: crate::action::ResponseType::Info,
                 };
                 let _ = self.handle_action(action);
             }
             RuntimeStatus::TraceInfoFailed { trace_id, error } => {
                 self.clear_waiting_state();
-                let action = Action::AddResponse {
-                    content: format!("Failed to get info for trace {trace_id}: {error}"),
+                let text = format!("✗ Failed to get info for trace {trace_id}: {error}");
+                let styled = crate::components::command_panel::ResponseFormatter::style_generic_message_lines(&text);
+                let action = Action::AddResponseWithStyle {
+                    content: text,
+                    styled_lines: Some(styled),
                     response_type: crate::action::ResponseType::Error,
                 };
                 let _ = self.handle_action(action);
@@ -2484,8 +2604,18 @@ impl App {
                     }
                 }
 
-                let action = Action::AddResponse {
-                    content: format!("✓ Trace {trace_id} enabled"),
+                let text = format!("✅ Trace {trace_id} enabled");
+                let styled = vec![
+                    crate::components::command_panel::style_builder::StyledLineBuilder::new()
+                        .styled(
+                            text.clone(),
+                            crate::components::command_panel::style_builder::StylePresets::SUCCESS,
+                        )
+                        .build(),
+                ];
+                let action = Action::AddResponseWithStyle {
+                    content: text,
+                    styled_lines: Some(styled),
                     response_type: crate::action::ResponseType::Success,
                 };
                 let _ = self.handle_action(action);
@@ -2503,8 +2633,18 @@ impl App {
                     }
                 }
 
-                let action = Action::AddResponse {
-                    content: format!("✓ Trace {trace_id} disabled"),
+                let text = format!("✅ Trace {trace_id} disabled");
+                let styled = vec![
+                    crate::components::command_panel::style_builder::StyledLineBuilder::new()
+                        .styled(
+                            text.clone(),
+                            crate::components::command_panel::style_builder::StylePresets::SUCCESS,
+                        )
+                        .build(),
+                ];
+                let action = Action::AddResponseWithStyle {
+                    content: text,
+                    styled_lines: Some(styled),
                     response_type: crate::action::ResponseType::Success,
                 };
                 let _ = self.handle_action(action);
@@ -2522,17 +2662,28 @@ impl App {
                     }
                 }
 
-                let action = Action::AddResponse {
-                    content: if let Some(ref err) = error {
-                        format!("✗ Failed to enable traces: {err}")
-                    } else {
-                        format!("✓ All traces enabled ({count} traces)")
-                    },
-                    response_type: if error.is_some() {
-                        crate::action::ResponseType::Error
-                    } else {
-                        crate::action::ResponseType::Success
-                    },
+                let (plain, rtype, style) = if let Some(ref err) = error {
+                    (
+                        format!("✗ Failed to enable traces: {err}"),
+                        crate::action::ResponseType::Error,
+                        crate::components::command_panel::style_builder::StylePresets::ERROR,
+                    )
+                } else {
+                    (
+                        format!("✅ All traces enabled ({count} traces)"),
+                        crate::action::ResponseType::Success,
+                        crate::components::command_panel::style_builder::StylePresets::SUCCESS,
+                    )
+                };
+                let styled = vec![
+                    crate::components::command_panel::style_builder::StyledLineBuilder::new()
+                        .styled(plain.clone(), style)
+                        .build(),
+                ];
+                let action = Action::AddResponseWithStyle {
+                    content: plain,
+                    styled_lines: Some(styled),
+                    response_type: rtype,
                 };
                 let _ = self.handle_action(action);
             }
@@ -2549,32 +2700,49 @@ impl App {
                     }
                 }
 
-                let action = Action::AddResponse {
-                    content: if let Some(ref err) = error {
-                        format!("✗ Failed to disable traces: {err}")
-                    } else {
-                        format!("✓ All traces disabled ({count} traces)")
-                    },
-                    response_type: if error.is_some() {
-                        crate::action::ResponseType::Error
-                    } else {
-                        crate::action::ResponseType::Success
-                    },
+                let (plain, rtype, style) = if let Some(ref err) = error {
+                    (
+                        format!("✗ Failed to disable traces: {err}"),
+                        crate::action::ResponseType::Error,
+                        crate::components::command_panel::style_builder::StylePresets::ERROR,
+                    )
+                } else {
+                    (
+                        format!("✅ All traces disabled ({count} traces)"),
+                        crate::action::ResponseType::Success,
+                        crate::components::command_panel::style_builder::StylePresets::SUCCESS,
+                    )
+                };
+                let styled = vec![
+                    crate::components::command_panel::style_builder::StyledLineBuilder::new()
+                        .styled(plain.clone(), style)
+                        .build(),
+                ];
+                let action = Action::AddResponseWithStyle {
+                    content: plain,
+                    styled_lines: Some(styled),
+                    response_type: rtype,
                 };
                 let _ = self.handle_action(action);
             }
             RuntimeStatus::TraceEnableFailed { trace_id, error } => {
                 self.clear_waiting_state();
-                let action = Action::AddResponse {
-                    content: format!("✗ Failed to enable trace {trace_id}: {error}"),
+                let text = format!("✗ Failed to enable trace {trace_id}: {error}");
+                let styled = crate::components::command_panel::ResponseFormatter::style_generic_message_lines(&text);
+                let action = Action::AddResponseWithStyle {
+                    content: text,
+                    styled_lines: Some(styled),
                     response_type: crate::action::ResponseType::Error,
                 };
                 let _ = self.handle_action(action);
             }
             RuntimeStatus::TraceDisableFailed { trace_id, error } => {
                 self.clear_waiting_state();
-                let action = Action::AddResponse {
-                    content: format!("✗ Failed to disable trace {trace_id}: {error}"),
+                let text = format!("✗ Failed to disable trace {trace_id}: {error}");
+                let styled = crate::components::command_panel::ResponseFormatter::style_generic_message_lines(&text);
+                let action = Action::AddResponseWithStyle {
+                    content: text,
+                    styled_lines: Some(styled),
                     response_type: crate::action::ResponseType::Error,
                 };
                 let _ = self.handle_action(action);
@@ -2592,8 +2760,18 @@ impl App {
                     }
                 }
 
-                let action = Action::AddResponse {
-                    content: format!("✓ Trace {trace_id} deleted"),
+                let text = format!("✅ Trace {trace_id} deleted");
+                let styled = vec![
+                    crate::components::command_panel::style_builder::StyledLineBuilder::new()
+                        .styled(
+                            text.clone(),
+                            crate::components::command_panel::style_builder::StylePresets::SUCCESS,
+                        )
+                        .build(),
+                ];
+                let action = Action::AddResponseWithStyle {
+                    content: text,
+                    styled_lines: Some(styled),
                     response_type: crate::action::ResponseType::Success,
                 };
                 let _ = self.handle_action(action);
@@ -2608,24 +2786,38 @@ impl App {
                     self.state.source_panel.trace_locations.clear();
                 }
 
-                let action = Action::AddResponse {
-                    content: if let Some(ref err) = error {
-                        format!("✗ Failed to delete traces: {err}")
-                    } else {
-                        format!("✓ All traces deleted ({count} traces)")
-                    },
-                    response_type: if error.is_some() {
-                        crate::action::ResponseType::Error
-                    } else {
-                        crate::action::ResponseType::Success
-                    },
+                let (plain, rtype, style) = if let Some(ref err) = error {
+                    (
+                        format!("✗ Failed to delete traces: {err}"),
+                        crate::action::ResponseType::Error,
+                        crate::components::command_panel::style_builder::StylePresets::ERROR,
+                    )
+                } else {
+                    (
+                        format!("✅ All traces deleted ({count} traces)"),
+                        crate::action::ResponseType::Success,
+                        crate::components::command_panel::style_builder::StylePresets::SUCCESS,
+                    )
+                };
+                let styled = vec![
+                    crate::components::command_panel::style_builder::StyledLineBuilder::new()
+                        .styled(plain.clone(), style)
+                        .build(),
+                ];
+                let action = Action::AddResponseWithStyle {
+                    content: plain,
+                    styled_lines: Some(styled),
+                    response_type: rtype,
                 };
                 let _ = self.handle_action(action);
             }
             RuntimeStatus::TraceDeleteFailed { trace_id, error } => {
                 self.clear_waiting_state();
-                let action = Action::AddResponse {
-                    content: format!("✗ Failed to delete trace {trace_id}: {error}"),
+                let text = format!("✗ Failed to delete trace {trace_id}: {error}");
+                let styled = crate::components::command_panel::ResponseFormatter::style_generic_message_lines(&text);
+                let action = Action::AddResponseWithStyle {
+                    content: text,
+                    styled_lines: Some(styled),
                     response_type: crate::action::ResponseType::Error,
                 };
                 let _ = self.handle_action(action);
@@ -2636,16 +2828,29 @@ impl App {
                 total_count,
             } => {
                 self.clear_waiting_state();
-                let action = Action::AddResponse {
-                    content: format!("✓ Saved {saved_count} of {total_count} traces to {filename}"),
+                let text = format!("✅ Saved {saved_count} of {total_count} traces to {filename}");
+                let styled = vec![
+                    crate::components::command_panel::style_builder::StyledLineBuilder::new()
+                        .styled(
+                            text.clone(),
+                            crate::components::command_panel::style_builder::StylePresets::SUCCESS,
+                        )
+                        .build(),
+                ];
+                let action = Action::AddResponseWithStyle {
+                    content: text,
+                    styled_lines: Some(styled),
                     response_type: crate::action::ResponseType::Success,
                 };
                 let _ = self.handle_action(action);
             }
             RuntimeStatus::TracesSaveFailed { error } => {
                 self.clear_waiting_state();
-                let action = Action::AddResponse {
-                    content: format!("✗ Failed to save traces: {error}"),
+                let text = format!("✗ Failed to save traces: {error}");
+                let styled = crate::components::command_panel::ResponseFormatter::style_generic_message_lines(&text);
+                let action = Action::AddResponseWithStyle {
+                    content: text,
+                    styled_lines: Some(styled),
                     response_type: crate::action::ResponseType::Error,
                 };
                 let _ = self.handle_action(action);
@@ -2674,7 +2879,7 @@ impl App {
                     ));
                 } else {
                     // Some traces failed
-                    response.push_str(&format!("⚠ Partially loaded traces from {filename}\n"));
+                    response.push_str(&format!("⚠️ Partially loaded traces from {filename}\n"));
                     response.push_str(&format!(
                         "  ✓ {} traces created ({} enabled, {} disabled)\n",
                         success_count,
@@ -2692,8 +2897,69 @@ impl App {
                     }
                 }
 
-                let action = Action::AddResponse {
+                // Styled version
+                let mut styled = Vec::new();
+                use crate::components::command_panel::style_builder::{
+                    StylePresets, StyledLineBuilder,
+                };
+                if failed_count == 0 {
+                    styled.push(
+                        StyledLineBuilder::new()
+                            .styled(
+                                format!(
+                                    "✅ Loaded {} traces from {} ({} enabled, {} disabled)",
+                                    total_count,
+                                    filename,
+                                    success_count - disabled_count,
+                                    disabled_count
+                                ),
+                                StylePresets::SUCCESS,
+                            )
+                            .build(),
+                    );
+                } else {
+                    styled.push(
+                        StyledLineBuilder::new()
+                            .styled(
+                                format!("⚠️ Partially loaded traces from {filename}"),
+                                StylePresets::WARNING,
+                            )
+                            .build(),
+                    );
+                    styled.push(
+                        StyledLineBuilder::new()
+                            .text("  ")
+                            .styled(
+                                format!(
+                                    "✅ {} traces created ({} enabled, {} disabled)",
+                                    success_count,
+                                    success_count - disabled_count,
+                                    disabled_count
+                                ),
+                                StylePresets::SUCCESS,
+                            )
+                            .build(),
+                    );
+                    for detail in &details {
+                        if let crate::events::LoadStatus::Failed = detail.status {
+                            if let Some(ref err) = detail.error {
+                                styled.push(
+                                    StyledLineBuilder::new()
+                                        .text("  ")
+                                        .styled(
+                                            format!("✗ {} - {}", detail.target, err),
+                                            StylePresets::ERROR,
+                                        )
+                                        .build(),
+                                );
+                            }
+                        }
+                    }
+                }
+
+                let action = Action::AddResponseWithStyle {
                     content: response,
+                    styled_lines: Some(styled),
                     response_type: if failed_count == 0 {
                         crate::action::ResponseType::Success
                     } else {
@@ -2704,8 +2970,11 @@ impl App {
             }
             RuntimeStatus::TracesLoadFailed { filename, error } => {
                 self.clear_waiting_state();
-                let action = Action::AddResponse {
-                    content: format!("✗ Failed to load {filename}: {error}"),
+                let text = format!("✗ Failed to load {filename}: {error}");
+                let styled = crate::components::command_panel::ResponseFormatter::style_generic_message_lines(&text);
+                let action = Action::AddResponseWithStyle {
+                    content: text,
+                    styled_lines: Some(styled),
                     response_type: crate::action::ResponseType::Error,
                 };
                 let _ = self.handle_action(action);
@@ -2733,8 +3002,10 @@ impl App {
                 }
 
                 if let Some(content) = self.format_runtime_status_for_display(&status) {
-                    let action = Action::AddResponse {
+                    let styled_lines = crate::components::command_panel::ResponseFormatter::style_generic_message_lines(&content);
+                    let action = Action::AddResponseWithStyle {
                         content,
+                        styled_lines: Some(styled_lines),
                         response_type: self.get_response_type_for_status(&status),
                     };
                     let _ = self.handle_action(action);

@@ -718,34 +718,8 @@ impl OptimizedInputHandler {
 
     /// Add a command to the command history
     fn add_command_to_history(&self, state: &mut CommandPanelState, command: &str) {
-        use crate::model::panel_state::CommandHistoryItem;
-        use std::time::Instant;
-
-        // Add to new history manager (persistent)
-        state.add_command_to_history(command);
-
-        // Also add to old command_history for display compatibility
-        let item = CommandHistoryItem {
-            command: command.to_string(),
-            response: None, // Will be filled when response arrives
-            timestamp: Instant::now(),
-            prompt: "(ghostscope) ".to_string(),
-            response_type: None,
-        };
-
-        state.command_history.push(item);
-        tracing::debug!(
-            "add_command_to_history: Added command '{}', history length now: {}",
-            command,
-            state.command_history.len()
-        );
-
-        // Limit history size
-        const MAX_HISTORY: usize = 1000;
-        if state.command_history.len() > MAX_HISTORY {
-            state.command_history.remove(0);
-        }
-        // Note: Renderer will display command_history directly
+        // Use the unified method from CommandPanelState
+        state.add_command_entry(command);
     }
 }
 
