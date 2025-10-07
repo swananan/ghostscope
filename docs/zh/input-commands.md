@@ -320,46 +320,53 @@ Debug files (.gnu_debuglink):
 
 **语法：**
 ```
-info function <name>
-i f <name>          # 缩写形式
+info function <name> [verbose|v]
+i f <name> [v]      # 缩写形式
 ```
 
 **参数：**
 - `<name>`: 函数名
+- `[verbose|v]`: 可选。显示 DWARF 位置表达式（默认隐藏）
 
 **示例：**
 ```
-info function main       # 显示main的调试信息
-i f calculate           # 缩写形式
+info function main       # 显示调试信息（不显示 DWARF 表达式）
+info function main v     # 显示完整调试信息（包含 DWARF 表达式）
+i f calculate verbose   # 缩写形式，显示详细信息
+i f test v              # 最短形式，显示详细信息
 ```
 
 ### info line - 源码行调试信息
 
 **语法：**
 ```
-info line <file:line>
-i l <file:line>     # 缩写形式
+info line <file:line> [verbose|v]
+i l <file:line> [v] # 缩写形式
 ```
 
 **参数：**
 - `<file:line>`: 文件名和行号
+- `[verbose|v]`: 可选。显示 DWARF 位置表达式（默认隐藏）
 
 **示例：**
 ```
-info line main.c:42     # 第42行的调试信息
-i l test.c:100         # 缩写形式
+info line main.c:42     # 显示第42行的调试信息（不显示 DWARF 表达式）
+info line main.c:42 v   # 显示完整调试信息（包含 DWARF 表达式）
+i l test.c:100 verbose # 缩写形式，显示详细信息
+i l test.c:100 v       # 最短形式，显示详细信息
 ```
 
 ### info address - 地址调试信息 [待实现]
 
 **语法：**
 ```
-info address <addr>
-i a <addr>          # 缩写形式
+info address <addr> [verbose|v]
+i a <addr> [v]      # 缩写形式
 ```
 
 **参数：**
 - `<addr>`: 内存地址
+- `[verbose|v]`: 可选。显示 DWARF 位置表达式（默认隐藏）
 
 **状态：** 尚未实现
 

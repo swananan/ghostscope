@@ -324,46 +324,53 @@ Debug files (.gnu_debuglink):
 
 **Syntax:**
 ```
-info function <name>
-i f <name>          # Short form
+info function <name> [verbose|v]
+i f <name> [v]      # Short form
 ```
 
 **Parameters:**
 - `<name>`: Function name
+- `[verbose|v]`: Optional. Show DWARF location expressions (hidden by default)
 
 **Examples:**
 ```
-info function main       # Show debug info for main
-i f calculate           # Short form
+info function main       # Show debug info (without DWARF expressions)
+info function main v     # Show with DWARF expressions
+i f calculate verbose   # Short form with verbose
+i f test v              # Shortest form with verbose
 ```
 
 ### info line - Source Line Debug Info
 
 **Syntax:**
 ```
-info line <file:line>
-i l <file:line>     # Short form
+info line <file:line> [verbose|v]
+i l <file:line> [v] # Short form
 ```
 
 **Parameters:**
 - `<file:line>`: File name and line number
+- `[verbose|v]`: Optional. Show DWARF location expressions (hidden by default)
 
 **Examples:**
 ```
-info line main.c:42     # Debug info for line 42
-i l test.c:100         # Short form
+info line main.c:42     # Debug info for line 42 (without DWARF expressions)
+info line main.c:42 v   # Show with DWARF expressions
+i l test.c:100 verbose # Short form with verbose
+i l test.c:100 v       # Shortest form with verbose
 ```
 
 ### info address - Address Debug Info [TODO]
 
 **Syntax:**
 ```
-info address <addr>
-i a <addr>          # Short form
+info address <addr> [verbose|v]
+i a <addr> [v]      # Short form
 ```
 
 **Parameters:**
 - `<addr>`: Memory address
+- `[verbose|v]`: Optional. Show DWARF location expressions (hidden by default)
 
 **Status:** Not yet implemented
 

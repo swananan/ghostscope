@@ -234,8 +234,12 @@ pub async fn handle_info_function(
     session: &mut Option<GhostSession>,
     runtime_channels: &mut RuntimeChannels,
     target: String,
+    verbose: bool,
 ) {
-    info!("Info function request for: {}", target);
+    info!(
+        "Info function request for: {} (verbose: {})",
+        target, verbose
+    );
 
     let result = try_get_function_debug_info(session, &target);
 
@@ -247,6 +251,7 @@ pub async fn handle_info_function(
                 .send(RuntimeStatus::InfoFunctionResult {
                     target: target.clone(),
                     info: debug_info,
+                    verbose,
                 });
         }
         Err(error_msg) => {
@@ -269,8 +274,9 @@ pub async fn handle_info_line(
     session: &mut Option<GhostSession>,
     runtime_channels: &mut RuntimeChannels,
     target: String,
+    verbose: bool,
 ) {
-    info!("Info line request for: {}", target);
+    info!("Info line request for: {} (verbose: {})", target, verbose);
 
     let result = try_get_line_debug_info(session, &target);
 
@@ -282,6 +288,7 @@ pub async fn handle_info_line(
                 .send(RuntimeStatus::InfoLineResult {
                     target: target.clone(),
                     info: debug_info,
+                    verbose,
                 });
         }
         Err(error_msg) => {
@@ -304,6 +311,7 @@ pub async fn handle_info_address(
     _session: &mut Option<GhostSession>,
     runtime_channels: &mut RuntimeChannels,
     target: String,
+    _verbose: bool,
 ) {
     info!("Info address request for: {} (not implemented)", target);
 

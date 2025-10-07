@@ -2267,12 +2267,16 @@ impl App {
                     let _ = self.handle_action(action);
                 }
             }
-            RuntimeStatus::InfoFunctionResult { target: _, info } => {
+            RuntimeStatus::InfoFunctionResult {
+                target: _,
+                info,
+                verbose,
+            } => {
                 // Mark command as completed
                 self.clear_waiting_state();
                 // Format and display function debug info
-                let formatted_info = info.format_for_display();
-                let styled_lines = info.format_for_display_styled();
+                let formatted_info = info.format_for_display(verbose);
+                let styled_lines = info.format_for_display_styled(verbose);
                 let action = Action::AddResponseWithStyle {
                     content: formatted_info,
                     styled_lines: Some(styled_lines),
@@ -2291,12 +2295,16 @@ impl App {
                 };
                 let _ = self.handle_action(action);
             }
-            RuntimeStatus::InfoLineResult { target: _, info } => {
+            RuntimeStatus::InfoLineResult {
+                target: _,
+                info,
+                verbose,
+            } => {
                 // Mark command as completed
                 self.clear_waiting_state();
                 // Format and display line debug info
-                let formatted_info = info.format_for_display();
-                let styled_lines = info.format_for_display_styled();
+                let formatted_info = info.format_for_display(verbose);
+                let styled_lines = info.format_for_display_styled(verbose);
                 let action = Action::AddResponseWithStyle {
                     content: formatted_info,
                     styled_lines: Some(styled_lines),
@@ -2315,12 +2323,16 @@ impl App {
                 };
                 let _ = self.handle_action(action);
             }
-            RuntimeStatus::InfoAddressResult { target: _, info } => {
+            RuntimeStatus::InfoAddressResult {
+                target: _,
+                info,
+                verbose,
+            } => {
                 // Mark command as completed
                 self.clear_waiting_state();
                 // Format and display address debug info
-                let formatted_info = info.format_for_display();
-                let styled_lines = info.format_for_display_styled();
+                let formatted_info = info.format_for_display(verbose);
+                let styled_lines = info.format_for_display_styled(verbose);
                 let action = Action::AddResponseWithStyle {
                     content: formatted_info,
                     styled_lines: Some(styled_lines),
