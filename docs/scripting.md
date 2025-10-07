@@ -218,7 +218,7 @@ let quotient = a / b;  // Division
 
 1. Parentheses `()`
 2. Member access `.`, Array access `[]`
-3. Pointer dereference `*`, Address of `&`, Unary minus `-`
+3. Pointer dereference `*`, Address of `&`, Unary minus `-`, Logical NOT `!`
 4. Multiplication `/`, Division `/`
 5. Addition `+`, Subtraction `-`
 6. Comparisons `==`, `!=`, `<`, `<=`, `>`, `>=`
@@ -235,8 +235,9 @@ let complex = (x + y) / (a - b);
 
 ### Logical Operators
 
-- `&&` (logical AND), `||` (logical OR)
+- `!` (logical NOT), `&&` (logical AND), `||` (logical OR)
 - Operands are treated as booleans with "non-zero is true" semantics
+- `!expr` yields `true` if `expr` evaluates to zero/false; otherwise `false`.
 - `||` and `&&` use short-circuit evaluation
   - `||`: if LHS is true, RHS is not evaluated
   - `&&`: if LHS is false, RHS is not evaluated
@@ -255,6 +256,10 @@ trace main:entry {
     } else if a < 100 || p == 0 {
         print "OR";
     }
+
+    // Unary logical NOT on expressions that produce booleans
+    print "NOT1:{}", !starts_with(activity, "main");
+    print "NOT2:{}", !strncmp(record, "HTTP", 4);
 }
 ```
 

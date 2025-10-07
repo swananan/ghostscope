@@ -845,6 +845,7 @@ impl<'ctx> EbpfContext<'ctx> {
                 E::Int(v) => v.to_string(),
                 E::String(s) => format!("\"{}\"", s),
                 E::Float(v) => format!("{}", v),
+                E::UnaryNot(e1) => format!("!{}", inner(e1)),
                 E::Bool(v) => v.to_string(),
                 E::SpecialVar(s) => format!("${}", s),
                 E::BuiltinCall { name, args } => {

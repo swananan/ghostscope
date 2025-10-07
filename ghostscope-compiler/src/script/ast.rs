@@ -4,6 +4,7 @@ pub enum Expr {
     Float(f64),
     String(String),
     Bool(bool),
+    UnaryNot(Box<Expr>),
     Variable(String),
     MemberAccess(Box<Expr>, String),   // person.name
     PointerDeref(Box<Expr>),           // *ptr
@@ -166,6 +167,7 @@ pub fn infer_type(expr: &Expr) -> Result<VarType, String> {
         Expr::Float(_) => Ok(VarType::Float),
         Expr::String(_) => Ok(VarType::String),
         Expr::Bool(_) => Ok(VarType::Bool),
+        Expr::UnaryNot(_) => Ok(VarType::Bool),
         // During parsing phase, we cannot know variable types, only check literal expressions
         // For variable references, return a default type to allow compilation to continue, actual type checking will be done in code generation phase
         Expr::Variable(_) => Ok(VarType::Int), // Temporarily assume variables are integer type to let parsing pass

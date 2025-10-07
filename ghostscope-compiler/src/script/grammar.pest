@@ -61,7 +61,9 @@ additive = { term ~ (add_op ~ term)* }
 // Support unary minus by introducing a 'unary' level
 term = { unary ~ (mul_op ~ unary)* }
 // Note: use recursive definition so multiple '-' nest correctly and parser can detect '-' branch
-unary = { "-" ~ unary | factor }
+neg_unary = { "-" ~ unary }
+not_unary = { "!" ~ unary }
+unary = { neg_unary | not_unary | factor }
 factor = {
     // Builtin calls must be checked before identifier to avoid ambiguity
     strncmp_call |
