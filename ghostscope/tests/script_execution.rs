@@ -1420,6 +1420,44 @@ trace process_record {
 }
 
 #[tokio::test]
+async fn test_bool_literals_in_expressions() -> anyhow::Result<()> {
+    init();
+    ensure_global_cleanup_registered();
+
+    // Validate boolean literals in expressions (both orders) and negative cases
+    let script_content = r#"
+trace log_activity {
+    // positive cases
+    print "B1:{}", starts_with(activity, "main") == true;
+    print "B4:{}", true == starts_with(activity, "main");
+    // negative (non-match literal)
+    print "B6:{}", starts_with(activity, "zzz") == false;
+}
+
+trace process_record {
+    // positive cases
+    print "B2:{}", strncmp(record, "HTTP", 4) == false;
+    print "B3:{}", false == strncmp(record, "HTTP", 4);
+    // negative case (should be false)
+    print "B5:{}", strncmp(record, "HTTP", 4) == true;
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script(script_content, 6).await?;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    // positives
+    assert!(stdout.lines().any(|l| l.contains("B1:true")), "Expected B1:true. STDOUT: {}", stdout);
+    assert!(stdout.lines().any(|l| l.contains("B2:true")), "Expected B2:true. STDOUT: {}", stdout);
+    assert!(stdout.lines().any(|l| l.contains("B3:true")), "Expected B3:true. STDOUT: {}", stdout);
+    assert!(stdout.lines().any(|l| l.contains("B4:true")), "Expected B4:true. STDOUT: {}", stdout);
+    assert!(stdout.lines().any(|l| l.contains("B6:true")), "Expected B6:true. STDOUT: {}", stdout);
+    // negative
+    assert!(stdout.lines().any(|l| l.contains("B5:false")), "Expected B5:false. STDOUT: {}", stdout);
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_correct_pid_filtering() -> anyhow::Result<()> {
     init();
     ensure_global_cleanup_registered();

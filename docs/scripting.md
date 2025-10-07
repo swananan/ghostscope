@@ -94,7 +94,7 @@ Script variable types and capabilities:
 | Type | Literal/Example | Description | Ops/Comparisons |
 | --- | --- | --- | --- |
 | Integer (int, internally i64) | `123`, `-42` | Signed 64-bit integer | +, -, *, /; can mix with DWARF integer-like scalars |
-| Boolean (bool) | from comparisons: `a < b` | Produced by comparisons/logical expressions | logical AND/OR (script only); when mixing with DWARF integers, treated as 0/1 |
+| Boolean (bool) | `true`, `false`, or from comparisons like `a < b` | Produced by literals/comparisons/logical expressions | logical AND/OR (script only); when mixing with DWARF integers, treated as 0/1 |
 | String | `"hello"` | UTF-8 string literal | Equality `==`, `!=` with DWARF C strings; no ordering comparisons |
 
 Notes:

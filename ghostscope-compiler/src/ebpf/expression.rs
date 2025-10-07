@@ -173,6 +173,11 @@ impl<'ctx> EbpfContext<'ctx> {
                     .map_err(|e| CodeGenError::Builder(e.to_string()))?;
                 Ok(cast_ptr)
             }
+            Expr::Bool(value) => {
+                // Represent booleans as i1 for logical/compare consistency
+                let b = self.context.bool_type().const_int(if *value { 1 } else { 0 }, false);
+                Ok(b.into())
+            }
             Expr::Variable(var_name) => {
                 debug!("compile_expr: Compiling variable expression: {}", var_name);
 
