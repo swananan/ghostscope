@@ -8,7 +8,140 @@ use inkwell::values::BasicValueEnum;
 use inkwell::AddressSpace;
 use tracing::debug;
 
+// Read cap for string builtins (strncmp/starts_with)
+pub const STRING_BUILTIN_READ_CAP: u32 = 64;
+
 impl<'ctx> EbpfContext<'ctx> {
+    /// Builtin strncmp/starts_with implementation: bounded byte-compare without NUL requirement.
+    fn compile_strncmp_builtin(
+        &mut self,
+        dwarf_expr: &Expr,
+        lit: &str,
+        n: u32,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        // Resolve DWARF expression to get address or pointer value
+        let var = self
+            .query_dwarf_for_complex_expr(dwarf_expr)?
+            .ok_or_else(|| CodeGenError::TypeError("builtin requires DWARF expression".into()))?;
+
+        // Determine pointer value (i64) of the target memory
+        let ptr_i64 = if let Some(dty) = var.dwarf_type.as_ref() {
+            // Try full value first
+            let val_any = self.evaluate_result_to_llvm_value(
+                &var.evaluation_result,
+                dty,
+                &var.name,
+                self.get_compile_time_context()?.pc_address,
+            )?;
+            match val_any {
+                BasicValueEnum::IntValue(iv) => iv,
+                BasicValueEnum::PointerValue(pv) => self
+                    .builder
+                    .build_ptr_to_int(pv, self.context.i64_type(), "ptr_as_i64")
+                    .map_err(|e| CodeGenError::Builder(e.to_string()))?,
+                _ => {
+                    // Fallback: read pointer from address
+                    let module_hint = self.current_resolved_var_module_path.clone();
+                    let addr = self.evaluation_result_to_address_with_hint(
+                        &var.evaluation_result,
+                        None,
+                        module_hint.as_deref(),
+                    )?;
+                    let val_any =
+                        self.generate_memory_read(addr, ghostscope_dwarf::MemoryAccessSize::U64)?;
+                    match val_any {
+                        BasicValueEnum::IntValue(iv) => iv,
+                        _ => {
+                            return Err(CodeGenError::LLVMError(
+                                "pointer load did not return integer".into(),
+                            ))
+                        }
+                    }
+                }
+            }
+        } else {
+            // No DWARF type: compute address then read pointer-sized value
+            let module_hint = self.current_resolved_var_module_path.clone();
+            let addr = self.evaluation_result_to_address_with_hint(
+                &var.evaluation_result,
+                None,
+                module_hint.as_deref(),
+            )?;
+            let val_any =
+                self.generate_memory_read(addr, ghostscope_dwarf::MemoryAccessSize::U64)?;
+            match val_any {
+                BasicValueEnum::IntValue(iv) => iv,
+                _ => {
+                    return Err(CodeGenError::LLVMError(
+                        "pointer load did not return integer".into(),
+                    ))
+                }
+            }
+        };
+
+        // Cap read length for safety
+        let max_n = std::cmp::min(n, STRING_BUILTIN_READ_CAP);
+        let lit_len = std::cmp::min(lit.len() as u32, STRING_BUILTIN_READ_CAP);
+        let cmp_len = std::cmp::min(max_n, lit_len);
+
+        // Read bytes into buffer
+        let (buf_global, status, arr_ty) =
+            self.read_user_bytes_into_buffer(ptr_i64, cmp_len, "_gs_bi_strncmp")?;
+        let status_ok = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                status,
+                self.context.i64_type().const_zero(),
+                "rd_ok",
+            )
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        // XOR/OR accumulation over cmp_len bytes
+        let i32_ty = self.context.i32_type();
+        let idx0 = i32_ty.const_zero();
+        let mut acc = self.context.i8_type().const_zero();
+        for (i, b) in lit.as_bytes().iter().take(cmp_len as usize).enumerate() {
+            let idx_i = i32_ty.const_int(i as u64, false);
+            let ptr_i = unsafe {
+                self.builder
+                    .build_gep(arr_ty, buf_global, &[idx0, idx_i], "ch_ptr")
+                    .map_err(|e| CodeGenError::Builder(e.to_string()))?
+            };
+            let ch = self
+                .builder
+                .build_load(self.context.i8_type(), ptr_i, "ch")
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            let ch = match ch {
+                BasicValueEnum::IntValue(iv) => iv,
+                _ => return Err(CodeGenError::LLVMError("load did not return i8".into())),
+            };
+            let expect = self.context.i8_type().const_int(*b as u64, false);
+            let diff = self
+                .builder
+                .build_xor(ch, expect, "diff")
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            acc = self
+                .builder
+                .build_or(acc, diff, "acc_or")
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        }
+        let eq_bytes = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                acc,
+                self.context.i8_type().const_zero(),
+                "acc_zero",
+            )
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        let result = self
+            .builder
+            .build_and(status_ok, eq_bytes, "strncmp_and")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        Ok(result.into())
+    }
     /// Compile an expression
     pub fn compile_expr(&mut self, expr: &Expr) -> Result<BasicValueEnum<'ctx>> {
         match expr {
@@ -77,6 +210,52 @@ impl<'ctx> EbpfContext<'ctx> {
                 self.compile_dwarf_expression(expr)
             }
             Expr::SpecialVar(name) => self.handle_special_variable(name),
+            Expr::BuiltinCall { name, args } => match name.as_str() {
+                "strncmp" => {
+                    if args.len() != 3 {
+                        return Err(CodeGenError::TypeError(
+                            "strncmp expects 3 arguments".into(),
+                        ));
+                    }
+                    let n = match &args[2] {
+                        Expr::Int(v) if *v >= 0 => *v as u32,
+                        _ => {
+                            return Err(CodeGenError::TypeError(
+                                "strncmp length must be a non-negative integer literal".into(),
+                            ))
+                        }
+                    };
+                    let lit = match &args[1] {
+                        Expr::String(s) => s.as_str(),
+                        _ => {
+                            return Err(CodeGenError::TypeError(
+                                "strncmp second argument must be a string literal".into(),
+                            ))
+                        }
+                    };
+                    self.compile_strncmp_builtin(&args[0], lit, n)
+                }
+                "starts_with" => {
+                    if args.len() != 2 {
+                        return Err(CodeGenError::TypeError(
+                            "starts_with expects 2 arguments".into(),
+                        ));
+                    }
+                    let lit = match &args[1] {
+                        Expr::String(s) => s.as_str(),
+                        _ => {
+                            return Err(CodeGenError::TypeError(
+                                "starts_with second argument must be a string literal".into(),
+                            ))
+                        }
+                    };
+                    self.compile_strncmp_builtin(&args[0], lit, lit.len() as u32)
+                }
+                _ => Err(CodeGenError::NotImplemented(format!(
+                    "Unknown builtin function: {}",
+                    name
+                ))),
+            },
             Expr::BinaryOp { left, op, right } => {
                 // String comparison fast-path: script string vs DWARF char*/char[N]
                 if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual) {

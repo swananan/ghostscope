@@ -63,6 +63,9 @@ term = { unary ~ (mul_op ~ unary)* }
 // Note: use recursive definition so multiple '-' nest correctly and parser can detect '-' branch
 unary = { "-" ~ unary | factor }
 factor = {
+    // Builtin calls must be checked before identifier to avoid ambiguity
+    strncmp_call |
+    starts_with_call |
     string |
     float |
     int |
@@ -75,6 +78,10 @@ factor = {
     identifier |
     "(" ~ expr ~ ")"
 }
+
+// Builtin function calls (phase 1)
+strncmp_call = { "strncmp" ~ "(" ~ expr ~ "," ~ string ~ "," ~ int ~ ")" }
+starts_with_call = { "starts_with" ~ "(" ~ expr ~ "," ~ string ~ ")" }
 
 special_var = @{ "$" ~ (ASCII_ALPHANUMERIC | "_")+ }
 

@@ -10,6 +10,11 @@ pub enum Expr {
     ArrayAccess(Box<Expr>, Box<Expr>), // arr[0] (new)
     ChainAccess(Vec<String>),          // person.name.first (new)
     SpecialVar(String),                // For $arg0, $arg1, $retval, $pc, $sp etc.
+    // Builtin function call, e.g., strncmp(expr, "lit", n), starts_with(expr, "lit")
+    BuiltinCall {
+        name: String,
+        args: Vec<Expr>,
+    },
     BinaryOp {
         left: Box<Expr>,
         op: BinaryOp,
@@ -168,6 +173,10 @@ pub fn infer_type(expr: &Expr) -> Result<VarType, String> {
         Expr::ArrayAccess(_, _) => Ok(VarType::Int), // New: array access returns element type (assume int for now)
         Expr::ChainAccess(_) => Ok(VarType::Int), // New: chain access returns final member type (assume int for now)
         Expr::SpecialVar(_) => Ok(VarType::Int),  // Special variables like $arg0, $retval etc.
+        Expr::BuiltinCall { name, args: _ } => match name.as_str() {
+            "strncmp" | "starts_with" => Ok(VarType::Bool),
+            _ => Err(format!("Unknown builtin function: {}", name)),
+        },
         Expr::BinaryOp { left, op, right } => {
             // Only check types when both sides are literals
             let left_is_literal = matches!(

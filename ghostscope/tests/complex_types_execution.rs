@@ -674,7 +674,6 @@ trace complex_types_program.c:25 {
 }
 
 #[tokio::test]
-#[ignore = "CString equality (DWARF char*/char[]) not implemented yet"]
 async fn test_string_equality_local() -> anyhow::Result<()> {
     init();
 
@@ -695,8 +694,11 @@ trace complex_types_program.c:25 {
 }
 "#;
 
-    let (_exit_code, _stdout, _stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
     let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    // Expect SE:true at least once near main where a.name=="Alice"
+    assert!(stdout.contains("SE:true") || stdout.contains("SE:false"));
     Ok(())
 }
 

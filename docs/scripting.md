@@ -9,9 +9,10 @@ GhostScope uses a domain-specific language for defining trace points and actions
 4. [Print Statement](#print-statement)
 5. [Conditional Statements](#conditional-statements)
 6. [Expressions](#expressions)
-7. [Special Variables](#special-variables)
-8. [Examples](#examples)
-9. [Limitations](#limitations)
+7. [Built-in Functions](#built-in-functions)
+8. [Special Variables](#special-variables)
+9. [Examples](#examples)
+10. [Limitations](#limitations)
 
 ## Basic Syntax
 
@@ -328,9 +329,51 @@ Performance and safety notes:
 
 - Comparisons are compiled into bounded, branch-light checks to be verifier-friendly on most kernels. Still, placing many string comparisons in a single probe or attaching at extremely hot sites may add CPU and verifier load.
 - Prefer attaching at less-hot lines/functions if you only need occasional confirmation (e.g., update sites for a string field), or split multiple heavy comparisons into separate trace points.
-- GhostScope limits read sizes internally; very long literals may be truncated by an internal cap for safety.
+- Builtins (`strncmp`/`starts_with`) cap read length to 64 bytes for safety (see `STRING_BUILTIN_READ_CAP` in `ghostscope-compiler/src/ebpf/expression.rs`).
+  CString equality reads only `L+1` bytes (no extra cap beyond the literal length).
 
 // Floats are not supported in GhostScope scripts.
+
+## Built-in Functions
+
+GhostScope provides built-in functions to make common string checks efficient and verifier-friendly.
+
+Supported built-ins (phase 1):
+- `strncmp(expr, "lit", n)`
+  - Compares the first `n` bytes of the memory pointed to by `expr` against the string literal `lit`.
+  - Does not require a terminating NUL within `n` bytes.
+  - `expr` may be a DWARF `char*`, `char[N]`, or a generic pointer expression; GhostScope performs a bounded user-memory read and compares bytes.
+  - Any read failure evaluates to `false`.
+  - Read length is capped at 64 bytes; if `n` exceeds the cap or the available array size, it is truncated. See `STRING_BUILTIN_READ_CAP` in `ghostscope-compiler/src/ebpf/expression.rs`.
+
+- `starts_with(expr, "lit")`
+  - Equivalent to `strncmp(expr, "lit", len("lit"))`.
+  - Same failure and safety semantics as above.
+
+Verifier friendliness and performance:
+- Compiles to branch-light byte comparisons (e.g., XOR/OR accumulation) to avoid verifier state explosion.
+- Avoid packing many large string checks into a single very hot probe; consider splitting trace points or using less-hot sites when possible.
+
+Examples
+
+```ghostscope
+// Function parameter (const char* activity)
+trace log_activity {
+    print "is_main:{}", starts_with(activity, "main");
+    print "eq5:{}", strncmp(activity, "main_", 5);
+}
+
+// Global C strings and fixed arrays
+trace globals_program.c:32 {
+    print "gm_hello:{}", starts_with(gm, "Hello"); // gm: const char*
+    print "lm_libw:{}", strncmp(lm, "LIB_", 4);    // lm: const char*
+}
+
+// Generic pointer (read failure -> false)
+trace process_record {
+    print "rec_http:{}", strncmp(record, "HTTP", 4); // record: struct* -> false
+}
+```
 ```
 
 ### Special Variables (In Progress)
@@ -461,7 +504,7 @@ trace server_respond {
 1. **No Loops**: For safety reasons, loops (`for`, `while`) are not supported
 2. **No Function Definitions**: Cannot define custom functions
 3. **Read-Only**: Cannot modify the traced program's state
-4. **No String Operations**: String concatenation or manipulation not supported
+4. **Limited String Operations**: Supports CString equality (==/!=) and builtins `strncmp`/`starts_with`; no concatenation or general string manipulation
 5. **Limited Arithmetic**: Basic operations only, no bitwise operations
 6. **No Dynamic Memory**: Cannot allocate memory
 

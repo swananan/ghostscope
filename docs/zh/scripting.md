@@ -9,9 +9,10 @@ GhostScope 使用专门的领域特定语言来定义追踪点和操作。脚本
 4. [打印语句](#打印语句)
 5. [条件语句](#条件语句)
 6. [表达式](#表达式)
-7. [特殊变量](#特殊变量)
-8. [示例](#示例)
-9. [限制](#限制)
+7. [内置函数](#内置函数)
+8. [特殊变量](#特殊变量)
+9. [示例](#示例)
+10. [限制](#限制)
 
 ## 基础语法
 
@@ -217,6 +218,46 @@ print "姓名: {}, 年龄: {}", person.name, person.age;
 ```
 
 **注意**：格式字符串使用 `{}` 占位符（Rust 风格），而不是 `%d`/`%s`（C 风格）。
+
+## 内置函数
+
+GhostScope 提供两个字符串内置函数，用于高效、对 verifier 友好的比较：
+
+- `strncmp(expr, "lit", n)`
+  - 将 `expr` 指向的内存前 `n` 个字节与字面量 `lit` 比较。
+  - 在 `n` 字节内不要求出现终止符 `\0`。
+  - `expr` 可为 DWARF 的 `char*`、`char[N]`，也可为通用指针；GhostScope 会做有界的用户态内存读取并按字节比较。
+  - 任何读取失败均返回 `false`。
+  - 为安全起见比较长度固定上限为 64 字节（编译器常量 `STRING_BUILTIN_READ_CAP`，见 `ghostscope-compiler/src/ebpf/expression.rs`）；若 `n` 超过上限或数组可用长度，会自动裁剪。
+
+- `starts_with(expr, "lit")`
+  - 等价于 `strncmp(expr, "lit", len("lit"))`。
+  - 失败与安全语义同上。
+
+Verifier 友好与性能：
+- 内置函数生成的比较逻辑尽量少分支（如按字节 XOR/OR 累积），降低 verifier 状态数量。
+- 避免在极热的探针里塞入大量大字符串比较；必要时拆分脚本或选择不那么热的落点。
+
+示例
+
+```ghostscope
+// 函数参数（const char* activity）
+trace log_activity {
+    print "is_main:{}", starts_with(activity, "main");
+    print "eq5:{}", strncmp(activity, "main_", 5);
+}
+
+// 全局只读字符串与定长数组
+trace globals_program.c:32 {
+    print "gm_hello:{}", starts_with(gm, "Hello"); // gm: const char*
+    print "lm_libw:{}", strncmp(lm, "LIB_", 4);    // lm: const char*
+}
+
+// 通用指针（读取失败 → false）
+trace process_record {
+    print "rec_http:{}", strncmp(record, "HTTP", 4); // record: struct* -> false
+}
+```
 
 ## 条件语句
 
@@ -464,7 +505,7 @@ trace server_respond {
 1. **无循环**：出于安全考虑，不支持循环（`for`、`while`）
 2. **无函数定义**：不能定义自定义函数
 3. **只读**：不能修改被追踪程序的状态
-4. **无字符串操作**：不支持字符串连接或操作
+4. **字符串操作有限**：支持 C 字符串等值（==/!=）与内置函数 `strncmp`/`starts_with`；不支持字符串连接或一般性字符串处理
 5. **有限的算术运算**：仅支持基本运算，不支持位运算
 6. **无动态内存**：不能分配内存
 

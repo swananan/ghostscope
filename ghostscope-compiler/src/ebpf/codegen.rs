@@ -846,6 +846,10 @@ impl<'ctx> EbpfContext<'ctx> {
                 E::String(s) => format!("\"{}\"", s),
                 E::Float(v) => format!("{}", v),
                 E::SpecialVar(s) => format!("${}", s),
+                E::BuiltinCall { name, args } => {
+                    let arg_strs: Vec<String> = args.iter().map(inner).collect();
+                    format!("{}({})", name, arg_strs.join(", "))
+                }
                 E::BinaryOp { left, op, right } => {
                     let op_str = match op {
                         crate::script::ast::BinaryOp::Add => "+",
