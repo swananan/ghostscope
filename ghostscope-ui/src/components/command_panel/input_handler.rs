@@ -170,10 +170,10 @@ impl InputHandler {
                         command: command_to_execute,
                     }]
                 } else {
-                    vec![Action::AddResponse {
-                        content: String::new(),
-                        response_type: crate::action::ResponseType::Info,
-                    }]
+                    // Return empty action list instead of adding an empty response
+                    // This prevents creating unnecessary history entries when user
+                    // exits history search without executing a command
+                    vec![]
                 }
             }
             // Ctrl+R: Next search result
@@ -240,11 +240,8 @@ impl InputHandler {
 
                         // Update auto suggestion after character insertion
                         state.update_auto_suggestion();
-
-                        actions.push(Action::AddResponse {
-                            content: String::new(),
-                            response_type: crate::action::ResponseType::Info,
-                        });
+                        // Note: No action is pushed here. Character insertion is a local
+                        // editing operation that doesn't require a response or command execution
                     }
                     JkEscapeResult::WaitForK => {
                         // Don't insert 'j' yet, just wait for potential 'k'

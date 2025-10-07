@@ -121,7 +121,7 @@ mod save_command_tests {
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             actions[0],
-            Action::AddResponse {
+            Action::AddResponseWithStyle {
                 response_type: ResponseType::Error,
                 ..
             }
@@ -137,7 +137,7 @@ mod save_command_tests {
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             actions[0],
-            Action::AddResponse {
+            Action::AddResponseWithStyle {
                 response_type: ResponseType::Error,
                 ..
             }
@@ -199,9 +199,10 @@ mod command_response_tests {
         let _actions = handler.handle_submit(&mut state);
 
         // Add response
-        ResponseFormatter::add_response(
+        ResponseFormatter::add_response_with_style(
             &mut state,
             "✓ Realtime eBPF output logging started: /tmp/test.log".to_string(),
+            None,
             ResponseType::Success,
         );
 
@@ -233,18 +234,20 @@ mod command_response_tests {
         // First command
         state.input_text = "save output test1.log".to_string();
         let _actions = handler.handle_submit(&mut state);
-        ResponseFormatter::add_response(
+        ResponseFormatter::add_response_with_style(
             &mut state,
             "✓ Started logging to test1.log".to_string(),
+            None,
             ResponseType::Success,
         );
 
         // Second command
         state.input_text = "save session test2.log".to_string();
         let _actions = handler.handle_submit(&mut state);
-        ResponseFormatter::add_response(
+        ResponseFormatter::add_response_with_style(
             &mut state,
             "✓ Started logging to test2.log".to_string(),
+            None,
             ResponseType::Success,
         );
 
@@ -279,9 +282,10 @@ mod command_response_tests {
         let _actions = handler.handle_submit(&mut state);
 
         // Add error response
-        ResponseFormatter::add_response(
+        ResponseFormatter::add_response_with_style(
             &mut state,
             "✗ Failed to start output logging: Directory does not exist".to_string(),
+            None,
             ResponseType::Error,
         );
 

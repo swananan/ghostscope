@@ -1043,8 +1043,11 @@ impl CommandParser {
         }
 
         if parts.len() < 2 {
-            return Some(vec![Action::AddResponse {
-                content: "Usage: stop <output|session>".to_string(),
+            let plain = "Usage: stop <output|session>".to_string();
+            let styled = Self::styled_usage(&plain);
+            return Some(vec![Action::AddResponseWithStyle {
+                content: plain,
+                styled_lines: Some(styled),
                 response_type: ResponseType::Error,
             }]);
         }
@@ -1052,13 +1055,25 @@ impl CommandParser {
         match parts[1] {
             "output" => Some(vec![Action::StopSaveOutput]),
             "session" => Some(vec![Action::StopSaveSession]),
-            _ => Some(vec![Action::AddResponse {
-                content: format!(
+            _ => {
+                let plain = format!(
                     "Unknown stop target: '{}'. Use 'stop output' or 'stop session'",
                     parts[1]
-                ),
-                response_type: ResponseType::Error,
-            }]),
+                );
+                let styled = vec![
+                    crate::components::command_panel::style_builder::StyledLineBuilder::new()
+                        .styled(
+                            plain.clone(),
+                            crate::components::command_panel::style_builder::StylePresets::ERROR,
+                        )
+                        .build(),
+                ];
+                Some(vec![Action::AddResponseWithStyle {
+                    content: plain,
+                    styled_lines: Some(styled),
+                    response_type: ResponseType::Error,
+                }])
+            }
         }
     }
 
@@ -1080,8 +1095,11 @@ impl CommandParser {
         };
 
         if filename.is_empty() {
-            return Some(vec![Action::AddResponse {
-                content: "Usage: source <filename>".to_string(),
+            let plain = "Usage: source <filename>".to_string();
+            let styled = Self::styled_usage(&plain);
+            return Some(vec![Action::AddResponseWithStyle {
+                content: plain,
+                styled_lines: Some(styled),
                 response_type: ResponseType::Error,
             }]);
         }
@@ -1090,8 +1108,15 @@ impl CommandParser {
         match TracePersistence::load_traces_from_file(filename) {
             Ok(traces) => {
                 if traces.is_empty() {
-                    return Some(vec![Action::AddResponse {
-                        content: format!("No traces found in {filename}"),
+                    let plain = format!("No traces found in {filename}");
+                    let styled = vec![
+                        crate::components::command_panel::style_builder::StyledLineBuilder::new()
+                            .styled(plain.clone(), crate::components::command_panel::style_builder::StylePresets::WARNING)
+                            .build(),
+                    ];
+                    return Some(vec![Action::AddResponseWithStyle {
+                        content: plain,
+                        styled_lines: Some(styled),
                         response_type: ResponseType::Warning,
                     }]);
                 }
@@ -1382,8 +1407,18 @@ impl CommandParser {
 
         // Handle "i a <target>" -> "info address <target>" (TODO)
         if command.starts_with("i a ") {
-            return Some(vec![Action::AddResponse {
-                content: "TODO: i a (info address) command not implemented yet".to_string(),
+            let plain = "TODO: i a (info address) command not implemented yet".to_string();
+            let styled = vec![
+                crate::components::command_panel::style_builder::StyledLineBuilder::new()
+                    .styled(
+                        plain.clone(),
+                        crate::components::command_panel::style_builder::StylePresets::WARNING,
+                    )
+                    .build(),
+            ];
+            return Some(vec![Action::AddResponseWithStyle {
+                content: plain,
+                styled_lines: Some(styled),
                 response_type: ResponseType::Error,
             }]);
         }
