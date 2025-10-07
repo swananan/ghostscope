@@ -66,6 +66,7 @@ factor = {
     // Builtin calls must be checked before identifier to avoid ambiguity
     strncmp_call |
     starts_with_call |
+    bool |
     string |
     float |
     int |
@@ -102,3 +103,4 @@ identifier = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
 int = @{ ASCII_DIGIT+ }
 float = @{ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
 string = @{ "\"" ~ (!"\"" ~ ANY)* ~ "\"" } 
+bool = @{ "true" | "false" }

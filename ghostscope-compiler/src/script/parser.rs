@@ -526,6 +526,10 @@ fn parse_factor(pair: Pair<Rule>) -> Result<Expr> {
                     let value = &raw_value[1..raw_value.len() - 1];
                     Ok(Expr::String(value.to_string()))
                 }
+                Rule::bool => {
+                    let val = inner.as_str() == "true";
+                    Ok(Expr::Bool(val))
+                }
                 Rule::identifier => {
                     let name = inner.as_str().to_string();
                     Ok(Expr::Variable(name))
