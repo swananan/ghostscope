@@ -847,6 +847,258 @@ trace globals_program.c:32 {
 }
 
 #[tokio::test]
+async fn test_format_specifiers_memory_and_pointer() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let script = r#"
+trace globals_program.c:32 {
+    // Hex dump first 4 bytes of g_message
+    print "HX={:x.4}", g_message;
+    // ASCII dump first 5 bytes of s.name
+    print "AS={:s.5}", s.name;
+    // Dynamic star length 4 on lm (lib_message)
+    print "DS={:s.*}", 4, lm;
+    // Pointer formatting for &G_STATE
+    print "P={:p}", &G_STATE;
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    use regex::Regex;
+    // Expect hex bytes pattern (four bytes)
+    let re_hex4 = Regex::new(r"HX=([0-9a-fA-F]{2}(\s+[0-9a-fA-F]{2}){3})").unwrap();
+    // Expect ASCII substrings
+    let has_as = stdout.lines().any(|l| {
+        l.contains("AS=INIT")
+            || l.contains("AS=RUNNI")
+            || l.contains("AS=LIB")
+            || l.contains("AS=HELLO")
+    });
+    let has_ds = stdout
+        .lines()
+        .any(|l| l.contains("DS=LIB_") || l.contains("DS=Hell"));
+    // Pointer has 0x prefix
+    let has_ptr = stdout.lines().any(|l| l.contains("P=0x"));
+
+    let has_hex = stdout.lines().any(|l| re_hex4.is_match(l));
+    assert!(has_hex, "Expected hex dump HX=. STDOUT: {}", stdout);
+    assert!(has_as, "Expected ASCII dump AS=. STDOUT: {}", stdout);
+    assert!(
+        has_ds,
+        "Expected dynamic star ASCII DS=. STDOUT: {}",
+        stdout
+    );
+    assert!(has_ptr, "Expected pointer P=0x.... STDOUT: {}", stdout);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_large_pattern_dump_and_checks() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Validate:
+    // - First 16 bytes of lib_pattern are 00..0f (hex)
+    // - Byte at index 100 is 100
+    // - Byte at index 255 is 255
+    // - Dynamic {:x.*} with length=10 shows 00..09
+    let script = r#"
+trace globals_program.c:32 {
+    print "LPX16={:x.16}", lib_pattern;
+    print "LPD10={:x.*}", 10, lib_pattern;
+    print "B100={} B255={}", lib_pattern[100], lib_pattern[255];
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    use regex::Regex;
+    let re_first16 = Regex::new(r"LPX16=00(\s+01)(\s+02)(\s+03)(\s+04)(\s+05)(\s+06)(\s+07)(\s+08)(\s+09)(\s+0a)(\s+0b)(\s+0c)(\s+0d)(\s+0e)(\s+0f)").unwrap();
+    let has_first16 = stdout.lines().any(|l| re_first16.is_match(l));
+    let has_dyn10 = stdout
+        .lines()
+        .any(|l| l.contains("LPD10=00 01 02 03 04 05 06 07 08 09"));
+    let has_b100 = stdout.lines().any(|l| l.contains("B100=100"));
+    let has_b255 = stdout.lines().any(|l| l.contains("B255=255"));
+
+    assert!(
+        has_first16,
+        "Expected first 16 bytes 00..0f. STDOUT: {}",
+        stdout
+    );
+    assert!(
+        has_dyn10,
+        "Expected dynamic 10 bytes 00..09. STDOUT: {}",
+        stdout
+    );
+    assert!(has_b100, "Expected B100=100. STDOUT: {}", stdout);
+    assert!(has_b255, "Expected B255=255. STDOUT: {}", stdout);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_format_capture_len_zero_and_exceed_cap() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // With project-level ghostscope.toml setting mem_dump_cap=64,
+    // - len=0 should yield empty
+    // - len=128 should truncate to 64 bytes
+    let script = r#"
+trace globals_program.c:32 {
+    let z = 0;
+    let big = 128;
+    print "Z0={:x.z$}", lib_pattern;     // expect empty
+    print "XC={:x.big$}", lib_pattern;   // expect 64 bytes due to cap
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    use regex::Regex;
+    // Z0 should be exactly 'Z0=' with no hex bytes following
+    let re_z0_empty = Regex::new(r"^\s*Z0=\s*$").unwrap();
+    let has_z0_empty = stdout.lines().any(|l| re_z0_empty.is_match(l));
+
+    // 64 bytes hex: two hex digits repeated 64 times with optional spaces between
+    let re_64_hex = Regex::new(r"XC=([0-9a-fA-F]{2}(\s+[0-9a-fA-F]{2}){63})").unwrap();
+    let has_trunc_64 = stdout.lines().any(|l| re_64_hex.is_match(l));
+
+    assert!(has_z0_empty, "Expected Z0= (empty). STDOUT: {}", stdout);
+    assert!(
+        has_trunc_64,
+        "Expected XC= to contain exactly 64 bytes due to cap. STDOUT: {}",
+        stdout
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_format_negative_len_clamped_to_zero() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Negative lengths should clamp to 0 and produce empty output
+    let script = r#"
+trace globals_program.c:32 {
+    let neg = -5;
+    print "ZN1={:x.neg$}", lib_pattern;   // capture negative -> empty
+    print "ZN2={:x.*}", -10, lib_pattern; // star negative -> empty
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    use regex::Regex;
+    let re_empty1 = Regex::new(r"^\s*ZN1=\s*$").unwrap();
+    let re_empty2 = Regex::new(r"^\s*ZN2=\s*$").unwrap();
+    let has_zn1 = stdout.lines().any(|l| re_empty1.is_match(l));
+    let has_zn2 = stdout.lines().any(|l| re_empty2.is_match(l));
+
+    assert!(has_zn1, "Expected ZN1= (empty). STDOUT: {}", stdout);
+    assert!(has_zn2, "Expected ZN2= (empty). STDOUT: {}", stdout);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_format_specifiers_capture_len() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let script = r#"
+trace globals_program.c:32 {
+    let n = 4;
+    // Capture length from script variable for ASCII and HEX
+    print "CL={:s.n$}", lm;
+    print "CH={:x.n$}", g_message;
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    use regex::Regex;
+    // Hex 4 bytes
+    let re_hex4 = Regex::new(r"CH=([0-9a-fA-F]{2}(\s+[0-9a-fA-F]{2}){3})").unwrap();
+    let has_hex = stdout.lines().any(|l| re_hex4.is_match(l));
+    // ASCII 4 bytes from lm or g_message
+    let has_cl = stdout
+        .lines()
+        .any(|l| l.contains("CL=LIB_") || l.contains("CL=Hell"));
+
+    assert!(has_hex, "Expected hex dump CH=. STDOUT: {}", stdout);
+    assert!(has_cl, "Expected capture-len ASCII CL=. STDOUT: {}", stdout);
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_top_level_array_member_struct_field() -> anyhow::Result<()> {
     init();
 

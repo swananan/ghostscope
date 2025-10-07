@@ -166,6 +166,14 @@ pub struct EbpfConfig {
     /// even on kernels that support RingBuf.
     #[serde(default = "default_force_perf_event_array")]
     pub force_perf_event_array: bool,
+    /// Per-argument memory dump cap for extended format specifiers ({:x}/{:s})
+    /// Default: 1024 bytes; increase for larger previews.
+    #[serde(default = "default_mem_dump_cap")]
+    pub mem_dump_cap: u32,
+    /// Maximum size of a single trace event (bytes). Applies to PerfEventArray accumulation buffer.
+    /// Default: 32768 bytes (32KB). Increase for larger formatted prints.
+    #[serde(default = "default_max_trace_event_size")]
+    pub max_trace_event_size: u32,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -260,6 +268,14 @@ fn default_force_perf_event_array() -> bool {
     false
 }
 
+fn default_mem_dump_cap() -> u32 {
+    4096
+}
+
+fn default_max_trace_event_size() -> u32 {
+    32768
+}
+
 fn default_save_option() -> SaveOption {
     SaveOption {
         debug: true,
@@ -323,6 +339,8 @@ impl Default for EbpfConfig {
             perf_page_count: default_perf_page_count(),
             proc_module_offsets_max_entries: default_proc_module_offsets_max_entries(),
             force_perf_event_array: default_force_perf_event_array(),
+            mem_dump_cap: default_mem_dump_cap(),
+            max_trace_event_size: default_max_trace_event_size(),
         }
     }
 }

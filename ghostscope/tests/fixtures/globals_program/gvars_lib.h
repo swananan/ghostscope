@@ -12,6 +12,8 @@ extern int lib_counter;            // .data
 extern const char lib_message[];   // .rodata
 extern char lib_bss[512];          // .bss
 extern GlobalState LIB_STATE;      // .data
+// Patterned byte array for testing large dumps
+extern unsigned char lib_pattern[300]; // .data (filled at load)
 
 // Ticking function to mutate library globals periodically
 void lib_tick(void);

@@ -33,6 +33,17 @@ enum ComplexArgSource<'ctx> {
         dwarf_type: ghostscope_dwarf::TypeInfo,
         module_for_offsets: Option<String>,
     },
+    /// Memory dump from a pointer/byte address with a static length
+    MemDump {
+        src_addr: inkwell::values::IntValue<'ctx>,
+        len: usize,
+    },
+    /// Memory dump with dynamic runtime length; bytes read up to min(len_value, max_len)
+    MemDumpDynamic {
+        src_addr: inkwell::values::IntValue<'ctx>,
+        len_value: inkwell::values::IntValue<'ctx>,
+        max_len: usize,
+    },
     ImmediateBytes {
         bytes: Vec<u8>,
     },
@@ -58,6 +69,9 @@ struct ComplexArg<'ctx> {
 }
 
 impl<'ctx> EbpfContext<'ctx> {
+    #[allow(dead_code)]
+    #[allow(dead_code)]
+    const DEFAULT_MEM_DUMP_LEN: usize = 256; // legacy default, replaced by compile_options.mem_dump_cap
     /// Unified expression resolver: returns a ComplexArg carrying
     /// a consistent var_name_index/type_index/access_path/data_len/source
     /// with strict priority: script variables -> DWARF (locals/params/globals).
@@ -200,11 +214,12 @@ impl<'ctx> EbpfContext<'ctx> {
                 let dwarf_type = var.dwarf_type.as_ref().ok_or_else(|| {
                     CodeGenError::DwarfError("Expression has no DWARF type information".to_string())
                 })?;
-                let mut data_len = Self::compute_read_size_for_type(dwarf_type);
+                let data_len = Self::compute_read_size_for_type(dwarf_type);
                 if data_len == 0 {
                     return Err(CodeGenError::TypeSizeNotAvailable(var.name));
                 }
-                data_len = std::cmp::min(data_len, 1993);
+                // Previously clamped to 1993 bytes; now use full DWARF size (transport clamps per event size)
+                // data_len unchanged
                 let module_hint = self.take_module_hint();
                 Ok(ComplexArg {
                     var_name_index: self.trace_context.add_variable_name(var.name.clone()),
@@ -289,11 +304,11 @@ impl<'ctx> EbpfContext<'ctx> {
                                 }
                                 _ => {
                                     // Fall back to runtime read path
-                                    let mut data_len = Self::compute_read_size_for_type(t);
+                                    let data_len = Self::compute_read_size_for_type(t);
                                     if data_len == 0 {
                                         return Err(CodeGenError::TypeSizeNotAvailable(v.name));
                                     }
-                                    data_len = std::cmp::min(data_len, 1993);
+                                    // Remove legacy 1993-byte clamp; keep DWARF-reported size
                                     let module_hint = self.take_module_hint();
                                     Ok(ComplexArg {
                                         var_name_index: self
@@ -313,11 +328,11 @@ impl<'ctx> EbpfContext<'ctx> {
                         } else {
                             // Complex types or link-time addresses: use RuntimeRead
                             // (globals/statics need memory read; not an address print unless AddressOf)
-                            let mut data_len = Self::compute_read_size_for_type(t);
+                            let data_len = Self::compute_read_size_for_type(t);
                             if data_len == 0 {
                                 return Err(CodeGenError::TypeSizeNotAvailable(v.name));
                             }
-                            data_len = std::cmp::min(data_len, 1993);
+                            // Remove legacy 1993-byte clamp; keep DWARF-reported size
                             let module_hint = self.take_module_hint();
                             Ok(ComplexArg {
                                 var_name_index: self
@@ -413,6 +428,12 @@ impl<'ctx> EbpfContext<'ctx> {
             }
             ComplexArgSource::AddressValue { .. } | ComplexArgSource::ImmediateBytes { .. } => {
                 // Use ComplexFormat with "{}" to render address/immediate nicely
+                let fmt_idx = self.trace_context.add_string("{}".to_string());
+                self.generate_print_complex_format_instruction(fmt_idx, &[arg])?;
+                Ok(1)
+            }
+            ComplexArgSource::MemDump { .. } | ComplexArgSource::MemDumpDynamic { .. } => {
+                // Use ComplexFormat with "{}"; generate_print_complex_format_instruction handles MemDump
                 let fmt_idx = self.trace_context.add_string("{}".to_string());
                 self.generate_print_complex_format_instruction(fmt_idx, &[arg])?;
                 Ok(1)
@@ -1102,8 +1123,422 @@ impl<'ctx> EbpfContext<'ctx> {
         );
         let format_string_index = self.trace_context.add_string(format.to_string());
         let mut complex_args: Vec<ComplexArg<'ctx>> = Vec::with_capacity(args.len());
-        for a in args.iter() {
-            complex_args.push(self.resolve_expr_to_arg(a)?);
+
+        // Parse placeholders from the format string to support extended specifiers
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Conv {
+            Default,
+            HexLower,
+            HexUpper,
+            Ptr,
+            Ascii,
+        }
+        #[derive(Clone, Debug, PartialEq)]
+        enum LenSpec {
+            None,
+            Static(usize),
+            Star,
+            Capture(String),
+        }
+
+        fn parse_slots(fmt: &str) -> Vec<(Conv, LenSpec)> {
+            let mut res = Vec::new();
+            let mut it = fmt.chars().peekable();
+            while let Some(ch) = it.next() {
+                if ch == '{' {
+                    if it.peek() == Some(&'{') {
+                        it.next();
+                        continue;
+                    }
+                    let mut content = String::new();
+                    for c in it.by_ref() {
+                        if c == '}' {
+                            break;
+                        }
+                        content.push(c);
+                    }
+                    if content.is_empty() {
+                        res.push((Conv::Default, LenSpec::None));
+                    } else if let Some(rest) = content.strip_prefix(':') {
+                        let mut sit = rest.chars();
+                        let conv = match sit.next().unwrap_or(' ') {
+                            'x' => Conv::HexLower,
+                            'X' => Conv::HexUpper,
+                            'p' => Conv::Ptr,
+                            's' => Conv::Ascii,
+                            _ => Conv::Default,
+                        };
+                        let rest: String = sit.collect();
+                        let lens = if rest.is_empty() {
+                            LenSpec::None
+                        } else if let Some(r) = rest.strip_prefix('.') {
+                            if r == "*" {
+                                LenSpec::Star
+                            } else if let Some(s) = r.strip_suffix('$') {
+                                LenSpec::Capture(s.to_string())
+                            } else if r.chars().all(|c| c.is_ascii_digit()) {
+                                LenSpec::Static(r.parse::<usize>().unwrap_or(0))
+                            } else {
+                                LenSpec::None
+                            }
+                        } else {
+                            LenSpec::None
+                        };
+                        res.push((conv, lens));
+                    } else {
+                        res.push((Conv::Default, LenSpec::None));
+                    }
+                }
+            }
+            res
+        }
+
+        let slots = parse_slots(format);
+        let mut ai = 0usize; // arg cursor
+        for (conv, lens) in slots.into_iter() {
+            match conv {
+                Conv::Default => {
+                    if ai >= args.len() {
+                        break;
+                    }
+                    let a = self.resolve_expr_to_arg(&args[ai])?;
+                    complex_args.push(a);
+                    ai += 1;
+                }
+                Conv::Ptr => {
+                    if ai >= args.len() {
+                        break;
+                    }
+                    // Force pointer address payload (u64) regardless of DWARF shape
+                    let expr = &args[ai];
+                    // Try compile to IntValue or PointerValue
+                    let val = self.compile_expr(expr)?;
+                    let iv = match val {
+                        BasicValueEnum::IntValue(iv) => iv,
+                        BasicValueEnum::PointerValue(pv) => self
+                            .builder
+                            .build_ptr_to_int(pv, self.context.i64_type(), "ptr_to_i64")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?,
+                        _ => self
+                            .compile_dwarf_expression(expr)
+                            .and_then(|bv| match bv {
+                                BasicValueEnum::IntValue(iv) => Ok(iv),
+                                BasicValueEnum::PointerValue(pv) => self
+                                    .builder
+                                    .build_ptr_to_int(pv, self.context.i64_type(), "ptr_to_i64")
+                                    .map_err(|e| CodeGenError::Builder(e.to_string())),
+                                _ => Err(CodeGenError::TypeError("pointer expected".into())),
+                            })?,
+                    };
+                    complex_args.push(ComplexArg {
+                        var_name_index: self
+                            .trace_context
+                            .add_variable_name(self.expr_to_name(expr)),
+                        type_index: self.add_synthesized_type_index_for_kind(TypeKind::Pointer),
+                        access_path: Vec::new(),
+                        data_len: 8,
+                        source: ComplexArgSource::ComputedInt {
+                            value: iv,
+                            byte_len: 8,
+                        },
+                    });
+                    ai += 1;
+                }
+                Conv::HexLower | Conv::HexUpper | Conv::Ascii => {
+                    // Memory dump; handle static length at compile time. Other cases use default read and let user space trim.
+                    // Handle star: consume length arg (as computed int) then value arg
+                    let wants_ascii = matches!(conv, Conv::Ascii);
+                    match lens {
+                        LenSpec::Static(n) if ai < args.len() => {
+                            // Resolve value expr address
+                            let expr = &args[ai];
+                            // Try get pointer address directly from expr value
+                            let val = self.compile_expr(expr).ok();
+                            let mut addr_iv: Option<IntValue> = match val {
+                                Some(BasicValueEnum::PointerValue(pv)) => Some(
+                                    self.builder
+                                        .build_ptr_to_int(pv, self.context.i64_type(), "ptr_to_i64")
+                                        .map_err(|e| CodeGenError::Builder(e.to_string()))?,
+                                ),
+                                _ => None,
+                            };
+                            // If compiled value is IntValue but DWARF type is a pointer, treat the IntValue as an address (pointer value)
+                            if addr_iv.is_none() {
+                                if let Some(BasicValueEnum::IntValue(iv)) = val {
+                                    if let Some(var) = self.query_dwarf_for_complex_expr(expr)? {
+                                        if let Some(ref t) = var.dwarf_type {
+                                            if matches!(
+                                                t,
+                                                ghostscope_dwarf::TypeInfo::PointerType { .. }
+                                            ) {
+                                                addr_iv = Some(iv);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            let addr_iv = if let Some(iv) = addr_iv {
+                                iv
+                            } else {
+                                // Fallback: DWARF address (for arrays/char[N])
+                                let var =
+                                    self.query_dwarf_for_complex_expr(expr)?.ok_or_else(|| {
+                                        CodeGenError::VariableNotFound(format!("{:?}", expr))
+                                    })?;
+                                let mod_hint = self.take_module_hint();
+                                self.evaluation_result_to_address_with_hint(
+                                    &var.evaluation_result,
+                                    None,
+                                    mod_hint.as_deref(),
+                                )?
+                            };
+                            complex_args.push(ComplexArg {
+                                var_name_index: self
+                                    .trace_context
+                                    .add_variable_name(self.expr_to_name(expr)),
+                                type_index: self
+                                    .trace_context
+                                    .add_type(ghostscope_dwarf::TypeInfo::ArrayType {
+                                    element_type: Box::new(ghostscope_dwarf::TypeInfo::BaseType {
+                                        name: "u8".into(),
+                                        size: 1,
+                                        encoding: ghostscope_dwarf::constants::DW_ATE_unsigned_char
+                                            .0
+                                            as u16,
+                                    }),
+                                    element_count: Some(n as u64),
+                                    total_size: Some(n as u64),
+                                }),
+                                access_path: Vec::new(),
+                                data_len: n,
+                                source: ComplexArgSource::MemDump {
+                                    src_addr: addr_iv,
+                                    len: n,
+                                },
+                            });
+                            ai += 1;
+                        }
+                        LenSpec::Star => {
+                            // Dynamic length: consume length arg, then create a dynamic mem-dump for value
+                            if ai + 1 >= args.len() {
+                                break;
+                            }
+                            // length argument
+                            let len_expr = &args[ai];
+                            let len_val = self.compile_expr(len_expr)?;
+                            let (len_iv, byte_len) = match len_val {
+                                BasicValueEnum::IntValue(iv) => (iv, 8usize),
+                                _ => {
+                                    return Err(CodeGenError::TypeError(
+                                        "length must be integer".into(),
+                                    ))
+                                }
+                            };
+                            complex_args.push(ComplexArg {
+                                var_name_index: self
+                                    .trace_context
+                                    .add_variable_name("__len".into()),
+                                type_index: self.add_synthesized_type_index_for_kind(TypeKind::U64),
+                                access_path: Vec::new(),
+                                data_len: byte_len,
+                                source: ComplexArgSource::ComputedInt {
+                                    value: len_iv,
+                                    byte_len,
+                                },
+                            });
+
+                            // value expression -> dynamic memdump with cap
+                            let val_expr = &args[ai + 1];
+                            // Resolve base address either from pointer-typed value or DWARF evaluation
+                            let val = self.compile_expr(val_expr).ok();
+                            let mut addr_iv: Option<IntValue> = match val {
+                                Some(BasicValueEnum::PointerValue(pv)) => Some(
+                                    self.builder
+                                        .build_ptr_to_int(pv, self.context.i64_type(), "ptr_to_i64")
+                                        .map_err(|e| CodeGenError::Builder(e.to_string()))?,
+                                ),
+                                _ => None,
+                            };
+                            if addr_iv.is_none() {
+                                if let Some(BasicValueEnum::IntValue(iv)) = val {
+                                    if let Some(var) =
+                                        self.query_dwarf_for_complex_expr(val_expr)?
+                                    {
+                                        if let Some(ref t) = var.dwarf_type {
+                                            if matches!(
+                                                t,
+                                                ghostscope_dwarf::TypeInfo::PointerType { .. }
+                                            ) {
+                                                addr_iv = Some(iv);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            let addr_iv = if let Some(iv) = addr_iv {
+                                iv
+                            } else {
+                                let var = self.query_dwarf_for_complex_expr(val_expr)?.ok_or_else(
+                                    || CodeGenError::VariableNotFound(format!("{:?}", val_expr)),
+                                )?;
+                                let mod_hint = self.take_module_hint();
+                                self.evaluation_result_to_address_with_hint(
+                                    &var.evaluation_result,
+                                    None,
+                                    mod_hint.as_deref(),
+                                )?
+                            };
+                            // Reserve up to configured per-arg cap for dynamic slices
+                            let cap = self.compile_options.mem_dump_cap as usize;
+                            complex_args.push(ComplexArg {
+                                var_name_index: self
+                                    .trace_context
+                                    .add_variable_name(self.expr_to_name(val_expr)),
+                                type_index: self
+                                    .trace_context
+                                    .add_type(ghostscope_dwarf::TypeInfo::ArrayType {
+                                    element_type: Box::new(ghostscope_dwarf::TypeInfo::BaseType {
+                                        name: "u8".into(),
+                                        size: 1,
+                                        encoding: ghostscope_dwarf::constants::DW_ATE_unsigned_char
+                                            .0
+                                            as u16,
+                                    }),
+                                    element_count: Some(cap as u64),
+                                    total_size: Some(cap as u64),
+                                }),
+                                access_path: Vec::new(),
+                                data_len: cap,
+                                source: ComplexArgSource::MemDumpDynamic {
+                                    src_addr: addr_iv,
+                                    len_value: len_iv,
+                                    max_len: cap,
+                                },
+                            });
+                            ai += 2;
+                        }
+                        LenSpec::Capture(name) => {
+                            // Use script variable `name` as length; emit a length argument + a dynamic mem-dump argument
+                            if ai >= args.len() {
+                                break;
+                            }
+                            if !self.variable_exists(&name) {
+                                return Err(CodeGenError::TypeError(format!(
+                                    "capture length variable '{}' not found",
+                                    name
+                                )));
+                            }
+                            // length as computed int
+                            let len_val = self.load_variable(&name)?;
+                            let (len_iv, byte_len) = match len_val {
+                                BasicValueEnum::IntValue(iv) => (iv, 8usize),
+                                BasicValueEnum::PointerValue(pv) => (
+                                    self.builder
+                                        .build_ptr_to_int(
+                                            pv,
+                                            self.context.i64_type(),
+                                            "len_ptr_to_i64",
+                                        )
+                                        .map_err(|e| CodeGenError::Builder(e.to_string()))?,
+                                    8usize,
+                                ),
+                                _ => {
+                                    return Err(CodeGenError::TypeError(
+                                        "length must be integer/pointer".into(),
+                                    ))
+                                }
+                            };
+                            complex_args.push(ComplexArg {
+                                var_name_index: self.trace_context.add_variable_name(name.clone()),
+                                type_index: self.add_synthesized_type_index_for_kind(TypeKind::U64),
+                                access_path: Vec::new(),
+                                data_len: byte_len,
+                                source: ComplexArgSource::ComputedInt {
+                                    value: len_iv,
+                                    byte_len,
+                                },
+                            });
+
+                            // value
+                            let val_expr = &args[ai];
+                            let val = self.compile_expr(val_expr).ok();
+                            let mut addr_iv: Option<IntValue> = match val {
+                                Some(BasicValueEnum::PointerValue(pv)) => Some(
+                                    self.builder
+                                        .build_ptr_to_int(pv, self.context.i64_type(), "ptr_to_i64")
+                                        .map_err(|e| CodeGenError::Builder(e.to_string()))?,
+                                ),
+                                _ => None,
+                            };
+                            if addr_iv.is_none() {
+                                if let Some(BasicValueEnum::IntValue(iv)) = val {
+                                    if let Some(var) =
+                                        self.query_dwarf_for_complex_expr(val_expr)?
+                                    {
+                                        if let Some(ref t) = var.dwarf_type {
+                                            if matches!(
+                                                t,
+                                                ghostscope_dwarf::TypeInfo::PointerType { .. }
+                                            ) {
+                                                addr_iv = Some(iv);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            let addr_iv = if let Some(iv) = addr_iv {
+                                iv
+                            } else {
+                                let var = self.query_dwarf_for_complex_expr(val_expr)?.ok_or_else(
+                                    || CodeGenError::VariableNotFound(format!("{:?}", val_expr)),
+                                )?;
+                                let mod_hint = self.take_module_hint();
+                                self.evaluation_result_to_address_with_hint(
+                                    &var.evaluation_result,
+                                    None,
+                                    mod_hint.as_deref(),
+                                )?
+                            };
+                            let cap = self.compile_options.mem_dump_cap as usize;
+                            complex_args.push(ComplexArg {
+                                var_name_index: self
+                                    .trace_context
+                                    .add_variable_name(self.expr_to_name(val_expr)),
+                                type_index: self
+                                    .trace_context
+                                    .add_type(ghostscope_dwarf::TypeInfo::ArrayType {
+                                    element_type: Box::new(ghostscope_dwarf::TypeInfo::BaseType {
+                                        name: "u8".into(),
+                                        size: 1,
+                                        encoding: ghostscope_dwarf::constants::DW_ATE_unsigned_char
+                                            .0
+                                            as u16,
+                                    }),
+                                    element_count: Some(cap as u64),
+                                    total_size: Some(cap as u64),
+                                }),
+                                access_path: Vec::new(),
+                                data_len: cap,
+                                source: ComplexArgSource::MemDumpDynamic {
+                                    src_addr: addr_iv,
+                                    len_value: len_iv,
+                                    max_len: cap,
+                                },
+                            });
+                            ai += 1;
+                        }
+                        _ => {
+                            // None: resolve value directly
+                            if ai >= args.len() {
+                                break;
+                            }
+                            complex_args.push(self.resolve_expr_to_arg(&args[ai])?);
+                            ai += 1;
+                        }
+                    }
+                    let _ = wants_ascii; // reserved for future per-arg metadata
+                }
+            }
         }
         self.generate_print_complex_format_instruction(format_string_index, &complex_args)?;
         Ok(1)
@@ -1300,6 +1735,8 @@ impl<'ctx> EbpfContext<'ctx> {
                 ComplexArgSource::AddressValue { .. } => 8,
                 ComplexArgSource::RuntimeRead { .. } => std::cmp::max(a.data_len, 12),
                 ComplexArgSource::ComputedInt { byte_len, .. } => *byte_len,
+                ComplexArgSource::MemDump { len, .. } => *len,
+                ComplexArgSource::MemDumpDynamic { max_len, .. } => *max_len,
             };
             total_args_payload += header_len + reserved_payload;
             arg_count = arg_count.saturating_add(1);
@@ -1407,6 +1844,8 @@ impl<'ctx> EbpfContext<'ctx> {
                 ComplexArgSource::AddressValue { .. } => 8,
                 ComplexArgSource::RuntimeRead { .. } => std::cmp::max(a.data_len, 12),
                 ComplexArgSource::ComputedInt { byte_len, .. } => *byte_len,
+                ComplexArgSource::MemDump { len, .. } => *len,
+                ComplexArgSource::MemDumpDynamic { max_len, .. } => *max_len,
             };
 
             // Base pointer = data_ptr + offset
@@ -1605,6 +2044,286 @@ impl<'ctx> EbpfContext<'ctx> {
                             })?;
                     }
                     // data_len already set to reserved_len
+                }
+                ComplexArgSource::MemDump { src_addr, len } => {
+                    // Perform bounded read of len bytes from src_addr into payload
+                    let (buf_global, status, arr_ty) = self.read_user_bytes_into_buffer(
+                        *src_addr,
+                        *len as u32,
+                        "_gs_fmt_memdump",
+                    )?;
+                    // status==0 => OK, else store errno at payload and mark fail
+                    let ok = self
+                        .builder
+                        .build_int_compare(
+                            inkwell::IntPredicate::EQ,
+                            status,
+                            self.context.i64_type().const_zero(),
+                            "md_ok",
+                        )
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                    let curr = self.builder.get_insert_block().unwrap();
+                    let func = curr.get_parent().unwrap();
+                    let ok_b = self.context.append_basic_block(func, "md_ok");
+                    let err_b = self.context.append_basic_block(func, "md_err");
+                    let cont_b = self.context.append_basic_block(func, "md_cont");
+                    self.builder
+                        .build_conditional_branch(ok, ok_b, err_b)
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    // ok: copy bytes into var_data_ptr
+                    self.builder.position_at_end(ok_b);
+                    let i32_ty = self.context.i32_type();
+                    let idx0 = i32_ty.const_zero();
+                    for i in 0..*len {
+                        let idx_i = i32_ty.const_int(i as u64, false);
+                        let src_ptr = unsafe {
+                            self.builder
+                                .build_gep(arr_ty, buf_global, &[idx0, idx_i], "src_ptr")
+                                .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                        };
+                        let byte = self
+                            .builder
+                            .build_load(self.context.i8_type(), src_ptr, "b")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        let dst_ptr = unsafe {
+                            self.builder
+                                .build_gep(
+                                    self.context.i8_type(),
+                                    var_data_ptr,
+                                    &[self.context.i32_type().const_int(i as u64, false)],
+                                    "dst_ptr",
+                                )
+                                .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                        };
+                        self.builder
+                            .build_store(dst_ptr, byte)
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                    }
+                    self.builder
+                        .build_unconditional_branch(cont_b)
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    // err: write errno/addr payload like RuntimeRead fail
+                    self.builder.position_at_end(err_b);
+                    // set status = ReadError
+                    self.builder
+                        .build_store(
+                            apl_ptr,
+                            self.context
+                                .i8_type()
+                                .const_int(VariableStatus::ReadError as u64, false),
+                        )
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    // write errno + addr (12 bytes) to var_data_ptr
+                    let ret = status;
+                    let errno_ptr = self
+                        .builder
+                        .build_pointer_cast(
+                            var_data_ptr,
+                            self.context.ptr_type(AddressSpace::default()),
+                            "errno_ptr",
+                        )
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    self.builder
+                        .build_store(errno_ptr, ret)
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    let addr_ptr_i8 = unsafe {
+                        self.builder
+                            .build_gep(
+                                self.context.i8_type(),
+                                var_data_ptr,
+                                &[self.context.i32_type().const_int(4, false)],
+                                "addr_ptr_i8",
+                            )
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                    };
+                    let addr_ptr = self
+                        .builder
+                        .build_pointer_cast(
+                            addr_ptr_i8,
+                            self.context.ptr_type(AddressSpace::default()),
+                            "addr_ptr",
+                        )
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    self.builder
+                        .build_store(addr_ptr, *src_addr)
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    self.mark_any_fail()?;
+                    self.builder
+                        .build_unconditional_branch(cont_b)
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    self.builder.position_at_end(cont_b);
+                }
+                ComplexArgSource::MemDumpDynamic {
+                    src_addr,
+                    len_value,
+                    max_len,
+                } => {
+                    // Read up to rlen=min(len_value, max_len) into helper buffer, then copy bytes into payload
+                    let i32_ty = self.context.i32_type();
+                    let rlen_i32 = if len_value.get_type().get_bit_width() > 32 {
+                        self.builder
+                            .build_int_truncate(*len_value, i32_ty, "mdd_len_trunc")
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                    } else if len_value.get_type().get_bit_width() < 32 {
+                        self.builder
+                            .build_int_z_extend(*len_value, i32_ty, "mdd_len_zext")
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                    } else {
+                        *len_value
+                    };
+                    // clamp negative to 0
+                    let zero_i32 = i32_ty.const_zero();
+                    let is_neg = self
+                        .builder
+                        .build_int_compare(
+                            inkwell::IntPredicate::SLT,
+                            rlen_i32,
+                            zero_i32,
+                            "mdd_len_neg",
+                        )
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    let rlen_nn = self
+                        .builder
+                        .build_select(is_neg, zero_i32, rlen_i32, "mdd_len_nn")
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                        .into_int_value();
+
+                    let max_const = i32_ty.const_int(*max_len as u64, false);
+                    let gt = self
+                        .builder
+                        .build_int_compare(inkwell::IntPredicate::UGT, rlen_nn, max_const, "mdd_gt")
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    let sel_len = self
+                        .builder
+                        .build_select(gt, max_const, rlen_nn, "mdd_rlen")
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                        .into_int_value();
+
+                    // If effective length is zero, mark status and skip read.
+                    let curr = self.builder.get_insert_block().unwrap();
+                    let func = curr.get_parent().unwrap();
+                    let zero_b = self.context.append_basic_block(func, "mdd_len_zero");
+                    let read_b = self.context.append_basic_block(func, "mdd_len_read");
+                    let cont_b = self.context.append_basic_block(func, "mdd_cont");
+                    let is_zero = self
+                        .builder
+                        .build_int_compare(
+                            inkwell::IntPredicate::EQ,
+                            sel_len,
+                            i32_ty.const_zero(),
+                            "mdd_len_zero",
+                        )
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    self.builder
+                        .build_conditional_branch(is_zero, zero_b, read_b)
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+                    // Zero-length branch: set status=ZeroLength and continue.
+                    self.builder.position_at_end(zero_b);
+                    self.builder
+                        .build_store(
+                            apl_ptr,
+                            self.context
+                                .i8_type()
+                                .const_int(VariableStatus::ZeroLength as u64, false),
+                        )
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    self.builder
+                        .build_unconditional_branch(cont_b)
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+                    // Non-zero path: perform probe_read_user directly into var_data_ptr
+                    self.builder.position_at_end(read_b);
+                    let dst_ptr = self
+                        .builder
+                        .build_bit_cast(
+                            var_data_ptr,
+                            self.context.ptr_type(AddressSpace::default()),
+                            "mdd_dst_ptr",
+                        )
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    let src_ptr = self
+                        .builder
+                        .build_int_to_ptr(
+                            *src_addr,
+                            self.context.ptr_type(AddressSpace::default()),
+                            "mdd_src_ptr",
+                        )
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    let ret = self
+                        .create_bpf_helper_call(
+                            BPF_FUNC_probe_read_user as u64,
+                            &[dst_ptr, sel_len.into(), src_ptr.into()],
+                            self.context.i64_type().into(),
+                            "probe_read_user_dyn",
+                        )?
+                        .into_int_value();
+                    let ok = self
+                        .builder
+                        .build_int_compare(
+                            inkwell::IntPredicate::EQ,
+                            ret,
+                            self.context.i64_type().const_zero(),
+                            "mdd_ok",
+                        )
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                    let ok_b = self.context.append_basic_block(func, "mdd_ok");
+                    let err_b = self.context.append_basic_block(func, "mdd_err");
+                    self.builder
+                        .build_conditional_branch(ok, ok_b, err_b)
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    // ok: data already in var_data_ptr
+                    self.builder.position_at_end(ok_b);
+                    self.builder
+                        .build_unconditional_branch(cont_b)
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    // err: status+errno+addr
+                    self.builder.position_at_end(err_b);
+                    self.builder
+                        .build_store(
+                            apl_ptr,
+                            self.context
+                                .i8_type()
+                                .const_int(VariableStatus::ReadError as u64, false),
+                        )
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    let errno_ptr = self
+                        .builder
+                        .build_pointer_cast(
+                            var_data_ptr,
+                            self.context.ptr_type(AddressSpace::default()),
+                            "mdd_errno_ptr",
+                        )
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    self.builder
+                        .build_store(errno_ptr, ret)
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    let addr_ptr_i8 = unsafe {
+                        self.builder
+                            .build_gep(
+                                self.context.i8_type(),
+                                var_data_ptr,
+                                &[self.context.i32_type().const_int(4, false)],
+                                "mdd_addr_ptr_i8",
+                            )
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                    };
+                    let addr_ptr = self
+                        .builder
+                        .build_pointer_cast(
+                            addr_ptr_i8,
+                            self.context.ptr_type(AddressSpace::default()),
+                            "mdd_addr_ptr",
+                        )
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    self.builder
+                        .build_store(addr_ptr, *src_addr)
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    self.mark_any_fail()?;
+                    self.builder
+                        .build_unconditional_branch(cont_b)
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    self.builder.position_at_end(cont_b);
                 }
                 ComplexArgSource::ComputedInt { value, byte_len } => {
                     // Write computed integer into payload buffer based on requested byte_len

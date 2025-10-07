@@ -170,6 +170,16 @@ proc_module_offsets_max_entries = 4096
 # Default: 32 (128KB per CPU)
 perf_page_count = 32
 
+# Per-argument memory dump cap for extended format specifiers ({:x}/{:s}).
+# Increase this to dump more bytes per argument (e.g., 8192 or 16384).
+mem_dump_cap = 4096
+
+# Maximum size (in bytes) of a single trace event message.
+# Applies to PerfEventArray accumulation buffer and serves as an upper bound
+# when constructing print instructions in the kernel.
+# Increase if you plan to print many/large variables in one event.
+max_trace_event_size = 32768
+
 # Force use of PerfEventArray instead of RingBuf (for testing only)
 # WARNING: This is for testing purposes only. Normally the system auto-detects
 # kernel capabilities and uses RingBuf (kernel >= 5.8) or falls back to PerfEventArray.

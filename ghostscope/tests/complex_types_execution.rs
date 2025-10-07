@@ -382,11 +382,11 @@ async fn test_cross_type_comparisons_local() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Cross-type comparisons（剔除字符串等值，单独用例）
-    // - a.age > 26（DWARF int vs 脚本 int）
-    // - a.status == 0（DWARF enum-as-int vs 脚本 int）
-    // - a.friend_ref == 0（DWARF 指针 vs 脚本 int）
-    // - let t = 100; a.age < t（DWARF int vs 脚本变量）
+    // Cross-type comparisons (string equality is covered by dedicated tests)
+    // - a.age > 26 (DWARF int vs script int)
+    // - a.status == 0 (DWARF enum-as-int vs script int)
+    // - a.friend_ref == 0 (DWARF pointer vs script int)
+    // - let t = 100; a.age < t (DWARF int vs script variable)
     let script = r#"
 trace complex_types_program.c:25 {
     let t = 100;

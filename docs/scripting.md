@@ -156,7 +156,7 @@ print *ptr;
 
 ### Formatted Printing
 
-Use `{}` as placeholders in format strings:
+Use Rust-like placeholders in format strings:
 
 ```ghostscope
 // Format string with arguments
@@ -165,7 +165,37 @@ print "X: {}, Y: {}", x, y;
 print "Name: {}, Age: {}", person.name, person.age;
 ```
 
-**Note**: The format string uses `{}` placeholders (Rust-style), not `%d`/`%s` (C-style).
+Extended specifiers and dynamic length
+
+```ghostscope
+// Hex / pointer / ASCII string
+print "A={:x} B={:08X}", a, b;   // hex lower/upper (width/pad planned in phase 2)
+print "p={:p}", ptr;             // pointer address 0x...
+print "s={:s}", cstr;            // ASCII dump for bytes; for char*/char[N], `{}` still prints quoted CString
+
+// Memory dump from pointer/array
+print "h={:x.16}", buf;          // hex dump 16 bytes from buf
+print "ascii={:s.32}", name;      // ASCII dump up to 32 bytes (char* stops at first NUL)
+
+// Dynamic length (Rust-style star): length argument comes before value
+print "buf={:x.*}", len, buf;    // consumes two args: len then buf
+
+// Dynamic length via capture variable (no extra arg)
+let n = tail_len;                 // script variable
+print "tail={:s.n$}", p;          // length captured from n
+```
+
+Notes
+- `{}` is default; `{:x}`/`{:X}` for integers; `{:p}` for pointers; `{:s}` for ASCII bytes.
+- Length suffixes:
+  - `.{N}`: static length (reads N bytes)
+  - `.*`: dynamic length; consumes two arguments (length first, then value)
+  - `.name$`: capture a script variable named `name` as length; does not consume an extra value argument
+- Kernel performs bounded reads; user space renders hex/ASCII. For `{:s}` ASCII, rendering stops at the first NUL byte; non-printables are escaped as `\xNN`.
+- Memory-dump reads are capped per argument by configuration (`ebpf.mem_dump_cap`, default 4096 bytes). If the requested length exceeds the cap, data is truncated. If the event payload cap is exceeded, the output may be truncated and shown with `…`.
+- On read failure (e.g., invalid pointer, missing offsets, null deref), extended specifiers print `<MISSING_ARG>`.
+
+**Note**: The format string uses Rust-style placeholders, not `%d`/`%s` (C-style).
 
 ## Conditional Statements
 

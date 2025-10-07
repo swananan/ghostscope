@@ -122,6 +122,8 @@ pub async fn run_command_line_runtime(parsed_args: ParsedArgs) -> Result<()> {
         proc_module_offsets_max_entries: 4096,                      // Default
         perf_page_count: 64,                                        // Default
         event_map_type: ghostscope_compiler::EventMapType::RingBuf, // Will be overridden by config
+        mem_dump_cap: 1024,
+        max_trace_event_size: 32768,
     };
 
     // Step 6: Compile and load script with graceful error handling

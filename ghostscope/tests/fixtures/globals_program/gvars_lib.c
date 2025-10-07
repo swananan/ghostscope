@@ -6,6 +6,8 @@ int lib_counter = 100;                 // .data
 const char lib_message[] = "LIB_MESSAGE"; // .rodata
 char lib_bss[512];                      // .bss (zero-initialized)
 GlobalState LIB_STATE = {"LIB", 1, {123, 4.5}, {9,8,7,6}}; // .data
+// 300-byte pattern buffer for tests (filled at library load)
+unsigned char lib_pattern[300]; // .bss -> becomes .data after constructor fills
 
 // Internal file-scope static (should appear as static in DWARF)
 static int lib_internal_counter;        // .bss
@@ -32,4 +34,14 @@ void lib_tick(void) {
 
 int* lib_get_internal_counter_ptr(void) {
     return &lib_internal_counter;
+}
+
+// Initialize lib_pattern with a simple ascending pattern: 0x00,0x01,...,0xFF,0x00,... (length 300)
+#if defined(__GNUC__)
+__attribute__((constructor))
+#endif
+static void init_lib_pattern(void) {
+    for (int i = 0; i < 300; i++) {
+        lib_pattern[i] = (unsigned char)(i & 0xFF);
+    }
 }

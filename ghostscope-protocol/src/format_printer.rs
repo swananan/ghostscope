@@ -36,30 +36,12 @@ impl FormatPrinter {
             }
         };
 
-        // Convert complex variables to formatted strings
-        let formatted_vars: Vec<String> = complex_variables
-            .iter()
-            .map(|var| {
-                Self::format_complex_variable_with_status(
-                    var.var_name_index,
-                    var.type_index,
-                    &var.access_path,
-                    &var.data,
-                    var.status,
-                    trace_context,
-                )
-                .split(" = ")
-                .last() // Take just the value part, not "name = value"
-                .unwrap_or("<FORMAT_ERROR>")
-                .to_string()
-            })
-            .collect();
-
-        // Apply formatting with the converted variables
-        Self::apply_format_strings(format_string, &formatted_vars)
+        // Apply formatting using raw variables to support extended specifiers
+        Self::apply_format_with_specs(format_string, complex_variables, trace_context)
     }
 
-    /// Apply formatting: replace {} placeholders with string values
+    #[allow(dead_code)]
+    /// Simple placeholder applier for tests that don't use complex variables
     fn apply_format_strings(format_string: &str, formatted_values: &[String]) -> String {
         let mut result = String::new();
         let mut chars = format_string.chars().peekable();
@@ -69,20 +51,18 @@ impl FormatPrinter {
             match ch {
                 '{' => {
                     if chars.peek() == Some(&'{') {
-                        chars.next(); // Skip escaped '{{'
+                        chars.next();
                         result.push('{');
                     } else {
-                        // Found a placeholder, skip to '}' and replace with variable value
-                        let mut found_closing = false;
-                        for inner_ch in chars.by_ref() {
-                            if inner_ch == '}' {
-                                found_closing = true;
+                        // Skip to closing '}' and substitute
+                        let mut found = false;
+                        for c in chars.by_ref() {
+                            if c == '}' {
+                                found = true;
                                 break;
                             }
                         }
-
-                        if found_closing {
-                            // Replace with string value
+                        if found {
                             if var_index < formatted_values.len() {
                                 result.push_str(&formatted_values[var_index]);
                                 var_index += 1;
@@ -96,17 +76,465 @@ impl FormatPrinter {
                 }
                 '}' => {
                     if chars.peek() == Some(&'}') {
-                        chars.next(); // Skip escaped '}}'
+                        chars.next();
                         result.push('}');
                     } else {
-                        // Unmatched '}' - just output it (protocol doesn't validate)
                         result.push('}');
                     }
                 }
                 _ => result.push(ch),
             }
         }
+        result
+    }
 
+    /// Apply formatting with extended specifiers {:x}/{:X}/{:p}/{:s}, and optional
+    /// length suffix .N / .* / .name$.
+    fn apply_format_with_specs(
+        format_string: &str,
+        vars: &[ParsedComplexVariable],
+        trace_context: &TraceContext,
+    ) -> String {
+        let mut result = String::new();
+        let mut chars = format_string.chars().peekable();
+        let mut var_index: usize = 0;
+
+        while let Some(ch) = chars.next() {
+            match ch {
+                '{' => {
+                    if chars.peek() == Some(&'{') {
+                        chars.next();
+                        result.push('{');
+                    } else {
+                        let mut found = false;
+                        let mut content = String::new();
+                        for c in chars.by_ref() {
+                            if c == '}' {
+                                found = true;
+                                break;
+                            }
+                            content.push(c);
+                        }
+                        if !found {
+                            result.push_str("<MALFORMED_PLACEHOLDER>");
+                            continue;
+                        }
+
+                        if content.is_empty() {
+                            // default {}
+                            if var_index < vars.len() {
+                                let v = &vars[var_index];
+                                let s = Self::format_complex_variable_with_status(
+                                    v.var_name_index,
+                                    v.type_index,
+                                    &v.access_path,
+                                    &v.data,
+                                    v.status,
+                                    trace_context,
+                                );
+                                let value_part = s.split(" = ").last().unwrap_or(&s);
+                                result.push_str(value_part);
+                                var_index += 1;
+                            } else {
+                                result.push_str("<MISSING_ARG>");
+                            }
+                            continue;
+                        }
+
+                        if !content.starts_with(':') {
+                            result.push_str("<INVALID_SPEC>");
+                            continue;
+                        }
+                        let tail = &content[1..];
+                        let mut it = tail.chars();
+                        let conv = it.next().unwrap_or(' ');
+                        let rest: String = it.collect();
+
+                        // (removed) helper to get bytes of current arg; we now surface errors explicitly
+
+                        enum Len {
+                            None,
+                            Static(usize),
+                            Star,
+                            Capture,
+                        }
+                        let lenspec = if rest.is_empty() {
+                            Len::None
+                        } else if let Some(r) = rest.strip_prefix('.') {
+                            if r == "*" {
+                                Len::Star
+                            } else if r.ends_with('$') {
+                                Len::Capture
+                            } else if r.chars().all(|c| c.is_ascii_digit()) {
+                                Len::Static(r.parse::<usize>().unwrap_or(0))
+                            } else {
+                                Len::None
+                            }
+                        } else {
+                            Len::None
+                        };
+
+                        // helper: parse signed length from 8-byte little endian, clamp to >=0
+                        fn parse_len_usize(lenb: &[u8]) -> usize {
+                            if lenb.len() >= 8 {
+                                let arr = [
+                                    lenb[0], lenb[1], lenb[2], lenb[3], lenb[4], lenb[5], lenb[6],
+                                    lenb[7],
+                                ];
+                                let v = i64::from_le_bytes(arr);
+                                if v <= 0 {
+                                    0
+                                } else {
+                                    v as usize
+                                }
+                            } else {
+                                0
+                            }
+                        }
+
+                        // helper: format error value for a var when status != Ok/ZeroLength
+                        let err_value_part = |idx: usize| -> Option<String> {
+                            if idx >= vars.len() {
+                                return None;
+                            }
+                            let v = &vars[idx];
+                            if v.status == VariableStatus::Ok as u8
+                                || v.status == VariableStatus::ZeroLength as u8
+                            {
+                                None
+                            } else {
+                                let s = Self::format_complex_variable_with_status(
+                                    v.var_name_index,
+                                    v.type_index,
+                                    &v.access_path,
+                                    &v.data,
+                                    v.status,
+                                    trace_context,
+                                );
+                                Some(s.split(" = ").last().unwrap_or(&s).to_string())
+                            }
+                        };
+
+                        match conv {
+                            'x' | 'X' => {
+                                match lenspec {
+                                    Len::Star => {
+                                        if var_index + 1 >= vars.len() {
+                                            result.push_str("<MISSING_ARG>");
+                                        } else if let Some(err) = err_value_part(var_index) {
+                                            // surface error from length argument
+                                            result.push_str(&err);
+                                            var_index += 2;
+                                            continue;
+                                        } else if let Some(err) = err_value_part(var_index + 1) {
+                                            // surface error from value argument
+                                            result.push_str(&err);
+                                            var_index += 2;
+                                            continue;
+                                        } else {
+                                            // both Ok or ZeroLength
+                                            let lenb = vars[var_index].data.as_slice();
+                                            let n = parse_len_usize(lenb);
+                                            let v = &vars[var_index + 1];
+                                            let full = v.data.as_slice();
+                                            let take =
+                                                if v.status == VariableStatus::ZeroLength as u8 {
+                                                    0
+                                                } else {
+                                                    std::cmp::min(n, full.len())
+                                                };
+                                            let b = &full[..take];
+                                            let s = b
+                                                .iter()
+                                                .map(|vv| {
+                                                    if conv == 'x' {
+                                                        format!("{vv:02x}")
+                                                    } else {
+                                                        format!("{vv:02X}")
+                                                    }
+                                                })
+                                                .collect::<Vec<_>>()
+                                                .join(" ");
+                                            result.push_str(&s);
+                                            var_index += 2;
+                                            continue;
+                                        }
+                                        // when missing one of the args, don't advance to avoid misalignment
+                                    }
+                                    Len::Static(n) => {
+                                        if var_index >= vars.len() {
+                                            result.push_str("<MISSING_ARG>");
+                                        } else if let Some(err) = err_value_part(var_index) {
+                                            result.push_str(&err);
+                                            var_index += 1;
+                                            continue;
+                                        } else {
+                                            let v = &vars[var_index];
+                                            let full = v.data.as_slice();
+                                            let take =
+                                                if v.status == VariableStatus::ZeroLength as u8 {
+                                                    0
+                                                } else {
+                                                    std::cmp::min(n, full.len())
+                                                };
+                                            let b = &full[..take];
+                                            let s = b
+                                                .iter()
+                                                .map(|vv| {
+                                                    if conv == 'x' {
+                                                        format!("{vv:02x}")
+                                                    } else {
+                                                        format!("{vv:02X}")
+                                                    }
+                                                })
+                                                .collect::<Vec<_>>()
+                                                .join(" ");
+                                            result.push_str(&s);
+                                            var_index += 1;
+                                            continue;
+                                        }
+                                    }
+                                    Len::Capture => {
+                                        if var_index + 1 >= vars.len() {
+                                            result.push_str("<MISSING_ARG>");
+                                        } else if let Some(err) = err_value_part(var_index) {
+                                            result.push_str(&err);
+                                            var_index += 2;
+                                            continue;
+                                        } else if let Some(err) = err_value_part(var_index + 1) {
+                                            result.push_str(&err);
+                                            var_index += 2;
+                                            continue;
+                                        } else {
+                                            let lenb = vars[var_index].data.as_slice();
+                                            let n = parse_len_usize(lenb);
+                                            let v = &vars[var_index + 1];
+                                            let full = v.data.as_slice();
+                                            let take =
+                                                if v.status == VariableStatus::ZeroLength as u8 {
+                                                    0
+                                                } else {
+                                                    std::cmp::min(n, full.len())
+                                                };
+                                            let b = &full[..take];
+                                            let s = b
+                                                .iter()
+                                                .map(|vv| {
+                                                    if conv == 'x' {
+                                                        format!("{vv:02x}")
+                                                    } else {
+                                                        format!("{vv:02X}")
+                                                    }
+                                                })
+                                                .collect::<Vec<_>>()
+                                                .join(" ");
+                                            result.push_str(&s);
+                                            var_index += 2;
+                                            continue;
+                                        }
+                                        // when missing one of the args, don't advance
+                                    }
+                                    Len::None => {
+                                        if var_index >= vars.len() {
+                                            result.push_str("<MISSING_ARG>");
+                                        } else if let Some(err) = err_value_part(var_index) {
+                                            result.push_str(&err);
+                                            var_index += 1;
+                                            continue;
+                                        } else {
+                                            let v = &vars[var_index];
+                                            let b = if v.status == VariableStatus::ZeroLength as u8
+                                            {
+                                                &[][..]
+                                            } else {
+                                                v.data.as_slice()
+                                            };
+                                            let s = b
+                                                .iter()
+                                                .map(|vv| {
+                                                    if conv == 'x' {
+                                                        format!("{vv:02x}")
+                                                    } else {
+                                                        format!("{vv:02X}")
+                                                    }
+                                                })
+                                                .collect::<Vec<_>>()
+                                                .join(" ");
+                                            result.push_str(&s);
+                                            var_index += 1;
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                            's' => {
+                                let mut render_bytes = |b: &[u8]| {
+                                    let mut out = String::new();
+                                    for &c in b.iter() {
+                                        if c == 0 {
+                                            break;
+                                        }
+                                        if (0x20..=0x7e).contains(&c) {
+                                            out.push(c as char);
+                                        } else {
+                                            out.push_str(&format!("\\x{c:02x}"));
+                                        }
+                                    }
+                                    result.push_str(&out);
+                                };
+
+                                match lenspec {
+                                    Len::Star => {
+                                        if var_index + 1 >= vars.len() {
+                                            result.push_str("<MISSING_ARG>");
+                                        } else if let Some(err) = err_value_part(var_index) {
+                                            result.push_str(&err);
+                                            var_index += 2;
+                                            continue;
+                                        } else if let Some(err) = err_value_part(var_index + 1) {
+                                            result.push_str(&err);
+                                            var_index += 2;
+                                            continue;
+                                        } else {
+                                            let lenb = vars[var_index].data.as_slice();
+                                            let n = parse_len_usize(lenb);
+                                            let v = &vars[var_index + 1];
+                                            let full = v.data.as_slice();
+                                            let take =
+                                                if v.status == VariableStatus::ZeroLength as u8 {
+                                                    0
+                                                } else {
+                                                    std::cmp::min(n, full.len())
+                                                };
+                                            render_bytes(&full[..take]);
+                                            var_index += 2;
+                                            continue;
+                                        }
+                                    }
+                                    Len::Static(n) => {
+                                        if var_index >= vars.len() {
+                                            result.push_str("<MISSING_ARG>");
+                                        } else if let Some(err) = err_value_part(var_index) {
+                                            result.push_str(&err);
+                                            var_index += 1;
+                                            continue;
+                                        } else {
+                                            let v = &vars[var_index];
+                                            let full = v.data.as_slice();
+                                            let take =
+                                                if v.status == VariableStatus::ZeroLength as u8 {
+                                                    0
+                                                } else {
+                                                    std::cmp::min(n, full.len())
+                                                };
+                                            render_bytes(&full[..take]);
+                                            var_index += 1;
+                                            continue;
+                                        }
+                                    }
+                                    Len::Capture => {
+                                        if var_index + 1 >= vars.len() {
+                                            result.push_str("<MISSING_ARG>");
+                                        } else if let Some(err) = err_value_part(var_index) {
+                                            result.push_str(&err);
+                                            var_index += 2;
+                                            continue;
+                                        } else if let Some(err) = err_value_part(var_index + 1) {
+                                            result.push_str(&err);
+                                            var_index += 2;
+                                            continue;
+                                        } else {
+                                            let lenb = vars[var_index].data.as_slice();
+                                            let n = parse_len_usize(lenb);
+                                            let v = &vars[var_index + 1];
+                                            let full = v.data.as_slice();
+                                            let take =
+                                                if v.status == VariableStatus::ZeroLength as u8 {
+                                                    0
+                                                } else {
+                                                    std::cmp::min(n, full.len())
+                                                };
+                                            render_bytes(&full[..take]);
+                                            var_index += 2;
+                                            continue;
+                                        }
+                                    }
+                                    Len::None => {
+                                        if var_index >= vars.len() {
+                                            result.push_str("<MISSING_ARG>");
+                                        } else if let Some(err) = err_value_part(var_index) {
+                                            result.push_str(&err);
+                                            var_index += 1;
+                                            continue;
+                                        } else {
+                                            let v = &vars[var_index];
+                                            let b = if v.status == VariableStatus::ZeroLength as u8
+                                            {
+                                                &[][..]
+                                            } else {
+                                                v.data.as_slice()
+                                            };
+                                            render_bytes(b);
+                                            var_index += 1;
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                            'p' => {
+                                if var_index >= vars.len() {
+                                    result.push_str("<MISSING_ARG>");
+                                } else if let Some(err) = err_value_part(var_index) {
+                                    result.push_str(&err);
+                                    var_index += 1;
+                                    continue;
+                                } else {
+                                    let b = vars[var_index].data.as_slice();
+                                    if b.len() >= 8 {
+                                        let addr = u64::from_le_bytes([
+                                            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                                        ]);
+                                        result.push_str(&format!("0x{addr:x}"));
+                                    } else {
+                                        result.push_str("<INVALID_POINTER>");
+                                    }
+                                    var_index += 1;
+                                    continue;
+                                }
+                            }
+                            _ => {
+                                // fallback to default formatting
+                                if var_index < vars.len() {
+                                    let v = &vars[var_index];
+                                    let s = Self::format_complex_variable_with_status(
+                                        v.var_name_index,
+                                        v.type_index,
+                                        &v.access_path,
+                                        &v.data,
+                                        v.status,
+                                        trace_context,
+                                    );
+                                    let value_part = s.split(" = ").last().unwrap_or(&s);
+                                    result.push_str(value_part);
+                                    var_index += 1;
+                                } else {
+                                    result.push_str("<MISSING_ARG>");
+                                }
+                            }
+                        }
+                    }
+                }
+                '}' => {
+                    if chars.peek() == Some(&'}') {
+                        chars.next();
+                        result.push('}');
+                    } else {
+                        result.push('}');
+                    }
+                }
+                _ => result.push(ch),
+            }
+        }
         result
     }
 
@@ -193,6 +621,7 @@ impl FormatPrinter {
                 format!("<proc offsets unavailable> ({type_suffix}*)")
             }
             s if s == VariableStatus::Truncated as u8 => format!("<truncated> ({type_suffix}*)"),
+            s if s == VariableStatus::ZeroLength as u8 => format!("<len<=0> ({type_suffix})"),
             _ => format!("<error status={status}> ({type_suffix}*)"),
         };
 
@@ -969,5 +1398,173 @@ mod tests {
         assert!(res.contains("S {"));
         assert!(res.contains("active: 1"));
         assert!(res.contains("flags: 3"));
+    }
+
+    #[test]
+    fn test_ext_hex_preserves_null_deref_error() {
+        let mut trace_context = TraceContext::new();
+        let fmt_idx = trace_context.add_string("{:x.16}".to_string());
+
+        // Array<u8,16> as the value type
+        let arr_type = TypeInfo::ArrayType {
+            element_type: Box::new(TypeInfo::BaseType {
+                name: "u8".to_string(),
+                size: 1,
+                encoding: gimli::constants::DW_ATE_unsigned_char.0 as u16,
+            }),
+            element_count: Some(16),
+            total_size: Some(16),
+        };
+        let type_idx = trace_context.add_type(arr_type);
+        let var_name_idx = trace_context.add_variable_name("buf".to_string());
+
+        let vars = vec![ParsedComplexVariable {
+            var_name_index: var_name_idx,
+            type_index: type_idx,
+            access_path: String::new(),
+            status: VariableStatus::NullDeref as u8,
+            data: vec![],
+        }];
+
+        let out = FormatPrinter::format_complex_print_data(fmt_idx, &vars, &trace_context);
+        assert!(
+            out.contains("null pointer dereference"),
+            "unexpected output: {out}"
+        );
+        assert!(
+            !out.contains("<MISSING_ARG>"),
+            "should not hide error: {out}"
+        );
+    }
+
+    #[test]
+    fn test_ext_s_preserves_read_error_errno_addr() {
+        let mut trace_context = TraceContext::new();
+        let fmt_idx = trace_context.add_string("{:s.16}".to_string());
+
+        // Array<u8,16>
+        let arr_type = TypeInfo::ArrayType {
+            element_type: Box::new(TypeInfo::BaseType {
+                name: "u8".to_string(),
+                size: 1,
+                encoding: gimli::constants::DW_ATE_unsigned_char.0 as u16,
+            }),
+            element_count: Some(16),
+            total_size: Some(16),
+        };
+        let type_idx = trace_context.add_type(arr_type);
+        let var_name_idx = trace_context.add_variable_name("buf".to_string());
+
+        // Encode errno:i32 + addr:u64 into data
+        let errno: i32 = -14; // EFAULT-like
+        let addr: u64 = 0x1234_5678_9abc_def0;
+        let mut data = Vec::new();
+        data.extend_from_slice(&errno.to_le_bytes());
+        data.extend_from_slice(&addr.to_le_bytes());
+
+        let vars = vec![ParsedComplexVariable {
+            var_name_index: var_name_idx,
+            type_index: type_idx,
+            access_path: String::new(),
+            status: VariableStatus::ReadError as u8,
+            data,
+        }];
+
+        let out = FormatPrinter::format_complex_print_data(fmt_idx, &vars, &trace_context);
+        assert!(
+            out.contains("read_user failed errno=-14"),
+            "unexpected: {out}"
+        );
+        assert!(out.contains("0x123456789abcdef0"), "missing addr: {out}");
+    }
+
+    #[test]
+    fn test_ext_p_preserves_offsets_unavailable() {
+        let mut trace_context = TraceContext::new();
+        let fmt_idx = trace_context.add_string("P={:p}".to_string());
+
+        let ptr_type = TypeInfo::PointerType {
+            target_type: Box::new(TypeInfo::BaseType {
+                name: "u8".to_string(),
+                size: 1,
+                encoding: gimli::constants::DW_ATE_unsigned_char.0 as u16,
+            }),
+            size: 8,
+        };
+        let type_idx = trace_context.add_type(ptr_type);
+        let var_name_idx = trace_context.add_variable_name("ptr".to_string());
+
+        let vars = vec![ParsedComplexVariable {
+            var_name_index: var_name_idx,
+            type_index: type_idx,
+            access_path: String::new(),
+            status: VariableStatus::OffsetsUnavailable as u8,
+            data: vec![],
+        }];
+
+        let out = FormatPrinter::format_complex_print_data(fmt_idx, &vars, &trace_context);
+        assert!(out.starts_with("P="), "prefix lost: {out}");
+        assert!(
+            out.contains("proc offsets unavailable"),
+            "unexpected: {out}"
+        );
+    }
+
+    #[test]
+    fn test_ext_star_len_error_precedence() {
+        let mut trace_context = TraceContext::new();
+        let fmt_idx = trace_context.add_string("S={:x.*}".to_string());
+
+        // length argument (will surface its error), use base type for simplicity
+        let len_type = TypeInfo::BaseType {
+            name: "i64".to_string(),
+            size: 8,
+            encoding: gimli::constants::DW_ATE_signed.0 as u16,
+        };
+        let len_ty_idx = trace_context.add_type(len_type);
+        let len_name_idx = trace_context.add_variable_name("len".to_string());
+
+        // value argument (OK)
+        let arr_type = TypeInfo::ArrayType {
+            element_type: Box::new(TypeInfo::BaseType {
+                name: "u8".to_string(),
+                size: 1,
+                encoding: gimli::constants::DW_ATE_unsigned_char.0 as u16,
+            }),
+            element_count: Some(16),
+            total_size: Some(16),
+        };
+        let val_ty_idx = trace_context.add_type(arr_type);
+        let val_name_idx = trace_context.add_variable_name("buf".to_string());
+        let val_data: Vec<u8> = (0u8..16).collect();
+
+        let vars = vec![
+            ParsedComplexVariable {
+                var_name_index: len_name_idx,
+                type_index: len_ty_idx,
+                access_path: String::new(),
+                status: VariableStatus::NullDeref as u8,
+                data: vec![],
+            },
+            ParsedComplexVariable {
+                var_name_index: val_name_idx,
+                type_index: val_ty_idx,
+                access_path: String::new(),
+                status: VariableStatus::Ok as u8,
+                data: val_data,
+            },
+        ];
+
+        let out = FormatPrinter::format_complex_print_data(fmt_idx, &vars, &trace_context);
+        assert!(out.starts_with("S="), "prefix lost: {out}");
+        assert!(
+            out.contains("null pointer"),
+            "should surface len arg error: {out}"
+        );
+        // should not print hex bytes when length errored out
+        assert!(
+            !out.contains("00 01 02 03"),
+            "should not render bytes: {out}"
+        );
     }
 }

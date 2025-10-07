@@ -54,6 +54,8 @@ pub enum VariableStatus {
     /// Required runtime offsets/proc mapping not available at eBPF time
     /// (e.g., no (pid,module) offsets to compute address)
     OffsetsUnavailable = 5,
+    /// Requested dynamic length is <= 0; no bytes were read
+    ZeroLength = 6,
 }
 
 /// Print string instruction data (most optimized)

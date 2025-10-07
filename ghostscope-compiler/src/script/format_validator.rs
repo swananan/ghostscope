@@ -11,25 +11,30 @@ pub struct FormatValidator;
 impl FormatValidator {
     /// Validate that format string placeholders match the number of arguments
     pub fn validate_format_arguments(format: &str, args: &[Expr]) -> Result<(), ParseError> {
-        let placeholder_count = Self::count_placeholders(format)?;
+        let (placeholders, star_extras) = Self::count_required_args(format)?;
+        let required_args = placeholders + star_extras;
 
-        if placeholder_count != args.len() {
+        if required_args != args.len() {
             let args_len = args.len();
             return Err(ParseError::TypeError(format!(
-                "Format string '{format}' expects {placeholder_count} placeholder(s) but received {args_len} argument(s)"
+                "Format string '{format}' expects {required_args} argument(s) but received {args_len} argument(s)"
             )));
         }
 
-        // TODO: Future enhancement - validate expression types against format specifiers
-        // e.g., {:d} requires integer types, {:s} requires string types
+        // TODO (phase 2): validate expression types against format specifiers
+        // e.g., {:x} requires integer or pointer; {:s} requires char*/bytes
 
         Ok(())
     }
 
     /// Count the number of placeholders in a format string
     /// Supports basic {} placeholders and escape sequences {{, }}
-    fn count_placeholders(format: &str) -> Result<usize, ParseError> {
-        let mut count = 0;
+    /// Extended: supports {:x}, {:X}, {:p}, {:s}, and optional length suffixes .N or .*
+    /// Returns (placeholders, star_extras) where star_extras is the number of additional
+    /// dynamic-length arguments required by `.*` occurrences.
+    fn count_required_args(format: &str) -> Result<(usize, usize), ParseError> {
+        let mut placeholders = 0usize;
+        let mut star_extras = 0usize;
         let mut chars = format.chars().peekable();
 
         while let Some(ch) = chars.next() {
@@ -54,15 +59,69 @@ impl FormatValidator {
                             return Err(ParseError::InvalidExpression);
                         }
 
-                        // TODO: Future enhancement - validate placeholder content
-                        // For now, we only support empty placeholders: {}
-                        if !placeholder_content.is_empty() {
-                            return Err(ParseError::TypeError(format!(
-                                "Complex format specifiers not yet supported: {{{placeholder_content}}}"
-                            )));
+                        // Accept: empty "{}" or extended forms like ":x", ":X", ":p", ":s", optionally with
+                        // a length suffix ".N" (digits) or ".*" (dynamic length consumes one extra argument)
+                        if placeholder_content.is_empty() {
+                            placeholders += 1;
+                        } else {
+                            // Must start with ':'
+                            if !placeholder_content.starts_with(':') {
+                                return Err(ParseError::TypeError(format!(
+                                    "Invalid format specifier '{{{}}}': expected ':' prefix",
+                                    placeholder_content
+                                )));
+                            }
+                            // Extract conv and optional suffix
+                            let tail = &placeholder_content[1..];
+                            // conv is first char
+                            let mut iter = tail.chars();
+                            let conv = iter.next().ok_or_else(|| {
+                                ParseError::TypeError("Empty format after ':'".to_string())
+                            })?;
+                            match conv {
+                                'x' | 'X' | 'p' | 's' => {}
+                                _ => {
+                                    return Err(ParseError::TypeError(format!(
+                                        "Unsupported format conversion '{{:{}}}'",
+                                        conv
+                                    )));
+                                }
+                            }
+                            // Remaining should be empty or ".N" or ".*" or ".name$" (capture variable)
+                            let rest: String = iter.collect();
+                            if rest.is_empty() {
+                                // ok
+                            } else if let Some(rem) = rest.strip_prefix('.') {
+                                if rem == "*" {
+                                    star_extras += 1; // dynamic length consumes next arg
+                                } else if rem.chars().all(|c| c.is_ascii_digit()) {
+                                    // static length, ok
+                                } else if let Some(name) = rem.strip_suffix('$') {
+                                    // capture variable name: [A-Za-z_][A-Za-z0-9_]*$
+                                    let mut chars = name.chars();
+                                    let valid = if let Some(first) = chars.next() {
+                                        (first.is_ascii_alphabetic() || first == '_')
+                                            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+                                    } else {
+                                        false
+                                    };
+                                    if !valid {
+                                        return Err(ParseError::TypeError(format!(
+                                            "Invalid capture variable in specifier '{{:{conv}.{rem}}}'"
+                                        )));
+                                    }
+                                } else {
+                                    return Err(ParseError::TypeError(format!(
+                                        "Invalid length in specifier '{{:{conv}{rest}}}'"
+                                    )));
+                                }
+                            } else {
+                                return Err(ParseError::TypeError(format!(
+                                    "Invalid specifier syntax '{{:{conv}{rest}}}'"
+                                )));
+                            }
+                            placeholders += 1;
                         }
-
-                        count += 1;
                     }
                 }
                 '}' => {
@@ -76,7 +135,7 @@ impl FormatValidator {
             }
         }
 
-        Ok(count)
+        Ok((placeholders, star_extras))
     }
 }
 
@@ -89,29 +148,66 @@ mod tests {
     fn test_count_placeholders() {
         // Basic cases
         assert_eq!(
-            FormatValidator::count_placeholders("hello world").unwrap(),
-            0
+            FormatValidator::count_required_args("hello world").unwrap(),
+            (0, 0)
         );
-        assert_eq!(FormatValidator::count_placeholders("hello {}").unwrap(), 1);
-        assert_eq!(FormatValidator::count_placeholders("{} {}").unwrap(), 2);
         assert_eq!(
-            FormatValidator::count_placeholders("pid: {}, name: {}").unwrap(),
-            2
+            FormatValidator::count_required_args("hello {}").unwrap(),
+            (1, 0)
+        );
+        assert_eq!(
+            FormatValidator::count_required_args("{} {}").unwrap(),
+            (2, 0)
+        );
+        assert_eq!(
+            FormatValidator::count_required_args("pid: {}, name: {}").unwrap(),
+            (2, 0)
         );
 
         // Escape sequences
         assert_eq!(
-            FormatValidator::count_placeholders("use {{}} for braces").unwrap(),
-            0
+            FormatValidator::count_required_args("use {{}} for braces").unwrap(),
+            (0, 0)
         );
         assert_eq!(
-            FormatValidator::count_placeholders("value: {}, braces: {{}}").unwrap(),
-            1
+            FormatValidator::count_required_args("value: {}, braces: {{}}").unwrap(),
+            (1, 0)
         );
 
         // Error cases
-        assert!(FormatValidator::count_placeholders("unclosed {").is_err());
-        assert!(FormatValidator::count_placeholders("unmatched }").is_err());
+        assert!(FormatValidator::count_required_args("unclosed {").is_err());
+        assert!(FormatValidator::count_required_args("unmatched }").is_err());
+
+        // Extended specifiers
+        assert_eq!(
+            FormatValidator::count_required_args("{:x}").unwrap(),
+            (1, 0)
+        );
+        assert_eq!(
+            FormatValidator::count_required_args("{:X}").unwrap(),
+            (1, 0)
+        );
+        assert_eq!(
+            FormatValidator::count_required_args("{:p}").unwrap(),
+            (1, 0)
+        );
+        assert_eq!(
+            FormatValidator::count_required_args("{:s}").unwrap(),
+            (1, 0)
+        );
+        assert_eq!(
+            FormatValidator::count_required_args("{:x.16}").unwrap(),
+            (1, 0)
+        );
+        assert_eq!(
+            FormatValidator::count_required_args("{:s.*}").unwrap(),
+            (1, 1)
+        );
+        assert_eq!(
+            FormatValidator::count_required_args("{:x.len$}").unwrap(),
+            (1, 0)
+        );
+        assert!(FormatValidator::count_required_args("{:x.1a$}").is_err());
     }
 
     #[test]
