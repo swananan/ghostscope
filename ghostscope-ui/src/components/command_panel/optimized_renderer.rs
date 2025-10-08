@@ -135,10 +135,15 @@ impl OptimizedRenderer {
                     } else {
                         // Fallback to old logic
                         let wrapped_lines = self.wrap_text(&static_line.content, width);
+                        // If original content has ANSI codes, don't use response_type for wrapped lines
+                        let has_ansi = static_line.content.contains("\x1b[");
                         for wrapped_line in wrapped_lines {
-                            lines.push(
-                                self.create_response_line(&wrapped_line, static_line.response_type),
-                            );
+                            let response_type = if has_ansi {
+                                None // Let ANSI parser handle colors
+                            } else {
+                                static_line.response_type
+                            };
+                            lines.push(self.create_response_line(&wrapped_line, response_type));
                         }
                     }
                 }
@@ -969,16 +974,23 @@ impl OptimizedRenderer {
         content: &str,
         response_type: Option<ResponseType>,
     ) -> Line<'static> {
-        let style = match response_type {
-            Some(ResponseType::Success) => Style::default().fg(Color::Green),
-            Some(ResponseType::Error) => Style::default().fg(Color::Red),
-            Some(ResponseType::Warning) => Style::default().fg(Color::Yellow),
-            Some(ResponseType::Info) => Style::default().fg(Color::Cyan),
-            Some(ResponseType::Progress) => Style::default().fg(Color::Blue),
-            Some(ResponseType::ScriptDisplay) => Style::default().fg(Color::Magenta),
-            None => Style::default().fg(Color::Gray),
-        };
-        Line::from(Span::styled(content.to_string(), style))
+        // Check if content contains ANSI color codes
+        if content.contains("\x1b[") {
+            // Parse ANSI codes and create styled spans
+            Line::from(self.parse_ansi_colors(content))
+        } else {
+            // Use default response type styling
+            let style = match response_type {
+                Some(ResponseType::Success) => Style::default().fg(Color::Green),
+                Some(ResponseType::Error) => Style::default().fg(Color::Red),
+                Some(ResponseType::Warning) => Style::default().fg(Color::Yellow),
+                Some(ResponseType::Info) => Style::default().fg(Color::Cyan),
+                Some(ResponseType::Progress) => Style::default().fg(Color::Blue),
+                Some(ResponseType::ScriptDisplay) => Style::default().fg(Color::Magenta),
+                None => Style::default(), // No color for wrapped ANSI lines
+            };
+            Line::from(Span::styled(content.to_string(), style))
+        }
     }
 
     /// Create fallback welcome line
@@ -1190,7 +1202,7 @@ impl OptimizedRenderer {
         }
     }
 
-    /// Wrap text to fit within the specified width
+    /// Wrap text to fit within the specified width (preserves ANSI escape sequences and color state)
     fn wrap_text(&self, text: &str, width: u16) -> Vec<String> {
         if width <= 2 {
             return vec![text.to_string()];
@@ -1200,23 +1212,58 @@ impl OptimizedRenderer {
         let mut lines = Vec::new();
 
         for line in text.lines() {
-            let line_width: usize = line
-                .chars()
-                .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
-                .sum();
+            // Calculate visible width (excluding ANSI codes)
+            let line_width = self.visible_width(line);
 
             if line_width <= max_width {
                 lines.push(line.to_string());
             } else {
                 let mut current_line = String::new();
                 let mut current_width = 0;
+                let mut chars = line.chars().peekable();
+                let mut in_ansi_sequence = false;
+                let mut active_color_code = String::new(); // Track active color
 
-                for ch in line.chars() {
+                while let Some(ch) = chars.next() {
+                    // Detect ANSI escape sequence start
+                    if ch == '\x1b' && chars.peek() == Some(&'[') {
+                        in_ansi_sequence = true;
+                        current_line.push(ch);
+                        active_color_code.clear();
+                        active_color_code.push(ch);
+                        continue;
+                    }
+
+                    // If in ANSI sequence, add character without counting width
+                    if in_ansi_sequence {
+                        current_line.push(ch);
+                        active_color_code.push(ch);
+                        if ch == 'm' {
+                            in_ansi_sequence = false;
+                            // Check if this is a reset code
+                            if active_color_code == "\x1b[0m" {
+                                active_color_code.clear();
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Normal character - count width
                     let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
 
                     if current_width + char_width > max_width && !current_line.is_empty() {
+                        // Add reset before line break if we have active color
+                        if !active_color_code.is_empty() && !current_line.ends_with("\x1b[0m") {
+                            current_line.push_str("\x1b[0m");
+                        }
                         lines.push(current_line);
-                        current_line = ch.to_string();
+
+                        // Start new line with active color if any
+                        current_line = String::new();
+                        if !active_color_code.is_empty() && active_color_code != "\x1b[0m" {
+                            current_line.push_str(&active_color_code);
+                        }
+                        current_line.push(ch);
                         current_width = char_width;
                     } else {
                         current_line.push(ch);
@@ -1235,6 +1282,31 @@ impl OptimizedRenderer {
         }
 
         lines
+    }
+
+    /// Calculate visible width of text (excluding ANSI escape sequences)
+    fn visible_width(&self, text: &str) -> usize {
+        let mut width = 0;
+        let mut chars = text.chars().peekable();
+        let mut in_ansi_sequence = false;
+
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' && chars.peek() == Some(&'[') {
+                in_ansi_sequence = true;
+                continue;
+            }
+
+            if in_ansi_sequence {
+                if ch == 'm' {
+                    in_ansi_sequence = false;
+                }
+                continue;
+            }
+
+            width += UnicodeWidthChar::width(ch).unwrap_or(0);
+        }
+
+        width
     }
 
     /// Wrap styled line preserving spans - uses same logic as wrap_text() for consistency
@@ -1305,6 +1377,63 @@ impl OptimizedRenderer {
 
     pub fn scroll_down(&mut self) {
         self.scroll_offset += 1;
+    }
+
+    /// Parse ANSI color codes and create styled spans
+    fn parse_ansi_colors(&self, text: &str) -> Vec<Span<'static>> {
+        let mut spans = Vec::new();
+        let mut current_text = String::new();
+        let mut current_style = Style::default();
+        let mut chars = text.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' && chars.peek() == Some(&'[') {
+                // Save current text if any
+                if !current_text.is_empty() {
+                    spans.push(Span::styled(current_text.clone(), current_style));
+                    current_text.clear();
+                }
+
+                // Skip '['
+                chars.next();
+
+                // Parse color code
+                let mut code = String::new();
+                while let Some(&c) = chars.peek() {
+                    if c == 'm' {
+                        chars.next(); // consume 'm'
+                        break;
+                    }
+                    code.push(c);
+                    chars.next();
+                }
+
+                // Apply color based on code
+                current_style = match code.as_str() {
+                    "0" => Style::default(),                     // Reset
+                    "31" => Style::default().fg(Color::Red),     // Red
+                    "32" => Style::default().fg(Color::Green),   // Green
+                    "33" => Style::default().fg(Color::Yellow),  // Yellow
+                    "34" => Style::default().fg(Color::Blue),    // Blue
+                    "35" => Style::default().fg(Color::Magenta), // Magenta
+                    "36" => Style::default().fg(Color::Cyan),    // Cyan
+                    _ => current_style,                          // Unknown, keep current
+                };
+            } else {
+                current_text.push(ch);
+            }
+        }
+
+        // Add remaining text
+        if !current_text.is_empty() {
+            spans.push(Span::styled(current_text, current_style));
+        }
+
+        if spans.is_empty() {
+            spans.push(Span::raw(text.to_string()));
+        }
+
+        spans
     }
 }
 

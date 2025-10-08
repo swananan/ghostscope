@@ -661,7 +661,7 @@ impl ScriptEditor {
             };
 
             result.push(format!(
-                "{success_emoji} Trace Results: 1 successful, 0 failed"
+                "{success_emoji} Trace Results: \x1b[32m1 successful\x1b[0m, 0 failed"
             ));
 
             if let Some(trace_id) = details.trace_id {
@@ -673,7 +673,7 @@ impl ScriptEditor {
             }
         } else {
             result.push(format!(
-                "{success_emoji} Trace Results: 1 successful, 0 failed"
+                "{success_emoji} Trace Results: \x1b[32m1 successful\x1b[0m, 0 failed"
             ));
             result.push(format!("  • {target} → trace attached"));
         }
@@ -717,9 +717,24 @@ impl ScriptEditor {
             success_emoji
         };
 
+        // Format with colors: green for successful (if > 0), red for failed (if > 0)
+        let success_part = if compilation_details.success_count > 0 {
+            format!(
+                "\x1b[32m{} successful\x1b[0m",
+                compilation_details.success_count
+            )
+        } else {
+            format!("{} successful", compilation_details.success_count)
+        };
+
+        let failed_part = if compilation_details.failed_count > 0 {
+            format!("\x1b[31m{} failed\x1b[0m", compilation_details.failed_count)
+        } else {
+            format!("{} failed", compilation_details.failed_count)
+        };
+
         result.push(format!(
-            "{} Trace Results: {} successful, {} failed",
-            summary_emoji, compilation_details.success_count, compilation_details.failed_count
+            "{summary_emoji} Trace Results: {success_part}, {failed_part}"
         ));
 
         // List all successful traces
@@ -794,7 +809,7 @@ impl ScriptEditor {
         // ❌ Error summary
         let error_emoji = emoji_config.get_script_status(crate::ui::emoji::ScriptStatus::Error);
         result.push(format!(
-            "{error_emoji} Trace Results: 0 successful, 1 failed"
+            "{error_emoji} Trace Results: 0 successful, \x1b[31m1 failed\x1b[0m"
         ));
 
         // Simplified error message (remove redundant prefixes)
