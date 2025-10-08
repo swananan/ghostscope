@@ -1280,24 +1280,28 @@ impl App {
                     &command,
                 );
                 additional_actions.extend(actions);
+                self.state.command_renderer.mark_pending_updates();
             }
             Action::ExitScriptMode => {
                 let actions = crate::components::command_panel::ScriptEditor::exit_script_mode(
                     &mut self.state.command_panel,
                 );
                 additional_actions.extend(actions);
+                self.state.command_renderer.mark_pending_updates();
             }
             Action::SubmitScript => {
                 let actions = crate::components::command_panel::ScriptEditor::submit_script(
                     &mut self.state.command_panel,
                 );
                 additional_actions.extend(actions);
+                self.state.command_renderer.mark_pending_updates();
             }
             Action::CancelScript => {
                 let actions = crate::components::command_panel::ScriptEditor::exit_script_mode(
                     &mut self.state.command_panel,
                 );
                 additional_actions.extend(actions);
+                self.state.command_renderer.mark_pending_updates();
             }
             Action::AddResponseWithStyle {
                 content,
