@@ -128,7 +128,7 @@ impl LoadingUI {
         let header_text = Text::from(vec![Line::from(vec![
             Span::styled("🔍 ", Style::default().fg(Color::Yellow)),
             Span::styled(
-                "Ghostscope v0.1.0 - A DWARF-aware eBPF tracer with cgdb-like TUI - explore live processes at runtime",
+                format!("Ghostscope v{} - A DWARF-aware eBPF tracer with cgdb-like TUI - explore live processes at runtime", env!("CARGO_PKG_VERSION")),
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
@@ -201,7 +201,7 @@ impl LoadingUI {
 
         let mut lines = vec![
             Line::from(Span::styled(
-                "🔍 Ghostscope v0.1.0",
+                format!("🔍 Ghostscope v{}", env!("CARGO_PKG_VERSION")),
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),

@@ -12,7 +12,7 @@ use tracing::warn;
 
 #[derive(Parser)]
 #[command(name = "dwarf-tool")]
-#[command(version = "0.1.0")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "DWARF debug information analysis tool with multiple analysis modes")]
 #[command(author = "swananan")]
 #[command(
