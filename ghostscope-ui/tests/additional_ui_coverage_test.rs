@@ -383,3 +383,96 @@ mod input_state_tests {
         assert!(matches!(state.input_state, InputState::Ready));
     }
 }
+
+#[cfg(test)]
+mod script_editor_cache_tests {
+    use super::*;
+
+    #[test]
+    fn test_empty_script_cache_restoration() {
+        // Test that empty script can be re-entered with cursor visible
+        let mut state = CommandPanelState::default();
+
+        // First entry - enter script mode
+        let actions = ScriptEditor::enter_script_mode(&mut state, "trace test.c:10");
+        assert!(!actions.is_empty());
+        assert!(state.script_cache.is_some());
+        assert_eq!(state.mode, InteractionMode::ScriptEditor);
+
+        let cache = state.script_cache.as_ref().unwrap();
+        assert_eq!(cache.target, "test.c:10");
+        assert!(
+            !cache.lines.is_empty(),
+            "First entry should have at least one line"
+        );
+        assert_eq!(cache.lines.len(), 1);
+        assert_eq!(cache.lines[0], "");
+        assert_eq!(cache.cursor_line, 0);
+        assert_eq!(cache.cursor_col, 0);
+
+        // Exit without any input
+        let actions = ScriptEditor::exit_script_mode(&mut state);
+        assert!(!actions.is_empty());
+        assert_eq!(state.mode, InteractionMode::Input);
+
+        // Verify that empty script was saved to cache
+        let cache = state.script_cache.as_ref().unwrap();
+        assert!(cache.saved_scripts.contains_key("test.c:10"));
+        let saved = cache.saved_scripts.get("test.c:10").unwrap();
+        assert_eq!(saved.content, "");
+        assert_eq!(saved.cursor_line, 0);
+        assert_eq!(saved.cursor_col, 0);
+
+        // Second entry - should restore from cache with at least one line
+        let actions = ScriptEditor::enter_script_mode(&mut state, "trace test.c:10");
+        assert!(!actions.is_empty());
+        assert_eq!(state.mode, InteractionMode::ScriptEditor);
+
+        let cache = state.script_cache.as_ref().unwrap();
+        assert!(
+            !cache.lines.is_empty(),
+            "Second entry should have at least one line"
+        );
+        assert_eq!(cache.lines.len(), 1);
+        assert_eq!(cache.lines[0], "");
+        assert_eq!(cache.cursor_line, 0);
+        assert_eq!(cache.cursor_col, 0);
+    }
+
+    #[test]
+    fn test_nonempty_script_cache_restoration() {
+        // Test that non-empty script is properly restored
+        let mut state = CommandPanelState::default();
+
+        // First entry
+        ScriptEditor::enter_script_mode(&mut state, "trace main");
+
+        // Add some content
+        ScriptEditor::insert_char(&mut state, 'p');
+        ScriptEditor::insert_char(&mut state, 'r');
+        ScriptEditor::insert_char(&mut state, 'i');
+        ScriptEditor::insert_newline(&mut state);
+        ScriptEditor::insert_char(&mut state, 'n');
+        ScriptEditor::insert_char(&mut state, 't');
+
+        let cache = state.script_cache.as_ref().unwrap();
+        assert_eq!(cache.lines.len(), 2);
+        assert_eq!(cache.lines[0], "pri");
+        assert_eq!(cache.lines[1], "nt");
+        assert_eq!(cache.cursor_line, 1);
+        assert_eq!(cache.cursor_col, 2);
+
+        // Exit
+        ScriptEditor::exit_script_mode(&mut state);
+
+        // Second entry - should restore content and cursor position
+        ScriptEditor::enter_script_mode(&mut state, "trace main");
+
+        let cache = state.script_cache.as_ref().unwrap();
+        assert_eq!(cache.lines.len(), 2);
+        assert_eq!(cache.lines[0], "pri");
+        assert_eq!(cache.lines[1], "nt");
+        assert_eq!(cache.cursor_line, 1);
+        assert_eq!(cache.cursor_col, 2);
+    }
+}
