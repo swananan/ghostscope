@@ -183,7 +183,11 @@ Inspired by and learned from:
 - [**bpftrace**](https://github.com/iovisor/bpftrace) - eBPF tracing techniques
 - [**cgdb**](https://cgdb.github.io/) - TUI design and user experience
 
-Special thanks to these excellent blog posts:
+Special thanks to these excellent resources that taught us a lot:
 
+**Blog Posts:**
 - [**The Wonderland of Dynamic Tracing**](https://blog.openresty.com/en/dynamic-tracing-part-1/)
 - [**Unwinding the Stack the Hard Way**](https://lesenechal.fr/en/linux/unwinding-the-stack-the-hard-way)
+
+**Books:**
+- [**Crafting Interpreters**](https://craftinginterpreters.com/)
