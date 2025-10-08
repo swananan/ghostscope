@@ -5,6 +5,7 @@ use inkwell::module::Linkage;
 use inkwell::module::Module;
 use inkwell::values::PointerValue;
 use inkwell::AddressSpace;
+// AddressSpace was used for pointer-typed BTF encodings; no longer needed after int-field BTF
 use std::collections::HashMap;
 use tracing::{error, info};
 
@@ -94,8 +95,10 @@ impl<'ctx> MapManager<'ctx> {
         key_type: SizedType,
         value_type: SizedType,
     ) -> Result<()> {
-        info!("Creating map definition: {} (type: {:?}, max_entries: {}, key_type: {:?}, value_type: {:?})", 
-            name, map_type, max_entries, key_type, value_type);
+        info!(
+            "Creating map definition: {} (type: {:?}, max_entries: {}, key_type: {:?}, value_type: {:?})",
+            name, map_type, max_entries, key_type, value_type
+        );
 
         // Store map type information
         self.map_types.insert(name.to_string(), map_type);
@@ -105,58 +108,28 @@ impl<'ctx> MapManager<'ctx> {
         info!("Map variable name: {}", var_name);
 
         // Create BPF map definition structure that aya expects
-        // This should match the structure that aya-obj looks for
-        let i32_type = self.context.i32_type();
+        // Match clang-style: fields are pointers (64-bit); actual values are
+        // encoded via BTF pointer-to-array lengths, not via initializers.
+        let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
 
-        // Use aya binding for map type ID
-        let map_type_id = map_type.to_aya_map_type();
-
-        // Calculate key and value sizes in bytes (converting from bits)
-        let key_size = if key_type.is_none {
-            0
-        } else {
-            (key_type.size / 8) as u32
-        };
-        let value_size = if value_type.is_none {
-            0
-        } else {
-            (value_type.size / 8) as u32
-        };
-        let max_entries_u32 = max_entries.min(u32::MAX as u64) as u32;
+        // Values are conveyed by BTF; initializers can be null pointers.
 
         // Create struct with appropriate fields based on map type
         // Ringbuf only needs type and max_entries, others need all 4 fields
         let (elements, initializer_values): (Vec<_>, Vec<_>) = match map_type {
-            BpfMapType::Ringbuf => {
-                // Ringbuf: only type and max_entries
-                (
-                    vec![
-                        i32_type.into(), // type
-                        i32_type.into(), // max_entries
-                    ],
-                    vec![
-                        i32_type.const_int(map_type_id as u64, false).into(),
-                        i32_type.const_int(max_entries_u32 as u64, false).into(),
-                    ],
-                )
-            }
-            _ => {
-                // Other maps: type, key_size, value_size, max_entries
-                (
-                    vec![
-                        i32_type.into(), // type
-                        i32_type.into(), // key_size
-                        i32_type.into(), // value_size
-                        i32_type.into(), // max_entries
-                    ],
-                    vec![
-                        i32_type.const_int(map_type_id as u64, false).into(),
-                        i32_type.const_int(key_size as u64, false).into(),
-                        i32_type.const_int(value_size as u64, false).into(),
-                        i32_type.const_int(max_entries_u32 as u64, false).into(),
-                    ],
-                )
-            }
+            BpfMapType::Ringbuf => (
+                vec![ptr_ty.into(), ptr_ty.into()],
+                vec![ptr_ty.const_null().into(), ptr_ty.const_null().into()],
+            ),
+            _ => (
+                vec![ptr_ty.into(), ptr_ty.into(), ptr_ty.into(), ptr_ty.into()],
+                vec![
+                    ptr_ty.const_null().into(),
+                    ptr_ty.const_null().into(),
+                    ptr_ty.const_null().into(),
+                    ptr_ty.const_null().into(),
+                ],
+            ),
         };
         let struct_type = self.context.struct_type(&elements, false);
         let initializer = struct_type.const_named_struct(&initializer_values);
@@ -352,181 +325,111 @@ impl<'ctx> MapManager<'ctx> {
         let file = compile_unit.get_file();
         let scope = compile_unit.as_debug_info_scope();
 
-        // Create the map structure based on map type, matching clang's BTF format
-        // aya expects 'type' field to be a pointer to array where array.len contains the map type
+        // Create the map structure based on map type, matching clang/aya BTF format:
+        // fields are pointers to arrays whose nr_elems encode values.
         let map_type_id = map_type.to_aya_map_type();
 
-        // Create array type with nr_elems = map_type_id (this is how aya encodes map types)
-        // Use Range<i64> directly to encode the map type
-        let map_type_range = 0..map_type_id as i64;
-        let array_type = di_builder.create_array_type(
-            i32_type.as_type(), // element_type
-            64,                 // size_in_bits
-            32,                 // align_in_bits
-            std::slice::from_ref(&map_type_range),
-        );
+        // Helper: pointer to array with given element count (encoded in range)
+        let mk_ptr_to_array = |name: &str, nr_elems: i64| {
+            let range = 0..nr_elems;
+            let arr = di_builder.create_array_type(
+                i32_type.as_type(),
+                64,
+                32,
+                std::slice::from_ref(&range),
+            );
+            di_builder.create_pointer_type(name, arr.as_type(), 64, 64, AddressSpace::default())
+        };
 
-        // Create pointer to this array for the 'type' field
-        let type_ptr_type = di_builder.create_pointer_type(
-            "type",
-            array_type.as_type(),
-            64, // size_in_bits (pointer size)
-            64, // align_in_bits
-            AddressSpace::default(),
-        );
+        let type_ptr = mk_ptr_to_array("type", map_type_id as i64);
 
         let members = match map_type {
             BpfMapType::Ringbuf => {
-                // Ringbuf maps in clang BTF have only type and max_entries fields
-                // This matches the reference program structure
-                info!("Creating ringbuf BTF with 2 fields (type, max_entries)");
-
-                // Create max_entries array type with proper range
-                let max_entries_range = 0..max_entries as i64;
-                let max_entries_array = di_builder.create_array_type(
-                    i32_type.as_type(),
-                    64,
-                    32,
-                    std::slice::from_ref(&max_entries_range),
-                );
-                let max_entries_ptr = di_builder.create_pointer_type(
-                    "max_entries",
-                    max_entries_array.as_type(),
-                    64,
-                    64,
-                    AddressSpace::default(),
-                );
-
+                info!("Creating ringbuf BTF with 2 fields (type, max_entries) as pointer-to-array");
+                let max_entries_ptr = mk_ptr_to_array("max_entries", max_entries as i64);
                 vec![
                     di_builder.create_member_type(
                         scope,
                         "type",
                         file,
-                        0,  // line_no
-                        64, // size_in_bits (pointer size)
-                        64, // align_in_bits
-                        0,  // offset_in_bits
-                        0,  // flags
-                        type_ptr_type.as_type(),
+                        0,
+                        64,
+                        64,
+                        0,
+                        0,
+                        type_ptr.as_type(),
                     ),
                     di_builder.create_member_type(
                         scope,
                         "max_entries",
                         file,
-                        0,  // line_no
-                        64, // size_in_bits (pointer size)
-                        64, // align_in_bits
-                        64, // offset_in_bits
-                        0,  // flags
+                        0,
+                        64,
+                        64,
+                        64,
+                        0,
                         max_entries_ptr.as_type(),
                     ),
                 ]
             }
             _ => {
-                // Other maps have all fields as pointers to arrays with encoded values
                 info!("Creating array/hash BTF with pointer-to-array fields for aya compatibility");
-
-                // Create key_size array
-                let key_size_value = if key_type.is_none {
+                let key_size_val = if key_type.is_none {
                     0
                 } else {
                     (key_type.size / 8) as i64
                 };
-                let key_size_range = 0..key_size_value;
-                let key_size_array = di_builder.create_array_type(
-                    i32_type.as_type(),
-                    64,
-                    32,
-                    std::slice::from_ref(&key_size_range),
-                );
-                let key_size_ptr = di_builder.create_pointer_type(
-                    "key_size",
-                    key_size_array.as_type(),
-                    64,
-                    64,
-                    AddressSpace::default(),
-                );
-
-                // Create value_size array
-                let value_size_value = if value_type.is_none {
+                let value_size_val = if value_type.is_none {
                     0
                 } else {
                     (value_type.size / 8) as i64
                 };
-                let value_size_range = 0..value_size_value;
-                let value_size_array = di_builder.create_array_type(
-                    i32_type.as_type(),
-                    64,
-                    32,
-                    std::slice::from_ref(&value_size_range),
-                );
-                let value_size_ptr = di_builder.create_pointer_type(
-                    "value_size",
-                    value_size_array.as_type(),
-                    64,
-                    64,
-                    AddressSpace::default(),
-                );
-
-                // Create max_entries array
-                let max_entries_range = 0..max_entries as i64;
-                let max_entries_array = di_builder.create_array_type(
-                    i32_type.as_type(),
-                    64,
-                    32,
-                    std::slice::from_ref(&max_entries_range),
-                );
-                let max_entries_ptr = di_builder.create_pointer_type(
-                    "max_entries",
-                    max_entries_array.as_type(),
-                    64,
-                    64,
-                    AddressSpace::default(),
-                );
-
+                let key_size_ptr = mk_ptr_to_array("key_size", key_size_val);
+                let value_size_ptr = mk_ptr_to_array("value_size", value_size_val);
+                let max_entries_ptr = mk_ptr_to_array("max_entries", max_entries as i64);
                 vec![
                     di_builder.create_member_type(
                         scope,
                         "type",
                         file,
-                        0,  // line_no
-                        64, // size_in_bits (pointer size)
-                        64, // align_in_bits
-                        0,  // offset_in_bits
-                        0,  // flags
-                        type_ptr_type.as_type(),
+                        0,
+                        64,
+                        64,
+                        0,
+                        0,
+                        type_ptr.as_type(),
                     ),
                     di_builder.create_member_type(
                         scope,
                         "key_size",
                         file,
-                        0,  // line_no
-                        64, // size_in_bits (pointer size)
-                        64, // align_in_bits
-                        64, // offset_in_bits
-                        0,  // flags
+                        0,
+                        64,
+                        64,
+                        64,
+                        0,
                         key_size_ptr.as_type(),
                     ),
                     di_builder.create_member_type(
                         scope,
                         "value_size",
                         file,
-                        0,   // line_no
-                        64,  // size_in_bits (pointer size)
-                        64,  // align_in_bits
-                        128, // offset_in_bits
-                        0,   // flags
+                        0,
+                        64,
+                        64,
+                        128,
+                        0,
                         value_size_ptr.as_type(),
                     ),
                     di_builder.create_member_type(
                         scope,
                         "max_entries",
                         file,
-                        0,   // line_no
-                        64,  // size_in_bits (pointer size)
-                        64,  // align_in_bits
-                        192, // offset_in_bits
-                        0,   // flags
+                        0,
+                        64,
+                        64,
+                        192,
+                        0,
                         max_entries_ptr.as_type(),
                     ),
                 ]
@@ -536,10 +439,10 @@ impl<'ctx> MapManager<'ctx> {
         // Convert members to DIType vector
         let member_types: Vec<_> = members.iter().map(|m| m.as_type()).collect();
 
-        // Calculate total structure size based on number of fields (all pointers now)
+        // Total structure size: pointers (64-bit) per field
         let (total_size_bits, field_count) = match map_type {
-            BpfMapType::Ringbuf => (128, 2), // 2 * 64 bits (pointers)
-            _ => (256, 4),                   // 4 * 64 bits (pointers)
+            BpfMapType::Ringbuf => (128, 2), // 2 * 64 bits
+            _ => (256, 4),                   // 4 * 64 bits
         };
 
         // Create the map structure type (anonymous like reference)
