@@ -43,16 +43,13 @@ With this map in hand, GhostScope leverages **eBPF and uprobe** technology to sa
 
 GhostScope transforms compiled binaries into observable systems. Place trace points at function entries, specific source lines, or anywhere in between. Print local variables, global variables, function parameters, complex nested structures, even stack backtraces. All with the simplicity of printf debugging, but the power of modern tracing.
 
+The demo below shows GhostScope tracing an nginx worker process with debug information. You can see how GhostScope supports conditional logic, easily extracts information from complex data structures, and operates without disrupting the process.
+
 <br />
 
-<!-- Demo Video Placeholder -->
 <div align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/demo-dark.gif">
-    <source media="(prefers-color-scheme: light)" srcset="assets/demo-light.gif">
-    <img src="assets/demo.gif" alt="GhostScope Demo" width="100%"/>
-  </picture>
-  <p><sub><i>Real-time tracing of a running application with GhostScope</i></sub></p>
+  <img src="assets/demo.gif" alt="GhostScope Demo" width="100%"/>
+  <p><sub><i>Real-time tracing of a running nginx worker process</i></sub></p>
 </div>
 
 ## ✨ Highlights
