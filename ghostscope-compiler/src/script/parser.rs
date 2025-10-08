@@ -24,6 +24,9 @@ pub enum ParseError {
     #[error("Invalid expression")]
     InvalidExpression,
 
+    #[error("Syntax error: {0}")]
+    SyntaxError(String),
+
     #[error("Type error: {0}")]
     TypeError(String),
 
@@ -57,7 +60,16 @@ fn chunks_of_two<'a, T: RuleType>(pairs: Pairs<'a, T>) -> Vec<Vec<Pair<'a, T>>> 
 pub fn parse(input: &str) -> Result<Program> {
     debug!("Starting to parse input: {}", input.trim());
 
-    let pairs = GhostScopeParser::parse(Rule::program, input)?;
+    let pairs = match GhostScopeParser::parse(Rule::program, input) {
+        Ok(p) => p,
+        Err(e) => {
+            // Heuristic: detect unclosed string in print lines to provide a clearer hint
+            if let Some(msg) = detect_unclosed_print_string(input) {
+                return Err(ParseError::SyntaxError(msg));
+            }
+            return Err(ParseError::Pest(Box::new(e)));
+        }
+    };
     let mut program = Program::new();
 
     for pair in pairs {
@@ -78,6 +90,39 @@ pub fn parse(input: &str) -> Result<Program> {
 
     debug!("Parsing completed successfully");
     Ok(program)
+}
+
+// Best-effort heuristic: if a line contains a print statement with an opening quote
+// but no closing quote before arguments, give a clearer error.
+fn detect_unclosed_print_string(input: &str) -> Option<String> {
+    for (i, raw_line) in input.lines().enumerate() {
+        let line = raw_line.trim_start();
+        if !line.contains("print ") && !line.starts_with("print") {
+            continue;
+        }
+        // Toggle on '"' to detect unclosed string; ignore escaped quotes for simplicity
+        let mut open = false;
+        for ch in line.chars() {
+            if ch == '"' {
+                open = !open;
+            }
+        }
+        if open {
+            // Common case: missing closing quote before comma and arguments
+            if line.contains(',') {
+                return Some(format!(
+                    "Unclosed string literal in print at line {}. Did you forget a closing \"\" before ',' and arguments?",
+                    i + 1
+                ));
+            } else {
+                return Some(format!(
+                    "Unclosed string literal in print at line {}.",
+                    i + 1
+                ));
+            }
+        }
+    }
+    None
 }
 
 fn parse_statement(pair: Pair<Rule>) -> Result<Statement> {
