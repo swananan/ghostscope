@@ -31,7 +31,8 @@ impl ScriptEditor {
         let target = command.trim_start_matches("trace").trim();
 
         if target.is_empty() {
-            let plain = "Usage: trace <function_name|file:line>".to_string();
+            let plain =
+                "Usage: trace <function_name|file:line|0xADDR|module_suffix:0xADDR>".to_string();
             let styled = vec![
                 crate::components::command_panel::style_builder::StyledLineBuilder::new()
                     .styled(

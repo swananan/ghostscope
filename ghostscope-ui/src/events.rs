@@ -93,9 +93,14 @@ impl TargetDebugInfo {
             .map(|module| module.address_mappings.len())
             .sum();
 
-        // Enhanced header with target name and statistics
+        // Header by target type
+        let header_prefix = match self.target_type {
+            TargetType::Function => "🔧 Function Debug Info",
+            TargetType::SourceLocation => "📄 Line Debug Info",
+            TargetType::Address => "📍 Address Debug Info",
+        };
         result.push_str(&format!(
-            "🔧 Function Debug Info: {} ({} modules, {} traceable addresses)\n\n",
+            "{header_prefix}: {} ({} modules, {} traceable addresses)\n\n",
             self.target, module_count, total_addresses
         ));
 
@@ -110,6 +115,26 @@ impl TargetDebugInfo {
             ));
         }
 
+        // Suggestions for address targets
+        if let TargetType::Address = self.target_type {
+            // Try to pick the first address for an example
+            let example_addr = self
+                .modules
+                .iter()
+                .flat_map(|m| m.address_mappings.iter())
+                .map(|m| m.address)
+                .next();
+            if let Some(addr) = example_addr {
+                result.push_str("\n💡 Tips:\n");
+                result.push_str(&format!(
+                    "  - In '-t <module>' mode: use `trace 0x{addr:x} {{ ... }}` (defaults to that module)\n"
+                ));
+                result.push_str(&format!(
+                    "  - In '-p <pid>' mode: default module is the main executable; for library addresses, start GhostScope with '-t <that .so>' then use `trace 0x{addr:x} {{ ... }}`\n"
+                ));
+            }
+        }
+
         result
     }
 
@@ -120,12 +145,17 @@ impl TargetDebugInfo {
 
         let mut lines = Vec::new();
 
-        // Title line
+        // Title line by type
         let total_addresses: usize = self.modules.iter().map(|m| m.address_mappings.len()).sum();
+        let header_prefix = match self.target_type {
+            TargetType::Function => "🔧 Function Debug Info",
+            TargetType::SourceLocation => "📄 Line Debug Info",
+            TargetType::Address => "📍 Address Debug Info",
+        };
         lines.push(
             StyledLineBuilder::new()
                 .title(format!(
-                    "🔧 Function Debug Info: {} ({} modules, {} addresses)",
+                    "{header_prefix}: {} ({} modules, {} addresses)",
                     self.target,
                     self.modules.len(),
                     total_addresses
@@ -142,6 +172,41 @@ impl TargetDebugInfo {
                 self.line_number,
                 verbose,
             ));
+        }
+
+        // Suggestions for address targets
+        if let TargetType::Address = self.target_type {
+            // Example address from first mapping
+            if let Some(addr) = self
+                .modules
+                .iter()
+                .flat_map(|m| m.address_mappings.iter())
+                .map(|m| m.address)
+                .next()
+            {
+                lines.push(Line::from(""));
+                lines.push(
+                    StyledLineBuilder::new()
+                        .styled(
+                            "💡 Tips:",
+                            crate::components::command_panel::style_builder::StylePresets::SECTION,
+                        )
+                        .build(),
+                );
+                lines.push(
+                    StyledLineBuilder::new()
+                        .text("  - In '-t <module>' mode: use ")
+                        .value(format!("trace 0x{addr:x} {{ ... }}"))
+                        .text(" (defaults to that module)")
+                        .build(),
+                );
+                lines.push(
+                    StyledLineBuilder::new()
+                        .text("  - In '-p <pid>' mode: default module is main executable; for library addresses, start with '-t <that .so>' then use ")
+                        .value(format!("trace 0x{addr:x} {{ ... }}"))
+                        .build(),
+                );
+            }
         }
 
         lines

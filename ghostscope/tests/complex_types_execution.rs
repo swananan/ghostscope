@@ -940,6 +940,51 @@ trace complex_types_program.c:7 {
 }
 
 #[tokio::test]
+async fn test_trace_by_address_nopie_complex_types() -> anyhow::Result<()> {
+    // End-to-end on Non-PIE binary: resolve DWARF PC for a known source line and attach by 0xADDR
+    init();
+
+    // 1) Build and start Non-PIE binary (ET_EXEC)
+    let binary_path = FIXTURES.get_test_binary_complex_nopie()?;
+    let mut prog = Command::new(&binary_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // 2) Resolve a module-relative address (DWARF PC) for a stable line in update_complex
+    //    Choose 'c->age += 1;' which is consistently present near the top of the function.
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to load DWARF for Non-PIE test binary: {}", e))?;
+    let addrs = analyzer.lookup_addresses_by_source_line("complex_types_program.c", 8);
+    anyhow::ensure!(
+        !addrs.is_empty(),
+        "No DWARF addresses found for complex_types_program.c:8"
+    );
+    let pc = addrs[0].address;
+
+    // 3) Build a script that attaches by address and prints a marker
+    let script = format!("trace 0x{pc:x} {{\n    print \"NP_ADDR_OK\";\n}}\n");
+
+    // 4) Run ghostscope in PID mode (-p). Default module resolves to the main executable.
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(&script, 2, pid).await?;
+    let _ = prog.kill().await;
+
+    // 5) Validate: we should see the marker at least once
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    assert!(
+        stdout.lines().any(|l| l.contains("NP_ADDR_OK")),
+        "Expected NP_ADDR_OK in output. STDOUT: {}",
+        stdout
+    );
+
+    Ok(())
+}
+#[tokio::test]
 async fn test_complex_types_formatting() -> anyhow::Result<()> {
     init();
 

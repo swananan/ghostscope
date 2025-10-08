@@ -185,8 +185,11 @@ ls -i /usr/bin/app  # 查看当前文件 inode
          ↓
   文件偏移 (0x1234)
          ↓
-  uprobe_register(inode, 0x1234)
+uprobe_register(inode, 0x1234)
 ```
+
+注意
+- 脚本/CLI 的地址目标使用的是“模块相对虚拟地址（DWARF PC）”。也就是说，在脚本中 `trace libc.so.6:0xADDR { ... }` 或 `trace 0xADDR { ... }` 里的 `0xADDR` 是该模块的 DWARF PC。GhostScope 会在内部将该虚拟地址换算为 ELF 文件偏移（无论 PIE 或非 PIE），再进行 uprobe 附着。请勿与“原始文件偏移”混淆。
 
 ### 4. ASLR 对 Uprobe 的影响
 

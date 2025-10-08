@@ -26,7 +26,7 @@ impl UIStrings {
     // Help text
     pub const HELP_TEXT: &'static str = r#"Available commands:
   help     - Show this help message
-  trace    - Start tracing a function (enters script mode)
+  trace    - Start tracing a function/line/address (enters script mode)
   attach   - Attach to a process by PID
   detach   - Detach from current process
   quit     - Exit ghostscope

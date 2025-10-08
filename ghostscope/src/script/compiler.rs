@@ -342,10 +342,21 @@ pub async fn compile_and_load_script_for_cli(
         .as_mut()
         .ok_or_else(|| anyhow::anyhow!("Process analyzer is required for script compilation"))?;
 
+    // Determine an effective binary path for logging/reporting purposes.
+    // In PID mode, prefer main executable; in target mode (-t <binary>, including .so),
+    // fall back to the target binary path.
     let binary_path_string = if let Some(main_module) = process_analyzer.get_main_executable() {
         main_module.path.clone()
+    } else if let Some(bin) = session.target_binary.clone() {
+        bin
     } else {
-        return Err(anyhow::anyhow!("No main executable found in process"));
+        // As a last resort, try to pick the first shared library (target mode analyzer)
+        let libs = process_analyzer.get_shared_library_info();
+        if libs.len() == 1 {
+            libs[0].library_path.clone()
+        } else {
+            return Err(anyhow::anyhow!("No main executable found in process"));
+        }
     };
 
     // Step 2: Get starting trace ID from trace manager and use unified compilation interface with DwarfAnalyzer

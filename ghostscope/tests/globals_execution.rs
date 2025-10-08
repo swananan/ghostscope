@@ -180,6 +180,199 @@ trace globals_program.c:32 {
 }
 
 #[tokio::test]
+async fn test_trace_by_address_via_dwarf_line_lookup() -> anyhow::Result<()> {
+    // End-to-end: resolve a DWARF PC for a known source line, then attach with trace 0xADDR { ... }
+    init();
+
+    // 1) Start the fixture program
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+
+    // Give the program some time to start
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // 2) Resolve a module-relative address (DWARF PC) for a stable source line in globals_program.c
+    //    We reuse the same file:line that existing tests rely on and pick the first returned PC.
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to load DWARF for test binary: {}", e))?;
+    let addrs = analyzer.lookup_addresses_by_source_line("globals_program.c", 32);
+    anyhow::ensure!(
+        !addrs.is_empty(),
+        "No DWARF addresses found for globals_program.c:32"
+    );
+    let pc = addrs[0].address;
+
+    // 3) Build a script that attaches by address and prints a marker
+    let script = format!("trace 0x{pc:x} {{\n    print \"ADDR_OK\";\n}}\n");
+
+    // 4) Run ghostscope with -p and the script; in -p mode the default module is the main executable
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(&script, 2, pid).await?;
+    let _ = prog.kill().await;
+
+    // 5) Validate output: should see the marker at least once
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    assert!(
+        stdout.lines().any(|l| l.contains("ADDR_OK")),
+        "Expected ADDR_OK in output. STDOUT: {}",
+        stdout
+    );
+
+    Ok(())
+}
+
+async fn run_ghostscope_with_script_for_target(
+    script_content: &str,
+    timeout_secs: u64,
+    target_path: &std::path::Path,
+) -> anyhow::Result<(i32, String, String)> {
+    use std::ffi::OsString;
+    use std::io::Write;
+    use std::process::Stdio;
+    use tokio::process::Command;
+    use tokio::time::timeout;
+
+    let mut script_file = NamedTempFile::new()?;
+    script_file.write_all(script_content.as_bytes())?;
+    let script_path = script_file.path();
+
+    let binary_path = "../target/debug/ghostscope";
+    let args: Vec<OsString> = vec![
+        OsString::from("-t"),
+        target_path.as_os_str().to_os_string(),
+        OsString::from("--script-file"),
+        script_path.as_os_str().to_os_string(),
+        OsString::from("--no-save-llvm-ir"),
+        OsString::from("--no-save-ebpf"),
+        OsString::from("--no-save-ast"),
+        OsString::from("--no-log"),
+    ];
+
+    let mut command = Command::new(binary_path);
+    command.args(&args);
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+
+    let mut child = command.spawn()?;
+    let stdout_handle = child.stdout.take().unwrap();
+    let stderr_handle = child.stderr.take().unwrap();
+    let mut stdout_reader = BufReader::new(stdout_handle);
+    let mut stderr_reader = BufReader::new(stderr_handle);
+    let mut stdout_content = String::new();
+    let mut stderr_content = String::new();
+
+    let read_task = async {
+        let mut stdout_line = String::new();
+        let mut stderr_line = String::new();
+        for _ in 0..120 {
+            stdout_line.clear();
+            if let Ok(Ok(n)) = timeout(
+                Duration::from_millis(50),
+                stdout_reader.read_line(&mut stdout_line),
+            )
+            .await
+            {
+                if n > 0 {
+                    stdout_content.push_str(&stdout_line);
+                }
+            }
+            stderr_line.clear();
+            if let Ok(Ok(n)) = timeout(
+                Duration::from_millis(50),
+                stderr_reader.read_line(&mut stderr_line),
+            )
+            .await
+            {
+                if n > 0 {
+                    stderr_content.push_str(&stderr_line);
+                }
+            }
+            if let Ok(Some(_)) = child.try_wait() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    };
+
+    let _ = timeout(Duration::from_secs(timeout_secs), read_task).await;
+
+    let mut exit_code = match child.try_wait() {
+        Ok(Some(status)) => status.code().unwrap_or(-1),
+        _ => {
+            let _ = child.kill().await;
+            match timeout(Duration::from_secs(2), child.wait()).await {
+                Ok(Ok(status)) => status.code().unwrap_or(-1),
+                _ => -1,
+            }
+        }
+    };
+    if exit_code == -1 && (!stdout_content.is_empty() || !stderr_content.is_empty()) {
+        exit_code = 0;
+    }
+    Ok((exit_code, stdout_content, stderr_content))
+}
+
+#[tokio::test]
+async fn test_trace_address_with_target_shared_library() -> anyhow::Result<()> {
+    // Verify address tracing works when session is started with -t <libgvars.so>
+    init();
+
+    // Start an app that maps libgvars.so so that uprobe events occur
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let _pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Resolve a function address inside libgvars.so (e.g., lib_tick entry)
+    let lib_path = bin_dir.join("libgvars.so");
+    anyhow::ensure!(
+        lib_path.exists(),
+        "libgvars.so not found at {}",
+        lib_path.display()
+    );
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&lib_path)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to load DWARF for lib: {}", e))?;
+    let addrs = analyzer.lookup_function_addresses("lib_tick");
+    anyhow::ensure!(
+        !addrs.is_empty(),
+        "No addresses for lib_tick in libgvars.so"
+    );
+    let pc = addrs[0].address;
+
+    // Build script tracing at that address
+    let script = format!("trace 0x{pc:x} {{\n    print \"LIB_ADDR_OK\";\n}}\n");
+
+    // Run ghostscope in target mode (-t <libgvars.so>) with the script, collect output briefly
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(&script, 2, &lib_path).await?;
+    let _ = prog.kill().await;
+
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    assert!(
+        stdout.lines().any(|l| l.contains("LIB_ADDR_OK")),
+        "Expected LIB_ADDR_OK in output. STDOUT: {}",
+        stdout
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_address_of_with_hint_regression() -> anyhow::Result<()> {
     init();
 

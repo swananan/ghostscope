@@ -472,7 +472,8 @@ impl CommandParser {
     fn format_tracing_commands() -> String {
         [
             "📊 Tracing Commands:",
-            "  trace <target>             - Start tracing a function/location (t)",
+            "  trace <target>             - Start tracing a function/line/address (t)",
+            "    - target: function_name | file:line | 0xADDR | module_suffix:0xADDR",
             "  enable <id|all>            - Enable specific trace or all traces (en)",
             "  disable <id|all>           - Disable specific trace or all traces (dis)",
             "  delete <id|all>            - Delete specific trace or all traces (del)",
@@ -976,22 +977,41 @@ impl CommandParser {
             })]);
         }
 
-        // Handle info address command (TODO)
+        // Handle info address command
         if command.starts_with("info address ") || command.starts_with("i a ") {
-            let plain = "TODO: info address command not implemented yet".to_string();
-            let styled = vec![
-                crate::components::command_panel::style_builder::StyledLineBuilder::new()
-                    .styled(
-                        plain.clone(),
-                        crate::components::command_panel::style_builder::StylePresets::WARNING,
-                    )
-                    .build(),
-            ];
-            return Some(vec![Action::AddResponseWithStyle {
-                content: plain,
-                styled_lines: Some(styled),
-                response_type: ResponseType::Warning,
-            }]);
+            let args = if command.starts_with("info address ") {
+                command.strip_prefix("info address ").unwrap()
+            } else {
+                command.strip_prefix("i a ").unwrap()
+            };
+
+            let parts: Vec<&str> = args.split_whitespace().collect();
+            if parts.is_empty() {
+                let plain =
+                    "Usage: info address <0xADDR | module_suffix:0xADDR> [verbose|v]".to_string();
+                let styled = Self::styled_usage(&plain);
+                return Some(vec![Action::AddResponseWithStyle {
+                    content: plain,
+                    styled_lines: Some(styled),
+                    response_type: ResponseType::Error,
+                }]);
+            }
+
+            let target = parts[0].to_string();
+            let verbose = parts.len() > 1 && (parts[1] == "verbose" || parts[1] == "v");
+
+            state.input_state = InputState::WaitingResponse {
+                command: command.to_string(),
+                sent_time: Instant::now(),
+                command_type: CommandType::InfoAddress {
+                    target: target.clone(),
+                    verbose,
+                },
+            };
+
+            return Some(vec![Action::SendRuntimeCommand(
+                RuntimeCommand::InfoAddress { target, verbose },
+            )]);
         }
 
         None

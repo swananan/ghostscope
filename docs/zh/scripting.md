@@ -75,6 +75,23 @@ trace /home/user/project/src/utils.c:100 {
 }
 ```
 
+#### 地址
+```ghostscope
+// 按模块相对地址（DWARF PC）追踪
+trace 0x401234 {
+    print "命中地址";
+}
+
+// 指定模块 + 地址（支持全路径或唯一后缀匹配）
+trace libc.so.6:0x1234 {
+    print "命中 libc 地址";
+}
+```
+
+说明：
+- `0xADDR` 的默认模块取决于启动模式：`-t <binary>` 使用 `<binary>`；`-p <pid>` 使用主可执行文件。
+- `模块后缀:0xADDR` 可通过“全路径”或“唯一后缀”选中模块；若后缀不唯一，会提示候选项。
+
 ## 变量
 
 ### 脚本变量
