@@ -89,9 +89,9 @@ impl ScriptEditor {
         state.mode = InteractionMode::ScriptEditor;
 
         let message = if restored_from_cache {
-            format!("📝 Script editor opened for '{target}' (restored from cache)\nPress Ctrl+S to submit, ESC to cancel, F3 to clear")
+            format!("📝 Script editor opened for '{target}' (restored from cache)\nPress Ctrl+S to submit, ESC to cancel")
         } else {
-            format!("📝 Script editor opened for '{target}'\nPress Ctrl+S to submit, ESC to cancel, F3 to clear")
+            format!("📝 Script editor opened for '{target}'\nPress Ctrl+S to submit, ESC to cancel")
         };
 
         let styled = vec![

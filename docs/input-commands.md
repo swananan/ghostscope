@@ -40,7 +40,39 @@ t process_data               # Use short form
 ```
 
 **Description:**
-After executing trace command, you enter Script Mode to write trace scripts. Press `Ctrl+S` to save and execute, `Ctrl+C` to cancel.
+After executing trace command, you enter Script Mode to write trace scripts. Press `Ctrl+S` to save and execute, `Ctrl+C` or `Esc` to cancel.
+
+**Script Mode Workflow:**
+1. Execute `trace <target>` → Enter Script Mode with syntax highlighting
+2. Write trace script (see [Script Language Reference](scripting.md) for syntax)
+3. Submit and compile:
+   - `Ctrl+S`: Submit script and compile to eBPF
+   - `Ctrl+C` or `Esc`: Cancel and return to Input Mode
+4. View compilation results in command panel
+5. Check real-time trace output in eBPF Output Panel
+
+**Script Caching:**
+- Scripts are automatically cached per target
+- Re-entering same target (e.g., `trace sample.c:42` again) restores previous script
+- Cache persists until you exit GhostScope
+- Useful for iterative debugging: modify → test → modify
+
+**Quick Start Example:**
+```bash
+# 1. Enter script mode for a function
+trace main
+
+# 2. In Script Mode, write:
+print "Entering main, argc={}", argc;
+
+# 3. Press Ctrl+S to submit
+# 4. See output: ✅ Trace Results: 1 successful, 0 failed
+
+# 5. Later, modify the same trace:
+trace main          # Your previous script is restored!
+
+# 6. Edit and press Ctrl+S again
+```
 
 ### enable - Enable Traces
 
