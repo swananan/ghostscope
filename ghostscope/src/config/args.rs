@@ -16,7 +16,7 @@ pub enum LayoutMode {
 #[command(
     about = "A DWARF-aware eBPF tracer with cgdb-like TUI - explore live processes at runtime"
 )]
-#[command(version = "0.1.0")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 pub struct Args {
     /// Binary file to debug (path or name)
     pub binary: Option<String>,
