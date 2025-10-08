@@ -364,7 +364,7 @@ Performance and safety notes:
 
 - Comparisons are compiled into bounded, branch-light checks to be verifier-friendly on most kernels. Still, placing many string comparisons in a single probe or attaching at extremely hot sites may add CPU and verifier load.
 - Prefer attaching at less-hot lines/functions if you only need occasional confirmation (e.g., update sites for a string field), or split multiple heavy comparisons into separate trace points.
-- Builtins (`strncmp`/`starts_with`) cap read length to 64 bytes for safety (see `STRING_BUILTIN_READ_CAP` in `ghostscope-compiler/src/ebpf/expression.rs`).
+- Builtins (`strncmp`/`starts_with`) cap read length by `ebpf.compare_cap` (default 64 bytes).
   CString equality reads only `L+1` bytes (no extra cap beyond the literal length).
 
 // Floats are not supported in GhostScope scripts.
@@ -379,11 +379,20 @@ Supported built-ins (phase 1):
   - Does not require a terminating NUL within `n` bytes.
   - `expr` may be a DWARF `char*`, `char[N]`, or a generic pointer expression; GhostScope performs a bounded user-memory read and compares bytes.
   - Any read failure evaluates to `false`.
-  - Read length is capped at 64 bytes; if `n` exceeds the cap or the available array size, it is truncated. See `STRING_BUILTIN_READ_CAP` in `ghostscope-compiler/src/ebpf/expression.rs`.
+  - Read length is capped by configuration `ebpf.compare_cap` (default 64 bytes). If `n` exceeds the cap or the available array size, it is truncated.
 
 - `starts_with(expr, "lit")`
   - Equivalent to `strncmp(expr, "lit", len("lit"))`.
   - Same failure and safety semantics as above.
+
+- `memcmp(expr_a, expr_b, len)`
+  - Boolean variant: returns `true` iff the first `len` bytes at `expr_a` and `expr_b` are identical.
+  - Pointer vs pointer only; for literal comparisons against strings, use `strncmp`/`starts_with` instead.
+  - `len` can be a script integer expression; negative values clamp to 0, and a configurable cap (`ebpf.compare_cap`, default 64) applies. The effective compare length is `min(max(len,0), CAP)`.
+  - No NUL-terminator semantics; compares raw bytes only.
+  - Any read failure on either side evaluates to `false`.
+  - If `len == 0`, the result is `true` and no user-memory read is performed (fast-path).
+  - Implementation is verifier-friendly: reads are bounded and comparisons are accumulated without early exits.
 
 Verifier friendliness and performance:
 - Compiles to branch-light byte comparisons (e.g., XOR/OR accumulation) to avoid verifier state explosion.
@@ -407,6 +416,19 @@ trace globals_program.c:32 {
 // Generic pointer (read failure -> false)
 trace process_record {
     print "rec_http:{}", strncmp(record, "HTTP", 4); // record: struct* -> false
+}
+
+// Raw memory equality between two pointers
+trace globals_program.c:32 {
+    // Equal bytes
+    if memcmp(&lib_pattern[0], &lib_pattern[0], 16) { print "EQ"; } else { print "NE"; }
+    // Different due to offset
+    if memcmp(&lib_pattern[0], &lib_pattern[1], 16) { print "EQ2"; } else { print "NE2"; }
+    // len=0 → true
+    if memcmp(&lib_pattern[0], &lib_pattern[1], 0) { print "Z0"; }
+    // Dynamic length from script variable
+    let n = 10;
+    if memcmp(&lib_pattern[0], &lib_pattern[0], n) { print "DYN_EQ"; }
 }
 ```
 ```

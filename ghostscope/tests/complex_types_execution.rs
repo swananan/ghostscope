@@ -187,6 +187,92 @@ trace complex_types_program.c:7 {
 }
 
 #[tokio::test]
+async fn test_memcmp_struct_name_equal_and_diff() -> anyhow::Result<()> {
+    init();
+
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("complex_types_program", OptimizationLevel::Debug)?;
+    let mut prog = Command::new(&binary_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Compare embedded char[16] field name: &c.name[0] vs itself / offset 1
+    let script = r#"
+trace update_complex {
+    if memcmp(&c.name[0], &c.name[0], 5) { print "CNAME_EQ"; }
+    if !memcmp(&c.name[0], &c.name[1], 5) { print "CNAME_NE"; }
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    assert!(
+        stdout.contains("CNAME_EQ"),
+        "Expected CNAME_EQ. STDOUT: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("CNAME_NE"),
+        "Expected CNAME_NE. STDOUT: {}",
+        stdout
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_memcmp_dynamic_and_zero_negative_on_name() -> anyhow::Result<()> {
+    init();
+
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("complex_types_program", OptimizationLevel::Debug)?;
+    let mut prog = Command::new(&binary_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let script = r#"
+trace update_complex {
+    // len=0 -> true
+    if memcmp(&c.name[0], &c.name[1], 0) { print "Z0"; }
+    // dynamic len from script var
+    let n = 8;
+    if memcmp(&c.name[0], &c.name[0], n) { print "DYN_OK"; }
+    // negative clamps to 0 -> true
+    let k = -3;
+    if memcmp(&c.name[0], &c.name[1], k) { print "NEG_OK"; }
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    assert!(stdout.contains("Z0"), "Expected Z0. STDOUT: {}", stdout);
+    assert!(
+        stdout.contains("DYN_OK"),
+        "Expected DYN_OK. STDOUT: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("NEG_OK"),
+        "Expected NEG_OK. STDOUT: {}",
+        stdout
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_string_comparison_struct_char_array() -> anyhow::Result<()> {
     init();
 

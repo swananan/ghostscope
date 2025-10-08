@@ -66,6 +66,7 @@ not_unary = { "!" ~ unary }
 unary = { neg_unary | not_unary | factor }
 factor = {
     // Builtin calls must be checked before identifier to avoid ambiguity
+    memcmp_call |
     strncmp_call |
     starts_with_call |
     bool |
@@ -85,6 +86,7 @@ factor = {
 // Builtin function calls (phase 1)
 strncmp_call = { "strncmp" ~ "(" ~ expr ~ "," ~ string ~ "," ~ int ~ ")" }
 starts_with_call = { "starts_with" ~ "(" ~ expr ~ "," ~ string ~ ")" }
+memcmp_call = { "memcmp" ~ "(" ~ expr ~ "," ~ expr ~ "," ~ expr ~ ")" }
 
 special_var = @{ "$" ~ (ASCII_ALPHANUMERIC | "_")+ }
 

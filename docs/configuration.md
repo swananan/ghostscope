@@ -289,6 +289,12 @@ proc_module_offsets_max_entries = 4096  # Default
 # Increase to dump more bytes per argument.
 mem_dump_cap = 4096
 
+# Compare cap for built-in comparisons (strncmp/starts_with/memcmp).
+# Controls the maximum number of bytes compared per call.
+# Effective compare length is min(max(len, 0), compare_cap).
+# Default: 64 bytes.
+compare_cap = 64
+
 # Maximum size of a single trace event (bytes). Applies to PerfEventArray accumulation buffer.
 max_trace_event_size = 32768
 
@@ -364,6 +370,7 @@ max_entries = 10000
 [ebpf]
 ringbuf_size = 1048576  # 1MB buffer for high event rates
 mem_dump_cap = 4096     # Larger per-arg dump
+compare_cap = 64        # Max bytes for built-in compares (strncmp/memcmp)
 max_trace_event_size = 65536  # Larger event size for big formatted prints
 proc_module_offsets_max_entries = 8192  # Support many modules
 
@@ -379,6 +386,7 @@ enable_console_logging = false
 [ebpf]
 ringbuf_size = 131072  # 128KB minimal buffer
 mem_dump_cap = 512
+compare_cap = 32       # Smaller compare cap for minimal overhead
 max_trace_event_size = 16384
 proc_module_offsets_max_entries = 1024  # Single process only
 

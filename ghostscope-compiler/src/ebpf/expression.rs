@@ -4,14 +4,321 @@
 
 use super::context::{CodeGenError, EbpfContext, Result};
 use crate::script::{BinaryOp, Expr};
+use aya_ebpf_bindings::bindings::bpf_func_id::BPF_FUNC_probe_read_user;
 use inkwell::values::BasicValueEnum;
 use inkwell::AddressSpace;
 use tracing::debug;
 
-// Read cap for string builtins (strncmp/starts_with)
-pub const STRING_BUILTIN_READ_CAP: u32 = 64;
+// compare cap is provided via compile_options.compare_cap (config: ebpf.compare_cap)
 
 impl<'ctx> EbpfContext<'ctx> {
+    /// Builtin memcmp (boolean variant): returns true iff first `len` bytes equal.
+    /// Supports dynamic `len` (expr), clamped to [0, compare_cap].
+    fn compile_memcmp_builtin(
+        &mut self,
+        a_expr: &Expr,
+        b_expr: &Expr,
+        len_expr: &Expr,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        // Helper to resolve an expression to i64 pointer value
+        let mut resolve_ptr_i64 = |e: &Expr| -> Result<inkwell::values::IntValue<'ctx>> {
+            // Try compiling as generic expr first
+            if let Ok(v) = self.compile_expr(e) {
+                match v {
+                    BasicValueEnum::IntValue(iv) => {
+                        // Zero/sign-extend or truncate to i64 as needed
+                        let bw = iv.get_type().get_bit_width();
+                        let v64 = if bw < 64 {
+                            self.builder
+                                .build_int_z_extend(iv, self.context.i64_type(), "ptr_zext")
+                                .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                        } else if bw > 64 {
+                            self.builder
+                                .build_int_truncate(iv, self.context.i64_type(), "ptr_trunc")
+                                .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                        } else {
+                            iv
+                        };
+                        return Ok(v64);
+                    }
+                    BasicValueEnum::PointerValue(pv) => {
+                        let v64 = self
+                            .builder
+                            .build_ptr_to_int(pv, self.context.i64_type(), "ptr_as_i64")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        return Ok(v64);
+                    }
+                    _ => {}
+                }
+            }
+
+            // Fallback to DWARF evaluation
+            let var = self.query_dwarf_for_complex_expr(e)?.ok_or_else(|| {
+                CodeGenError::TypeError("memcmp requires pointer/address expression".into())
+            })?;
+            if let Some(dty) = var.dwarf_type.as_ref() {
+                let val_any = self.evaluate_result_to_llvm_value(
+                    &var.evaluation_result,
+                    dty,
+                    &var.name,
+                    self.get_compile_time_context()?.pc_address,
+                )?;
+                match val_any {
+                    BasicValueEnum::IntValue(iv) => Ok(iv),
+                    BasicValueEnum::PointerValue(pv) => self
+                        .builder
+                        .build_ptr_to_int(pv, self.context.i64_type(), "ptr_as_i64")
+                        .map_err(|e| CodeGenError::Builder(e.to_string())),
+                    _ => Err(CodeGenError::TypeError(
+                        "DWARF value is not pointer/integer".into(),
+                    )),
+                }
+            } else {
+                let module_hint = self.current_resolved_var_module_path.clone();
+                self.evaluation_result_to_address_with_hint(
+                    &var.evaluation_result,
+                    None,
+                    module_hint.as_deref(),
+                )
+            }
+        };
+
+        let ptr_a = resolve_ptr_i64(a_expr)?;
+        let ptr_b = resolve_ptr_i64(b_expr)?;
+
+        // Compile length expr to i32 and clamp to [0, CAP]
+        let len_val = self.compile_expr(len_expr)?;
+        let len_iv = match len_val {
+            BasicValueEnum::IntValue(iv) => iv,
+            _ => {
+                return Err(CodeGenError::TypeError(
+                    "memcmp length must be an integer expression".into(),
+                ))
+            }
+        };
+        let i32_ty = self.context.i32_type();
+        let len_i32 = if len_iv.get_type().get_bit_width() > 32 {
+            self.builder
+                .build_int_truncate(len_iv, i32_ty, "memcmp_len_trunc")
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?
+        } else if len_iv.get_type().get_bit_width() < 32 {
+            self.builder
+                .build_int_z_extend(len_iv, i32_ty, "memcmp_len_zext")
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?
+        } else {
+            len_iv
+        };
+        let zero_i32 = i32_ty.const_zero();
+        let is_neg = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::SLT,
+                len_i32,
+                zero_i32,
+                "memcmp_len_neg",
+            )
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let len_nn = self
+            .builder
+            .build_select(is_neg, zero_i32, len_i32, "memcmp_len_nn")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?
+            .into_int_value();
+        let cap = self.compile_options.compare_cap;
+        let cap_const = i32_ty.const_int(cap as u64, false);
+        let gt = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::UGT,
+                len_nn,
+                cap_const,
+                "memcmp_len_gt",
+            )
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let sel_len = self
+            .builder
+            .build_select(gt, cap_const, len_nn, "memcmp_len_sel")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?
+            .into_int_value();
+
+        // Fast-path: if effective length is zero, return true without any reads
+        let len_is_zero = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                sel_len,
+                i32_ty.const_zero(),
+                "memcmp_len_is_zero",
+            )
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let curr_block = self.builder.get_insert_block().unwrap();
+        let func = curr_block.get_parent().unwrap();
+        let zero_b = self.context.append_basic_block(func, "memcmp_len_zero");
+        let nz_b = self.context.append_basic_block(func, "memcmp_len_nz");
+        let cont_b = self.context.append_basic_block(func, "memcmp_len_cont");
+        self.builder
+            .build_conditional_branch(len_is_zero, zero_b, nz_b)
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        // Zero-length branch: true
+        self.builder.position_at_end(zero_b);
+        let bool_true = self.context.bool_type().const_int(1, false);
+        self.builder
+            .build_unconditional_branch(cont_b)
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let zero_block = self.builder.get_insert_block().unwrap();
+
+        // Non-zero branch: perform reads and compare
+        self.builder.position_at_end(nz_b);
+
+        // Prepare static buffers of size CAP for both sides
+        let (arr_a_ty, buf_a) = self.get_or_create_i8_buffer(cap, "_gs_bi_memcmp_a");
+        let (arr_b_ty, buf_b) = self.get_or_create_i8_buffer(cap, "_gs_bi_memcmp_b");
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let dst_a = self
+            .builder
+            .build_bit_cast(buf_a, ptr_ty, "memcmp_dst_a")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let dst_b = self
+            .builder
+            .build_bit_cast(buf_b, ptr_ty, "memcmp_dst_b")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let src_a = self
+            .builder
+            .build_int_to_ptr(ptr_a, ptr_ty, "memcmp_src_a")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let src_b = self
+            .builder
+            .build_int_to_ptr(ptr_b, ptr_ty, "memcmp_src_b")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        // Call bpf_probe_read_user for A and B with dynamic sel_len
+        let ret_a = self
+            .create_bpf_helper_call(
+                BPF_FUNC_probe_read_user as u64,
+                &[dst_a, sel_len.into(), src_a.into()],
+                self.context.i64_type().into(),
+                "probe_read_user_memcmp_a",
+            )?
+            .into_int_value();
+        let ret_b = self
+            .create_bpf_helper_call(
+                BPF_FUNC_probe_read_user as u64,
+                &[dst_b, sel_len.into(), src_b.into()],
+                self.context.i64_type().into(),
+                "probe_read_user_memcmp_b",
+            )?
+            .into_int_value();
+        let i64_ty = self.context.i64_type();
+        let ok_a = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                ret_a,
+                i64_ty.const_zero(),
+                "memcmp_ok_a",
+            )
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let ok_b = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                ret_b,
+                i64_ty.const_zero(),
+                "memcmp_ok_b",
+            )
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let status_ok = self
+            .builder
+            .build_and(ok_a, ok_b, "memcmp_status_ok")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        // Aggregate XOR/OR across 0..CAP, masked by (i < sel_len)
+        let i32_ty = self.context.i32_type();
+        let idx0 = i32_ty.const_zero();
+        let mut acc = self.context.i8_type().const_zero();
+        for i in 0..cap as usize {
+            let idx_i = i32_ty.const_int(i as u64, false);
+            // active = (i < sel_len)
+            let active = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::ULT,
+                    idx_i,
+                    sel_len,
+                    &format!("memcmp_i{}_active", i),
+                )
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            // a[i]
+            let pa = unsafe {
+                self.builder
+                    .build_gep(arr_a_ty, buf_a, &[idx0, idx_i], &format!("memcmp_a_i{}", i))
+                    .map_err(|e| CodeGenError::Builder(e.to_string()))?
+            };
+            let va = self
+                .builder
+                .build_load(self.context.i8_type(), pa, &format!("ld_a_{}", i))
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            let va = match va {
+                BasicValueEnum::IntValue(iv) => iv,
+                _ => return Err(CodeGenError::LLVMError("memcmp load a != i8".into())),
+            };
+            // b[i]
+            let pb = unsafe {
+                self.builder
+                    .build_gep(arr_b_ty, buf_b, &[idx0, idx_i], &format!("memcmp_b_i{}", i))
+                    .map_err(|e| CodeGenError::Builder(e.to_string()))?
+            };
+            let vb = self
+                .builder
+                .build_load(self.context.i8_type(), pb, &format!("ld_b_{}", i))
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            let vb = match vb {
+                BasicValueEnum::IntValue(iv) => iv,
+                _ => return Err(CodeGenError::LLVMError("memcmp load b != i8".into())),
+            };
+            let diff = self
+                .builder
+                .build_xor(va, vb, &format!("memcmp_diff_{}", i))
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            let zero8 = self.context.i8_type().const_zero();
+            let masked = self
+                .builder
+                .build_select(active, diff, zero8, &format!("memcmp_masked_{}", i))
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                .into_int_value();
+            acc = self
+                .builder
+                .build_or(acc, masked, &format!("memcmp_acc_{}", i))
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        }
+        let eq_bytes = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                acc,
+                self.context.i8_type().const_zero(),
+                "memcmp_acc_zero",
+            )
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let nz_result = self
+            .builder
+            .build_and(status_ok, eq_bytes, "memcmp_and")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        self.builder
+            .build_unconditional_branch(cont_b)
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let nz_block = self.builder.get_insert_block().unwrap();
+
+        // Merge
+        self.builder.position_at_end(cont_b);
+        let phi = self
+            .builder
+            .build_phi(self.context.bool_type(), "memcmp_phi")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        phi.add_incoming(&[(&bool_true, zero_block), (&nz_result, nz_block)]);
+        Ok(phi.as_basic_value())
+    }
     /// Builtin strncmp/starts_with implementation: bounded byte-compare without NUL requirement.
     fn compile_strncmp_builtin(
         &mut self,
@@ -80,8 +387,9 @@ impl<'ctx> EbpfContext<'ctx> {
         };
 
         // Cap read length for safety
-        let max_n = std::cmp::min(n, STRING_BUILTIN_READ_CAP);
-        let lit_len = std::cmp::min(lit.len() as u32, STRING_BUILTIN_READ_CAP);
+        let cap = self.compile_options.compare_cap;
+        let max_n = std::cmp::min(n, cap);
+        let lit_len = std::cmp::min(lit.len() as u32, cap);
         let cmp_len = std::cmp::min(max_n, lit_len);
 
         // Read bytes into buffer
@@ -237,6 +545,12 @@ impl<'ctx> EbpfContext<'ctx> {
             }
             Expr::SpecialVar(name) => self.handle_special_variable(name),
             Expr::BuiltinCall { name, args } => match name.as_str() {
+                "memcmp" => {
+                    if args.len() != 3 {
+                        return Err(CodeGenError::TypeError("memcmp expects 3 arguments".into()));
+                    }
+                    self.compile_memcmp_builtin(&args[0], &args[1], &args[2])
+                }
                 "strncmp" => {
                     if args.len() != 3 {
                         return Err(CodeGenError::TypeError(

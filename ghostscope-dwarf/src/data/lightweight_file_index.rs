@@ -211,19 +211,6 @@ impl ScopedFileIndexManager {
     ) -> Option<String> {
         let file_index_ref = self.cu_file_indices.get(compilation_unit)?;
 
-        // Only enumerate files when debug logging is enabled to avoid O(n) cost per lookup
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            tracing::debug!("  Available files in CU '{}':", compilation_unit);
-            for entry in file_index_ref.file_entries().iter() {
-                tracing::debug!(
-                    "    file_index={}, filename='{}', dir_index={}",
-                    entry.file_index,
-                    entry.filename,
-                    entry.directory_index
-                );
-            }
-        }
-
         let file_entry = file_index_ref.get_file_entry(file_index)?;
 
         let full_path = file_entry
