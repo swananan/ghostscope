@@ -249,7 +249,13 @@ Browse and navigate command history with Vim-style navigation.
 
 ### Mode: Script Mode
 
-Edit trace scripts after executing `trace` command.
+Edit trace scripts with syntax highlighting after executing `trace` command.
+
+**Features:**
+- Real-time syntax highlighting for GhostScope script language
+- Line numbers with current line emphasis
+- Multi-line editing support
+- Automatic script caching per target (restored on re-entry)
 
 #### Text Editing
 
@@ -279,7 +285,7 @@ Edit trace scripts after executing `trace` command.
 | Shortcut | Function |
 |----------|----------|
 | `Ctrl+S` | Submit script (compile and load) |
-| `Ctrl+C` | Cancel script edit |
+| `Ctrl+C` or `Esc` | Cancel script edit and return to Input Mode |
 
 ---
 
