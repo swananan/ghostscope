@@ -516,6 +516,44 @@ trace complex_types_program.c:25 {
 }
 
 #[tokio::test]
+async fn test_special_vars_pid_tid_timestamp_complex() -> anyhow::Result<()> {
+    init();
+
+    // Build and start complex_types_program (Debug)
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("complex_types_program", OptimizationLevel::Debug)?;
+    let mut prog = Command::new(&binary_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let script = format!(
+        "trace complex_types_program.c:25 {{\n    print \"PID={} TID={} TS={}\", $pid, $tid, $timestamp;\n    if $pid == {} {{ print \"PID_OK\"; }}\n}}\n",
+        "{}", "{}", "{}", pid
+    );
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(&script, 3, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    assert!(
+        stdout.contains("PID_OK"),
+        "Expected PID_OK. STDOUT: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("PID=") || stdout.contains("PID:"),
+        "Expected PID field in output. STDOUT: {}",
+        stdout
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_if_else_if_and_bare_expr_local() -> anyhow::Result<()> {
     init();
 

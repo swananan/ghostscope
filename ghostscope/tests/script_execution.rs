@@ -174,6 +174,60 @@ pub async fn cleanup_global_test_process() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn test_special_pid_in_if_condition() -> anyhow::Result<()> {
+    init();
+    ensure_global_cleanup_registered();
+
+    let opt_level = OptimizationLevel::Debug;
+    let test_pid = get_global_test_pid_with_opt(opt_level).await?;
+
+    // Use $pid in an expression: it should equal the traced process PID
+    let script_content = format!(
+        "trace sample_program.c:16 {{\n    if $pid == {} {{ print \"PID_OK\"; }} else {{ print \"PID_BAD\"; }}\n}}\n",
+        test_pid
+    );
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_opt(&script_content, 3, opt_level).await?;
+
+    assert_eq!(exit_code, 0, "stderr={}", stderr);
+    assert!(
+        stdout.contains("PID_OK"),
+        "Expected PID_OK in output. STDOUT: {}",
+        stdout
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_special_tid_and_timestamp_print() -> anyhow::Result<()> {
+    init();
+    ensure_global_cleanup_registered();
+
+    let opt_level = OptimizationLevel::Debug;
+    let _ = get_global_test_pid_with_opt(opt_level).await?;
+
+    // Just print them to ensure they compile, evaluate and render
+    let script_content = r#"
+trace sample_program.c:16 {
+    print "TST:{} {}", $tid, $timestamp;
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_opt(script_content, 3, opt_level).await?;
+
+    assert_eq!(exit_code, 0, "stderr={}", stderr);
+    assert!(
+        stdout.contains("TST:"),
+        "Expected TST: with tid/timestamp in output. STDOUT: {}",
+        stdout
+    );
+    Ok(())
+}
+
 // Global cleanup registration - only runs once when the first test calls it
 static GLOBAL_CLEANUP_REGISTERED: Once = Once::new();
 

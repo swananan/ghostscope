@@ -174,26 +174,28 @@ print arr[0].name;
 - 目前“局部变量、参数、全局变量”均已支持自动解引用（无需显式 `*ptr`，也不需要 `->`，统一使用 `.`，在安全范围内会自动加载并解引用指针值，类似于 Rust 的自动解引用）。
 - 数组访问：已支持顶层 `arr[常量]` 与“链尾”`a.b.c[常量]`。暂不支持：链中间索引（如 `a.b[2].c`）、动态下标（`arr[i]`）和多维数组。
 
-### 特殊变量（实现中）
+### 特殊变量
 
-特殊变量以 `$` 开头，提供运行时信息访问：
+特殊变量以 `$` 开头，提供运行时信息访问。
+
+当前已支持：
+
+- `$pid` — 当前进程 ID（tgid），来自 `bpf_get_current_pid_tgid` 的低 32 位。
+- `$tid` — 当前线程 ID（tid），来自 `bpf_get_current_pid_tgid` 的高 32 位。
+- `$timestamp` — 单调时间戳（纳秒），来自 `bpf_ktime_get_ns`。
+
+以上均作为整数参与比较与计算。
+
+示例
 
 ```ghostscope
-// 函数参数（x86_64 调用约定）
-$arg0, $arg1, $arg2, $arg3, $arg4, $arg5
-
-// 进程信息
-$pid    // 进程 ID
-$tid    // 线程 ID
-$comm   // 进程名称
-
-// 返回值（在返回探针中）
-$retval
-
-// CPU 寄存器（架构特定）
-$pc     // 程序计数器
-$sp     // 栈指针
+trace sample.c:42 {
+    if $pid == 12345 { print "match"; }
+    print "PID:{} TID:{} TS:{}", $pid, $tid, $timestamp;
+}
 ```
+
+提示：目前仅支持 `$pid`、`$tid`、`$timestamp`。后续可能按需加入“寄存器相关”的特殊变量。
 
 ### 变量查找顺序
 
@@ -511,25 +513,12 @@ trace main {
 }
 ```
 
-### 监控函数参数
-
-```ghostscope
-trace calculate {
-    print "calculate({}, {})", $arg0, $arg1;
-
-    if $arg0 > 1000 {
-        print "检测到大输入";
-        bt;
-    }
-}
-```
-
 ### 条件追踪
 
 ```ghostscope
 trace malloc {
-    if $arg0 > 1048576 {  // 1 MB
-        print "大内存分配: {} 字节", $arg0;
+    if size > 1048576 {  // 1 MB
+        print "大内存分配: {} 字节", size;
         backtrace;
     }
 }

@@ -543,7 +543,11 @@ impl<'ctx> EbpfContext<'ctx> {
                 );
                 self.compile_dwarf_expression(expr)
             }
-            Expr::SpecialVar(name) => self.handle_special_variable(name),
+            Expr::SpecialVar(name) => {
+                // Accept both "$pid" and "pid" forms from the parser
+                let sanitized = name.trim_start_matches('$');
+                self.handle_special_variable(sanitized)
+            }
             Expr::BuiltinCall { name, args } => match name.as_str() {
                 "memcmp" => {
                     if args.len() != 3 {
@@ -850,10 +854,13 @@ impl<'ctx> EbpfContext<'ctx> {
                 let ts = self.get_current_timestamp()?;
                 Ok(ts.into())
             }
-            _ => Err(CodeGenError::NotImplemented(format!(
-                "Special variable ${} not implemented",
-                name
-            ))),
+            _ => {
+                let supported = ["$pid", "$tid", "$timestamp"].join(", ");
+                Err(CodeGenError::NotImplemented(format!(
+                    "Unknown special variable '${}'. Supported: {}",
+                    name, supported
+                )))
+            }
         }
     }
 

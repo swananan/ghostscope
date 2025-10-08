@@ -321,6 +321,44 @@ async fn run_ghostscope_with_script_for_target(
 }
 
 #[tokio::test]
+async fn test_special_vars_pid_tid_timestamp_globals() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let script = format!(
+        "trace globals_program.c:32 {{\n    print \"PID={} TID={} TS={}\", $pid, $tid, $timestamp;\n    if $pid == {} {{ print \"PID_EQ\"; }}\n}}\n",
+        "{}", "{}", "{}", pid
+    );
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(&script, 3, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    assert!(
+        stdout.contains("PID_EQ"),
+        "Expected PID_EQ. STDOUT: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("PID=") || stdout.contains("PID:"),
+        "Expected PID print. STDOUT: {}",
+        stdout
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_trace_address_with_target_shared_library() -> anyhow::Result<()> {
     // Verify address tracing works when session is started with -t <libgvars.so>
     init();

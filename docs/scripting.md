@@ -457,26 +457,28 @@ trace globals_program.c:32 {
 ```
 ```
 
-### Special Variables (In Progress)
+### Special Variables
 
-Special variables start with `$` and provide access to runtime information:
+Special variables start with `$` and expose runtime info from the kernel.
+
+Supported now:
+
+- `$pid` — current process ID (tgid), from `bpf_get_current_pid_tgid` lower 32 bits.
+- `$tid` — current thread ID, from `bpf_get_current_pid_tgid` upper 32 bits.
+- `$timestamp` — monotonic timestamp in nanoseconds, from `bpf_ktime_get_ns`.
+
+All behave as integers and can be used in comparisons and arithmetic.
+
+Examples
 
 ```ghostscope
-// Function arguments (x86_64 calling convention)
-$arg0, $arg1, $arg2, $arg3, $arg4, $arg5
-
-// Process information
-$pid    // Process ID
-$tid    // Thread ID
-$comm   // Process name
-
-// Return value (in return probes)
-$retval
-
-// CPU registers (architecture-specific)
-$pc     // Program counter
-$sp     // Stack pointer
+trace sample.c:42 {
+    if $pid == 12345 { print "match"; }
+    print "PID:{} TID:{} TS:{}", $pid, $tid, $timestamp;
+}
 ```
+
+Note: Only `$pid`, `$tid` and `$timestamp` are supported at present. Additional register-related specials may be added later.
 
 ### Variable Lookup Order
 
@@ -510,25 +512,12 @@ trace main {
 }
 ```
 
-### Monitoring Function Arguments
-
-```ghostscope
-trace calculate {
-    print "calculate({}, {})", $arg0, $arg1;
-
-    if $arg0 > 1000 {
-        print "Large input detected";
-        bt;
-    }
-}
-```
-
 ### Conditional Tracing
 
 ```ghostscope
 trace malloc {
-    if $arg0 > 1048576 {  // 1 MB
-        print "Large allocation: {} bytes", $arg0;
+    if size > 1048576 {  // 1 MB
+        print "Large allocation: {} bytes", size;
         backtrace;
     }
 }
