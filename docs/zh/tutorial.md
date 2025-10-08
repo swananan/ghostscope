@@ -98,6 +98,7 @@ trace {target}  # target 可以是函数或源码行号
 
 #### 3. 命令模式
 这个时候，如果一切顺利，我们将在 eBPF 输出面板上看到脚本对应的输出。但要查看输出，我们需要把焦点切换到 eBPF 输出面板。
+
 ![eBPF Output](../images/ebpf-output.png)
 *eBPF 输出结果*
 
@@ -131,6 +132,22 @@ trace {target}  # target 可以是函数或源码行号
    - 这个设计灵感来自 cgdb，我非常喜欢这种快捷方式
 
 这样的工作流程更加流畅，让追踪点的设置变得轻而易举。
+
+### 💡 查看追踪点可用变量
+
+在设置追踪点之前，如果想知道某个位置可以访问哪些局部变量和参数，可以使用 `info` 命令：
+
+```
+info line <file:line>       # 查看源码行的可用变量
+info function <func_name>   # 查看函数入口的可用变量
+info address <0xADDR>       # 查看地址的可用变量
+```
+
+这些命令会显示该位置的调试信息，包括可访问的变量列表：
+
+![Info Source Line](../images/info-line.png)
+*使用 info line 命令查看可用变量*
+
 
 ## 使用脚本文件
 

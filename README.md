@@ -15,7 +15,7 @@
     <img src="https://img.shields.io/badge/version-0.1.0-blue.svg" alt="Version"/>
     <img src="https://img.shields.io/badge/license-GPL-green.svg" alt="License: GPL"/>
     <img src="https://img.shields.io/badge/Linux-4.4+-orange.svg" alt="Linux 4.4+"/>
-    <img src="https://img.shields.io/badge/Rust-1.75+-red.svg" alt="Rust 1.75+"/>
+    <img src="https://img.shields.io/badge/Rust-1.88.0-red.svg" alt="Rust 1.88.0"/>
   </p>
 
   <!-- Language Switch -->

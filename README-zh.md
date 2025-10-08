@@ -15,7 +15,7 @@
     <img src="https://img.shields.io/badge/版本-0.1.0-blue.svg" alt="Version"/>
     <img src="https://img.shields.io/badge/协议-GPL-green.svg" alt="License: GPL"/>
     <img src="https://img.shields.io/badge/Linux-4.4+-orange.svg" alt="Linux 4.4+"/>
-    <img src="https://img.shields.io/badge/Rust-1.75+-red.svg" alt="Rust 1.75+"/>
+    <img src="https://img.shields.io/badge/Rust-1.88.0-red.svg" alt="Rust 1.88.0"/>
   </p>
 
 </div>
@@ -157,7 +157,7 @@ GhostScope 将编译后的二进制文件转变为可观测系统。在函数入
 
 我们欢迎贡献！无论是错误报告、功能请求、文档改进还是代码贡献，我们都感谢您帮助改进 GhostScope。
 
-请查看我们的[贡献指南](docs/contributing.md)了解：
+请查看我们的[贡献指南](docs/zh/contributing.md)了解：
 - 行为准则
 - 开发工作流
 - 编码标准

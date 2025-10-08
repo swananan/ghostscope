@@ -1,9 +1,5 @@
 # GhostScope Roadmap (Milestones)
 
-## Global variables in `-p <pid>` mode — stability and compatibility improvements
-  - Automatic ASLR section offset computation and population
-  - Runtime null-pointer dereference protection
-
 ## Global variables in `-t <exec_path>` mode (planned)
   - Background: resolving globals requires per-module ASLR offsets computed from `/proc/<pid>/maps`, while `-t` mode has no PID context.
   - Direction: introduce PID discovery/subscription in the attach flow, or compute and populate offsets once a PID is known at trigger time; ensure safety and ordering.
