@@ -188,7 +188,7 @@ print "tail={:s.n$}", p;          // length captured from n
 Notes
 - `{}` is default; `{:x}`/`{:X}` for integers; `{:p}` for pointers; `{:s}` for ASCII bytes.
 - Length suffixes:
-  - `.{N}`: static length (reads N bytes)
+  - `.{N}`: static length (reads N bytes). `N` supports decimal, hex (`0x..`), octal (`0o..`), and binary (`0b..`).
   - `.*`: dynamic length; consumes two arguments (length first, then value)
   - `.name$`: capture a script variable named `name` as length; does not consume an extra value argument
 - Kernel performs bounded reads; user space renders hex/ASCII. For `{:s}` ASCII, rendering stops at the first NUL byte; non-printables are escaped as `\xNN`.
@@ -242,6 +242,13 @@ let sum = a + b;       // Addition
 let diff = a - b;      // Subtraction
 let product = a * b;   // Multiplication (not for pointers)
 let quotient = a / b;  // Division
+
+// Integer literals
+let x = 123;           // decimal
+let h = 0x1f;          // hex (31)
+let o = 0o755;         // octal (493)
+let b = 0b1010;        // binary (10)
+let neg = -0x10;       // unary minus applies (parsed as 0 - 16)
 ```
 
 ### Expression Precedence
@@ -387,8 +394,8 @@ Supported built-ins (phase 1):
 
 - `memcmp(expr_a, expr_b, len)`
   - Boolean variant: returns `true` iff the first `len` bytes at `expr_a` and `expr_b` are identical.
-  - Pointer vs pointer only; for literal comparisons against strings, use `strncmp`/`starts_with` instead.
-  - `len` can be a script integer expression; negative values clamp to 0, and a configurable cap (`ebpf.compare_cap`, default 64) applies. The effective compare length is `min(max(len,0), CAP)`.
+  - Pointers: `expr_a` and `expr_b` accept DWARF pointer/array expressions or a raw address literal (decimal/hex `0x..`/octal `0o..`/binary `0b..`). For literal string comparisons, use `strncmp`/`starts_with` instead.
+  - `len` can be a script integer expression; supports decimal, hex (`0x..`), octal (`0o..`), and binary (`0b..`) literals. Negative values clamp to 0, and a configurable cap (`ebpf.compare_cap`, default 64) applies. The effective compare length is `min(max(len,0), CAP)`.
   - No NUL-terminator semantics; compares raw bytes only.
   - Any read failure on either side evaluates to `false`.
   - If `len == 0`, the result is `true` and no user-memory read is performed (fast-path).

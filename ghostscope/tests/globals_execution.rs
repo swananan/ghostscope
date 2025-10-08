@@ -1912,6 +1912,7 @@ trace globals_program.c:26 {
     print *ls;          // deref pointer to struct
 }
 "#;
+
     let (exit_code, stdout, stderr) =
         run_ghostscope_with_script_for_pid_perf(script, 2, pid).await?;
 
@@ -1938,5 +1939,47 @@ trace globals_program.c:26 {
         stdout
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_memcmp_numeric_pointer_literal_and_hex_len() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let script = r#"
+trace globals_program.c:32 {
+    // hex static length should work when comparing equal pointers
+    if memcmp(&lib_pattern[0], &lib_pattern[0], 0x10) { print "LENHEX"; }
+    // numeric pointer literal is expected to be invalid and thus false
+    if memcmp(&lib_pattern[0], 0xdeadbeef, 16) { print "NP_TRUE"; } else { print "NP_FALSE"; }
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    assert!(
+        stdout.lines().any(|l| l.contains("LENHEX")),
+        "Expected LENHEX. STDOUT: {}",
+        stdout
+    );
+    assert!(
+        stdout.lines().any(|l| l.contains("NP_FALSE")),
+        "Expected NP_FALSE. STDOUT: {}",
+        stdout
+    );
     Ok(())
 }
