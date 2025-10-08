@@ -1,9 +1,5 @@
 <div align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.png">
-    <source media="(prefers-color-scheme: light)" srcset="assets/logo-light.png">
-    <img src="assets/logo-light.png" alt="GhostScope Logo" width="200"/>
-  </picture>
+  <img src="assets/logo.png" alt="GhostScope Logo" width="200"/>
   <h1 style="margin-top: 0.2em;">GhostScope</h1>
   <h3>⚡ 下一代 eBPF 用户态运行时追踪器</h3>
   <p>
