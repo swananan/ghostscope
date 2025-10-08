@@ -3068,10 +3068,16 @@ impl App {
                 }
 
                 if let Some(content) = self.format_runtime_status_for_display(&status) {
-                    let styled_lines = crate::components::command_panel::ResponseFormatter::style_generic_message_lines(&content);
+                    // Don't use styled_lines if content contains ANSI color codes
+                    // Let the renderer handle ANSI parsing instead
+                    let styled_lines = if content.contains("\x1b[") {
+                        None
+                    } else {
+                        Some(crate::components::command_panel::ResponseFormatter::style_generic_message_lines(&content))
+                    };
                     let action = Action::AddResponseWithStyle {
                         content,
-                        styled_lines: Some(styled_lines),
+                        styled_lines,
                         response_type: self.get_response_type_for_status(&status),
                     };
                     let _ = self.handle_action(action);
