@@ -35,7 +35,6 @@ sudo ghostscope -t /usr/lib/libexample.so
 > 1. The `-p` option traces the main program and all currently loaded dynamic libraries (libraries loaded later via dlopen are not yet supported)
 > 2. The executables and libraries you want to trace **must contain debug information**, otherwise GhostScope will be helpless. How to check? See the [Debug Symbols section in the Installation Guide](install.md#3-debug-symbols-required)
 
-> 💡 **Technical background**: I don't really want to say so much, but I have to 😂. Understanding uprobe mechanism is crucial for using GhostScope correctly. I recommend reading the [Uprobe Internals](uprobe-internals.md) documentation to avoid common pitfalls.
 
 ## Understanding the TUI
 
@@ -43,7 +42,7 @@ sudo ghostscope -t /usr/lib/libexample.so
 
 After successfully launching GhostScope, you'll see a loading screen — GhostScope is loading debug information and building query indices. This might take some time (loading nginx takes about 3 seconds, for example). Don't ask me why GDB loads so fast, I'm still learning optimization tricks from GDB, hoping to make it faster in future versions.
 
-![Loading UI](images/loading_ui.png)
+![Loading UI](images/loading-ui.png)
 *GhostScope's carefully designed loading interface*
 
 If all goes well, in the blink of an eye (you might miss the carefully designed loading screen), you'll see GhostScope's TUI interface:
@@ -52,18 +51,17 @@ If all goes well, in the blink of an eye (you might miss the carefully designed 
 *GhostScope TUI main interface*
 
 ### The Three Panels
-
 Here's a brief introduction to GhostScope's TUI panel layout:
 
-#### 1. Source Panel (Top)
+#### 1. Source Panel
 - **What it shows**: Application source code (defaults to the file containing the main function)
 - **Purpose**: Browse code and set trace points
 
-#### 2. eBPF Output Panel (Middle)
+#### 2. eBPF Output Panel
 - **What it shows**: Real-time trace output
 - **Purpose**: View execution traces as they happen
 
-#### 3. Command Panel (Bottom)
+#### 3. Command Panel
 - **What it shows**: Command input line
 - **Purpose**: Enter trace commands and control session
 
@@ -90,16 +88,18 @@ Press Enter to enter script mode and start writing GhostScope scripts to probe p
 - Support for script variables and simple conditional logic
 - For more script syntax details, see [Script Language Reference](scripting.md)
 
-![Script Mode](images/script_mode.png)
+![Script Mode](images/script-mode.png)
 *Script editing mode*
 
 After writing, press `Ctrl+S` to submit code. If all goes well, the script will be compiled to eBPF bytecode and loaded onto the uprobe.
 
-![Script Result](images/script_result.png)
+![Script Result](images/script-result.png)
 *Script execution result*
 
 #### 3. Command Mode
 At this point, if everything works, we'll see the script output in the eBPF output panel. But to view it, we need to switch focus to the eBPF output panel.
+![eBPF Output](images/ebpf-output.png)
+*eBPF output results*
 
 Press `Esc` to switch from input mode to command mode. In this mode:
 
@@ -125,10 +125,10 @@ For more panel operations, see [TUI Reference Guide](tui-reference.md) and [Comm
 A more efficient approach is to start from the source panel:
 
 1. **Browse source**: Switch focus to the source panel, use Vim-style navigation to browse code
-2. **Quick trace point setting**: When you see an interesting line, press **Space** to directly enter script mode
+2. **Switch files**: Press `o` to bring up the file search bar, quickly find and switch to other source files
+3. **Quick trace point setting**: When you see an interesting line, press **Space** to directly enter script mode
    - The trace target automatically sets to the file and line number at the cursor
    - This design is inspired by cgdb, I really love this shortcut
-3. **Switch files**: Press `o` to bring up the file search bar, quickly find and switch to other source files
 
 This workflow is more fluid, making trace point setting effortless.
 
@@ -152,17 +152,14 @@ Run it:
 sudo ghostscope -p $(pidof your_app) --script-file trace.gs
 ```
 
+**💡 Tip**: After setting multiple trace points in the TUI, you can use the `save trace <filename>` command to save all current trace points to a file for later reuse. See [Command Reference](input-commands.md) for details.
+
 
 ## Next Steps
 
 - **Limitations** (Recommended): Read [Limitations](limitations.md) to understand known constraints and best practices
+- **Technical background**: I don't really want to say so much, but I have to 😂. Understanding uprobe mechanism is crucial for using GhostScope correctly. I recommend reading the [Uprobe Internals](uprobe-internals.md) documentation to avoid common pitfalls.
 - **Full TUI Reference**: See [TUI Reference Guide](tui-reference.md) for all keyboard shortcuts
 - **Command Reference**: See [Command Reference](input-commands.md) for all available commands
 - **Script Language**: Learn the full syntax in [Script Language Reference](scripting.md)
 - **Configuration**: See [Configuration Reference](configuration.md) for customization options
-
-## Getting Help
-
-- Press `?` in TUI for quick help
-- Use `help <command>` in command panel
-- Visit [GitHub Discussions](https://github.com/swananan/ghostscope/discussions)
