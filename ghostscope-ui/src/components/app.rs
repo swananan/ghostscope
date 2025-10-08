@@ -289,13 +289,6 @@ impl App {
                     }
 
                     match key.code {
-                        KeyCode::Char('q')
-                            if key
-                                .modifiers
-                                .contains(crossterm::event::KeyModifiers::CONTROL) =>
-                        {
-                            actions_to_process.push(Action::Quit);
-                        }
                         KeyCode::Char('c')
                             if key
                                 .modifiers
