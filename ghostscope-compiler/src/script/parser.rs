@@ -7,7 +7,7 @@ use crate::script::ast::{
     infer_type, BinaryOp, Expr, PrintStatement, Program, Statement, TracePattern,
 };
 use crate::script::format_validator::FormatValidator;
-use tracing::debug;
+use tracing::{debug, info};
 
 #[derive(Parser)]
 #[grammar = "script/grammar.pest"]
@@ -426,8 +426,22 @@ fn parse_else_clause(pair: Pair<Rule>) -> Result<Statement> {
         _ => {
             // Parse else block statements
             let mut else_body = Vec::new();
-            for stmt_pair in inner.into_inner() {
-                else_body.push(parse_statement(stmt_pair)?);
+            for node in inner.into_inner() {
+                match node.as_rule() {
+                    Rule::statement => {
+                        else_body.push(parse_statement(node)?);
+                    }
+                    // Some grammars flatten block children to concrete statements (e.g., print_stmt)
+                    Rule::print_stmt => {
+                        let content = node
+                            .into_inner()
+                            .next()
+                            .ok_or(ParseError::InvalidExpression)?;
+                        let pr = parse_print_content(content)?;
+                        else_body.push(Statement::Print(pr));
+                    }
+                    _ => return Err(ParseError::UnexpectedToken(node.as_rule())),
+                }
             }
             Ok(Statement::Block(else_body))
         }
@@ -520,6 +534,7 @@ fn parse_factor(pair: Pair<Rule>) -> Result<Expr> {
         Rule::factor => {
             let inner = pair.into_inner().next().unwrap();
             match inner.as_rule() {
+                Rule::memcmp_call => parse_builtin_call(inner),
                 Rule::strncmp_call => parse_builtin_call(inner),
                 Rule::starts_with_call => parse_builtin_call(inner),
                 Rule::chain_access => parse_chain_access(inner),
@@ -562,11 +577,25 @@ fn parse_factor(pair: Pair<Rule>) -> Result<Expr> {
 }
 
 fn parse_builtin_call(pair: Pair<Rule>) -> Result<Expr> {
-    // pair is strncmp_call or starts_with_call
+    // pair is memcmp_call / strncmp_call / starts_with_call
     let rule = pair.as_rule();
     let mut it = pair.into_inner();
     // First token inside is the function name as identifier within the rule text; easier approach: use rule to select
     match rule {
+        Rule::memcmp_call => {
+            // grammar: memcmp "(" expr "," expr "," expr ")"
+            let a_node = it.next().ok_or(ParseError::InvalidExpression)?; // expr
+            let a_expr = parse_expr(a_node)?;
+            let b_node = it.next().ok_or(ParseError::InvalidExpression)?; // expr
+            let b_expr = parse_expr(b_node)?;
+            let n_node = it.next().ok_or(ParseError::InvalidExpression)?; // expr (支持变量或常量)
+            let n_expr = parse_expr(n_node)?;
+
+            Ok(Expr::BuiltinCall {
+                name: "memcmp".to_string(),
+                args: vec![a_expr, b_expr, n_expr],
+            })
+        }
         Rule::strncmp_call => {
             // grammar: strncmp "(" expr "," string "," int ")"
             let expr_node = it.next().ok_or(ParseError::InvalidExpression)?; // expr
@@ -656,56 +685,95 @@ fn parse_trace_pattern(pair: Pair<Rule>) -> Result<TracePattern> {
 }
 
 fn parse_print_content(pair: Pair<Rule>) -> Result<PrintStatement> {
-    debug!(
-        "parse_print_content: {:?} = \"{}\"",
+    info!(
+        "parse_print_content: rule={:?} text=\"{}\"",
         pair.as_rule(),
         pair.as_str().trim()
     );
+    // Flatten any nested print_content nodes into a single list of children
+    fn collect_flattened<'a>(p: Pair<'a, Rule>, out: &mut Vec<Pair<'a, Rule>>) {
+        if p.as_rule() == Rule::print_content {
+            for c in p.into_inner() {
+                collect_flattened(c, out);
+            }
+        } else {
+            out.push(p);
+        }
+    }
 
-    let inner = pair.into_inner().next().unwrap();
-    debug!(
-        "parse_print_content inner: {:?} = \"{}\"",
-        inner.as_rule(),
-        inner.as_str().trim()
+    let mut flat: Vec<Pair<Rule>> = Vec::new();
+    collect_flattened(pair, &mut flat);
+    info!(
+        "parse_print_content: flat_rules=[{}]",
+        flat.iter()
+            .map(|p| format!("{:?}", p.as_rule()))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
+    if flat.is_empty() {
+        return Err(ParseError::InvalidExpression);
+    }
 
-    match inner.as_rule() {
+    // Prefer an explicit format_expr if present
+    if let Some(fmt_idx) = flat.iter().position(|p| p.as_rule() == Rule::format_expr) {
+        let fmt_pair = flat.remove(fmt_idx);
+        info!("parse_print_content: branch=format_expr");
+        let mut inner_pairs = fmt_pair.into_inner();
+        let format_string = inner_pairs.next().unwrap();
+        let format_content = &format_string.as_str()[1..format_string.as_str().len() - 1];
+        let mut args = Vec::new();
+        for arg_pair in inner_pairs {
+            args.push(parse_expr(arg_pair)?);
+        }
+        info!(
+            "parse_print_content: fmt='{}' argc={}",
+            format_content,
+            args.len()
+        );
+        FormatValidator::validate_format_arguments(format_content, &args)?;
+        return Ok(PrintStatement::Formatted {
+            format: format_content.to_string(),
+            args,
+        });
+    }
+
+    // Else, if first is a string and followed by one or more exprs, treat as flattened format
+    if flat[0].as_rule() == Rule::string && flat.len() >= 2 {
+        info!("parse_print_content: branch=flattened_string_with_args");
+        let content_quoted = flat[0].as_str();
+        let content = &content_quoted[1..content_quoted.len() - 1];
+        let mut args = Vec::new();
+        for p in flat.iter().skip(1) {
+            if p.as_rule() != Rule::expr {
+                return Err(ParseError::UnexpectedToken(p.as_rule()));
+            }
+            args.push(parse_expr(p.clone())?);
+        }
+        info!("parse_print_content: fmt='{}' argc={}", content, args.len());
+        FormatValidator::validate_format_arguments(content, &args)?;
+        return Ok(PrintStatement::Formatted {
+            format: content.to_string(),
+            args,
+        });
+    }
+
+    // Single string or single expr
+    match flat[0].as_rule() {
         Rule::string => {
-            // Extract string content (remove quotes)
-            let content = inner.as_str();
-            let content = &content[1..content.len() - 1]; // Remove surrounding quotes
+            info!("parse_print_content: branch=plain_string");
+            let content = flat[0].as_str();
+            let content = &content[1..content.len() - 1];
             Ok(PrintStatement::String(content.to_string()))
         }
         Rule::expr => {
-            // Generic expression printing
-            let expr = parse_expr(inner)?;
+            info!("parse_print_content: branch=complex_variable");
+            let expr = parse_expr(flat[0].clone())?;
             Ok(PrintStatement::ComplexVariable(expr))
         }
-        Rule::format_expr => {
-            // Format string with arguments
-            let mut inner_pairs = inner.into_inner();
-            let format_string = inner_pairs.next().unwrap();
-
-            // Extract format string content (remove quotes)
-            let format_content = format_string.as_str();
-            let format_content = &format_content[1..format_content.len() - 1];
-
-            // Parse arguments
-            let mut args = Vec::new();
-            for arg_pair in inner_pairs {
-                let arg_expr = parse_expr(arg_pair)?;
-                args.push(arg_expr);
-            }
-
-            // Validate format string and arguments match
-            FormatValidator::validate_format_arguments(format_content, &args)?;
-
-            Ok(PrintStatement::Formatted {
-                format: format_content.to_string(),
-                args,
-            })
+        other => {
+            info!("parse_print_content: branch=unexpected rule={:?}", other);
+            Err(ParseError::UnexpectedToken(other))
         }
-        _ => Err(ParseError::UnexpectedToken(inner.as_rule())),
     }
 }
 
@@ -860,5 +928,62 @@ fn parse_address_of(pair: Pair<Rule>) -> Result<Expr> {
     match parsed {
         Expr::PointerDeref(inner_expr) => Ok(*inner_expr),
         other => Ok(Expr::AddressOf(Box::new(other))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_memcmp_builtin_in_if_should_succeed() {
+        let script = r#"
+trace foo {
+    if memcmp(&buf[0], &buf[1], 16) { print "EQ"; }
+}
+"#;
+        let r = parse(script);
+        assert!(r.is_ok(), "parse failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn parse_memcmp_with_dynamic_len() {
+        let script = r#"
+trace foo {
+    let n = 10;
+    if memcmp(&buf[0], &buf[0], n) { print "OK"; }
+}
+"#;
+        let r = parse(script);
+        assert!(r.is_ok(), "parse failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn parse_if_else_with_flattened_format_and_star_len() {
+        // else branch contains a flattened format print with {:s.*} and two args
+        let script = r#"
+trace src/http/ngx_http_request.c:1845 {
+    if strncmp(host.data, "ghostscope", 10) {
+        print "We got the request {}", *r;
+    } else {
+        print "The other hostname is {:s.*}", host.len, host.data;
+    }
+}
+"#;
+        let r = parse(script);
+        assert!(r.is_ok(), "parse failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn parse_memcmp_len_zero_and_negative() {
+        let script = r#"
+trace foo {
+    if memcmp(&p[0], &q[0], 0) { print "Z0"; }
+    let k = -5;
+    if memcmp(&p[0], &q[0], k) { print "NEG"; }
+}
+"#;
+        let r = parse(script);
+        assert!(r.is_ok(), "parse failed: {:?}", r.err());
     }
 }

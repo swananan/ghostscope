@@ -251,18 +251,27 @@ print "tail={:s.n$}", p;          // 长度来自变量 n
 
 ## 内置函数
 
-GhostScope 提供两个字符串内置函数，用于高效、对 verifier 友好的比较：
+GhostScope 提供若干对 verifier 友好的内置比较函数：
 
 - `strncmp(expr, "lit", n)`
   - 将 `expr` 指向的内存前 `n` 个字节与字面量 `lit` 比较。
   - 在 `n` 字节内不要求出现终止符 `\0`。
   - `expr` 可为 DWARF 的 `char*`、`char[N]`，也可为通用指针；GhostScope 会做有界的用户态内存读取并按字节比较。
   - 任何读取失败均返回 `false`。
-  - 为安全起见比较长度固定上限为 64 字节（编译器常量 `STRING_BUILTIN_READ_CAP`，见 `ghostscope-compiler/src/ebpf/expression.rs`）；若 `n` 超过上限或数组可用长度，会自动裁剪。
+  - 比较长度由配置 `ebpf.compare_cap` 控制（默认 64 字节）；若 `n` 超过上限或数组可用长度，会自动裁剪。
 
 - `starts_with(expr, "lit")`
   - 等价于 `strncmp(expr, "lit", len("lit"))`。
   - 失败与安全语义同上。
+
+- `memcmp(expr_a, expr_b, len)`
+  - 布尔语义：若 `expr_a` 与 `expr_b` 所指内存的前 `len` 个字节完全一致，返回 `true`，否则 `false`。
+  - 仅支持指针对指针；若需与字符串字面量比较，请使用 `strncmp`/`starts_with`。
+  - `len` 支持脚本整数表达式；负值会被钳为 0，并受配置上限 `ebpf.compare_cap`（默认 64 字节）裁剪。有效比较长度为 `min(max(len,0), CAP)`。
+  - 不涉及 NUL 终止；按原始字节比较。
+  - 任一侧读取失败均按 `false` 处理。
+  - 若 `len == 0`，结果为 `true`，且不会执行任何用户内存读取（快速路径）。
+  - 实现为固定上界、无早退的按字节累积比较，便于通过 verifier。
 
 Verifier 友好与性能：
 - 内置函数生成的比较逻辑尽量少分支（如按字节 XOR/OR 累积），降低 verifier 状态数量。
@@ -286,6 +295,19 @@ trace globals_program.c:32 {
 // 通用指针（读取失败 → false）
 trace process_record {
     print "rec_http:{}", strncmp(record, "HTTP", 4); // record: struct* -> false
+}
+
+// 两个指针之间的原始内存等值比较
+trace globals_program.c:32 {
+    // 完全相等
+    if memcmp(&lib_pattern[0], &lib_pattern[0], 16) { print "EQ"; } else { print "NE"; }
+    // 偏移后产生差异
+    if memcmp(&lib_pattern[0], &lib_pattern[1], 16) { print "EQ2"; } else { print "NE2"; }
+    // len=0 → true
+    if memcmp(&lib_pattern[0], &lib_pattern[1], 0) { print "Z0"; }
+    // 动态长度来自脚本变量
+    let n = 10;
+    if memcmp(&lib_pattern[0], &lib_pattern[0], n) { print "DYN_EQ"; }
 }
 ```
 

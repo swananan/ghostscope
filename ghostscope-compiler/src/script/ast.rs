@@ -178,7 +178,7 @@ pub fn infer_type(expr: &Expr) -> Result<VarType, String> {
         Expr::ChainAccess(_) => Ok(VarType::Int), // New: chain access returns final member type (assume int for now)
         Expr::SpecialVar(_) => Ok(VarType::Int),  // Special variables like $arg0, $retval etc.
         Expr::BuiltinCall { name, args: _ } => match name.as_str() {
-            "strncmp" | "starts_with" => Ok(VarType::Bool),
+            "strncmp" | "starts_with" | "memcmp" => Ok(VarType::Bool),
             _ => Err(format!("Unknown builtin function: {}", name)),
         },
         Expr::BinaryOp { left, op, right } => {

@@ -287,6 +287,11 @@ proc_module_offsets_max_entries = 4096  # 默认
 # 扩展格式占位符（{:x}/{:s}）单个参数的内存转储上限（字节）。
 mem_dump_cap = 4096
 
+# 内置比较（strncmp/starts_with/memcmp）的最大比较字节数。
+# 实际比较长度为 min(max(len, 0), compare_cap)。
+# 默认：64 字节。
+compare_cap = 64
+
 # 单条 trace 事件的最大大小（字节）。适用于 PerfEventArray 累计缓冲区。
 max_trace_event_size = 32768
 
@@ -361,6 +366,8 @@ max_entries = 10000
 # 针对高频事件跟踪优化
 [ebpf]
 ringbuf_size = 1048576  # 1MB 缓冲区用于高事件率
+mem_dump_cap = 4096     # 单参数转储上限更高
+compare_cap = 64        # 内置比较最大比较字节数（strncmp/memcmp）
 proc_module_offsets_max_entries = 8192  # 支持更多模块
 
 [general]
@@ -374,6 +381,8 @@ enable_console_logging = false
 # 生产环境最小资源占用
 [ebpf]
 ringbuf_size = 131072  # 128KB 最小缓冲区
+mem_dump_cap = 512
+compare_cap = 32       # 降低内置比较上限以减小开销
 proc_module_offsets_max_entries = 1024  # 仅单进程
 
 [general]

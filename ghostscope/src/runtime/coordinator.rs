@@ -103,6 +103,7 @@ async fn run_tui_coordinator_with_ui_config_and_merged_config(
         perf_page_count: 64,    // Default, will be overridden by config
         event_map_type: ghostscope_compiler::EventMapType::RingBuf, // Will be overridden by config
         mem_dump_cap: 1024,
+        compare_cap: 64,
         max_trace_event_size: 32768,
     };
 

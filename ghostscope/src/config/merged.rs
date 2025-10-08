@@ -255,6 +255,7 @@ impl MergedConfig {
             perf_page_count: self.ebpf_config.perf_page_count,
             event_map_type,
             mem_dump_cap: self.ebpf_config.mem_dump_cap,
+            compare_cap: self.ebpf_config.compare_cap,
             max_trace_event_size: self.ebpf_config.max_trace_event_size,
         }
     }

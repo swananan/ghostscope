@@ -123,6 +123,7 @@ pub async fn run_command_line_runtime(parsed_args: ParsedArgs) -> Result<()> {
         perf_page_count: 64,                                        // Default
         event_map_type: ghostscope_compiler::EventMapType::RingBuf, // Will be overridden by config
         mem_dump_cap: 1024,
+        compare_cap: 64,
         max_trace_event_size: 32768,
     };
 
