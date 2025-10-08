@@ -5,12 +5,12 @@ A deep dive into the design and implementation of GhostScope's eBPF-based runtim
 ## System Overview
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    Terminal UI (TUI)                    │
-│         ┌──────────────────────────────────┐            │
-│         │      TEA Architecture            │            │
-│         │   (Model-Update-View Pattern)    │            │
-│         └────────────┬─────────────────────┘            │
+┌──────────────────────────────────────────────────────────┐
+│                    Terminal UI (TUI)                     │
+│         ┌──────────────────────────────────┐             │
+│         │      TEA Architecture            │             │
+│         │   (Model-Update-View Pattern)    │             │
+│         └────────────┬─────────────────────┘             │
 │                      │ Action Events                     │
 └──────────────────────┼───────────────────────────────────┘
                        │
@@ -19,21 +19,21 @@ A deep dive into the design and implementation of GhostScope's eBPF-based runtim
             │  (mpsc channels)    │
             └──────────┬──────────┘
                        │
-┌──────────────────────▼───────────────────────────────────┐
-│              Runtime Coordinator                         │
-│         (Tokio-based async orchestration)                │
+┌──────────────────────▼────────────────────────────────────┐
+│              Runtime Coordinator                          │
+│         (Tokio-based async orchestration)                 │
 │                                                           │
-│  ┌─────────────┐  ┌────────────┐  ┌─────────────┐      │
-│  │ GhostSession│  │   DWARF    │  │    Trace    │      │
-│  │  (State)    │  │  Analyzer  │  │   Manager   │      │
-│  └─────────────┘  └────────────┘  └─────────────┘      │
+│  ┌─────────────┐  ┌────────────┐  ┌─────────────┐         │
+│  │ GhostSession│  │   DWARF    │  │    Trace    │         │
+│  │  (State)    │  │  Analyzer  │  │   Manager   │         │
+│  └─────────────┘  └────────────┘  └─────────────┘         │
 │                                                           │
-│  Event Loop: tokio::select! {                            │
-│    - Wait for eBPF events (from all loaders)             │
-│    - Handle runtime commands (from TUI)                  │
-│    - Send status updates                                 │
+│  Event Loop: tokio::select! {                             │
+│    - Wait for eBPF events (from all loaders)              │
+│    - Handle runtime commands (from TUI)                   │
+│    - Send status updates                                  │
 │  }                                                        │
-└───────────┬────────────────────────────┬─────────────────┘
+└───────────┬────────────────────────────┬──────────────────┘
             │                            │
    ┌────────▼─────────┐        ┌────────▼──────────┐
    │ Script Compiler  │        │  eBPF Loaders     │
@@ -121,36 +121,41 @@ TODO: Still slow, need to research how GDB optimizes DWARF parsing performance.
 Multi-stage pipeline with type safety at each level:
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│ Stage 1: Script Parsing                                 │
+┌──────────────────────────────────────────────────────────┐
+│ Stage 1: Script Parsing                                  │
 │                                                          │
-│   User Script (*.gs)                                    │
+│   User Script (*.gs)                                     │
 │         ↓                                                │
-│   Pest Parser (PEG grammar)                             │
+│   Pest Parser (PEG grammar)                              │
 │         ↓                                                │
-│   Abstract Syntax Tree (AST)                            │
-└─────────────────────────────────────────────────────────┘
+│   Abstract Syntax Tree (AST)                             │
+└──────────────────────────────────────────────────────────┘
                          ↓
-┌─────────────────────────────────────────────────────────┐
-│ Stage 2: LLVM IR Generation                             │
+┌──────────────────────────────────────────────────────────┐
+│ Stage 2: LLVM IR Generation                              │
 │                                                          │
-│   AST + DWARF Info                                      │
+│   AST + DWARF Info                                       │
 │         ↓                                                │
-│   Symbol Resolution (variables, types, locations)       │
+│   Symbol Resolution (variables, types, locations)        │
 │         ↓                                                │
-│   LLVM IR (type-safe intermediate representation)       │
-└─────────────────────────────────────────────────────────┘
+│   LLVM IR (type-safe intermediate representation)        │
+└──────────────────────────────────────────────────────────┘
                          ↓
-┌─────────────────────────────────────────────────────────┐
-│ Stage 3: eBPF Backend                                   │
+┌──────────────────────────────────────────────────────────┐
+│ Stage 3: eBPF Backend                                    │
 │                                                          │
-│   LLVM IR                                               │
+│   LLVM IR                                                │
 │         ↓                                                │
-│   LLVM BPF Backend (optimizations + codegen)            │
+│   LLVM BPF Backend (optimizations + codegen)             │
 │         ↓                                                │
-│   eBPF Bytecode (verifier-friendly)                     │
-└─────────────────────────────────────────────────────────┘
+│   eBPF Bytecode (verifier-friendly)                      │
+└──────────────────────────────────────────────────────────┘
 ```
+
+The diagram below is from [Crafting Interpreters](https://craftinginterpreters.com/), with the red path highlighting GhostScope's compilation flow. Of course, Pest and LLVM do the heavy lifting for us.
+
+![Compile Pipeline](images/compile.png)
+*Compilation pipeline diagram (red path shows GhostScope's flow)*
 
 ### 5. Trace Manager
 
@@ -197,7 +202,7 @@ Multi-stage pipeline with type safety at each level:
 ```
 ┌───────────────────────────────────────────────────────┐
 │              Kernel Space                             │
-│                                                        │
+│                                                       │
 │  ┌────────────┐                                       │
 │  │  eBPF      │  Trace event occurs                   │
 │  │  Program   │         ↓                             │
@@ -207,36 +212,36 @@ Multi-stage pipeline with type safety at each level:
 │        │                ↓                             │
 │        │         bpf_ringbuf_output()                 │
 │        │                ↓                             │
-│        └────────►┌─────────────────────┐             │
-│                  │  Ring Buffer        │             │
-│                  │  (per-CPU, 256KB)   │             │
-│                  │                     │             │
-│                  │  [Event1][Event2]...│             │
-│                  └──────────┬──────────┘             │
-└─────────────────────────────┼────────────────────────┘
+│        └────────►┌─────────────────────┐              │
+│                  │  Ring Buffer        │              │
+│                  │  (per-CPU, 256KB)   │              │
+│                  │                     │              │
+│                  │  [Event1][Event2]...│              │
+│                  └──────────┬──────────┘              │
+└─────────────────────────────┼─────────────────────────┘
                               │ Memory-mapped
                               ↓
-┌─────────────────────────────┼────────────────────────┐
-│              User Space     │                        │
-│                             │                        │
-│  ┌──────────────────────────▼──────────┐            │
-│  │  Trace Manager                       │            │
-│  │  (polls ring buffer)                 │            │
-│  └──────────────────────┬───────────────┘            │
+┌─────────────────────────────┼─────────────────────────┐
+│              User Space     │                         │
+│                             │                         │
+│  ┌──────────────────────────▼──────────┐              │
+│  │  Trace Manager                       │             │
+│  │  (polls ring buffer)                 │             │
+│  └──────────────────────┬───────────────┘             │
 │                         │                             │
 │              Read events (non-blocking)               │
 │                         ↓                             │
-│  ┌──────────────────────────────────────┐            │
-│  │  Streaming Parser                    │            │
-│  │  (handles variable-length messages)  │            │
-│  └──────────────────────┬───────────────┘            │
+│  ┌──────────────────────────────────────┐             │
+│  │  Streaming Parser                    │             │
+│  │  (handles variable-length messages)  │             │
+│  └──────────────────────┬───────────────┘             │
 │                         │                             │
 │              Parsed trace events                      │
 │                         ↓                             │
-│  ┌──────────────────────────────────────┐            │
-│  │  Runtime Coordinator                 │            │
-│  │  (forwards to UI)                    │            │
-│  └──────────────────────────────────────┘            │
+│  ┌──────────────────────────────────────┐             │
+│  │  Runtime Coordinator                 │             │
+│  │  (forwards to UI)                    │             │
+│  └──────────────────────────────────────┘             │
 └───────────────────────────────────────────────────────┘
 ```
 
@@ -268,36 +273,36 @@ Multi-stage pipeline with type safety at each level:
 GhostScope uses an **instruction-based protocol** for flexible trace event representation:
 
 ```
-┌────────────────────────────────────────────────────┐
-│ TraceEventHeader (4 bytes)                         │
-│   - magic: u32 (0x43484C53 "CHLS")                 │
-├────────────────────────────────────────────────────┤
-│ TraceEventMessage (24 bytes)                       │
-│   - trace_id: u64                                  │
-│   - timestamp: u64                                 │
-│   - pid: u32                                       │
-│   - tid: u32                                       │
-├────────────────────────────────────────────────────┤
-│ Instruction Sequence (variable length)             │
+┌─────────────────────────────────────────────────────┐
+│ TraceEventHeader (4 bytes)                          │
+│   - magic: u32 (0x43484C53 "CHLS")                  │
+├─────────────────────────────────────────────────────┤
+│ TraceEventMessage (24 bytes)                        │
+│   - trace_id: u64                                   │
+│   - timestamp: u64                                  │
+│   - pid: u32                                        │
+│   - tid: u32                                        │
+├─────────────────────────────────────────────────────┤
+│ Instruction Sequence (variable length)              │
 │                                                     │
-│   ┌──────────────────────────────────────┐         │
-│   │ InstructionHeader (4 bytes)          │         │
-│   │   - inst_type: u8                    │         │
-│   │   - data_length: u16                 │         │
-│   │   - reserved: u8                     │         │
-│   ├──────────────────────────────────────┤         │
-│   │ InstructionData (variable length)    │         │
-│   │   - Depends on instruction type      │         │
-│   └──────────────────────────────────────┘         │
+│   ┌──────────────────────────────────────┐          │
+│   │ InstructionHeader (4 bytes)          │          │
+│   │   - inst_type: u8                    │          │
+│   │   - data_length: u16                 │          │
+│   │   - reserved: u8                     │          │
+│   ├──────────────────────────────────────┤          │
+│   │ InstructionData (variable length)    │          │
+│   │   - Depends on instruction type      │          │
+│   └──────────────────────────────────────┘          │
 │                                                     │
-│   ... (more instructions) ...                      │
+│   ... (more instructions) ...                       │
 │                                                     │
-│   ┌──────────────────────────────────────┐         │
-│   │ EndInstruction (final marker)        │         │
-│   │   - total_instructions: u16          │         │
-│   │   - execution_status: u8             │         │
-│   └──────────────────────────────────────┘         │
-└────────────────────────────────────────────────────┘
+│   ┌──────────────────────────────────────┐          │
+│   │ EndInstruction (final marker)        │          │
+│   │   - total_instructions: u16          │          │
+│   │   - execution_status: u8             │          │
+│   └──────────────────────────────────────┘          │
+└─────────────────────────────────────────────────────┘
 ```
 
 **Instruction Types**:

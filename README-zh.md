@@ -178,7 +178,11 @@ GhostScope 采用 [GNU 通用公共许可证](LICENSE) 授权。
 - [**bpftrace**](https://github.com/iovisor/bpftrace) - eBPF 追踪技术
 - [**cgdb**](https://cgdb.github.io/) - TUI 设计和用户体验
 
-特别感谢以下优秀博客文章，学到了很多：
+特别感谢以下优秀资源，从中学到了很多：
 
+**博客文章：**
 - [**动态追踪漫谈**](https://blog.openresty.com.cn/cn/dynamic-tracing/)
 - [**Unwinding the stack the hard way**](https://lesenechal.fr/en/linux/unwinding-the-stack-the-hard-way)
+
+**技术书籍：**
+- [**Crafting Interpreters**](https://craftinginterpreters.com/)
