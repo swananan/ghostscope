@@ -51,8 +51,14 @@ impl ScriptEditor {
         let (lines, cursor_line, cursor_col, restored_from_cache) =
             if let Some(ref cache) = state.script_cache {
                 if let Some(saved_script) = cache.saved_scripts.get(target) {
+                    let mut lines: Vec<String> =
+                        saved_script.content.lines().map(String::from).collect();
+                    // Ensure at least one line exists (empty string.lines() returns empty iterator)
+                    if lines.is_empty() {
+                        lines.push(String::new());
+                    }
                     (
-                        saved_script.content.lines().map(String::from).collect(),
+                        lines,
                         saved_script.cursor_line,
                         saved_script.cursor_col,
                         true,
@@ -106,20 +112,19 @@ impl ScriptEditor {
 
     /// Exit script editing mode
     pub fn exit_script_mode(state: &mut CommandPanelState) -> Vec<Action> {
-        // Save current script state before exiting (if there's content)
+        // Save current script state before exiting (always save, even if empty)
         if let Some(ref mut cache) = state.script_cache {
             let script_content = cache.lines.join("\n");
-            if !script_content.trim().is_empty() || cache.cursor_line > 0 || cache.cursor_col > 0 {
-                // Save script with current cursor position
-                cache.saved_scripts.insert(
-                    cache.target.clone(),
-                    crate::model::panel_state::SavedScript {
-                        content: script_content,
-                        cursor_line: cache.cursor_line,
-                        cursor_col: cache.cursor_col,
-                    },
-                );
-            }
+            // Always save script state to cache, even if empty
+            // This ensures second entry will properly restore cursor and content
+            cache.saved_scripts.insert(
+                cache.target.clone(),
+                crate::model::panel_state::SavedScript {
+                    content: script_content,
+                    cursor_line: cache.cursor_line,
+                    cursor_col: cache.cursor_col,
+                },
+            );
         }
 
         state.mode = InteractionMode::Input;
