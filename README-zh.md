@@ -38,16 +38,13 @@ GhostScope 是一个**运行时追踪工具**，将 printf 调试的简单性带
 
 GhostScope 将编译后的二进制文件转变为可观测系统。在函数入口、特定源代码行或任何中间位置设置追踪点，打印局部变量、全局变量、函数参数、复杂嵌套结构，甚至函数调用栈。既拥有 printf 调试的简单性，又具备现代追踪技术的强大功能。
 
+下面的演示展示了使用 GhostScope 追踪带有调试信息的 nginx worker 进程。可以看到，GhostScope 支持条件判断逻辑，能够轻松提取复杂数据结构的内部信息，且完全不影响进程的正常运行。
+
 <br />
 
-<!-- 演示视频占位符 -->
 <div align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/demo-dark.gif">
-    <source media="(prefers-color-scheme: light)" srcset="assets/demo-light.gif">
-    <img src="assets/demo.gif" alt="GhostScope Demo" width="100%"/>
-  </picture>
-  <p><sub><i>使用 GhostScope 实时追踪运行中的应用程序</i></sub></p>
+  <img src="assets/demo.gif" alt="GhostScope Demo" width="100%"/>
+  <p><sub><i>实时追踪运行中的 nginx worker 进程</i></sub></p>
 </div>
 
 ## ✨ 核心特性
@@ -185,7 +182,7 @@ GhostScope 采用 [GNU 通用公共许可证](LICENSE) 授权。
 - [**bpftrace**](https://github.com/iovisor/bpftrace) - eBPF 追踪技术
 - [**cgdb**](https://cgdb.github.io/) - TUI 设计和用户体验
 
-特别感谢以下优秀博客文章，学习了很多：
+特别感谢以下优秀博客文章，学到了很多：
 
 - [**动态追踪漫谈**](https://blog.openresty.com.cn/cn/dynamic-tracing/)
-- [**硬核方式进行栈回溯**](https://lesenechal.fr/en/linux/unwinding-the-stack-the-hard-way)
+- [**Unwinding the stack the hard way**](https://lesenechal.fr/en/linux/unwinding-the-stack-the-hard-way)
