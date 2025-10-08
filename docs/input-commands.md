@@ -27,6 +27,11 @@ t <target>          # Short form
     - Full path: `/path/to/file.c:42`
     - Relative path: `src/file.c:42`
     - Filename (fuzzy match): `file.c:42` or even partial name
+  - Address: `0xADDR` or `module_suffix:0xADDR`
+    - `0xADDR`: Module-relative virtual address (DWARF PC). Default module depends on startup mode:
+      - `-t <binary>`: defaults to `<binary>` (including `.so`)
+      - `-p <pid>`: defaults to the process’s main executable
+    - `module_suffix:0xADDR`: Address in a specific module. The module part supports full path or unique suffix matching; ambiguous suffixes will be reported with candidates.
 
 **Examples:**
 ```
@@ -36,6 +41,8 @@ trace /home/user/src/sample.c:42    # Full path
 trace src/sample.c:42         # Relative path
 trace sample.c:42            # Filename only (fuzzy match)
 trace sample:42              # Partial filename (fuzzy match)
+t 0x401234                   # Address in default module (depends on -t/-p)
+t libc.so.6:0x1234           # Address in a shared library by suffix
 t process_data               # Use short form
 ```
 
@@ -360,19 +367,32 @@ i l test.c:100 verbose # Short form with verbose
 i l test.c:100 v       # Shortest form with verbose
 ```
 
-### info address - Address Debug Info [TODO]
+### info address - Address Debug Info
 
 **Syntax:**
 ```
-info address <addr> [verbose|v]
-i a <addr> [v]      # Short form
+info address <0xADDR | module_suffix:0xADDR> [verbose|v]
+i a <0xADDR | module_suffix:0xADDR> [v]    # Short form
 ```
 
 **Parameters:**
-- `<addr>`: Memory address
-- `[verbose|v]`: Optional. Show DWARF location expressions (hidden by default)
+- `<0xADDR>`: Module-relative virtual address (DWARF/symbol PC) in hex. If no module is specified, the default module applies (see below).
+- `module_suffix:0xADDR`: Address in a specific module. The module part supports full path or unique suffix matching; ambiguity will be reported with candidates.
+- `[verbose|v]`: Optional. Show DWARF location expressions (hidden by default).
 
-**Status:** Not yet implemented
+**Defaults and modes:**
+- Launched with `-t <binary>` (target mode): the default module is `<binary>`.
+- Launched with `-p <pid>` (PID mode): the default module is the main executable of the process. For library addresses, specify the module via suffix or use `-t` with that `.so`.
+
+**Description:**
+Shows per-module debug info for a given address: resolves function name (if any), source file:line (if available), and variables/parameters visible at that PC. Also displays the underlying module to attach and performs module suffix matching.
+
+**Examples:**
+```
+info address 0x401234      # Use default module (depends on -t/-p)
+info address libc.so.6:0x1234  # Suffix match shared library + address
+info address /usr/bin/nginx:0xdeadbeef v  # Full path + verbose
+```
 
 ---
 

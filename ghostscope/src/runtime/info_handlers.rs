@@ -306,21 +306,156 @@ pub async fn handle_info_line(
     }
 }
 
-/// Handle InfoAddress command (TODO: not implemented yet)
+/// Handle InfoAddress command
 pub async fn handle_info_address(
-    _session: &mut Option<GhostSession>,
+    session: &mut Option<GhostSession>,
     runtime_channels: &mut RuntimeChannels,
     target: String,
-    _verbose: bool,
+    verbose: bool,
 ) {
-    info!("Info address request for: {} (not implemented)", target);
+    info!(
+        "Info address request for: {} (verbose: {})",
+        target, verbose
+    );
 
-    let _ = runtime_channels
-        .status_sender
-        .send(RuntimeStatus::InfoAddressFailed {
-            target: target.clone(),
-            error: "Info address command not implemented yet".to_string(),
-        });
+    // Helper: parse address (hex 0x.. or decimal)
+    fn parse_addr(s: &str) -> Result<u64, String> {
+        let t = s.trim();
+        if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+            u64::from_str_radix(hex, 16)
+                .map_err(|_| format!("Invalid hex address '{}': must be 0x..", s))
+        } else {
+            t.parse::<u64>()
+                .map_err(|_| format!("Invalid address '{}': use 0x.. or decimal", s))
+        }
+    }
+
+    // Helper: resolve module path by exact or suffix match
+    fn resolve_module_path(
+        analyzer: &ghostscope_dwarf::DwarfAnalyzer,
+        sess: &GhostSession,
+        module_spec: Option<&str>,
+    ) -> Result<String, String> {
+        // Build module list: main + shared libraries
+        let mut modules: Vec<String> = Vec::new();
+        if let Some(main) = analyzer.get_main_executable() {
+            modules.push(main.path);
+        }
+        for lib in analyzer.get_shared_library_info() {
+            modules.push(lib.library_path);
+        }
+
+        if let Some(spec) = module_spec {
+            let spec = spec.trim();
+            // Exact match first
+            if let Some(found) = modules.iter().find(|p| p.as_str() == spec) {
+                return Ok(found.clone());
+            }
+            // Suffix match
+            let candidates: Vec<String> =
+                modules.into_iter().filter(|p| p.ends_with(spec)).collect();
+            match candidates.len() {
+                0 => Err(format!(
+                    "Module '{}' not found among loaded modules. Use full path or a unique suffix.",
+                    spec
+                )),
+                1 => Ok(candidates[0].clone()),
+                _ => {
+                    let mut sample = candidates.clone();
+                    sample.truncate(5);
+                    Err(format!(
+                        "Ambiguous module suffix '{}'. Candidates:\n  - {}\nPlease use a more specific suffix or full path.",
+                        spec,
+                        sample.join("\n  - ")
+                    ))
+                }
+            }
+        } else {
+            // No module specified: choose default based on mode
+            if sess.is_target_mode() {
+                // -t mode: default to the target binary
+                if let Some(bin) = &sess.target_binary {
+                    return Ok(bin.clone());
+                }
+            }
+            // Otherwise use main executable
+            analyzer
+                .get_main_executable()
+                .map(|m| m.path)
+                .ok_or_else(|| {
+                    "No default module available. Start with -p <pid> or -t <binary>.".to_string()
+                })
+        }
+    }
+
+    let result = (|| -> Result<TargetDebugInfo, String> {
+        let sess = session.as_mut().ok_or_else(|| {
+            "No active debugging session. Target process may not be attached or DWARF symbols are unavailable.".to_string()
+        })?;
+        let analyzer = sess
+            .process_analyzer
+            .as_ref()
+            .ok_or_else(|| "No process analyzer available".to_string())?;
+
+        // Parse target: either "module:0xADDR" or "0xADDR"
+        let (module_spec, addr_str) = if let Some(idx) = target.rfind(':') {
+            let (lhs, rhs) = target.split_at(idx);
+            (Some(lhs), rhs.trim_start_matches(':'))
+        } else {
+            (None, target.as_str())
+        };
+
+        let vaddr = parse_addr(addr_str)?;
+        let module_path = resolve_module_path(analyzer, sess, module_spec)?;
+
+        // Aggregate per-module info via existing helper
+        let ma = ModuleAddress::new(std::path::PathBuf::from(&module_path), vaddr);
+        let (modules, _first) = process_module_addresses_for_variables(
+            sess.process_analyzer.as_mut().unwrap(),
+            &[ma.clone()],
+            &format!("address 0x{vaddr:x}"),
+        );
+
+        // Derive source location if available
+        let source_location = sess
+            .process_analyzer
+            .as_mut()
+            .unwrap()
+            .lookup_source_location(&ma);
+
+        Ok(TargetDebugInfo {
+            target: if let Some(ms) = module_spec {
+                format!("{}:{}", ms.trim(), addr_str.trim())
+            } else {
+                addr_str.trim().to_string()
+            },
+            target_type: TargetType::Address,
+            file_path: source_location.as_ref().map(|sl| sl.file_path.clone()),
+            line_number: source_location.as_ref().map(|sl| sl.line_number),
+            function_name: None,
+            modules,
+        })
+    })();
+
+    match result {
+        Ok(info) => {
+            let _ = runtime_channels
+                .status_sender
+                .send(RuntimeStatus::InfoAddressResult {
+                    target: target.clone(),
+                    info,
+                    verbose,
+                });
+        }
+        Err(error_msg) => {
+            let _ = runtime_channels
+                .status_sender
+                .send(RuntimeStatus::InfoAddressFailed {
+                    target,
+                    error: error_msg,
+                });
+        }
+    }
 }
 
 /// Try to get debug info for a function

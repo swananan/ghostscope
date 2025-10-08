@@ -419,6 +419,72 @@ impl<'a> AstCompiler<'a> {
                 }
                 Ok(())
             }
+            TracePattern::Address(addr) => {
+                // Resolve default module path
+                // Prefer main executable; if unavailable (e.g., -t <lib>.so),
+                // fall back to the single loaded shared library (target module).
+                let module_path: Option<String> = if let Some(analyzer) = &self.process_analyzer {
+                    if let Some(main) = analyzer.get_main_executable() {
+                        Some(main.path)
+                    } else {
+                        let libs = analyzer.get_shared_library_info();
+                        if libs.len() == 1 {
+                            Some(libs[0].library_path.clone())
+                        } else {
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                let module_path = match module_path {
+                    Some(p) => p,
+                    None => {
+                        return Err(CompileError::Other(
+                            "No module available to resolve address. In PID mode, default module is the main executable. In target mode (-t <binary>), the specified binary is used (including .so).".to_string(),
+                        ));
+                    }
+                };
+
+                // Convert DWARF PC (vaddr) to ELF file offset for uprobe
+                let file_off = self
+                    .process_analyzer
+                    .as_ref()
+                    .and_then(|an| an.vaddr_to_file_offset(&module_path, *addr));
+
+                if file_off.is_none() {
+                    return Err(CompileError::Other(format!(
+                        "Address 0x{addr:x} is not within a loadable segment of '{}' (cannot compute file offset)",
+                        module_path
+                    )));
+                }
+
+                let target_info = ResolvedTarget {
+                    function_name: None,
+                    function_address: Some(*addr),
+                    binary_path: module_path,
+                    uprobe_offset: file_off,
+                    pattern: pattern.clone(),
+                };
+
+                match self.generate_ebpf_for_target(&target_info, statements, pid) {
+                    Ok(uprobe_config) => {
+                        self.uprobe_configs.push(uprobe_config);
+                        info!("✓ Successfully generated eBPF for address 0x{:x}", addr);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let error_msg = e.to_string();
+                        self.failed_targets.push(FailedTarget {
+                            target_name: format!("0x{addr:x}"),
+                            pc_address: *addr,
+                            error_message: error_msg.clone(),
+                        });
+                        Err(CompileError::Other(error_msg))
+                    }
+                }
+            }
             TracePattern::FunctionName(func_name) => {
                 // Resolve all addresses for the function name and generate per-PC programs
                 let module_addresses = if let Some(analyzer) = &mut self.process_analyzer {

@@ -75,6 +75,23 @@ trace /home/user/project/src/utils.c:100 {
 }
 ```
 
+#### Addresses
+```ghostscope
+// Trace by module-relative address (DWARF PC)
+trace 0x401234 {
+    print "Hit address";
+}
+
+// Trace an address in a specific module (supports full path or unique suffix)
+trace libc.so.6:0x1234 {
+    print "Hit libc address";
+}
+```
+
+Notes
+- `0xADDR` uses the default module depending on startup mode: `-t <binary>` uses `<binary>`; `-p <pid>` uses the main executable.
+- `module_suffix:0xADDR` picks the specified module by full path or unique suffix; ambiguous suffixes will be reported with candidates.
+
 
 ## Variables
 
