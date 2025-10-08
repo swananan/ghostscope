@@ -132,6 +132,21 @@ A more efficient approach is to start from the source panel:
 
 This workflow is more fluid, making trace point setting effortless.
 
+### 💡 Viewing Available Variables at Trace Points
+
+Before setting a trace point, if you want to know which local variables and parameters are accessible at a specific location, you can use the `info` commands:
+
+```
+info line <file:line>       # View available variables at a source line
+info function <func_name>   # View available variables at function entry
+info address <0xADDR>       # View available variables at an address
+```
+
+These commands display debug information for that location, including the list of accessible variables:
+
+![Info Source Line](images/info-line.png)
+*Using info line command to view available variables*
+
 ## Using Script Files
 
 For repeated use, save your traces in a file:

@@ -48,8 +48,3 @@ git commit -m "docs: update installation instructions"
 ## Development Setup
 
 Please refer to the [Development Guide](development.md) for setting up your development environment.
-
-## Community
-
-- [GitHub Discussions](https://github.com/swananan/ghostscope/discussions) - Questions and discussions
-- Email: jt26wzz@gmail.com
