@@ -158,6 +158,29 @@ impl FormatPrinter {
                             Star,
                             Capture,
                         }
+                        // helper: parse static length supporting decimal/0x.. /0o.. /0b..
+                        fn parse_static_len(spec: &str) -> Option<usize> {
+                            if spec.chars().all(|c| c.is_ascii_digit()) {
+                                return spec.parse::<usize>().ok();
+                            }
+                            if let Some(hex) = spec.strip_prefix("0x") {
+                                if !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                                    return usize::from_str_radix(hex, 16).ok();
+                                }
+                            }
+                            if let Some(oct) = spec.strip_prefix("0o") {
+                                if !oct.is_empty() && oct.chars().all(|c| matches!(c, '0'..='7')) {
+                                    return usize::from_str_radix(oct, 8).ok();
+                                }
+                            }
+                            if let Some(bin) = spec.strip_prefix("0b") {
+                                if !bin.is_empty() && bin.chars().all(|c| matches!(c, '0' | '1')) {
+                                    return usize::from_str_radix(bin, 2).ok();
+                                }
+                            }
+                            None
+                        }
+
                         let lenspec = if rest.is_empty() {
                             Len::None
                         } else if let Some(r) = rest.strip_prefix('.') {
@@ -165,8 +188,8 @@ impl FormatPrinter {
                                 Len::Star
                             } else if r.ends_with('$') {
                                 Len::Capture
-                            } else if r.chars().all(|c| c.is_ascii_digit()) {
-                                Len::Static(r.parse::<usize>().unwrap_or(0))
+                            } else if let Some(n) = parse_static_len(r) {
+                                Len::Static(n)
                             } else {
                                 Len::None
                             }

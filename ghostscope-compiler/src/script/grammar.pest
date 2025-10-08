@@ -71,6 +71,9 @@ factor = {
     starts_with_call |
     bool |
     string |
+    hex_int |
+    oct_int |
+    bin_int |
     float |
     int |
     special_var |
@@ -104,7 +107,11 @@ add_op = { "+" | "-" }
 mul_op = { "*" | "/" }
 
 identifier = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
+// Integer literals
 int = @{ ASCII_DIGIT+ }
+hex_int = @{ "0x" ~ ASCII_HEX_DIGIT+ }
+oct_int = @{ "0o" ~ ASCII_OCT_DIGIT+ }
+bin_int = @{ "0b" ~ ("0"|"1")+ }
 float = @{ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
 string = @{ "\"" ~ (!"\"" ~ ANY)* ~ "\"" } 
 bool = @{ "true" | "false" }

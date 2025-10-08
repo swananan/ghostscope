@@ -544,6 +544,22 @@ fn parse_factor(pair: Pair<Rule>) -> Result<Expr> {
                     let value = inner.as_str().parse::<i64>().unwrap();
                     Ok(Expr::Int(value))
                 }
+                Rule::hex_int => {
+                    // strip 0x and parse as hex
+                    let s = inner.as_str();
+                    let v = i64::from_str_radix(&s[2..], 16).unwrap_or(0);
+                    Ok(Expr::Int(v))
+                }
+                Rule::oct_int => {
+                    let s = inner.as_str();
+                    let v = i64::from_str_radix(&s[2..], 8).unwrap_or(0);
+                    Ok(Expr::Int(v))
+                }
+                Rule::bin_int => {
+                    let s = inner.as_str();
+                    let v = i64::from_str_radix(&s[2..], 2).unwrap_or(0);
+                    Ok(Expr::Int(v))
+                }
                 Rule::float => {
                     let value = inner.as_str().parse::<f64>().unwrap();
                     Ok(Expr::Float(value))
@@ -981,6 +997,52 @@ trace foo {
     if memcmp(&p[0], &q[0], 0) { print "Z0"; }
     let k = -5;
     if memcmp(&p[0], &q[0], k) { print "NEG"; }
+}
+"#;
+        let r = parse(script);
+        assert!(r.is_ok(), "parse failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn parse_numeric_literals_hex_oct_bin_and_memcmp_usage() {
+        let script = r#"
+trace foo {
+    let a = 0x10;   // 16
+    let b = 0o755;  // 493
+    let c = 0b1010; // 10
+    // use in memcmp length
+    if memcmp(&buf[0], &buf[0], 0x20) { print "H"; }
+    if memcmp(&buf[0], &buf[0], 0o40) { print "O"; }
+    if memcmp(&buf[0], &buf[0], 0b100000) { print "B"; }
+    // use numeric literal as pointer address for second arg
+    if memcmp(&buf[0], 0x7fff0000, 16) { print "P"; }
+}
+"#;
+        let r = parse(script);
+        assert!(r.is_ok(), "parse failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn parse_memcmp_with_numeric_pointers_and_len_bases() {
+        let script = r#"
+trace foo {
+    let n = 0x10;
+    if memcmp(0x1000, 0x2000, n) { print "NP"; }
+    if memcmp(0o4000, 0b1000000000000, 0o20) { print "NP2"; }
+}
+"#;
+        let r = parse(script);
+        assert!(r.is_ok(), "parse failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn parse_format_static_len_bases_in_prints() {
+        // Validate that static length .N supports 0x/0o/0b in formatted prints
+        let script = r#"
+trace foo {
+    print "HX={:x.0x10}", buf;
+    print "HS={:s.0o20}", buf;
+    print "HB={:X.0b1000}", buf;
 }
 "#;
         let r = parse(script);

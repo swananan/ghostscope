@@ -94,8 +94,6 @@ impl FormatValidator {
                             } else if let Some(rem) = rest.strip_prefix('.') {
                                 if rem == "*" {
                                     star_extras += 1; // dynamic length consumes next arg
-                                } else if rem.chars().all(|c| c.is_ascii_digit()) {
-                                    // static length, ok
                                 } else if let Some(name) = rem.strip_suffix('$') {
                                     // capture variable name: [A-Za-z_][A-Za-z0-9_]*$
                                     let mut chars = name.chars();
@@ -110,6 +108,18 @@ impl FormatValidator {
                                             "Invalid capture variable in specifier '{{:{conv}.{rem}}}'"
                                         )));
                                     }
+                                } else if rem.chars().all(|c| c.is_ascii_digit())
+                                    || (rem.starts_with("0x")
+                                        && rem.len() > 2
+                                        && rem[2..].chars().all(|c| c.is_ascii_hexdigit()))
+                                    || (rem.starts_with("0o")
+                                        && rem.len() > 2
+                                        && rem[2..].chars().all(|c| matches!(c, '0'..='7')))
+                                    || (rem.starts_with("0b")
+                                        && rem.len() > 2
+                                        && rem[2..].chars().all(|c| matches!(c, '0' | '1')))
+                                {
+                                    // static length with base support: decimal / 0x.. / 0o.. / 0b..
                                 } else {
                                     return Err(ParseError::TypeError(format!(
                                         "Invalid length in specifier '{{:{conv}{rest}}}'"
@@ -205,6 +215,19 @@ mod tests {
         );
         assert_eq!(
             FormatValidator::count_required_args("{:x.len$}").unwrap(),
+            (1, 0)
+        );
+        // Static length with hex/oct/bin
+        assert_eq!(
+            FormatValidator::count_required_args("{:x.0x10}").unwrap(),
+            (1, 0)
+        );
+        assert_eq!(
+            FormatValidator::count_required_args("{:s.0o20}").unwrap(),
+            (1, 0)
+        );
+        assert_eq!(
+            FormatValidator::count_required_args("{:X.0b1000}").unwrap(),
             (1, 0)
         );
         assert!(FormatValidator::count_required_args("{:x.1a$}").is_err());
