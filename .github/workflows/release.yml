@@ -1,0 +1,57 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-20.04
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install LLVM 18 and dependencies
+      run: |
+        wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
+        sudo add-apt-repository "deb http://apt.llvm.org/focal/ llvm-toolchain-focal-18 main"
+        sudo apt-get update
+        sudo apt-get install -y \
+          llvm-18 llvm-18-dev llvm-18-runtime \
+          clang-18 libclang-18-dev \
+          libpolly-18-dev \
+          libzstd-dev zlib1g-dev libtinfo-dev libxml2-dev
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Set LLVM environment
+      run: |
+        echo "LLVM_SYS_181_PREFIX=/usr/lib/llvm-18" >> $GITHUB_ENV
+        echo "/usr/lib/llvm-18/bin" >> $GITHUB_PATH
+
+    - name: Verify LLVM installation
+      run: |
+        llvm-config-18 --version
+        llvm-config-18 --prefix
+
+    - name: Build release
+      run: cargo build --release
+
+    - name: Check glibc dependency
+      run: |
+        echo "=== glibc version on build system ==="
+        ldd --version | head -1
+        echo "=== Required glibc versions ==="
+        objdump -T ./target/release/ghostscope | grep GLIBC | sed 's/.*GLIBC_\([.0-9]*\).*/\1/g' | sort -Vu
+        echo "=== Binary info ==="
+        file ./target/release/ghostscope
+        ls -lh ./target/release/ghostscope
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ghostscope-x86_64-linux-gnu
+        path: target/release/ghostscope

@@ -3,12 +3,80 @@
 ## 前置要求
 
 - Rust 1.88.0（通过 `rust-toolchain.toml` 强制指定）
-- LLVM 18（包括 Polly 库：`libpolly-18-dev`）
 - Linux 内核 4.4+
+- LLVM 18（包括 Polly 库：`libpolly-18-dev`）
+
+### 设置 LLVM 18
+
+#### Ubuntu/Debian
+
+```bash
+# 添加 LLVM 官方仓库
+wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
+
+# Ubuntu 22.04 (Jammy)
+sudo add-apt-repository "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main"
+
+# Ubuntu 20.04 (Focal)
+sudo add-apt-repository "deb http://apt.llvm.org/focal/ llvm-toolchain-focal-18 main"
+
+# Ubuntu 24.04 (Noble)
+sudo add-apt-repository "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-18 main"
+
+# 安装 LLVM 18 及依赖
+sudo apt-get update
+sudo apt-get install -y \
+  llvm-18 llvm-18-dev llvm-18-runtime \
+  clang-18 libclang-18-dev \
+  libpolly-18-dev \
+  libzstd-dev zlib1g-dev libtinfo-dev libxml2-dev
+
+# 设置环境变量（添加到 ~/.bashrc 以持久化）
+export LLVM_SYS_181_PREFIX=/usr/lib/llvm-18
+
+# 验证安装
+llvm-config-18 --version
+```
+
+#### 故障排查
+
+如果构建时遇到 `No suitable version of LLVM was found` 错误：
+
+```bash
+# 确保设置了 LLVM_SYS_181_PREFIX
+export LLVM_SYS_181_PREFIX=/usr/lib/llvm-18
+
+# 验证 LLVM 安装
+llvm-config-18 --prefix
+
+# 清理并重新构建
+cargo clean
+cargo build
+```
 
 ## 构建
 
+### Debug 构建（默认）
+
+```bash
+# 如果未在 ~/.bashrc 中设置，需要先设置 LLVM 前缀
+export LLVM_SYS_181_PREFIX=/usr/lib/llvm-18
+
+# 构建 debug 版本
 cargo build
+```
+
+### Release 构建
+
+```bash
+# 如果未在 ~/.bashrc 中设置，需要先设置 LLVM 前缀
+export LLVM_SYS_181_PREFIX=/usr/lib/llvm-18
+
+# 构建 release 版本
+cargo build --release
+```
+
+**注意**：开发过程中默认使用 debug 构建，以获得更快的迭代速度和更好的调试体验。
 
 ## 测试
 
