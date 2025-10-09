@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 pub fn find_debug_file<P: AsRef<Path>>(
     binary_path: P,
     user_search_paths: &[String],
+    allow_loose_debug_match: bool,
 ) -> Result<Option<PathBuf>> {
     let binary_path = binary_path.as_ref();
 
@@ -90,10 +91,18 @@ pub fn find_debug_file<P: AsRef<Path>>(
                     return Ok(Some(candidate_path));
                 }
                 Ok(false) => {
-                    tracing::warn!(
-                        "Debug file {} exists but verification failed (CRC or build ID mismatch)",
-                        candidate_path.display()
-                    );
+                    if allow_loose_debug_match {
+                        tracing::warn!(
+                            "Debug file {} exists but verification failed; loose match enabled -> using it",
+                            candidate_path.display()
+                        );
+                        return Ok(Some(candidate_path));
+                    } else {
+                        tracing::error!(
+                            "Debug file {} exists but verification failed (CRC or Build-ID mismatch)",
+                            candidate_path.display()
+                        );
+                    }
                 }
                 Err(e) => {
                     tracing::debug!(
@@ -219,15 +228,8 @@ fn verify_debug_file(
     // 1. Verify CRC-32
     let actual_crc = calculate_gnu_debuglink_crc(&file_data);
 
-    tracing::debug!(
-        "CRC check for {}: expected=0x{:08x}, actual=0x{:08x}",
-        debug_file_path.display(),
-        expected_crc,
-        actual_crc
-    );
-
     if actual_crc != expected_crc {
-        tracing::warn!(
+        tracing::error!(
             "CRC mismatch for {}: expected=0x{:08x}, actual=0x{:08x}",
             debug_file_path.display(),
             expected_crc,
@@ -235,6 +237,11 @@ fn verify_debug_file(
         );
         return Ok(false);
     }
+    tracing::info!(
+        "CRC verification passed for {}: 0x{:08x}",
+        debug_file_path.display(),
+        actual_crc
+    );
 
     // 2. Verify build ID if present
     let debug_obj = object::File::parse(&*file_data)?;
@@ -243,39 +250,36 @@ fn verify_debug_file(
     match (binary_build_id, debug_build_id) {
         (Some(binary_id), Some(debug_id)) => {
             if binary_id != debug_id {
-                tracing::warn!(
+                tracing::error!(
                     "Build ID mismatch for {}: binary={:02x?}, debug={:02x?}",
                     debug_file_path.display(),
                     binary_id,
                     debug_id
                 );
-                // According to GDB behavior: CRC takes priority, build ID mismatch is just a warning
-                // We still return true if CRC matches
-                tracing::warn!(
-                    "CRC matches but build IDs differ - using debug file anyway (following GDB behavior)"
-                );
+                return Ok(false);
             } else {
-                tracing::debug!(
-                    "Build ID verification passed for {}: {:02x?}",
+                tracing::info!(
+                    "Build ID verification passed for {}: binary={:02x?}, debug={:02x?}",
                     debug_file_path.display(),
-                    binary_id
+                    binary_id,
+                    debug_id
                 );
             }
         }
         (Some(binary_id), None) => {
-            tracing::debug!(
-                "Binary has build ID {:02x?} but debug file has none",
+            tracing::info!(
+                "Binary has Build ID {:02x?} but debug file has none (CRC matched)",
                 binary_id
             );
         }
         (None, Some(debug_id)) => {
-            tracing::debug!(
-                "Debug file has build ID {:02x?} but binary has none",
+            tracing::info!(
+                "Debug file has Build ID {:02x?} but binary has none (CRC matched)",
                 debug_id
             );
         }
         (None, None) => {
-            tracing::debug!("Neither binary nor debug file has build ID");
+            tracing::info!("Neither binary nor debug file has Build ID (CRC matched)");
         }
     }
 
@@ -297,10 +301,11 @@ fn calculate_gnu_debuglink_crc(data: &[u8]) -> u32 {
 pub fn try_load_debug_file<P: AsRef<Path>>(
     binary_path: P,
     user_search_paths: &[String],
+    allow_loose_debug_match: bool,
 ) -> Result<Option<(PathBuf, memmap2::Mmap)>> {
     let binary_path = binary_path.as_ref();
 
-    match find_debug_file(binary_path, user_search_paths)? {
+    match find_debug_file(binary_path, user_search_paths, allow_loose_debug_match)? {
         Some(debug_path) => {
             tracing::info!(
                 "Loading debug info from separate file: {}",

@@ -213,6 +213,11 @@ search_paths = [
     "/opt/debug-symbols"        # 自定义调试符号服务器
 ]
 
+# 允许非严格的调试文件匹配（CRC/Build-ID）
+# 默认：false（严格）。当设置为 true 时，即使 CRC 或 Build‑ID 不完全匹配，
+# 也会继续使用该独立调试文件（会记录警告日志）。仅建议在排障或环境不规范时短期启用。
+allow_loose_debug_match = false
+
 [files]
 # 保存 LLVM IR 文件
 [files.save_llvm_ir]

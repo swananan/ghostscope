@@ -214,6 +214,13 @@ search_paths = [
     "/opt/debug-symbols"        # Custom debug symbol server
 ]
 
+# Allow non-strict debug file matching (CRC/Build-ID)
+# Default: false (strict). When true, GhostScope will allow using a separate
+# debug file even if CRC or Build-ID does not match exactly. This is useful for
+# ad-hoc environments or partially repackaged symbols, but may cause inaccurate
+# symbol/line information. Prefer leaving this off unless you know what you are doing.
+allow_loose_debug_match = false
+
 [files]
 # Save LLVM IR files
 [files.save_llvm_ir]

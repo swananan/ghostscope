@@ -81,21 +81,41 @@ impl GhostSession {
             .unwrap_or_default()
     }
 
+    fn get_allow_loose_debug_match(&self) -> bool {
+        self.config
+            .as_ref()
+            .map(|c| c.dwarf_allow_loose_debug_match)
+            .unwrap_or(false)
+    }
+
     /// Load binary and perform DWARF analysis using parallel loading (TUI mode)
     pub async fn load_binary_parallel(&mut self) -> Result<()> {
         info!("Loading binary and performing DWARF analysis (parallel mode)");
 
         let debug_search_paths = self.get_debug_search_paths();
+        let allow_loose = self.get_allow_loose_debug_match();
 
         let process_analyzer = if let Some(pid) = self.target_pid {
             info!("Loading binary from PID: {} (parallel)", pid);
             Some(
-                DwarfAnalyzer::from_pid_parallel_with_config(pid, &debug_search_paths, |_| {})
-                    .await?,
+                DwarfAnalyzer::from_pid_parallel_with_config(
+                    pid,
+                    &debug_search_paths,
+                    allow_loose,
+                    |_| {},
+                )
+                .await?,
             )
         } else if let Some(ref binary_path) = self.target_binary {
             info!("Loading binary from executable path: {}", binary_path);
-            Some(DwarfAnalyzer::from_exec_path_with_config(binary_path, &debug_search_paths).await?)
+            Some(
+                DwarfAnalyzer::from_exec_path_with_config(
+                    binary_path,
+                    &debug_search_paths,
+                    allow_loose,
+                )
+                .await?,
+            )
         } else {
             warn!("No PID or binary path specified - running without binary analysis");
             None
@@ -116,6 +136,7 @@ impl GhostSession {
         info!("Loading binary and performing DWARF analysis (parallel mode with progress)");
 
         let debug_search_paths = self.get_debug_search_paths();
+        let allow_loose = self.get_allow_loose_debug_match();
 
         let process_analyzer = if let Some(pid) = self.target_pid {
             info!("Loading binary from PID: {} (parallel with progress)", pid);
@@ -123,13 +144,21 @@ impl GhostSession {
                 DwarfAnalyzer::from_pid_parallel_with_config(
                     pid,
                     &debug_search_paths,
+                    allow_loose,
                     progress_callback,
                 )
                 .await?,
             )
         } else if let Some(ref binary_path) = self.target_binary {
             info!("Loading binary from executable path: {}", binary_path);
-            Some(DwarfAnalyzer::from_exec_path_with_config(binary_path, &debug_search_paths).await?)
+            Some(
+                DwarfAnalyzer::from_exec_path_with_config(
+                    binary_path,
+                    &debug_search_paths,
+                    allow_loose,
+                )
+                .await?,
+            )
         } else {
             warn!("No PID or binary path specified - running without binary analysis");
             None
@@ -249,6 +278,7 @@ mod tests {
             should_save_ast: false,
             layout_mode: crate::config::LayoutMode::Horizontal,
             force_perf_event_array: false,
+            allow_loose_debug_match: false,
         };
 
         let config = crate::config::Config {

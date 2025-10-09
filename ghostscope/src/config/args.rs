@@ -75,6 +75,11 @@ pub struct Args {
     #[arg(long, short = 'd', value_name = "PATH")]
     pub debug_file: Option<PathBuf>,
 
+    /// Allow non-strict debug file matching (CRC/Build-ID mismatches)
+    /// Default is strict (disabled). When set, CRC/Build-ID mismatches are allowed with WARN logs.
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub allow_loose_debug_match: bool,
+
     /// Script to execute (inline script - optional for TUI mode)
     #[arg(long, short = 's', value_name = "SCRIPT")]
     pub script: Option<String>,
@@ -149,6 +154,7 @@ pub struct ParsedArgs {
     pub should_save_ast: bool,
     pub layout_mode: LayoutMode,
     pub force_perf_event_array: bool,
+    pub allow_loose_debug_match: bool,
 }
 
 impl Args {
@@ -209,6 +215,7 @@ impl Args {
                 should_save_ast,
                 layout_mode: parsed.layout,
                 force_perf_event_array: parsed.force_perf_event_array,
+                allow_loose_debug_match: parsed.allow_loose_debug_match,
             }
         } else {
             // Normal parsing without --args
@@ -248,6 +255,7 @@ impl Args {
                 should_save_ast,
                 layout_mode: parsed.layout,
                 force_perf_event_array: parsed.force_perf_event_array,
+                allow_loose_debug_match: parsed.allow_loose_debug_match,
             }
         }
     }
