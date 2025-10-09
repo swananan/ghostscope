@@ -711,6 +711,17 @@ fn parse_trace_pattern(pair: Pair<Rule>) -> Result<TracePattern> {
     let inner = pair.into_inner().next().unwrap();
 
     match inner.as_rule() {
+        Rule::module_hex_address => {
+            let mut parts = inner.into_inner();
+            let module = parts.next().unwrap().as_str().to_string();
+            let hex = parts.next().unwrap().as_str();
+            let addr =
+                u64::from_str_radix(&hex[2..], 16).map_err(|_| ParseError::InvalidExpression)?;
+            Ok(TracePattern::AddressInModule {
+                module,
+                address: addr,
+            })
+        }
         Rule::hex_address => {
             let addr_str = inner.as_str();
             // Remove "0x" prefix and parse as hex
@@ -1092,5 +1103,92 @@ trace foo {
 "#;
         let r = parse(script);
         assert!(r.is_ok(), "parse failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn parse_trace_patterns_function_line_address_wildcard() {
+        // Function name
+        let s1 = r#"trace main { print "OK"; }"#;
+        assert!(parse(s1).is_ok());
+
+        // Source line with path and hyphen
+        let s2 = r#"trace /tmp/test-file.c:42 { print "L"; }"#;
+        assert!(parse(s2).is_ok());
+
+        // Hex address
+        let s3 = r#"trace 0x401234 { print "A"; }"#;
+        assert!(parse(s3).is_ok());
+
+        // Wildcard
+        let s4 = r#"trace printf* { print "W"; }"#;
+        assert!(parse(s4).is_ok());
+
+        // Module-qualified address
+        let s5 = r#"trace /lib/x86_64-linux-gnu/libc.so.6:0x1234 { print "M"; }"#;
+        assert!(parse(s5).is_ok());
+    }
+
+    #[test]
+    fn parse_module_hex_address_overflow_should_error() {
+        // Address exceeds u64 (17 hex digits) -> parse error, not 0 fallback
+        let s = r#"trace libfoo.so:0x10000000000000000 { print "X"; }"#;
+        let r = parse(s);
+        assert!(r.is_err(), "expected parse error for overflow address");
+    }
+
+    #[test]
+    fn parse_special_variables_basic() {
+        // $pid/$tid/$timestamp in expressions and prints
+        let script = r#"
+trace foo {
+    if $pid == 123 && $tid != 0 { print "PID_TID"; }
+    print $timestamp;
+    print "P:{} T:{} TS:{}", $pid, $tid, $timestamp;
+}
+"#;
+        let r = parse(script);
+        assert!(r.is_ok(), "parse failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn parse_chain_and_array_access() {
+        // Member/chain and array tail index
+        let script = r#"
+trace foo {
+    print person.name.first;
+    print arr[0];
+    // Supported: top-level array access with trailing member
+    print ifaces[0].mtu;
+}
+"#;
+        let r = parse(script);
+        assert!(r.is_ok(), "parse failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn parse_pointer_and_address_of() {
+        let script = r#"
+trace foo {
+    print *ptr;
+    print &var;
+    print *(arr_ptr);
+}
+"#;
+        let r = parse(script);
+        assert!(r.is_ok(), "parse failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn parse_unclosed_print_string_reports_friendly_error() {
+        let bad = r#"
+trace foo {
+    print "Unclosed {}, value
+}
+"#;
+        let r = parse(bad);
+        match r {
+            Err(ParseError::SyntaxError(msg)) => assert!(msg.contains("Unclosed string literal")),
+            other => panic!("expected SyntaxError, got {:?}", other),
+        }
     }
 }

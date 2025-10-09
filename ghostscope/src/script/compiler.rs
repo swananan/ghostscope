@@ -206,10 +206,7 @@ pub async fn compile_and_load_script_for_tui(
     // Step 5: If we have successful configurations, attach uprobes and register traces
     if !compilation_result.uprobe_configs.is_empty() {
         // Prepare uprobe configurations with binary path
-        let mut uprobe_configs = compilation_result.uprobe_configs;
-        for config in uprobe_configs.iter_mut() {
-            config.binary_path = binary_path.clone();
-        }
+        let uprobe_configs = compilation_result.uprobe_configs;
 
         info!("Attaching {} uprobe configurations", uprobe_configs.len());
         for (i, config) in uprobe_configs.iter().enumerate() {
@@ -345,7 +342,7 @@ pub async fn compile_and_load_script_for_cli(
     // Determine an effective binary path for logging/reporting purposes.
     // In PID mode, prefer main executable; in target mode (-t <binary>, including .so),
     // fall back to the target binary path.
-    let binary_path_string = if let Some(main_module) = process_analyzer.get_main_executable() {
+    let _binary_path_string = if let Some(main_module) = process_analyzer.get_main_executable() {
         main_module.path.clone()
     } else if let Some(bin) = session.target_binary.clone() {
         bin
@@ -428,11 +425,7 @@ pub async fn compile_and_load_script_for_cli(
     }
 
     // Step 3: Prepare and attach uprobe configurations
-    let mut uprobe_configs = compilation_result.uprobe_configs;
-
-    for config in uprobe_configs.iter_mut() {
-        config.binary_path = binary_path_string.clone();
-    }
+    let uprobe_configs = compilation_result.uprobe_configs;
 
     if uprobe_configs.is_empty() {
         // Check if we have debug info - this is checked during module loading

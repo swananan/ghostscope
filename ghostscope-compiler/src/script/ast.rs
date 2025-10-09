@@ -89,6 +89,11 @@ pub enum TracePattern {
     FunctionName(String), // trace main { ... }
     Wildcard(String),     // trace printf* { ... }
     Address(u64),         // trace 0x400000 { ... }
+    AddressInModule {
+        // trace module_suffix:0xADDR { ... }
+        module: String,
+        address: u64,
+    },
     SourceLine {
         // trace file.c:123 { ... }
         file_path: String,
