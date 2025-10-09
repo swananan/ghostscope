@@ -58,6 +58,20 @@ pub fn init() {
                 .arg("clean")
                 .current_dir(&globals_dir)
                 .output();
+
+            // cpp_complex_program
+            let cpp_complex_dir = base.join("cpp_complex_program");
+            let _ = Command::new("make")
+                .arg("clean")
+                .current_dir(&cpp_complex_dir)
+                .output();
+
+            // rust_global_program
+            let rust_global_dir = base.join("rust_global_program");
+            let _ = Command::new("cargo")
+                .arg("clean")
+                .current_dir(&rust_global_dir)
+                .output();
         }
         libc::atexit(cleanup_fixtures);
     });
@@ -319,6 +333,18 @@ impl TestFixtures {
             self.base_path
                 .join("globals_program")
                 .join("globals_program")
+        } else if name == "rust_global_program" {
+            ensure_rust_global_program_compiled()?;
+            self.base_path
+                .join("rust_global_program")
+                .join("target")
+                .join("debug")
+                .join("rust_global_program")
+        } else if name == "cpp_complex_program" {
+            ensure_cpp_complex_program_compiled()?;
+            self.base_path
+                .join("cpp_complex_program")
+                .join("cpp_complex_program")
         } else {
             // Fallback to old binaries directory (debug only)
             self.base_path.join("binaries").join(name).join(name)
@@ -392,6 +418,8 @@ lazy_static! {
 }
 
 static COMPILE_GLOBALS: Once = Once::new();
+static COMPILE_RUST_GLOBAL: Once = Once::new();
+static COMPILE_CPP_COMPLEX: Once = Once::new();
 
 fn ensure_globals_program_compiled() -> anyhow::Result<()> {
     let mut result = Ok(());
@@ -417,6 +445,72 @@ fn ensure_globals_program_compiled() -> anyhow::Result<()> {
             Err(e) => {
                 result = Err(anyhow::anyhow!(
                     "Failed to run make for globals_program: {}",
+                    e
+                ));
+            }
+        }
+    });
+    result
+}
+
+fn ensure_rust_global_program_compiled() -> anyhow::Result<()> {
+    let mut result = Ok(());
+    COMPILE_RUST_GLOBAL.call_once(|| {
+        let base =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rust_global_program");
+        println!("Compiling rust_global_program (Debug) in {:?}", base);
+        match Command::new("cargo")
+            .arg("build")
+            .current_dir(&base)
+            .output()
+        {
+            Ok(out) => {
+                if out.status.success() {
+                    println!("✓ Successfully compiled rust_global_program");
+                } else {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    result = Err(anyhow::anyhow!(
+                        "Failed to compile rust_global_program: {}",
+                        stderr
+                    ));
+                }
+            }
+            Err(e) => {
+                result = Err(anyhow::anyhow!(
+                    "Failed to run make for rust_global_program: {}",
+                    e
+                ));
+            }
+        }
+    });
+    result
+}
+
+fn ensure_cpp_complex_program_compiled() -> anyhow::Result<()> {
+    let mut result = Ok(());
+    COMPILE_CPP_COMPLEX.call_once(|| {
+        let base =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cpp_complex_program");
+        println!("Compiling cpp_complex_program (Debug) in {:?}", base);
+        let _ = Command::new("make")
+            .arg("clean")
+            .current_dir(&base)
+            .output();
+        match Command::new("make").arg("all").current_dir(&base).output() {
+            Ok(out) => {
+                if out.status.success() {
+                    println!("✓ Successfully compiled cpp_complex_program");
+                } else {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    result = Err(anyhow::anyhow!(
+                        "Failed to compile cpp_complex_program: {}",
+                        stderr
+                    ));
+                }
+            }
+            Err(e) => {
+                result = Err(anyhow::anyhow!(
+                    "Failed to run make for cpp_complex_program: {}",
                     e
                 ));
             }

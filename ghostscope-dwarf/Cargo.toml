@@ -15,6 +15,8 @@ tracing.workspace = true
 thiserror.workspace = true
 ghostscope-platform = { path = "../ghostscope-platform" }
 ghostscope-protocol = { path = "../ghostscope-protocol" }
+rustc-demangle = "0.1"
+cpp_demangle = "0.4"
 
 # For parallel loading
 tokio.workspace = true
@@ -29,4 +31,3 @@ crc32fast = "1.4"
 
 # For home directory expansion in debug search paths
 dirs = "5.0"
-

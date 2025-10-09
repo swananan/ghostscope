@@ -639,6 +639,31 @@ impl<'a> DwarfParser<'a> {
                             };
 
                             functions.entry(name).or_default().push(index_entry);
+
+                            // If a distinct linkage name exists, add an alias entry (GDB-like behavior)
+                            if let Some((linkage_name, _)) =
+                                self.extract_linkage_name(self.dwarf, &unit, entry)?
+                            {
+                                if linkage_name != metadata.name.clone().unwrap_or_default() {
+                                    let mut alias_flags = flags;
+                                    alias_flags.is_linkage = true;
+                                    let index_entry_linkage = IndexEntry {
+                                        name: linkage_name.clone(),
+                                        die_offset: entry.offset(),
+                                        unit_offset,
+                                        tag: entry.tag(),
+                                        flags: alias_flags,
+                                        language: cu_language,
+                                        address_ranges: self
+                                            .extract_address_ranges(self.dwarf, &unit, entry)?,
+                                        entry_pc: self.extract_entry_pc(entry)?,
+                                    };
+                                    functions
+                                        .entry(linkage_name)
+                                        .or_default()
+                                        .push(index_entry_linkage);
+                                }
+                            }
                         }
                     }
                     gimli::constants::DW_TAG_inlined_subroutine => {
@@ -677,6 +702,31 @@ impl<'a> DwarfParser<'a> {
                             };
 
                             functions.entry(name).or_default().push(index_entry);
+
+                            // Add linkage alias for inlined subroutine if present
+                            if let Some((linkage_name, _)) =
+                                self.extract_linkage_name(self.dwarf, &unit, entry)?
+                            {
+                                if linkage_name != metadata.name.clone().unwrap_or_default() {
+                                    let mut alias_flags = flags;
+                                    alias_flags.is_linkage = true;
+                                    let index_entry_linkage = IndexEntry {
+                                        name: linkage_name.clone(),
+                                        die_offset: entry.offset(),
+                                        unit_offset,
+                                        tag: entry.tag(),
+                                        flags: alias_flags,
+                                        language: cu_language,
+                                        address_ranges: self
+                                            .extract_address_ranges(self.dwarf, &unit, entry)?,
+                                        entry_pc: self.extract_entry_pc(entry)?,
+                                    };
+                                    functions
+                                        .entry(linkage_name)
+                                        .or_default()
+                                        .push(index_entry_linkage);
+                                }
+                            }
                         }
                     }
                     gimli::constants::DW_TAG_variable => {
@@ -717,6 +767,39 @@ impl<'a> DwarfParser<'a> {
                             };
 
                             variables.entry(name).or_default().push(index_entry);
+
+                            // Add linkage alias for variable if present
+                            if let Some((linkage_name, _)) =
+                                self.extract_linkage_name(self.dwarf, &unit, entry)?
+                            {
+                                if linkage_name
+                                    != self
+                                        .extract_name(self.dwarf, &unit, entry)?
+                                        .unwrap_or_default()
+                                {
+                                    let mut alias_flags = flags;
+                                    alias_flags.is_linkage = true;
+                                    let index_entry_linkage = IndexEntry {
+                                        name: linkage_name.clone(),
+                                        die_offset: entry.offset(),
+                                        unit_offset,
+                                        tag: entry.tag(),
+                                        flags: alias_flags,
+                                        language: cu_language,
+                                        address_ranges: self
+                                            .extract_variable_address(entry, &unit)
+                                            .ok()
+                                            .flatten()
+                                            .map(|addr| vec![(addr, addr)])
+                                            .unwrap_or_default(),
+                                        entry_pc: None,
+                                    };
+                                    variables
+                                        .entry(linkage_name)
+                                        .or_default()
+                                        .push(index_entry_linkage);
+                                }
+                            }
                         }
                     }
                     gimli::constants::DW_TAG_structure_type
