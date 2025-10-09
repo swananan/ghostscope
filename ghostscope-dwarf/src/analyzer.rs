@@ -135,7 +135,7 @@ impl DwarfAnalyzer {
 
     /// Create DWARF analyzer from PID using parallel loading
     pub async fn from_pid_parallel(pid: u32) -> Result<Self> {
-        Self::from_pid_parallel_with_config(pid, &[], |_event| {}).await
+        Self::from_pid_parallel_with_config(pid, &[], false, |_event| {}).await
     }
 
     /// Create DWARF analyzer from PID using parallel loading with progress callback
@@ -143,13 +143,14 @@ impl DwarfAnalyzer {
     where
         F: Fn(ModuleLoadingEvent) + Send + Sync + 'static,
     {
-        Self::from_pid_parallel_with_config(pid, &[], progress_callback).await
+        Self::from_pid_parallel_with_config(pid, &[], false, progress_callback).await
     }
 
     /// Create DWARF analyzer from PID using parallel loading with debug search paths and progress callback
     pub async fn from_pid_parallel_with_config<F>(
         pid: u32,
         debug_search_paths: &[String],
+        allow_loose_debug_match: bool,
         progress_callback: F,
     ) -> Result<Self>
     where
@@ -182,6 +183,7 @@ impl DwarfAnalyzer {
         if !debug_search_paths.is_empty() {
             loader = loader.with_debug_search_paths(debug_search_paths.to_vec());
         }
+        loader = loader.with_loose_debug_match(allow_loose_debug_match);
 
         let modules = loader
             .with_progress_callback(progress_callback)
@@ -199,13 +201,14 @@ impl DwarfAnalyzer {
 
     /// Create DWARF analyzer from executable path (single module mode, now async parallel)
     pub async fn from_exec_path<P: AsRef<std::path::Path>>(exec_path: P) -> Result<Self> {
-        Self::from_exec_path_with_config(exec_path, &[]).await
+        Self::from_exec_path_with_config(exec_path, &[], false).await
     }
 
     /// Create DWARF analyzer from executable path with debug search paths
     pub async fn from_exec_path_with_config<P: AsRef<std::path::Path>>(
         exec_path: P,
         debug_search_paths: &[String],
+        allow_loose_debug_match: bool,
     ) -> Result<Self> {
         let exec_path = exec_path.as_ref().to_path_buf();
         tracing::info!(
@@ -227,7 +230,9 @@ impl DwarfAnalyzer {
         };
 
         // Load the single module using parallel loading
-        match ModuleData::load_parallel(module_mapping, debug_search_paths).await {
+        match ModuleData::load_parallel(module_mapping, debug_search_paths, allow_loose_debug_match)
+            .await
+        {
             Ok(module_data) => {
                 analyzer.modules.insert(exec_path.clone(), module_data);
                 tracing::info!(

@@ -69,9 +69,11 @@ impl ModuleData {
     pub(crate) async fn load_parallel(
         module_mapping: ModuleMapping,
         debug_search_paths: &[String],
+        allow_loose_debug_match: bool,
     ) -> Result<Self> {
         tracing::info!("Parallel loading for: {}", module_mapping.path.display());
-        Self::load_internal_parallel(module_mapping, debug_search_paths).await
+        Self::load_internal_parallel(module_mapping, debug_search_paths, allow_loose_debug_match)
+            .await
     }
 
     /// Resolve a struct/class type by name using only indexes + shallow resolution (no scanning).
@@ -195,6 +197,7 @@ impl ModuleData {
     async fn load_internal_parallel(
         module_mapping: ModuleMapping,
         debug_search_paths: &[String],
+        allow_loose_debug_match: bool,
     ) -> Result<Self> {
         tracing::debug!(
             "Loading module in parallel: {}",
@@ -229,6 +232,7 @@ impl ModuleData {
                     match crate::debuglink::try_load_debug_file(
                         &module_mapping.path,
                         debug_search_paths,
+                        allow_loose_debug_match,
                     )? {
                         Some((debug_path, debug_mmap)) => {
                             tracing::info!(

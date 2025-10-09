@@ -16,6 +16,8 @@ pub struct LoadConfig {
     pub max_module_concurrency: usize,
     /// Debug file search paths (for .gnu_debuglink)
     pub debug_search_paths: Vec<String>,
+    /// Allow non-strict debug file matching (CRC/Build-ID)
+    pub allow_loose_debug_match: bool,
 }
 
 impl Default for LoadConfig {
@@ -23,6 +25,7 @@ impl Default for LoadConfig {
         Self {
             max_module_concurrency: num_cpus::get(),
             debug_search_paths: Vec::new(),
+            allow_loose_debug_match: false,
         }
     }
 }
@@ -33,6 +36,7 @@ impl LoadConfig {
         Self {
             max_module_concurrency: num_cpus::get(),
             debug_search_paths: Vec::new(),
+            allow_loose_debug_match: false,
         }
     }
 }
@@ -61,6 +65,12 @@ impl ModuleLoader {
     /// Set debug search paths for .gnu_debuglink files
     pub fn with_debug_search_paths(mut self, paths: Vec<String>) -> Self {
         self.config.debug_search_paths = paths;
+        self
+    }
+
+    /// Set loose debug match policy (CRC/Build-ID mismatches allowed)
+    pub fn with_loose_debug_match(mut self, allow: bool) -> Self {
+        self.config.allow_loose_debug_match = allow;
         self
     }
 
@@ -100,6 +110,7 @@ impl ModuleLoader {
         let total_modules = self.mappings.len();
         let progress_callback = Arc::new(progress_callback);
         let debug_search_paths = Arc::new(self.config.debug_search_paths.clone());
+        let allow_loose = self.config.allow_loose_debug_match;
 
         let tasks: Vec<_> = self
             .mappings
@@ -124,7 +135,8 @@ impl ModuleLoader {
 
                     let start_time = std::time::Instant::now();
 
-                    let result = ModuleData::load_parallel(mapping, &debug_search_paths).await;
+                    let result =
+                        ModuleData::load_parallel(mapping, &debug_search_paths, allow_loose).await;
 
                     let load_time_ms = start_time.elapsed().as_millis() as u64;
 

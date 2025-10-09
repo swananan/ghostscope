@@ -36,6 +36,7 @@ pub struct MergedConfig {
     // DWARF configuration
     #[allow(dead_code)]
     pub dwarf_search_paths: Vec<String>,
+    pub dwarf_allow_loose_debug_match: bool,
 
     // eBPF configuration
     pub ebpf_config: crate::config::settings::EbpfConfig,
@@ -159,7 +160,12 @@ impl MergedConfig {
             history_enabled: config.ui.history.enabled,
             history_max_entries: config.ui.history.max_entries,
             ebpf_max_messages: config.ui.ebpf_max_messages,
-            dwarf_search_paths: config.dwarf.search_paths,
+            dwarf_search_paths: config.dwarf.search_paths.clone(),
+            dwarf_allow_loose_debug_match: if args.allow_loose_debug_match {
+                true
+            } else {
+                config.dwarf.allow_loose_debug_match
+            },
             ebpf_config: {
                 // Command line --force-perf-event-array overrides config file
                 let mut ebpf_config = config.ebpf;

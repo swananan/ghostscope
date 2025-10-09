@@ -113,6 +113,10 @@ pub struct DwarfConfig {
     /// DWARF debug information search paths (for future --debug-file auto-discovery)
     #[serde(default = "default_debug_search_paths")]
     pub search_paths: Vec<String>,
+    /// Allow non-strict matching of separate debug files (CRC/Build-ID)
+    /// Default: false (strict). When true, CRC/Build-ID mismatches are allowed with WARN logs.
+    #[serde(default)]
+    pub allow_loose_debug_match: bool,
 }
 
 /// Source code path configuration
@@ -336,6 +340,7 @@ impl Default for DwarfConfig {
     fn default() -> Self {
         Self {
             search_paths: default_debug_search_paths(),
+            allow_loose_debug_match: false,
         }
     }
 }

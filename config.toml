@@ -70,6 +70,12 @@ search_paths = [
     "~/.local/lib/debug"
 ]
 
+# Allow non-strict debug file matching (CRC/Build-ID)
+# Default: false (strict). When true, GhostScope will allow using a separate
+# debug file even if CRC or Build-ID does not match exactly. Useful for
+# ad-hoc environments; may cause inaccurate symbol/line info.
+allow_loose_debug_match = false
+
 [files]
 # File saving options (overridden by --save-*/--no-save-* flags)
 # Format: { debug = bool, release = bool }
