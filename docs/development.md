@@ -3,14 +3,80 @@
 ## Prerequisites
 
 - Rust 1.88.0 (enforced via `rust-toolchain.toml`)
-- LLVM 18 (including Polly library: `libpolly-18-dev`)
 - Linux kernel 4.4+
+- LLVM 18 (including Polly library: `libpolly-18-dev`)
+
+### Setting Up LLVM 18
+
+#### Ubuntu/Debian
+
+```bash
+# Add LLVM official repository
+wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
+
+# For Ubuntu 22.04 (Jammy)
+sudo add-apt-repository "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main"
+
+# For Ubuntu 20.04 (Focal)
+sudo add-apt-repository "deb http://apt.llvm.org/focal/ llvm-toolchain-focal-18 main"
+
+# For Ubuntu 24.04 (Noble)
+sudo add-apt-repository "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-18 main"
+
+# Install LLVM 18 and dependencies
+sudo apt-get update
+sudo apt-get install -y \
+  llvm-18 llvm-18-dev llvm-18-runtime \
+  clang-18 libclang-18-dev \
+  libpolly-18-dev \
+  libzstd-dev zlib1g-dev libtinfo-dev libxml2-dev
+
+# Set environment variable (add to ~/.bashrc for persistence)
+export LLVM_SYS_181_PREFIX=/usr/lib/llvm-18
+
+# Verify installation
+llvm-config-18 --version
+```
+
+#### Troubleshooting
+
+If you encounter `No suitable version of LLVM was found` error during build:
+
+```bash
+# Ensure LLVM_SYS_181_PREFIX is set
+export LLVM_SYS_181_PREFIX=/usr/lib/llvm-18
+
+# Verify LLVM installation
+llvm-config-18 --prefix
+
+# Clean and rebuild
+cargo clean
+cargo build
+```
 
 ## Build
 
+### Debug Build (Default)
+
 ```bash
+# Set LLVM prefix if not in ~/.bashrc
+export LLVM_SYS_181_PREFIX=/usr/lib/llvm-18
+
+# Build debug version
 cargo build
 ```
+
+### Release Build
+
+```bash
+# Set LLVM prefix if not in ~/.bashrc
+export LLVM_SYS_181_PREFIX=/usr/lib/llvm-18
+
+# Build release version
+cargo build --release
+```
+
+**Note**: Debug builds are used by default during development for faster iteration and better debugging experience.
 
 ## Testing
 
