@@ -14,6 +14,7 @@ statement = {
 
 trace_stmt = { "trace" ~ trace_pattern ~ "{" ~ statement* ~ "}" }
 trace_pattern = { 
+    module_hex_address |
     hex_address |
     wildcard_pattern |
     source_line |
@@ -21,6 +22,7 @@ trace_pattern = {
 }
 
 hex_address = @{ "0x" ~ ASCII_HEX_DIGIT+ }
+module_hex_address = { file_path ~ ":" ~ hex_address }
 wildcard_pattern = @{ identifier ~ "*" }
 source_line = { file_path ~ ":" ~ line_number }
 function_name = { identifier }

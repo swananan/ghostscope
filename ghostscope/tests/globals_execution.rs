@@ -215,7 +215,8 @@ async fn test_trace_by_address_via_dwarf_line_lookup() -> anyhow::Result<()> {
     let script = format!("trace 0x{pc:x} {{\n    print \"ADDR_OK\";\n}}\n");
 
     // 4) Run ghostscope with -p and the script; in -p mode the default module is the main executable
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(&script, 2, pid).await?;
+    // Allow a bit more time for the shared library function to trigger
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(&script, 4, pid).await?;
     let _ = prog.kill().await;
 
     // 5) Validate output: should see the marker at least once
@@ -401,12 +402,74 @@ async fn test_trace_address_with_target_shared_library() -> anyhow::Result<()> {
         run_ghostscope_with_script_for_target(&script, 2, &lib_path).await?;
     let _ = prog.kill().await;
 
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    assert_eq!(
+        exit_code, 0,
+        "stderr={} stdout={} script={}",
+        stderr, stdout, script
+    );
     assert!(
         stdout.lines().any(|l| l.contains("LIB_ADDR_OK")),
-        "Expected LIB_ADDR_OK in output. STDOUT: {}",
-        stdout
+        "Expected LIB_ADDR_OK in output. STDOUT: {}, script {}",
+        stdout,
+        script
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_trace_module_qualified_address_in_pid_mode() -> anyhow::Result<()> {
+    // E2E: In PID mode, use module-qualified address 'module_suffix:0xADDR'
+    // and verify the compiler resolves the module by suffix and attaches.
+    init();
+
+    // Start the fixture program which loads libgvars.so
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Resolve a function address inside libgvars.so (e.g., lib_tick entry)
+    let lib_path = bin_dir.join("libgvars.so");
+    anyhow::ensure!(
+        lib_path.exists(),
+        "libgvars.so not found at {}",
+        lib_path.display()
+    );
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&lib_path)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to load DWARF for lib: {}", e))?;
+    let addrs = analyzer.lookup_function_addresses("lib_tick");
+    anyhow::ensure!(
+        !addrs.is_empty(),
+        "No addresses for lib_tick in libgvars.so"
+    );
+    let pc = addrs[0].address;
+
+    // Use module-qualified address with suffix to target the library
+    let script = format!("trace libgvars.so:0x{pc:x} {{\n    print \"LIB_MQUAL_OK\";\n}}\n");
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(&script, 2, pid).await?;
+    let _ = prog.kill().await;
+
+    assert_eq!(
+        exit_code, 0,
+        "stderr={} stdout={}, script={}",
+        stderr, stdout, script
+    );
+    assert!(
+        stdout.lines().any(|l| l.contains("LIB_MQUAL_OK")),
+        "Expected LIB_MQUAL_OK in output. STDOUT: {}, script: {}",
+        stdout,
+        script
+    );
+
     Ok(())
 }
 

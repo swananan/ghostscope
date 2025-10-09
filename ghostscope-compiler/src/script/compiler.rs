@@ -485,6 +485,92 @@ impl<'a> AstCompiler<'a> {
                     }
                 }
             }
+            TracePattern::AddressInModule { module, address } => {
+                // Resolve module path by exact or suffix match across loaded modules
+                let module_path = if let Some(analyzer) = &self.process_analyzer {
+                    let mut modules: Vec<String> = Vec::new();
+                    if let Some(main) = analyzer.get_main_executable() {
+                        modules.push(main.path);
+                    }
+                    for lib in analyzer.get_shared_library_info() {
+                        modules.push(lib.library_path);
+                    }
+
+                    // exact match
+                    if let Some(found) = modules.iter().find(|p| p.as_str() == module) {
+                        found.clone()
+                    } else {
+                        // suffix match
+                        let candidates: Vec<String> = modules
+                            .into_iter()
+                            .filter(|p| p.ends_with(module))
+                            .collect();
+                        match candidates.len() {
+                            0 => {
+                                return Err(CompileError::Other(format!(
+                                    "Module '{}' not found among loaded modules. Use full path or a unique suffix.",
+                                    module
+                                )));
+                            }
+                            1 => candidates[0].clone(),
+                            _ => {
+                                let mut sample = candidates.clone();
+                                sample.truncate(5);
+                                return Err(CompileError::Other(format!(
+                                    "Ambiguous module suffix '{}'. Candidates:\n  - {}\nPlease use a more specific suffix or full path.",
+                                    module,
+                                    sample.join("\n  - ")
+                                )));
+                            }
+                        }
+                    }
+                } else {
+                    return Err(CompileError::Other(
+                        "No process analyzer available to resolve module".to_string(),
+                    ));
+                };
+
+                // Convert DWARF PC (vaddr) to ELF file offset for uprobe
+                let file_off = self
+                    .process_analyzer
+                    .as_ref()
+                    .and_then(|an| an.vaddr_to_file_offset(&module_path, *address));
+
+                if file_off.is_none() {
+                    return Err(CompileError::Other(format!(
+                        "Address 0x{address:x} is not within a loadable segment of '{}' (cannot compute file offset)",
+                        module_path
+                    )));
+                }
+
+                let target_info = ResolvedTarget {
+                    function_name: None,
+                    function_address: Some(*address),
+                    binary_path: module_path,
+                    uprobe_offset: file_off,
+                    pattern: pattern.clone(),
+                };
+
+                match self.generate_ebpf_for_target(&target_info, statements, pid) {
+                    Ok(uprobe_config) => {
+                        self.uprobe_configs.push(uprobe_config);
+                        info!(
+                            "✓ Successfully generated eBPF for module-qualified address {}:0x{:x}",
+                            module, address
+                        );
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let error_msg = e.to_string();
+                        self.failed_targets.push(FailedTarget {
+                            target_name: format!("{}:0x{:x}", module, address),
+                            pc_address: *address,
+                            error_message: error_msg.clone(),
+                        });
+                        Err(CompileError::Other(error_msg))
+                    }
+                }
+            }
             TracePattern::FunctionName(func_name) => {
                 // Resolve all addresses for the function name and generate per-PC programs
                 let module_addresses = if let Some(analyzer) = &mut self.process_analyzer {
