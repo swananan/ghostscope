@@ -326,6 +326,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "cpp_demangle"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2bb79cb74d735044c972aae58ed0aaa9a837e85b01106a54c39e42e97f62253"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -689,6 +698,7 @@ name = "ghostscope-dwarf"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cpp_demangle",
  "crc32fast",
  "dirs",
  "futures",
@@ -699,6 +709,7 @@ dependencies = [
  "memmap2",
  "num_cpus",
  "object 0.36.7",
+ "rustc-demangle",
  "thiserror 2.0.12",
  "tokio",
  "tracing",

@@ -275,7 +275,7 @@ impl DwarfAnalyzer {
         let mut results = Vec::new();
 
         for (module_path, module_data) in &self.modules {
-            let addresses = module_data.lookup_function_addresses(name);
+            let addresses = module_data.lookup_function_addresses_any(name);
 
             // Create a ModuleAddress for each address found in this module
             for address in addresses {
@@ -358,11 +358,26 @@ impl DwarfAnalyzer {
     pub fn find_global_variables_by_name(&self, name: &str) -> Vec<(PathBuf, GlobalVariableInfo)> {
         let mut results = Vec::new();
         for (module_path, module_data) in &self.modules {
-            let vars = module_data.find_global_variables_by_name(name);
+            let vars = module_data.find_global_variables_by_name_any(name);
             for v in vars {
                 results.push((module_path.clone(), v));
             }
         }
+        if !results.is_empty() {
+            return results;
+        }
+
+        // Fallback: scan all globals in each module and match by exact or leaf name
+        for (module_path, module_data) in &self.modules {
+            let all = module_data.list_all_global_variables();
+            for v in all {
+                let leaf = v.name.rsplit("::").next().unwrap_or(&v.name).to_string();
+                if v.name == name || leaf == name {
+                    results.push((module_path.clone(), v));
+                }
+            }
+        }
+
         results
     }
 

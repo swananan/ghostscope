@@ -37,6 +37,9 @@ use std::{
     time::Instant,
 };
 
+// Clippy: factor complex HashMap<String, Vec<usize>> type into an alias
+type NameIndex = HashMap<String, Vec<usize>>;
+
 /// Complete DWARF data for a single module
 #[derive(Debug)]
 pub(crate) struct ModuleData {
@@ -62,6 +65,11 @@ pub(crate) struct ModuleData {
     block_index: crate::data::BlockIndex,
     /// Type name index for cross-CU completion
     type_name_index: crate::data::TypeNameIndex,
+    /// Demangled name maps for flexible lookups
+    demangled_function_map: HashMap<String, Vec<usize>>,
+    demangled_function_leaf_map: HashMap<String, Vec<usize>>,
+    demangled_variable_map: HashMap<String, Vec<usize>>,
+    demangled_variable_leaf_map: HashMap<String, Vec<usize>>,
 }
 
 impl ModuleData {
@@ -390,6 +398,14 @@ impl ModuleData {
             state_label
         );
 
+        // Build demangled name indices from the lightweight index
+        let (
+            demangled_function_map,
+            demangled_function_leaf_map,
+            demangled_variable_map,
+            demangled_variable_leaf_map,
+        ) = Self::build_demangled_maps(&parse_result.lightweight_index);
+
         Ok(Self {
             module_mapping: module_mapping.clone(),
             lightweight_index: parse_result.lightweight_index,
@@ -402,6 +418,10 @@ impl ModuleData {
             type_name_index,
             _dwarf_mapped_file: mapped_file,
             _binary_mapped_file: binary_mapped,
+            demangled_function_map,
+            demangled_function_leaf_map,
+            demangled_variable_map,
+            demangled_variable_leaf_map,
         })
     }
 
@@ -1371,6 +1391,343 @@ impl ModuleData {
         }
     }
 
+    /// Build demangled name maps from the lightweight index
+    fn build_demangled_maps(ix: &LightweightIndex) -> (NameIndex, NameIndex, NameIndex, NameIndex) {
+        let mut fn_full: NameIndex = HashMap::new();
+        let mut fn_leaf: NameIndex = HashMap::new();
+        let mut var_full: NameIndex = HashMap::new();
+        let mut var_leaf: NameIndex = HashMap::new();
+
+        // Normalize a demangled signature string by removing extra spaces
+        // e.g., "ns1::add(int, int)" -> "ns1::add(int,int)"
+        let normalize_sig = |s: &str| -> String {
+            let mut out = s.replace(", ", ",");
+            out = out.replace("( ", "(");
+            out = out.replace(" )", ")");
+            out = out.replace(" ,", ",");
+            out
+        };
+
+        let (_, _, total) = ix.get_stats();
+        for idx in 0..total {
+            if let Some(entry) = ix.entry(idx) {
+                let tag = entry.tag;
+                // Prefer demangled names when applicable
+                if let Some(d) = crate::core::demangle_by_lang(entry.language, &entry.name) {
+                    let leaf = crate::core::demangled_leaf(&d);
+                    let d_norm = normalize_sig(&d);
+                    let leaf_norm = normalize_sig(&leaf);
+                    match tag {
+                        gimli::constants::DW_TAG_subprogram
+                        | gimli::constants::DW_TAG_inlined_subroutine => {
+                            fn_full.entry(d.clone()).or_default().push(idx);
+                            if d_norm != d {
+                                fn_full.entry(d_norm).or_default().push(idx);
+                            }
+                            fn_leaf.entry(leaf.clone()).or_default().push(idx);
+                            if leaf_norm != leaf {
+                                fn_leaf.entry(leaf_norm).or_default().push(idx);
+                            }
+                        }
+                        gimli::constants::DW_TAG_variable => {
+                            var_full.entry(d.clone()).or_default().push(idx);
+                            if d_norm != d {
+                                var_full.entry(d_norm).or_default().push(idx);
+                            }
+                            var_leaf.entry(leaf.clone()).or_default().push(idx);
+                            if leaf_norm != leaf {
+                                var_leaf.entry(leaf_norm).or_default().push(idx);
+                            }
+                        }
+                        _ => {}
+                    }
+                } else {
+                    // Always index a leaf for non-demangled names too (last component or the whole name)
+                    let last = entry
+                        .name
+                        .rsplit("::")
+                        .next()
+                        .unwrap_or(&entry.name)
+                        .to_string();
+                    let last_norm = normalize_sig(&last);
+                    match tag {
+                        gimli::constants::DW_TAG_subprogram
+                        | gimli::constants::DW_TAG_inlined_subroutine => {
+                            fn_leaf.entry(last.clone()).or_default().push(idx);
+                            if last_norm != last {
+                                fn_leaf.entry(last_norm).or_default().push(idx);
+                            }
+                        }
+                        gimli::constants::DW_TAG_variable => {
+                            var_leaf.entry(last.clone()).or_default().push(idx);
+                            if last_norm != last {
+                                var_leaf.entry(last_norm).or_default().push(idx);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        (fn_full, fn_leaf, var_full, var_leaf)
+    }
+
+    /// Compute addresses for a function entry (inline vs real function with prologue-skip)
+    fn compute_addresses_for_entry(&self, entry: &crate::core::IndexEntry) -> Vec<u64> {
+        let mut out = Vec::new();
+        if entry.flags.is_inline {
+            let mut cand: Vec<u64> = entry.address_ranges.iter().map(|(s, _)| *s).collect();
+            if let Some(ep) = entry.entry_pc {
+                cand.push(ep);
+            }
+            cand.sort_unstable();
+            cand.dedup();
+            out.extend(cand);
+        } else {
+            for (start, _end) in &entry.address_ranges {
+                let exec = self.line_mapping.find_first_executable_address(*start);
+                out.push(exec);
+            }
+        }
+        out
+    }
+
+    /// Lookup function addresses by any of: DW_AT_name, linkage name, or demangled name
+    pub(crate) fn lookup_function_addresses_any(&self, name: &str) -> Vec<u64> {
+        // Fast path: direct name (includes DW_AT_name and linkage names if present)
+        let addrs = self.lookup_function_addresses(name);
+        if !addrs.is_empty() {
+            return addrs;
+        }
+
+        // Helper: normalize demangled signature spacing (e.g., "(int, int)" -> "(int,int)")
+        let normalize_sig = |s: &str| -> Option<String> {
+            if !s.contains('(') {
+                return None;
+            }
+            let mut out = s.replace(", ", ",");
+            out = out.replace("( ", "(");
+            out = out.replace(" )", ")");
+            out = out.replace(" ,", ",");
+            if out != s {
+                Some(out)
+            } else {
+                None
+            }
+        };
+
+        // Demangled full match
+        if let Some(indices) = self.demangled_function_map.get(name) {
+            let mut out = Vec::new();
+            for &idx in indices {
+                if let Some(entry) = self.lightweight_index.entry(idx) {
+                    out.extend(self.compute_addresses_for_entry(entry));
+                }
+            }
+            out.sort_unstable();
+            out.dedup();
+            if !out.is_empty() {
+                return out;
+            }
+        }
+        // Try normalized variant
+        if let Some(norm) = normalize_sig(name) {
+            if let Some(indices) = self.demangled_function_map.get(&norm) {
+                let mut out = Vec::new();
+                for &idx in indices {
+                    if let Some(entry) = self.lightweight_index.entry(idx) {
+                        out.extend(self.compute_addresses_for_entry(entry));
+                    }
+                }
+                out.sort_unstable();
+                out.dedup();
+                if !out.is_empty() {
+                    return out;
+                }
+            }
+        }
+
+        // Demangled leaf match
+        if let Some(indices) = self.demangled_function_leaf_map.get(name) {
+            let mut out = Vec::new();
+            for &idx in indices {
+                if let Some(entry) = self.lightweight_index.entry(idx) {
+                    out.extend(self.compute_addresses_for_entry(entry));
+                }
+            }
+            out.sort_unstable();
+            out.dedup();
+            if !out.is_empty() {
+                return out;
+            }
+        }
+        // Try normalized leaf variant
+        if let Some(norm) = normalize_sig(name) {
+            if let Some(indices) = self.demangled_function_leaf_map.get(&norm) {
+                let mut out = Vec::new();
+                for &idx in indices {
+                    if let Some(entry) = self.lightweight_index.entry(idx) {
+                        out.extend(self.compute_addresses_for_entry(entry));
+                    }
+                }
+                out.sort_unstable();
+                out.dedup();
+                if !out.is_empty() {
+                    return out;
+                }
+            }
+        }
+
+        // Fallback: suffix match on known function names with namespace separators
+        // e.g., match leaf "bar" to "ns::Foo::bar"
+        let mut out = Vec::new();
+        for key in self.lightweight_index.get_function_names() {
+            if key.rsplit("::").next().map(|s| s == name).unwrap_or(false) {
+                let entries = self.lightweight_index.find_dies_by_function_name(key);
+                for e in entries {
+                    out.extend(self.compute_addresses_for_entry(e));
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Find global/static variables by any name (DW_AT_name, linkage, or demangled)
+    pub(crate) fn find_global_variables_by_name_any(&self, name: &str) -> Vec<GlobalVariableInfo> {
+        let base = self.find_global_variables_by_name(name);
+        if !base.is_empty() {
+            return base;
+        }
+
+        // Build object file once for section classification
+        let obj = match object::File::parse(&self._binary_mapped_file.data[..]) {
+            Ok(f) => f,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut out = Vec::new();
+        // Try demangled full (preserve the demangled name that matched)
+        if let Some(indices) = self.demangled_variable_map.get(name) {
+            for &idx in indices {
+                if let Some(entry) = self.lightweight_index.entry(idx) {
+                    let link_address = entry.address_ranges.first().and_then(|(lo, hi)| {
+                        if lo == hi {
+                            Some(*lo)
+                        } else {
+                            None
+                        }
+                    });
+                    let section = link_address.and_then(|addr| self.classify_section(&obj, addr));
+                    out.push(GlobalVariableInfo {
+                        name: name.to_string(),
+                        link_address,
+                        section,
+                        die_offset: entry.die_offset,
+                        unit_offset: entry.unit_offset,
+                    });
+                }
+            }
+            if !out.is_empty() {
+                return out;
+            }
+        }
+
+        // Try demangled leaf (preserve the demangled name that matched)
+        if let Some(indices) = self.demangled_variable_leaf_map.get(name) {
+            for &idx in indices {
+                if let Some(entry) = self.lightweight_index.entry(idx) {
+                    let link_address = entry.address_ranges.first().and_then(|(lo, hi)| {
+                        if lo == hi {
+                            Some(*lo)
+                        } else {
+                            None
+                        }
+                    });
+                    let section = link_address.and_then(|addr| self.classify_section(&obj, addr));
+                    out.push(GlobalVariableInfo {
+                        name: name.to_string(),
+                        link_address,
+                        section,
+                        die_offset: entry.die_offset,
+                        unit_offset: entry.unit_offset,
+                    });
+                }
+            }
+        }
+
+        if !out.is_empty() {
+            return out;
+        }
+
+        // Fallback: suffix match on variable names with namespace separators
+        let mut extra = Vec::new();
+        for key in self.lightweight_index.get_variable_names() {
+            if key.rsplit("::").next().map(|s| s == name).unwrap_or(false) {
+                for e in self.lightweight_index.find_variables_by_name(key) {
+                    let link_address =
+                        e.address_ranges
+                            .first()
+                            .and_then(|(lo, hi)| if lo == hi { Some(*lo) } else { None });
+                    let section = link_address.and_then(|addr| self.classify_section(&obj, addr));
+                    extra.push(GlobalVariableInfo {
+                        // Preserve the requested (likely demangled/leaf) name for downstream comparisons
+                        name: name.to_string(),
+                        link_address,
+                        section,
+                        die_offset: e.die_offset,
+                        unit_offset: e.unit_offset,
+                    });
+                }
+            }
+        }
+
+        if !extra.is_empty() {
+            return extra;
+        }
+
+        // Final fallback: scan all entries to match by exact or leaf name
+        let mut scan = Vec::new();
+        let (_, _, total) = self.lightweight_index.get_stats();
+        for i in 0..total {
+            if let Some(e) = self.lightweight_index.entry(i) {
+                if e.tag != gimli::constants::DW_TAG_variable {
+                    continue;
+                }
+                let last = e.name.rsplit("::").next().unwrap_or(&e.name);
+                if last == name || e.name == name {
+                    let link_address =
+                        e.address_ranges
+                            .first()
+                            .and_then(|(lo, hi)| if lo == hi { Some(*lo) } else { None });
+                    let section = link_address.and_then(|addr| self.classify_section(&obj, addr));
+                    scan.push(GlobalVariableInfo {
+                        name: if last == name
+                            || self.demangled_variable_map.contains_key(name)
+                            || self.demangled_variable_leaf_map.contains_key(name)
+                        {
+                            name.to_string()
+                        } else {
+                            e.name.clone()
+                        },
+                        link_address,
+                        section,
+                        die_offset: e.die_offset,
+                        unit_offset: e.unit_offset,
+                    });
+                }
+            }
+        }
+
+        if !scan.is_empty() {
+            scan
+        } else {
+            out
+        }
+    }
+
     /// Helper: shallow resolve a type at (cu, die_off)
     fn detailed_shallow_type(
         &self,
@@ -1525,9 +1882,12 @@ impl ModuleData {
                 let name = sect.name().ok().unwrap_or("");
                 let stype = if name == ".text" || name.starts_with(".text.") {
                     SectionType::Text
-                } else if name == ".rodata" || name.starts_with(".rodata") {
+                } else if name == ".rodata"
+                    || name.starts_with(".rodata")
+                    || name.starts_with(".data.rel.ro")
+                {
                     SectionType::Rodata
-                } else if name == ".data" || name.starts_with(".data.") {
+                } else if name == ".data" || name.starts_with(".data") {
                     SectionType::Data
                 } else if name == ".bss" || name.starts_with(".bss.") {
                     SectionType::Bss

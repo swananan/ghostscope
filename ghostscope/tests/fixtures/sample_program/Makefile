@@ -1,6 +1,7 @@
 # Simple Makefile for sample program with multiple optimization levels
 CC = gcc
 BASE_CFLAGS = -Wall -Wextra -g
+OBJCOPY ?= objcopy
 
 # Default debug build (O0)
 CFLAGS = $(BASE_CFLAGS) -O0
@@ -18,9 +19,9 @@ sample_lib.o: sample_lib.c sample_lib.h
 # Build stripped binary with separate debug file (.gnu_debuglink)
 sample_program_stripped: sample_program.o sample_lib.o
 	$(CC) $(CFLAGS) -o sample_program_stripped sample_program.o sample_lib.o
-	objcopy --only-keep-debug sample_program_stripped sample_program_stripped.debug
-	objcopy --strip-debug sample_program_stripped
-	objcopy --add-gnu-debuglink=sample_program_stripped.debug sample_program_stripped
+	$(OBJCOPY) --only-keep-debug sample_program_stripped sample_program_stripped.debug
+	$(OBJCOPY) --strip-debug sample_program_stripped
+	$(OBJCOPY) --add-gnu-debuglink=sample_program_stripped.debug sample_program_stripped
 	@echo "Created stripped binary: sample_program_stripped"
 	@echo "Debug info in: sample_program_stripped.debug"
 	@readelf -x .gnu_debuglink sample_program_stripped 2>/dev/null || true
