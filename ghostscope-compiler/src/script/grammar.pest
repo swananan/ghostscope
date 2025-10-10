@@ -71,6 +71,7 @@ factor = {
     memcmp_call |
     strncmp_call |
     starts_with_call |
+    hex_call |
     bool |
     string |
     hex_int |
@@ -91,7 +92,8 @@ factor = {
 // Builtin function calls (phase 1)
 strncmp_call = { "strncmp" ~ "(" ~ expr ~ "," ~ string ~ "," ~ int ~ ")" }
 starts_with_call = { "starts_with" ~ "(" ~ expr ~ "," ~ string ~ ")" }
-memcmp_call = { "memcmp" ~ "(" ~ expr ~ "," ~ expr ~ "," ~ expr ~ ")" }
+memcmp_call = { "memcmp" ~ "(" ~ expr ~ "," ~ expr ~ ("," ~ expr)? ~ ")" }
+hex_call = { "hex" ~ "(" ~ string ~ ")" }
 
 special_var = @{ "$" ~ (ASCII_ALPHANUMERIC | "_")+ }
 

@@ -412,11 +412,15 @@ Supported built-ins (phase 1):
 - `memcmp(expr_a, expr_b, len)`
   - Boolean variant: returns `true` iff the first `len` bytes at `expr_a` and `expr_b` are identical.
   - Pointers: `expr_a` and `expr_b` accept DWARF pointer/array expressions or a raw address literal (decimal/hex `0x..`/octal `0o..`/binary `0b..`). For literal string comparisons, use `strncmp`/`starts_with` instead.
-  - `len` can be a script integer expression; supports decimal, hex (`0x..`), octal (`0o..`), and binary (`0b..`) literals. Negative values clamp to 0, and a configurable cap (`ebpf.compare_cap`, default 64) applies. The effective compare length is `min(max(len,0), CAP)`.
+  - Integer expressions semantics: any integer expression (that is not `hex("...")`) is treated as a user virtual address and read via `bpf_probe_read_user`. It is NOT interpreted as a byte pattern. To compare against raw bytes, use `hex("...")` below.
+  - `len` can be a script integer expression; supports decimal, hex (`0x..`), octal (`0o..`), and binary (`0b..`) literals. The engine clamps negative values to 0 at runtime; however, the parser rejects literal negative lengths.
   - No NUL-terminator semantics; compares raw bytes only.
   - Any read failure on either side evaluates to `false`.
   - If `len == 0`, the result is `true` and no user-memory read is performed (fast-path).
   - Implementation is verifier-friendly: reads are bounded and comparisons are accumulated without early exits.
+  - See also: Hex Literal Helper (`hex`) below.
+    - If either operand is `hex("...")`, you may omit `len`; the parser will infer `len` from the hex pattern size. If both operands are `hex(...)`, their sizes must match.
+    - When using a literal `len` with `hex("...")`, the parser validates that `len` is non-negative and does not exceed the hex pattern size.
 
 Verifier friendliness and performance:
 - Compiles to branch-light byte comparisons (e.g., XOR/OR accumulation) to avoid verifier state explosion.
@@ -455,6 +459,25 @@ trace globals_program.c:32 {
     if memcmp(&lib_pattern[0], &lib_pattern[0], n) { print "DYN_EQ"; }
 }
 ```
+```
+
+### Hex Literal Helper (`hex`)
+
+- Syntax: `hex("<HEX BYTES>")`
+  - `<HEX BYTES>` must contain only hex digits (`0-9a-fA-F`) and spaces as separators (tabs and other separators are not allowed); after removing spaces, the number of hex digits must be even.
+  - Parse-time validation: any non-hex, non-space character or odd number of hex digits causes a clear error. Additionally, with `memcmp(expr, hex(...), len_literal)`, the parser rejects `len_literal` larger than the hex pattern size, and rejects negative literal lengths.
+- Semantics: produces a byte sequence interpreted left-to-right (two hex digits per byte). No endianness is involved and no `0x` prefixes are allowed inside the string.
+- Scope: supported as an argument to `memcmp` to compare memory against raw bytes (e.g., headers, magic constants).
+- Examples:
+
+```ghostscope
+trace foo {
+    // Compare first 2 bytes with ASCII "PO"
+    if memcmp(buf, hex("50 4F"), 2) { print "HDR"; }
+
+    // Compare 4 bytes 0xDE 0xAD 0xBE 0xEF
+    if memcmp(ptr, hex("DE AD BE EF"), 4) { print "MAGIC"; }
+}
 ```
 
 ### Special Variables

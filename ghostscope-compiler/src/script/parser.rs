@@ -131,7 +131,10 @@ fn parse_statement(pair: Pair<Rule>) -> Result<Statement> {
         pair.as_rule(),
         pair.as_str().trim()
     );
-    let inner = pair.into_inner().next().unwrap();
+    let inner = pair
+        .into_inner()
+        .next()
+        .ok_or(ParseError::InvalidExpression)?;
     debug!(
         "parse_statement inner: {:?} = '{}'",
         inner.as_rule(),
@@ -141,7 +144,7 @@ fn parse_statement(pair: Pair<Rule>) -> Result<Statement> {
     match inner.as_rule() {
         Rule::trace_stmt => {
             let mut inner_pairs = inner.into_inner();
-            let pattern_pair = inner_pairs.next().unwrap();
+            let pattern_pair = inner_pairs.next().ok_or(ParseError::InvalidExpression)?;
             let pattern = parse_trace_pattern(pattern_pair)?;
 
             let mut body = Vec::new();
@@ -153,13 +156,19 @@ fn parse_statement(pair: Pair<Rule>) -> Result<Statement> {
             Ok(Statement::TracePoint { pattern, body })
         }
         Rule::print_stmt => {
-            let print_content = inner.into_inner().next().unwrap();
+            let print_content = inner
+                .into_inner()
+                .next()
+                .ok_or(ParseError::InvalidExpression)?;
             let print_stmt = parse_print_content(print_content)?;
             Ok(Statement::Print(print_stmt))
         }
         Rule::backtrace_stmt => Ok(Statement::Backtrace),
         Rule::expr_stmt => {
-            let expr = inner.into_inner().next().unwrap();
+            let expr = inner
+                .into_inner()
+                .next()
+                .ok_or(ParseError::InvalidExpression)?;
             let parsed_expr = parse_expr(expr)?;
 
             // Check expression type to ensure consistent operation types
@@ -171,8 +180,12 @@ fn parse_statement(pair: Pair<Rule>) -> Result<Statement> {
         }
         Rule::var_decl_stmt => {
             let mut inner_pairs = inner.into_inner();
-            let name = inner_pairs.next().unwrap().as_str().to_string();
-            let expr = inner_pairs.next().unwrap();
+            let name = inner_pairs
+                .next()
+                .ok_or(ParseError::InvalidExpression)?
+                .as_str()
+                .to_string();
+            let expr = inner_pairs.next().ok_or(ParseError::InvalidExpression)?;
             let parsed_expr = parse_expr(expr)?;
 
             // Check expression type to ensure consistent operation types
@@ -188,7 +201,7 @@ fn parse_statement(pair: Pair<Rule>) -> Result<Statement> {
         Rule::if_stmt => {
             debug!("Parsing if_stmt");
             let mut inner_pairs = inner.into_inner();
-            let condition_pair = inner_pairs.next().unwrap();
+            let condition_pair = inner_pairs.next().ok_or(ParseError::InvalidExpression)?;
             debug!(
                 "if_stmt condition_pair: {:?} = '{}'",
                 condition_pair.as_rule(),
@@ -431,13 +444,16 @@ fn parse_condition(pair: Pair<Rule>) -> Result<Expr> {
 }
 
 fn parse_else_clause(pair: Pair<Rule>) -> Result<Statement> {
-    let inner = pair.into_inner().next().unwrap();
+    let inner = pair
+        .into_inner()
+        .next()
+        .ok_or(ParseError::InvalidExpression)?;
     match inner.as_rule() {
         Rule::if_stmt => {
             // Directly parse if statement for else if
             debug!("Parsing else if statement");
             let mut inner_pairs = inner.into_inner();
-            let condition_pair = inner_pairs.next().unwrap();
+            let condition_pair = inner_pairs.next().ok_or(ParseError::InvalidExpression)?;
             debug!(
                 "else if condition_pair: {:?} = '{}'",
                 condition_pair.as_rule(),
@@ -497,7 +513,7 @@ fn parse_term(pair: Pair<Rule>) -> Result<Expr> {
     match pair.as_rule() {
         Rule::term => {
             let mut pairs = pair.into_inner();
-            let first = pairs.next().unwrap();
+            let first = pairs.next().ok_or(ParseError::InvalidExpression)?;
             let mut left = parse_unary(first)?;
 
             for chunk in chunks_of_two(pairs) {
@@ -577,38 +593,58 @@ fn parse_unary(pair: Pair<Rule>) -> Result<Expr> {
 fn parse_factor(pair: Pair<Rule>) -> Result<Expr> {
     match pair.as_rule() {
         Rule::factor => {
-            let inner = pair.into_inner().next().unwrap();
+            let inner = pair
+                .into_inner()
+                .next()
+                .ok_or(ParseError::InvalidExpression)?;
             match inner.as_rule() {
                 Rule::memcmp_call => parse_builtin_call(inner),
                 Rule::strncmp_call => parse_builtin_call(inner),
                 Rule::starts_with_call => parse_builtin_call(inner),
+                Rule::hex_call => parse_builtin_call(inner),
                 Rule::chain_access => parse_chain_access(inner),
                 Rule::pointer_deref => parse_pointer_deref(inner),
                 Rule::address_of => parse_address_of(inner),
-                Rule::int => {
-                    let value = inner.as_str().parse::<i64>().unwrap();
-                    Ok(Expr::Int(value))
-                }
+                Rule::int => match inner.as_str().parse::<i64>() {
+                    Ok(value) => Ok(Expr::Int(value)),
+                    Err(_) => Err(ParseError::TypeError(
+                        "invalid decimal integer literal".to_string(),
+                    )),
+                },
                 Rule::hex_int => {
                     // strip 0x and parse as hex
                     let s = inner.as_str();
-                    let v = i64::from_str_radix(&s[2..], 16).unwrap_or(0);
-                    Ok(Expr::Int(v))
+                    match i64::from_str_radix(&s[2..], 16) {
+                        Ok(v) => Ok(Expr::Int(v)),
+                        Err(_) => Err(ParseError::TypeError(
+                            "invalid hex integer literal".to_string(),
+                        )),
+                    }
                 }
                 Rule::oct_int => {
                     let s = inner.as_str();
-                    let v = i64::from_str_radix(&s[2..], 8).unwrap_or(0);
-                    Ok(Expr::Int(v))
+                    match i64::from_str_radix(&s[2..], 8) {
+                        Ok(v) => Ok(Expr::Int(v)),
+                        Err(_) => Err(ParseError::TypeError(
+                            "invalid octal integer literal".to_string(),
+                        )),
+                    }
                 }
                 Rule::bin_int => {
                     let s = inner.as_str();
-                    let v = i64::from_str_radix(&s[2..], 2).unwrap_or(0);
-                    Ok(Expr::Int(v))
+                    match i64::from_str_radix(&s[2..], 2) {
+                        Ok(v) => Ok(Expr::Int(v)),
+                        Err(_) => Err(ParseError::TypeError(
+                            "invalid binary integer literal".to_string(),
+                        )),
+                    }
                 }
-                Rule::float => {
-                    let value = inner.as_str().parse::<f64>().unwrap();
-                    Ok(Expr::Float(value))
-                }
+                Rule::float => match inner.as_str().parse::<f64>() {
+                    Ok(value) => Ok(Expr::Float(value)),
+                    Err(_) => Err(ParseError::TypeError(
+                        "invalid floating literal".to_string(),
+                    )),
+                },
                 Rule::string => {
                     // Remove quotes at the beginning and end
                     let raw_value = inner.as_str();
@@ -638,19 +674,99 @@ fn parse_factor(pair: Pair<Rule>) -> Result<Expr> {
 }
 
 fn parse_builtin_call(pair: Pair<Rule>) -> Result<Expr> {
-    // pair is memcmp_call / strncmp_call / starts_with_call
+    // pair is memcmp_call / strncmp_call / starts_with_call / hex_call
     let rule = pair.as_rule();
     let mut it = pair.into_inner();
     // First token inside is the function name as identifier within the rule text; easier approach: use rule to select
     match rule {
         Rule::memcmp_call => {
-            // grammar: memcmp "(" expr "," expr "," expr ")"
-            let a_node = it.next().ok_or(ParseError::InvalidExpression)?; // expr
-            let a_expr = parse_expr(a_node)?;
-            let b_node = it.next().ok_or(ParseError::InvalidExpression)?; // expr
-            let b_expr = parse_expr(b_node)?;
-            let n_node = it.next().ok_or(ParseError::InvalidExpression)?;
-            let n_expr = parse_expr(n_node)?;
+            // grammar: memcmp("(" expr "," expr ["," expr] ")")
+            let mut nodes: Vec<_> = it.collect();
+            if nodes.len() < 2 || nodes.len() > 3 {
+                return Err(ParseError::InvalidExpression);
+            }
+            let a_expr = parse_expr(nodes.remove(0))?;
+            let b_expr = parse_expr(nodes.remove(0))?;
+
+            // Helper to get hex length (bytes)
+            let hex_len = |e: &Expr| -> Option<usize> {
+                if let Expr::BuiltinCall { name, args } = e {
+                    if name == "hex" {
+                        if let Some(Expr::String(s)) = args.first() {
+                            return Some(s.len() / 2);
+                        }
+                    }
+                }
+                None
+            };
+
+            let n_expr = if let Some(n_node) = nodes.first() {
+                // With explicit len: reuse previous literal checks
+                let n_expr = parse_expr(n_node.clone())?;
+                let literal_len_opt: Option<isize> = match &n_expr {
+                    Expr::Int(n) => Some(*n as isize),
+                    Expr::BinaryOp {
+                        left,
+                        op: BinaryOp::Subtract,
+                        right,
+                    } => {
+                        if matches!(left.as_ref(), Expr::Int(0)) {
+                            if let Expr::Int(k) = right.as_ref() {
+                                Some(-(*k as isize))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(n) = literal_len_opt {
+                    if n < 0 {
+                        return Err(ParseError::TypeError(
+                            "memcmp length must be non-negative".to_string(),
+                        ));
+                    }
+                    let l = n as usize;
+                    if let Some(la) = hex_len(&a_expr) {
+                        if l > la {
+                            return Err(ParseError::TypeError(format!(
+                                "memcmp length ({l}) exceeds hex pattern size on left side ({la} bytes)"
+                            )));
+                        }
+                    }
+                    if let Some(lb) = hex_len(&b_expr) {
+                        if l > lb {
+                            return Err(ParseError::TypeError(format!(
+                                "memcmp length ({l}) exceeds hex pattern size on right side ({lb} bytes)"
+                            )));
+                        }
+                    }
+                }
+                n_expr
+            } else {
+                // No len provided: allow only when at least one side is hex(...)
+                let la = hex_len(&a_expr);
+                let lb = hex_len(&b_expr);
+                match (la, lb) {
+                    (Some(l), None) | (None, Some(l)) => Expr::Int(l as i64),
+                    (Some(la), Some(lb)) => {
+                        if la != lb {
+                            return Err(ParseError::TypeError(
+                                "memcmp hex operands have different sizes; provide explicit len"
+                                    .to_string(),
+                            ));
+                        }
+                        Expr::Int(la as i64)
+                    }
+                    _ => {
+                        return Err(ParseError::TypeError(
+                            "memcmp without len requires at least one hex(...) operand".to_string(),
+                        ))
+                    }
+                }
+            };
 
             Ok(Expr::BuiltinCall {
                 name: "memcmp".to_string(),
@@ -703,18 +819,60 @@ fn parse_builtin_call(pair: Pair<Rule>) -> Result<Expr> {
                 args: vec![arg0, Expr::String(lit)],
             })
         }
+        Rule::hex_call => {
+            // grammar: hex("HEX...")
+            // Validate at parse time: allow only hex digits with optional whitespace separators.
+            let lit_node = it.next().ok_or(ParseError::InvalidExpression)?;
+            if lit_node.as_rule() != Rule::string {
+                return Err(ParseError::TypeError(
+                    "hex expects a string literal".to_string(),
+                ));
+            }
+            let raw = lit_node.as_str();
+            let inner = &raw[1..raw.len() - 1];
+            let mut sanitized = String::with_capacity(inner.len());
+            for ch in inner.chars() {
+                if ch.is_ascii_hexdigit() {
+                    sanitized.push(ch);
+                } else if ch == ' ' {
+                    // allow spaces as separators (tabs not allowed)
+                    continue;
+                } else {
+                    return Err(ParseError::TypeError(format!(
+                        "hex literal contains non-hex character: '{ch}'"
+                    )));
+                }
+            }
+            if sanitized.len() % 2 == 1 {
+                return Err(ParseError::TypeError(
+                    "hex literal must contain an even number of hex digits".to_string(),
+                ));
+            }
+            Ok(Expr::BuiltinCall {
+                name: "hex".to_string(),
+                // Store sanitized hex-only string; codegen will convert to bytes
+                args: vec![Expr::String(sanitized)],
+            })
+        }
         _ => Err(ParseError::UnexpectedToken(rule)),
     }
 }
 
 fn parse_trace_pattern(pair: Pair<Rule>) -> Result<TracePattern> {
-    let inner = pair.into_inner().next().unwrap();
+    let inner = pair
+        .into_inner()
+        .next()
+        .ok_or(ParseError::InvalidExpression)?;
 
     match inner.as_rule() {
         Rule::module_hex_address => {
             let mut parts = inner.into_inner();
-            let module = parts.next().unwrap().as_str().to_string();
-            let hex = parts.next().unwrap().as_str();
+            let module = parts
+                .next()
+                .ok_or(ParseError::InvalidExpression)?
+                .as_str()
+                .to_string();
+            let hex = parts.next().ok_or(ParseError::InvalidExpression)?.as_str();
             let addr =
                 u64::from_str_radix(&hex[2..], 16).map_err(|_| ParseError::InvalidExpression)?;
             Ok(TracePattern::AddressInModule {
@@ -735,15 +893,23 @@ fn parse_trace_pattern(pair: Pair<Rule>) -> Result<TracePattern> {
             Ok(TracePattern::Wildcard(pattern))
         }
         Rule::function_name => {
-            let func_name = inner.into_inner().next().unwrap().as_str().to_string();
+            let func_name = inner
+                .into_inner()
+                .next()
+                .ok_or(ParseError::InvalidExpression)?
+                .as_str()
+                .to_string();
             Ok(TracePattern::FunctionName(func_name))
         }
         Rule::source_line => {
             let mut parts = inner.into_inner();
-            let file_path = parts.next().unwrap().as_str().to_string();
-            let line_number = parts
+            let file_path = parts
                 .next()
-                .unwrap()
+                .ok_or(ParseError::InvalidExpression)?
+                .as_str()
+                .to_string();
+            let line_pair = parts.next().ok_or(ParseError::InvalidExpression)?;
+            let line_number = line_pair
                 .as_str()
                 .parse::<u32>()
                 .map_err(|_| ParseError::InvalidExpression)?;
@@ -791,7 +957,7 @@ fn parse_print_content(pair: Pair<Rule>) -> Result<PrintStatement> {
         let fmt_pair = flat.remove(fmt_idx);
         info!("parse_print_content: branch=format_expr");
         let mut inner_pairs = fmt_pair.into_inner();
-        let format_string = inner_pairs.next().unwrap();
+        let format_string = inner_pairs.next().ok_or(ParseError::InvalidExpression)?;
         let format_content = &format_string.as_str()[1..format_string.as_str().len() - 1];
         let mut args = Vec::new();
         for arg_pair in inner_pairs {
@@ -857,7 +1023,10 @@ fn parse_complex_variable(pair: Pair<Rule>) -> Result<Expr> {
         pair.as_str().trim()
     );
 
-    let inner = pair.into_inner().next().unwrap();
+    let inner = pair
+        .into_inner()
+        .next()
+        .ok_or(ParseError::InvalidExpression)?;
     match inner.as_rule() {
         Rule::chain_access => parse_chain_access(inner),
         Rule::array_access => parse_array_access(inner),
@@ -912,8 +1081,8 @@ fn parse_chain_access(pair: Pair<Rule>) -> Result<Expr> {
 // Parse array access: arr[index]
 fn parse_array_access(pair: Pair<Rule>) -> Result<Expr> {
     let mut inner_pairs = pair.into_inner();
-    let array_name = inner_pairs.next().unwrap();
-    let index_expr = inner_pairs.next().unwrap();
+    let array_name = inner_pairs.next().ok_or(ParseError::InvalidExpression)?;
+    let index_expr = inner_pairs.next().ok_or(ParseError::InvalidExpression)?;
 
     let _array_expr = Box::new(Expr::Variable(array_name.as_str().to_string()));
     let parsed_index = parse_expr(index_expr)?;
@@ -944,7 +1113,11 @@ fn parse_array_access(pair: Pair<Rule>) -> Result<Expr> {
 // Parse member access: person.name
 fn parse_member_access(pair: Pair<Rule>) -> Result<Expr> {
     let mut parts = pair.into_inner();
-    let base = parts.next().unwrap().as_str().to_string();
+    let base = parts
+        .next()
+        .ok_or(ParseError::InvalidExpression)?
+        .as_str()
+        .to_string();
 
     // Collect all subsequent identifiers after the base
     let mut tail: Vec<String> = Vec::new();
@@ -1079,6 +1252,17 @@ trace foo {
     }
 
     #[test]
+    fn parse_memcmp_hex_builtin() {
+        let script = r#"
+trace foo {
+    if memcmp(&buf[0], hex("504F"), 2) { print "OK"; }
+}
+"#;
+        let r = parse(script);
+        assert!(r.is_ok(), "parse failed: {:?}", r.err());
+    }
+
+    #[test]
     fn parse_memcmp_with_numeric_pointers_and_len_bases() {
         let script = r#"
 trace foo {
@@ -1089,6 +1273,184 @@ trace foo {
 "#;
         let r = parse(script);
         assert!(r.is_ok(), "parse failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn parse_hex_with_non_hex_char_should_fail() {
+        let script = r#"
+trace foo {
+    if memcmp(&buf[0], hex("G0"), 1) { print "X"; }
+}
+"#;
+        let r = parse(script);
+        match r {
+            Ok(_) => panic!("expected parse error for non-hex char"),
+            Err(ParseError::TypeError(msg)) => {
+                assert!(
+                    msg.contains("hex literal contains non-hex character"),
+                    "unexpected msg: {msg}"
+                );
+            }
+            Err(e) => panic!("unexpected error variant: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_hex_with_odd_digits_should_fail() {
+        let script = r#"
+trace foo {
+    if memcmp(&buf[0], hex("123"), 1) { print "X"; }
+}
+"#;
+        let r = parse(script);
+        match r {
+            Ok(_) => panic!("expected parse error for odd-length hex"),
+            Err(ParseError::TypeError(msg)) => {
+                assert!(
+                    msg.contains("even number of hex digits"),
+                    "unexpected msg: {msg}"
+                );
+            }
+            Err(e) => panic!("unexpected error variant: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_hex_with_spaces_should_succeed() {
+        let script = r#"
+trace foo {
+    if memcmp(&buf[0], hex("4c 49 42 5f"), 4) { print "OK"; }
+}
+"#;
+        let r = parse(script);
+        assert!(r.is_ok(), "parse failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn parse_memcmp_hex_len_exceeds_left_should_fail() {
+        // hex has 2 bytes, len=3 should error on left side
+        let script = r#"
+trace foo {
+    if memcmp(hex("504f"), &buf[0], 3) { print "X"; }
+}
+"#;
+        let r = parse(script);
+        match r {
+            Ok(_) => panic!("expected parse error for len > hex(left) size"),
+            Err(ParseError::TypeError(msg)) => {
+                assert!(
+                    msg.contains("exceeds hex pattern size on left side"),
+                    "unexpected msg: {msg}"
+                );
+            }
+            Err(e) => panic!("unexpected error variant: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_memcmp_hex_len_exceeds_right_should_fail() {
+        // hex has 2 bytes, len=5 should error on right side
+        let script = r#"
+trace foo {
+    if memcmp(&buf[0], hex("50 4f"), 5) { print "X"; }
+}
+"#;
+        let r = parse(script);
+        match r {
+            Ok(_) => panic!("expected parse error for len > hex(right) size"),
+            Err(ParseError::TypeError(msg)) => {
+                assert!(
+                    msg.contains("exceeds hex pattern size on right side"),
+                    "unexpected msg: {msg}"
+                );
+            }
+            Err(e) => panic!("unexpected error variant: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_memcmp_hex_negative_len_should_fail() {
+        let script = r#"
+trace foo {
+    if memcmp(&buf[0], hex("50 4f"), -1) { print "X"; }
+}
+"#;
+        let r = parse(script);
+        match r {
+            Ok(_) => panic!("expected parse error for negative len"),
+            Err(ParseError::TypeError(msg)) => {
+                assert!(
+                    msg.contains("length must be non-negative"),
+                    "unexpected msg: {msg}"
+                );
+            }
+            Err(e) => panic!("unexpected error variant: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_memcmp_hex_len_equal_should_succeed() {
+        // hex has 4 bytes, len=4 OK
+        let script = r#"
+trace foo {
+    if memcmp(&buf[0], hex("de ad be ef"), 4) { print "OK"; }
+}
+"#;
+        let r = parse(script);
+        assert!(r.is_ok(), "parse failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn parse_memcmp_hex_infers_len_left_should_succeed() {
+        let script = r#"
+trace foo {
+    if memcmp(hex("50 4f"), &buf[0]) { print "OK"; }
+}
+"#;
+        let r = parse(script);
+        assert!(r.is_ok(), "parse failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn parse_memcmp_hex_infers_len_right_should_succeed() {
+        let script = r#"
+trace foo {
+    if memcmp(&buf[0], hex("de ad be ef")) { print "OK"; }
+}
+"#;
+        let r = parse(script);
+        assert!(r.is_ok(), "parse failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn parse_memcmp_missing_len_without_hex_should_fail() {
+        let script = r#"
+trace foo {
+    if memcmp(&buf[0], &buf[1]) { print "OK"; }
+}
+"#;
+        let r = parse(script);
+        assert!(
+            r.is_err(),
+            "expected parse error for missing len without hex"
+        );
+    }
+
+    #[test]
+    fn parse_memcmp_both_hex_mismatch_should_fail() {
+        let script = r#"
+trace foo {
+    if memcmp(hex("50"), hex("504f")) { print "OK"; }
+}
+"#;
+        let r = parse(script);
+        match r {
+            Ok(_) => panic!("expected parse error for mismatched hex sizes"),
+            Err(ParseError::TypeError(msg)) => {
+                assert!(msg.contains("different sizes"), "unexpected msg: {msg}");
+            }
+            Err(e) => panic!("unexpected error variant: {e:?}"),
+        }
     }
 
     #[test]
