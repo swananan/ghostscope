@@ -76,6 +76,37 @@ export LLVM_SYS_181_PREFIX=/usr/lib/llvm-18
 cargo build --release
 ```
 
+### Docker 构建（推荐用于 Release）
+
+在 Ubuntu 20.04 容器中构建，获得最大兼容性（glibc 2.31）：
+
+```bash
+# 一键构建（如需要会自动创建 Docker 镜像）
+./docker-build.sh
+
+# 输出：./target/release/ghostscope
+```
+
+**优势：**
+- 使用 glibc 2.31 构建（兼容 Ubuntu 20.04+、Debian 11+、RHEL 8+）
+- 隔离环境，不影响系统
+- 在不同开发机器上可复现构建
+
+**其他 Docker 命令：**
+
+```bash
+# 构建 debug 版本
+docker run --rm -v $(pwd):/workspace -w /workspace \
+    ghostscope-builder:ubuntu20.04 cargo build
+
+# 进入容器交互式环境
+docker run -it --rm -v $(pwd):/workspace -w /workspace \
+    ghostscope-builder:ubuntu20.04 bash
+
+# 重新构建 Docker 镜像（仅在 Dockerfile 修改后需要）
+docker build -t ghostscope-builder:ubuntu20.04 .
+```
+
 **注意**：开发过程中默认使用 debug 构建，以获得更快的迭代速度和更好的调试体验。
 
 ## 测试

@@ -1,0 +1,29 @@
+# Build artifacts
+target/
+*.log
+gs_*
+ghostscope.log
+
+# Git
+.git/
+.gitignore
+
+# Environment
+.env
+
+# Documentation (not needed for build)
+docs/
+*.md
+!CLAUDE.md
+
+# CI/CD (not needed for build)
+.github/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test files
+test_*
