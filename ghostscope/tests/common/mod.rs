@@ -1,5 +1,9 @@
-#![allow(clippy::uninlined_format_args)]
-#![allow(dead_code)]
+// Clippy: allow some lints in test utilities
+#![allow(
+    clippy::uninlined_format_args,
+    clippy::needless_borrows_for_generic_args,
+    dead_code
+)]
 
 //! Common test utilities shared across integration tests
 
@@ -83,13 +87,10 @@ static COMPILE_STRIPPED: Once = Once::new();
 /// Optimization level for test program compilation
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OptimizationLevel {
-    Debug, // -O0 (default)
-    #[allow(dead_code)]
-    O1, // -O1
-    O2,    // -O2
-    #[allow(dead_code)]
-    O3, // -O3
-    #[allow(dead_code)]
+    Debug,    // -O0 (default)
+    O1,       // -O1
+    O2,       // -O2
+    O3,       // -O3
     Stripped, // -O0 with separate debug file (.gnu_debuglink)
 }
 

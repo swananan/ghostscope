@@ -323,10 +323,10 @@ pub async fn handle_info_address(
         let t = s.trim();
         if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
             u64::from_str_radix(hex, 16)
-                .map_err(|_| format!("Invalid hex address '{}': must be 0x..", s))
+                .map_err(|_| format!("Invalid hex address '{s}': must be 0x.."))
         } else {
             t.parse::<u64>()
-                .map_err(|_| format!("Invalid address '{}': use 0x.. or decimal", s))
+                .map_err(|_| format!("Invalid address '{s}': use 0x.. or decimal"))
         }
     }
 
@@ -356,8 +356,7 @@ pub async fn handle_info_address(
                 modules.into_iter().filter(|p| p.ends_with(spec)).collect();
             match candidates.len() {
                 0 => Err(format!(
-                    "Module '{}' not found among loaded modules. Use full path or a unique suffix.",
-                    spec
+                    "Module '{spec}' not found among loaded modules. Use full path or a unique suffix."
                 )),
                 1 => Ok(candidates[0].clone()),
                 _ => {
@@ -495,15 +494,12 @@ fn try_get_line_debug_info(
     use std::path::PathBuf;
 
     // Parse original input once
-    let (orig_file, line_part) = target.rsplit_once(':').ok_or_else(|| {
-        format!(
-            "Invalid target format '{}'. Expected format: file:line",
-            target
-        )
-    })?;
+    let (orig_file, line_part) = target
+        .rsplit_once(':')
+        .ok_or_else(|| format!("Invalid target format '{target}'. Expected format: file:line"))?;
     let line_number = line_part
         .parse::<u32>()
-        .map_err(|_| format!("Invalid line number '{}' in target '{}'", line_part, target))?;
+        .map_err(|_| format!("Invalid line number '{line_part}' in target '{target}'"))?;
 
     // Build candidate DWARF file paths in priority order
     let mut candidates: Vec<String> = Vec::new();
@@ -689,8 +685,7 @@ fn handle_function_target(
 
     if module_addresses.is_empty() {
         return Err(format!(
-            "Function '{}' not found in any loaded module",
-            function_name
+            "Function '{function_name}' not found in any loaded module"
         ));
     }
 
@@ -705,7 +700,7 @@ fn handle_function_target(
     );
 
     // Process modules and extract variable information
-    let target_description = format!("function '{}'", function_name);
+    let target_description = format!("function '{function_name}'");
     let (mut modules, first_module_address) = process_module_addresses_for_variables(
         process_analyzer,
         &module_addresses,
@@ -747,23 +742,21 @@ fn handle_source_location_target(
     let parts: Vec<&str> = target.split(':').collect();
     if parts.len() != 2 {
         return Err(format!(
-            "Invalid target format '{}'. Expected format: file:line",
-            target
+            "Invalid target format '{target}'. Expected format: file:line"
         ));
     }
 
     let file_path = parts[0];
     let line_number = parts[1]
         .parse::<u32>()
-        .map_err(|_| format!("Invalid line number '{}' in target '{}'", parts[1], target))?;
+        .map_err(|_| format!("Invalid line number '{}' in target '{target}'", parts[1]))?;
 
     // Resolve source line to all addresses across all modules
     let module_addresses = process_analyzer.lookup_addresses_by_source_line(file_path, line_number);
 
     if module_addresses.is_empty() {
         return Err(format!(
-            "Cannot resolve any address for {}:{}",
-            file_path, line_number
+            "Cannot resolve any address for {file_path}:{line_number}"
         ));
     }
 
@@ -779,7 +772,7 @@ fn handle_source_location_target(
     );
 
     // Process modules and extract variable information
-    let target_description = format!("source line '{}:{}'", file_path, line_number);
+    let target_description = format!("source line '{file_path}:{line_number}'");
     let (modules, first_module_address) = process_module_addresses_for_variables(
         process_analyzer,
         &module_addresses,

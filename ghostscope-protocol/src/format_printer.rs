@@ -40,8 +40,8 @@ impl FormatPrinter {
         Self::apply_format_with_specs(format_string, complex_variables, trace_context)
     }
 
-    #[allow(dead_code)]
     /// Simple placeholder applier for tests that don't use complex variables
+    #[cfg(test)]
     fn apply_format_strings(format_string: &str, formatted_values: &[String]) -> String {
         let mut result = String::new();
         let mut chars = format_string.chars().peekable();
@@ -935,9 +935,7 @@ impl FormatPrinter {
             TypeInfo::UnknownType { name } => {
                 format!("<UNKNOWN_TYPE_{name}_{}_BYTES>", data.len())
             }
-            TypeInfo::OptimizedOut { name } => {
-                format!("<OPTIMIZED_OUT_{name}>")
-            }
+            TypeInfo::OptimizedOut { .. } => "<optimized out>".to_string(),
         }
     }
 

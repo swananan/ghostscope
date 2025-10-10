@@ -27,7 +27,7 @@ impl<'ctx> EbpfContext<'ctx> {
         inkwell::values::PointerValue<'ctx>,
     ) {
         let array_ty = self.context.i8_type().array_type(size);
-        let name = format!("{}_{}", name_prefix, size);
+        let name = format!("{name_prefix}_{size}");
         let global_ptr = match self.module.get_global(&name) {
             Some(g) => g.as_pointer_value(),
             None => {
@@ -486,8 +486,7 @@ impl<'ctx> EbpfContext<'ctx> {
             Ok(reg_value)
         } else {
             Err(CodeGenError::RegisterMappingError(format!(
-                "Failed to load register {} as integer",
-                reg_num
+                "Failed to load register {reg_num} as integer"
             )))
         }
     }
@@ -622,8 +621,7 @@ impl<'ctx> EbpfContext<'ctx> {
         let byte_offset = register_mapping::dwarf_reg_to_pt_regs_byte_offset(dwarf_reg)
             .ok_or_else(|| {
                 CodeGenError::RegisterMappingError(format!(
-                    "Unsupported DWARF register: {}",
-                    dwarf_reg
+                    "Unsupported DWARF register: {dwarf_reg}"
                 ))
             })?;
 

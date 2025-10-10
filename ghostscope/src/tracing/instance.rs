@@ -17,30 +17,31 @@ pub struct TraceInstance {
     pub ebpf_function_name: String, // eBPF function name for uprobe attachment
 }
 
+pub struct TraceInstanceArgs {
+    pub trace_id: u32,
+    pub target: String,
+    pub script_content: String,
+    pub pc: u64,
+    pub binary_path: String,
+    pub target_display: String,
+    pub target_pid: Option<u32>,
+    pub loader: Option<ghostscope_loader::GhostScopeLoader>,
+    pub ebpf_function_name: String,
+}
+
 impl TraceInstance {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        trace_id: u32,
-        target: String,
-        script_content: String,
-        pc: u64,
-        binary_path: String,
-        target_display: String,
-        target_pid: Option<u32>,
-        loader: Option<GhostScopeLoader>,
-        ebpf_function_name: String,
-    ) -> Self {
+    pub fn new(args: TraceInstanceArgs) -> Self {
         Self {
-            trace_id,
-            target,
-            script_content,
-            pc,
-            binary_path,
-            target_display,
-            target_pid,
+            trace_id: args.trace_id,
+            target: args.target,
+            script_content: args.script_content,
+            pc: args.pc,
+            binary_path: args.binary_path,
+            target_display: args.target_display,
+            target_pid: args.target_pid,
             is_enabled: false,
-            loader,
-            ebpf_function_name,
+            loader: args.loader,
+            ebpf_function_name: args.ebpf_function_name,
         }
     }
 

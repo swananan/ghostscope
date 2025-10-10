@@ -184,7 +184,7 @@ pub fn infer_type(expr: &Expr) -> Result<VarType, String> {
         Expr::SpecialVar(_) => Ok(VarType::Int),  // Special variables like $arg0, $retval etc.
         Expr::BuiltinCall { name, args: _ } => match name.as_str() {
             "strncmp" | "starts_with" | "memcmp" => Ok(VarType::Bool),
-            _ => Err(format!("Unknown builtin function: {}", name)),
+            _ => Err(format!("Unknown builtin function: {name}")),
         },
         Expr::BinaryOp { left, op, right } => {
             // Only check types when both sides are literals
@@ -203,8 +203,7 @@ pub fn infer_type(expr: &Expr) -> Result<VarType, String> {
 
                 if left_type != right_type {
                     return Err(format!(
-                        "Type mismatch: Cannot perform operation between {:?} and {:?}",
-                        left_type, right_type
+                        "Type mismatch: Cannot perform operation between {left_type:?} and {right_type:?}"
                     ));
                 }
 

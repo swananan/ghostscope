@@ -70,7 +70,7 @@ impl<'ctx> EbpfContext<'ctx> {
                 let offset_val = self
                     .builder
                     .build_load(self.context.i32_type(), offset_ptr, "offset")
-                    .map_err(|e| CodeGenError::LLVMError(format!("Failed to load offset: {}", e)))?
+                    .map_err(|e| CodeGenError::LLVMError(format!("Failed to load offset: {e}")))?
                     .into_int_value();
 
                 let buffer_size = self
@@ -93,7 +93,7 @@ impl<'ctx> EbpfContext<'ctx> {
                         "offset_in_bounds",
                     )
                     .map_err(|e| {
-                        CodeGenError::LLVMError(format!("Failed to compare offset: {}", e))
+                        CodeGenError::LLVMError(format!("Failed to compare offset: {e}"))
                     })?;
 
                 let overflow_block = self
@@ -106,7 +106,7 @@ impl<'ctx> EbpfContext<'ctx> {
                 self.builder
                     .build_conditional_branch(offset_in_bounds, check_write_block, overflow_block)
                     .map_err(|e| {
-                        CodeGenError::LLVMError(format!("Failed to build first branch: {}", e))
+                        CodeGenError::LLVMError(format!("Failed to build first branch: {e}"))
                     })?;
 
                 // Check 2: Ensure offset + size doesn't exceed buffer
@@ -116,7 +116,7 @@ impl<'ctx> EbpfContext<'ctx> {
                 let new_offset_val = self
                     .builder
                     .build_int_add(offset_val, size_i32, "new_offset")
-                    .map_err(|e| CodeGenError::LLVMError(format!("Failed to add size: {}", e)))?;
+                    .map_err(|e| CodeGenError::LLVMError(format!("Failed to add size: {e}")))?;
 
                 let write_fits = self
                     .builder
@@ -127,7 +127,7 @@ impl<'ctx> EbpfContext<'ctx> {
                         "write_fits",
                     )
                     .map_err(|e| {
-                        CodeGenError::LLVMError(format!("Failed to compare write size: {}", e))
+                        CodeGenError::LLVMError(format!("Failed to compare write size: {e}"))
                     })?;
 
                 let continue_block = self
@@ -137,7 +137,7 @@ impl<'ctx> EbpfContext<'ctx> {
                 self.builder
                     .build_conditional_branch(write_fits, continue_block, overflow_block)
                     .map_err(|e| {
-                        CodeGenError::LLVMError(format!("Failed to build second branch: {}", e))
+                        CodeGenError::LLVMError(format!("Failed to build second branch: {e}"))
                     })?;
 
                 // Overflow block: Reset offset to 0 and return early
@@ -145,14 +145,10 @@ impl<'ctx> EbpfContext<'ctx> {
                 self.builder.position_at_end(overflow_block);
                 self.builder
                     .build_store(offset_ptr, self.context.i32_type().const_zero())
-                    .map_err(|e| {
-                        CodeGenError::LLVMError(format!("Failed to reset offset: {}", e))
-                    })?;
+                    .map_err(|e| CodeGenError::LLVMError(format!("Failed to reset offset: {e}")))?;
                 self.builder
                     .build_return(Some(&self.context.i32_type().const_zero()))
-                    .map_err(|e| {
-                        CodeGenError::LLVMError(format!("Failed to build return: {}", e))
-                    })?;
+                    .map_err(|e| CodeGenError::LLVMError(format!("Failed to build return: {e}")))?;
 
                 // Continue block: Both checks passed, safe to write
                 self.builder.position_at_end(continue_block);
@@ -163,7 +159,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     .builder
                     .build_int_z_extend(offset_val, self.context.i64_type(), "offset_i64")
                     .map_err(|e| {
-                        CodeGenError::LLVMError(format!("Failed to extend offset: {}", e))
+                        CodeGenError::LLVMError(format!("Failed to extend offset: {e}"))
                     })?;
 
                 // Use GEP with i64 to avoid sign extension
@@ -176,7 +172,7 @@ impl<'ctx> EbpfContext<'ctx> {
                             "dest_ptr",
                         )
                         .map_err(|e| {
-                            CodeGenError::LLVMError(format!("Failed to get dest GEP: {}", e))
+                            CodeGenError::LLVMError(format!("Failed to get dest GEP: {e}"))
                         })?
                 };
 
@@ -189,15 +185,13 @@ impl<'ctx> EbpfContext<'ctx> {
                         1,
                         self.context.i64_type().const_int(size, false),
                     )
-                    .map_err(|e| CodeGenError::LLVMError(format!("Failed to memcpy: {}", e)))?;
+                    .map_err(|e| CodeGenError::LLVMError(format!("Failed to memcpy: {e}")))?;
 
                 // Update offset: offset += size
                 // Reuse new_offset_val calculated earlier (line 108-115) to avoid redundant computation
                 self.builder
                     .build_store(offset_ptr, new_offset_val)
-                    .map_err(|e| {
-                        CodeGenError::LLVMError(format!("Failed to store offset: {}", e))
-                    })?;
+                    .map_err(|e| CodeGenError::LLVMError(format!("Failed to store offset: {e}")))?;
             }
         }
         Ok(())
@@ -215,7 +209,7 @@ impl<'ctx> EbpfContext<'ctx> {
             let offset_ptr = self.get_or_create_perf_buffer_offset();
             self.builder
                 .build_store(offset_ptr, self.context.i32_type().const_zero())
-                .map_err(|e| CodeGenError::LLVMError(format!("Failed to reset offset: {}", e)))?;
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to reset offset: {e}")))?;
         }
 
         let header_buffer = self.create_instruction_buffer();
@@ -233,14 +227,14 @@ impl<'ctx> EbpfContext<'ctx> {
                 self.context.ptr_type(AddressSpace::default()),
                 "magic_u32_ptr",
             )
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast magic ptr: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast magic ptr: {e}")))?;
         let magic_val = self
             .context
             .i32_type()
             .const_int(ghostscope_protocol::consts::MAGIC.into(), false);
         self.builder
             .build_store(magic_u32_ptr, magic_val)
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store magic: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store magic: {e}")))?;
 
         // Send header segment (RingBuf) or accumulate (PerfEventArray)
         self.write_to_accumulation_buffer_or_send(header_buffer, header_size)?;
@@ -270,11 +264,11 @@ impl<'ctx> EbpfContext<'ctx> {
                 self.context.ptr_type(AddressSpace::default()),
                 "trace_id_u64_ptr",
             )
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast trace_id ptr: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast trace_id ptr: {e}")))?;
         let trace_id_val = self.context.i64_type().const_int(trace_id, false);
         self.builder
             .build_store(trace_id_u64_ptr, trace_id_val)
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store trace_id: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store trace_id: {e}")))?;
 
         // timestamp at offset 8
         let timestamp = self.get_current_timestamp()?;
@@ -289,9 +283,7 @@ impl<'ctx> EbpfContext<'ctx> {
                         .const_int(consts::TRACE_EVENT_MESSAGE_TIMESTAMP_OFFSET as u64, false)],
                     "timestamp_ptr",
                 )
-                .map_err(|e| {
-                    CodeGenError::LLVMError(format!("Failed to get timestamp GEP: {}", e))
-                })?
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get timestamp GEP: {e}")))?
         };
         let timestamp_u64_ptr = self
             .builder
@@ -300,10 +292,10 @@ impl<'ctx> EbpfContext<'ctx> {
                 self.context.ptr_type(AddressSpace::default()),
                 "timestamp_u64_ptr",
             )
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast timestamp ptr: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast timestamp ptr: {e}")))?;
         self.builder
             .build_store(timestamp_u64_ptr, timestamp)
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store timestamp: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store timestamp: {e}")))?;
 
         // pid and tid at offset 16 and 20
         let pid_tgid_result = self.get_current_pid_tgid()?;
@@ -311,16 +303,16 @@ impl<'ctx> EbpfContext<'ctx> {
         let pid = self
             .builder
             .build_int_truncate(pid_tgid_result, i32_type, "pid")
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to truncate pid: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to truncate pid: {e}")))?;
         let shift_32 = self.context.i64_type().const_int(32, false);
         let tid_64 = self
             .builder
             .build_right_shift(pid_tgid_result, shift_32, false, "tid_64")
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to shift tid: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to shift tid: {e}")))?;
         let tid = self
             .builder
             .build_int_truncate(tid_64, i32_type, "tid")
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to truncate tid: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to truncate tid: {e}")))?;
 
         // Store pid at offset 16
         let pid_ptr = unsafe {
@@ -334,7 +326,7 @@ impl<'ctx> EbpfContext<'ctx> {
                         .const_int(consts::TRACE_EVENT_MESSAGE_PID_OFFSET as u64, false)],
                     "pid_ptr",
                 )
-                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get pid GEP: {}", e)))?
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get pid GEP: {e}")))?
         };
         let pid_u32_ptr = self
             .builder
@@ -343,10 +335,10 @@ impl<'ctx> EbpfContext<'ctx> {
                 self.context.ptr_type(AddressSpace::default()),
                 "pid_u32_ptr",
             )
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast pid ptr: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast pid ptr: {e}")))?;
         self.builder
             .build_store(pid_u32_ptr, pid)
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store pid: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store pid: {e}")))?;
 
         // Store tid at offset 20
         let tid_ptr = unsafe {
@@ -360,7 +352,7 @@ impl<'ctx> EbpfContext<'ctx> {
                         .const_int(consts::TRACE_EVENT_MESSAGE_TID_OFFSET as u64, false)],
                     "tid_ptr",
                 )
-                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get tid GEP: {}", e)))?
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get tid GEP: {e}")))?
         };
         let tid_u32_ptr = self
             .builder
@@ -369,10 +361,10 @@ impl<'ctx> EbpfContext<'ctx> {
                 self.context.ptr_type(AddressSpace::default()),
                 "tid_u32_ptr",
             )
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast tid ptr: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast tid ptr: {e}")))?;
         self.builder
             .build_store(tid_u32_ptr, tid)
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store tid: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store tid: {e}")))?;
 
         // Send message segment (RingBuf) or accumulate (PerfEventArray)
         self.write_to_accumulation_buffer_or_send(message_buffer, message_size)?;
@@ -403,7 +395,7 @@ impl<'ctx> EbpfContext<'ctx> {
             .const_int(InstructionType::EndInstruction as u64, false);
         self.builder
             .build_store(inst_type_ptr, inst_type_val)
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store inst_type: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store inst_type: {e}")))?;
 
         // data_length at offset 1
         let data_length_ptr = unsafe {
@@ -418,7 +410,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     "data_length_ptr",
                 )
                 .map_err(|e| {
-                    CodeGenError::LLVMError(format!("Failed to get data_length GEP: {}", e))
+                    CodeGenError::LLVMError(format!("Failed to get data_length GEP: {e}"))
                 })?
         };
         let data_length_i16_ptr = self
@@ -428,16 +420,14 @@ impl<'ctx> EbpfContext<'ctx> {
                 self.context.ptr_type(AddressSpace::default()),
                 "data_length_i16_ptr",
             )
-            .map_err(|e| {
-                CodeGenError::LLVMError(format!("Failed to cast data_length ptr: {}", e))
-            })?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast data_length ptr: {e}")))?;
         let data_length_val = self
             .context
             .i16_type()
             .const_int(std::mem::size_of::<EndInstructionData>() as u64, false);
         self.builder
             .build_store(data_length_i16_ptr, data_length_val)
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_length: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_length: {e}")))?;
 
         // Write EndInstructionData at offset 4
         // total_instructions
@@ -453,7 +443,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     "total_instructions_ptr",
                 )
                 .map_err(|e| {
-                    CodeGenError::LLVMError(format!("Failed to get total_instructions GEP: {}", e))
+                    CodeGenError::LLVMError(format!("Failed to get total_instructions GEP: {e}"))
                 })?
         };
         let total_instructions_i16_ptr = self
@@ -464,7 +454,7 @@ impl<'ctx> EbpfContext<'ctx> {
                 "total_instructions_i16_ptr",
             )
             .map_err(|e| {
-                CodeGenError::LLVMError(format!("Failed to cast total_instructions ptr: {}", e))
+                CodeGenError::LLVMError(format!("Failed to cast total_instructions ptr: {e}"))
             })?;
         let total_instructions_val = self
             .context
@@ -473,7 +463,7 @@ impl<'ctx> EbpfContext<'ctx> {
         self.builder
             .build_store(total_instructions_i16_ptr, total_instructions_val)
             .map_err(|e| {
-                CodeGenError::LLVMError(format!("Failed to store total_instructions: {}", e))
+                CodeGenError::LLVMError(format!("Failed to store total_instructions: {e}"))
             })?;
 
         // execution_status at offset 6
@@ -490,7 +480,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     )],
                     "status_ptr",
                 )
-                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get status GEP: {}", e)))?
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get status GEP: {e}")))?
         };
         // Compute execution_status from runtime flags _gs_any_fail and _gs_any_success
         let any_fail_ptr = self.get_or_create_flag_global("_gs_any_fail");
@@ -499,23 +489,23 @@ impl<'ctx> EbpfContext<'ctx> {
         let any_fail_val = self
             .builder
             .build_load(self.context.i8_type(), any_fail_ptr, "any_fail")
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to load any_fail: {}", e)))?
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to load any_fail: {e}")))?
             .into_int_value();
         let any_succ_val = self
             .builder
             .build_load(self.context.i8_type(), any_succ_ptr, "any_succ")
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to load any_succ: {}", e)))?
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to load any_succ: {e}")))?
             .into_int_value();
 
         let zero = self.context.i8_type().const_zero();
         let is_fail = self
             .builder
             .build_int_compare(inkwell::IntPredicate::NE, any_fail_val, zero, "is_fail")
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cmp any_fail: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cmp any_fail: {e}")))?;
         let is_succ = self
             .builder
             .build_int_compare(inkwell::IntPredicate::NE, any_succ_val, zero, "is_succ")
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cmp any_succ: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cmp any_succ: {e}")))?;
 
         // status = if is_fail && !is_succ => 2
         //        else if is_fail && is_succ => 1
@@ -523,32 +513,32 @@ impl<'ctx> EbpfContext<'ctx> {
         let not_succ = self
             .builder
             .build_not(is_succ, "not_succ")
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to build not: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to build not: {e}")))?;
         let only_fail = self
             .builder
             .build_and(is_fail, not_succ, "only_fail")
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to build and: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to build and: {e}")))?;
         let both = self
             .builder
             .build_and(is_fail, is_succ, "both")
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to build and: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to build and: {e}")))?;
 
         let two = self.context.i8_type().const_int(2, false);
         let one = self.context.i8_type().const_int(1, false);
         let sel1 = self
             .builder
             .build_select(only_fail, two, zero, "status_sel1")
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to build select: {}", e)))?
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to build select: {e}")))?
             .into_int_value();
         let sel2 = self
             .builder
             .build_select(both, one, sel1, "status_sel2")
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to build select: {}", e)))?
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to build select: {e}")))?
             .into_int_value();
 
         self.builder
             .build_store(status_ptr, sel2)
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store status: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store status: {e}")))?;
 
         // Accumulate end instruction (RingBuf sends immediately, PerfEventArray accumulates)
         self.write_to_accumulation_buffer_or_send(end_buffer, total_size)?;
@@ -565,7 +555,7 @@ impl<'ctx> EbpfContext<'ctx> {
             let total_accumulated_size = self
                 .builder
                 .build_load(self.context.i32_type(), offset_ptr, "total_size")
-                .map_err(|e| CodeGenError::LLVMError(format!("Failed to load total size: {}", e)))?
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to load total size: {e}")))?
                 .into_int_value();
 
             // Convert i32 to i64 for size parameter
@@ -576,7 +566,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     self.context.i64_type(),
                     "total_size_i64",
                 )
-                .map_err(|e| CodeGenError::LLVMError(format!("Failed to extend size: {}", e)))?;
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to extend size: {e}")))?;
 
             // Send entire accumulated buffer via perf_event_output
             self.create_perf_event_output_dynamic(accum_buffer, total_size_i64)?;
@@ -585,7 +575,7 @@ impl<'ctx> EbpfContext<'ctx> {
             self.builder
                 .build_store(offset_ptr, self.context.i32_type().const_zero())
                 .map_err(|e| {
-                    CodeGenError::LLVMError(format!("Failed to reset offset after send: {}", e))
+                    CodeGenError::LLVMError(format!("Failed to reset offset after send: {e}"))
                 })?;
 
             info!("Sent entire accumulated buffer via PerfEventArray and reset offset");

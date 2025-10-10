@@ -594,7 +594,7 @@ impl Config {
         content: &str,
         error: toml::de::Error,
     ) -> anyhow::Error {
-        let error_msg = format!("Configuration file parsing error in '{}'", file_path);
+        let error_msg = format!("Configuration file parsing error in '{file_path}'");
 
         if let Some(span) = error.span() {
             // Calculate line and column from span

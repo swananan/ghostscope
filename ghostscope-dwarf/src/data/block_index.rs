@@ -9,7 +9,7 @@ use crate::parser::RangeExtractor;
 use gimli::{EndianArcSlice, LittleEndian, Reader};
 use std::collections::BTreeMap;
 
-/// Reference to a variable DIE within a unit
+/// Reference to a variable DIE within a unit (minimal info)
 #[derive(Debug, Clone)]
 pub struct VarRef {
     pub cu_offset: gimli::DebugInfoOffset,
@@ -23,6 +23,8 @@ pub struct BlockNode {
     pub ranges: Vec<(u64, u64)>,
     /// Optional entry_pc for call sites/inlined locations
     pub entry_pc: Option<u64>,
+    /// DIE offset for this block (lexical_block/inlined_subroutine)
+    pub die_offset: Option<gimli::UnitOffset>,
     /// Variables declared directly in this block
     pub variables: Vec<VarRef>,
     /// Children blocks indices
@@ -34,6 +36,7 @@ impl BlockNode {
         Self {
             ranges: Vec::new(),
             entry_pc: None,
+            die_offset: None,
             variables: Vec::new(),
             children: Vec::new(),
         }
@@ -79,7 +82,9 @@ impl FunctionBlocks {
         cu_offset: gimli::DebugInfoOffset,
         die_offset: gimli::UnitOffset,
     ) -> Self {
-        let nodes = vec![BlockNode::new()]; // root at 0
+        let mut root = BlockNode::new();
+        root.die_offset = Some(die_offset);
+        let nodes = vec![root]; // root at 0
         Self {
             name,
             cu_offset,
@@ -314,9 +319,67 @@ impl<'a> BlockIndexBuilder<'a> {
                             bn.entry_pc = Some(addr);
                         }
                     }
+                    // Record this block's DIE offset for later attribute lookups (e.g., frame base)
+                    bn.die_offset = Some(e.offset());
                     let new_idx = fb.nodes.len();
                     fb.nodes.push(bn);
                     fb.nodes[parent_idx].children.push(new_idx);
+
+                    // If this is an inlined subroutine, import origin parameters ONLY if this inline node
+                    // does not already have formal_parameter children (some compilers emit them directly).
+                    if e.tag() == gimli::constants::DW_TAG_inlined_subroutine {
+                        // Peek direct children of this inline node to detect existing formal_parameter DIEs
+                        let mut has_inline_params = false;
+                        if let Ok(mut it) = unit.entries_at_offset(e.offset()) {
+                            // skip self
+                            let _ = it.next_entry();
+                            while let Ok(Some((depth, ce))) = it.next_dfs() {
+                                if depth == 0 {
+                                    break;
+                                }
+                                if depth > 1 {
+                                    continue;
+                                }
+                                if ce.tag() == gimli::constants::DW_TAG_formal_parameter {
+                                    has_inline_params = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !has_inline_params {
+                            if let Ok(Some(attr)) = e.attr(gimli::constants::DW_AT_abstract_origin)
+                            {
+                                if let gimli::AttributeValue::UnitRef(origin_off) = attr.value() {
+                                    if let Ok(mut iter) = unit.entries_at_offset(origin_off) {
+                                        // Skip the origin DIE itself
+                                        let _ = iter.next_entry();
+                                        while let Ok(Some((depth, ce))) = iter.next_dfs() {
+                                            // Only consider direct children of the origin DIE
+                                            if depth == 0 {
+                                                break;
+                                            }
+                                            if depth > 1 {
+                                                continue;
+                                            }
+                                            if ce.tag() == gimli::constants::DW_TAG_formal_parameter
+                                            {
+                                                let v = VarRef {
+                                                    cu_offset: match unit.header.offset() {
+                                                        gimli::UnitSectionOffset::DebugInfoOffset(off) => off,
+                                                        _ => continue,
+                                                    },
+                                                    die_offset: ce.offset(),
+                                                };
+                                                if let Some(node) = fb.nodes.get_mut(new_idx) {
+                                                    node.variables.push(v);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     // Recurse into this block
                     self.walk_children(unit, child, new_idx, fb);
                 }

@@ -1,6 +1,9 @@
-#![allow(clippy::uninlined_format_args)]
-#![allow(clippy::needless_borrows_for_generic_args)]
-#![allow(clippy::collapsible_else_if)]
+// Clippy: allow some lints in tests
+#![allow(
+    clippy::uninlined_format_args,
+    clippy::needless_borrows_for_generic_args,
+    dead_code
+)]
 
 //! Script execution integration tests
 //!
@@ -319,7 +322,7 @@ async fn run_ghostscope_with_script_opt(
     );
 
     let mut command = Command::new(binary_path);
-    command.args(&args);
+    command.args(args);
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
 
@@ -798,30 +801,37 @@ trace sample_program.c:16 {
         let mut line_validations = 0;
         let mut validation_errors = Vec::new();
 
-        // Validate function-level traces (a == b - 5)
+        // Detect optimized-out markers and bad placeholders
+        let func_has_placeholder_zero = stdout.lines().any(|line| line.contains("FUNC: a=0 b=0"));
+        let func_has_optimized_marker = stdout
+            .lines()
+            .any(|line| line.contains("FUNC:") && line.to_lowercase().contains("optimiz"));
+        let line_has_optimized_marker = stdout
+            .lines()
+            .any(|line| line.contains("LINE16:") && line.to_lowercase().contains("optimiz"));
+
+        // Validate function-level traces (a == b - 5). Skip non-numeric or optimized-out lines.
         for line in stdout.lines() {
             if line.contains("FUNC: ") {
                 if let Some((a, b)) = parse_calc_line_simple(line) {
-                    if *opt_level != OptimizationLevel::Debug && a == 0 && b == 0 {
-                        println!(
-                            "TODO[trace-inline]: optimized build returned placeholder a=0 b=0; \
-                            skipping validation until we expose explicit 'optimized out'."
-                        );
-                        continue;
-                    }
-
-                    if a == b - 5 {
-                        println!(
-                            "✓ Function-level math validation passed: a={} == b-5={}",
-                            a,
-                            b - 5
-                        );
-                        func_validations += 1;
-                    } else {
-                        let error_msg =
-                            format!("Function-level validation failed: a={} != b-5={}", a, b - 5);
-                        println!("❌ {}", error_msg);
-                        validation_errors.push(error_msg);
+                    // Treat O2 placeholder zeros as non-valid (will be asserted below)
+                    if *opt_level == OptimizationLevel::Debug || (a != 0 || b != 0) {
+                        if a == b - 5 {
+                            println!(
+                                "✓ Function-level math validation passed: a={} == b-5={}",
+                                a,
+                                b - 5
+                            );
+                            func_validations += 1;
+                        } else {
+                            let error_msg = format!(
+                                "Function-level validation failed: a={} != b-5={}",
+                                a,
+                                b - 5
+                            );
+                            println!("❌ {}", error_msg);
+                            validation_errors.push(error_msg);
+                        }
                     }
                 }
             }
@@ -850,19 +860,42 @@ trace sample_program.c:16 {
             }
         }
 
-        if func_validations == 0 {
-            panic!(
-                "❌ Expected function-level traces for {} but none validated successfully. STDOUT: {}",
-                opt_level.description(),
+        // Adjust validation policy for optimized builds
+        if *opt_level == OptimizationLevel::Debug {
+            if func_validations == 0 {
+                panic!(
+                    "❌ Expected function-level traces for {} but none validated successfully. STDOUT: {}",
+                    opt_level.description(),
+                    stdout
+                );
+            }
+            if line_validations == 0 {
+                panic!(
+                    "❌ Expected line-level traces for {} but none validated successfully. STDOUT: {}",
+                    opt_level.description(),
+                    stdout
+                );
+            }
+        } else {
+            // In optimized builds, allow optimized-out markers in place of numeric validations,
+            // but ensure we never emit placeholder zeros.
+            assert!(
+                !func_has_placeholder_zero,
+                "Should not emit placeholder optimized-out values in optimized builds. STDOUT: {}",
                 stdout
             );
-        }
-        if line_validations == 0 {
-            panic!(
-                "❌ Expected line-level traces for {} but none validated successfully. STDOUT: {}",
-                opt_level.description(),
-                stdout
-            );
+            if func_validations == 0 && !func_has_optimized_marker {
+                panic!(
+                    "❌ Expected function-level traces to be either numerically valid or marked as optimized-out. STDOUT: {}",
+                    stdout
+                );
+            }
+            if line_validations == 0 && !line_has_optimized_marker {
+                panic!(
+                    "❌ Expected line-level traces to be either numerically valid or marked as optimized-out. STDOUT: {}",
+                    stdout
+                );
+            }
         }
 
         if !validation_errors.is_empty() {

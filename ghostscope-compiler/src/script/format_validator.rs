@@ -67,9 +67,8 @@ impl FormatValidator {
                             // Must start with ':'
                             if !placeholder_content.starts_with(':') {
                                 return Err(ParseError::TypeError(format!(
-                                    "Invalid format specifier '{{{}}}': expected ':' prefix",
-                                    placeholder_content
-                                )));
+                        "Invalid format specifier '{{{placeholder_content}}}': expected ':' prefix"
+                    )));
                             }
                             // Extract conv and optional suffix
                             let tail = &placeholder_content[1..];
@@ -82,8 +81,7 @@ impl FormatValidator {
                                 'x' | 'X' | 'p' | 's' => {}
                                 _ => {
                                     return Err(ParseError::TypeError(format!(
-                                        "Unsupported format conversion '{{:{}}}'",
-                                        conv
+                                        "Unsupported format conversion '{{:{conv}}}'"
                                     )));
                                 }
                             }

@@ -251,7 +251,7 @@ fn get_grouped_source_files_info(session: &GhostSession) -> anyhow::Result<Vec<S
                     (resolved_dir, file.basename.clone())
                 };
 
-                let key = format!("{}:{}", resolved_dir, resolved_basename);
+                let key = format!("{resolved_dir}:{resolved_basename}");
                 if seen.insert(key) {
                     ui_files.push(SourceFileInfo {
                         path: resolved_basename,

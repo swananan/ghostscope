@@ -26,7 +26,7 @@ use crate::{
     data::{
         CfiIndex, LightweightIndex, LineMappingTable, OnDemandResolver, ScopedFileIndexManager,
     },
-    parser::{CompilationUnit, SourceFile},
+    parser::{CompilationUnit, ExpressionEvaluator, SourceFile},
     proc_mapping::ModuleMapping,
 };
 use gimli::{LittleEndian, Reader};
@@ -73,6 +73,188 @@ pub(crate) struct ModuleData {
 }
 
 impl ModuleData {
+    // Find the innermost inline node containing the PC
+    fn find_innermost_inline_node(func: &crate::data::FunctionBlocks, pc: u64) -> Option<usize> {
+        let path = func.block_path_for_pc(pc);
+        path.iter()
+            .rev()
+            .find(|&&idx| func.nodes[idx].entry_pc.is_some())
+            .copied()
+    }
+
+    // Try to apply call-site parameter mapping for an inline node at a given PC
+    fn try_apply_call_site_mapping(
+        &self,
+        func: &crate::data::FunctionBlocks,
+        inline_idx: usize,
+        address: u64,
+        vars: &mut [crate::data::VariableWithEvaluation],
+        _var_refs: &[crate::data::block_index::VarRef],
+        get_cfa: &dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>,
+    ) {
+        let dwarf = self.resolver.dwarf_ref();
+        let header = match dwarf.debug_info.header_from_offset(func.cu_offset) {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        let unit = match dwarf.unit(header) {
+            Ok(u) => u,
+            Err(_) => return,
+        };
+        let node = &func.nodes[inline_idx];
+        let inline_die = match node.die_offset.and_then(|off| unit.entry(off).ok()) {
+            Some(e) => e,
+            None => return,
+        };
+        if inline_die.tag() != gimli::constants::DW_TAG_inlined_subroutine {
+            return;
+        }
+        // Get abstract origin to determine parameter order and names
+        let origin_off = match inline_die.attr_value(gimli::constants::DW_AT_abstract_origin) {
+            Ok(Some(gimli::AttributeValue::UnitRef(o))) => o,
+            _ => return,
+        };
+
+        // Collect origin formal parameter names in order
+        let mut origin_param_names: Vec<String> = Vec::new();
+        if let Ok(mut it) = unit.entries_at_offset(origin_off) {
+            let _ = it.next_entry();
+            while let Ok(Some((depth, e))) = it.next_dfs() {
+                if depth == 0 {
+                    break;
+                }
+                if depth > 1 {
+                    continue;
+                }
+                if e.tag() == gimli::constants::DW_TAG_formal_parameter {
+                    if let Ok(Some(a)) = e.attr(gimli::constants::DW_AT_name) {
+                        if let Ok(s) = dwarf.attr_string(&unit, a.value()) {
+                            if let Ok(ss) = s.to_string_lossy() {
+                                origin_param_names.push(ss.into_owned());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if origin_param_names.is_empty() {
+            return;
+        }
+
+        // Search call_site(_parameter) under the inline node
+        let mut param_values: Vec<Option<crate::core::EvaluationResult>> =
+            vec![None; origin_param_names.len()];
+        if let Ok(mut it) = unit.entries_at_offset(node.die_offset.unwrap()) {
+            let _ = it.next_entry();
+            while let Ok(Some((depth, e))) = it.next_dfs() {
+                if depth == 0 {
+                    break;
+                }
+                if depth > 1 {
+                    continue;
+                }
+                if e.tag() == gimli::constants::DW_TAG_call_site
+                    || e.tag() == gimli::constants::DW_TAG_GNU_call_site
+                {
+                    // Iterate its children for parameters
+                    if let Ok(mut pit) = unit.entries_at_offset(e.offset()) {
+                        let _ = pit.next_entry();
+                        while let Ok(Some((pdepth, pe))) = pit.next_dfs() {
+                            if pdepth == 0 {
+                                break;
+                            }
+                            if pdepth > 1 {
+                                continue;
+                            }
+                            if pe.tag() == gimli::constants::DW_TAG_call_site_parameter
+                                || pe.tag() == gimli::constants::DW_TAG_GNU_call_site_parameter
+                            {
+                                // Prefer DW_AT_location (exprloc); fallback to DW_AT_const_value
+                                let loc_attr = pe
+                                    .attr_value(gimli::constants::DW_AT_location)
+                                    .ok()
+                                    .flatten();
+                                if let Some(gimli::AttributeValue::Exprloc(expr)) = loc_attr {
+                                    if let Ok(ev) = ExpressionEvaluator::parse_expression(
+                                        expr.0.to_slice().ok().as_deref().unwrap_or(&[]),
+                                        unit.encoding(),
+                                        address,
+                                        Some(get_cfa),
+                                    ) {
+                                        if let Some(slot) =
+                                            param_values.iter_mut().find(|v| v.is_none())
+                                        {
+                                            *slot = Some(ev);
+                                        }
+                                    }
+                                } else if let Ok(Some(cv)) =
+                                    pe.attr_value(gimli::constants::DW_AT_const_value)
+                                {
+                                    use crate::core::DirectValueResult as DV;
+                                    use crate::core::EvaluationResult as ER;
+                                    let ev = match cv {
+                                        gimli::AttributeValue::Udata(u) => {
+                                            ER::DirectValue(DV::Constant(u as i64))
+                                        }
+                                        gimli::AttributeValue::Sdata(s) => {
+                                            ER::DirectValue(DV::Constant(s))
+                                        }
+                                        gimli::AttributeValue::Data1(d) => {
+                                            ER::DirectValue(DV::Constant(d as i64))
+                                        }
+                                        gimli::AttributeValue::Data2(d) => {
+                                            ER::DirectValue(DV::Constant(d as i64))
+                                        }
+                                        gimli::AttributeValue::Data4(d) => {
+                                            ER::DirectValue(DV::Constant(d as i64))
+                                        }
+                                        gimli::AttributeValue::Data8(d) => {
+                                            ER::DirectValue(DV::Constant(d as i64))
+                                        }
+                                        gimli::AttributeValue::Block(b) => match b.to_slice() {
+                                            Ok(bytes) => {
+                                                ER::DirectValue(DV::ImplicitValue(bytes.to_vec()))
+                                            }
+                                            Err(_) => ER::Optimized,
+                                        },
+                                        _ => ER::Optimized,
+                                    };
+                                    if let Some(slot) =
+                                        param_values.iter_mut().find(|v| v.is_none())
+                                    {
+                                        *slot = Some(ev);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if param_values.iter().all(|v| v.is_none()) {
+            return;
+        }
+
+        // Apply recovered values to vars by matching name to origin parameter names
+        for v in vars.iter_mut() {
+            if !v.is_parameter {
+                continue;
+            }
+            if !matches!(
+                v.evaluation_result,
+                crate::core::EvaluationResult::Optimized
+            ) {
+                continue;
+            }
+            let name = v.name.as_str();
+            if let Some(pos) = origin_param_names.iter().position(|n| n == name) {
+                if let Some(Some(ev)) = param_values.get(pos) {
+                    v.evaluation_result = ev.clone();
+                }
+            }
+        }
+    }
     /// Parallel loading: debug_info || debug_line || CFI simultaneously
     pub(crate) async fn load_parallel(
         module_mapping: ModuleMapping,
@@ -623,20 +805,28 @@ impl ModuleData {
                 build_ms,
                 t0.elapsed().as_millis()
             );
-            let cfa_result = if self.cfi_index.is_some() {
-                match self.get_cfa_result(address) {
-                    Ok(Some(cfa)) => Some(cfa),
-                    _ => None,
+            // Precompute preferred frame base: DW_AT_frame_base first, fallback to CFI CFA
+            let fb_result = self.compute_frame_base_for_pc(func, address);
+            let cfa_result = if fb_result.is_none() {
+                if self.cfi_index.is_some() {
+                    match self.get_cfa_result(address) {
+                        Ok(Some(cfa)) => Some(cfa),
+                        _ => None,
+                    }
+                } else {
+                    None
                 }
             } else {
                 None
             };
             let get_cfa_closure = move |addr: u64| -> Result<Option<crate::core::CfaResult>> {
                 if addr == address {
-                    Ok(cfa_result.clone())
-                } else {
-                    Ok(None)
+                    if let Some(fb) = fb_result.clone() {
+                        return Ok(Some(fb));
+                    }
+                    return Ok(cfa_result.clone());
                 }
+                Ok(None)
             };
             let var_refs = func.variables_at_pc(address);
             if !var_refs.is_empty() {
@@ -675,12 +865,44 @@ impl ModuleData {
                     }
                 }
 
+                // Call-site parameter mapping for inline: if inline parameters are optimized at this PC,
+                // try to recover their value from DW_TAG_call_site/_parameter under the inline node.
+                if let Some(inline_idx) = Self::find_innermost_inline_node(func, address) {
+                    self.try_apply_call_site_mapping(
+                        func,
+                        inline_idx,
+                        address,
+                        &mut vars,
+                        &var_refs,
+                        &get_cfa_closure,
+                    );
+                }
+
+                // Prefer non-optimized duplicates: if multiple entries share the same name,
+                // keep the one with the most informative EvaluationResult.
+                // Minimal de-dup for parameters: keep first occurrence per name.
+                let mut seen_param_names: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                let mut filtered: Vec<crate::data::VariableWithEvaluation> =
+                    Vec::with_capacity(vars.len());
+                for v in vars.into_iter() {
+                    if v.is_parameter {
+                        if seen_param_names.insert(v.name.clone()) {
+                            filtered.push(v);
+                        } else {
+                            // drop duplicate parameter with same name
+                        }
+                    } else {
+                        filtered.push(v);
+                    }
+                }
+
                 tracing::info!(
                     "DWARF:get_vars resolved {} vars total_ms={}",
-                    vars.len(),
+                    filtered.len(),
                     t0.elapsed().as_millis()
                 );
-                return Ok(vars);
+                return Ok(filtered);
             }
         }
 
@@ -1395,6 +1617,158 @@ impl ModuleData {
         }
     }
 
+    /// Compute DW_AT_frame_base for the innermost block that contains the PC, falling back to function scope.
+    /// Returns a CfaResult representing the frame base expression (register+offset or expression steps).
+    fn compute_frame_base_for_pc(
+        &self,
+        func: &crate::data::FunctionBlocks,
+        pc: u64,
+    ) -> Option<crate::core::CfaResult> {
+        // Helper: resolve an attribute up abstract_origin/specification
+        fn resolve_attr_with_origins(
+            entry: &gimli::DebuggingInformationEntry<gimli::EndianArcSlice<LittleEndian>>,
+            unit: &gimli::Unit<gimli::EndianArcSlice<LittleEndian>>,
+            attr: gimli::DwAt,
+        ) -> gimli::read::Result<Option<gimli::AttributeValue<gimli::EndianArcSlice<LittleEndian>>>>
+        {
+            let mut visited = std::collections::HashSet::new();
+            fn inner(
+                entry: &gimli::DebuggingInformationEntry<gimli::EndianArcSlice<LittleEndian>>,
+                unit: &gimli::Unit<gimli::EndianArcSlice<LittleEndian>>,
+                attr: gimli::DwAt,
+                visited: &mut std::collections::HashSet<gimli::UnitOffset>,
+            ) -> gimli::read::Result<
+                Option<gimli::AttributeValue<gimli::EndianArcSlice<LittleEndian>>>,
+            > {
+                if let Some(value) = entry.attr_value(attr)? {
+                    return Ok(Some(value));
+                }
+                for origin_attr in [
+                    gimli::constants::DW_AT_abstract_origin,
+                    gimli::constants::DW_AT_specification,
+                ] {
+                    if let Some(gimli::AttributeValue::UnitRef(off)) =
+                        entry.attr_value(origin_attr)?
+                    {
+                        if visited.insert(off) {
+                            let origin = unit.entry(off)?;
+                            if let Some(v) = inner(&origin, unit, attr, visited)? {
+                                return Ok(Some(v));
+                            }
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            inner(entry, unit, attr, &mut visited)
+        }
+
+        let dwarf = self.resolver.dwarf_ref();
+        let header = dwarf.debug_info.header_from_offset(func.cu_offset).ok()?;
+        let unit = dwarf.unit(header).ok()?;
+        // From innermost block to outermost (root at 0)
+        let path = func.block_path_for_pc(pc);
+        let mut candidates: Vec<gimli::UnitOffset> = Vec::new();
+        for &idx in path.iter().rev() {
+            if idx == 0 {
+                candidates.push(func.die_offset);
+            } else if let Some(off) = func.nodes.get(idx).and_then(|n| n.die_offset) {
+                candidates.push(off);
+            }
+        }
+
+        for off in candidates {
+            if let Ok(entry) = unit.entry(off) {
+                if let Ok(Some(val)) =
+                    resolve_attr_with_origins(&entry, &unit, gimli::constants::DW_AT_frame_base)
+                {
+                    // Evaluate to EvaluationResult using existing evaluator paths
+                    let eval_res = match val {
+                        gimli::AttributeValue::Exprloc(expr) => {
+                            ExpressionEvaluator::parse_expression(
+                                expr.0.to_slice().ok().as_deref().unwrap_or(&[]),
+                                unit.encoding(),
+                                pc,
+                                None,
+                            )
+                            .ok()
+                        }
+                        gimli::AttributeValue::LocationListsRef(offset) => {
+                            ExpressionEvaluator::parse_location_lists(
+                                &unit,
+                                dwarf,
+                                gimli::LocationListsOffset(offset.0),
+                                pc,
+                                None,
+                            )
+                            .ok()
+                        }
+                        gimli::AttributeValue::SecOffset(offset) => {
+                            ExpressionEvaluator::parse_location_lists(
+                                &unit,
+                                dwarf,
+                                gimli::LocationListsOffset(offset),
+                                pc,
+                                None,
+                            )
+                            .ok()
+                        }
+                        _ => None,
+                    };
+
+                    if let Some(er) = eval_res {
+                        use crate::core::{
+                            CfaResult, ComputeStep, EvaluationResult, LocationResult,
+                        };
+                        // Map EvaluationResult to CfaResult
+                        let cfa = match er {
+                            EvaluationResult::MemoryLocation(LocationResult::RegisterAddress {
+                                register,
+                                offset,
+                                ..
+                            }) => CfaResult::RegisterPlusOffset {
+                                register,
+                                offset: offset.unwrap_or(0),
+                            },
+                            EvaluationResult::MemoryLocation(
+                                LocationResult::ComputedLocation { steps },
+                            ) => CfaResult::Expression { steps },
+                            EvaluationResult::MemoryLocation(LocationResult::Address(addr)) => {
+                                CfaResult::Expression {
+                                    steps: vec![ComputeStep::PushConstant(addr as i64)],
+                                }
+                            }
+                            EvaluationResult::DirectValue(
+                                crate::core::DirectValueResult::Constant(c),
+                            ) => CfaResult::Expression {
+                                steps: vec![ComputeStep::PushConstant(c)],
+                            },
+                            EvaluationResult::DirectValue(
+                                crate::core::DirectValueResult::ImplicitValue(bytes),
+                            ) => {
+                                // Treat as constant pointer if size matches u64, else skip
+                                if bytes.len() == 8 {
+                                    let mut arr = [0u8; 8];
+                                    arr.copy_from_slice(&bytes);
+                                    let v = u64::from_le_bytes(arr) as i64;
+                                    CfaResult::Expression {
+                                        steps: vec![ComputeStep::PushConstant(v)],
+                                    }
+                                } else {
+                                    continue;
+                                }
+                            }
+                            _ => continue,
+                        };
+                        return Some(cfa);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
     /// Build demangled name maps from the lightweight index
     fn build_demangled_maps(ix: &LightweightIndex) -> (NameIndex, NameIndex, NameIndex, NameIndex) {
         let mut fn_full: NameIndex = HashMap::new();
@@ -1489,12 +1863,100 @@ impl ModuleData {
             cand.dedup();
             out.extend(cand);
         } else {
+            // If the function's formal parameters use DW_OP_entry_value, prefer true entry (no prologue skip)
+            let prefer_entry = self.function_uses_entry_value(entry).unwrap_or(false);
             for (start, _end) in &entry.address_ranges {
-                let exec = self.line_mapping.find_first_executable_address(*start);
-                out.push(exec);
+                let addr = if prefer_entry {
+                    *start
+                } else {
+                    self.line_mapping.find_first_executable_address(*start)
+                };
+                out.push(addr);
             }
         }
         out
+    }
+
+    /// Check if this subprogram uses DW_OP_entry_value in any formal parameter location
+    fn function_uses_entry_value(&self, idx_entry: &crate::core::IndexEntry) -> Result<bool> {
+        let dwarf = self.resolver.dwarf_ref();
+        let header = dwarf
+            .debug_info
+            .header_from_offset(idx_entry.unit_offset)
+            .map_err(|e| anyhow::anyhow!("unit header error: {}", e))?;
+        let unit = dwarf
+            .unit(header)
+            .map_err(|e| anyhow::anyhow!("unit load error: {}", e))?;
+        let entry = unit
+            .entry(idx_entry.die_offset)
+            .map_err(|e| anyhow::anyhow!("entry load error: {}", e))?;
+        if entry.tag() != gimli::constants::DW_TAG_subprogram {
+            return Ok(false);
+        }
+
+        // Helper: resolve attr with origins/specification
+        fn resolve_attr_with_origins(
+            entry: &gimli::DebuggingInformationEntry<gimli::EndianArcSlice<LittleEndian>>,
+            unit: &gimli::Unit<gimli::EndianArcSlice<LittleEndian>>,
+            attr: gimli::DwAt,
+        ) -> gimli::read::Result<Option<gimli::AttributeValue<gimli::EndianArcSlice<LittleEndian>>>>
+        {
+            let mut visited = std::collections::HashSet::new();
+            fn inner(
+                entry: &gimli::DebuggingInformationEntry<gimli::EndianArcSlice<LittleEndian>>,
+                unit: &gimli::Unit<gimli::EndianArcSlice<LittleEndian>>,
+                attr: gimli::DwAt,
+                visited: &mut std::collections::HashSet<gimli::UnitOffset>,
+            ) -> gimli::read::Result<
+                Option<gimli::AttributeValue<gimli::EndianArcSlice<LittleEndian>>>,
+            > {
+                if let Some(v) = entry.attr_value(attr)? {
+                    return Ok(Some(v));
+                }
+                for origin_attr in [
+                    gimli::constants::DW_AT_abstract_origin,
+                    gimli::constants::DW_AT_specification,
+                ] {
+                    if let Some(gimli::AttributeValue::UnitRef(off)) =
+                        entry.attr_value(origin_attr)?
+                    {
+                        if visited.insert(off) {
+                            let origin = unit.entry(off)?;
+                            if let Some(v2) = inner(&origin, unit, attr, visited)? {
+                                return Ok(Some(v2));
+                            }
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            inner(entry, unit, attr, &mut visited)
+        }
+
+        if let Ok(mut tree) = unit.entries_tree(Some(entry.offset())) {
+            if let Ok(root) = tree.root() {
+                let mut children = root.children();
+                while let Ok(Some(child)) = children.next() {
+                    let e = child.entry();
+                    if e.tag() == gimli::constants::DW_TAG_formal_parameter {
+                        if let Ok(Some(gimli::AttributeValue::Exprloc(expr))) =
+                            resolve_attr_with_origins(e, &unit, gimli::constants::DW_AT_location)
+                        {
+                            // Parse ops and look for EntryValue
+                            let mut expression = gimli::Expression(expr.0);
+                            while let Ok(op) =
+                                gimli::Operation::parse(&mut expression.0, unit.encoding())
+                            {
+                                if matches!(op, gimli::Operation::EntryValue { .. }) {
+                                    return Ok(true);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// Lookup function addresses by any of: DW_AT_name, linkage name, or demangled name

@@ -132,7 +132,7 @@ pub async fn initialize_dwarf_processing_with_progress(
             }
         }
         Err(e) => {
-            let error_msg = format!("Failed to create debug session: {}", e);
+            let error_msg = format!("Failed to create debug session: {e}");
             let _ = status_sender.send(RuntimeStatus::DwarfLoadingFailed(error_msg.clone()));
             Err(anyhow::anyhow!(error_msg))
         }

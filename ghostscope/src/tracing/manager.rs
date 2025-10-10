@@ -1,4 +1,4 @@
-use crate::tracing::instance::TraceInstance;
+use crate::tracing::instance::{TraceInstance, TraceInstanceArgs};
 use crate::tracing::snapshot::{TraceSnapshot, TraceSummary};
 use anyhow::Result;
 use futures::future::{select_all, BoxFuture};
@@ -20,6 +20,20 @@ pub struct TraceManager {
     trace_created_times: HashMap<u32, u64>,
 }
 
+/// Parameters for adding a new trace with a pre-allocated ID
+#[derive(Debug)]
+pub struct AddTraceParams {
+    pub trace_id: u32,
+    pub target: String,
+    pub script_content: String,
+    pub pc: u64,
+    pub binary_path: String,
+    pub target_display: String,
+    pub target_pid: Option<u32>,
+    pub loader: Option<GhostScopeLoader>,
+    pub ebpf_function_name: String,
+}
+
 impl TraceManager {
     pub fn new() -> Self {
         Self {
@@ -38,23 +52,11 @@ impl TraceManager {
     }
 
     /// Add a new trace instance with a pre-allocated trace ID
-    #[allow(clippy::too_many_arguments)]
-    pub fn add_trace_with_id(
-        &mut self,
-        trace_id: u32,
-        target: String,
-        script_content: String,
-        pc: u64,
-        binary_path: String,
-        target_display: String,
-        target_pid: Option<u32>,
-        loader: Option<GhostScopeLoader>,
-        ebpf_function_name: String,
-    ) -> u32 {
+    pub fn add_trace_with_id(&mut self, params: AddTraceParams) -> u32 {
         // Use the provided trace_id and ensure next_trace_id is updated to maintain proper ordering
         // This prevents ID conflicts and ensures IDs only increment
-        if trace_id >= self.next_trace_id {
-            self.next_trace_id = trace_id + 1;
+        if params.trace_id >= self.next_trace_id {
+            self.next_trace_id = params.trace_id + 1;
         }
 
         // Record creation time
@@ -62,32 +64,33 @@ impl TraceManager {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        self.trace_created_times.insert(trace_id, now);
+        self.trace_created_times.insert(params.trace_id, now);
 
         // Create unique target key by combining target with trace_id
         // This allows multiple traces for the same target (e.g., same function/line)
-        let unique_target = format!("{}#{}", target, trace_id);
+        let unique_target = format!("{}#{}", params.target, params.trace_id);
 
-        let trace_instance = TraceInstance::new(
-            trace_id,
-            target.clone(), // Keep original target for grouping
-            script_content,
-            pc,
-            binary_path,
-            target_display,
-            target_pid,
-            loader,
-            ebpf_function_name,
-        );
+        let trace_instance = TraceInstance::new(TraceInstanceArgs {
+            trace_id: params.trace_id,
+            target: params.target.clone(),
+            script_content: params.script_content,
+            pc: params.pc,
+            binary_path: params.binary_path,
+            target_display: params.target_display,
+            target_pid: params.target_pid,
+            loader: params.loader,
+            ebpf_function_name: params.ebpf_function_name,
+        });
 
-        self.traces.insert(trace_id, trace_instance);
-        self.target_to_trace_id.insert(unique_target, trace_id);
+        self.traces.insert(params.trace_id, trace_instance);
+        self.target_to_trace_id
+            .insert(unique_target, params.trace_id);
 
         debug!(
             "Added trace {} to manager with target '{}', next_trace_id updated to {}",
-            trace_id, target, self.next_trace_id
+            params.trace_id, params.target, self.next_trace_id
         );
-        trace_id
+        params.trace_id
     }
 
     /// Completely delete a trace by ID, destroying all associated resources

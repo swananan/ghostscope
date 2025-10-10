@@ -33,7 +33,7 @@ impl<'ctx> EbpfContext<'ctx> {
         // mainly read variables and send them via ringbuf.
 
         // Create a global variable if we need persistent storage
-        let global_name = format!("_var_{}", name);
+        let global_name = format!("_var_{name}");
         let global_var = match value {
             BasicValueEnum::IntValue(_) => {
                 let i64_type = self.context.i64_type();

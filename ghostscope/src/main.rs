@@ -1,4 +1,4 @@
-#![allow(clippy::uninlined_format_args)]
+// Keep binary clippy-clean without allow attributes
 
 mod cli;
 mod config;

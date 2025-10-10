@@ -26,9 +26,6 @@ pub struct GhostSession {
     pub source_path_resolver: SourcePathResolver, // Resolves DWARF paths to actual filesystem paths
     #[allow(dead_code)]
     pub debug_file: Option<String>, // Optional debug file path
-    #[allow(dead_code)]
-    pub is_attached: bool,
-    #[allow(dead_code)]
     pub config: Option<MergedConfig>, // Holds the merged configuration
 }
 
@@ -48,12 +45,12 @@ impl GhostSession {
                 .map(|p| p.to_string_lossy().to_string()),
             trace_manager: TraceManager::new(),
             source_path_resolver: SourcePathResolver::new(&config.source),
-            is_attached: false,
             config: Some(config.clone()),
         }
     }
 
     /// Create a new ghost session (without binary analysis - call load_binary separately)
+    #[allow(dead_code)]
     pub fn new(args: &ParsedArgs) -> Self {
         info!("Creating ghost session");
 
@@ -68,7 +65,6 @@ impl GhostSession {
                 .map(|p| p.to_string_lossy().to_string()),
             trace_manager: TraceManager::new(),
             source_path_resolver: SourcePathResolver::new(&Default::default()),
-            is_attached: false,
             config: None,
         }
     }
@@ -181,6 +177,7 @@ impl GhostSession {
     }
 
     /// Create ghost session and load binary in one step (now uses parallel loading)
+    #[allow(dead_code)]
     pub async fn new_with_binary(args: &ParsedArgs) -> Result<Self> {
         let mut session = Self::new(args);
         session.load_binary().await?;

@@ -51,7 +51,7 @@ async fn create_and_attach_loader(
 
             loader.attach_uprobe_with_program_name(
                 &config.binary_path,
-                &format!("0x{:x}", uprobe_offset), // Use address as function name
+                &format!("0x{uprobe_offset:x}"), // Use address as function name
                 Some(uprobe_offset),
                 target_pid.map(|p| p as i32),
                 Some(&config.ebpf_function_name),
@@ -105,7 +105,7 @@ pub async fn compile_and_load_script_for_tui(
                     pc_address: 0,
                     target_name: "compilation_failed".to_string(),
                     binary_path,
-                    status: ExecutionStatus::Failed(format!("Compilation error: {}", e)),
+                    status: ExecutionStatus::Failed(format!("Compilation error: {e}")),
                 }],
                 total_count: 1,
                 success_count: 0,
@@ -135,7 +135,7 @@ pub async fn compile_and_load_script_for_tui(
             target_name: config
                 .function_name
                 .clone()
-                .unwrap_or_else(|| format!("0x{:x}", config.function_address.unwrap_or(0))),
+                .unwrap_or_else(|| format!("{:#x}", config.function_address.unwrap_or(0))),
             binary_path: config.binary_path.clone(),
             status: ExecutionStatus::Success,
         });
@@ -210,13 +210,11 @@ pub async fn compile_and_load_script_for_tui(
 
         info!("Attaching {} uprobe configurations", uprobe_configs.len());
         for (i, config) in uprobe_configs.iter().enumerate() {
+            let fallback_name = format!("{:#x}", config.function_address.unwrap_or(0));
             info!(
                 "  Config {}: {:?} -> 0x{:x} (trace_id: {})",
                 i,
-                config
-                    .function_name
-                    .as_ref()
-                    .unwrap_or(&format!("0x{:x}", config.function_address.unwrap_or(0))),
+                config.function_name.as_ref().unwrap_or(&fallback_name),
                 config.uprobe_offset.unwrap_or(0),
                 config.assigned_trace_id
             );
@@ -225,10 +223,11 @@ pub async fn compile_and_load_script_for_tui(
         // Step 6: Attach uprobes individually and create traces with their own loaders
         let mut attached_count = 0;
         for config in &uprobe_configs {
+            let addr_disp = config.function_address.unwrap_or(0);
             let target_display = config
                 .function_name
                 .clone()
-                .unwrap_or_else(|| format!("0x{:x}", config.function_address.unwrap_or(0)));
+                .unwrap_or_else(|| format!("{addr_disp:#x}"));
 
             // Create individual loader for this config
             match create_and_attach_loader(config, session.target_pid).await {
@@ -256,20 +255,22 @@ pub async fn compile_and_load_script_for_tui(
 
                     // Register trace with its own loader
                     let _registered_trace_id = session.trace_manager.add_trace_with_id(
-                        config.assigned_trace_id,
-                        target_display.clone(),               // target
-                        script.to_string(),                   // script_content
-                        config.function_address.unwrap_or(0), // pc
-                        config.binary_path.clone(),           // binary_path
-                        target_display.clone(),               // target_display
-                        session.target_pid,                   // target_pid
-                        Some(loader),                         // Each trace gets its own loader
-                        format!(
-                            "gs_{}_{}_{}",
-                            session.target_pid.unwrap_or(0),
-                            target_display,
-                            config.assigned_trace_id
-                        ), // ebpf_function_name
+                        crate::tracing::manager::AddTraceParams {
+                            trace_id: config.assigned_trace_id,
+                            target: target_display.clone(),
+                            script_content: script.to_string(),
+                            pc: config.function_address.unwrap_or(0),
+                            binary_path: config.binary_path.clone(),
+                            target_display: target_display.clone(),
+                            target_pid: session.target_pid,
+                            loader: Some(loader),
+                            ebpf_function_name: format!(
+                                "gs_{}_{}_{}",
+                                session.target_pid.unwrap_or(0),
+                                target_display,
+                                config.assigned_trace_id
+                            ),
+                        },
                     );
 
                     // Enable the trace immediately since we just attached it
@@ -295,7 +296,7 @@ pub async fn compile_and_load_script_for_tui(
                     for result in &mut results {
                         if result.pc_address == config.function_address.unwrap_or(0) {
                             result.status =
-                                ExecutionStatus::Failed(format!("Failed to attach uprobe: {}", e));
+                                ExecutionStatus::Failed(format!("Failed to attach uprobe: {e}"));
                             success_count -= 1;
                             failed_count += 1;
                             break;
@@ -461,19 +462,17 @@ pub async fn compile_and_load_script_for_cli(
             Available functions (first 10):\n{}\n\
             \n\
             Tip: Run GhostScope in TUI mode to browse all available functions",
-            available_functions.iter().take(10).map(|f| format!("  - {}", f)).collect::<Vec<_>>().join("\n")
+            available_functions.iter().take(10).map(|f| format!("  - {f}")).collect::<Vec<_>>().join("\n")
         ));
     }
 
     info!("Attaching {} uprobe configurations", uprobe_configs.len());
     for (i, config) in uprobe_configs.iter().enumerate() {
+        let fallback_name = format!("{:#x}", config.function_address.unwrap_or(0));
         info!(
             "  Config {}: {:?} -> 0x{:x}",
             i,
-            config
-                .function_name
-                .as_ref()
-                .unwrap_or(&format!("0x{:x}", config.function_address.unwrap_or(0))),
+            config.function_name.as_ref().unwrap_or(&fallback_name),
             config.uprobe_offset.unwrap_or(0)
         );
     }
@@ -481,10 +480,11 @@ pub async fn compile_and_load_script_for_cli(
     // Step 4: Attach uprobes individually and create traces with their own loaders
     let mut attached_count = 0;
     for config in &uprobe_configs {
+        let addr_disp = config.function_address.unwrap_or(0);
         let target_display = config
             .function_name
             .clone()
-            .unwrap_or_else(|| format!("0x{:x}", config.function_address.unwrap_or(0)));
+            .unwrap_or_else(|| format!("{addr_disp:#x}"));
 
         // Create individual loader for this config
         match create_and_attach_loader(config, session.target_pid).await {
@@ -511,20 +511,22 @@ pub async fn compile_and_load_script_for_cli(
 
                 // Register trace with its own loader (CLI mode)
                 let _registered_trace_id = session.trace_manager.add_trace_with_id(
-                    config.assigned_trace_id,
-                    target_display.clone(),               // target
-                    script.to_string(),                   // script_content
-                    config.function_address.unwrap_or(0), // pc
-                    config.binary_path.clone(),           // binary_path
-                    target_display.clone(),               // target_display
-                    session.target_pid,                   // target_pid
-                    Some(loader),                         // Each trace gets its own loader
-                    format!(
-                        "gs_{}_{}_{}",
-                        session.target_pid.unwrap_or(0),
-                        target_display,
-                        config.assigned_trace_id
-                    ), // ebpf_function_name
+                    crate::tracing::manager::AddTraceParams {
+                        trace_id: config.assigned_trace_id,
+                        target: target_display.clone(),
+                        script_content: script.to_string(),
+                        pc: config.function_address.unwrap_or(0),
+                        binary_path: config.binary_path.clone(),
+                        target_display: target_display.clone(),
+                        target_pid: session.target_pid,
+                        loader: Some(loader),
+                        ebpf_function_name: format!(
+                            "gs_{}_{}_{}",
+                            session.target_pid.unwrap_or(0),
+                            target_display,
+                            config.assigned_trace_id
+                        ),
+                    },
                 );
 
                 // Enable the trace immediately since we just attached it

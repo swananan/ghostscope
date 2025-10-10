@@ -1,4 +1,9 @@
-#![allow(clippy::uninlined_format_args)]
+// Clippy: allow some lints in tests
+#![allow(
+    clippy::uninlined_format_args,
+    clippy::needless_borrows_for_generic_args,
+    dead_code
+)]
 
 //! Complex types script execution test
 //! - Uses a long-running test program with complex DWARF types
@@ -59,7 +64,7 @@ async fn run_ghostscope_with_script_for_pid_impl(
     }
 
     let mut command = Command::new(binary_path);
-    command.args(&args);
+    command.args(args);
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
 
