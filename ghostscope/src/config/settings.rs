@@ -40,17 +40,6 @@ impl std::fmt::Display for LogLevel {
 }
 
 impl LogLevel {
-    /// Convert to tracing level filter
-    pub fn to_tracing_level_filter(self) -> tracing::level_filters::LevelFilter {
-        match self {
-            LogLevel::Error => tracing::level_filters::LevelFilter::ERROR,
-            LogLevel::Warn => tracing::level_filters::LevelFilter::WARN,
-            LogLevel::Info => tracing::level_filters::LevelFilter::INFO,
-            LogLevel::Debug => tracing::level_filters::LevelFilter::DEBUG,
-            LogLevel::Trace => tracing::level_filters::LevelFilter::TRACE,
-        }
-    }
-
     /// Parse from string
     pub fn from_str(s: &str) -> Result<Self> {
         match s.to_lowercase().as_str() {

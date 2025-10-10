@@ -1739,24 +1739,76 @@ impl<'ctx> EbpfContext<'ctx> {
         use ghostscope_protocol::trace_event::PrintComplexFormatData;
         use InstructionType::PrintComplexFormat as IT;
 
-        // Calculate total size (reserve worst-case payload per-arg to avoid overflow)
-        let mut total_args_payload = 0usize;
+        // Calculate total size with buffer-capacity awareness to avoid overflow
+        // Instruction buffer capacity is currently 4096 (see create_instruction_buffer)
+        const INSTR_BUF_CAP: usize = 4096;
+        let fixed_overhead = std::mem::size_of::<InstructionHeader>()
+            + std::mem::size_of::<PrintComplexFormatData>();
+
+        // First pass: accumulate header bytes and static payload, record dynamic args
         let mut arg_count = 0u8;
-        for a in complex_args.iter() {
-            // Header bytes per-arg: var_name_index(2) + type_index(2) + status(1) + access_path_len(1) + access_path + data_len(2)
-            let header_len = 2 + 2 + 1 + 1 + a.access_path.len() + 2;
-            // Reserve payload bytes: for runtime reads, failures may carry errno(4)+addr(8) = 12 bytes
-            let reserved_payload = match &a.source {
+        let mut headers_total = 0usize;
+        let mut static_payload_total = 0usize;
+        let mut dynamic_indices: Vec<(usize, usize)> = Vec::new(); // (arg_idx, max_len)
+        let mut header_lens: Vec<usize> = Vec::with_capacity(complex_args.len());
+        for (idx, a) in complex_args.iter().enumerate() {
+            // Header bytes per-arg: var_name_index(2) + type_index(2) + access_path_len(1) + status(1) + data_len(2) + access_path
+            let header_len = 2 + 2 + 1 + 1 + 2 + a.access_path.len();
+            header_lens.push(header_len);
+            headers_total += header_len;
+
+            match &a.source {
+                ComplexArgSource::ImmediateBytes { bytes } => static_payload_total += bytes.len(),
+                ComplexArgSource::AddressValue { .. } => static_payload_total += 8,
+                ComplexArgSource::RuntimeRead { .. } => {
+                    static_payload_total += std::cmp::max(a.data_len, 12)
+                }
+                ComplexArgSource::ComputedInt { byte_len, .. } => static_payload_total += *byte_len,
+                ComplexArgSource::MemDump { len, .. } => static_payload_total += *len,
+                ComplexArgSource::MemDumpDynamic { max_len, .. } => {
+                    dynamic_indices.push((idx, *max_len))
+                }
+            }
+            arg_count = arg_count.saturating_add(1);
+        }
+
+        // Available space for all argument payloads within the instruction buffer
+        // Ensure we never exceed INSTR_BUF_CAP
+        let mut remaining_for_payload = INSTR_BUF_CAP
+            .saturating_sub(fixed_overhead)
+            .saturating_sub(headers_total);
+
+        // Allocate static payload first
+        remaining_for_payload = remaining_for_payload.saturating_sub(static_payload_total);
+
+        // Second pass: decide effective reserved payload for each arg
+        // Default to computed static payload; dynamic args get clamped to remaining space
+        let mut effective_reserved: Vec<usize> = Vec::with_capacity(complex_args.len());
+        for (idx, a) in complex_args.iter().enumerate() {
+            let reserved = match &a.source {
                 ComplexArgSource::ImmediateBytes { bytes } => bytes.len(),
                 ComplexArgSource::AddressValue { .. } => 8,
                 ComplexArgSource::RuntimeRead { .. } => std::cmp::max(a.data_len, 12),
                 ComplexArgSource::ComputedInt { byte_len, .. } => *byte_len,
                 ComplexArgSource::MemDump { len, .. } => *len,
-                ComplexArgSource::MemDumpDynamic { max_len, .. } => *max_len,
+                ComplexArgSource::MemDumpDynamic { .. } => {
+                    // find max_len for this dynamic arg and clamp to remaining
+                    let (_, max_len) = dynamic_indices
+                        .iter()
+                        .copied()
+                        .find(|(i, _)| *i == idx)
+                        .unwrap_or((idx, 0));
+                    let eff = std::cmp::min(max_len, remaining_for_payload);
+                    remaining_for_payload = remaining_for_payload.saturating_sub(eff);
+                    eff
+                }
             };
-            total_args_payload += header_len + reserved_payload;
-            arg_count = arg_count.saturating_add(1);
+            effective_reserved.push(reserved);
         }
+
+        // Now compute final inst_data_size using effective reservations
+        let total_args_payload: usize =
+            header_lens.iter().sum::<usize>() + effective_reserved.iter().sum::<usize>();
         let inst_data_size = std::mem::size_of::<PrintComplexFormatData>() + total_args_payload;
         let total_size = std::mem::size_of::<InstructionHeader>() + inst_data_size;
 
@@ -1847,18 +1899,11 @@ impl<'ctx> EbpfContext<'ctx> {
             )
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store arg_count: {e}")))?;
 
-        // Start of variable payload after PrintComplexFormatData — use compile-time offsets with reserved payload
+        // Start of variable payload after PrintComplexFormatData — use computed effective reservations
         let mut offset = std::mem::size_of::<PrintComplexFormatData>();
-        for a in complex_args.iter() {
+        for (arg_index, a) in complex_args.iter().enumerate() {
             // Per-arg reserved payload length
-            let reserved_len = match &a.source {
-                ComplexArgSource::ImmediateBytes { bytes } => bytes.len(),
-                ComplexArgSource::AddressValue { .. } => 8,
-                ComplexArgSource::RuntimeRead { .. } => std::cmp::max(a.data_len, 12),
-                ComplexArgSource::ComputedInt { byte_len, .. } => *byte_len,
-                ComplexArgSource::MemDump { len, .. } => *len,
-                ComplexArgSource::MemDumpDynamic { max_len, .. } => *max_len,
-            };
+            let reserved_len = effective_reserved[arg_index];
 
             // Base pointer = data_ptr + offset
             let arg_base = unsafe {
@@ -2167,8 +2212,10 @@ impl<'ctx> EbpfContext<'ctx> {
                 ComplexArgSource::MemDumpDynamic {
                     src_addr,
                     len_value,
-                    max_len,
+                    max_len: _,
                 } => {
+                    // Clamp runtime read to effective reserved length for this arg
+                    let eff_max_len = effective_reserved[arg_index] as u32;
                     // Read up to rlen=min(len_value, max_len) into helper buffer, then copy bytes into payload
                     let i32_ty = self.context.i32_type();
                     let rlen_i32 = if len_value.get_type().get_bit_width() > 32 {
@@ -2199,7 +2246,7 @@ impl<'ctx> EbpfContext<'ctx> {
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
                         .into_int_value();
 
-                    let max_const = i32_ty.const_int(*max_len as u64, false);
+                    let max_const = i32_ty.const_int(eff_max_len as u64, false);
                     let gt = self
                         .builder
                         .build_int_compare(inkwell::IntPredicate::UGT, rlen_nn, max_const, "mdd_gt")

@@ -123,6 +123,7 @@ The demo below shows GhostScope tracing an nginx worker process with debug infor
 
 - [**TUI Reference**](docs/tui-reference.md)
   Complete keyboard shortcuts and panel navigation
+  
 
 - [**Command Reference**](docs/input-commands.md)
   All available commands for Input Mode

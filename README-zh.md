@@ -118,6 +118,7 @@ GhostScope 将编译后的二进制文件转变为可观测系统。在函数入
 
 - [**TUI 参考手册**](docs/zh/tui-reference.md)
   完整的快捷键和面板导航
+  
 
 - [**命令参考**](docs/zh/input-commands.md)
   输入模式所有可用命令
