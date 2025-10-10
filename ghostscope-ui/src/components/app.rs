@@ -3640,6 +3640,15 @@ impl App {
 
     /// Handle Ctrl+C with double-press quit and special mode handling
     fn handle_ctrl_c(&mut self) -> Vec<Action> {
+        // If eBPF panel is in expanded view, close it on single Ctrl+C
+        if self.state.ui.focus.current_panel == crate::action::PanelType::EbpfInfo
+            && self.state.ebpf_panel.is_expanded()
+        {
+            self.state.ebpf_panel.close_expanded();
+            // Do not treat as first press for quitting
+            self.state.expecting_second_ctrl_c = false;
+            return vec![];
+        }
         // Check if this is a double Ctrl+C press (consecutive, no timeout)
         let is_double_press = self.state.expecting_second_ctrl_c;
 

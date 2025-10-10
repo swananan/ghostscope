@@ -649,7 +649,7 @@ fn parse_builtin_call(pair: Pair<Rule>) -> Result<Expr> {
             let a_expr = parse_expr(a_node)?;
             let b_node = it.next().ok_or(ParseError::InvalidExpression)?; // expr
             let b_expr = parse_expr(b_node)?;
-            let n_node = it.next().ok_or(ParseError::InvalidExpression)?; // expr (支持变量或常量)
+            let n_node = it.next().ok_or(ParseError::InvalidExpression)?;
             let n_expr = parse_expr(n_node)?;
 
             Ok(Expr::BuiltinCall {

@@ -120,12 +120,22 @@ pub struct EbpfPanelState {
     // Numeric jump input for N+G
     pub numeric_prefix: Option<String>,
     pub g_pressed: bool, // whether first 'g' was pressed (for 'gg')
+    // Expanded card view state
+    pub view_mode: EbpfViewMode,
+    pub expanded_scroll: usize,   // scroll offset inside expanded card
+    pub last_inner_height: usize, // last known inner height (for half-page scroll)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DisplayMode {
     AutoRefresh, // Default mode: always show latest trace, auto-scroll
     Scroll,      // Manual mode: show cursor, manual navigation
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EbpfViewMode {
+    List,
+    Expanded { index: usize, scroll: usize },
 }
 
 impl EbpfPanelState {
@@ -145,6 +155,9 @@ impl EbpfPanelState {
             next_message_id: 1,
             numeric_prefix: None,
             g_pressed: false,
+            view_mode: EbpfViewMode::List,
+            expanded_scroll: 0,
+            last_inner_height: 0,
         }
     }
 
@@ -304,6 +317,54 @@ impl EbpfPanelState {
         self.display_mode = DisplayMode::AutoRefresh;
         self.show_cursor = false;
         self.auto_scroll = true;
+    }
+
+    // Expanded view helpers
+    pub fn open_expanded_current(&mut self) {
+        if self.cursor_trace_index < self.trace_events.len() {
+            self.view_mode = EbpfViewMode::Expanded {
+                index: self.cursor_trace_index,
+                scroll: 0,
+            };
+            self.expanded_scroll = 0;
+        }
+    }
+
+    pub fn close_expanded(&mut self) {
+        self.view_mode = EbpfViewMode::List;
+        self.expanded_scroll = 0;
+    }
+
+    pub fn is_expanded(&self) -> bool {
+        matches!(self.view_mode, EbpfViewMode::Expanded { .. })
+    }
+
+    pub fn expanded_index(&self) -> Option<usize> {
+        if let EbpfViewMode::Expanded { index, .. } = self.view_mode {
+            Some(index)
+        } else {
+            None
+        }
+    }
+
+    pub fn set_expanded_scroll(&mut self, value: usize) {
+        self.expanded_scroll = value;
+        if let EbpfViewMode::Expanded { index, .. } = self.view_mode {
+            self.view_mode = EbpfViewMode::Expanded {
+                index,
+                scroll: self.expanded_scroll,
+            };
+        }
+    }
+
+    pub fn scroll_expanded_up(&mut self, lines: usize) {
+        let new_off = self.expanded_scroll.saturating_sub(lines);
+        self.set_expanded_scroll(new_off);
+    }
+
+    pub fn scroll_expanded_down(&mut self, lines: usize, max_lines: usize) {
+        let new_off = (self.expanded_scroll + lines).min(max_lines);
+        self.set_expanded_scroll(new_off);
     }
 }
 

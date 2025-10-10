@@ -133,7 +133,13 @@ Search and quickly switch between source files. File list comes from all source 
 
 ## Panel 2: eBPF Output Panel
 
-Displays real-time trace events. Operates in two display modes: **Auto-Refresh** (default) and **Scroll** (manual navigation).
+Displays real-time trace events as cards. Two display modes: **Auto-Refresh** (default) and **Scroll** (manual navigation).
+
+### Carded Output and Expanded View
+
+- Each event renders as a card with header and body.
+- In list view, each card shows up to 3 wrapped lines; if truncated, a bold yellow ` …` appears at the end of line 3.
+- Press `Enter` to expand the selected card. In expanded view: `j/k/↑/↓` scroll, `Ctrl+U/D` half-page, `PgUp/PgDn` page, `Esc` or `Ctrl+C` to close.
 
 ### Basic Navigation
 

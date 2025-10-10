@@ -70,34 +70,53 @@ async fn run_tui_coordinator_with_ui_config_and_merged_config(
         })
     };
 
-    // Create compile options from command line arguments
-    let compile_options = ghostscope_compiler::CompileOptions {
-        save_llvm_ir: parsed_args.should_save_llvm_ir,
-        save_ast: parsed_args.should_save_ast,
-        save_ebpf: parsed_args.should_save_ebpf,
-        binary_path_hint: None, // Will be set later when we know the binary
-        ringbuf_size: 262144,   // Default, will be overridden by config
-        proc_module_offsets_max_entries: 4096, // Default, will be overridden by config
-        perf_page_count: 64,    // Default, will be overridden by config
-        event_map_type: ghostscope_compiler::EventMapType::RingBuf, // Will be overridden by config
-        mem_dump_cap: 1024,
-        compare_cap: 64,
-        max_trace_event_size: 32768,
-    };
-
     // Start the runtime coordination task with session from DWARF processing
     let runtime_task = tokio::spawn(async move {
         // Wait for DWARF processing to complete and get the session
         match dwarf_task.await {
             Ok(Ok(session)) => {
+                // Build compile options from merged config using the same logic as CLI
+                // Derive a binary path hint from the session (main executable), if available
+                let binary_path_hint = session
+                    .process_analyzer
+                    .as_ref()
+                    .and_then(|analyzer| analyzer.get_main_executable())
+                    .map(|main_module| {
+                        std::path::Path::new(&main_module.path)
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("unknown")
+                            .to_string()
+                    });
+
+                let compile_options = merged_config.get_compile_options(
+                    parsed_args.should_save_llvm_ir,
+                    parsed_args.should_save_ebpf,
+                    parsed_args.should_save_ast,
+                    binary_path_hint,
+                );
+
                 run_runtime_coordinator(runtime_channels, Some(session), compile_options).await
             }
             Ok(Err(e)) => {
                 error!("DWARF processing failed: {}", e);
+                // Fall back to defaults if session failed
+                let compile_options = merged_config.get_compile_options(
+                    parsed_args.should_save_llvm_ir,
+                    parsed_args.should_save_ebpf,
+                    parsed_args.should_save_ast,
+                    None,
+                );
                 run_runtime_coordinator(runtime_channels, None, compile_options).await
             }
             Err(e) => {
                 error!("DWARF task panicked: {}", e);
+                let compile_options = merged_config.get_compile_options(
+                    parsed_args.should_save_llvm_ir,
+                    parsed_args.should_save_ebpf,
+                    parsed_args.should_save_ast,
+                    None,
+                );
                 run_runtime_coordinator(runtime_channels, None, compile_options).await
             }
         }
@@ -140,6 +159,9 @@ async fn run_runtime_coordinator(
                 match result {
                     Ok(events) => {
                         if let Some(ref _session) = session {
+                            if !events.is_empty() {
+                                tracing::debug!("Forwarding {} trace events to UI", events.len());
+                            }
                             for event_data in events {
                                 let _ = trace_sender.send(event_data);
                             }
