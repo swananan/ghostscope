@@ -1,4 +1,4 @@
-#![allow(clippy::uninlined_format_args)]
+// Keep library clippy-clean without allow attributes
 
 // New modular organization
 pub mod ebpf;

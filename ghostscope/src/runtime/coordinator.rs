@@ -45,30 +45,7 @@ pub async fn run_tui_coordinator_with_config(config: MergedConfig) -> Result<()>
         .await
 }
 
-/// Run GhostScope in TUI mode with tokio task coordination (without merged config)
-#[allow(dead_code)]
-pub async fn run_tui_coordinator(parsed_args: ParsedArgs) -> Result<()> {
-    // Use default UI configuration when no merged config is available
-    let ui_config = ghostscope_ui::UiConfig {
-        layout_mode: match parsed_args.layout_mode {
-            crate::config::LayoutMode::Horizontal => ghostscope_ui::LayoutMode::Horizontal,
-            crate::config::LayoutMode::Vertical => ghostscope_ui::LayoutMode::Vertical,
-        },
-        default_focus: ghostscope_ui::PanelType::InteractiveCommand, // Default
-        panel_ratios: [4, 3, 3],                                     // Default
-        history: ghostscope_ui::HistoryConfig::default(),
-        ebpf_max_messages: 2000, // Default
-    };
-
-    // Create a default MergedConfig from ParsedArgs for compatibility
-    let default_config = MergedConfig::new(
-        parsed_args.clone(),
-        crate::config::settings::Config::default(),
-    );
-
-    run_tui_coordinator_with_ui_config_and_merged_config(parsed_args, ui_config, default_config)
-        .await
-}
+// Removed unused legacy TUI coordinator to satisfy clippy without allow attributes
 
 /// Internal function to run TUI coordinator with UI configuration
 async fn run_tui_coordinator_with_ui_config_and_merged_config(
@@ -261,7 +238,7 @@ async fn run_runtime_coordinator(
                         if let Some(ref mut sess) = session {
                             sess.source_path_resolver.add_search_dir(dir.clone());
                             let _ = runtime_channels.status_sender.send(RuntimeStatus::SrcPathUpdated {
-                                message: format!("Added search directory: {}", dir),
+                                message: format!("Added search directory: {dir}"),
                             });
                         } else {
                             let _ = runtime_channels.status_sender.send(RuntimeStatus::SrcPathFailed {
@@ -278,7 +255,7 @@ async fn run_runtime_coordinator(
                         if let Some(ref mut sess) = session {
                             sess.source_path_resolver.add_substitution(from.clone(), to.clone());
                             let _ = runtime_channels.status_sender.send(RuntimeStatus::SrcPathUpdated {
-                                message: format!("Added path mapping: {} -> {}", from, to),
+                                message: format!("Added path mapping: {from} -> {to}"),
                             });
                         } else {
                             let _ = runtime_channels.status_sender.send(RuntimeStatus::SrcPathFailed {
@@ -295,12 +272,12 @@ async fn run_runtime_coordinator(
                         let should_reload = if let Some(ref mut sess) = session {
                             if sess.source_path_resolver.remove(&pattern) {
                                 let _ = runtime_channels.status_sender.send(RuntimeStatus::SrcPathUpdated {
-                                    message: format!("Removed path rule: {}", pattern),
+                                    message: format!("Removed path rule: {pattern}"),
                                 });
                                 true
                             } else {
                                 let _ = runtime_channels.status_sender.send(RuntimeStatus::SrcPathFailed {
-                                    error: format!("No matching path rule found: {}", pattern),
+                                    error: format!("No matching path rule found: {pattern}"),
                                 });
                                 false
                             }

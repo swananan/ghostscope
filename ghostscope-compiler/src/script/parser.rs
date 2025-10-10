@@ -1188,7 +1188,7 @@ trace foo {
         let r = parse(bad);
         match r {
             Err(ParseError::SyntaxError(msg)) => assert!(msg.contains("Unclosed string literal")),
-            other => panic!("expected SyntaxError, got {:?}", other),
+            other => panic!("expected SyntaxError, got {other:?}"),
         }
     }
 }

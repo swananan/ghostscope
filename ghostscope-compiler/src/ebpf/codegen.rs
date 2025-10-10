@@ -69,9 +69,6 @@ struct ComplexArg<'ctx> {
 }
 
 impl<'ctx> EbpfContext<'ctx> {
-    #[allow(dead_code)]
-    #[allow(dead_code)]
-    const DEFAULT_MEM_DUMP_LEN: usize = 256; // legacy default, replaced by compile_options.mem_dump_cap
     /// Unified expression resolver: returns a ComplexArg carrying
     /// a consistent var_name_index/type_index/access_path/data_len/source
     /// with strict priority: script variables -> DWARF (locals/params/globals).
@@ -180,7 +177,7 @@ impl<'ctx> EbpfContext<'ctx> {
             E::AddressOf(inner) => {
                 let var = self
                     .query_dwarf_for_complex_expr(inner)?
-                    .ok_or_else(|| CodeGenError::VariableNotFound(format!("{:?}", inner)))?;
+                    .ok_or_else(|| CodeGenError::VariableNotFound(format!("{inner:?}")))?;
                 let inner_ty = var.dwarf_type.as_ref().ok_or_else(|| {
                     CodeGenError::DwarfError("Expression has no DWARF type information".to_string())
                 })?;
@@ -210,7 +207,22 @@ impl<'ctx> EbpfContext<'ctx> {
             | E::ChainAccess(_)) => {
                 let var = self
                     .query_dwarf_for_complex_expr(expr)?
-                    .ok_or_else(|| CodeGenError::VariableNotFound(format!("{:?}", expr)))?;
+                    .ok_or_else(|| CodeGenError::VariableNotFound(format!("{expr:?}")))?;
+                if matches!(
+                    var.evaluation_result,
+                    ghostscope_dwarf::EvaluationResult::Optimized
+                ) {
+                    let ti = ghostscope_protocol::type_info::TypeInfo::OptimizedOut {
+                        name: var.name.clone(),
+                    };
+                    return Ok(ComplexArg {
+                        var_name_index: self.trace_context.add_variable_name(var.name.clone()),
+                        type_index: self.trace_context.add_type(ti),
+                        access_path: Vec::new(),
+                        data_len: 0,
+                        source: ComplexArgSource::ImmediateBytes { bytes: Vec::new() },
+                    });
+                }
                 let dwarf_type = var.dwarf_type.as_ref().ok_or_else(|| {
                     CodeGenError::DwarfError("Expression has no DWARF type information".to_string())
                 })?;
@@ -238,6 +250,24 @@ impl<'ctx> EbpfContext<'ctx> {
             E::Variable(name) => {
                 if let Some(v) = self.query_dwarf_for_variable(name)? {
                     if let Some(ref t) = v.dwarf_type {
+                        // If DWARF reports optimized-out at this PC, emit OptimizedOut type with no data
+                        if matches!(
+                            v.evaluation_result,
+                            ghostscope_dwarf::EvaluationResult::Optimized
+                        ) {
+                            let ti = ghostscope_protocol::type_info::TypeInfo::OptimizedOut {
+                                name: v.name.clone(),
+                            };
+                            return Ok(ComplexArg {
+                                var_name_index: self
+                                    .trace_context
+                                    .add_variable_name(v.name.clone()),
+                                type_index: self.trace_context.add_type(ti),
+                                access_path: Vec::new(),
+                                data_len: 0,
+                                source: ComplexArgSource::ImmediateBytes { bytes: Vec::new() },
+                            });
+                        }
                         let is_link_addr = matches!(
                             v.evaluation_result,
                             ghostscope_dwarf::EvaluationResult::MemoryLocation(
@@ -466,7 +496,7 @@ impl<'ctx> EbpfContext<'ctx> {
             .const_int(InstructionType::PrintComplexVariable as u64, false);
         self.builder
             .build_store(inst_buffer, inst_type_val)
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store inst_type: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store inst_type: {e}")))?;
 
         // Write data_length (u16) at offset 1
         let data_length_ptr = unsafe {
@@ -478,7 +508,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     "data_length_ptr",
                 )
                 .map_err(|e| {
-                    CodeGenError::LLVMError(format!("Failed to get data_length GEP: {}", e))
+                    CodeGenError::LLVMError(format!("Failed to get data_length GEP: {e}"))
                 })?
         };
         let data_length_ptr_cast = self
@@ -488,9 +518,7 @@ impl<'ctx> EbpfContext<'ctx> {
                 self.context.ptr_type(AddressSpace::default()),
                 "data_length_ptr_cast",
             )
-            .map_err(|e| {
-                CodeGenError::LLVMError(format!("Failed to cast data_length ptr: {}", e))
-            })?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast data_length ptr: {e}")))?;
         self.builder
             .build_store(
                 data_length_ptr_cast,
@@ -498,7 +526,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     .i16_type()
                     .const_int(total_data_length as u64, false),
             )
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_length: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_length: {e}")))?;
 
         // Data pointer (after header)
         let data_ptr = unsafe {
@@ -509,7 +537,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     &[self.context.i32_type().const_int(header_size as u64, false)],
                     "data_ptr",
                 )
-                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get data GEP: {}", e)))?
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get data GEP: {e}")))?
         };
 
         // var_name_index (u16)
@@ -528,7 +556,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     "var_name_index_ptr_i8",
                 )
                 .map_err(|e| {
-                    CodeGenError::LLVMError(format!("Failed to get var_name_index GEP: {}", e))
+                    CodeGenError::LLVMError(format!("Failed to get var_name_index GEP: {e}"))
                 })?
         };
         let var_name_index_ptr_i16 = self
@@ -539,13 +567,11 @@ impl<'ctx> EbpfContext<'ctx> {
                 "var_name_index_ptr_i16",
             )
             .map_err(|e| {
-                CodeGenError::LLVMError(format!("Failed to cast var_name_index ptr: {}", e))
+                CodeGenError::LLVMError(format!("Failed to cast var_name_index ptr: {e}"))
             })?;
         self.builder
             .build_store(var_name_index_ptr_i16, var_name_index_val)
-            .map_err(|e| {
-                CodeGenError::LLVMError(format!("Failed to store var_name_index: {}", e))
-            })?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store var_name_index: {e}")))?;
 
         // type_index (u16)
         let type_index_offset = std::mem::offset_of!(PrintComplexVariableData, type_index) as u64;
@@ -558,7 +584,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     "type_index_ptr_i8",
                 )
                 .map_err(|e| {
-                    CodeGenError::LLVMError(format!("Failed to get type_index GEP: {}", e))
+                    CodeGenError::LLVMError(format!("Failed to get type_index GEP: {e}"))
                 })?
         };
         let type_index_ptr = self
@@ -568,13 +594,11 @@ impl<'ctx> EbpfContext<'ctx> {
                 self.context.ptr_type(AddressSpace::default()),
                 "type_index_ptr_i16",
             )
-            .map_err(|e| {
-                CodeGenError::LLVMError(format!("Failed to cast type_index ptr: {}", e))
-            })?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast type_index ptr: {e}")))?;
         let type_index_val = self.context.i16_type().const_int(type_index as u64, false);
         self.builder
             .build_store(type_index_ptr, type_index_val)
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store type_index: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store type_index: {e}")))?;
 
         // access_path_len (u8) = 0
         let access_path_len_off =
@@ -591,13 +615,13 @@ impl<'ctx> EbpfContext<'ctx> {
                     "access_path_len_ptr",
                 )
                 .map_err(|e| {
-                    CodeGenError::LLVMError(format!("Failed to get access_path_len GEP: {}", e))
+                    CodeGenError::LLVMError(format!("Failed to get access_path_len GEP: {e}"))
                 })?
         };
         self.builder
             .build_store(access_path_len_ptr, self.context.i8_type().const_zero())
             .map_err(|e| {
-                CodeGenError::LLVMError(format!("Failed to store access_path_len: {}", e))
+                CodeGenError::LLVMError(format!("Failed to store access_path_len: {e}"))
             })?;
 
         // status (u8) = 0
@@ -610,11 +634,11 @@ impl<'ctx> EbpfContext<'ctx> {
                     &[self.context.i32_type().const_int(status_off, false)],
                     "status_ptr",
                 )
-                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get status GEP: {}", e)))?
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get status GEP: {e}")))?
         };
         self.builder
             .build_store(status_ptr, self.context.i8_type().const_zero())
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store status: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store status: {e}")))?;
 
         // data_len (u16)
         let data_len_off = std::mem::offset_of!(PrintComplexVariableData, data_len) as u64;
@@ -626,9 +650,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     &[self.context.i32_type().const_int(data_len_off, false)],
                     "data_len_ptr",
                 )
-                .map_err(|e| {
-                    CodeGenError::LLVMError(format!("Failed to get data_len GEP: {}", e))
-                })?
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get data_len GEP: {e}")))?
         };
         let data_len_ptr_cast = self
             .builder
@@ -637,13 +659,13 @@ impl<'ctx> EbpfContext<'ctx> {
                 self.context.ptr_type(AddressSpace::default()),
                 "data_len_ptr_cast",
             )
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast data_len ptr: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast data_len ptr: {e}")))?;
         self.builder
             .build_store(
                 data_len_ptr_cast,
                 self.context.i16_type().const_int(byte_len as u64, false),
             )
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_len: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_len: {e}")))?;
 
         // variable data starts right after PrintComplexVariableData (no access path)
         let var_data_ptr = unsafe {
@@ -657,9 +679,7 @@ impl<'ctx> EbpfContext<'ctx> {
                         .const_int(data_struct_size as u64, false)],
                     "var_data_ptr",
                 )
-                .map_err(|e| {
-                    CodeGenError::LLVMError(format!("Failed to get var_data GEP: {}", e))
-                })?
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get var_data GEP: {e}")))?
         };
 
         // Store computed integer value into payload according to byte_len
@@ -864,11 +884,11 @@ impl<'ctx> EbpfContext<'ctx> {
                 E::AddressOf(p) => format!("&{}", inner(p)),
                 E::ChainAccess(v) => v.join("."),
                 E::Int(v) => v.to_string(),
-                E::String(s) => format!("\"{}\"", s),
-                E::Float(v) => format!("{}", v),
+                E::String(s) => format!("\"{s}\""),
+                E::Float(v) => format!("{v}"),
                 E::UnaryNot(e1) => format!("!{}", inner(e1)),
                 E::Bool(v) => v.to_string(),
-                E::SpecialVar(s) => format!("${}", s),
+                E::SpecialVar(s) => format!("${s}"),
                 E::BuiltinCall { name, args } => {
                     let arg_strs: Vec<String> = args.iter().map(inner).collect();
                     format!("{}({})", name, arg_strs.join(", "))
@@ -974,10 +994,7 @@ impl<'ctx> EbpfContext<'ctx> {
                                 "cond_bool",
                             )
                             .map_err(|e| {
-                                CodeGenError::LLVMError(format!(
-                                    "Failed to create condition: {}",
-                                    e
-                                ))
+                                CodeGenError::LLVMError(format!("Failed to create condition: {e}"))
                             })?
                     }
                     _ => {
@@ -1010,7 +1027,7 @@ impl<'ctx> EbpfContext<'ctx> {
                 self.builder
                     .build_conditional_branch(cond_bool, then_block, else_block)
                     .map_err(|e| {
-                        CodeGenError::LLVMError(format!("Failed to create branch: {}", e))
+                        CodeGenError::LLVMError(format!("Failed to create branch: {e}"))
                     })?;
 
                 // Build then block
@@ -1022,7 +1039,7 @@ impl<'ctx> EbpfContext<'ctx> {
                 self.builder
                     .build_unconditional_branch(merge_block)
                     .map_err(|e| {
-                        CodeGenError::LLVMError(format!("Failed to branch to merge: {}", e))
+                        CodeGenError::LLVMError(format!("Failed to branch to merge: {e}"))
                     })?;
 
                 // Build else block
@@ -1034,7 +1051,7 @@ impl<'ctx> EbpfContext<'ctx> {
                 self.builder
                     .build_unconditional_branch(merge_block)
                     .map_err(|e| {
-                        CodeGenError::LLVMError(format!("Failed to branch to merge: {}", e))
+                        CodeGenError::LLVMError(format!("Failed to branch to merge: {e}"))
                     })?;
 
                 // Continue with merge block
@@ -1283,7 +1300,7 @@ impl<'ctx> EbpfContext<'ctx> {
                                 // Fallback: DWARF address (for arrays/char[N])
                                 let var =
                                     self.query_dwarf_for_complex_expr(expr)?.ok_or_else(|| {
-                                        CodeGenError::VariableNotFound(format!("{:?}", expr))
+                                        CodeGenError::VariableNotFound(format!("{expr:?}"))
                                     })?;
                                 let mod_hint = self.take_module_hint();
                                 self.evaluation_result_to_address_with_hint(
@@ -1379,7 +1396,7 @@ impl<'ctx> EbpfContext<'ctx> {
                                 iv
                             } else {
                                 let var = self.query_dwarf_for_complex_expr(val_expr)?.ok_or_else(
-                                    || CodeGenError::VariableNotFound(format!("{:?}", val_expr)),
+                                    || CodeGenError::VariableNotFound(format!("{val_expr:?}")),
                                 )?;
                                 let mod_hint = self.take_module_hint();
                                 self.evaluation_result_to_address_with_hint(
@@ -1424,8 +1441,7 @@ impl<'ctx> EbpfContext<'ctx> {
                             }
                             if !self.variable_exists(&name) {
                                 return Err(CodeGenError::TypeError(format!(
-                                    "capture length variable '{}' not found",
-                                    name
+                                    "capture length variable '{name}' not found"
                                 )));
                             }
                             // length as computed int
@@ -1490,7 +1506,7 @@ impl<'ctx> EbpfContext<'ctx> {
                                 iv
                             } else {
                                 let var = self.query_dwarf_for_complex_expr(val_expr)?.ok_or_else(
-                                    || CodeGenError::VariableNotFound(format!("{:?}", val_expr)),
+                                    || CodeGenError::VariableNotFound(format!("{val_expr:?}")),
                                 )?;
                                 let mod_hint = self.take_module_hint();
                                 self.evaluation_result_to_address_with_hint(
@@ -1753,7 +1769,7 @@ impl<'ctx> EbpfContext<'ctx> {
         let inst_type_val = self.context.i8_type().const_int(IT as u8 as u64, false);
         self.builder
             .build_store(buffer, inst_type_val)
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store inst_type: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store inst_type: {e}")))?;
         // data_length at +1
         let data_length_ptr = unsafe {
             self.builder
@@ -1764,7 +1780,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     "data_length_ptr",
                 )
                 .map_err(|e| {
-                    CodeGenError::LLVMError(format!("Failed to get data_length GEP: {}", e))
+                    CodeGenError::LLVMError(format!("Failed to get data_length GEP: {e}"))
                 })?
         };
         let data_length_i16_ptr = self
@@ -1774,16 +1790,14 @@ impl<'ctx> EbpfContext<'ctx> {
                 self.context.ptr_type(AddressSpace::default()),
                 "data_length_i16_ptr",
             )
-            .map_err(|e| {
-                CodeGenError::LLVMError(format!("Failed to cast data_length ptr: {}", e))
-            })?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast data_length ptr: {e}")))?;
         let data_length_val = self
             .context
             .i16_type()
             .const_int(inst_data_size as u64, false);
         self.builder
             .build_store(data_length_i16_ptr, data_length_val)
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_length: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_length: {e}")))?;
 
         // Write PrintComplexFormatData at offset 4
         let data_ptr = unsafe {
@@ -1795,7 +1809,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     "pcf_data_ptr",
                 )
                 .map_err(|e| {
-                    CodeGenError::LLVMError(format!("Failed to get pcf_data_ptr GEP: {}", e))
+                    CodeGenError::LLVMError(format!("Failed to get pcf_data_ptr GEP: {e}"))
                 })?
         };
 
@@ -1807,14 +1821,14 @@ impl<'ctx> EbpfContext<'ctx> {
                 self.context.ptr_type(AddressSpace::default()),
                 "fsi_ptr",
             )
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast fsi_ptr: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast fsi_ptr: {e}")))?;
         let fsi_val = self
             .context
             .i16_type()
             .const_int(format_string_index as u64, false);
         self.builder
             .build_store(fsi_ptr, fsi_val)
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store fsi: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store fsi: {e}")))?;
         // arg_count (u8) at +2
         let arg_cnt_ptr = unsafe {
             self.builder
@@ -1824,16 +1838,14 @@ impl<'ctx> EbpfContext<'ctx> {
                     &[self.context.i32_type().const_int(2, false)],
                     "arg_count_ptr",
                 )
-                .map_err(|e| {
-                    CodeGenError::LLVMError(format!("Failed to get arg_count GEP: {}", e))
-                })?
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get arg_count GEP: {e}")))?
         };
         self.builder
             .build_store(
                 arg_cnt_ptr,
                 self.context.i8_type().const_int(arg_count as u64, false),
             )
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store arg_count: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store arg_count: {e}")))?;
 
         // Start of variable payload after PrintComplexFormatData — use compile-time offsets with reserved payload
         let mut offset = std::mem::size_of::<PrintComplexFormatData>();
@@ -1858,7 +1870,7 @@ impl<'ctx> EbpfContext<'ctx> {
                         "arg_base",
                     )
                     .map_err(|e| {
-                        CodeGenError::LLVMError(format!("Failed to get arg_base GEP: {}", e))
+                        CodeGenError::LLVMError(format!("Failed to get arg_base GEP: {e}"))
                     })?
             };
 
@@ -1870,7 +1882,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     self.context.ptr_type(AddressSpace::default()),
                     "vni_cast",
                 )
-                .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast vni ptr: {}", e)))?;
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast vni ptr: {e}")))?;
             self.builder
                 .build_store(
                     vni_cast,
@@ -1878,7 +1890,7 @@ impl<'ctx> EbpfContext<'ctx> {
                         .i16_type()
                         .const_int(a.var_name_index as u64, false),
                 )
-                .map_err(|e| CodeGenError::LLVMError(format!("Failed to store vni: {}", e)))?;
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to store vni: {e}")))?;
 
             // type_index(u16) at +2
             let ti_ptr = unsafe {
@@ -1889,7 +1901,7 @@ impl<'ctx> EbpfContext<'ctx> {
                         &[self.context.i32_type().const_int(2, false)],
                         "ti_ptr",
                     )
-                    .map_err(|e| CodeGenError::LLVMError(format!("Failed to get ti GEP: {}", e)))?
+                    .map_err(|e| CodeGenError::LLVMError(format!("Failed to get ti GEP: {e}")))?
             };
             let ti_cast = self
                 .builder
@@ -1898,7 +1910,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     self.context.ptr_type(AddressSpace::default()),
                     "ti_cast",
                 )
-                .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast ti ptr: {}", e)))?;
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast ti ptr: {e}")))?;
             self.builder
                 .build_store(
                     ti_cast,
@@ -1906,7 +1918,7 @@ impl<'ctx> EbpfContext<'ctx> {
                         .i16_type()
                         .const_int(a.type_index as u64, false),
                 )
-                .map_err(|e| CodeGenError::LLVMError(format!("Failed to store ti: {}", e)))?;
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to store ti: {e}")))?;
 
             // status(u8) at +5
             let apl_ptr = unsafe {
@@ -1918,12 +1930,12 @@ impl<'ctx> EbpfContext<'ctx> {
                         "status_ptr",
                     )
                     .map_err(|e| {
-                        CodeGenError::LLVMError(format!("Failed to get status GEP: {}", e))
+                        CodeGenError::LLVMError(format!("Failed to get status GEP: {e}"))
                     })?
             };
             self.builder
                 .build_store(apl_ptr, self.context.i8_type().const_int(0, false))
-                .map_err(|e| CodeGenError::LLVMError(format!("Failed to store status: {}", e)))?;
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to store status: {e}")))?;
 
             // access_path_len(u8) at +4
             let apl_ptr2 = unsafe {
@@ -1934,7 +1946,7 @@ impl<'ctx> EbpfContext<'ctx> {
                         &[self.context.i32_type().const_int(4, false)],
                         "apl_ptr",
                     )
-                    .map_err(|e| CodeGenError::LLVMError(format!("Failed to get apl GEP: {}", e)))?
+                    .map_err(|e| CodeGenError::LLVMError(format!("Failed to get apl GEP: {e}")))?
             };
             self.builder
                 .build_store(
@@ -1943,7 +1955,7 @@ impl<'ctx> EbpfContext<'ctx> {
                         .i8_type()
                         .const_int(a.access_path.len() as u64, false),
                 )
-                .map_err(|e| CodeGenError::LLVMError(format!("Failed to store apl: {}", e)))?;
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to store apl: {e}")))?;
 
             // access_path bytes at +6..+6+len
             for (i, b) in a.access_path.iter().enumerate() {
@@ -1953,16 +1965,16 @@ impl<'ctx> EbpfContext<'ctx> {
                             self.context.i8_type(),
                             arg_base,
                             &[self.context.i32_type().const_int((6 + i) as u64, false)],
-                            &format!("ap_byte_{}", i),
+                            &format!("ap_byte_{i}"),
                         )
                         .map_err(|e| {
-                            CodeGenError::LLVMError(format!("Failed to get ap byte GEP: {}", e))
+                            CodeGenError::LLVMError(format!("Failed to get ap byte GEP: {e}"))
                         })?
                 };
                 self.builder
                     .build_store(byte_ptr, self.context.i8_type().const_int(*b as u64, false))
                     .map_err(|e| {
-                        CodeGenError::LLVMError(format!("Failed to store ap byte: {}", e))
+                        CodeGenError::LLVMError(format!("Failed to store ap byte: {e}"))
                     })?;
             }
 
@@ -1978,7 +1990,7 @@ impl<'ctx> EbpfContext<'ctx> {
                             .const_int((6 + a.access_path.len()) as u64, false)],
                         "dl_ptr",
                     )
-                    .map_err(|e| CodeGenError::LLVMError(format!("Failed to get dl GEP: {}", e)))?
+                    .map_err(|e| CodeGenError::LLVMError(format!("Failed to get dl GEP: {e}")))?
             };
             let dl_cast = self
                 .builder
@@ -1987,7 +1999,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     self.context.ptr_type(AddressSpace::default()),
                     "dl_cast",
                 )
-                .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast dl ptr: {}", e)))?;
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast dl ptr: {e}")))?;
             self.builder
                 .build_store(
                     dl_cast,
@@ -1995,7 +2007,7 @@ impl<'ctx> EbpfContext<'ctx> {
                         .i16_type()
                         .const_int(reserved_len as u64, false),
                 )
-                .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_len: {}", e)))?;
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_len: {e}")))?;
 
             // variable data starts at +8+path_len
             let var_data_ptr = unsafe {
@@ -2010,7 +2022,7 @@ impl<'ctx> EbpfContext<'ctx> {
                         "var_data_ptr",
                     )
                     .map_err(|e| {
-                        CodeGenError::LLVMError(format!("Failed to get var_data GEP: {}", e))
+                        CodeGenError::LLVMError(format!("Failed to get var_data GEP: {e}"))
                     })?
             };
 
@@ -2025,12 +2037,11 @@ impl<'ctx> EbpfContext<'ctx> {
                                     self.context.i8_type(),
                                     var_data_ptr,
                                     &[self.context.i32_type().const_int(i as u64, false)],
-                                    &format!("var_byte_{}", i),
+                                    &format!("var_byte_{i}"),
                                 )
                                 .map_err(|e| {
                                     CodeGenError::LLVMError(format!(
-                                        "Failed to get var byte GEP: {}",
-                                        e
+                                        "Failed to get var byte GEP: {e}"
                                     ))
                                 })?
                         };
@@ -2040,7 +2051,7 @@ impl<'ctx> EbpfContext<'ctx> {
                                 self.context.i8_type().const_int(*b as u64, false),
                             )
                             .map_err(|e| {
-                                CodeGenError::LLVMError(format!("Failed to store var byte: {}", e))
+                                CodeGenError::LLVMError(format!("Failed to store var byte: {e}"))
                             })?;
                     }
                     // data_len already set to reserved_len
@@ -2600,10 +2611,10 @@ impl<'ctx> EbpfContext<'ctx> {
                             "errno_ptr",
                         )
                         .map_err(|e| {
-                            CodeGenError::LLVMError(format!("Failed to cast errno ptr: {}", e))
+                            CodeGenError::LLVMError(format!("Failed to cast errno ptr: {e}"))
                         })?;
                     self.builder.build_store(i32_ptr, ret).map_err(|e| {
-                        CodeGenError::LLVMError(format!("Failed to store errno: {}", e))
+                        CodeGenError::LLVMError(format!("Failed to store errno: {e}"))
                     })?;
                     // write addr at [4..12]
                     let addr_ptr_i8 = unsafe {
@@ -2615,7 +2626,7 @@ impl<'ctx> EbpfContext<'ctx> {
                                 "addr_ptr_i8",
                             )
                             .map_err(|e| {
-                                CodeGenError::LLVMError(format!("Failed to get addr gep: {}", e))
+                                CodeGenError::LLVMError(format!("Failed to get addr gep: {e}"))
                             })?
                     };
                     let addr_ptr = self
@@ -2626,13 +2637,13 @@ impl<'ctx> EbpfContext<'ctx> {
                             "addr_ptr",
                         )
                         .map_err(|e| {
-                            CodeGenError::LLVMError(format!("Failed to cast addr ptr: {}", e))
+                            CodeGenError::LLVMError(format!("Failed to cast addr ptr: {e}"))
                         })?;
                     let src_as_i64 = src_addr;
                     self.builder
                         .build_store(addr_ptr, src_as_i64)
                         .map_err(|e| {
-                            CodeGenError::LLVMError(format!("Failed to store addr: {}", e))
+                            CodeGenError::LLVMError(format!("Failed to store addr: {e}"))
                         })?;
                     self.mark_any_fail()?;
                     self.builder
@@ -2691,7 +2702,7 @@ impl<'ctx> EbpfContext<'ctx> {
 
         // Send via ringbuf (reserved size is sufficient for worst-case payload)
         self.write_to_accumulation_buffer_or_send(buffer, total_size as u64)
-            .map_err(|e| CodeGenError::LLVMError(format!("Ringbuf output failed: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Ringbuf output failed: {e}")))?;
         Ok(())
     }
 
@@ -2727,9 +2738,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     )],
                     "inst_type_ptr",
                 )
-                .map_err(|e| {
-                    CodeGenError::LLVMError(format!("Failed to get inst_type GEP: {}", e))
-                })?
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get inst_type GEP: {e}")))?
         };
         let inst_type_val = self
             .context
@@ -2737,7 +2746,7 @@ impl<'ctx> EbpfContext<'ctx> {
             .const_int(InstructionType::PrintStringIndex as u64, false);
         self.builder
             .build_store(inst_type_ptr, inst_type_val)
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store inst_type: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store inst_type: {e}")))?;
 
         let data_length_ptr = unsafe {
             self.builder
@@ -2751,7 +2760,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     "data_length_ptr",
                 )
                 .map_err(|e| {
-                    CodeGenError::LLVMError(format!("Failed to get data_length GEP: {}", e))
+                    CodeGenError::LLVMError(format!("Failed to get data_length GEP: {e}"))
                 })?
         };
         let data_length_i16_ptr = self
@@ -2761,16 +2770,14 @@ impl<'ctx> EbpfContext<'ctx> {
                 self.context.ptr_type(AddressSpace::default()),
                 "data_length_i16_ptr",
             )
-            .map_err(|e| {
-                CodeGenError::LLVMError(format!("Failed to cast data_length ptr: {}", e))
-            })?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast data_length ptr: {e}")))?;
         let data_length_val = self
             .context
             .i16_type()
             .const_int(std::mem::size_of::<PrintStringIndexData>() as u64, false);
         self.builder
             .build_store(data_length_i16_ptr, data_length_val)
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_length: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_length: {e}")))?;
 
         // Fill string index data (after InstructionHeader)
         let string_index_ptr = unsafe {
@@ -2785,7 +2792,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     "string_index_ptr",
                 )
                 .map_err(|e| {
-                    CodeGenError::LLVMError(format!("Failed to get string_index GEP: {}", e))
+                    CodeGenError::LLVMError(format!("Failed to get string_index GEP: {e}"))
                 })?
         };
         let string_index_i16_ptr = self
@@ -2796,7 +2803,7 @@ impl<'ctx> EbpfContext<'ctx> {
                 "string_index_i16_ptr",
             )
             .map_err(|e| {
-                CodeGenError::LLVMError(format!("Failed to cast string_index ptr: {}", e))
+                CodeGenError::LLVMError(format!("Failed to cast string_index ptr: {e}"))
             })?;
         let string_index_val = self
             .context
@@ -2804,7 +2811,7 @@ impl<'ctx> EbpfContext<'ctx> {
             .const_int(string_index as u64, false);
         self.builder
             .build_store(string_index_i16_ptr, string_index_val)
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store string_index: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store string_index: {e}")))?;
 
         // Compute total instruction size: header + PrintStringIndexData
         let inst_size = self.context.i64_type().const_int(
@@ -2880,7 +2887,7 @@ impl<'ctx> EbpfContext<'ctx> {
             .const_int(InstructionType::PrintVariableIndex as u64, false);
         self.builder
             .build_store(inst_buffer, inst_type_val)
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store inst_type: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store inst_type: {e}")))?;
 
         // Store data_length field of InstructionHeader
         let data_length_ptr = unsafe {
@@ -2895,7 +2902,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     "data_length_ptr",
                 )
                 .map_err(|e| {
-                    CodeGenError::LLVMError(format!("Failed to get data_length GEP: {}", e))
+                    CodeGenError::LLVMError(format!("Failed to get data_length GEP: {e}"))
                 })?
         };
         let data_length_i16_ptr = self
@@ -2905,9 +2912,7 @@ impl<'ctx> EbpfContext<'ctx> {
                 self.context.ptr_type(AddressSpace::default()),
                 "data_length_i16_ptr",
             )
-            .map_err(|e| {
-                CodeGenError::LLVMError(format!("Failed to cast data_length ptr: {}", e))
-            })?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast data_length ptr: {e}")))?;
         let total_data_length = std::mem::size_of::<PrintVariableIndexData>() + data_size as usize;
         let data_length_val = self
             .context
@@ -2915,7 +2920,7 @@ impl<'ctx> EbpfContext<'ctx> {
             .const_int(total_data_length as u64, false);
         self.builder
             .build_store(data_length_i16_ptr, data_length_val)
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_length: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_length: {e}")))?;
 
         // Write PrintVariableIndexData after InstructionHeader
         let variable_data_start = unsafe {
@@ -2930,7 +2935,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     "variable_data_start",
                 )
                 .map_err(|e| {
-                    CodeGenError::LLVMError(format!("Failed to get variable_data_start GEP: {}", e))
+                    CodeGenError::LLVMError(format!("Failed to get variable_data_start GEP: {e}"))
                 })?
         };
 
@@ -2947,7 +2952,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     "var_name_index_ptr",
                 )
                 .map_err(|e| {
-                    CodeGenError::LLVMError(format!("Failed to get var_name_index GEP: {}", e))
+                    CodeGenError::LLVMError(format!("Failed to get var_name_index GEP: {e}"))
                 })?
         };
         let var_name_index_i16_ptr = self
@@ -2958,7 +2963,7 @@ impl<'ctx> EbpfContext<'ctx> {
                 "var_name_index_i16_ptr",
             )
             .map_err(|e| {
-                CodeGenError::LLVMError(format!("Failed to cast var_name_index ptr: {}", e))
+                CodeGenError::LLVMError(format!("Failed to cast var_name_index ptr: {e}"))
             })?;
         let var_name_index_val = self
             .context
@@ -2966,9 +2971,7 @@ impl<'ctx> EbpfContext<'ctx> {
             .const_int(var_name_index as u64, false);
         self.builder
             .build_store(var_name_index_i16_ptr, var_name_index_val)
-            .map_err(|e| {
-                CodeGenError::LLVMError(format!("Failed to store var_name_index: {}", e))
-            })?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store var_name_index: {e}")))?;
 
         // Store type_encoding using correct offset
         let type_encoding_ptr = unsafe {
@@ -2983,7 +2986,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     "type_encoding_ptr",
                 )
                 .map_err(|e| {
-                    CodeGenError::LLVMError(format!("Failed to get type_encoding GEP: {}", e))
+                    CodeGenError::LLVMError(format!("Failed to get type_encoding GEP: {e}"))
                 })?
         };
         let type_encoding_val = self
@@ -2992,9 +2995,7 @@ impl<'ctx> EbpfContext<'ctx> {
             .const_int(type_encoding as u8 as u64, false);
         self.builder
             .build_store(type_encoding_ptr, type_encoding_val)
-            .map_err(|e| {
-                CodeGenError::LLVMError(format!("Failed to store type_encoding: {}", e))
-            })?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store type_encoding: {e}")))?;
 
         // Store data_len using correct offset
         let data_len_ptr = unsafe {
@@ -3008,9 +3009,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     )],
                     "data_len_ptr",
                 )
-                .map_err(|e| {
-                    CodeGenError::LLVMError(format!("Failed to get data_len GEP: {}", e))
-                })?
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get data_len GEP: {e}")))?
         };
         let data_len_i16_ptr = self
             .builder
@@ -3019,11 +3018,11 @@ impl<'ctx> EbpfContext<'ctx> {
                 self.context.ptr_type(AddressSpace::default()),
                 "data_len_i16_ptr",
             )
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast data_len ptr: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast data_len ptr: {e}")))?;
         let data_len_val = self.context.i16_type().const_int(data_size as u64, false); // Store as u16
         self.builder
             .build_store(data_len_i16_ptr, data_len_val)
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_len: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_len: {e}")))?;
 
         // Store type_index using correct offset
         let type_index_ptr = unsafe {
@@ -3038,7 +3037,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     "type_index_ptr",
                 )
                 .map_err(|e| {
-                    CodeGenError::LLVMError(format!("Failed to get type_index GEP: {}", e))
+                    CodeGenError::LLVMError(format!("Failed to get type_index GEP: {e}"))
                 })?
         };
         let type_index_i16_ptr = self
@@ -3048,13 +3047,11 @@ impl<'ctx> EbpfContext<'ctx> {
                 self.context.ptr_type(AddressSpace::default()),
                 "type_index_i16_ptr",
             )
-            .map_err(|e| {
-                CodeGenError::LLVMError(format!("Failed to cast type_index ptr: {}", e))
-            })?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast type_index ptr: {e}")))?;
         let type_index_val = self.context.i16_type().const_int(type_index as u64, false);
         self.builder
             .build_store(type_index_i16_ptr, type_index_val)
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store type_index: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store type_index: {e}")))?;
 
         // Store status (set to 0)
         let reserved_ptr = unsafe {
@@ -3068,7 +3065,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     )],
                     "status_ptr",
                 )
-                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get status GEP: {}", e)))?
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get status GEP: {e}")))?
         };
         let reserved_val = self
             .context
@@ -3076,7 +3073,7 @@ impl<'ctx> EbpfContext<'ctx> {
             .const_int(VariableStatus::Ok as u64, false);
         self.builder
             .build_store(reserved_ptr, reserved_val)
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store status: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store status: {e}")))?;
 
         // Store actual variable data after PrintVariableIndexData structure
         let var_data_ptr = unsafe {
@@ -3090,9 +3087,7 @@ impl<'ctx> EbpfContext<'ctx> {
                         .const_int(std::mem::size_of::<PrintVariableIndexData>() as u64, false)],
                     "var_data_ptr",
                 )
-                .map_err(|e| {
-                    CodeGenError::LLVMError(format!("Failed to get var_data GEP: {}", e))
-                })?
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get var_data GEP: {e}")))?
         };
 
         // Store the runtime variable value based on data size
@@ -3105,7 +3100,7 @@ impl<'ctx> EbpfContext<'ctx> {
                         .builder
                         .build_int_truncate(int_val, self.context.i8_type(), "truncated_i8")
                         .map_err(|e| {
-                            CodeGenError::LLVMError(format!("Failed to truncate to i8: {}", e))
+                            CodeGenError::LLVMError(format!("Failed to truncate to i8: {e}"))
                         })?,
                     _ => {
                         return Err(CodeGenError::LLVMError(
@@ -3116,7 +3111,7 @@ impl<'ctx> EbpfContext<'ctx> {
                 self.builder
                     .build_store(var_data_ptr, truncated)
                     .map_err(|e| {
-                        CodeGenError::LLVMError(format!("Failed to store i8 data: {}", e))
+                        CodeGenError::LLVMError(format!("Failed to store i8 data: {e}"))
                     })?;
             }
             2 => {
@@ -3126,7 +3121,7 @@ impl<'ctx> EbpfContext<'ctx> {
                         .builder
                         .build_int_truncate(int_val, self.context.i16_type(), "truncated_i16")
                         .map_err(|e| {
-                            CodeGenError::LLVMError(format!("Failed to truncate to i16: {}", e))
+                            CodeGenError::LLVMError(format!("Failed to truncate to i16: {e}"))
                         })?,
                     _ => {
                         return Err(CodeGenError::LLVMError(
@@ -3142,10 +3137,10 @@ impl<'ctx> EbpfContext<'ctx> {
                         "i16_ptr",
                     )
                     .map_err(|e| {
-                        CodeGenError::LLVMError(format!("Failed to cast to i16 ptr: {}", e))
+                        CodeGenError::LLVMError(format!("Failed to cast to i16 ptr: {e}"))
                     })?;
                 self.builder.build_store(i16_ptr, truncated).map_err(|e| {
-                    CodeGenError::LLVMError(format!("Failed to store i16 data: {}", e))
+                    CodeGenError::LLVMError(format!("Failed to store i16 data: {e}"))
                 })?;
             }
             4 => {
@@ -3156,7 +3151,7 @@ impl<'ctx> EbpfContext<'ctx> {
                             .builder
                             .build_int_truncate(int_val, self.context.i32_type(), "truncated_i32")
                             .map_err(|e| {
-                                CodeGenError::LLVMError(format!("Failed to truncate to i32: {}", e))
+                                CodeGenError::LLVMError(format!("Failed to truncate to i32: {e}"))
                             })?;
                         let i32_ptr = self
                             .builder
@@ -3166,10 +3161,10 @@ impl<'ctx> EbpfContext<'ctx> {
                                 "i32_ptr",
                             )
                             .map_err(|e| {
-                                CodeGenError::LLVMError(format!("Failed to cast to i32 ptr: {}", e))
+                                CodeGenError::LLVMError(format!("Failed to cast to i32 ptr: {e}"))
                             })?;
                         self.builder.build_store(i32_ptr, truncated).map_err(|e| {
-                            CodeGenError::LLVMError(format!("Failed to store i32 data: {}", e))
+                            CodeGenError::LLVMError(format!("Failed to store i32 data: {e}"))
                         })?;
                     }
                     BasicValueEnum::FloatValue(float_val) => {
@@ -3181,10 +3176,10 @@ impl<'ctx> EbpfContext<'ctx> {
                                 "f32_ptr",
                             )
                             .map_err(|e| {
-                                CodeGenError::LLVMError(format!("Failed to cast to f32 ptr: {}", e))
+                                CodeGenError::LLVMError(format!("Failed to cast to f32 ptr: {e}"))
                             })?;
                         self.builder.build_store(f32_ptr, float_val).map_err(|e| {
-                            CodeGenError::LLVMError(format!("Failed to store f32 data: {}", e))
+                            CodeGenError::LLVMError(format!("Failed to store f32 data: {e}"))
                         })?;
                     }
                     _ => {
@@ -3206,10 +3201,10 @@ impl<'ctx> EbpfContext<'ctx> {
                                 "i64_ptr",
                             )
                             .map_err(|e| {
-                                CodeGenError::LLVMError(format!("Failed to cast to i64 ptr: {}", e))
+                                CodeGenError::LLVMError(format!("Failed to cast to i64 ptr: {e}"))
                             })?;
                         self.builder.build_store(i64_ptr, int_val).map_err(|e| {
-                            CodeGenError::LLVMError(format!("Failed to store i64 data: {}", e))
+                            CodeGenError::LLVMError(format!("Failed to store i64 data: {e}"))
                         })?;
                     }
                     BasicValueEnum::FloatValue(float_val) => {
@@ -3221,10 +3216,10 @@ impl<'ctx> EbpfContext<'ctx> {
                                 "f64_ptr",
                             )
                             .map_err(|e| {
-                                CodeGenError::LLVMError(format!("Failed to cast to f64 ptr: {}", e))
+                                CodeGenError::LLVMError(format!("Failed to cast to f64 ptr: {e}"))
                             })?;
                         self.builder.build_store(f64_ptr, float_val).map_err(|e| {
-                            CodeGenError::LLVMError(format!("Failed to store f64 data: {}", e))
+                            CodeGenError::LLVMError(format!("Failed to store f64 data: {e}"))
                         })?;
                     }
                     BasicValueEnum::PointerValue(ptr_val) => {
@@ -3234,8 +3229,7 @@ impl<'ctx> EbpfContext<'ctx> {
                             .build_ptr_to_int(ptr_val, self.context.i64_type(), "ptr_as_int")
                             .map_err(|e| {
                                 CodeGenError::LLVMError(format!(
-                                    "Failed to convert ptr to int: {}",
-                                    e
+                                    "Failed to convert ptr to int: {e}"
                                 ))
                             })?;
                         let i64_ptr = self
@@ -3246,10 +3240,10 @@ impl<'ctx> EbpfContext<'ctx> {
                                 "i64_ptr",
                             )
                             .map_err(|e| {
-                                CodeGenError::LLVMError(format!("Failed to cast to i64 ptr: {}", e))
+                                CodeGenError::LLVMError(format!("Failed to cast to i64 ptr: {e}"))
                             })?;
                         self.builder.build_store(i64_ptr, ptr_int).map_err(|e| {
-                            CodeGenError::LLVMError(format!("Failed to store pointer data: {}", e))
+                            CodeGenError::LLVMError(format!("Failed to store pointer data: {e}"))
                         })?;
                     }
                     _ => {
@@ -3261,8 +3255,7 @@ impl<'ctx> EbpfContext<'ctx> {
             }
             _ => {
                 return Err(CodeGenError::LLVMError(format!(
-                    "Unsupported data size: {}",
-                    data_size
+                    "Unsupported data size: {data_size}"
                 )));
             }
         }
@@ -3314,7 +3307,7 @@ impl<'ctx> EbpfContext<'ctx> {
 
         // Call the actual bpf_ringbuf_output helper function
         self.write_to_accumulation_buffer_or_send(inst_ptr, size_value)
-            .map_err(|e| CodeGenError::LLVMError(format!("Ringbuf output failed: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Ringbuf output failed: {e}")))?;
 
         debug!("Successfully queued instruction for ringbuf output");
         Ok(())
@@ -3348,8 +3341,7 @@ impl<'ctx> EbpfContext<'ctx> {
                 // Require DWARF type information
                 let dwarf_type = var_info.dwarf_type.as_ref().ok_or_else(|| {
                     CodeGenError::DwarfError(format!(
-                        "Variable '{}' has no type information in DWARF",
-                        var_name
+                        "Variable '{var_name}' has no type information in DWARF"
                     ))
                 })?;
 
@@ -3428,7 +3420,7 @@ impl<'ctx> EbpfContext<'ctx> {
             .const_int(InstructionType::PrintComplexVariable as u64, false);
         self.builder
             .build_store(inst_buffer, inst_type_val)
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store inst_type: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store inst_type: {e}")))?;
         tracing::trace!(
             "generate_print_complex_variable_runtime: wrote inst_type=PrintComplexVariable"
         );
@@ -3444,7 +3436,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     "data_length_ptr",
                 )
                 .map_err(|e| {
-                    CodeGenError::LLVMError(format!("Failed to get data_length GEP: {}", e))
+                    CodeGenError::LLVMError(format!("Failed to get data_length GEP: {e}"))
                 })?
         };
         let data_length_ptr_cast = self
@@ -3454,9 +3446,7 @@ impl<'ctx> EbpfContext<'ctx> {
                 self.context.ptr_type(AddressSpace::default()),
                 "data_length_ptr_cast",
             )
-            .map_err(|e| {
-                CodeGenError::LLVMError(format!("Failed to cast data_length ptr: {}", e))
-            })?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast data_length ptr: {e}")))?;
         self.builder
             .build_store(
                 data_length_ptr_cast,
@@ -3464,7 +3454,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     .i16_type()
                     .const_int(total_data_length as u64, false),
             )
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_length: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_length: {e}")))?;
         tracing::trace!(
             data_length = total_data_length,
             "generate_print_complex_variable_runtime: wrote data_length"
@@ -3479,7 +3469,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     &[self.context.i32_type().const_int(header_size as u64, false)],
                     "data_ptr",
                 )
-                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get data GEP: {}", e)))?
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get data GEP: {e}")))?
         };
 
         // var_name_index (u16)
@@ -3499,7 +3489,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     "var_name_index_ptr_i8",
                 )
                 .map_err(|e| {
-                    CodeGenError::LLVMError(format!("Failed to get var_name_index GEP: {}", e))
+                    CodeGenError::LLVMError(format!("Failed to get var_name_index GEP: {e}"))
                 })?
         };
         let var_name_index_ptr_i16 = self
@@ -3510,13 +3500,11 @@ impl<'ctx> EbpfContext<'ctx> {
                 "var_name_index_ptr_i16",
             )
             .map_err(|e| {
-                CodeGenError::LLVMError(format!("Failed to cast var_name_index ptr: {}", e))
+                CodeGenError::LLVMError(format!("Failed to cast var_name_index ptr: {e}"))
             })?;
         self.builder
             .build_store(var_name_index_ptr_i16, var_name_index_val)
-            .map_err(|e| {
-                CodeGenError::LLVMError(format!("Failed to store var_name_index: {}", e))
-            })?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store var_name_index: {e}")))?;
         tracing::trace!(
             var_name_index = meta.var_name_index,
             "generate_print_complex_variable_runtime: wrote var_name_index"
@@ -3534,7 +3522,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     "type_index_ptr_i8",
                 )
                 .map_err(|e| {
-                    CodeGenError::LLVMError(format!("Failed to get type_index GEP: {}", e))
+                    CodeGenError::LLVMError(format!("Failed to get type_index GEP: {e}"))
                 })?
         };
         let type_index_ptr = self
@@ -3544,16 +3532,14 @@ impl<'ctx> EbpfContext<'ctx> {
                 self.context.ptr_type(AddressSpace::default()),
                 "type_index_ptr_i16",
             )
-            .map_err(|e| {
-                CodeGenError::LLVMError(format!("Failed to cast type_index ptr: {}", e))
-            })?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast type_index ptr: {e}")))?;
         let type_index_val = self
             .context
             .i16_type()
             .const_int(meta.type_index as u64, false);
         self.builder
             .build_store(type_index_ptr, type_index_val)
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store type_index: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store type_index: {e}")))?;
         tracing::trace!(
             type_index = meta.type_index,
             "generate_print_complex_variable_runtime: wrote type_index"
@@ -3575,7 +3561,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     "access_path_len_ptr",
                 )
                 .map_err(|e| {
-                    CodeGenError::LLVMError(format!("Failed to get access_path_len GEP: {}", e))
+                    CodeGenError::LLVMError(format!("Failed to get access_path_len GEP: {e}"))
                 })?
         };
         self.builder
@@ -3586,7 +3572,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     .const_int(access_path_len as u64, false),
             )
             .map_err(|e| {
-                CodeGenError::LLVMError(format!("Failed to store access_path_len: {}", e))
+                CodeGenError::LLVMError(format!("Failed to store access_path_len: {e}"))
             })?;
         tracing::trace!(
             access_path_len,
@@ -3603,7 +3589,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     &[self.context.i32_type().const_int(status_off, false)],
                     "status_ptr",
                 )
-                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get status GEP: {}", e)))?
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get status GEP: {e}")))?
         };
         self.builder
             .build_store(
@@ -3612,7 +3598,9 @@ impl<'ctx> EbpfContext<'ctx> {
                     .i8_type()
                     .const_int(VariableStatus::Ok as u64, false),
             )
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store status: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store status: {e}")))?;
+
+        // (Optimized-out handling moved below after data_len pointer is available)
 
         // data_len (u16)
         let data_len_off = std::mem::offset_of!(PrintComplexVariableData, data_len) as u64;
@@ -3624,9 +3612,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     &[self.context.i32_type().const_int(data_len_off, false)],
                     "data_len_ptr",
                 )
-                .map_err(|e| {
-                    CodeGenError::LLVMError(format!("Failed to get data_len GEP: {}", e))
-                })?
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get data_len GEP: {e}")))?
         };
         let data_len_ptr_cast = self
             .builder
@@ -3635,17 +3621,19 @@ impl<'ctx> EbpfContext<'ctx> {
                 self.context.ptr_type(AddressSpace::default()),
                 "data_len_ptr_i16",
             )
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast data_len ptr: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast data_len ptr: {e}")))?;
         self.builder
             .build_store(
                 data_len_ptr_cast,
                 self.context.i16_type().const_int(data_len as u64, false),
             )
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_len: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_len: {e}")))?;
         tracing::trace!(
             data_len,
             "generate_print_complex_variable_runtime: wrote data_len"
         );
+
+        // Optimized-out case is handled earlier by resolving to an OptimizedOut type and ImmediateBytes path.
 
         // access_path bytes start after PrintComplexVariableData
         let access_path_ptr = unsafe {
@@ -3660,7 +3648,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     "access_path_ptr",
                 )
                 .map_err(|e| {
-                    CodeGenError::LLVMError(format!("Failed to get access_path GEP: {}", e))
+                    CodeGenError::LLVMError(format!("Failed to get access_path GEP: {e}"))
                 })?
         };
 
@@ -3672,18 +3660,15 @@ impl<'ctx> EbpfContext<'ctx> {
                         self.context.i8_type(),
                         access_path_ptr,
                         &[self.context.i32_type().const_int(i as u64, false)],
-                        &format!("access_path_byte_{}", i),
+                        &format!("access_path_byte_{i}"),
                     )
                     .map_err(|e| {
-                        CodeGenError::LLVMError(format!(
-                            "Failed to get access_path byte GEP: {}",
-                            e
-                        ))
+                        CodeGenError::LLVMError(format!("Failed to get access_path byte GEP: {e}"))
                     })?
             };
             let byte_val = self.context.i8_type().const_int(byte as u64, false);
             self.builder.build_store(byte_ptr, byte_val).map_err(|e| {
-                CodeGenError::LLVMError(format!("Failed to store access_path byte: {}", e))
+                CodeGenError::LLVMError(format!("Failed to store access_path byte: {e}"))
             })?;
         }
         if access_path_len > 0 {
@@ -3703,7 +3688,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     "variable_data_ptr",
                 )
                 .map_err(|e| {
-                    CodeGenError::LLVMError(format!("Failed to get variable_data GEP: {}", e))
+                    CodeGenError::LLVMError(format!("Failed to get variable_data GEP: {e}"))
                 })?
         };
 
@@ -3837,10 +3822,10 @@ impl<'ctx> EbpfContext<'ctx> {
                 self.context.ptr_type(AddressSpace::default()),
                 "errno_ptr",
             )
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast errno ptr: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast errno ptr: {e}")))?;
         self.builder
             .build_store(errno_ptr, ret)
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store errno: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store errno: {e}")))?;
         // write addr at [4..12]
         let addr_ptr_i8 = unsafe {
             self.builder
@@ -3850,7 +3835,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     &[self.context.i32_type().const_int(4, false)],
                     "addr_ptr_i8",
                 )
-                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get addr GEP: {}", e)))?
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get addr GEP: {e}")))?
         };
         let addr_ptr = self
             .builder
@@ -3859,10 +3844,10 @@ impl<'ctx> EbpfContext<'ctx> {
                 self.context.ptr_type(AddressSpace::default()),
                 "addr_ptr",
             )
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast addr ptr: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast addr ptr: {e}")))?;
         self.builder
             .build_store(addr_ptr, src_addr)
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store addr: {}", e)))?;
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store addr: {e}")))?;
         // mark fail
         self.mark_any_fail()?;
         self.builder

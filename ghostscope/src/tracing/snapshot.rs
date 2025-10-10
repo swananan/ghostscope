@@ -22,13 +22,4 @@ pub struct TraceSummary {
     pub disabled: usize,
 }
 
-impl TraceSummary {
-    #[allow(dead_code)]
-    pub fn new() -> Self {
-        Self {
-            total: 0,
-            active: 0,
-            disabled: 0,
-        }
-    }
-}
+impl TraceSummary {}

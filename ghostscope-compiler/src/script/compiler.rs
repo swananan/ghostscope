@@ -150,7 +150,7 @@ impl<'a> AstCompiler<'a> {
                                     TracePattern::SourceLine {
                                         file_path,
                                         line_number,
-                                    } => ft.target_name == format!("{}:{}", file_path, line_number),
+                                    } => ft.target_name == format!("{file_path}:{line_number}"),
                                     _ => false,
                                 });
 
@@ -160,8 +160,8 @@ impl<'a> AstCompiler<'a> {
                                     TracePattern::SourceLine {
                                         file_path,
                                         line_number,
-                                    } => format!("{}:{}", file_path, line_number),
-                                    _ => format!("trace_point_{}", index),
+                                    } => format!("{file_path}:{line_number}"),
+                                    _ => format!("trace_point_{index}"),
                                 };
 
                                 self.failed_targets.push(FailedTarget {
@@ -217,10 +217,8 @@ impl<'a> AstCompiler<'a> {
 
     /// Build a detailed error message for SourceLine resolution failures
     fn describe_source_line_failure(&mut self, file_path: &str, line_number: u32) -> String {
-        let default_msg = format!(
-            "No addresses resolved for source line {}:{}",
-            file_path, line_number
-        );
+        let default_msg =
+            format!("No addresses resolved for source line {file_path}:{line_number}");
 
         let analyzer = match &mut self.process_analyzer {
             Some(a) => a,
@@ -263,8 +261,7 @@ impl<'a> AstCompiler<'a> {
 
         if same_basename_paths.is_empty() {
             return format!(
-                "Source file not found in DWARF: {}.\n- Tips: use 'srcpath map <dwf_comp_dir> <local_dir>' or pass full DWARF path.\n- List files with: dwarf-tool source-files or 'info source-files'",
-                file_path
+                "Source file not found in DWARF: {file_path}.\n- Tips: use 'srcpath map <dwf_comp_dir> <local_dir>' or pass full DWARF path.\n- List files with: dwarf-tool source-files or 'info source-files'"
             );
         }
 
@@ -277,8 +274,7 @@ impl<'a> AstCompiler<'a> {
             }
             let sample_list = samples.join("\n  - ");
             return format!(
-                "Multiple files named '{}' found; the given path '{}' did not uniquely match by suffix.\nTry a more specific path or add a path mapping (srcpath map).\nExamples:\n  - {}",
-                basename, file_path, sample_list
+                "Multiple files named '{basename}' found; the given path '{file_path}' did not uniquely match by suffix.\nTry a more specific path or add a path mapping (srcpath map).\nExamples:\n  - {sample_list}"
             );
         }
 
@@ -307,14 +303,12 @@ impl<'a> AstCompiler<'a> {
         if !hit_candidates.is_empty() {
             let list = hit_candidates.join("\n  - ");
             return format!(
-                "Ambiguous path: '{}' did not resolve, but found addresses for the same line in:\n  - {}\nPlease use a more specific path (full DWARF path) or add a mapping (srcpath map).",
-                file_path, list
+                "Ambiguous path: '{file_path}' did not resolve, but found addresses for the same line in:\n  - {list}\nPlease use a more specific path (full DWARF path) or add a mapping (srcpath map)."
             );
         }
 
         format!(
-            "No executable addresses for {}:{} (file exists in DWARF but this line has no statement).\nTry a nearby line, or rebuild with debug info and lower optimization (e.g., -g -O0).",
-            file_path, line_number
+            "No executable addresses for {file_path}:{line_number} (file exists in DWARF but this line has no statement).\nTry a nearby line, or rebuild with debug info and lower optimization (e.g., -g -O0)."
         )
     }
 
@@ -455,8 +449,7 @@ impl<'a> AstCompiler<'a> {
 
                 if file_off.is_none() {
                     return Err(CompileError::Other(format!(
-                        "Address 0x{addr:x} is not within a loadable segment of '{}' (cannot compute file offset)",
-                        module_path
+                        "Address 0x{addr:x} is not within a loadable segment of '{module_path}' (cannot compute file offset)"
                     )));
                 }
 
@@ -508,8 +501,7 @@ impl<'a> AstCompiler<'a> {
                         match candidates.len() {
                             0 => {
                                 return Err(CompileError::Other(format!(
-                                    "Module '{}' not found among loaded modules. Use full path or a unique suffix.",
-                                    module
+                                    "Module '{module}' not found among loaded modules. Use full path or a unique suffix."
                                 )));
                             }
                             1 => candidates[0].clone(),
@@ -538,8 +530,7 @@ impl<'a> AstCompiler<'a> {
 
                 if file_off.is_none() {
                     return Err(CompileError::Other(format!(
-                        "Address 0x{address:x} is not within a loadable segment of '{}' (cannot compute file offset)",
-                        module_path
+                        "Address 0x{address:x} is not within a loadable segment of '{module_path}' (cannot compute file offset)"
                     )));
                 }
 
@@ -563,7 +554,7 @@ impl<'a> AstCompiler<'a> {
                     Err(e) => {
                         let error_msg = e.to_string();
                         self.failed_targets.push(FailedTarget {
-                            target_name: format!("{}:0x{:x}", module, address),
+                            target_name: format!("{module}:0x{address:x}"),
                             pc_address: *address,
                             error_message: error_msg.clone(),
                         });
@@ -582,8 +573,7 @@ impl<'a> AstCompiler<'a> {
                 if module_addresses.is_empty() {
                     // Strict behavior: fail this trace point immediately instead of skipping silently
                     return Err(CompileError::Other(format!(
-                        "No addresses resolved for function '{}' - function not found in debug symbols",
-                        func_name
+                        "No addresses resolved for function '{func_name}' - function not found in debug symbols"
                     )));
                 }
 
@@ -658,9 +648,8 @@ impl<'a> AstCompiler<'a> {
                 } else {
                     // All addresses failed to process - this is an error
                     Err(CompileError::Other(format!(
-                        "All {} addresses for function '{}' failed to process",
-                        failed_addresses, func_name
-                    )))
+                    "All {failed_addresses} addresses for function '{func_name}' failed to process"
+                )))
                 }
             }
             _ => {
@@ -916,8 +905,7 @@ impl<'a> AstCompiler<'a> {
                 function_name, llvm_errors
             );
             return Err(CompileError::LLVM(format!(
-                "Module validation failed for {}: {}",
-                function_name, llvm_errors
+                "Module validation failed for {function_name}: {llvm_errors}"
             )));
         }
         info!("Module validation passed for {}", function_name);

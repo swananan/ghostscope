@@ -245,18 +245,18 @@ impl<'ctx> EbpfContext<'ctx> {
                     inkwell::IntPredicate::ULT,
                     idx_i,
                     sel_len,
-                    &format!("memcmp_i{}_active", i),
+                    &format!("memcmp_i{i}_active"),
                 )
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?;
             // a[i]
             let pa = unsafe {
                 self.builder
-                    .build_gep(arr_a_ty, buf_a, &[idx0, idx_i], &format!("memcmp_a_i{}", i))
+                    .build_gep(arr_a_ty, buf_a, &[idx0, idx_i], &format!("memcmp_a_i{i}"))
                     .map_err(|e| CodeGenError::Builder(e.to_string()))?
             };
             let va = self
                 .builder
-                .build_load(self.context.i8_type(), pa, &format!("ld_a_{}", i))
+                .build_load(self.context.i8_type(), pa, &format!("ld_a_{i}"))
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?;
             let va = match va {
                 BasicValueEnum::IntValue(iv) => iv,
@@ -265,12 +265,12 @@ impl<'ctx> EbpfContext<'ctx> {
             // b[i]
             let pb = unsafe {
                 self.builder
-                    .build_gep(arr_b_ty, buf_b, &[idx0, idx_i], &format!("memcmp_b_i{}", i))
+                    .build_gep(arr_b_ty, buf_b, &[idx0, idx_i], &format!("memcmp_b_i{i}"))
                     .map_err(|e| CodeGenError::Builder(e.to_string()))?
             };
             let vb = self
                 .builder
-                .build_load(self.context.i8_type(), pb, &format!("ld_b_{}", i))
+                .build_load(self.context.i8_type(), pb, &format!("ld_b_{i}"))
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?;
             let vb = match vb {
                 BasicValueEnum::IntValue(iv) => iv,
@@ -278,17 +278,17 @@ impl<'ctx> EbpfContext<'ctx> {
             };
             let diff = self
                 .builder
-                .build_xor(va, vb, &format!("memcmp_diff_{}", i))
+                .build_xor(va, vb, &format!("memcmp_diff_{i}"))
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?;
             let zero8 = self.context.i8_type().const_zero();
             let masked = self
                 .builder
-                .build_select(active, diff, zero8, &format!("memcmp_masked_{}", i))
+                .build_select(active, diff, zero8, &format!("memcmp_masked_{i}"))
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?
                 .into_int_value();
             acc = self
                 .builder
-                .build_or(acc, masked, &format!("memcmp_acc_{}", i))
+                .build_or(acc, masked, &format!("memcmp_acc_{i}"))
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?;
         }
         let eq_bytes = self
@@ -596,8 +596,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     self.compile_strncmp_builtin(&args[0], lit, lit.len() as u32)
                 }
                 _ => Err(CodeGenError::NotImplemented(format!(
-                    "Unknown builtin function: {}",
-                    name
+                    "Unknown builtin function: {name}"
                 ))),
             },
             Expr::BinaryOp { left, op, right } => {
@@ -857,8 +856,7 @@ impl<'ctx> EbpfContext<'ctx> {
             _ => {
                 let supported = ["$pid", "$tid", "$timestamp"].join(", ");
                 Err(CodeGenError::NotImplemented(format!(
-                    "Unknown special variable '${}'. Supported: {}",
-                    name, supported
+                    "Unknown special variable '${name}'. Supported: {supported}"
                 )))
             }
         }
@@ -1049,8 +1047,7 @@ impl<'ctx> EbpfContext<'ctx> {
                         Ok(cmp.into())
                     }
                     _ => Err(CodeGenError::TypeError(format!(
-                        "Type mismatch in binary operation {:?}",
-                        op
+                        "Type mismatch in binary operation {op:?}"
                     ))),
                 }
             }
@@ -1076,8 +1073,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     Ok(cmp.into())
                 }
                 _ => Err(CodeGenError::TypeError(format!(
-                    "Type mismatch in binary operation {:?}",
-                    op
+                    "Type mismatch in binary operation {op:?}"
                 ))),
             },
             (FloatValue(left_float), FloatValue(right_float)) => match op {
@@ -1183,13 +1179,11 @@ impl<'ctx> EbpfContext<'ctx> {
                     Ok(result.into())
                 }
                 _ => Err(CodeGenError::NotImplemented(format!(
-                    "Float binary operation {:?} not implemented",
-                    op
+                    "Float binary operation {op:?} not implemented"
                 ))),
             },
             _ => Err(CodeGenError::TypeError(format!(
-                "Type mismatch in binary operation {:?}",
-                op
+                "Type mismatch in binary operation {op:?}"
             ))),
         }
     }
@@ -1246,7 +1240,7 @@ impl<'ctx> EbpfContext<'ctx> {
         let variable_with_eval = match self.query_dwarf_for_complex_expr(expr)? {
             Some(var) => var,
             None => {
-                let expr_str = self.expr_to_debug_string(expr);
+                let expr_str = Self::expr_to_debug_string(expr);
                 return Err(CodeGenError::VariableNotFound(expr_str));
             }
         };
@@ -1270,18 +1264,17 @@ impl<'ctx> EbpfContext<'ctx> {
     }
 
     /// Helper: Convert expression to string for debugging
-    #[allow(clippy::only_used_in_recursion)]
-    fn expr_to_debug_string(&self, expr: &crate::script::Expr) -> String {
+    fn expr_to_debug_string(expr: &crate::script::Expr) -> String {
         use crate::script::Expr;
 
         match expr {
             Expr::Variable(name) => name.clone(),
             Expr::MemberAccess(obj, field) => {
-                format!("{}.{}", self.expr_to_debug_string(obj), field)
+                format!("{}.{}", Self::expr_to_debug_string(obj), field)
             }
-            Expr::ArrayAccess(arr, _) => format!("{}[index]", self.expr_to_debug_string(arr)),
+            Expr::ArrayAccess(arr, _) => format!("{}[index]", Self::expr_to_debug_string(arr)),
             Expr::ChainAccess(chain) => chain.join("."),
-            Expr::PointerDeref(expr) => format!("*{}", self.expr_to_debug_string(expr)),
+            Expr::PointerDeref(expr) => format!("*{}", Self::expr_to_debug_string(expr)),
             _ => "expr".to_string(),
         }
     }

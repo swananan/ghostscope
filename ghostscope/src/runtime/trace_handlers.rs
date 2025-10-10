@@ -93,7 +93,7 @@ pub async fn handle_disable_all_traces(
                     .status_sender
                     .send(RuntimeStatus::AllTracesDisabled {
                         count: 0,
-                        error: Some(format!("Failed to disable all traces: {}", e)),
+                        error: Some(format!("Failed to disable all traces: {e}")),
                     });
             }
         }
@@ -130,7 +130,7 @@ pub async fn handle_enable_all_traces(
                     .status_sender
                     .send(RuntimeStatus::AllTracesEnabled {
                         count: 0,
-                        error: Some(format!("Failed to enable all traces: {}", e)),
+                        error: Some(format!("Failed to enable all traces: {e}")),
                     });
             }
         }
@@ -197,7 +197,7 @@ pub async fn handle_delete_all_traces(
                     .status_sender
                     .send(RuntimeStatus::AllTracesDeleted {
                         count: 0,
-                        error: Some(format!("Failed to delete all traces: {}", e)),
+                        error: Some(format!("Failed to delete all traces: {e}")),
                     });
             }
         }

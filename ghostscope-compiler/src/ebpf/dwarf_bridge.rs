@@ -475,7 +475,7 @@ impl<'ctx> EbpfContext<'ctx> {
 
     /// Convert DWARF type size to MemoryAccessSize
     fn dwarf_type_to_memory_access_size(&self, dwarf_type: &TypeInfo) -> MemoryAccessSize {
-        let size = self.get_dwarf_type_size(dwarf_type);
+        let size = Self::get_dwarf_type_size(dwarf_type);
         match size {
             1 => MemoryAccessSize::U8,
             2 => MemoryAccessSize::U16,
@@ -935,8 +935,7 @@ impl<'ctx> EbpfContext<'ctx> {
                 _ => {
                     warn!("Unimplemented ComputeStep: {:?}", step);
                     return Err(CodeGenError::NotImplemented(format!(
-                        "ComputeStep {:?} not yet implemented",
-                        step
+                        "ComputeStep {step:?} not yet implemented"
                     )));
                 }
             }
@@ -1079,17 +1078,13 @@ impl<'ctx> EbpfContext<'ctx> {
             }
             Err(e) => {
                 debug!("DWARF query error for '{}': {}", var_name, e);
-                Err(CodeGenError::DwarfError(format!(
-                    "DWARF query failed: {}",
-                    e
-                )))
+                Err(CodeGenError::DwarfError(format!("DWARF query failed: {e}")))
             }
         }
     }
 
     /// Get DWARF type size in bytes
-    #[allow(clippy::only_used_in_recursion)]
-    pub fn get_dwarf_type_size(&self, dwarf_type: &TypeInfo) -> u64 {
+    pub fn get_dwarf_type_size(dwarf_type: &TypeInfo) -> u64 {
         match dwarf_type {
             TypeInfo::BaseType { size, .. } => *size,
             TypeInfo::PointerType { size, .. } => *size,
@@ -1101,14 +1096,14 @@ impl<'ctx> EbpfContext<'ctx> {
                 underlying_type, ..
             } => {
                 // Read size equals the storage type size
-                self.get_dwarf_type_size(underlying_type)
+                Self::get_dwarf_type_size(underlying_type)
             }
             TypeInfo::TypedefType {
                 underlying_type, ..
-            } => self.get_dwarf_type_size(underlying_type),
+            } => Self::get_dwarf_type_size(underlying_type),
             TypeInfo::QualifiedType {
                 underlying_type, ..
-            } => self.get_dwarf_type_size(underlying_type),
+            } => Self::get_dwarf_type_size(underlying_type),
             TypeInfo::FunctionType { .. } => 8, // Function pointer size
             TypeInfo::UnknownType { .. } => 0,
             TypeInfo::OptimizedOut { .. } => 0, // Optimized out has no size
@@ -1428,7 +1423,7 @@ impl<'ctx> EbpfContext<'ctx> {
         let elem_name = format!("{}[{}]", base_var.name, index_value);
         let element_var = VariableWithEvaluation {
             name: elem_name,
-            type_name: self.type_info_to_name(&element_type),
+            type_name: Self::type_info_to_name(&element_type),
             dwarf_type: Some(element_type),
             evaluation_result: element_evaluation_result,
             scope_depth: base_var.scope_depth,
@@ -1628,8 +1623,8 @@ impl<'ctx> EbpfContext<'ctx> {
 
         // Create dereferenced variable
         let deref_var = VariableWithEvaluation {
-            name: format!("*{}", self.expr_to_string(expr)),
-            type_name: self.type_info_to_name(&pointed_type),
+            name: format!("*{}", Self::expr_to_string(expr)),
+            type_name: Self::type_info_to_name(&pointed_type),
             dwarf_type: Some(pointed_type),
             evaluation_result: self.compute_pointer_dereference(&ptr_var.evaluation_result)?,
             scope_depth: ptr_var.scope_depth,
@@ -1723,27 +1718,25 @@ impl<'ctx> EbpfContext<'ctx> {
     }
 
     /// Helper: Convert expression to string for debugging
-    #[allow(clippy::only_used_in_recursion)]
-    fn expr_to_string(&self, expr: &crate::script::Expr) -> String {
+    fn expr_to_string(expr: &crate::script::Expr) -> String {
         use crate::script::Expr;
 
         match expr {
             Expr::Variable(name) => name.clone(),
-            Expr::MemberAccess(obj, field) => format!("{}.{}", self.expr_to_string(obj), field),
-            Expr::ArrayAccess(arr, _) => format!("{}[index]", self.expr_to_string(arr)),
+            Expr::MemberAccess(obj, field) => format!("{}.{}", Self::expr_to_string(obj), field),
+            Expr::ArrayAccess(arr, _) => format!("{}[index]", Self::expr_to_string(arr)),
             Expr::ChainAccess(chain) => chain.join("."),
-            Expr::PointerDeref(expr) => format!("*{}", self.expr_to_string(expr)),
+            Expr::PointerDeref(expr) => format!("*{}", Self::expr_to_string(expr)),
             _ => "expr".to_string(),
         }
     }
 
     /// Helper: Extract readable name from TypeInfo
-    #[allow(clippy::only_used_in_recursion)]
-    fn type_info_to_name(&self, type_info: &TypeInfo) -> String {
+    fn type_info_to_name(type_info: &TypeInfo) -> String {
         match type_info {
             TypeInfo::BaseType { name, .. } => name.clone(),
             TypeInfo::PointerType { target_type, .. } => {
-                format!("{}*", self.type_info_to_name(target_type))
+                format!("{}*", Self::type_info_to_name(target_type))
             }
             TypeInfo::ArrayType {
                 element_type,
@@ -1751,14 +1744,14 @@ impl<'ctx> EbpfContext<'ctx> {
                 ..
             } => {
                 if let Some(count) = element_count {
-                    format!("{}[{}]", self.type_info_to_name(element_type), count)
+                    format!("{}[{}]", Self::type_info_to_name(element_type), count)
                 } else {
-                    format!("{}[]", self.type_info_to_name(element_type))
+                    format!("{}[]", Self::type_info_to_name(element_type))
                 }
             }
-            TypeInfo::StructType { name, .. } => format!("struct {}", name),
-            TypeInfo::UnionType { name, .. } => format!("union {}", name),
-            TypeInfo::EnumType { name, .. } => format!("enum {}", name),
+            TypeInfo::StructType { name, .. } => format!("struct {name}"),
+            TypeInfo::UnionType { name, .. } => format!("union {name}"),
+            TypeInfo::EnumType { name, .. } => format!("enum {name}"),
             TypeInfo::BitfieldType {
                 underlying_type,
                 bit_offset,
@@ -1768,13 +1761,13 @@ impl<'ctx> EbpfContext<'ctx> {
                     "bitfield<{}:{}> {}",
                     bit_offset,
                     bit_size,
-                    self.type_info_to_name(underlying_type)
+                    Self::type_info_to_name(underlying_type)
                 )
             }
             TypeInfo::TypedefType { name, .. } => name.clone(),
             TypeInfo::QualifiedType {
                 underlying_type, ..
-            } => self.type_info_to_name(underlying_type),
+            } => Self::type_info_to_name(underlying_type),
             TypeInfo::FunctionType { .. } => "function".to_string(),
             TypeInfo::UnknownType { name } => name.clone(),
             TypeInfo::OptimizedOut { name } => format!("<optimized_out> {name}"),

@@ -488,6 +488,6 @@ fn is_pid_running(pid: u32) -> bool {
     use std::path::Path;
 
     // On Linux, check if /proc/PID exists and is a directory
-    let proc_path = format!("/proc/{}", pid);
+    let proc_path = format!("/proc/{pid}");
     Path::new(&proc_path).is_dir()
 }

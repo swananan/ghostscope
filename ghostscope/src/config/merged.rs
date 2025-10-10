@@ -34,7 +34,6 @@ pub struct MergedConfig {
     pub ebpf_max_messages: usize,
 
     // DWARF configuration
-    #[allow(dead_code)]
     pub dwarf_search_paths: Vec<String>,
     pub dwarf_allow_loose_debug_match: bool,
 
