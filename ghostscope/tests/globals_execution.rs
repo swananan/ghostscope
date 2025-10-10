@@ -128,6 +128,47 @@ async fn run_ghostscope_with_script_for_pid_impl(
 }
 
 #[tokio::test]
+async fn test_memcmp_hex_helper_on_globals() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // gm -> "Hello, Global!" → prefix "Hello, " = 48 65 6c 6c 6f 2c 20
+    // lm -> "LIB_MESSAGE" → prefix "LIB_" = 4c 49 42 5f
+    let script = r#"
+trace globals_program.c:32 {
+    if memcmp(gm, hex("48656c6c6f2c20"), 7) { print "HEX_OK"; }
+    if memcmp(lm, hex("4c49425f"), 4) { print "HEX_LM"; }
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    assert!(
+        stdout.contains("HEX_OK"),
+        "Expected HEX_OK. STDOUT: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("HEX_LM"),
+        "Expected HEX_LM. STDOUT: {}",
+        stdout
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_script_signed_ints_regression() -> anyhow::Result<()> {
     init();
 
