@@ -1718,6 +1718,65 @@ trace foo {
     }
 
     #[test]
+    fn parse_assignment_is_rejected_with_friendly_message() {
+        let script = r#"
+trace foo {
+    let a = 1;
+    a = 2;
+}
+"#;
+        let r = parse(script);
+        match r {
+            Ok(_) => panic!("expected assignment error for immutable variables"),
+            Err(ParseError::TypeError(msg)) => {
+                assert!(
+                    msg.contains("Assignment is not supported"),
+                    "unexpected msg: {msg}"
+                );
+            }
+            Err(e) => panic!("unexpected error variant: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_starts_with_accepts_two_exprs() {
+        // Both sides are expr (identifiers); grammar should accept
+        let script = r#"
+trace foo {
+    if starts_with(name, s) { print "OK"; }
+}
+"#;
+        let r = parse(script);
+        assert!(r.is_ok(), "parse failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn parse_strncmp_accepts_two_exprs_and_len() {
+        let script = r#"
+trace foo {
+    if strncmp(lhs, rhs, 3) { print "EQ"; }
+}
+"#;
+        let r = parse(script);
+        assert!(r.is_ok(), "parse failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn parse_strncmp_negative_len_rejected() {
+        // Third argument must be a non-negative integer literal
+        let script = r#"
+trace foo {
+    if strncmp(lhs, rhs, -1) { print "X"; }
+}
+"#;
+        let r = parse(script);
+        assert!(r.is_err(), "expected parse error for negative length");
+        if let Err(ParseError::TypeError(msg)) = r {
+            assert!(msg.contains("non-negative"), "unexpected msg: {msg}");
+        }
+    }
+
+    #[test]
     fn parse_memcmp_missing_len_without_hex_should_fail() {
         let script = r#"
 trace foo {
