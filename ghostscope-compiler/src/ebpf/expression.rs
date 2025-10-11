@@ -69,9 +69,14 @@ impl<'ctx> EbpfContext<'ctx> {
             }
         } else {
             let module_hint = self.current_resolved_var_module_path.clone();
+            let status_ptr = if self.condition_context_active {
+                Some(self.get_or_create_cond_error_global())
+            } else {
+                None
+            };
             self.evaluation_result_to_address_with_hint(
                 &var.evaluation_result,
-                None,
+                status_ptr,
                 module_hint.as_deref(),
             )
         }
@@ -305,6 +310,146 @@ impl<'ctx> EbpfContext<'ctx> {
             .build_and(ok_a, ok_b, "memcmp_status_ok")
             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
 
+        // If in condition context and either side failed, set condition error code = 1 (ProbeReadFailed)
+        if self.condition_context_active {
+            let not_a = self
+                .builder
+                .build_not(ok_a, "memcmp_fail_a")
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            let not_b = self
+                .builder
+                .build_not(ok_b, "memcmp_fail_b")
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            let any_fail = self
+                .builder
+                .build_or(not_a, not_b, "memcmp_any_fail")
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            let cur_block = self.builder.get_insert_block().unwrap();
+            let func = cur_block.get_parent().unwrap();
+            let set_b = self.context.append_basic_block(func, "memcmp_set_err");
+            let cont_b = self.context.append_basic_block(func, "memcmp_cont");
+            self.builder
+                .build_conditional_branch(any_fail, set_b, cont_b)
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            self.builder.position_at_end(set_b);
+            // Align error_code with VariableStatus::ReadError = 2
+            let _ = self.set_condition_error_if_unset(2u8);
+            // Decide which side failed (prefer recording the actual failing side)
+            let not_a_val = self
+                .builder
+                .build_not(ok_a, "memcmp_fail_a_val")
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            let not_b_val = self
+                .builder
+                .build_not(ok_b, "memcmp_fail_b_val")
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            let cur_fn = self
+                .builder
+                .get_insert_block()
+                .unwrap()
+                .get_parent()
+                .unwrap();
+            let set_a_bb = self.context.append_basic_block(cur_fn, "set_addr_a");
+            let check_b_bb = self.context.append_basic_block(cur_fn, "check_fail_b");
+            let set_b_bb = self.context.append_basic_block(cur_fn, "set_addr_b");
+            let after_set_bb = self.context.append_basic_block(cur_fn, "after_set_addr");
+
+            // Branch on A failure first
+            self.builder
+                .build_conditional_branch(not_a_val, set_a_bb, check_b_bb)
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+            // set A address
+            self.builder.position_at_end(set_a_bb);
+            if let Some(pa) = match parse_hex_bytes(a_expr) {
+                Some(_) => None,
+                None => Some(self.resolve_ptr_i64_from_expr(a_expr)?),
+            } {
+                let _ = self.set_condition_error_addr_if_unset(pa);
+            }
+            self.builder
+                .build_unconditional_branch(after_set_bb)
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+            // check B failure and set B
+            self.builder.position_at_end(check_b_bb);
+            self.builder
+                .build_conditional_branch(not_b_val, set_b_bb, after_set_bb)
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            self.builder.position_at_end(set_b_bb);
+            if let Some(pb) = match parse_hex_bytes(b_expr) {
+                Some(_) => None,
+                None => Some(self.resolve_ptr_i64_from_expr(b_expr)?),
+            } {
+                let _ = self.set_condition_error_addr_if_unset(pb);
+            }
+            self.builder
+                .build_unconditional_branch(after_set_bb)
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            self.builder.position_at_end(after_set_bb);
+            // Build flags: bit0=A fail, bit1=B fail, bit2=len clamped, bit3=len<=0
+            let i8t = self.context.i8_type();
+            let b_a = self
+                .builder
+                .build_int_z_extend(
+                    self.builder
+                        .build_not(ok_a, "fa")
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?,
+                    i8t,
+                    "fa8",
+                )
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            let b_b1 = self
+                .builder
+                .build_int_z_extend(
+                    self.builder
+                        .build_not(ok_b, "fb")
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?,
+                    i8t,
+                    "fb8",
+                )
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            let sh1 = self
+                .builder
+                .build_left_shift(b_b1, i8t.const_int(1, false), "b_b_shift")
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            // gt: len_nn > cap  (len clamped)
+            let b_c = self
+                .builder
+                .build_int_z_extend(gt, i8t, "clamped8")
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            let sh2 = self
+                .builder
+                .build_left_shift(b_c, i8t.const_int(2, false), "b_c_shift")
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            // len<=0: reuse len_is_zero
+            let b_z = self
+                .builder
+                .build_int_z_extend(len_is_zero, i8t, "len0_8")
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            let sh3 = self
+                .builder
+                .build_left_shift(b_z, i8t.const_int(3, false), "b_z_shift")
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            let f01 = self
+                .builder
+                .build_or(b_a, sh1, "f01")
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            let f012 = self
+                .builder
+                .build_or(f01, sh2, "f012")
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            let flags = self
+                .builder
+                .build_or(f012, sh3, "flags")
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            let _ = self.or_condition_error_flags(flags);
+            self.builder
+                .build_unconditional_branch(cont_b)
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            self.builder.position_at_end(cont_b);
+        }
+
         // Aggregate XOR/OR across 0..CAP, masked by (i < sel_len)
         let i32_ty = self.context.i32_type();
         let idx0 = i32_ty.const_zero();
@@ -422,9 +567,14 @@ impl<'ctx> EbpfContext<'ctx> {
                 _ => {
                     // Fallback: read pointer from address
                     let module_hint = self.current_resolved_var_module_path.clone();
+                    let status_ptr = if self.condition_context_active {
+                        Some(self.get_or_create_cond_error_global())
+                    } else {
+                        None
+                    };
                     let addr = self.evaluation_result_to_address_with_hint(
                         &var.evaluation_result,
-                        None,
+                        status_ptr,
                         module_hint.as_deref(),
                     )?;
                     let val_any =
@@ -442,9 +592,14 @@ impl<'ctx> EbpfContext<'ctx> {
         } else {
             // No DWARF type: compute address then read pointer-sized value
             let module_hint = self.current_resolved_var_module_path.clone();
+            let status_ptr = if self.condition_context_active {
+                Some(self.get_or_create_cond_error_global())
+            } else {
+                None
+            };
             let addr = self.evaluation_result_to_address_with_hint(
                 &var.evaluation_result,
-                None,
+                status_ptr,
                 module_hint.as_deref(),
             )?;
             let val_any =
@@ -477,6 +632,32 @@ impl<'ctx> EbpfContext<'ctx> {
                 "rd_ok",
             )
             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        // If in condition context and read failed, set condition error code = 1 (ProbeReadFailed)
+        if self.condition_context_active {
+            let cur_block = self.builder.get_insert_block().unwrap();
+            let func = cur_block.get_parent().unwrap();
+            let set_b = self.context.append_basic_block(func, "strncmp_set_err");
+            let cont_b = self.context.append_basic_block(func, "strncmp_cont");
+            let not_ok = self
+                .builder
+                .build_not(status_ok, "rd_fail")
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            self.builder
+                .build_conditional_branch(not_ok, set_b, cont_b)
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            self.builder.position_at_end(set_b);
+            // VariableStatus::ReadError = 2
+            let _ = self.set_condition_error_if_unset(2u8);
+            let _ = self.set_condition_error_addr_if_unset(ptr_i64);
+            // flags: bit0 = read failure for strncmp
+            let one = self.context.i8_type().const_int(1, false);
+            let _ = self.or_condition_error_flags(one);
+            self.builder
+                .build_unconditional_branch(cont_b)
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            self.builder.position_at_end(cont_b);
+        }
 
         // XOR/OR accumulation over cmp_len bytes
         let i32_ty = self.context.i32_type();
@@ -1426,9 +1607,14 @@ impl<'ctx> EbpfContext<'ctx> {
 
         // Compute runtime address of the DWARF expression
         let module_hint = self.current_resolved_var_module_path.clone();
+        let status_ptr = if self.condition_context_active {
+            Some(self.get_or_create_cond_error_global())
+        } else {
+            None
+        };
         let addr = self.evaluation_result_to_address_with_hint(
             &var.evaluation_result,
-            None,
+            status_ptr,
             module_hint.as_deref(),
         )?;
 

@@ -13,6 +13,7 @@ GhostScope 使用专门的领域特定语言来定义追踪点和操作。脚本
 8. [特殊变量](#特殊变量)
 9. [示例](#示例)
 10. [限制](#限制)
+11. [运行时表达式失败（ExprError）](#运行时表达式失败expre rror)
 
 ## 基础语法
 
@@ -278,6 +279,7 @@ GhostScope 提供若干对 verifier 友好的内置比较函数：
   - `expr` 可为 DWARF 的 `char*`、`char[N]`，也可为通用指针；GhostScope 会做有界的用户态内存读取并按字节比较。
   - 任何读取失败均返回 `false`。
   - 比较长度由配置 `ebpf.compare_cap` 控制（默认 64 字节）；若 `n` 超过上限或数组可用长度，会自动裁剪。
+  - 运行时读取 DWARF 变量失败的呈现与分支行为，参见下文“运行时表达式失败（ExprError）”。
 
 - `starts_with(expr, "lit")`
   - 等价于 `strncmp(expr, "lit", len("lit"))`。
@@ -295,6 +297,7 @@ GhostScope 提供若干对 verifier 友好的内置比较函数：
   - 参见下文：十六进制字节串辅助（`hex`）。
     - 若任一参数为 `hex("...")`，可省略第三个 `len` 参数；解析器会用 `hex` 的字节数作为长度。若两侧都是 `hex(...)`，两者字节数需一致。
     - 当 `memcmp(expr, hex(...), len_literal)` 使用字面量长度时，解析器会检查 `len_literal` 不得超过字节串长度，且不能为负，否则报错。
+  - 运行时读取 DWARF 变量失败的呈现与分支行为，参见下文“运行时表达式失败（ExprError）”。
 
 Verifier 友好与性能：
 - 内置函数生成的比较逻辑尽量少分支（如按字节 XOR/OR 累积），降低 verifier 状态数量。
@@ -379,6 +382,8 @@ if x > 100 {
     print "小";
 }
 ```
+
+提示：条件表达式在运行时若读取 DWARF 变量失败，不会被静默当作 false；将发送一条结构化的 `ExprError` 并按“软中止”语义处理分支。详见下文“运行时表达式失败（ExprError）”。
 
 #### C 字符串等值比较（char*/char[]）
 
@@ -617,3 +622,46 @@ trace server_respond {
 - 字符串字面量必须使用双引号
 - 大多数语句需要分号
 - 追踪模式匹配支持文件模糊匹配（参见[命令参考](command-reference.md)）
+
+## 运行时表达式失败（ExprError）
+
+当 `if/else if` 条件或内置函数（如 `memcmp`、`strncmp`、`starts_with`）在运行时读取 DWARF 变量失败时，GhostScope 不会静默将条件当作 false，而是发送一条结构化的“表达式错误（ExprError）”指令到用户态并按“软中止”语义处理：
+
+- 软中止：
+  - 对出错的 `if`：跳过 then/else；`else if` 链继续评估；若后续某个条件为真则执行该分支。
+  - 对 `print`：不终止，行内展示变量读取错误；若 `print` 参数是 `memcmp/strncmp` 且失败，会附加一条 `ExprError` 警告。
+
+### ExprError 的字段
+
+- `expr`：表达式的可读文本（UTF‑8 安全截断）。
+- `code`：错误码，对齐 `VariableStatus` 语义：
+  - 1 = NullDeref（空指针解引用）
+  - 2 = ReadError（读失败，含 probe_read_user 等）
+  - 3 = AccessError（权限/访问错误）
+  - 4 = Truncated（长度被截断）
+  - 5 = OffsetsUnavailable（缺少 ASLR 偏移等运行时信息）
+  - 6 = ZeroLength（请求长度为 0）
+- `flags`：位掩码，提供额外上下文（不同内置函数有各自语义）：
+  - `memcmp`：
+    - `0x01` → first-arg read-fail（arg0）
+    - `0x02` → second-arg read-fail（arg1）
+    - `0x04` → len-clamped（长度被 compare_cap 裁剪）
+    - `0x08` → len=0（有效长度为 0）
+  - `strncmp/starts_with`：
+    - `0x01` → read-fail（目标读取失败）
+    - `0x04`、`0x08` 预留用于长度裁剪与长度为 0
+- `failing_addr`：失败涉及的指针地址（若可用，否则为 0）。
+
+控制台模式下的示例输出：
+
+```
+ExprError: memcmp(buf, hex("504f"), 2) (read error at 0x0000000100000000, flags: first-arg read-fail,len-clamped)
+```
+
+TUI 会以警告样式展示该行（无 emoji），并支持 3 行预览与展开查看。
+
+当失败地址为 0 时，会显示为 `at NULL`：
+
+```
+ExprError: memcmp(G_STATE.lib, hex("00"), 1) (read error at NULL, flags: first-arg read-fail)
+```

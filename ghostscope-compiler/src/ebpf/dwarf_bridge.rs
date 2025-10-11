@@ -69,6 +69,12 @@ impl<'ctx> EbpfContext<'ctx> {
         status_ptr: Option<PointerValue<'ctx>>,
         module_hint: Option<&str>,
     ) -> Result<IntValue<'ctx>> {
+        // Policy note:
+        // - Link-time addresses (DW_OP_addr or constant-foldable address expressions) are
+        //   always rebased using per-module section offsets (ASLR) to get a runtime address.
+        // - Runtime-derived addresses (register/stack-relative or computed via dereference)
+        //   are used as-is and are NOT rebased.
+        // The caller signals which path we are on by providing the original evaluation_result.
         let pt_regs_ptr = self.get_pt_regs_parameter()?;
         match evaluation_result {
             EvaluationResult::MemoryLocation(LocationResult::Address(addr)) => {
@@ -519,7 +525,18 @@ impl<'ctx> EbpfContext<'ctx> {
 
             DirectValueResult::ComputedValue { steps, result_size } => {
                 debug!("Generating computed value: {} steps", steps.len());
-                self.generate_compute_steps(steps, pt_regs_ptr, Some(*result_size), None, None)
+                let status_ptr = if self.condition_context_active {
+                    Some(self.get_or_create_cond_error_global())
+                } else {
+                    None
+                };
+                self.generate_compute_steps(
+                    steps,
+                    pt_regs_ptr,
+                    Some(*result_size),
+                    status_ptr,
+                    None,
+                )
             }
         }
     }
@@ -532,12 +549,38 @@ impl<'ctx> EbpfContext<'ctx> {
         dwarf_type: &TypeInfo,
     ) -> Result<BasicValueEnum<'ctx>> {
         match location {
+            // Policy note:
+            // We decide ASLR rebasing based on the DWARF evaluation RESULT SHAPE, not a
+            // "global variable" tag. Whenever DWARF yields a link-time address
+            // (LocationResult::Address) — including file-scope globals, static locals,
+            // rodata/data/bss, or any constant-folded address — we MUST apply per-module
+            // section offsets (.text/.rodata/.data/.bss) to obtain the runtime address.
+            // Conversely, for runtime-derived addresses (RegisterAddress or computed from
+            // registers/dereferences), we DO NOT rebase.
             LocationResult::Address(addr) => {
                 debug!("Generating absolute address: 0x{:x}", addr);
-                let addr_value = self.context.i64_type().const_int(*addr, false);
+                // Convert link-time address to runtime address using ASLR offsets when available
+                let module_hint = self.current_resolved_var_module_path.clone();
+                let status_ptr = if self.condition_context_active {
+                    Some(self.get_or_create_cond_error_global())
+                } else {
+                    None
+                };
+                let eval = ghostscope_dwarf::EvaluationResult::MemoryLocation(
+                    ghostscope_dwarf::LocationResult::Address(*addr),
+                );
+                let rt_addr = self.evaluation_result_to_address_with_hint(
+                    &eval,
+                    status_ptr,
+                    module_hint.as_deref(),
+                )?;
                 // Use DWARF type size for memory access
                 let access_size = self.dwarf_type_to_memory_access_size(dwarf_type);
-                self.generate_memory_read(addr_value, access_size)
+                if self.condition_context_active {
+                    self.generate_memory_read_with_status(rt_addr, access_size)
+                } else {
+                    self.generate_memory_read(rt_addr, access_size)
+                }
             }
 
             LocationResult::RegisterAddress {
@@ -584,18 +627,31 @@ impl<'ctx> EbpfContext<'ctx> {
                     })
                     .unwrap_or_else(|| self.dwarf_type_to_memory_access_size(dwarf_type));
 
-                self.generate_memory_read(final_addr, access_size)
+                if self.condition_context_active {
+                    self.generate_memory_read_with_status(final_addr, access_size)
+                } else {
+                    self.generate_memory_read(final_addr, access_size)
+                }
             }
 
             LocationResult::ComputedLocation { steps } => {
                 debug!("Generating computed location: {} steps", steps.len());
                 // Execute steps to compute the address
+                let status_ptr = if self.condition_context_active {
+                    Some(self.get_or_create_cond_error_global())
+                } else {
+                    None
+                };
                 let addr_value =
-                    self.generate_compute_steps(steps, pt_regs_ptr, None, None, None)?;
+                    self.generate_compute_steps(steps, pt_regs_ptr, None, status_ptr, None)?;
                 if let BasicValueEnum::IntValue(addr) = addr_value {
                     // Use DWARF type size for memory access
                     let access_size = self.dwarf_type_to_memory_access_size(dwarf_type);
-                    self.generate_memory_read(addr, access_size)
+                    if self.condition_context_active {
+                        self.generate_memory_read_with_status(addr, access_size)
+                    } else {
+                        self.generate_memory_read(addr, access_size)
+                    }
                 } else {
                     Err(CodeGenError::LLVMError(
                         "Address computation must return integer".to_string(),

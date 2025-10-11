@@ -28,6 +28,8 @@ pub enum InstructionType {
     PrintComplexVariable = 0x03, // print complex variable (with full type info)
     PrintComplexFormat = 0x05,   // print with complex variables in format args
     Backtrace = 0x10,            // backtrace instruction
+    /// Structured runtime expression error/warning (control-flow or print context)
+    ExprError = 0x20,
 
     // Control instructions
     EndInstruction = 0xFF, // marks end of instruction sequence
@@ -113,6 +115,15 @@ pub struct BacktraceData {
     pub reserved: u16, // Padding for alignment
                    // Followed by backtrace frame data in the instruction payload
 }
+/// ExprError instruction data - structured warning for runtime expression failure
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy, FromBytes, KnownLayout, Immutable, Unaligned)]
+pub struct ExprErrorData {
+    pub string_index: u16, // Index into string table for pretty expression text
+    pub error_code: u8,    // Error code (semantic defined by compiler)
+    pub flags: u8,         // Optional flags bitfield (e.g., which side failed)
+    pub failing_addr: u64, // Optional: address involved in failure (0 if unknown)
+}
 
 /// End instruction data - marks the end of instruction sequence
 #[repr(C, packed)]
@@ -135,6 +146,13 @@ pub enum Instruction {
         type_index: u16, // Index into type table (new field)
         data: Vec<u8>,
     },
+    /// Structured runtime expression error/warning
+    ExprError {
+        string_index: u16,
+        error_code: u8,
+        flags: u8,
+        failing_addr: u64,
+    },
     Backtrace {
         depth: u8,
         flags: u8,
@@ -152,6 +170,7 @@ impl Instruction {
         match self {
             Instruction::PrintStringIndex { .. } => InstructionType::PrintStringIndex,
             Instruction::PrintVariableIndex { .. } => InstructionType::PrintVariableIndex,
+            Instruction::ExprError { .. } => InstructionType::ExprError,
             Instruction::Backtrace { .. } => InstructionType::Backtrace,
             Instruction::EndInstruction { .. } => InstructionType::EndInstruction,
         }

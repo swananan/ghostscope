@@ -912,13 +912,23 @@ impl<'ctx> EbpfContext<'ctx> {
                 }
             }
         }
-        let mut s = inner(expr);
+        let s_full = inner(expr);
         const MAX_NAME: usize = 96;
-        if s.len() > MAX_NAME {
-            s.truncate(MAX_NAME.saturating_sub(3));
-            s.push_str("...");
+        if s_full.chars().count() > MAX_NAME {
+            // Keep space for ellipsis
+            let keep = MAX_NAME.saturating_sub(3);
+            let mut acc = String::with_capacity(MAX_NAME);
+            for (i, ch) in s_full.chars().enumerate() {
+                if i >= keep {
+                    break;
+                }
+                acc.push(ch);
+            }
+            acc.push_str("...");
+            acc
+        } else {
+            s_full
         }
-        s
     }
 
     // removed old helpers (pure lvalue/binary_op detection) — unified resolver handles shapes
@@ -979,6 +989,14 @@ impl<'ctx> EbpfContext<'ctx> {
                 then_body,
                 else_body,
             } => {
+                // Prepare condition context (runtime error capture)
+                // Pretty expression text for warning
+                let expr_text = self.expr_to_name(condition);
+                let expr_index = self.trace_context.add_string(expr_text);
+                // Activate condition context (compile-time flag) and reset runtime error byte
+                self.condition_context_active = true;
+                self.reset_condition_error()?;
+
                 // Compile condition expression
                 let cond_value = self.compile_expr(condition)?;
 
@@ -1012,7 +1030,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     .get_parent()
                     .ok_or_else(|| CodeGenError::LLVMError("No parent function".to_string()))?;
 
-                // Create basic blocks for then and else paths
+                // Create basic blocks for error/noerror and then/else paths
                 let then_block = self
                     .context
                     .append_basic_block(current_function, "then_block");
@@ -1022,8 +1040,69 @@ impl<'ctx> EbpfContext<'ctx> {
                 let merge_block = self
                     .context
                     .append_basic_block(current_function, "merge_block");
+                let err_block = self
+                    .context
+                    .append_basic_block(current_function, "cond_err_block");
+                let ok_block = self
+                    .context
+                    .append_basic_block(current_function, "cond_ok_block");
+                // After cond compiled, deactivate compile-time flag
+                self.condition_context_active = false;
 
-                // Branch based on condition
+                // First branch: did runtime errors occur while evaluating the condition?
+                let cond_err_pred = self.build_condition_error_predicate()?;
+                self.builder
+                    .build_conditional_branch(cond_err_pred, err_block, ok_block)
+                    .map_err(|e| {
+                        CodeGenError::LLVMError(format!("Failed to branch on cond_err: {e}"))
+                    })?;
+
+                // Error path: emit ExprError and decide destination
+                self.builder.position_at_end(err_block);
+                let cond_err_ptr = self.get_or_create_cond_error_global();
+                let err_code = self
+                    .builder
+                    .build_load(self.context.i8_type(), cond_err_ptr, "cond_err_code")
+                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                    .into_int_value();
+                // Also load failing address (i64)
+                let cond_err_addr_ptr = self.get_or_create_cond_error_addr_global();
+                let err_addr = self
+                    .builder
+                    .build_load(self.context.i64_type(), cond_err_addr_ptr, "cond_err_addr")
+                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                    .into_int_value();
+                // Load flags
+                let cond_err_flags_ptr = self.get_or_create_cond_error_flags_global();
+                let err_flags = self
+                    .builder
+                    .build_load(self.context.i8_type(), cond_err_flags_ptr, "cond_err_flags")
+                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                    .into_int_value();
+                self.generate_expr_error(expr_index, err_code, err_flags, err_addr)?;
+                // Decide where to go on error: if else_body is If (else-if), go to else_block to continue;
+                // otherwise, skip else (suppress) and jump to merge.
+                let goto_else = matches!(else_body.as_deref(), Some(Statement::If { .. }));
+                if goto_else {
+                    self.builder
+                        .build_unconditional_branch(else_block)
+                        .map_err(|e| {
+                            CodeGenError::LLVMError(format!(
+                                "Failed to branch to else on error: {e}"
+                            ))
+                        })?;
+                } else {
+                    self.builder
+                        .build_unconditional_branch(merge_block)
+                        .map_err(|e| {
+                            CodeGenError::LLVMError(format!(
+                                "Failed to branch to merge on error: {e}"
+                            ))
+                        })?;
+                }
+
+                // No-error path: branch on boolean condition
+                self.builder.position_at_end(ok_block);
                 self.builder
                     .build_conditional_branch(cond_bool, then_block, else_block)
                     .map_err(|e| {
@@ -2871,6 +2950,199 @@ impl<'ctx> EbpfContext<'ctx> {
         self.send_instruction_via_ringbuf(inst_buffer, inst_size)
     }
 
+    /// Generate ExprError instruction with expression string index and error code/flags
+    pub fn generate_expr_error(
+        &mut self,
+        expr_string_index: u16,
+        error_code_iv: inkwell::values::IntValue<'ctx>,
+        flags_iv: inkwell::values::IntValue<'ctx>,
+        failing_addr_iv: inkwell::values::IntValue<'ctx>,
+    ) -> Result<()> {
+        let inst_buffer = self.create_instruction_buffer();
+
+        // Store instruction type at offset 0
+        let inst_type_val = self
+            .context
+            .i8_type()
+            .const_int(InstructionType::ExprError as u64, false);
+        self.builder
+            .build_store(inst_buffer, inst_type_val)
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store inst_type: {e}")))?;
+
+        // data_length
+        let data_length_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    inst_buffer,
+                    &[self.context.i32_type().const_int(
+                        std::mem::offset_of!(InstructionHeader, data_length) as u64,
+                        false,
+                    )],
+                    "exprerr_data_length_ptr",
+                )
+                .map_err(|e| {
+                    CodeGenError::LLVMError(format!("Failed to get data_length GEP: {e}"))
+                })?
+        };
+        let data_length_i16_ptr = self
+            .builder
+            .build_pointer_cast(
+                data_length_ptr,
+                self.context.ptr_type(AddressSpace::default()),
+                "exprerr_data_length_i16_ptr",
+            )
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast data_length ptr: {e}")))?;
+        let data_length_val = self.context.i16_type().const_int(
+            std::mem::size_of::<ghostscope_protocol::trace_event::ExprErrorData>() as u64,
+            false,
+        );
+        self.builder
+            .build_store(data_length_i16_ptr, data_length_val)
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_length: {e}")))?;
+
+        // Payload fields after header
+        // string_index at offset sizeof(InstructionHeader) + 0 (u16)
+        let si_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    inst_buffer,
+                    &[self
+                        .context
+                        .i32_type()
+                        .const_int(std::mem::size_of::<InstructionHeader>() as u64, false)],
+                    "exprerr_si_ptr",
+                )
+                .map_err(|e| {
+                    CodeGenError::LLVMError(format!("Failed to get string_index GEP: {e}"))
+                })?
+        };
+        let si_i16_ptr = self
+            .builder
+            .build_pointer_cast(
+                si_ptr,
+                self.context.ptr_type(AddressSpace::default()),
+                "exprerr_si_i16_ptr",
+            )
+            .map_err(|e| {
+                CodeGenError::LLVMError(format!("Failed to cast string_index ptr: {e}"))
+            })?;
+        let si_val = self
+            .context
+            .i16_type()
+            .const_int(expr_string_index as u64, false);
+        self.builder
+            .build_store(si_i16_ptr, si_val)
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store string_index: {e}")))?;
+
+        // error_code at +2, flags at +3
+        let ec_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    inst_buffer,
+                    &[self
+                        .context
+                        .i32_type()
+                        .const_int((std::mem::size_of::<InstructionHeader>() + 2) as u64, false)],
+                    "exprerr_ec_ptr",
+                )
+                .map_err(|e| {
+                    CodeGenError::LLVMError(format!("Failed to get error_code GEP: {e}"))
+                })?
+        };
+        // Truncate/extend runtime error code to i8
+        let ec_i8 = if error_code_iv.get_type().get_bit_width() == 8 {
+            error_code_iv
+        } else if error_code_iv.get_type().get_bit_width() > 8 {
+            self.builder
+                .build_int_truncate(error_code_iv, self.context.i8_type(), "ec_trunc")
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+        } else {
+            self.builder
+                .build_int_z_extend(error_code_iv, self.context.i8_type(), "ec_zext")
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+        };
+        self.builder
+            .build_store(ec_ptr, ec_i8)
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store error_code: {e}")))?;
+        let fl_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    inst_buffer,
+                    &[self
+                        .context
+                        .i32_type()
+                        .const_int((std::mem::size_of::<InstructionHeader>() + 3) as u64, false)],
+                    "exprerr_flags_ptr",
+                )
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get flags GEP: {e}")))?
+        };
+        // Truncate/extend runtime flags to i8
+        let fl_i8 = if flags_iv.get_type().get_bit_width() == 8 {
+            flags_iv
+        } else if flags_iv.get_type().get_bit_width() > 8 {
+            self.builder
+                .build_int_truncate(flags_iv, self.context.i8_type(), "fl_trunc")
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+        } else {
+            self.builder
+                .build_int_z_extend(flags_iv, self.context.i8_type(), "fl_zext")
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+        };
+        self.builder
+            .build_store(fl_ptr, fl_i8)
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store flags: {e}")))?;
+
+        // failing_addr at +4 (u64)
+        let addr_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    inst_buffer,
+                    &[self
+                        .context
+                        .i32_type()
+                        .const_int((std::mem::size_of::<InstructionHeader>() + 4) as u64, false)],
+                    "exprerr_addr_ptr",
+                )
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get addr GEP: {e}")))?
+        };
+        let addr_i64 = if failing_addr_iv.get_type().get_bit_width() == 64 {
+            failing_addr_iv
+        } else if failing_addr_iv.get_type().get_bit_width() > 64 {
+            self.builder
+                .build_int_truncate(failing_addr_iv, self.context.i64_type(), "addr_trunc")
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+        } else {
+            self.builder
+                .build_int_z_extend(failing_addr_iv, self.context.i64_type(), "addr_zext")
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+        };
+        let addr_ptr_cast = self
+            .builder
+            .build_pointer_cast(
+                addr_ptr,
+                self.context.ptr_type(AddressSpace::default()),
+                "exprerr_addr_i64_ptr",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder
+            .build_store(addr_ptr_cast, addr_i64)
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store failing_addr: {e}")))?;
+
+        // Send instruction
+        let inst_size = self.context.i64_type().const_int(
+            (std::mem::size_of::<ghostscope_protocol::trace_event::ExprErrorData>()
+                + std::mem::size_of::<ghostscope_protocol::trace_event::InstructionHeader>())
+                as u64,
+            false,
+        );
+        self.send_instruction_via_ringbuf(inst_buffer, inst_size)
+    }
+
     /// Generate eBPF code for PrintVariableIndex instruction
     pub fn generate_print_variable_index(
         &mut self,
@@ -3984,5 +4256,23 @@ mod tests {
         let program = crate::script::Program::new();
         let res = ctx.compile_program(&program, "test_fmt", &[stmt], None, None, None);
         assert!(res.is_ok(), "Compilation failed: {:?}", res.err());
+    }
+
+    #[test]
+    fn expr_to_name_truncates_utf8_safely() {
+        let context = inkwell::context::Context::create();
+        let opts = CompileOptions::default();
+        let ctx = EbpfContext::new(&context, "test_mod", Some(0), &opts).expect("create ctx");
+        // Build a long expression comprised of multibyte chars to exceed 96 chars
+        let mut chain: Vec<String> = Vec::new();
+        for _ in 0..50 {
+            // each "错误" is 6 bytes, 2 chars -> quickly exceeds 96 chars
+            chain.push("错误".to_string());
+        }
+        let expr = crate::script::Expr::ChainAccess(chain);
+        let s = ctx.expr_to_name(&expr);
+        // Ensure we got a trailing ellipsis and no panic on multibyte boundary
+        assert!(s.ends_with("..."));
+        assert!(s.chars().count() <= 96);
     }
 }

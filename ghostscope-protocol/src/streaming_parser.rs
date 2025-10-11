@@ -29,6 +29,13 @@ pub enum ParsedInstruction {
         formatted_value: String,
         raw_data: Vec<u8>,
     },
+    /// Structured runtime expression error/warning
+    ExprError {
+        expr: String,
+        error_code: u8,
+        flags: u8,
+        failing_addr: u64,
+    },
     PrintComplexFormat {
         formatted_output: String,
     },
@@ -453,6 +460,23 @@ impl StreamingTraceParser {
                 }
             }
 
+            t if t == InstructionType::ExprError as u8 => {
+                let (data_struct, _) =
+                    crate::trace_event::ExprErrorData::read_from_prefix(inst_data)
+                        .map_err(|_| "Invalid ExprError data".to_string())?;
+                let si = data_struct.string_index;
+                let expr = match trace_context.get_string(si) {
+                    Some(s) => s.to_string(),
+                    None => format!("<INVALID_EXPR_INDEX_{si}>"),
+                };
+                ParsedInstruction::ExprError {
+                    expr,
+                    error_code: data_struct.error_code,
+                    flags: data_struct.flags,
+                    failing_addr: data_struct.failing_addr,
+                }
+            }
+
             t if t == InstructionType::PrintComplexFormat as u8 => {
                 let (format_data, _) = PrintComplexFormatData::read_from_prefix(inst_data)
                     .map_err(|_| "Invalid PrintComplexFormat data".to_string())?;
@@ -626,6 +650,78 @@ impl ParsedInstruction {
             } => {
                 format!("{name} ({type_encoding:?}): {formatted_value}")
             }
+            ParsedInstruction::ExprError {
+                expr,
+                error_code,
+                flags,
+                failing_addr,
+            } => {
+                // Map code to brief reason aligned with VariableStatus
+                // 1: NullDeref, 2: ReadError, 3: AccessError, 4: Truncated, 5: OffsetsUnavailable, 6: ZeroLength
+                let reason = match *error_code {
+                    1 => "null deref",
+                    2 => "read error",
+                    3 => "access error",
+                    4 => "truncated",
+                    5 => "offsets unavailable",
+                    6 => "zero length",
+                    _ => "error",
+                };
+
+                // Human-friendly flags (best-effort based on expr content)
+                fn readable_flags(expr: &str, flags: u8) -> Option<String> {
+                    if flags == 0 {
+                        return None;
+                    }
+                    let mut tags: Vec<&'static str> = Vec::new();
+                    let is_memcmp = expr.contains("memcmp(");
+                    let is_strncmp = expr.contains("strncmp(") || expr.contains("starts_with(");
+                    if is_memcmp {
+                        if (flags & 0x01) != 0 {
+                            tags.push("first-arg read-fail");
+                        }
+                        if (flags & 0x02) != 0 {
+                            tags.push("second-arg read-fail");
+                        }
+                        if (flags & 0x04) != 0 {
+                            tags.push("len-clamped");
+                        }
+                        if (flags & 0x08) != 0 {
+                            tags.push("len=0");
+                        }
+                    } else if is_strncmp {
+                        if (flags & 0x01) != 0 {
+                            tags.push("read-fail");
+                        }
+                        if (flags & 0x04) != 0 {
+                            tags.push("len-clamped");
+                        }
+                        if (flags & 0x08) != 0 {
+                            tags.push("len=0");
+                        }
+                    } else {
+                        // Unknown producer; fall back to hex for transparency
+                        return Some(format!("0x{flags:02x}"));
+                    }
+                    if tags.is_empty() {
+                        None
+                    } else {
+                        Some(tags.join(","))
+                    }
+                }
+
+                let flags_text = readable_flags(expr, *flags);
+                let addr_text = if *failing_addr != 0 {
+                    format!("at 0x{failing_addr:016x}")
+                } else {
+                    "at NULL".to_string()
+                };
+                let base = format!("ExprError: {expr} ({reason} {addr_text}");
+                match flags_text {
+                    Some(f) => format!("{base}, flags: {f})"),
+                    None => format!("{base})"),
+                }
+            }
 
             ParsedInstruction::PrintComplexFormat { formatted_output } => formatted_output.clone(),
             ParsedInstruction::PrintComplexVariable {
@@ -661,6 +757,7 @@ impl ParsedInstruction {
         match self {
             ParsedInstruction::PrintString { .. } => "PrintString".to_string(),
             ParsedInstruction::PrintVariable { .. } => "PrintVariable".to_string(),
+            ParsedInstruction::ExprError { .. } => "ExprError".to_string(),
 
             ParsedInstruction::PrintComplexFormat { .. } => "PrintComplexFormat".to_string(),
             ParsedInstruction::PrintComplexVariable { .. } => "PrintComplexVariable".to_string(),
@@ -710,5 +807,93 @@ mod tests {
         // TODO: Add instruction segments and EndInstruction test
         // This demonstrates the pattern: TraceContext is managed externally by loader,
         // not by the parser itself
+    }
+
+    #[test]
+    fn test_parse_exprerror_instruction() {
+        let mut trace_context = TraceContext::new();
+        let expr_idx = trace_context.add_string("memcmp(buf, hex(\"504f\"), 2)".to_string());
+
+        let mut parser = StreamingTraceParser::new();
+
+        // Header
+        let header = TraceEventHeader {
+            magic: crate::consts::MAGIC,
+        };
+        let header_bytes = zerocopy::IntoBytes::as_bytes(&header);
+        assert!(parser
+            .process_segment(header_bytes, &trace_context)
+            .unwrap()
+            .is_none());
+
+        // Message
+        let message = TraceEventMessage {
+            trace_id: 1,
+            timestamp: 0,
+            pid: 123,
+            tid: 456,
+        };
+        let message_bytes = zerocopy::IntoBytes::as_bytes(&message);
+        assert!(parser
+            .process_segment(message_bytes, &trace_context)
+            .unwrap()
+            .is_none());
+
+        // ExprError instruction: header(4) + payload(12)
+        let mut inst = Vec::new();
+        // InstructionHeader
+        inst.push(InstructionType::ExprError as u8); // inst_type
+        inst.extend_from_slice(
+            &(std::mem::size_of::<crate::trace_event::ExprErrorData>() as u16).to_le_bytes(),
+        ); // data_length
+        inst.push(0u8); // reserved
+                        // ExprErrorData payload
+        inst.extend_from_slice(&expr_idx.to_le_bytes()); // string_index
+        inst.push(1u8); // error_code
+        inst.push(0u8); // flags
+        inst.extend_from_slice(&0x1234_5678_9abc_def0u64.to_le_bytes()); // failing_addr
+
+        // EndInstruction
+        inst.push(InstructionType::EndInstruction as u8);
+        inst.extend_from_slice(&(std::mem::size_of::<EndInstructionData>() as u16).to_le_bytes());
+        inst.push(0u8); // reserved
+                        // EndInstructionData
+                        // EndInstructionData: total_instructions:u16, execution_status:u8, reserved:u8
+        inst.extend_from_slice(&1u16.to_le_bytes()); // total_instructions
+        inst.push(1u8); // execution_status
+        inst.push(0u8); // reserved
+
+        let event = parser
+            .process_segment(&inst, &trace_context)
+            .unwrap()
+            .expect("complete event");
+        assert_eq!(event.trace_id, 1);
+        assert_eq!(event.pid, 123);
+        assert_eq!(event.tid, 456);
+        assert_eq!(event.instructions.len(), 2);
+        match &event.instructions[0] {
+            ParsedInstruction::ExprError {
+                expr,
+                error_code,
+                flags,
+                failing_addr,
+            } => {
+                assert_eq!(expr, "memcmp(buf, hex(\"504f\"), 2)");
+                assert_eq!(*error_code, 1);
+                assert_eq!(*flags, 0);
+                assert_eq!(*failing_addr, 0x1234_5678_9abc_def0u64);
+            }
+            other => panic!("unexpected first instruction: {other:?}"),
+        }
+        match &event.instructions[1] {
+            ParsedInstruction::EndInstruction {
+                total_instructions,
+                execution_status,
+            } => {
+                assert_eq!(*total_instructions, 1);
+                assert_eq!(*execution_status, 1); // partial_failure
+            }
+            other => panic!("unexpected last instruction: {other:?}"),
+        }
     }
 }
