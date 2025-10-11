@@ -981,7 +981,12 @@ impl<'ctx> EbpfContext<'ctx> {
                     "Variable '{}' not found in script variables, checking DWARF",
                     var_name
                 );
-                self.compile_dwarf_expression(expr)
+                // If not a DWARF variable either, treat as out-of-scope script name for friendliness
+                match self.query_dwarf_for_variable(var_name) {
+                    Ok(Some(_)) => self.compile_dwarf_expression(expr),
+                    Ok(None) => Err(CodeGenError::VariableNotInScope(var_name.clone())),
+                    Err(e) => Err(CodeGenError::DwarfError(e.to_string())),
+                }
             }
             Expr::SpecialVar(name) => {
                 // Accept both "$pid" and "pid" forms from the parser

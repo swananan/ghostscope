@@ -4,6 +4,15 @@ use ghostscope_loader::{GhostScopeLoader, ProcModuleOffsetsValue};
 use ghostscope_ui::events::{ExecutionStatus, ScriptCompilationDetails, ScriptExecutionResult};
 use tracing::{error, info, warn};
 
+fn map_compile_error_message(e: &ghostscope_compiler::CompileError) -> String {
+    match e {
+        ghostscope_compiler::CompileError::CodeGen(
+            ghostscope_compiler::ebpf::context::CodeGenError::VariableNotInScope(name),
+        ) => format!("Use of variable '{name}' outside of its scope"),
+        _ => e.to_string(),
+    }
+}
+
 /// Create and attach a loader for a single uprobe configuration
 async fn create_and_attach_loader(
     config: &ghostscope_compiler::UProbeConfig,
@@ -98,14 +107,15 @@ pub async fn compile_and_load_script_for_tui(
     ) {
         Ok(result) => result,
         Err(e) => {
-            error!("Script compilation failed: {}", e);
+            let friendly = map_compile_error_message(&e);
+            error!("Script compilation failed: {}", friendly);
             return Ok(ScriptCompilationDetails {
                 trace_ids: vec![],
                 results: vec![ScriptExecutionResult {
                     pc_address: 0,
                     target_name: "compilation_failed".to_string(),
                     binary_path,
-                    status: ExecutionStatus::Failed(format!("Compilation error: {e}")),
+                    status: ExecutionStatus::Failed(format!("Compilation error: {friendly}")),
                 }],
                 total_count: 1,
                 success_count: 0,
@@ -370,10 +380,11 @@ pub async fn compile_and_load_script_for_cli(
     ) {
         Ok(result) => result,
         Err(e) => {
-            error!("Script compilation failed: {}", e);
+            let friendly = map_compile_error_message(&e);
+            error!("Script compilation failed: {}", friendly);
             return Err(anyhow::anyhow!(
                 "Script compilation failed: {}. Please check your script syntax and try again.",
-                e
+                friendly
             ));
         }
     };

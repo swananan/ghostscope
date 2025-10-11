@@ -108,19 +108,30 @@ let message = "hello";
 let result = a + b;
 ```
 
-Types and capabilities:
+#### Types and capabilities
 
 | Type | Literal/Example | Description | Ops/Comparisons |
 | --- | --- | --- | --- |
 | Integer (i64) | `123`, `-42` | 64‑bit signed integer | +, -, *, /; mixes with DWARF integer‑like scalars |
 | Boolean (bool) | `true`, `false`, or from comparison `a < b` | From literals/comparisons/logical ops | logical AND/OR; when mixing with DWARF integers, treated as 0/1 |
 | String | `"hello"` | UTF‑8 string literal | Equality `==`, `!=` with DWARF C strings; no ordering |
+| Alias (address alias) | `let p = &buf[0];` (created via `&expr` or `&expr + <const>`) | A named alias to a DWARF address expression (pointer/array/member address). Useful to give simple names to complex DWARF types/expressions. | Address‑only usage: pass to `memcmp/strncmp/starts_with`, or use with `{:x.N}`/`{:s.N}`/`{:p}`. Not a general pointer: no deref; no arithmetic beyond the bind‑time constant offset; not used for generic comparisons. |
 
 Notes:
-1. Script variables do not expose structs/arrays/pointers. Access those through DWARF variables (member access, deref, constant index) to obtain scalars first.
+1. Script variables do not expose structs/arrays/pointers. Access those through DWARF variables (member access, deref, constant index) to obtain scalars first. The only exception is an alias variable created via address‑of (`&expr` or `&expr + <const>`), which serves as a named address for use in memory operations and pointer/byte formatting.
 2. Floats are not supported in scripts or runtime.
 3. Unary minus `-` is supported and can nest (e.g., `-1`, `-(-1)`), parsed as `0 - expr`.
 4. Transport encodes booleans as 0/1; renderers display `true/false`.
+
+#### Scoping & Shadowing
+
+- Block scope: every `{ ... }` creates a new lexical scope; `if`’s then/else are independent sub‑scopes. A variable is visible only within its declaring scope and nested sub‑scopes; it is not visible after the scope ends.
+- No shadowing between script variables: inner scopes cannot re‑bind a name that exists in an outer scope (even though they are different scopes).
+- Friendly errors:
+  - Assignment: `Assignment is not supported: variables are immutable. Use 'let a = ...' to bind once.`
+  - Same‑scope redeclaration: `Redeclaration in the same scope is not allowed: 'x'`
+  - Shadowing: `Shadowing is not allowed for immutable variables: 'x'`
+  - Out‑of‑scope use: `Use of variable 'y' outside of its scope`
 
 ### DWARF Variables
 

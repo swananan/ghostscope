@@ -106,6 +106,10 @@ pub struct EbpfContext<'ctx> {
     // When a variable is bound from a string literal (or copied from another string var),
     // we keep its bytes (including optional NUL) here for content printing via ImmediateBytes.
     pub string_vars: HashMap<String, Vec<u8>>,
+
+    // === Lexical scoping for immutable variables ===
+    // Each scope frame records names declared in that scope.
+    pub scope_stack: Vec<std::collections::HashSet<String>>,
 }
 
 // Temporary alias for backward compatibility during refactoring
@@ -207,7 +211,64 @@ impl<'ctx> EbpfContext<'ctx> {
             alias_vars: HashMap::new(),
             // String variables
             string_vars: HashMap::new(),
+
+            // Scopes
+            scope_stack: Vec::new(),
         })
+    }
+
+    /// Enter a new lexical scope
+    pub fn enter_scope(&mut self) {
+        self.scope_stack.push(std::collections::HashSet::new());
+    }
+
+    /// Exit current lexical scope and drop all names declared within
+    pub fn exit_scope(&mut self) {
+        if let Some(names) = self.scope_stack.pop() {
+            for name in names {
+                self.variables.remove(&name);
+                self.var_types.remove(&name);
+                self.alias_vars.remove(&name);
+                self.string_vars.remove(&name);
+                self.optimized_out_vars.remove(&name);
+                self.var_pc_addresses.remove(&name);
+            }
+        }
+    }
+
+    /// Check if a name exists in any active scope
+    pub fn is_name_in_any_scope(&self, name: &str) -> bool {
+        self.scope_stack.iter().any(|s| s.contains(name))
+    }
+
+    /// Check if a name exists in current (top) scope
+    pub fn is_name_in_current_scope(&self, name: &str) -> bool {
+        match self.scope_stack.last() {
+            Some(top) => top.contains(name),
+            None => false,
+        }
+    }
+
+    /// Declare a name in the current scope. Disallow same-scope redeclaration and shadowing.
+    pub fn declare_name_in_current_scope(&mut self, name: &str) -> Result<()> {
+        if self.scope_stack.is_empty() {
+            // Initialize a root scope if not present
+            self.enter_scope();
+        }
+        if self.is_name_in_current_scope(name) {
+            return Err(CodeGenError::TypeError(format!(
+                "Redeclaration in the same scope is not allowed: '{name}'"
+            )));
+        }
+        if self.is_name_in_any_scope(name) {
+            return Err(CodeGenError::TypeError(format!(
+                "Shadowing is not allowed for immutable variables: '{name}'"
+            )));
+        }
+        if let Some(top) = self.scope_stack.last_mut() {
+            top.insert(name.to_string());
+        }
+        Ok(())
     }
 
     /// Create a new code generator with DWARF analyzer support

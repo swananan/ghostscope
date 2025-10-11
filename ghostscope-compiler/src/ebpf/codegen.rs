@@ -427,7 +427,7 @@ impl<'ctx> EbpfContext<'ctx> {
                         ))
                     }
                 } else {
-                    Err(CodeGenError::VariableNotFound(name.clone()))
+                    Err(CodeGenError::VariableNotInScope(name.clone()))
                 }
             }
 
@@ -1083,29 +1083,15 @@ impl<'ctx> EbpfContext<'ctx> {
         match statement {
             Statement::AliasDeclaration { name, target } => {
                 info!("Registering alias variable: {} = {:?}", name, target);
-                // Immutability: disallow re-binding an existing script name
-                if self.variable_exists(name)
-                    || self.alias_variable_exists(name)
-                    || self.get_string_variable_bytes(name).is_some()
-                {
-                    return Err(CodeGenError::TypeError(format!(
-                        "immutable variable: '{name}' is already bound in this trace block"
-                    )));
-                }
+                // Declare in current scope (no redeclaration or shadowing)
+                self.declare_name_in_current_scope(name)?;
                 self.set_alias_variable(name, target.clone());
                 Ok(0)
             }
             Statement::VarDeclaration { name, value } => {
                 info!("Processing variable declaration: {} = {:?}", name, value);
-                // Immutability: disallow redeclaration/reassignment of the same name
-                if self.variable_exists(name)
-                    || self.alias_variable_exists(name)
-                    || self.get_string_variable_bytes(name).is_some()
-                {
-                    return Err(CodeGenError::TypeError(format!(
-                        "immutable variable: '{name}' is already bound in this trace block"
-                    )));
-                }
+                // Declare in current scope (no redeclaration or shadowing)
+                self.declare_name_in_current_scope(name)?;
                 // Decide whether this is an alias binding (DWARF-backed address/reference)
                 if self.is_alias_candidate_expr(value) {
                     self.set_alias_variable(name, value.clone());
@@ -1282,9 +1268,11 @@ impl<'ctx> EbpfContext<'ctx> {
                 // Build then block
                 self.builder.position_at_end(then_block);
                 let mut then_instructions = 0u16;
+                self.enter_scope();
                 for stmt in then_body {
                     then_instructions += self.compile_statement(stmt)?;
                 }
+                self.exit_scope();
                 self.builder
                     .build_unconditional_branch(merge_block)
                     .map_err(|e| {
@@ -1295,7 +1283,9 @@ impl<'ctx> EbpfContext<'ctx> {
                 self.builder.position_at_end(else_block);
                 let mut else_instructions = 0u16;
                 if let Some(else_stmt) = else_body {
+                    self.enter_scope();
                     else_instructions += self.compile_statement(else_stmt)?;
+                    self.exit_scope();
                 }
                 self.builder
                     .build_unconditional_branch(merge_block)
@@ -1311,16 +1301,21 @@ impl<'ctx> EbpfContext<'ctx> {
             }
             Statement::Block(nested_statements) => {
                 let mut total_instructions = 0u16;
+                self.enter_scope();
                 for stmt in nested_statements {
                     total_instructions += self.compile_statement(stmt)?;
                 }
+                self.exit_scope();
                 Ok(total_instructions)
             }
             Statement::TracePoint { pattern: _, body } => {
                 let mut total_instructions = 0u16;
+                // Start a new scope for the trace body
+                self.enter_scope();
                 for stmt in body {
                     total_instructions += self.compile_statement(stmt)?;
                 }
+                self.exit_scope();
                 Ok(total_instructions)
             }
             _ => {
@@ -4528,7 +4523,10 @@ mod tests {
         let res = ctx.compile_program(&program, "immut", &[d1, d2], None, None, None);
         assert!(res.is_err(), "expected immutability error, got {res:?}");
         let msg = format!("{:?}", res.err());
-        assert!(msg.contains("immutable variable"));
+        assert!(
+            msg.contains("Redeclaration in the same scope") || msg.contains("immutable variable"),
+            "unexpected error msg: {msg}"
+        );
     }
 
     #[test]
@@ -4554,7 +4552,7 @@ mod tests {
         let res = ctx.compile_program(&program, "immut_alias", &[a1, a2], None, None, None);
         assert!(
             res.is_err(),
-            "expected immutability error for alias, got {res:?}",
+            "expected immutability error for alias, got {res:?}"
         );
     }
 
@@ -4683,6 +4681,62 @@ mod tests {
         assert!(res.is_err(), "expected error");
         let msg = format!("{:?}", res.err());
         assert!(msg.contains("starts_with requires at least one string argument"));
+    }
+
+    #[test]
+    fn shadowing_rejected_in_inner_scope() {
+        let context = inkwell::context::Context::create();
+        let opts = CompileOptions::default();
+        let mut ctx = EbpfContext::new(&context, "test_mod", Some(0), &opts).expect("ctx");
+
+        // let x = 1; { let x = 2; }
+        let d1 = crate::script::Statement::VarDeclaration {
+            name: "x".to_string(),
+            value: crate::script::Expr::Int(1),
+        };
+        let inner =
+            crate::script::Statement::Block(vec![crate::script::Statement::VarDeclaration {
+                name: "x".to_string(),
+                value: crate::script::Expr::Int(2),
+            }]);
+        let program = crate::script::Program::new();
+        let res = ctx.compile_program(&program, "shadow", &[d1, inner], None, None, None);
+        assert!(res.is_err(), "expected shadowing error");
+        let msg = format!("{:?}", res.err());
+        assert!(
+            msg.contains("Shadowing is not allowed") || msg.contains("shadow"),
+            "unexpected: {msg}"
+        );
+    }
+
+    #[test]
+    fn out_of_scope_use_is_rejected() {
+        let context = inkwell::context::Context::create();
+        let opts = CompileOptions::default();
+        let mut ctx = EbpfContext::new(&context, "test_mod", Some(0), &opts).expect("ctx");
+
+        // { let y = 2; } print y;  -> y is out of scope
+        let block =
+            crate::script::Statement::Block(vec![crate::script::Statement::VarDeclaration {
+                name: "y".to_string(),
+                value: crate::script::Expr::Int(2),
+            }]);
+        let print_y = crate::script::Statement::Print(crate::script::PrintStatement::Variable(
+            "y".to_string(),
+        ));
+        let program = crate::script::Program::new();
+        let res = ctx.compile_program(
+            &program,
+            "out_of_scope",
+            &[block, print_y],
+            None,
+            None,
+            None,
+        );
+        assert!(
+            res.is_err(),
+            "expected out-of-scope or missing analyzer error"
+        );
     }
 
     #[test]
