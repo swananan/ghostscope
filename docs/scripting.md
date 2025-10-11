@@ -97,6 +97,8 @@ Notes:
 
 ### Script Variables
 
+**Script variables are immutable.** Within a single trace block, a name can be bound only once; redeclaration is a compile error, and there is no assignment statement (`x = ...` is not supported).
+
 Declare with `let`:
 
 ```ghostscope
@@ -124,7 +126,26 @@ Notes:
 
 DWARF variables include locals, parameters, and globals from the traced program.
 
-Supported complex access:
+#### DWARF Types
+
+| DWARF Type | Example (source language) | Mapping/Display | Access/Operations |
+| --- | --- | --- | --- |
+| Signed/Unsigned Integers (1/2/4/8 bytes) | `int`, `long`, `unsigned int`, `size_t` | I8/I16/I32/I64 or U8/U16/U32/U64 | Printable; mixes with script integers/bools for arithmetic and comparisons (after width/sign normalization) |
+| Boolean | `bool` | Bool (`true`/`false`) | Printable; comparable with script booleans/integers |
+| Float | `float`, `double` | Printable | eBPF has no FP; scripts don’t support float literals/ops |
+| Char | `char`, `unsigned char` | 1‑byte int/char | Printed as 1‑byte integer; arrays/pointers see below |
+| C string | `char*`, `const char*`, `char[]` | CString (rendered as string) | Printable; equality `==`, `!=` with script strings |
+| Pointer | `T*`, `void*`, function pointer | Pointer/NullPointer (address) | Supports `*` deref and `==`/`!=`; auto‑deref for locals/params/globals when safe |
+| Array | `T[N]` | Array | Constant index reads (top‑level or chain‑tail); dynamic/mid indexes and multi‑dim not supported |
+| Struct/Class | `struct Foo`, `class Bar` | Struct | Use `.` member access; operate on scalar members only |
+| Union | `union U` | Union | Show one member view; access members then treat as scalar |
+| Enum | `enum E` | Enum (via base int) | Printed as `Type::Variant`; arithmetic/compare uses base integer |
+| Bitfield | `int flags:3` | Bitfield → integer view | Extracted integer; mixes with script ints/bools |
+| Typedef/Qualified | `typedef`, `const`, `volatile` | Typedef/QualifiedType | Treated as underlying type |
+| Optimized‑out | variable optimized away | OptimizedOut | Read fails; renders `<OPTIMIZED_OUT>`; operations follow failure semantics |
+| Unknown | unsupported/unknown | Unknown | Renders `<UNKNOWN_TYPE_N_BYTES>` |
+
+#### Supported Complex Access
 
 ```ghostscope
 // Simple variable
@@ -367,16 +388,17 @@ GhostScope supports equality/inequality between a script string literal and a DW
 
 ## Built-in Functions
 
-### `strncmp(expr, "lit", n)`
-  - Compares the first `n` bytes of memory pointed to by `expr` with the string literal `lit`.
-  - No requirement for a terminating NUL within `n` bytes.
-  - `expr` may be a DWARF pointer or array (any element type), address‑of (e.g., `&expr`, `&arr[0]`), or a generic pointer. The engine performs a bounded user‑memory read and compares bytes. For non‑char arrays, comparison is on raw bytes; `n` is in bytes.
-  - Any read failure evaluates to `false`. See “Runtime Expression Failures (ExprError)”.
-  - Read length is capped by `ebpf.compare_cap` (default 64 bytes); if `n` exceeds the cap or available array size, it is truncated.
+### `strncmp(a, b, n)`
+  - Check equality within the first `n` bytes (no NUL required).
+  - At least one side (`a` or `b`) must be a string: string literal or a script string variable (e.g., `let s = "AB";`).
+  - The other side can be: DWARF pointer/array, DWARF alias, or another string.
+  - If both sides are strings, the result folds at compile time. If exactly one side is a string, runtime reads the other side and compares (read failures produce ExprError).
+  - `n` must be a non‑negative integer literal; effective length is `min(n, compare_cap, string length, readable bytes)` (compare_cap defaults to 64).
 
-### `starts_with(expr, "lit")`
-  - Equivalent to `strncmp(expr, "lit", len("lit"))`.
-  - Same failure/safety semantics as above.
+### `starts_with(a, b)`
+  - Check if `a` starts with `b`, equivalent to `strncmp(a, b, len(b))`.
+  - At least one side must be a string (literal or script string variable); the other side can be an address expression (DWARF pointer/array or alias) or a string.
+  - If both sides are strings, the result folds at compile time; if exactly one side is a string, runtime reads `len(b)` bytes from the other side and compares (read failures produce ExprError).
 
 ### `memcmp(expr_a, expr_b, len)`
   - Boolean semantics: returns `true` if the first `len` bytes at `expr_a` and `expr_b` are identical.
@@ -463,6 +485,10 @@ trace foo {
     if memcmp(ptr, hex("DE AD BE EF"), 4) { print "MAGIC"; }
 }
 ```
+
+## Stack Backtrace (not implemented)
+
+Backtrace printing via `backtrace;` or `bt;` is planned but not implemented yet. The syntax is reserved, and a dedicated section will be added once available.
 
 ## Examples
 
@@ -605,7 +631,7 @@ trace foo {
 When an `if/else if` condition or a builtin (`memcmp`, `strncmp`, `starts_with`) depends on DWARF‑backed runtime reads and a read fails, GhostScope does not silently treat the condition as `false`. Instead, it sends a structured warning (ExprError) to user space and applies soft‑abort semantics:
 
 - Soft‑abort:
-  - For a failing `if`: skip then/else; an `else if` chain continues; if a later condition succeeds, its branch runs.
+  - For a failing `if`: skip the current then/else. An `else if` chain continues; if a later condition succeeds, its branch runs. The final `else` behaves normally unless a previous condition in the chain already succeeded.
   - For `print`: do not abort the line; per‑variable statuses render inline. If a builtin fails inside `print`, an additional ExprError is emitted.
 
 ### ExprError Fields
@@ -640,3 +666,10 @@ When the failing address is zero:
 ```
 ExprError: memcmp(G_STATE.lib, hex("00"), 1) (read error at NULL, flags: first-arg read-fail)
 ```
+### Comparison Operators
+
+The comparison operators are `==`, `!=`, `<`, `<=`, `>`, `>=`.
+
+- Operands may be script integers/bools and DWARF integer‑like scalars; the engine normalizes width/sign before comparing.
+- For C strings (char*/char[]), use equality `==`/`!=` with string literals or script string variables under “CString Equality”, or prefer the built‑ins `strncmp`/`starts_with` for bounded and prefix checks.
+- Pointer equality supports `==`/`!=` on pointers (including auto‑dereferenced locals/params/globals when applicable).

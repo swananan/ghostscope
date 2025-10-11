@@ -458,6 +458,77 @@ trace calculate_something {
 }
 
 #[tokio::test]
+async fn test_memcmp_rejects_script_pointer_variable_e2e() -> anyhow::Result<()> {
+    init();
+    ensure_global_cleanup_registered();
+
+    // Using a script pointer variable as memcmp arg must fail at compile time now.
+    let script_content = r#"
+trace calculate_something {
+    let p = "A";
+    if memcmp(p, hex("41"), 1) { print "OK"; } else { print "NO"; }
+}
+"#;
+
+    let (exit_code, _stdout, stderr) = run_ghostscope_with_script(script_content, 2).await?;
+    assert!(
+        exit_code != 0,
+        "expected non-zero exit due to compile error; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("Script compilation failed"),
+        "stderr should contain compilation error. stderr={stderr}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_string_variable_copy_allowed_e2e() -> anyhow::Result<()> {
+    init();
+    ensure_global_cleanup_registered();
+
+    let script_content = r#"
+trace calculate_something {
+    let s = "A";
+    let p = s;
+    print p;
+}
+"#;
+
+    let (exit_code, _stdout, stderr) = run_ghostscope_with_script(script_content, 5).await?;
+    assert_eq!(exit_code, 0, "unexpected error: stderr={stderr}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_assignment_is_rejected_with_friendly_message_e2e() -> anyhow::Result<()> {
+    init();
+    ensure_global_cleanup_registered();
+
+    // Immutable variables: reject assignment 'a = ...' with friendly error
+    let script_content = r#"
+trace calculate_something {
+    let a = G_STATE.lib;
+    a = G_STATE;
+    if memcmp(a, hex("00"), 1) { print "A"; }
+    else if memcmp(gm, hex("48"), 1) { print "B"; }
+    else { print "C"; }
+}
+"#;
+
+    let (exit_code, _stdout, stderr) = run_ghostscope_with_script(script_content, 2).await?;
+    assert!(
+        exit_code != 0,
+        "expected compile-time error; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("Assignment is not supported: variables are immutable"),
+        "stderr should contain friendly assignment error. stderr={stderr}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_logical_mixed_precedence() -> anyhow::Result<()> {
     init();
     ensure_global_cleanup_registered();

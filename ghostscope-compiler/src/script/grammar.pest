@@ -8,6 +8,7 @@ statement = {
     print_stmt |
     backtrace_stmt |
     if_stmt |
+    assign_stmt |
     expr_stmt |
     var_decl_stmt
 }
@@ -40,6 +41,7 @@ format_expr = { string ~ "," ~ expr ~ ("," ~ expr)* }
 backtrace_stmt = { ("backtrace" | "bt") ~ ";" }
 expr_stmt = { expr ~ ";" }
 var_decl_stmt = { "let" ~ identifier ~ "=" ~ expr ~ ";" }
+assign_stmt = { identifier ~ "=" ~ expr ~ ";" }
 
 // Conditional statements (Rust style)
 if_stmt = { "if" ~ condition ~ "{" ~ statement* ~ "}" ~ else_clause? }
@@ -90,8 +92,8 @@ factor = {
 }
 
 // Builtin function calls (phase 1)
-strncmp_call = { "strncmp" ~ "(" ~ expr ~ "," ~ string ~ "," ~ int ~ ")" }
-starts_with_call = { "starts_with" ~ "(" ~ expr ~ "," ~ string ~ ")" }
+strncmp_call = { "strncmp" ~ "(" ~ expr ~ "," ~ expr ~ "," ~ int ~ ")" }
+starts_with_call = { "starts_with" ~ "(" ~ expr ~ "," ~ expr ~ ")" }
 memcmp_call = { "memcmp" ~ "(" ~ expr ~ "," ~ expr ~ ("," ~ expr)? ~ ")" }
 hex_call = { "hex" ~ "(" ~ string ~ ")" }
 

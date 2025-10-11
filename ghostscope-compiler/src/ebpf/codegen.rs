@@ -75,10 +75,53 @@ impl<'ctx> EbpfContext<'ctx> {
     fn resolve_expr_to_arg(&mut self, expr: &crate::script::ast::Expr) -> Result<ComplexArg<'ctx>> {
         use crate::script::ast::Expr as E;
         match expr {
+            // 0) Alias variables: resolve to address and render as pointer value
+            E::Variable(name) if self.alias_variable_exists(name) => {
+                let aliased = self.get_alias_variable(name).expect("alias exists");
+                let addr_i64 = self.resolve_ptr_i64_from_expr(&aliased)?;
+                let var_name_index = self.trace_context.add_variable_name(name.clone());
+                Ok(ComplexArg {
+                    var_name_index,
+                    type_index: self.add_synthesized_type_index_for_kind(TypeKind::Pointer),
+                    access_path: Vec::new(),
+                    data_len: 8,
+                    source: ComplexArgSource::ComputedInt {
+                        value: addr_i64,
+                        byte_len: 8,
+                    },
+                })
+            }
             // 1) Script variables first
             E::Variable(name) if self.variable_exists(name) => {
                 let val = self.load_variable(name)?;
                 let var_name_index = self.trace_context.add_variable_name(name.clone());
+                // If this is a string variable, print its contents instead of address
+                if self
+                    .get_variable_type(name)
+                    .is_some_and(|t| matches!(t, crate::script::VarType::String))
+                {
+                    let bytes_opt = self.get_string_variable_bytes(name).cloned();
+                    if let Some(bytes) = bytes_opt {
+                        // Build a char[] type with length=bytes.len()
+                        let char_type = ghostscope_dwarf::TypeInfo::BaseType {
+                            name: "char".to_string(),
+                            size: 1,
+                            encoding: ghostscope_dwarf::constants::DW_ATE_unsigned_char.0 as u16,
+                        };
+                        let array_type = ghostscope_dwarf::TypeInfo::ArrayType {
+                            element_type: Box::new(char_type),
+                            element_count: Some(bytes.len() as u64),
+                            total_size: Some(bytes.len() as u64),
+                        };
+                        return Ok(ComplexArg {
+                            var_name_index,
+                            type_index: self.trace_context.add_type(array_type),
+                            access_path: Vec::new(),
+                            data_len: bytes.len(),
+                            source: ComplexArgSource::ImmediateBytes { bytes },
+                        });
+                    }
+                }
                 match val {
                     BasicValueEnum::IntValue(iv) => {
                         // Preserve signedness for display: map bit width to I8/I16/I32/I64
@@ -106,7 +149,7 @@ impl<'ctx> EbpfContext<'ctx> {
                         })
                     }
                     BasicValueEnum::PointerValue(pv) => {
-                        // Treat as pointer value (rendered as hex). Cast to i64 payload.
+                        // Non-string pointer variable: print as address (hex)
                         let iv = self
                             .builder
                             .build_ptr_to_int(pv, self.context.i64_type(), "ptr_to_i64")
@@ -931,6 +974,68 @@ impl<'ctx> EbpfContext<'ctx> {
         }
     }
 
+    /// Heuristic to decide if an expression should be bound as a DWARF alias variable.
+    /// Prefer shapes that resolve to a runtime address via DWARF or address-of:
+    /// - AddressOf(...)
+    /// - Member/Array/PointerDeref/Chain access
+    /// - Variable that is a DWARF-backed symbol (not a script var)
+    /// - Simple constant-offset on top of an aliasy expression: alias + K (K >= 0)
+    fn is_alias_candidate_expr(&mut self, expr: &crate::script::ast::Expr) -> bool {
+        use crate::script::ast::BinaryOp as BO;
+        use crate::script::ast::Expr as E;
+        match expr {
+            // Alias variable names are alias candidates
+            E::Variable(name) if self.alias_variable_exists(name) => true,
+            // Explicit address-of is always an alias
+            E::AddressOf(_) => true,
+            // Constant offset on top of an alias-eligible expression
+            E::BinaryOp {
+                left,
+                op: BO::Add,
+                right,
+            } => {
+                let is_const_nonneg = |e: &E| matches!(e, E::Int(v) if *v >= 0);
+                (self.is_alias_candidate_expr(left) && is_const_nonneg(right))
+                    || (self.is_alias_candidate_expr(right) && is_const_nonneg(left))
+            }
+            // Otherwise, probe DWARF type: only pointer/array expressions are treated as alias
+            other => {
+                match self.query_dwarf_for_complex_expr(other) {
+                    Ok(Some(var)) => {
+                        // unwrap typedef/qualified
+                        let mut ty_opt = var.dwarf_type.as_ref();
+                        while let Some(ty) = ty_opt {
+                            match ty {
+                                ghostscope_dwarf::TypeInfo::TypedefType {
+                                    underlying_type, ..
+                                } => {
+                                    ty_opt = Some(underlying_type.as_ref());
+                                }
+                                ghostscope_dwarf::TypeInfo::QualifiedType {
+                                    underlying_type,
+                                    ..
+                                } => {
+                                    ty_opt = Some(underlying_type.as_ref());
+                                }
+                                _ => break,
+                            }
+                        }
+                        if let Some(ty) = ty_opt {
+                            matches!(
+                                ty,
+                                ghostscope_dwarf::TypeInfo::PointerType { .. }
+                                    | ghostscope_dwarf::TypeInfo::ArrayType { .. }
+                            )
+                        } else {
+                            false
+                        }
+                    }
+                    _ => false,
+                }
+            }
+        }
+    }
+
     // removed old helpers (pure lvalue/binary_op detection) — unified resolver handles shapes
 
     /// Main entry point: compile program with staged transmission system
@@ -976,12 +1081,77 @@ impl<'ctx> EbpfContext<'ctx> {
         debug!("Compiling statement: {:?}", statement);
 
         match statement {
+            Statement::AliasDeclaration { name, target } => {
+                info!("Registering alias variable: {} = {:?}", name, target);
+                // Immutability: disallow re-binding an existing script name
+                if self.variable_exists(name)
+                    || self.alias_variable_exists(name)
+                    || self.get_string_variable_bytes(name).is_some()
+                {
+                    return Err(CodeGenError::TypeError(format!(
+                        "immutable variable: '{name}' is already bound in this trace block"
+                    )));
+                }
+                self.set_alias_variable(name, target.clone());
+                Ok(0)
+            }
             Statement::VarDeclaration { name, value } => {
                 info!("Processing variable declaration: {} = {:?}", name, value);
-                // Compile the value expression and store in variable
-                let compiled_value = self.compile_expr(value)?;
-                self.store_variable(name, compiled_value)?;
-                Ok(0) // VarDeclaration doesn't generate instructions
+                // Immutability: disallow redeclaration/reassignment of the same name
+                if self.variable_exists(name)
+                    || self.alias_variable_exists(name)
+                    || self.get_string_variable_bytes(name).is_some()
+                {
+                    return Err(CodeGenError::TypeError(format!(
+                        "immutable variable: '{name}' is already bound in this trace block"
+                    )));
+                }
+                // Decide whether this is an alias binding (DWARF-backed address/reference)
+                if self.is_alias_candidate_expr(value) {
+                    self.set_alias_variable(name, value.clone());
+                    tracing::debug!(var=%name, "Registered DWARF alias variable");
+                    Ok(0)
+                } else {
+                    // Compile the value expression and store as concrete variable
+                    // Special-case: string literal and string var copy — record bytes for content printing
+                    match value {
+                        crate::script::Expr::String(s) => {
+                            let mut bytes = s.as_bytes().to_vec();
+                            bytes.push(0); // NUL terminate for display convenience
+                            self.set_string_variable_bytes(name, bytes);
+                        }
+                        crate::script::Expr::Variable(ref nm) => {
+                            if self
+                                .get_variable_type(nm)
+                                .is_some_and(|t| matches!(t, crate::script::VarType::String))
+                            {
+                                if let Some(b) = self.get_string_variable_bytes(nm).cloned() {
+                                    self.set_string_variable_bytes(name, b);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    let compiled_value = self.compile_expr(value)?;
+                    // Disallow storing pointer values in script variables, except for string literals
+                    if let BasicValueEnum::PointerValue(_) = compiled_value {
+                        // Allow if RHS is a string literal OR a string variable (VarType::String)
+                        let allow_string_var_copy = match value {
+                            crate::script::Expr::String(_) => true,
+                            crate::script::Expr::Variable(ref nm) => self
+                                .get_variable_type(nm)
+                                .is_some_and(|t| matches!(t, crate::script::VarType::String)),
+                            _ => false,
+                        };
+                        if !allow_string_var_copy {
+                            return Err(CodeGenError::TypeError(
+                                "script variables cannot store pointer values; use DWARF alias (let v = &expr) or keep it as a string".to_string(),
+                            ));
+                        }
+                    }
+                    self.store_variable(name, compiled_value)?;
+                    Ok(0) // VarDeclaration doesn't generate instructions
+                }
             }
             Statement::Print(print_stmt) => self.compile_print_statement(print_stmt),
             Statement::If {
@@ -4259,13 +4429,13 @@ mod tests {
     }
 
     #[test]
-    fn memcmp_accepts_script_pointer_variable_fallback() {
+    fn memcmp_rejects_script_pointer_variable_now() {
         let context = inkwell::context::Context::create();
         let opts = CompileOptions::default();
         let mut ctx =
             EbpfContext::new(&context, "test_mod", Some(0), &opts).expect("create EbpfContext");
 
-        // let p = "A";  // script pointer to const string
+        // let p = "A";  // script pointer to const string (no longer accepted as memcmp arg)
         let decl = crate::script::Statement::VarDeclaration {
             name: "p".to_string(),
             value: crate::script::Expr::String("A".to_string()),
@@ -4299,7 +4469,220 @@ mod tests {
             None,
             None,
         );
-        assert!(res.is_ok(), "Compilation failed: {:?}", res.err());
+        assert!(
+            res.is_err(),
+            "Expected type error for script pointer variable in memcmp"
+        );
+    }
+
+    #[test]
+    fn strncmp_requires_string_on_one_side_error_message() {
+        let context = inkwell::context::Context::create();
+        let opts = CompileOptions::default();
+        let mut ctx = EbpfContext::new(&context, "test_mod", Some(0), &opts).expect("ctx");
+
+        // strncmp(42, 43, 2) -> neither side is string (literal/var); expect type error
+        let stmt = crate::script::Statement::If {
+            condition: crate::script::Expr::BuiltinCall {
+                name: "strncmp".to_string(),
+                args: vec![
+                    crate::script::Expr::Int(42),
+                    crate::script::Expr::Int(43),
+                    crate::script::Expr::Int(2),
+                ],
+            },
+            then_body: vec![crate::script::Statement::Print(
+                crate::script::PrintStatement::String("OK".to_string()),
+            )],
+            else_body: None,
+        };
+        let program = crate::script::Program::new();
+        let res = ctx.compile_program(&program, "test_strncmp_err", &[stmt], None, None, None);
+        assert!(
+            res.is_err(),
+            "expected error when neither side is string (got {res:?})",
+        );
+        let msg = format!("{:?}", res.err());
+        assert!(msg.contains("strncmp requires at least one string argument"));
+    }
+
+    // No test needed here for string var copy rejection; current semantics allow
+    // let s = "A"; let p = s; as a string-to-string assignment.
+
+    #[test]
+    fn immutable_variable_redeclaration_rejected() {
+        let context = inkwell::context::Context::create();
+        let opts = CompileOptions::default();
+        let mut ctx = EbpfContext::new(&context, "test_mod", Some(0), &opts).expect("ctx");
+
+        // let x = 1; let x = 2;  (same trace block)
+        let d1 = crate::script::Statement::VarDeclaration {
+            name: "x".to_string(),
+            value: crate::script::Expr::Int(1),
+        };
+        let d2 = crate::script::Statement::VarDeclaration {
+            name: "x".to_string(),
+            value: crate::script::Expr::Int(2),
+        };
+        let program = crate::script::Program::new();
+        let res = ctx.compile_program(&program, "immut", &[d1, d2], None, None, None);
+        assert!(res.is_err(), "expected immutability error, got {res:?}");
+        let msg = format!("{:?}", res.err());
+        assert!(msg.contains("immutable variable"));
+    }
+
+    #[test]
+    fn immutable_alias_rebinding_rejected() {
+        let context = inkwell::context::Context::create();
+        let opts = CompileOptions::default();
+        let mut ctx = EbpfContext::new(&context, "test_mod", Some(0), &opts).expect("ctx");
+
+        // let p = &arr[0]; let p = &arr[0];
+        let a1 = crate::script::Statement::AliasDeclaration {
+            name: "p".to_string(),
+            target: crate::script::Expr::AddressOf(Box::new(crate::script::Expr::Variable(
+                "arr".to_string(),
+            ))),
+        };
+        let a2 = crate::script::Statement::AliasDeclaration {
+            name: "p".to_string(),
+            target: crate::script::Expr::AddressOf(Box::new(crate::script::Expr::Variable(
+                "arr".to_string(),
+            ))),
+        };
+        let program = crate::script::Program::new();
+        let res = ctx.compile_program(&program, "immut_alias", &[a1, a2], None, None, None);
+        assert!(
+            res.is_err(),
+            "expected immutability error for alias, got {res:?}",
+        );
+    }
+
+    #[test]
+    fn alias_to_alias_with_const_offset_is_alias_variable() {
+        let context = inkwell::context::Context::create();
+        let opts = CompileOptions::default();
+        let mut ctx = EbpfContext::new(&context, "test_mod", Some(0), &opts).expect("ctx");
+        // let base = &buf[0]; let tail = base + 16;
+        let s1 = crate::script::Statement::AliasDeclaration {
+            name: "base".to_string(),
+            target: crate::script::Expr::AddressOf(Box::new(crate::script::Expr::ArrayAccess(
+                Box::new(crate::script::Expr::Variable("buf".to_string())),
+                Box::new(crate::script::Expr::Int(0)),
+            ))),
+        };
+        let s2 = crate::script::Statement::VarDeclaration {
+            name: "tail".to_string(),
+            value: crate::script::Expr::BinaryOp {
+                left: Box::new(crate::script::Expr::Variable("base".to_string())),
+                op: crate::script::BinaryOp::Add,
+                right: Box::new(crate::script::Expr::Int(16)),
+            },
+        };
+        let program = crate::script::Program::new();
+        // Should treat tail as alias (not as value), thus compile_program succeeds
+        let res = ctx.compile_program(&program, "alias_stage", &[s1, s2], None, None, None);
+        assert!(res.is_ok(), "expected alias-to-alias staging to compile");
+    }
+
+    #[test]
+    fn alias_to_alias_copy_is_alias_variable() {
+        let context = inkwell::context::Context::create();
+        let opts = CompileOptions::default();
+        let mut ctx = EbpfContext::new(&context, "test_mod", Some(0), &opts).expect("ctx");
+        // let a = &G_STATE.lib; let b = a;
+        let a = crate::script::Statement::AliasDeclaration {
+            name: "a".to_string(),
+            target: crate::script::Expr::AddressOf(Box::new(crate::script::Expr::MemberAccess(
+                Box::new(crate::script::Expr::Variable("G_STATE".to_string())),
+                "lib".to_string(),
+            ))),
+        };
+        let b = crate::script::Statement::VarDeclaration {
+            name: "b".to_string(),
+            value: crate::script::Expr::Variable("a".to_string()),
+        };
+        let program = crate::script::Program::new();
+        let res = ctx.compile_program(&program, "alias_copy", &[a, b], None, None, None);
+        assert!(res.is_ok(), "expected alias-to-alias copy to compile");
+    }
+
+    #[test]
+    fn strncmp_folds_with_script_string_and_literal_true() {
+        let context = inkwell::context::Context::create();
+        let opts = CompileOptions::default();
+        let mut ctx = EbpfContext::new(&context, "test_mod", Some(0), &opts).expect("ctx");
+
+        // Prepare: let s = "ABC";
+        let decl = crate::script::Statement::VarDeclaration {
+            name: "s".to_string(),
+            value: crate::script::Expr::String("ABC".to_string()),
+        };
+        let program = crate::script::Program::new();
+        let res = ctx.compile_program(&program, "decl", &[decl], None, None, None);
+        assert!(res.is_ok());
+
+        // Expression: strncmp(s, "ABD", 2) -> true
+        let expr = crate::script::Expr::BuiltinCall {
+            name: "strncmp".to_string(),
+            args: vec![
+                crate::script::Expr::Variable("s".to_string()),
+                crate::script::Expr::String("ABD".to_string()),
+                crate::script::Expr::Int(2),
+            ],
+        };
+        let v = ctx.compile_expr(&expr).expect("compile expr");
+        match v {
+            inkwell::values::BasicValueEnum::IntValue(iv) => {
+                assert_eq!(iv.get_type().get_bit_width(), 1);
+                // true expected (string repr may vary across LLVM versions, check both forms)
+                let s = format!("{iv}");
+                assert!(s.contains("i1 true") || s.contains("true"));
+            }
+            other => panic!("expected IntValue i1, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn starts_with_folds_with_two_literals() {
+        let context = inkwell::context::Context::create();
+        let opts = CompileOptions::default();
+        let mut ctx = EbpfContext::new(&context, "test_mod", Some(0), &opts).expect("ctx");
+
+        // Expression: starts_with("abcdef", "abc") -> true
+        let expr = crate::script::Expr::BuiltinCall {
+            name: "starts_with".to_string(),
+            args: vec![
+                crate::script::Expr::String("abcdef".to_string()),
+                crate::script::Expr::String("abc".to_string()),
+            ],
+        };
+        let v = ctx.compile_expr(&expr).expect("compile expr");
+        match v {
+            inkwell::values::BasicValueEnum::IntValue(iv) => {
+                assert_eq!(iv.get_type().get_bit_width(), 1);
+                let s = format!("{iv}");
+                assert!(s.contains("i1 true") || s.contains("true"));
+            }
+            _ => panic!("expected i1"),
+        }
+    }
+
+    #[test]
+    fn starts_with_requires_one_string_side_error() {
+        let context = inkwell::context::Context::create();
+        let opts = CompileOptions::default();
+        let mut ctx = EbpfContext::new(&context, "test_mod", Some(0), &opts).expect("ctx");
+
+        // Neither side is string
+        let expr = crate::script::Expr::BuiltinCall {
+            name: "starts_with".to_string(),
+            args: vec![crate::script::Expr::Int(1), crate::script::Expr::Int(2)],
+        };
+        let res = ctx.compile_expr(&expr);
+        assert!(res.is_err(), "expected error");
+        let msg = format!("{:?}", res.err());
+        assert!(msg.contains("starts_with requires at least one string argument"));
     }
 
     #[test]
