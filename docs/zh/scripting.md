@@ -269,93 +269,6 @@ print "tail={:s.n$}", p;          // 长度来自变量 n
 
 **注意**：格式字符串遵循 Rust 风格，不支持 `%d`/`%s`（C 风格）。
 
-## 内置函数
-
-GhostScope 提供若干对 verifier 友好的内置比较函数：
-
-- `strncmp(expr, "lit", n)`
-  - 将 `expr` 指向的内存前 `n` 个字节与字面量 `lit` 比较。
-  - 在 `n` 字节内不要求出现终止符 `\0`。
-  - `expr` 可为 DWARF 的 `char*`、`char[N]`，也可为通用指针；GhostScope 会做有界的用户态内存读取并按字节比较。
-  - 任何读取失败均返回 `false`。
-  - 比较长度由配置 `ebpf.compare_cap` 控制（默认 64 字节）；若 `n` 超过上限或数组可用长度，会自动裁剪。
-  - 运行时读取 DWARF 变量失败的呈现与分支行为，参见下文“运行时表达式失败（ExprError）”。
-
-- `starts_with(expr, "lit")`
-  - 等价于 `strncmp(expr, "lit", len("lit"))`。
-  - 失败与安全语义同上。
-
-- `memcmp(expr_a, expr_b, len)`
-  - 布尔语义：若 `expr_a` 与 `expr_b` 所指内存的前 `len` 个字节完全一致，返回 `true`，否则 `false`。
-  - 指针来源：`expr_a`/`expr_b` 可为 DWARF 指针/数组表达式，或“原始地址字面量”（十进制/十六进制 `0x..`/八进制 `0o..`/二进制 `0b..`）。若需与字符串字面量比较，请使用 `strncmp`/`starts_with`。
-  - 整数表达式语义：只要不是 `hex("...")`，任何整数表达式都被当作“用户虚拟地址”处理，并通过 `bpf_probe_read_user` 读取；不会按“字节序列”解释。若要比较原始字节，请使用下文 `hex("...")`。
-  - `len` 支持脚本整数表达式，且整数字面量支持十进制、十六进制（`0x..`）、八进制（`0o..`）与二进制（`0b..`）。运行时会将负值钳为 0；但解析器会拒绝“字面量负长度”。
-  - 不涉及 NUL 终止；按原始字节比较。
-  - 任一侧读取失败均按 `false` 处理。
-  - 若 `len == 0`，结果为 `true`，且不会执行任何用户内存读取（快速路径）。
-  - 实现为固定上界、无早退的按字节累积比较，便于通过 verifier。
-  - 参见下文：十六进制字节串辅助（`hex`）。
-    - 若任一参数为 `hex("...")`，可省略第三个 `len` 参数；解析器会用 `hex` 的字节数作为长度。若两侧都是 `hex(...)`，两者字节数需一致。
-    - 当 `memcmp(expr, hex(...), len_literal)` 使用字面量长度时，解析器会检查 `len_literal` 不得超过字节串长度，且不能为负，否则报错。
-  - 运行时读取 DWARF 变量失败的呈现与分支行为，参见下文“运行时表达式失败（ExprError）”。
-
-Verifier 友好与性能：
-- 内置函数生成的比较逻辑尽量少分支（如按字节 XOR/OR 累积），降低 verifier 状态数量。
-- 避免在极热的探针里塞入大量大字符串比较；必要时拆分脚本或选择不那么热的落点。
-
-示例
-
-```ghostscope
-// 函数参数（const char* activity）
-trace log_activity {
-    print "is_main:{}", starts_with(activity, "main");
-    print "eq5:{}", strncmp(activity, "main_", 5);
-}
-
-// 全局只读字符串与定长数组
-trace globals_program.c:32 {
-    print "gm_hello:{}", starts_with(gm, "Hello"); // gm: const char*
-    print "lm_libw:{}", strncmp(lm, "LIB_", 4);    // lm: const char*
-}
-
-// 通用指针（读取失败 → false）
-trace process_record {
-    print "rec_http:{}", strncmp(record, "HTTP", 4); // record: struct* -> false
-}
-
-// 两个指针之间的原始内存等值比较
-trace globals_program.c:32 {
-    // 完全相等
-    if memcmp(&lib_pattern[0], &lib_pattern[0], 16) { print "EQ"; } else { print "NE"; }
-    // 偏移后产生差异
-    if memcmp(&lib_pattern[0], &lib_pattern[1], 16) { print "EQ2"; } else { print "NE2"; }
-    // len=0 → true
-    if memcmp(&lib_pattern[0], &lib_pattern[1], 0) { print "Z0"; }
-    // 动态长度来自脚本变量
-    let n = 10;
-    if memcmp(&lib_pattern[0], &lib_pattern[0], n) { print "DYN_EQ"; }
-}
-```
-
-### 十六进制字节串辅助（`hex`）
-
-- 语法：`hex("<HEX BYTES>")`
-  - `<HEX BYTES>` 仅允许十六进制字符（`0-9a-fA-F`）与空格分隔（不支持 Tab 等其他分隔符）；去掉空格后十六进制字符数量必须为偶数。
-  - 解析期校验：若出现非十六进制字符（除空格外）或为奇数字节，直接报错并给出明确原因。配合 `memcmp(expr, hex(...), len_literal)` 且长度为字面量时，还会检查 `len_literal` 不能超过字节串长度，且不能为负。
-- 语义：按书写顺序逐字节解析（每两个十六进制字符组成一个字节），不涉及大小端；不支持在字符串中写 `0x` 前缀。
-- 使用范围：作为 `memcmp` 的参数，用于和原始字节序列比较（如文件头、魔数）。
-- 示例：
-
-```ghostscope
-trace foo {
-    // 比较前 2 字节是否为 ASCII "PO"
-    if memcmp(buf, hex("50 4F"), 2) { print "HDR"; }
-
-    // 比较 4 字节 0xDE 0xAD 0xBE 0xEF
-    if memcmp(ptr, hex("DE AD BE EF"), 4) { print "MAGIC"; }
-}
-```
-
 ## 条件语句
 
 GhostScope 使用 Rust 风格的条件语句语法：
@@ -384,23 +297,6 @@ if x > 100 {
 ```
 
 提示：条件表达式在运行时若读取 DWARF 变量失败，不会被静默当作 false；将发送一条结构化的 `ExprError` 并按“软中止”语义处理分支。详见下文“运行时表达式失败（ExprError）”。
-
-#### C 字符串等值比较（char*/char[]）
-
-GhostScope 支持将脚本字符串字面量与 DWARF 侧的 C 字符串进行等值比较：
-
-- 支持的 DWARF 形式：`const char*` / `char*` 指针，以及固定长度 `char[N]`。
-- 支持的运算符：`==` 与 `!=`。
-- 比较语义（严格 `\0`）：设脚本字面量长度为 `L`。
-  - 对 `char*`：使用有界的 `bpf_probe_read_user_str` 读取至多 `L+1` 字节。若 helper 返回值恰为 `L+1`，且读取到的第 `L` 个字节为 `\0`，且前 `L` 个字节逐字节等于字面量，则判等。
-  - 对 `char[N]`：使用有界的 `bpf_probe_read_user` 读取 `min(N, L+1)` 字节。要求 `L+1 <= N`，且缓冲区第 `L` 个字节为 `\0`，且前 `L` 个字节逐字节等于字面量，才判等。
-  - 任何读取失败（无效地址/权限等）一律按“不相等”处理。
-
-性能与安全提示：
-
-- 比较逻辑以“有界、低分支”的方式生成，更友好于 eBPF 验证器。但在同一个探针中堆叠过多字符串比较，或挂在极热路径上，仍可能带来额外的 CPU 与验证负载。
-- 仅需偶尔确认时，建议挂在“更新字符串字段”的代码行；或将多个较重的比较拆分为多个 `trace`。
-- 读取长度内部设有上限保护；对于非常长的字面量，出于安全考虑可能被截断到内部上限。
 
 ### 比较运算符
 
@@ -482,7 +378,7 @@ trace main:entry {
 - 比较（==、!=、<、<=、>、>=）
   - 支持：脚本变量（整数/布尔） 与上述 DWARF 整数类标量；比较前会对宽度与符号进行统一。
   - 指针比较：仅支持等值/不等（DWARF 指针 == DWARF 指针、DWARF 指针 == 0）。
-  - C 字符串等值：DWARF 变量（`char*` 或 `char[]`） 与 脚本变量（字符串字面量）可做 `==`/`!=` 等值比较（通过有界读取再比较）。
+  - C 字符串等值：DWARF 变量（`char*` 或 `char[]`） 与 脚本变量（字符串字面量）可做 `==`/`!=` 等值比较（通过有界读取再比较）。（可以参考下面一小节）
   - 不支持：字符串大小关系比较、聚合整体比较、浮点与 DWARF 值混用比较。
 - 浮点
   - 不支持浮点运算；脚本与 DWARF 层均不支持。
@@ -510,15 +406,119 @@ trace foo.c:50 {
     // print "same:{}", p == q;     // 指针与指针（若二者在作用域内）
 }
 
+```
+
+### C 字符串等值比较（char*/char[]）
+
+GhostScope 支持将脚本字符串字面量与 DWARF 侧的 C 字符串进行等值比较：
+
+- 支持的 DWARF 形式：`const char*` / `char*` 指针，以及固定长度 `char[N]`。
+- 支持的运算符：`==` 与 `!=`。
+- 比较语义（严格 `\0`）：设脚本字面量长度为 `L`。
+  - 对 `char*`：使用有界的 `bpf_probe_read_user_str` 读取至多 `L+1` 字节。若 helper 返回值恰为 `L+1`，且读取到的第 `L` 个字节为 `\0`，且前 `L` 个字节逐字节等于字面量，则判等。
+  - 对 `char[N]`：使用有界的 `bpf_probe_read_user` 读取 `min(N, L+1)` 字节。要求 `L+1 <= N`，且缓冲区第 `L` 个字节为 `\0`，且前 `L` 个字节逐字节等于字面量，才判等。
+  - 任何读取失败（无效地址/权限等）一律按“不相等”处理。
+
+```ghostscope
 // C 字符串等值：DWARF char*/char[] 与脚本字符串字面量
 trace foo.c:60 {
     print "greet-ok:{}", gm == "Hello, Global!"; // gm: const char* 或 char[]
 }
-
-
 ```
 
-## 栈回溯语句（实现中）
+## 内置函数
+
+### `strncmp(expr, "lit", n)`
+  - 将 `expr` 指向的内存前 `n` 个字节与字面量 `lit` 比较。
+  - 在 `n` 字节内不要求出现终止符 `\0`。
+  - `expr` 可为 DWARF 的“指针或数组”表达式（元素类型不限）、取址表达式（如 `&expr`、`&arr[0]`），也可为通用指针；引擎按字节读取并比较。对于非 `char` 数组，比较的也是原始字节；`n` 的单位是“字节”。
+  - 任何读取失败均返回 `false`。
+  - 比较长度由配置 `ebpf.compare_cap` 控制（默认 64 字节）；若 `n` 超过上限或数组可用长度，会自动裁剪。
+  - 运行时读取 DWARF 变量失败的呈现与分支行为，参见下文“运行时表达式失败（ExprError）”。
+
+示例：`strncmp`
+
+```ghostscope
+// 函数参数（const char* activity）
+trace log_activity {
+    print "eq5:{}", strncmp(activity, "main_", 5);
+}
+
+// 全局/只读字符串或定长数组
+trace globals_program.c:32 {
+    print "lm_libw:{}", strncmp(lm, "LIB_", 4);    // lm: const char*
+}
+
+// 通用指针（读取失败 → false）
+trace process_record {
+    print "rec_http:{}", strncmp(record, "HTTP", 4); // record: struct* -> false
+}
+```
+### `starts_with(expr, "lit")`
+  - 等价于 `strncmp(expr, "lit", len("lit"))`。
+  - 失败与安全语义同上。
+
+示例：`starts_with`
+
+```ghostscope
+// 前缀匹配（等价于 strncmp(expr, lit, len(lit)))
+trace log_activity {
+    print "is_main:{}", starts_with(activity, "main");
+}
+
+trace globals_program.c:32 {
+    print "gm_hello:{}", starts_with(gm, "Hello"); // gm: const char*
+}
+```
+
+### `memcmp(expr_a, expr_b, len)`
+  - 布尔语义：若 `expr_a` 与 `expr_b` 所指内存的前 `len` 个字节完全一致，返回 `true`，否则 `false`。
+  - 指针来源：`expr_a`/`expr_b` 可为 DWARF“指针或数组”表达式（元素类型不限）、取址表达式（如 `&expr`、`&arr[0]`）。若需与字符串字面量比较，请使用 `strncmp`/`starts_with`。
+  - 不支持将“裸整型地址”作为指针实参。若要比对原始字节，请使用下文 `hex("...")`。
+    - 若任一参数为 `hex("...")`，可省略第三个 `len` 参数；解析器会用 `hex` 的字节数作为长度。若两侧都是 `hex(...)`，两者字节数需一致。
+    - 当 `memcmp(expr, hex(...), len_literal)` 使用字面量长度时，解析器会检查 `len_literal` 不得超过字节串长度，且不能为负，否则报错。
+  - `len` 支持脚本整数表达式，且整数字面量支持十进制、十六进制（`0x..`）、八进制（`0o..`）与二进制（`0b..`）。运行时会将负值钳为 0；但解析器会拒绝“字面量负长度”。
+  - 不涉及 NUL 终止；按原始字节比较（单位为字节）。
+  - 若 `len == 0`，结果为 `true`，且不会执行任何用户内存读取（快速路径）。
+  - 运行时读取 DWARF 变量失败的呈现与分支行为，参见下文“运行时表达式失败（ExprError）”。
+
+示例：`memcmp`
+
+```ghostscope
+// 两个指针之间的原始内存等值比较
+trace globals_program.c:32 {
+    // 完全相等
+    if memcmp(&lib_pattern[0], &lib_pattern[0], 16) { print "EQ"; } else { print "NE"; }
+    // 偏移后产生差异
+    if memcmp(&lib_pattern[0], &lib_pattern[1], 16) { print "EQ2"; } else { print "NE2"; }
+    // len=0 → true（不发生任何用户态读取）
+    if memcmp(&lib_pattern[0], &lib_pattern[1], 0) { print "Z0"; }
+    // 动态长度来自脚本变量
+    let n = 10;
+    if memcmp(&lib_pattern[0], &lib_pattern[0], n) { print "DYN_EQ"; }
+}
+```
+
+### `hex("<HEX BYTES>")`
+
+- 语法：`hex("<HEX BYTES>")`
+  - `<HEX BYTES>` 仅允许十六进制字符（`0-9a-fA-F`）与空格分隔（不支持 Tab 等其他分隔符）；去掉空格后十六进制字符数量必须为偶数。
+  - 解析期校验：若出现非十六进制字符（除空格外）或为奇数字节，直接报错并给出明确原因。配合 `memcmp(expr, hex(...), len_literal)` 且长度为字面量时，还会检查 `len_literal` 不能超过字节串长度，且不能为负。
+- 语义：按书写顺序逐字节解析（每两个十六进制字符组成一个字节），不涉及大小端；不支持在字符串中写 `0x` 前缀。
+- 使用范围：作为 `memcmp` 的参数，用于和原始字节序列比较（如文件头、魔数）。
+- 示例：
+
+```ghostscope
+trace foo {
+    // 比较前 2 字节是否为 ASCII "PO"
+    if memcmp(buf, hex("50 4F"), 2) { print "HDR"; }
+
+    // 比较 4 字节 0xDE 0xAD 0xBE 0xEF
+    if memcmp(ptr, hex("DE AD BE EF"), 4) { print "MAGIC"; }
+}
+```
+
+## 栈回溯语句（还没有实现）
 
 打印当前调用栈：
 
@@ -532,69 +532,122 @@ bt;
 
 ## 示例
 
-### 基础函数追踪
+本节集中展示常见、高价值的用法片段（节选自我们的 e2e 覆盖）。
+
+### 基础函数追踪与进程信息
 
 ```ghostscope
 trace main {
     print "程序启动";
-    print "PID: {}", $pid;
+    print "PID:{} TID:{} TS:{}", $pid, $tid, $timestamp;
 }
 ```
 
-### 条件追踪
+### 条件追踪与回溯
 
 ```ghostscope
 trace malloc {
-    if size > 1048576 {  // 1 MB
+    if size > 1_048_576 {  // 1 MB
         print "大内存分配: {} 字节", size;
-        backtrace;
+        backtrace;          // 打印调用栈（实现中）
     }
 }
 ```
 
-### 结构体字段访问
+### DWARF 自动解引用与成员访问
 
 ```ghostscope
 trace process_user {
-    print "用户: {}", user.name;
-    print "ID: {}", user.id;
+    // 结构体字段
+    print "用户:{}", user.name;
+    print "状态:{}", user.status;
 
-    if user.status == 1 {
-        print "活跃用户";
-    }
+    // 自动解引用指针（安全前提下，无需手写 * 与 ->）
+    print "好友:{}", user.friend_ref.name;
 }
 ```
 
-### 复杂变量访问
+### 数组访问与取址（&）
 
 ```ghostscope
-trace handle_request {
-    // 数组访问
-    print "第一项: {}", items[0];
+trace foo.c:42 {
+    // 顶层常量下标与链尾常量下标
+    print "arr0:{}", arr[0];
+    print "name0:{}", person.names[0];
 
-    // 嵌套结构体访问
-    print "配置值: {}", config.network.timeout;
-
-    // 指针操作
-    print "解引用: {}", *ptr;
-    print "地址: {}", &variable;
+    // 取地址后参与内置比较/内存转储
+    print "p(&buf[0])={:p}", &buf[0];
 }
 ```
 
-### 脚本文件中的多个追踪点
+### C 字符串比较（char*/char[]）
 
 ```ghostscope
-// script.gs 文件
-trace server_accept {
-    print "新连接";
+// 参数 activity: const char*
+trace log_activity {
+    print "前缀:{}", starts_with(activity, "main");
+    print "等值:{}", strncmp(activity, "main_", 5);
 }
 
-trace server_process {
-    print "处理请求类型: {}", $arg0;
+// 全局/只读字符串
+trace globals_program.c:32 {
+    print "lm_libw:{}", strncmp(lm, "LIB_", 4);    // lm: const char*
+}
+```
+
+### 原始内存比较（memcmp）与 hex 字节串
+
+```ghostscope
+trace globals_program.c:32 {
+    // 指针对比（完全相等/有偏移）
+    if memcmp(&lib_pattern[0], &lib_pattern[0], 16) { print "EQ"; } else { print "NE"; }
+    if memcmp(&lib_pattern[0], &lib_pattern[1], 16) { print "EQ2"; } else { print "NE2"; }
+
+    // len=0 → true（不发生任何用户态读取）
+    if memcmp(&lib_pattern[0], &lib_pattern[1], 0) { print "Z0"; }
+
+    // 动态长度来自脚本变量
+    let n = 10;
+    if memcmp(&lib_pattern[0], &lib_pattern[0], n) { print "DYN_EQ"; }
 }
 
-trace server_respond {
-    print "发送响应代码: {}", $arg1;
+// 与字节模式（hex）匹配
+trace foo {
+    if memcmp(buf, hex("50 4F"), 2) { print "HDR"; }          // 前 2 字节为 "PO"
+    if memcmp(ptr, hex("DE AD BE EF"), 4) { print "MAGIC"; }  // 魔数
+}
+```
+
+### else-if 链与 ExprError 软中止
+
+```ghostscope
+// G_STATE.lib 某些时刻为 NULL，读取失败会触发 ExprError
+trace globals_program.c:32 {
+    if memcmp(G_STATE.lib, hex("00"), 1) { print "A"; }
+    else if memcmp(gm, hex("48"), 1) { print "B"; }
+    else { print "C"; }
+}
+// 预期：出现 ExprError 警告行，并打印 B；A/C 不出现（软中止抑制 THEN/ELSE）
+```
+
+### 结构体 Pretty Print 与指针解引用
+
+```ghostscope
+// 以 complex_types_program 为例
+trace complex_types_program.c:25 {
+    print s.name;   // char[16] → 字符串
+    print s;        // pretty-print 结构体
+    print *ls;      // 解引用指针并 pretty-print
+}
+```
+
+### 动态长度格式化与内存转储
+
+```ghostscope
+trace foo {
+    let n = 32;
+    print "h={:x.*}", n, buf;       // 以十六进制打印 n 字节
+    print "ascii={:s.n$}", name;    // 捕获变量 n 为长度，不额外消耗实参
 }
 ```
 

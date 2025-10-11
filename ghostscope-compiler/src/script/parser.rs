@@ -688,6 +688,19 @@ fn parse_builtin_call(pair: Pair<Rule>) -> Result<Expr> {
             let a_expr = parse_expr(nodes.remove(0))?;
             let b_expr = parse_expr(nodes.remove(0))?;
 
+            // Disallow obviously invalid types early
+            if matches!(a_expr, Expr::Bool(_)) || matches!(b_expr, Expr::Bool(_)) {
+                return Err(ParseError::TypeError(
+                    "memcmp pointer arguments cannot be boolean; use an address or hex(...)"
+                        .to_string(),
+                ));
+            }
+            if matches!(a_expr, Expr::String(_)) || matches!(b_expr, Expr::String(_)) {
+                return Err(ParseError::TypeError(
+                    "memcmp does not accept string literals; use strncmp for strings".to_string(),
+                ));
+            }
+
             // Helper to get hex length (bytes)
             let hex_len = |e: &Expr| -> Option<usize> {
                 if let Expr::BuiltinCall { name, args } = e {
@@ -703,6 +716,11 @@ fn parse_builtin_call(pair: Pair<Rule>) -> Result<Expr> {
             let n_expr = if let Some(n_node) = nodes.first() {
                 // With explicit len: reuse previous literal checks
                 let n_expr = parse_expr(n_node.clone())?;
+                if matches!(n_expr, Expr::Bool(_)) {
+                    return Err(ParseError::TypeError(
+                        "memcmp length must be an integer or expression, not boolean".to_string(),
+                    ));
+                }
                 let literal_len_opt: Option<isize> = match &n_expr {
                     Expr::Int(n) => Some(*n as isize),
                     Expr::BinaryOp {
@@ -768,6 +786,49 @@ fn parse_builtin_call(pair: Pair<Rule>) -> Result<Expr> {
                 }
             };
 
+            // Constant folding: memcmp(hex(...), hex(...), N)
+            let as_hex = |e: &Expr| -> Option<String> {
+                if let Expr::BuiltinCall { name, args } = e {
+                    if name == "hex" {
+                        if let Some(Expr::String(s)) = args.first() {
+                            return Some(s.clone());
+                        }
+                    }
+                }
+                None
+            };
+
+            if let (Some(h1), Some(h2), Expr::Int(n)) = (as_hex(&a_expr), as_hex(&b_expr), &n_expr)
+            {
+                // Safe hex -> bytes (sanitized earlier to hex digits only)
+                fn hex_to_bytes(s: &str) -> std::result::Result<Vec<u8>, ParseError> {
+                    let mut out = Vec::with_capacity(s.len() / 2);
+                    let bytes = s.as_bytes();
+                    let mut i = 0;
+                    while i + 1 < bytes.len() {
+                        let h = bytes[i] as char;
+                        let l = bytes[i + 1] as char;
+                        let hv = h
+                            .to_digit(16)
+                            .ok_or_else(|| ParseError::TypeError("invalid hex digit".to_string()))?
+                            as u8;
+                        let lv = l
+                            .to_digit(16)
+                            .ok_or_else(|| ParseError::TypeError("invalid hex digit".to_string()))?
+                            as u8;
+                        out.push((hv << 4) | lv);
+                        i += 2;
+                    }
+                    Ok(out)
+                }
+
+                let v1 = hex_to_bytes(&h1)?;
+                let v2 = hex_to_bytes(&h2)?;
+                let ln = (*n).max(0) as usize;
+                let eq = v1.iter().take(ln).eq(v2.iter().take(ln));
+                return Ok(Expr::Bool(eq));
+            }
+
             Ok(Expr::BuiltinCall {
                 name: "memcmp".to_string(),
                 args: vec![a_expr, b_expr, n_expr],
@@ -777,6 +838,12 @@ fn parse_builtin_call(pair: Pair<Rule>) -> Result<Expr> {
             // grammar: strncmp "(" expr "," string "," int ")"
             let expr_node = it.next().ok_or(ParseError::InvalidExpression)?; // expr
             let arg0 = parse_expr(expr_node)?;
+            if matches!(arg0, Expr::Bool(_)) {
+                return Err(ParseError::TypeError(
+                    "strncmp first argument cannot be boolean; provide an address or string"
+                        .to_string(),
+                ));
+            }
             let lit_node = it.next().ok_or(ParseError::InvalidExpression)?; // string
             if lit_node.as_rule() != Rule::string {
                 return Err(ParseError::TypeError(
@@ -797,6 +864,14 @@ fn parse_builtin_call(pair: Pair<Rule>) -> Result<Expr> {
                     "strncmp length must be non-negative".to_string(),
                 ));
             }
+            // Constant folding when both sides are string literals
+            if let Expr::String(lhs) = &arg0 {
+                let ln = n_val.max(0) as usize;
+                let a = lhs.as_bytes();
+                let b = lit.as_bytes();
+                let eq = a.iter().take(ln).eq(b.iter().take(ln));
+                return Ok(Expr::Bool(eq));
+            }
             Ok(Expr::BuiltinCall {
                 name: "strncmp".to_string(),
                 args: vec![arg0, Expr::String(lit), Expr::Int(n_val)],
@@ -806,6 +881,12 @@ fn parse_builtin_call(pair: Pair<Rule>) -> Result<Expr> {
             // grammar: starts_with "(" expr "," string ")"
             let expr_node = it.next().ok_or(ParseError::InvalidExpression)?;
             let arg0 = parse_expr(expr_node)?;
+            if matches!(arg0, Expr::Bool(_)) {
+                return Err(ParseError::TypeError(
+                    "starts_with first argument cannot be boolean; provide an address or string"
+                        .to_string(),
+                ));
+            }
             let lit_node = it.next().ok_or(ParseError::InvalidExpression)?;
             if lit_node.as_rule() != Rule::string {
                 return Err(ParseError::TypeError(
@@ -814,6 +895,11 @@ fn parse_builtin_call(pair: Pair<Rule>) -> Result<Expr> {
             }
             let raw = lit_node.as_str();
             let lit = raw[1..raw.len() - 1].to_string();
+            // Constant folding when both sides are string literals
+            if let Expr::String(lhs) = &arg0 {
+                let ok = lhs.as_bytes().starts_with(lit.as_bytes());
+                return Ok(Expr::Bool(ok));
+            }
             Ok(Expr::BuiltinCall {
                 name: "starts_with".to_string(),
                 args: vec![arg0, Expr::String(lit)],
@@ -1324,6 +1410,129 @@ trace foo {
 "#;
         let r = parse(script);
         assert!(r.is_ok(), "parse failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn parse_memcmp_rejects_string_literal() {
+        let script = r#"
+trace foo {
+    if memcmp(&buf[0], "PO", 2) { print "X"; }
+}
+"#;
+        let r = parse(script);
+        assert!(
+            matches!(r, Err(ParseError::TypeError(ref msg)) if msg.contains("memcmp does not accept string literals")),
+            "expected type error, got: {r:?}"
+        );
+    }
+
+    #[test]
+    fn parse_memcmp_rejects_bool_args_and_len() {
+        // Bool as pointer argument
+        let s1 = r#"
+trace foo { if memcmp(true, hex("00"), 1) { print "X"; } }
+"#;
+        let r1 = parse(s1);
+        assert!(r1.is_err());
+
+        // Bool as length
+        let s2 = r#"
+trace foo { if memcmp(&p[0], hex("00"), false) { print "X"; } }
+"#;
+        let r2 = parse(s2);
+        assert!(
+            matches!(r2, Err(ParseError::TypeError(ref msg)) if msg.contains("length must be")),
+            "unexpected: {r2:?}"
+        );
+    }
+
+    #[test]
+    fn parse_strncmp_constant_folds_on_two_literals() {
+        // equal for first 2 bytes
+        let s = r#"
+trace foo {
+    if strncmp("abc", "abd", 2) { print "T"; } else { print "F"; }
+}
+"#;
+        let prog = parse(s).expect("parse ok");
+        // Walk down to the If condition and ensure it became a Bool(true)
+        let stmt0 = prog.statements.first().expect("one trace");
+        match stmt0 {
+            Statement::TracePoint { body, .. } => match &body[0] {
+                Statement::If { condition, .. } => {
+                    assert!(matches!(condition, Expr::Bool(true)));
+                }
+                other => panic!("expected If, got {other:?}"),
+            },
+            other => panic!("expected TracePoint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_memcmp_constant_folds_on_two_hex() {
+        let s = r#"
+trace foo {
+    if memcmp(hex("504f"), hex("504F"), 2) { print "EQ"; } else { print "NE"; }
+}
+"#;
+        let prog = parse(s).expect("parse ok");
+        let stmt0 = prog.statements.first().expect("one trace");
+        match stmt0 {
+            Statement::TracePoint { body, .. } => match &body[0] {
+                Statement::If { condition, .. } => assert!(matches!(condition, Expr::Bool(true))),
+                other => panic!("expected If, got {other:?}"),
+            },
+            other => panic!("expected TracePoint, got {other:?}"),
+        }
+
+        // Mismatch without explicit len but equal sizes
+        let s2 = r#"
+trace foo {
+    if memcmp(hex("504f"), hex("514f")) { print "EQ"; } else { print "NE"; }
+}
+"#;
+        let prog2 = parse(s2).expect("parse ok");
+        let stmt02 = prog2.statements.first().expect("one trace");
+        match stmt02 {
+            Statement::TracePoint { body, .. } => match &body[0] {
+                Statement::If { condition, .. } => assert!(matches!(condition, Expr::Bool(false))),
+                other => panic!("expected If, got {other:?}"),
+            },
+            other => panic!("expected TracePoint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_starts_with_constant_folds_on_two_literals() {
+        let s = r#"
+trace foo {
+    if starts_with("abcdef", "abc") { print "T"; } else { print "F"; }
+}
+"#;
+        let prog = parse(s).expect("parse ok");
+        let stmt0 = prog.statements.first().expect("one trace");
+        match stmt0 {
+            Statement::TracePoint { body, .. } => match &body[0] {
+                Statement::If { condition, .. } => assert!(matches!(condition, Expr::Bool(true))),
+                other => panic!("expected If, got {other:?}"),
+            },
+            other => panic!("expected TracePoint, got {other:?}"),
+        }
+
+        let s2 = r#"
+trace foo {
+    if starts_with("ab", "abc") { print "T"; } else { print "F"; }
+}
+"#;
+        let prog2 = parse(s2).expect("parse ok");
+        let stmt02 = prog2.statements.first().expect("one trace");
+        match stmt02 {
+            Statement::TracePoint { body, .. } => match &body[0] {
+                Statement::If { condition, .. } => assert!(matches!(condition, Expr::Bool(false))),
+                other => panic!("expected If, got {other:?}"),
+            },
+            other => panic!("expected TracePoint, got {other:?}"),
+        }
     }
 
     #[test]

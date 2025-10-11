@@ -133,6 +133,39 @@ async fn run_ghostscope_with_script_for_pid_impl(
 }
 
 #[tokio::test]
+async fn test_memcmp_int_array_decay_to_pointer() -> anyhow::Result<()> {
+    init();
+
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("complex_types_program", OptimizationLevel::Debug)?;
+    let mut prog = Command::new(&binary_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Use DWARF int arr[8] directly as a pointer via decay semantics
+    let script = r#"
+trace update_complex {
+    if memcmp(c.arr, c.arr, 16) { print "ARR_EQ"; }
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 2, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    assert!(
+        stdout.contains("ARR_EQ"),
+        "Expected ARR_EQ. STDOUT: {}",
+        stdout
+    );
+    Ok(())
+}
+
 async fn test_entry_prints() -> anyhow::Result<()> {
     init();
 

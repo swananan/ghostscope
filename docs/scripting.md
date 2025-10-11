@@ -1,6 +1,6 @@
 # GhostScope Script Language Reference
 
-GhostScope uses a domain-specific language for defining trace points and actions. Scripts are written when using the `trace` command in TUI or loaded from script files.
+GhostScope uses a domain‑specific language to define trace points and actions. You can write scripts inline in the TUI with the `trace` command or load them from a script file.
 
 ## Table of Contents
 1. [Basic Syntax](#basic-syntax)
@@ -13,6 +13,7 @@ GhostScope uses a domain-specific language for defining trace points and actions
 8. [Special Variables](#special-variables)
 9. [Examples](#examples)
 10. [Limitations](#limitations)
+11. [Runtime Expression Failures (ExprError)](#runtime-expression-failures-exprerror)
 
 ## Basic Syntax
 
@@ -29,32 +30,32 @@ GhostScope uses a domain-specific language for defining trace points and actions
 
 ### Statement Types
 
-GhostScope supports the following statement types:
-- `trace` - Define trace points with actions
-- `print` - Output formatted text
-- `backtrace` / `bt` - Print stack backtrace (in progress)
-- `if`/`else` - Conditional execution
-- `let` - Variable declaration
+GhostScope supports the following statements:
+- `trace` — define trace points and their actions
+- `print` — output formatted text
+- `backtrace` / `bt` — print call stack (in progress)
+- `if` / `else` — conditional execution
+- `let` — script variable declaration
 - Expression statements
 
 ## Trace Statements
 
-The `trace` statement is the top-level construct for defining trace points. It's only used in script files, not inside trace blocks.
+The `trace` statement is the top‑level construct used only at the script file level (not nested inside other trace blocks).
 
 ### Syntax
 
 ```ghostscope
 trace <pattern> {
-    // statements to execute when trace point is hit
+    // statements executed when the trace point fires
 }
 ```
 
 ### Trace Patterns
 
-#### Function Names
+#### Function Name
 ```ghostscope
 trace main {
-    print "Main function called";
+    print "Main called";
 }
 
 trace calculate_something {
@@ -62,9 +63,9 @@ trace calculate_something {
 }
 ```
 
-#### Source Lines
+#### Source Line
 ```ghostscope
-// Trace specific file and line
+// Trace a specific file and line
 trace sample.c:42 {
     print "Hit line 42";
 }
@@ -75,29 +76,28 @@ trace /home/user/project/src/utils.c:100 {
 }
 ```
 
-#### Addresses
+#### Address
 ```ghostscope
-// Trace by module-relative address (DWARF PC)
+// Module‑relative address (DWARF PC)
 trace 0x401234 {
     print "Hit address";
 }
 
-// Trace an address in a specific module (supports full path or unique suffix)
+// Module suffix + address (full path or unique suffix)
 trace libc.so.6:0x1234 {
     print "Hit libc address";
 }
 ```
 
-Notes
-- `0xADDR` uses the default module depending on startup mode: `-t <binary>` uses `<binary>`; `-p <pid>` uses the main executable.
-- `module_suffix:0xADDR` picks the specified module by full path or unique suffix; ambiguous suffixes will be reported with candidates.
-
+Notes:
+- For `0xADDR`, the default module depends on startup mode: `-t <binary>` uses `<binary>`; `-p <pid>` uses the main executable.
+- `module_suffix:0xADDR` allows selecting a module by full path or unique suffix; ambiguous suffixes will list candidates.
 
 ## Variables
 
-### Script Variable Declaration
+### Script Variables
 
-Declare script variables using the `let` keyword:
+Declare with `let`:
 
 ```ghostscope
 let count = 0;
@@ -106,23 +106,25 @@ let message = "hello";
 let result = a + b;
 ```
 
-Script variable types and capabilities:
+Types and capabilities:
 
 | Type | Literal/Example | Description | Ops/Comparisons |
 | --- | --- | --- | --- |
-| Integer (int, internally i64) | `123`, `-42` | Signed 64-bit integer | +, -, *, /; can mix with DWARF integer-like scalars |
-| Boolean (bool) | `true`, `false`, or from comparisons like `a < b` | Produced by literals/comparisons/logical expressions | logical AND/OR (script only); when mixing with DWARF integers, treated as 0/1 |
-| String | `"hello"` | UTF-8 string literal | Equality `==`, `!=` with DWARF C strings; no ordering comparisons |
+| Integer (i64) | `123`, `-42` | 64‑bit signed integer | +, -, *, /; mixes with DWARF integer‑like scalars |
+| Boolean (bool) | `true`, `false`, or from comparison `a < b` | From literals/comparisons/logical ops | logical AND/OR; when mixing with DWARF integers, treated as 0/1 |
+| String | `"hello"` | UTF‑8 string literal | Equality `==`, `!=` with DWARF C strings; no ordering |
 
 Notes:
-1. Script variables do not support user-defined structs/arrays/pointers; access such data via DWARF variables (member access, deref, constant index) to obtain scalars first.
-2. Floating-point arithmetic is not supported.
-3. Unary minus `-` is supported and can be nested (e.g., `-1`, `-(-1)`), parsed as `0 - expr`.
-4. Transport encodes booleans as a single byte 0/1; the renderer displays `true`/`false`.
+1. Script variables do not expose structs/arrays/pointers. Access those through DWARF variables (member access, deref, constant index) to obtain scalars first.
+2. Floats are not supported in scripts or runtime.
+3. Unary minus `-` is supported and can nest (e.g., `-1`, `-(-1)`), parsed as `0 - expr`.
+4. Transport encodes booleans as 0/1; renderers display `true/false`.
 
-### Local Variables, Parameters, and Global Variables
+### DWARF Variables
 
-GhostScope supports complex variable access:
+DWARF variables include locals, parameters, and globals from the traced program.
+
+Supported complex access:
 
 ```ghostscope
 // Simple variable
@@ -140,32 +142,59 @@ print arr[i];
 print *ptr;
 print *(ptr);
 
-// Address of
+// Address‑of
 print &variable;
 
-// Complex chains
+// Chained access
 print obj.field.subfield;
 print arr[0].name;
 ```
 
-Note:
-- Auto-dereference is supported for locals, parameters, and globals. You don't need to write `*ptr` explicitly; when it is safe to do so, the pointer will be read and dereferenced at runtime (with null checks).
-- Array access: supported for top-level `arr[const]` and chain-tail `a.b.c[const]`. Not supported: chain-middle indices (e.g., `a.b[2].c`), dynamic indices (`arr[i]`), and multi-dimensional arrays.
+Tips:
+- Auto‑dereference is supported for locals/params/globals. You don’t need to write `*ptr` or `->`; when safe, pointers are read and dereferenced automatically.
+- Array access: supported for top‑level `arr[const]` and chain‑tail `a.b.c[const]`. Not supported: chain‑middle indices (`a.b[2].c`), dynamic indices (`arr[i]`), and multi‑dim arrays.
+
+## Special Variables
+
+Start with `$` and expose runtime info:
+
+- `$pid` — current process ID (tgid), low 32 bits of `bpf_get_current_pid_tgid`.
+- `$tid` — current thread ID (tid), high 32 bits of `bpf_get_current_pid_tgid`.
+- `$timestamp` — monotonic timestamp (ns), from `bpf_ktime_get_ns`.
+
+All behave as integers for comparisons/arithmetic.
+
+Example:
+
+```ghostscope
+trace sample.c:42 {
+    if $pid == 12345 { print "match"; }
+    print "PID:{} TID:{} TS:{}", $pid, $tid, $timestamp;
+}
+```
+
+Note: Currently only `$pid`, `$tid`, `$timestamp` are supported. Register‑related specials may be added later if needed.
+
+### Variable Lookup Order
+
+1. Script variables declared with `let`
+2. Locals/params resolved from DWARF
+3. Program globals
+
+Note: script variables can shadow program variables; choose names carefully.
 
 ## Print Statement
-
-The `print` statement outputs information during tracing.
 
 ### Basic Forms
 
 ```ghostscope
-// Print string literal
+// String literal
 print "Hello, World";
 
-// Print variable
+// Variable
 print count;
 
-// Print complex expression
+// Complex expressions
 print person.name;
 print arr[0];
 print *ptr;
@@ -173,55 +202,52 @@ print *ptr;
 
 ### Formatted Printing
 
-Use Rust-like placeholders in format strings:
+Rust‑like placeholders:
 
 ```ghostscope
-// Format string with arguments
 print "Value: {}", value;
 print "X: {}, Y: {}", x, y;
 print "Name: {}, Age: {}", person.name, person.age;
 ```
 
-Extended specifiers and dynamic length
+Extended specifiers and dynamic length:
 
 ```ghostscope
-// Hex / pointer / ASCII string
-print "A={:x} B={:08X}", a, b;   // hex lower/upper (width/pad planned in phase 2)
-print "p={:p}", ptr;             // pointer address 0x...
-print "s={:s}", cstr;            // ASCII dump for bytes; for char*/char[N], `{}` still prints quoted CString
+// Hex / pointer / ASCII bytes
+print "A={:x} B={:08X}", a, b;
+print "p={:p}", ptr;
+print "s={:s}", cstr;            // for char*/char[N], `{}` prints quoted C string
 
 // Memory dump from pointer/array
-print "h={:x.16}", buf;          // hex dump 16 bytes from buf
-print "ascii={:s.32}", name;      // ASCII dump up to 32 bytes (char* stops at first NUL)
+print "h={:x.16}", buf;          // read 16B as hex
+print "ascii={:s.32}", name;      // read 32B as ASCII (char* stops at first NUL)
 
-// Dynamic length (Rust-style star): length argument comes before value
-print "buf={:x.*}", len, buf;    // consumes two args: len then buf
+// Dynamic length (star): length argument comes before value
+print "buf={:x.*}", len, buf;
 
-// Dynamic length via capture variable (no extra arg)
-let n = tail_len;                 // script variable
-print "tail={:s.n$}", p;          // length captured from n
+// Dynamic length via capture
+let n = tail_len;
+print "tail={:s.n$}", p;
 ```
 
-Notes
-- `{}` is default; `{:x}`/`{:X}` for integers; `{:p}` for pointers; `{:s}` for ASCII bytes.
+Notes:
+- `{}` default; `{:x}`/`{:X}` for integers; `{:p}` pointer; `{:s}` ASCII bytes.
 - Length suffixes:
-  - `.{N}`: static length (reads N bytes). `N` supports decimal, hex (`0x..`), octal (`0o..`), and binary (`0b..`).
-  - `.*`: dynamic length; consumes two arguments (length first, then value)
-  - `.name$`: capture a script variable named `name` as length; does not consume an extra value argument
-- Kernel performs bounded reads; user space renders hex/ASCII. For `{:s}` ASCII, rendering stops at the first NUL byte; non-printables are escaped as `\xNN`.
-- Memory-dump reads are capped per argument by configuration (`ebpf.mem_dump_cap`, default 4096 bytes). If the requested length exceeds the cap, data is truncated. If the event payload cap is exceeded, the output may be truncated and shown with `…`.
-- On read failure (e.g., invalid pointer, missing offsets, null deref), extended specifiers print `<MISSING_ARG>`.
+  - `.{N}`: static length (decimal/`0x..`/`0o..`/`0b..`).
+  - `.*`: dynamic (consumes two args: len then value).
+  - `.name$`: capture script variable `name` as length; does not consume an extra value arg.
+- Kernel performs bounded reads; user space renders hex/ASCII. For `{:s}` ASCII, rendering stops at first NUL; non‑printables show as `\xNN`.
+- Per‑argument read cap is controlled by `ebpf.mem_dump_cap` (default 4096 bytes). Requests beyond cap are truncated; if event payload is exceeded, output may also truncate with `…`.
+- On read failure (e.g., null deref, offsets unavailable, permission), extended specifiers print `<MISSING_ARG>`.
 
-**Note**: The format string uses Rust-style placeholders, not `%d`/`%s` (C-style).
+**Note**: Format strings use Rust‑style placeholders, not `%d`/`%s`.
 
 ## Conditional Statements
-
-GhostScope uses Rust-style syntax for conditionals:
 
 ```ghostscope
 // Simple if
 if x > 100 {
-    print "Large value";
+    print "Large";
 }
 
 // If-else
@@ -241,48 +267,40 @@ if x > 100 {
 }
 ```
 
-### Comparison Operators
-
-- `==` - Equal
-- `!=` - Not equal
-- `<` - Less than
-- `<=` - Less than or equal
-- `>` - Greater than
-- `>=` - Greater than or equal
+Note: When a conditional depends on DWARF‑backed reads and a read fails at runtime, GhostScope does not silently treat the condition as false. It emits a structured ExprError and applies soft‑abort semantics for that condition. See “Runtime Expression Failures (ExprError)”.
 
 ## Expressions
 
-### Arithmetic Operations
+### Arithmetic
 
 ```ghostscope
-let sum = a + b;       // Addition
-let diff = a - b;      // Subtraction
-let product = a * b;   // Multiplication (not for pointers)
-let quotient = a / b;  // Division
+let sum = a + b;
+let diff = a - b;
+let product = a * b;
+let quotient = a / b;
 
 // Integer literals
 let x = 123;           // decimal
 let h = 0x1f;          // hex (31)
 let o = 0o755;         // octal (493)
 let b = 0b1010;        // binary (10)
-let neg = -0x10;       // unary minus applies (parsed as 0 - 16)
+let neg = -0x10;       // unary minus is parsed as 0 - 16
 ```
 
-### Expression Precedence
+### Precedence
 
 1. Parentheses `()`
 2. Member access `.`, Array access `[]`
-3. Pointer dereference `*`, Address of `&`, Unary minus `-`, Logical NOT `!`
-4. Multiplication `/`, Division `/`
+3. Pointer deref `*`, Address‑of `&`, Unary minus `-`, Logical NOT `!`
+4. Multiplication `*`, Division `/`
 5. Addition `+`, Subtraction `-`
 6. Comparisons `==`, `!=`, `<`, `<=`, `>`, `>=`
 7. Logical AND `&&`
 8. Logical OR `||`
 
-### Expression Grouping
+### Grouping
 
 ```ghostscope
-// Use parentheses for explicit precedence
 let result = (a + b) * c;
 let complex = (x + y) / (a - b);
 ```
@@ -290,18 +308,10 @@ let complex = (x + y) / (a - b);
 ### Logical Operators
 
 - `!` (logical NOT), `&&` (logical AND), `||` (logical OR)
-- Operands are treated as booleans with "non-zero is true" semantics
-- `!expr` yields `true` if `expr` evaluates to zero/false; otherwise `false`.
-- `||` and `&&` use short-circuit evaluation
-  - `||`: if LHS is true, RHS is not evaluated
-  - `&&`: if LHS is false, RHS is not evaluated
+- Non‑zero is true
+- `||`/`&&` short‑circuit
 
-Boolean values
-
-- Comparisons and logical operators produce boolean results.
-- Transport encodes booleans as a single byte 0/1. The renderer displays them as `true`/`false`.
-
-Examples
+Examples:
 
 ```ghostscope
 trace main:entry {
@@ -311,7 +321,6 @@ trace main:entry {
         print "OR";
     }
 
-    // Unary logical NOT on expressions that produce booleans
     print "NOT1:{}", !starts_with(activity, "main");
     print "NOT2:{}", !strncmp(record, "HTTP", 4);
 }
@@ -319,334 +328,314 @@ trace main:entry {
 
 ### Unary Minus
 
-- Semantics: negate an expression; recursive nesting is supported.
-- Parsing: treated as `0 - expr`, ensuring `-1`, `-x`, and `-(-1)` evaluate as signed integers.
+Semantics: negate an expression; recursive nesting is supported. Parsing is treated as `0 - expr`.
 
 ```ghostscope
 trace foo.c:42 {
-    let a = -1;          // a = -1
-    let b = -(-1);       // b = 1
-    print a;             // Output: a = -1
-    print "X:{}", b;     // Output: X:1
+    let a = -1;
+    let b = -(-1);
+    print a;
+    print "X:{}", b;
 }
 ```
 
-### Cross-type Operations With DWARF Values
+### Cross‑type Operations with DWARF Values
 
 - Arithmetic (+, -, *, /)
-  - Supported: script int/bool with DWARF integer-like scalars
-    - BaseType (signed/unsigned 1/2/4/8 bytes), Enum (as underlying integer), Bitfield (extracted integer), char/unsigned char (1 byte)
-  - Not supported: aggregates (struct/union/array), pointers, floats at runtime
+  - Supported: script int/bool with DWARF integer‑like scalars
+    - BaseType (signed/unsigned 1/2/4/8 bytes), Enum (as underlying), Bitfield (extracted integer), char/unsigned char (1 byte)
+  - Not supported: aggregates (struct/union/array), pointers, floats
 - Comparisons (==, !=, <, <=, >, >=)
-  - Supported: script int/bool with the DWARF integer-like types above (after width/sign unification)
-  - Pointer: only equality/inequality (pointer==pointer, pointer==0)
-  - CString equality: DWARF char* or char[] vs script string literal (==, !=) with bounded read/compare
-  - Not supported: relational string compares; aggregates; floats with DWARF
-- Floats
-  - Not supported: eBPF does not support floating-point runtime operations. GhostScope scripts do not support float literals or float arithmetic.
+  - Supported: script int/bool with DWARF integer‑like types
+  - Pointers: only equality/inequality (pointer==pointer, pointer==0)
+  - CString equality: DWARF char* or char[] vs script string literal via bounded read
+  - Not supported: relational string comparisons; aggregates; floats
+- Floats: not supported (eBPF runtime)
 
-Error semantics: If a read fails (null deref/read error/offsets unavailable), comparisons return false and arithmetic returns 0; the event status carries the error code.
+Error semantics: If a DWARF read fails (null deref/read error/offsets unavailable), comparisons return false and arithmetic returns 0; event status carries the error code.
 
-Examples
+### CString Equality (char*/char[])
 
-```ghostscope
-// Integer arithmetic and comparisons with DWARF locals/globals
-trace foo.c:42 {
-    // DWARF int (e.g., s.counter) mixed with script int
-    if s.counter > 100 {
-        print "hot";
-    }
-    print "sum:{}", s.counter + 5;
+GhostScope supports equality/inequality between a script string literal and a DWARF‑side C string:
 
-    // Enum/bitfield compare (treated as integer)
-    print "active:{}", a.active == 1;
-}
-
-// Pointer equality (no ordering compares)
-trace foo.c:50 {
-    print "isNull:{}", p == 0;       // pointer vs NULL
-    // print "same:{}", p == q;     // pointer vs pointer (if both in scope)
-}
-
-// CString equality: DWARF char*/char[] vs script string literal
-trace foo.c:60 {
-    print "greet-ok:{}", gm == "Hello, Global!"; // gm: const char* or char[]
-}
-
-#### CString Equality Details (char*/char[])
-
-GhostScope supports comparing a script string literal with a DWARF-side C string:
-
-- Supported forms: `const char*` / `char*` and fixed-size `char[N]`.
+- Supported forms: `const char*` / `char*` and fixed‑size `char[N]`.
 - Operators: `==` and `!=`.
 - Semantics (strict NUL): let the literal length be `L`.
-  - For `char*`: GhostScope performs a bounded `bpf_probe_read_user_str` of up to `L+1` bytes. Equality requires the helper to return exactly `L+1`, the last byte to be `\0`, and all preceding `L` bytes to match the literal.
-  - For `char[N]`: GhostScope performs a bounded `bpf_probe_read_user` of `min(N, L+1)` bytes. Equality requires `L+1 <= N`, the byte at index `L` to be `\0`, and all preceding `L` bytes to match the literal.
+  - For `char*`: perform a bounded `bpf_probe_read_user_str` of up to `L+1` bytes. Equality requires the helper to return exactly `L+1`, the byte at index `L` to be `\0`, and the first `L` bytes to match the literal.
+  - For `char[N]`: perform a bounded `bpf_probe_read_user` of `min(N, L+1)` bytes. Equality requires `L+1 <= N`, the byte at index `L` to be `\0`, and the first `L` bytes to match the literal.
   - Any read failure (invalid address, permission, etc.) evaluates to `false`.
-
-Performance and safety notes:
-
-- Comparisons are compiled into bounded, branch-light checks to be verifier-friendly on most kernels. Still, placing many string comparisons in a single probe or attaching at extremely hot sites may add CPU and verifier load.
-- Prefer attaching at less-hot lines/functions if you only need occasional confirmation (e.g., update sites for a string field), or split multiple heavy comparisons into separate trace points.
-- Builtins (`strncmp`/`starts_with`) cap read length by `ebpf.compare_cap` (default 64 bytes).
-  CString equality reads only `L+1` bytes (no extra cap beyond the literal length).
-
-// Floats are not supported in GhostScope scripts.
 
 ## Built-in Functions
 
-GhostScope provides built-in functions to make common string checks efficient and verifier-friendly.
+### `strncmp(expr, "lit", n)`
+  - Compares the first `n` bytes of memory pointed to by `expr` with the string literal `lit`.
+  - No requirement for a terminating NUL within `n` bytes.
+  - `expr` may be a DWARF pointer or array (any element type), address‑of (e.g., `&expr`, `&arr[0]`), or a generic pointer. The engine performs a bounded user‑memory read and compares bytes. For non‑char arrays, comparison is on raw bytes; `n` is in bytes.
+  - Any read failure evaluates to `false`. See “Runtime Expression Failures (ExprError)”.
+  - Read length is capped by `ebpf.compare_cap` (default 64 bytes); if `n` exceeds the cap or available array size, it is truncated.
 
-Supported built-ins (phase 1):
-- `strncmp(expr, "lit", n)`
-  - Compares the first `n` bytes of the memory pointed to by `expr` against the string literal `lit`.
-  - Does not require a terminating NUL within `n` bytes.
-  - `expr` may be a DWARF `char*`, `char[N]`, or a generic pointer expression; GhostScope performs a bounded user-memory read and compares bytes.
-  - Any DWARF-backed read failure evaluates to `false` and is surfaced as a structured warning; see “Runtime Expression Failures (ExprError)” below.
-  - Read length is capped by configuration `ebpf.compare_cap` (default 64 bytes). If `n` exceeds the cap or the available array size, it is truncated.
-
-- `starts_with(expr, "lit")`
+### `starts_with(expr, "lit")`
   - Equivalent to `strncmp(expr, "lit", len("lit"))`.
-  - Same failure and safety semantics as above.
+  - Same failure/safety semantics as above.
 
-- `memcmp(expr_a, expr_b, len)`
-  - Boolean variant: returns `true` iff the first `len` bytes at `expr_a` and `expr_b` are identical.
-  - Pointers: `expr_a` and `expr_b` accept DWARF pointer/array expressions or a raw address literal (decimal/hex `0x..`/octal `0o..`/binary `0b..`). For literal string comparisons, use `strncmp`/`starts_with` instead.
-  - Integer expressions semantics: any integer expression (that is not `hex("...")`) is treated as a user virtual address and read via `bpf_probe_read_user`. It is NOT interpreted as a byte pattern. To compare against raw bytes, use `hex("...")` below.
-  - `len` can be a script integer expression; supports decimal, hex (`0x..`), octal (`0o..`), and binary (`0b..`) literals. The engine clamps negative values to 0 at runtime; however, the parser rejects literal negative lengths.
-  - No NUL-terminator semantics; compares raw bytes only.
-  - Any DWARF-backed read failure on either side evaluates to `false` and is surfaced as a structured warning; see “Runtime Expression Failures (ExprError)”.
-  - If `len == 0`, the result is `true` and no user-memory read is performed (fast-path).
-  - Implementation is verifier-friendly: reads are bounded and comparisons are accumulated without early exits.
-  - See also: Hex Literal Helper (`hex`) below.
-    - If either operand is `hex("...")`, you may omit `len`; the parser will infer `len` from the hex pattern size. If both operands are `hex(...)`, their sizes must match.
-    - When using a literal `len` with `hex("...")`, the parser validates that `len` is non-negative and does not exceed the hex pattern size.
+### `memcmp(expr_a, expr_b, len)`
+  - Boolean semantics: returns `true` if the first `len` bytes at `expr_a` and `expr_b` are identical.
+  - Pointer sources: `expr_a`/`expr_b` may be DWARF pointer or array (any element type), or address‑of forms (e.g., `&expr`, `&arr[0]`). For literal string comparisons, use `strncmp`/`starts_with`.
+  - Bare integer addresses as pointer arguments are not supported. To match raw bytes, use `hex("...")`.
+    - If either operand is `hex("...")`, `len` may be omitted; the parser infers `len` from the hex size. If both sides are `hex(...)`, sizes must match.
+    - With a literal `len` and `hex(...)`, negative lengths and lengths greater than the hex size are rejected at parse time.
+  - `len` accepts script integer expressions (decimal, `0x..`, `0o..`, `0b..`). At runtime, negative values are clamped to 0; literal negatives are rejected by the parser.
+  - No NUL semantics; raw byte comparison (length in bytes).
+  - If `len == 0`, result is `true` (no user‑memory reads).
+  - Any DWARF read failure on either side evaluates to `false` (see ExprError).
 
 Verifier friendliness and performance:
-- Compiles to branch-light byte comparisons (e.g., XOR/OR accumulation) to avoid verifier state explosion.
-- Avoid packing many large string checks into a single very hot probe; consider splitting trace points or using less-hot sites when possible.
+- Compiles to branch‑light byte comparisons (e.g., XOR/OR accumulation) to avoid verifier state explosion.
+- Avoid packing many large string checks into a single hot probe; consider splitting trace points or attaching at less‑hot sites.
 
-Examples
+Examples: `strncmp`
 
 ```ghostscope
 // Function parameter (const char* activity)
 trace log_activity {
-    print "is_main:{}", starts_with(activity, "main");
     print "eq5:{}", strncmp(activity, "main_", 5);
 }
 
-// Global C strings and fixed arrays
+// Global/rodata C strings or fixed arrays
 trace globals_program.c:32 {
-    print "gm_hello:{}", starts_with(gm, "Hello"); // gm: const char*
     print "lm_libw:{}", strncmp(lm, "LIB_", 4);    // lm: const char*
 }
 
-// Generic pointer (read failure -> false)
+// Generic pointer (read failure → false)
 trace process_record {
     print "rec_http:{}", strncmp(record, "HTTP", 4); // record: struct* -> false
 }
+```
 
+Examples: `starts_with`
+
+```ghostscope
+// Prefix match (equivalent to strncmp(expr, lit, len(lit)))
+trace log_activity {
+    print "is_main:{}", starts_with(activity, "main");
+}
+
+trace globals_program.c:32 {
+    print "gm_hello:{}", starts_with(gm, "Hello"); // gm: const char*
+}
+```
+
+Examples: `memcmp`
+
+```ghostscope
 // Raw memory equality between two pointers
 trace globals_program.c:32 {
     // Equal bytes
     if memcmp(&lib_pattern[0], &lib_pattern[0], 16) { print "EQ"; } else { print "NE"; }
     // Different due to offset
     if memcmp(&lib_pattern[0], &lib_pattern[1], 16) { print "EQ2"; } else { print "NE2"; }
-    // len=0 → true
+    // len=0 → true (no user-memory reads)
     if memcmp(&lib_pattern[0], &lib_pattern[1], 0) { print "Z0"; }
     // Dynamic length from script variable
     let n = 10;
     if memcmp(&lib_pattern[0], &lib_pattern[0], n) { print "DYN_EQ"; }
 }
-```
+
+// Match against byte patterns (hex)
+trace foo {
+    if memcmp(buf, hex("50 4F"), 2) { print "HDR"; }          // first 2 bytes are "PO"
+    if memcmp(ptr, hex("DE AD BE EF"), 4) { print "MAGIC"; }  // 4-byte magic
+}
 ```
 
 ### Hex Literal Helper (`hex`)
 
 - Syntax: `hex("<HEX BYTES>")`
-  - `<HEX BYTES>` must contain only hex digits (`0-9a-fA-F`) and spaces as separators (tabs and other separators are not allowed); after removing spaces, the number of hex digits must be even.
-  - Parse-time validation: any non-hex, non-space character or odd number of hex digits causes a clear error. Additionally, with `memcmp(expr, hex(...), len_literal)`, the parser rejects `len_literal` larger than the hex pattern size, and rejects negative literal lengths.
-- Semantics: produces a byte sequence interpreted left-to-right (two hex digits per byte). No endianness is involved and no `0x` prefixes are allowed inside the string.
-- Scope: supported as an argument to `memcmp` to compare memory against raw bytes (e.g., headers, magic constants).
+  - Only hex digits (`0-9a-fA-F`) and spaces; after removing spaces, there must be an even number of digits. Tabs and other separators are not allowed.
+  - Parse‑time validation: rejects any non‑hex character and odd digit count; with `memcmp(expr, hex(...), len_literal)`, literal `len` must be non‑negative and must not exceed the hex size.
+- Semantics: parses two hex digits per byte left‑to‑right; no endianness involved; no `0x` inside the string.
+- Scope: as an argument to `memcmp` to compare memory against raw bytes (headers, magic constants, etc.).
 - Examples:
 
 ```ghostscope
 trace foo {
-    // Compare first 2 bytes with ASCII "PO"
     if memcmp(buf, hex("50 4F"), 2) { print "HDR"; }
-
-    // Compare 4 bytes 0xDE 0xAD 0xBE 0xEF
     if memcmp(ptr, hex("DE AD BE EF"), 4) { print "MAGIC"; }
 }
 ```
 
-### Special Variables
+## Examples
 
-Special variables start with `$` and expose runtime info from the kernel.
+This section highlights common and high‑value patterns (inspired by e2e tests).
 
-Supported now:
-
-- `$pid` — current process ID (tgid), from `bpf_get_current_pid_tgid` lower 32 bits.
-- `$tid` — current thread ID, from `bpf_get_current_pid_tgid` upper 32 bits.
-- `$timestamp` — monotonic timestamp in nanoseconds, from `bpf_ktime_get_ns`.
-
-All behave as integers and can be used in comparisons and arithmetic.
-
-Examples
+### Basic Function Trace & Process Info
 
 ```ghostscope
-trace sample.c:42 {
-    if $pid == 12345 { print "match"; }
+trace main {
+    print "Program start";
     print "PID:{} TID:{} TS:{}", $pid, $tid, $timestamp;
 }
 ```
 
-Note: Only `$pid`, `$tid` and `$timestamp` are supported at present. Additional register-related specials may be added later.
-
-### Variable Lookup Order
-
-When a variable is encountered in a script, GhostScope searches in this order:
-1. Script-defined variables (defined with `let`)
-2. Local variables and parameters from the traced program
-3. Global variables from the traced program
-
-Note: Script variables can shadow program variables, so be careful with naming.
-
-## Backtrace Statement (In Progress)
-
-Print the current call stack:
-
-```ghostscope
-// Full form
-backtrace;
-
-// Short form
-bt;
-```
-
-## Examples
-
-### Basic Function Tracing
-
-```ghostscope
-trace main {
-    print "Program started";
-    print "PID: {}", $pid;
-}
-```
-
-### Conditional Tracing
+### Conditional Trace & Backtrace
 
 ```ghostscope
 trace malloc {
-    if size > 1048576 {  // 1 MB
+    if size > 1_048_576 {  // 1 MB
         print "Large allocation: {} bytes", size;
-        backtrace;
+        backtrace;          // (in progress)
     }
 }
 ```
 
-### Struct Field Access
+### DWARF Auto‑Deref & Member Access
 
 ```ghostscope
 trace process_user {
-    print "User: {}", user.name;
-    print "ID: {}", user.id;
+    print "user:{}", user.name;
+    print "status:{}", user.status;
 
-    if user.status == 1 {
-        print "Active user";
-    }
+    // auto‑deref pointer to struct when safe
+    print "friend:{}", user.friend_ref.name;
 }
 ```
 
-### Complex Variable Access
+### Array Access & Address‑Of
 
 ```ghostscope
-trace handle_request {
-    // Array access
-    print "First item: {}", items[0];
+trace foo.c:42 {
+    print "arr0:{}", arr[0];
+    print "name0:{}", person.names[0];
 
-    // Nested struct access
-    print "Config value: {}", config.network.timeout;
-
-    // Pointer operations
-    print "Dereferenced: {}", *ptr;
-    print "Address: {}", &variable;
+    // address‑of used in builtins or dumps
+    print "p(&buf[0])={:p}", &buf[0];
 }
 ```
 
-### Multiple Trace Points in Script File
+### CString Comparisons (char*/char[])
 
 ```ghostscope
-// script.gs file
-trace server_accept {
-    print "New connection";
+trace log_activity {
+    print "prefix:{}", starts_with(activity, "main");
+    print "eq:{}", strncmp(activity, "main_", 5);
 }
 
-trace server_process {
-    print "Processing request type: {}", $arg0;
+trace globals_program.c:32 {
+    print "lm_libw:{}", strncmp(lm, "LIB_", 4);
+}
+```
+
+### Raw Memory Compare (memcmp) & hex Byte Strings
+
+```ghostscope
+trace globals_program.c:32 {
+    if memcmp(&lib_pattern[0], &lib_pattern[0], 16) { print "EQ"; } else { print "NE"; }
+    if memcmp(&lib_pattern[0], &lib_pattern[1], 16) { print "EQ2"; } else { print "NE2"; }
+    if memcmp(&lib_pattern[0], &lib_pattern[1], 0) { print "Z0"; }
+    let n = 10;
+    if memcmp(&lib_pattern[0], &lib_pattern[0], n) { print "DYN_EQ"; }
 }
 
-trace server_respond {
-    print "Sending response code: {}", $arg1;
+trace foo {
+    if memcmp(buf, hex("50 4F"), 2) { print "HDR"; }
+    if memcmp(ptr, hex("DE AD BE EF"), 4) { print "MAGIC"; }
+}
+```
+
+### else‑if Chains & ExprError Soft‑Abort
+
+```ghostscope
+// G_STATE.lib can be NULL at times; read failure triggers ExprError
+trace globals_program.c:32 {
+    if memcmp(G_STATE.lib, hex("00"), 1) { print "A"; }
+    else if memcmp(gm, hex("48"), 1) { print "B"; }
+    else { print "C"; }
+}
+// Expect: an ExprError line and "B" printed; A/C suppressed by soft‑abort
+```
+
+### Struct Pretty Print & Pointer Deref
+
+```ghostscope
+// Example adapted from complex_types_program
+trace complex_types_program.c:25 {
+    print s.name;   // char[16] -> string
+    print s;        // pretty‑print struct
+    print *ls;      // deref pointer then pretty‑print
+}
+```
+
+### Dynamic Length Formatting & Dumps
+
+```ghostscope
+trace foo {
+    let n = 32;
+    print "h={:x.*}", n, buf;
+    print "ascii={:s.n$}", name;
 }
 ```
 
 ## Limitations
 
-1. **No Loops**: For safety reasons, loops (`for`, `while`) are not supported
-2. **No Function Definitions**: Cannot define custom functions
-3. **Read-Only**: Cannot modify the traced program's state
-4. **Limited String Operations**: Supports CString equality (==/!=) and builtins `strncmp`/`starts_with`; no concatenation or general string manipulation
-5. **Limited Arithmetic**: Basic operations only, no bitwise operations
-6. **No Dynamic Memory**: Cannot allocate memory
+1. No loops (`for`, `while`)
+2. No user‑defined functions
+3. Read‑only (no mutation of target program state)
+4. Limited string operations (CString equality and built‑ins only)
+5. Limited arithmetic (no bitwise operators yet)
+6. No dynamic memory allocation in eBPF
 
 ## Best Practices
 
-1. **Keep It Simple**: Trace actions should be lightweight to minimize overhead
-2. **Filter Early**: Use conditions to reduce trace frequency
-3. **Use Meaningful Output**: Include context in print statements
-4. **Avoid Complex Logic**: Keep trace logic straightforward
-5. **Test Incrementally**: Start with simple traces, add complexity gradually
+1. Keep it simple to minimize overhead
+2. Filter early with conditions
+3. Include context in print outputs
+4. Avoid complicated logic in probes
+5. Build up incrementally
 
 ## Notes
 
-- Variable declarations (`let`) create script-local variables, not program variables
-- All variables are dynamically typed
+- `let` declares script‑local variables, not program variables
+- All variables are dynamically typed in script space
 - String literals must use double quotes
-- Statement semicolons are required for most statements
-- The trace pattern matching supports fuzzy file matching (see [Command Reference](command-reference.md))
+- Most statements require semicolons
+- Trace pattern matching supports fuzzy file suffix (see Command Reference)
+
 ## Runtime Expression Failures (ExprError)
 
-When an `if/else if` condition or a builtin (`memcmp`, `strncmp`, `starts_with`) depends on DWARF-backed runtime reads and a read fails, GhostScope does not silently treat the condition as `false`. Instead, it sends a structured warning (ExprError) to user space and applies “soft-abort” semantics:
+When an `if/else if` condition or a builtin (`memcmp`, `strncmp`, `starts_with`) depends on DWARF‑backed runtime reads and a read fails, GhostScope does not silently treat the condition as `false`. Instead, it sends a structured warning (ExprError) to user space and applies soft‑abort semantics:
 
-- Soft-abort semantics
-  - For the failing `if`: skip both then and else. An `else if` chain will continue evaluation; if a later condition succeeds, its branch executes.
-  - For `print`: do not abort; variables already carry per-variable statuses. If a builtin arg (e.g., `memcmp`) fails inside `print`, an additional ExprError is emitted while the line still renders.
+- Soft‑abort:
+  - For a failing `if`: skip then/else; an `else if` chain continues; if a later condition succeeds, its branch runs.
+  - For `print`: do not abort the line; per‑variable statuses render inline. If a builtin fails inside `print`, an additional ExprError is emitted.
 
-### ExprError fields
+### ExprError Fields
 
-- `expr`: human-readable expression text (UTF-8 safe truncated if long).
-- `code`: error code aligned with `VariableStatus` meanings:
-  - 1 = NullDeref, 2 = ReadError, 3 = AccessError, 4 = Truncated, 5 = OffsetsUnavailable, 6 = ZeroLength
-- `flags`: bitmask with builtin-specific meanings:
+- `expr`: human‑readable expression text (UTF‑8 safe truncation)
+- `code`: aligned with `VariableStatus` semantics:
+  - 1 = NullDeref
+  - 2 = ReadError (includes probe_read_user failures)
+  - 3 = AccessError
+  - 4 = Truncated
+  - 5 = OffsetsUnavailable (missing ASLR offsets)
+  - 6 = ZeroLength (requested length is 0)
+- `flags`: bitmask (builtin‑specific meanings)
   - `memcmp`:
-    - `0x01` → first-arg read-fail (arg0)
-    - `0x02` → second-arg read-fail (arg1)
-    - `0x04` → len-clamped (compare length truncated to cap)
-    - `0x08` → len=0 (effective length is zero)
+    - `0x01` → first‑arg read‑fail
+    - `0x02` → second‑arg read‑fail
+    - `0x04` → len‑clamped (compare length truncated to cap)
+    - `0x08` → len=0
   - `strncmp/starts_with`:
-    - `0x01` → read-fail
-    - `0x04`, `0x08` reserved for length clamped/zero (future use)
-- `failing_addr`: the pointer address involved in the failure (0 if unknown).
+    - `0x01` → read‑fail
+    - `0x04`, `0x08` reserved (length clamped/zero)
+- `failing_addr`: the pointer address involved (or 0 if unknown). When zero, renderers show `at NULL`.
 
-Console example (no emoji; TUI adds its own styling):
+Console example:
 
 ```
 ExprError: memcmp(buf, hex("504f"), 2) (read error at 0x0000000100000000, flags: first-arg read-fail,len-clamped)
 ```
 
-When the failing address is zero, the output shows `at NULL`:
+When the failing address is zero:
 
 ```
 ExprError: memcmp(G_STATE.lib, hex("00"), 1) (read error at NULL, flags: first-arg read-fail)
