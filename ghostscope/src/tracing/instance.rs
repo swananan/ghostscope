@@ -46,24 +46,19 @@ impl TraceInstance {
     }
 
     /// Enable this trace instance
-    #[allow(clippy::needless_return)]
     pub fn enable(&mut self) -> Result<()> {
         if self.is_enabled {
             info!("Trace {} is already enabled", self.trace_id);
-            return Ok(());
-        }
-
-        info!(
-            "Enabling trace {} for target '{}' at PC 0x{:x} in binary '{}'",
-            self.trace_id, self.target_display, self.pc, self.binary_path
-        );
-
-        // Attach uprobe using the loader
-        if let Some(ref mut loader) = self.loader {
+            Ok(())
+        } else if let Some(ref mut loader) = self.loader {
+            info!(
+                "Enabling trace {} for target '{}' at PC 0x{:x} in binary '{}'",
+                self.trace_id, self.target_display, self.pc, self.binary_path
+            );
             if loader.is_uprobe_attached() {
                 warn!("Uprobe already attached for trace {}", self.trace_id);
                 self.is_enabled = true;
-                return Ok(());
+                Ok(())
             } else if loader.get_attachment_info().is_some() {
                 info!(
                     "Re-attaching uprobe for trace {} (program already loaded)",
@@ -76,14 +71,14 @@ impl TraceInstance {
                             self.trace_id
                         );
                         self.is_enabled = true;
-                        return Ok(());
+                        Ok(())
                     }
                     Err(e) => {
                         error!(
                             "❌ Failed to re-attach uprobe for trace {}: {}",
                             self.trace_id, e
                         );
-                        return Err(anyhow::anyhow!("Failed to re-attach uprobe: {}", e));
+                        Err(anyhow::anyhow!("Failed to re-attach uprobe: {}", e))
                     }
                 }
             } else {
@@ -103,20 +98,20 @@ impl TraceInstance {
                             self.trace_id, self.pc
                         );
                         self.is_enabled = true;
-                        return Ok(());
+                        Ok(())
                     }
                     Err(e) => {
                         error!(
                             "❌ Failed to attach uprobe for trace {}: {}",
                             self.trace_id, e
                         );
-                        return Err(anyhow::anyhow!("Failed to attach uprobe: {}", e));
+                        Err(anyhow::anyhow!("Failed to attach uprobe: {}", e))
                     }
                 }
             }
         } else {
             error!("No eBPF loader available for trace {}", self.trace_id);
-            return Err(anyhow::anyhow!("No eBPF loader available"));
+            Err(anyhow::anyhow!("No eBPF loader available"))
         }
     }
 

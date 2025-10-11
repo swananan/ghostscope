@@ -4259,6 +4259,94 @@ mod tests {
     }
 
     #[test]
+    fn memcmp_accepts_script_pointer_variable_fallback() {
+        let context = inkwell::context::Context::create();
+        let opts = CompileOptions::default();
+        let mut ctx =
+            EbpfContext::new(&context, "test_mod", Some(0), &opts).expect("create EbpfContext");
+
+        // let p = "A";  // script pointer to const string
+        let decl = crate::script::Statement::VarDeclaration {
+            name: "p".to_string(),
+            value: crate::script::Expr::String("A".to_string()),
+        };
+
+        // if memcmp(p, hex("41"), 1) { print "OK"; }
+        let if_stmt = crate::script::Statement::If {
+            condition: crate::script::Expr::BuiltinCall {
+                name: "memcmp".to_string(),
+                args: vec![
+                    crate::script::Expr::Variable("p".to_string()),
+                    crate::script::Expr::BuiltinCall {
+                        name: "hex".to_string(),
+                        args: vec![crate::script::Expr::String("41".to_string())],
+                    },
+                    crate::script::Expr::Int(1),
+                ],
+            },
+            then_body: vec![crate::script::Statement::Print(
+                crate::script::PrintStatement::String("OK".to_string()),
+            )],
+            else_body: None,
+        };
+
+        let program = crate::script::Program::new();
+        let res = ctx.compile_program(
+            &program,
+            "test_memcmp_ptr",
+            &[decl, if_stmt],
+            None,
+            None,
+            None,
+        );
+        assert!(res.is_ok(), "Compilation failed: {:?}", res.err());
+    }
+
+    #[test]
+    fn memcmp_rejects_bare_integer_pointer_argument() {
+        let context = inkwell::context::Context::create();
+        let opts = CompileOptions::default();
+        let mut ctx =
+            EbpfContext::new(&context, "test_mod", Some(0), &opts).expect("create EbpfContext");
+
+        // let q = 0xdeadbeef;  // integer, not a pointer value
+        let decl = crate::script::Statement::VarDeclaration {
+            name: "q".to_string(),
+            value: crate::script::Expr::Int(0xdeadbeef),
+        };
+
+        // if memcmp(q, hex("00"), 1) { print "X"; }
+        let if_stmt = crate::script::Statement::If {
+            condition: crate::script::Expr::BuiltinCall {
+                name: "memcmp".to_string(),
+                args: vec![
+                    crate::script::Expr::Variable("q".to_string()),
+                    crate::script::Expr::BuiltinCall {
+                        name: "hex".to_string(),
+                        args: vec![crate::script::Expr::String("00".to_string())],
+                    },
+                    crate::script::Expr::Int(1),
+                ],
+            },
+            then_body: vec![crate::script::Statement::Print(
+                crate::script::PrintStatement::String("X".to_string()),
+            )],
+            else_body: None,
+        };
+
+        let program = crate::script::Program::new();
+        let res = ctx.compile_program(
+            &program,
+            "test_memcmp_int_ptr",
+            &[decl, if_stmt],
+            None,
+            None,
+            None,
+        );
+        assert!(res.is_err(), "Expected compilation error but got Ok");
+    }
+
+    #[test]
     fn expr_to_name_truncates_utf8_safely() {
         let context = inkwell::context::Context::create();
         let opts = CompileOptions::default();

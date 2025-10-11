@@ -5,6 +5,7 @@
 use super::context::{CodeGenError, EbpfContext, Result};
 use crate::script::{BinaryOp, Expr};
 use aya_ebpf_bindings::bindings::bpf_func_id::BPF_FUNC_probe_read_user;
+use ghostscope_dwarf::TypeInfo as DwarfType;
 use inkwell::values::BasicValueEnum;
 use inkwell::AddressSpace;
 use tracing::debug;
@@ -12,73 +13,157 @@ use tracing::debug;
 // compare cap is provided via compile_options.compare_cap (config: ebpf.compare_cap)
 
 impl<'ctx> EbpfContext<'ctx> {
+    /// Ensure that when an expression refers to a DWARF-backed variable (not via address-of),
+    /// the variable's DWARF type is a pointer or array (decays to pointer for memcmp/strncmp).
+    fn ensure_dwarf_pointer_arg(&mut self, e: &Expr, where_ctx: &str) -> Result<()> {
+        // Allow explicit address-of forms (&expr), which purposefully produce a pointer
+        if matches!(e, Expr::AddressOf(_)) {
+            return Ok(());
+        }
+        match self.query_dwarf_for_complex_expr(e) {
+            Ok(Some(var)) => {
+                let Some(mut ty) = var.dwarf_type.as_ref() else {
+                    return Err(CodeGenError::TypeError(format!(
+                        "{where_ctx}: DWARF variable has no type information"
+                    )));
+                };
+                // Unwrap typedef/qualified wrappers
+                loop {
+                    match ty {
+                        DwarfType::TypedefType {
+                            underlying_type, ..
+                        } => ty = underlying_type.as_ref(),
+                        DwarfType::QualifiedType {
+                            underlying_type, ..
+                        } => ty = underlying_type.as_ref(),
+                        _ => break,
+                    }
+                }
+                if !matches!(
+                    ty,
+                    DwarfType::PointerType { .. } | DwarfType::ArrayType { .. }
+                ) {
+                    return Err(CodeGenError::TypeError(format!(
+                        "{where_ctx}: only pointer or array DWARF variables are supported"
+                    )));
+                }
+                Ok(())
+            }
+            // No DWARF info or analyzer missing: allow script-level pointer values
+            Ok(None) | Err(_) => match self.compile_expr(e) {
+                Ok(BasicValueEnum::PointerValue(_)) => Ok(()),
+                _ => Err(CodeGenError::TypeError(format!(
+                    "{where_ctx}: expression is not a pointer"
+                ))),
+            },
+        }
+    }
+
     /// Resolve an expression to an i64 pointer value. Accepts integer (address) and pointer values;
     /// falls back to DWARF evaluation for complex expressions.
     fn resolve_ptr_i64_from_expr(&mut self, e: &Expr) -> Result<inkwell::values::IntValue<'ctx>> {
         use inkwell::values::BasicValueEnum::*;
-        // Try compiling as a generic expr first
-        if let Ok(v) = self.compile_expr(e) {
-            match v {
-                IntValue(iv) => {
-                    // Zero/sign-extend or truncate to i64 as needed
-                    let bw = iv.get_type().get_bit_width();
-                    let v64 = if bw < 64 {
-                        self.builder
-                            .build_int_z_extend(iv, self.context.i64_type(), "ptr_zext")
-                            .map_err(|e| CodeGenError::Builder(e.to_string()))?
-                    } else if bw > 64 {
-                        self.builder
-                            .build_int_truncate(iv, self.context.i64_type(), "ptr_trunc")
-                            .map_err(|e| CodeGenError::Builder(e.to_string()))?
-                    } else {
-                        iv
-                    };
-                    return Ok(v64);
-                }
-                PointerValue(pv) => {
-                    let v64 = self
-                        .builder
-                        .build_ptr_to_int(pv, self.context.i64_type(), "ptr_as_i64")
-                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-                    return Ok(v64);
-                }
-                _ => {}
+        // Special-case: explicit address-of must yield a pointer-sized address
+        if let Expr::AddressOf(inner) = e {
+            if let Some(var) = self.query_dwarf_for_complex_expr(inner)? {
+                let module_hint = self.current_resolved_var_module_path.clone();
+                let status_ptr = if self.condition_context_active {
+                    Some(self.get_or_create_cond_error_global())
+                } else {
+                    None
+                };
+                return self.evaluation_result_to_address_with_hint(
+                    &var.evaluation_result,
+                    status_ptr,
+                    module_hint.as_deref(),
+                );
+            } else {
+                return Err(CodeGenError::TypeError(
+                    "cannot take address of unresolved expression".into(),
+                ));
             }
         }
-
-        // Fallback to DWARF evaluation
-        let var = self.query_dwarf_for_complex_expr(e)?.ok_or_else(|| {
-            CodeGenError::TypeError("memcmp requires pointer/address expression".into())
-        })?;
-        if let Some(dty) = var.dwarf_type.as_ref() {
-            let val_any = self.evaluate_result_to_llvm_value(
-                &var.evaluation_result,
-                dty,
-                &var.name,
-                self.get_compile_time_context()?.pc_address,
-            )?;
-            match val_any {
-                IntValue(iv) => Ok(iv),
-                PointerValue(pv) => self
-                    .builder
-                    .build_ptr_to_int(pv, self.context.i64_type(), "ptr_as_i64")
-                    .map_err(|e| CodeGenError::Builder(e.to_string())),
-                _ => Err(CodeGenError::TypeError(
-                    "DWARF value is not pointer/integer".into(),
-                )),
+        // Prefer DWARF-based address resolution first so that array/aggregate
+        // expressions decay to their base address rather than loading values.
+        if let Ok(Some(var)) = self.query_dwarf_for_complex_expr(e) {
+            if let Some(mut dty) = var.dwarf_type.as_ref() {
+                // unwrap aliases
+                loop {
+                    match dty {
+                        DwarfType::TypedefType {
+                            underlying_type, ..
+                        } => dty = underlying_type.as_ref(),
+                        DwarfType::QualifiedType {
+                            underlying_type, ..
+                        } => dty = underlying_type.as_ref(),
+                        _ => break,
+                    }
+                }
+                match dty {
+                    DwarfType::PointerType { .. } => {
+                        let val_any = self.evaluate_result_to_llvm_value(
+                            &var.evaluation_result,
+                            dty,
+                            &var.name,
+                            self.get_compile_time_context()?.pc_address,
+                        )?;
+                        match val_any {
+                            IntValue(iv) => Ok(iv),
+                            PointerValue(pv) => self
+                                .builder
+                                .build_ptr_to_int(pv, self.context.i64_type(), "ptr_as_i64")
+                                .map_err(|e| CodeGenError::Builder(e.to_string())),
+                            _ => Err(CodeGenError::TypeError(
+                                "DWARF value is not pointer/integer".into(),
+                            )),
+                        }
+                    }
+                    DwarfType::ArrayType { .. } => {
+                        // Use the base address of the array as pointer
+                        let module_hint = self.current_resolved_var_module_path.clone();
+                        let status_ptr = if self.condition_context_active {
+                            Some(self.get_or_create_cond_error_global())
+                        } else {
+                            None
+                        };
+                        self.evaluation_result_to_address_with_hint(
+                            &var.evaluation_result,
+                            status_ptr,
+                            module_hint.as_deref(),
+                        )
+                    }
+                    _ => Err(CodeGenError::TypeError(
+                        "DWARF value is not pointer/array".into(),
+                    )),
+                }
+            } else {
+                let module_hint = self.current_resolved_var_module_path.clone();
+                let status_ptr = if self.condition_context_active {
+                    Some(self.get_or_create_cond_error_global())
+                } else {
+                    None
+                };
+                self.evaluation_result_to_address_with_hint(
+                    &var.evaluation_result,
+                    status_ptr,
+                    module_hint.as_deref(),
+                )
             }
         } else {
-            let module_hint = self.current_resolved_var_module_path.clone();
-            let status_ptr = if self.condition_context_active {
-                Some(self.get_or_create_cond_error_global())
-            } else {
-                None
-            };
-            self.evaluation_result_to_address_with_hint(
-                &var.evaluation_result,
-                status_ptr,
-                module_hint.as_deref(),
-            )
+            // Fallback: accept script-defined pointer values (but not bare integer addresses)
+            match self.compile_expr(e) {
+                Ok(inkwell::values::BasicValueEnum::PointerValue(pv)) => self
+                    .builder
+                    .build_ptr_to_int(pv, self.context.i64_type(), "ptr_as_i64_fallback")
+                    .map_err(|er| CodeGenError::Builder(er.to_string())),
+                Ok(inkwell::values::BasicValueEnum::IntValue(_)) => Err(CodeGenError::TypeError(
+                    "expression is not a pointer/address".into(),
+                )),
+                Ok(_) => Err(CodeGenError::TypeError(
+                    "expression is not a pointer/address".into(),
+                )),
+                Err(e) => Err(e),
+            }
         }
     }
     /// Builtin memcmp (boolean variant): returns true iff first `len` bytes equal.
@@ -210,6 +295,10 @@ impl<'ctx> EbpfContext<'ctx> {
         };
 
         // Side A
+        // If side A is DWARF-backed (and not an explicit address-of), enforce pointer DWARF type
+        if parse_hex_bytes(a_expr).is_none() {
+            self.ensure_dwarf_pointer_arg(a_expr, "memcmp arg0")?;
+        }
         let ok_a = if let Some(bytes) = parse_hex_bytes(a_expr) {
             let i32_ty = self.context.i32_type();
             let idx0 = i32_ty.const_zero();
@@ -258,6 +347,9 @@ impl<'ctx> EbpfContext<'ctx> {
         };
 
         // Side B
+        if parse_hex_bytes(b_expr).is_none() {
+            self.ensure_dwarf_pointer_arg(b_expr, "memcmp arg1")?;
+        }
         let ok_b = if let Some(bytes) = parse_hex_bytes(b_expr) {
             let i32_ty = self.context.i32_type();
             let idx0 = i32_ty.const_zero();
@@ -549,69 +641,86 @@ impl<'ctx> EbpfContext<'ctx> {
             .query_dwarf_for_complex_expr(dwarf_expr)?
             .ok_or_else(|| CodeGenError::TypeError("builtin requires DWARF expression".into()))?;
 
+        // Enforce DWARF pointer OR array type for the first argument
+        let mut ty = var.dwarf_type.as_ref().ok_or_else(|| {
+            CodeGenError::TypeError("strncmp first argument lacks DWARF type".into())
+        })?;
+        loop {
+            match ty {
+                DwarfType::TypedefType {
+                    underlying_type, ..
+                } => ty = underlying_type.as_ref(),
+                DwarfType::QualifiedType {
+                    underlying_type, ..
+                } => ty = underlying_type.as_ref(),
+                _ => break,
+            }
+        }
+        let is_ptr = matches!(ty, DwarfType::PointerType { .. });
+        let is_arr = matches!(ty, DwarfType::ArrayType { .. });
+        if !(is_ptr || is_arr) {
+            return Err(CodeGenError::TypeError(
+                "strncmp first argument must be a pointer or array DWARF variable".into(),
+            ));
+        }
+
         // Determine pointer value (i64) of the target memory
-        let ptr_i64 = if let Some(dty) = var.dwarf_type.as_ref() {
+        let ptr_i64 = if let Some(dty0) = var.dwarf_type.as_ref() {
             // Try full value first
-            let val_any = self.evaluate_result_to_llvm_value(
-                &var.evaluation_result,
-                dty,
-                &var.name,
-                self.get_compile_time_context()?.pc_address,
-            )?;
-            match val_any {
-                BasicValueEnum::IntValue(iv) => iv,
-                BasicValueEnum::PointerValue(pv) => self
-                    .builder
-                    .build_ptr_to_int(pv, self.context.i64_type(), "ptr_as_i64")
-                    .map_err(|e| CodeGenError::Builder(e.to_string()))?,
-                _ => {
-                    // Fallback: read pointer from address
+            // Unwrap aliases for branching
+            let mut dty = dty0;
+            loop {
+                match dty {
+                    DwarfType::TypedefType {
+                        underlying_type, ..
+                    } => dty = underlying_type.as_ref(),
+                    DwarfType::QualifiedType {
+                        underlying_type, ..
+                    } => dty = underlying_type.as_ref(),
+                    _ => break,
+                }
+            }
+            match dty {
+                DwarfType::PointerType { .. } => {
+                    let val_any = self.evaluate_result_to_llvm_value(
+                        &var.evaluation_result,
+                        dty,
+                        &var.name,
+                        self.get_compile_time_context()?.pc_address,
+                    )?;
+                    match val_any {
+                        BasicValueEnum::IntValue(iv) => iv,
+                        BasicValueEnum::PointerValue(pv) => self
+                            .builder
+                            .build_ptr_to_int(pv, self.context.i64_type(), "ptr_as_i64")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?,
+                        _ => {
+                            return Err(CodeGenError::TypeError(
+                                "strncmp requires pointer/integer value for pointer; got unsupported DWARF value".into(),
+                            ))
+                        }
+                    }
+                }
+                DwarfType::ArrayType { .. } => {
+                    // Use base address of array
                     let module_hint = self.current_resolved_var_module_path.clone();
                     let status_ptr = if self.condition_context_active {
                         Some(self.get_or_create_cond_error_global())
                     } else {
                         None
                     };
-                    let addr = self.evaluation_result_to_address_with_hint(
+                    self.evaluation_result_to_address_with_hint(
                         &var.evaluation_result,
                         status_ptr,
                         module_hint.as_deref(),
-                    )?;
-                    let val_any =
-                        self.generate_memory_read(addr, ghostscope_dwarf::MemoryAccessSize::U64)?;
-                    match val_any {
-                        BasicValueEnum::IntValue(iv) => iv,
-                        _ => {
-                            return Err(CodeGenError::LLVMError(
-                                "pointer load did not return integer".into(),
-                            ))
-                        }
-                    }
+                    )?
                 }
+                _ => unreachable!(),
             }
         } else {
-            // No DWARF type: compute address then read pointer-sized value
-            let module_hint = self.current_resolved_var_module_path.clone();
-            let status_ptr = if self.condition_context_active {
-                Some(self.get_or_create_cond_error_global())
-            } else {
-                None
-            };
-            let addr = self.evaluation_result_to_address_with_hint(
-                &var.evaluation_result,
-                status_ptr,
-                module_hint.as_deref(),
-            )?;
-            let val_any =
-                self.generate_memory_read(addr, ghostscope_dwarf::MemoryAccessSize::U64)?;
-            match val_any {
-                BasicValueEnum::IntValue(iv) => iv,
-                _ => {
-                    return Err(CodeGenError::LLVMError(
-                        "pointer load did not return integer".into(),
-                    ))
-                }
-            }
+            return Err(CodeGenError::TypeError(
+                "strncmp first argument lacks DWARF type".into(),
+            ));
         };
 
         // Cap read length for safety

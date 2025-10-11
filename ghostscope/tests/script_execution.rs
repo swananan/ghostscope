@@ -194,11 +194,10 @@ async fn test_special_pid_in_if_condition() -> anyhow::Result<()> {
     let (exit_code, stdout, stderr) =
         run_ghostscope_with_script_opt(&script_content, 3, opt_level).await?;
 
-    assert_eq!(exit_code, 0, "stderr={}", stderr);
+    assert_eq!(exit_code, 0, "stderr={stderr}");
     assert!(
         stdout.contains("PID_OK"),
-        "Expected PID_OK in output. STDOUT: {}",
-        stdout
+        "Expected PID_OK in output. STDOUT: {stdout}"
     );
 
     Ok(())
@@ -222,11 +221,10 @@ trace sample_program.c:16 {
     let (exit_code, stdout, stderr) =
         run_ghostscope_with_script_opt(script_content, 3, opt_level).await?;
 
-    assert_eq!(exit_code, 0, "stderr={}", stderr);
+    assert_eq!(exit_code, 0, "stderr={stderr}");
     assert!(
         stdout.contains("TST:"),
-        "Expected TST: with tid/timestamp in output. STDOUT: {}",
-        stdout
+        "Expected TST: with tid/timestamp in output. STDOUT: {stdout}"
     );
     Ok(())
 }
