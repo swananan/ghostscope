@@ -402,7 +402,7 @@ Supported built-ins (phase 1):
   - Compares the first `n` bytes of the memory pointed to by `expr` against the string literal `lit`.
   - Does not require a terminating NUL within `n` bytes.
   - `expr` may be a DWARF `char*`, `char[N]`, or a generic pointer expression; GhostScope performs a bounded user-memory read and compares bytes.
-  - Any read failure evaluates to `false`.
+  - Any DWARF-backed read failure evaluates to `false` and is surfaced as a structured warning; see “Runtime Expression Failures (ExprError)” below.
   - Read length is capped by configuration `ebpf.compare_cap` (default 64 bytes). If `n` exceeds the cap or the available array size, it is truncated.
 
 - `starts_with(expr, "lit")`
@@ -415,7 +415,7 @@ Supported built-ins (phase 1):
   - Integer expressions semantics: any integer expression (that is not `hex("...")`) is treated as a user virtual address and read via `bpf_probe_read_user`. It is NOT interpreted as a byte pattern. To compare against raw bytes, use `hex("...")` below.
   - `len` can be a script integer expression; supports decimal, hex (`0x..`), octal (`0o..`), and binary (`0b..`) literals. The engine clamps negative values to 0 at runtime; however, the parser rejects literal negative lengths.
   - No NUL-terminator semantics; compares raw bytes only.
-  - Any read failure on either side evaluates to `false`.
+  - Any DWARF-backed read failure on either side evaluates to `false` and is surfaced as a structured warning; see “Runtime Expression Failures (ExprError)”.
   - If `len == 0`, the result is `true` and no user-memory read is performed (fast-path).
   - Implementation is verifier-friendly: reads are bounded and comparisons are accumulated without early exits.
   - See also: Hex Literal Helper (`hex`) below.
@@ -616,3 +616,38 @@ trace server_respond {
 - String literals must use double quotes
 - Statement semicolons are required for most statements
 - The trace pattern matching supports fuzzy file matching (see [Command Reference](command-reference.md))
+## Runtime Expression Failures (ExprError)
+
+When an `if/else if` condition or a builtin (`memcmp`, `strncmp`, `starts_with`) depends on DWARF-backed runtime reads and a read fails, GhostScope does not silently treat the condition as `false`. Instead, it sends a structured warning (ExprError) to user space and applies “soft-abort” semantics:
+
+- Soft-abort semantics
+  - For the failing `if`: skip both then and else. An `else if` chain will continue evaluation; if a later condition succeeds, its branch executes.
+  - For `print`: do not abort; variables already carry per-variable statuses. If a builtin arg (e.g., `memcmp`) fails inside `print`, an additional ExprError is emitted while the line still renders.
+
+### ExprError fields
+
+- `expr`: human-readable expression text (UTF-8 safe truncated if long).
+- `code`: error code aligned with `VariableStatus` meanings:
+  - 1 = NullDeref, 2 = ReadError, 3 = AccessError, 4 = Truncated, 5 = OffsetsUnavailable, 6 = ZeroLength
+- `flags`: bitmask with builtin-specific meanings:
+  - `memcmp`:
+    - `0x01` → first-arg read-fail (arg0)
+    - `0x02` → second-arg read-fail (arg1)
+    - `0x04` → len-clamped (compare length truncated to cap)
+    - `0x08` → len=0 (effective length is zero)
+  - `strncmp/starts_with`:
+    - `0x01` → read-fail
+    - `0x04`, `0x08` reserved for length clamped/zero (future use)
+- `failing_addr`: the pointer address involved in the failure (0 if unknown).
+
+Console example (no emoji; TUI adds its own styling):
+
+```
+ExprError: memcmp(buf, hex("504f"), 2) (read error at 0x0000000100000000, flags: first-arg read-fail,len-clamped)
+```
+
+When the failing address is zero, the output shows `at NULL`:
+
+```
+ExprError: memcmp(G_STATE.lib, hex("00"), 1) (read error at NULL, flags: first-arg read-fail)
+```

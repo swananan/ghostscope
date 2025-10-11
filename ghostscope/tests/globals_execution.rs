@@ -169,6 +169,121 @@ trace globals_program.c:32 {
 }
 
 #[tokio::test]
+async fn test_if_memcmp_failure_emits_exprerror_and_suppress_else() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Force a failing user read in condition: address 0x1 is invalid, memcmp will fail probe_read_user
+    // Soft-abort semantics: emit ExprError, suppress both then and else, but keep subsequent prints.
+    let script = r#"
+trace globals_program.c:32 {
+    if memcmp(0x1, hex("00"), 1) { print "THEN"; } else { print "ELSE"; }
+    print "AFTER";
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={} ", stderr, stdout);
+
+    // Should have ExprError line and AFTER; should not see THEN/ELSE
+    assert!(
+        stdout.contains("ExprError"),
+        "Expected ExprError warning. STDOUT: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("AFTER"),
+        "Expected AFTER. STDOUT: {}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("THEN"),
+        "THEN should be suppressed. STDOUT: {}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("ELSE"),
+        "ELSE should be suppressed. STDOUT: {}",
+        stdout
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_else_if_continues_after_error() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // First if may fail at runtime via DWARF read (G_STATE.lib == NULL on even ticks),
+    // else-if checks gm first byte == 'H' (0x48) should succeed, else suppressed
+    let script = r#"
+trace globals_program.c:32 {
+    if memcmp(G_STATE.lib, hex("00"), 1) { print "A"; }
+    else if memcmp(gm, hex("48"), 1) { print "B"; }
+    else { print "C"; }
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={} ", stderr, stdout);
+
+    // Expect ExprError (from first if, when G_STATE.lib is NULL), and B printed; A/C should not appear
+    assert!(
+        stdout.contains("ExprError"),
+        "Expected ExprError warning. STDOUT: {}",
+        stdout
+    );
+    // Check per-line tokens to avoid false positives on 'A' letter inside other words
+    let mut saw_b_token = false;
+    let mut saw_a_token = false;
+    let mut saw_c_token = false;
+    for line in stdout.lines() {
+        let t = line.trim();
+        if t == "B" {
+            saw_b_token = true;
+        }
+        if t == "A" {
+            saw_a_token = true;
+        }
+        if t == "C" {
+            saw_c_token = true;
+        }
+    }
+    assert!(saw_b_token, "Expected B from else-if. STDOUT: {}", stdout);
+    assert!(!saw_a_token, "A should not be printed. STDOUT: {}", stdout);
+    assert!(
+        !saw_c_token,
+        "C should be suppressed due to else-if true. STDOUT: {}",
+        stdout
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_script_signed_ints_regression() -> anyhow::Result<()> {
     init();
 
@@ -2311,14 +2426,32 @@ trace globals_program.c:32 {
     let _ = prog.kill().await;
     assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
 
+    // hex static length path succeeds
     assert!(
-        stdout.lines().any(|l| l.contains("LENHEX")),
+        stdout.contains("LENHEX"),
         "Expected LENHEX. STDOUT: {}",
         stdout
     );
+    // numeric pointer literal read now triggers ExprError in condition context; both then/else suppressed
     assert!(
-        stdout.lines().any(|l| l.contains("NP_FALSE")),
-        "Expected NP_FALSE. STDOUT: {}",
+        stdout.contains("ExprError"),
+        "Expected ExprError for numeric pointer literal. STDOUT: {}",
+        stdout
+    );
+    // Should include failing address and human-readable flag for first argument
+    assert!(
+        stdout.contains("at 0x00000000deadbeef") || stdout.contains("at 0xdeadbeef"),
+        "Expected failing addr in output. STDOUT: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("second-arg read-fail"),
+        "Expected second-arg read-fail flag. STDOUT: {}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("NP_TRUE") && !stdout.contains("NP_FALSE"),
+        "Neither NP_TRUE nor NP_FALSE should be printed under soft-abort. STDOUT: {}",
         stdout
     );
     Ok(())

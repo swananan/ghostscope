@@ -93,6 +93,9 @@ pub struct EbpfContext<'ctx> {
 
     // Compilation options (includes eBPF map configuration)
     pub compile_options: crate::CompileOptions,
+
+    // === Control-flow expression error capture (soft abort) ===
+    pub condition_context_active: bool,
 }
 
 // Temporary alias for backward compatibility during refactoring
@@ -186,6 +189,9 @@ impl<'ctx> EbpfContext<'ctx> {
             current_resolved_var_module_path: None,
             pm_key_alloca: None,
             compile_options: compile_options.clone(),
+
+            // Control-flow expression context
+            condition_context_active: false,
         })
     }
 
@@ -520,5 +526,177 @@ impl<'ctx> EbpfContext<'ctx> {
     /// Mark that at least one variable failed (status!=0)
     pub fn mark_any_fail(&mut self) -> Result<()> {
         self.store_flag_value("_gs_any_fail", 1)
+    }
+
+    /// Get or create global for condition error code (i8). Name: _gs_cond_error
+    pub fn get_or_create_cond_error_global(&mut self) -> PointerValue<'ctx> {
+        if let Some(g) = self.module.get_global("_gs_cond_error") {
+            return g.as_pointer_value();
+        }
+        let i8_type = self.context.i8_type();
+        let global =
+            self.module
+                .add_global(i8_type, Some(AddressSpace::default()), "_gs_cond_error");
+        global.set_initializer(&i8_type.const_zero());
+        global.as_pointer_value()
+    }
+
+    /// Reset condition error to 0 (only meaningful when condition_context_active=true)
+    pub fn reset_condition_error(&mut self) -> Result<()> {
+        let ptr = self.get_or_create_cond_error_global();
+        self.builder
+            .build_store(ptr, self.context.i8_type().const_zero())
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to reset _gs_cond_error: {e}")))?;
+        // Also reset error address
+        let aptr = self.get_or_create_cond_error_addr_global();
+        self.builder
+            .build_store(aptr, self.context.i64_type().const_zero())
+            .map_err(|e| {
+                CodeGenError::LLVMError(format!("Failed to reset _gs_cond_error_addr: {e}"))
+            })?;
+        // Also reset flags
+        let fptr = self.get_or_create_cond_error_flags_global();
+        self.builder
+            .build_store(fptr, self.context.i8_type().const_zero())
+            .map_err(|e| {
+                CodeGenError::LLVMError(format!("Failed to reset _gs_cond_error_flags: {e}"))
+            })?;
+        Ok(())
+    }
+
+    /// Get or create global for condition error address (i64). Name: _gs_cond_error_addr
+    pub fn get_or_create_cond_error_addr_global(&mut self) -> PointerValue<'ctx> {
+        if let Some(g) = self.module.get_global("_gs_cond_error_addr") {
+            return g.as_pointer_value();
+        }
+        let i64_type = self.context.i64_type();
+        let global = self.module.add_global(
+            i64_type,
+            Some(AddressSpace::default()),
+            "_gs_cond_error_addr",
+        );
+        global.set_initializer(&i64_type.const_zero());
+        global.as_pointer_value()
+    }
+
+    /// If in condition context, set error code when it's currently 0 (first error wins)
+    pub fn set_condition_error_if_unset(&mut self, code: u8) -> Result<()> {
+        if !self.condition_context_active {
+            return Ok(());
+        }
+        let ptr = self.get_or_create_cond_error_global();
+        let cur = self
+            .builder
+            .build_load(self.context.i8_type(), ptr, "cond_err_cur")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_int_value();
+        let is_zero = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                cur,
+                self.context.i8_type().const_zero(),
+                "cond_err_is_zero",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let newv_bv: inkwell::values::BasicValueEnum =
+            self.context.i8_type().const_int(code as u64, false).into();
+        let sel = self
+            .builder
+            .build_select::<inkwell::values::BasicValueEnum, _>(
+                is_zero,
+                newv_bv,
+                cur.into(),
+                "cond_err_new",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder
+            .build_store(ptr, sel)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Read the current condition error as i1 predicate: (error != 0)
+    pub fn build_condition_error_predicate(&mut self) -> Result<inkwell::values::IntValue<'ctx>> {
+        let ptr = self.get_or_create_cond_error_global();
+        let cur = self
+            .builder
+            .build_load(self.context.i8_type(), ptr, "cond_err_cur")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_int_value();
+        self.builder
+            .build_int_compare(
+                inkwell::IntPredicate::NE,
+                cur,
+                self.context.i8_type().const_zero(),
+                "cond_err_nonzero",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))
+    }
+
+    /// Get or create global for condition error flags (i8). Name: _gs_cond_error_flags
+    pub fn get_or_create_cond_error_flags_global(&mut self) -> PointerValue<'ctx> {
+        if let Some(g) = self.module.get_global("_gs_cond_error_flags") {
+            return g.as_pointer_value();
+        }
+        let i8_type = self.context.i8_type();
+        let global = self.module.add_global(
+            i8_type,
+            Some(AddressSpace::default()),
+            "_gs_cond_error_flags",
+        );
+        global.set_initializer(&i8_type.const_zero());
+        global.as_pointer_value()
+    }
+
+    /// OR into condition error flags (BV must be i8)
+    pub fn or_condition_error_flags(&mut self, flags: IntValue<'ctx>) -> Result<()> {
+        if !self.condition_context_active {
+            return Ok(());
+        }
+        let ptr = self.get_or_create_cond_error_flags_global();
+        let cur = self
+            .builder
+            .build_load(self.context.i8_type(), ptr, "cond_err_flags_cur")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_int_value();
+        let newv = self
+            .builder
+            .build_or(cur, flags, "cond_err_flags_or")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder
+            .build_store(ptr, newv)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        Ok(())
+    }
+
+    /// If in condition context, record failing address (first win). addr must be i64
+    pub fn set_condition_error_addr_if_unset(&mut self, addr: IntValue<'ctx>) -> Result<()> {
+        if !self.condition_context_active {
+            return Ok(());
+        }
+        let ptr = self.get_or_create_cond_error_addr_global();
+        let cur = self
+            .builder
+            .build_load(self.context.i64_type(), ptr, "cond_err_addr_cur")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_int_value();
+        let is_zero = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                cur,
+                self.context.i64_type().const_zero(),
+                "cond_err_addr_is_zero",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let sel = self
+            .builder
+            .build_select::<IntValue<'ctx>, _>(is_zero, addr, cur, "cond_err_addr_new")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder
+            .build_store(ptr, sel)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        Ok(())
     }
 }
