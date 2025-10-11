@@ -10,6 +10,26 @@ use inkwell::AddressSpace;
 use tracing::{debug, info};
 
 impl<'ctx> EbpfContext<'ctx> {
+    /// Register a DWARF alias variable. The value expression is stored and resolved at use time.
+    pub fn set_alias_variable(&mut self, name: &str, expr: crate::script::Expr) {
+        self.alias_vars.insert(name.to_string(), expr);
+        // Ensure any previous concrete variable storage is cleared to avoid confusion
+        self.variables.remove(name);
+        self.var_types.remove(name);
+        self.optimized_out_vars.remove(name);
+        self.var_pc_addresses.remove(name);
+        self.string_vars.remove(name);
+    }
+
+    /// Check whether an alias variable exists
+    pub fn alias_variable_exists(&self, name: &str) -> bool {
+        self.alias_vars.contains_key(name)
+    }
+
+    /// Get a clone of the stored alias expression if present
+    pub fn get_alias_variable(&self, name: &str) -> Option<crate::script::Expr> {
+        self.alias_vars.get(name).cloned()
+    }
     /// Store a variable value
     pub fn store_variable(&mut self, name: &str, value: BasicValueEnum<'ctx>) -> Result<()> {
         // Determine variable type from the value
@@ -156,5 +176,19 @@ impl<'ctx> EbpfContext<'ctx> {
         self.var_types.clear();
         self.optimized_out_vars.clear();
         self.var_pc_addresses.clear();
+        self.alias_vars.clear();
+        self.string_vars.clear();
+    }
+
+    /// Register a string variable's bytes (including optional NUL terminator)
+    pub fn set_string_variable_bytes(&mut self, name: &str, bytes: Vec<u8>) {
+        self.string_vars.insert(name.to_string(), bytes);
+        // String vars are concrete script variables of VarType::String; no alias
+        self.alias_vars.remove(name);
+    }
+
+    /// Get string variable bytes if present
+    pub fn get_string_variable_bytes(&self, name: &str) -> Option<&Vec<u8>> {
+        self.string_vars.get(name)
     }
 }

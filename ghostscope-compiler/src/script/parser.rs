@@ -164,6 +164,20 @@ fn parse_statement(pair: Pair<Rule>) -> Result<Statement> {
             Ok(Statement::Print(print_stmt))
         }
         Rule::backtrace_stmt => Ok(Statement::Backtrace),
+        Rule::assign_stmt => {
+            // Friendly error for immutable variables (no assignment supported)
+            let mut it = inner.into_inner();
+            let name = it
+                .next()
+                .ok_or(ParseError::InvalidExpression)?
+                .as_str()
+                .to_string();
+            // consume rhs expr
+            let _ = it.next();
+            Err(ParseError::TypeError(format!(
+                "Assignment is not supported: variables are immutable. Use 'let {name} = ...' to bind once."
+            )))
+        }
         Rule::expr_stmt => {
             let expr = inner
                 .into_inner()
@@ -193,10 +207,17 @@ fn parse_statement(pair: Pair<Rule>) -> Result<Statement> {
                 return Err(ParseError::TypeError(err));
             }
 
-            Ok(Statement::VarDeclaration {
-                name,
-                value: parsed_expr,
-            })
+            if is_alias_expr(&parsed_expr) {
+                Ok(Statement::AliasDeclaration {
+                    name,
+                    target: parsed_expr,
+                })
+            } else {
+                Ok(Statement::VarDeclaration {
+                    name,
+                    value: parsed_expr,
+                })
+            }
         }
         Rule::if_stmt => {
             debug!("Parsing if_stmt");
@@ -246,6 +267,27 @@ fn parse_expr(pair: Pair<Rule>) -> Result<Expr> {
             parse_logical_or(inner)
         }
         _ => Err(ParseError::UnexpectedToken(pair.as_rule())),
+    }
+}
+
+/// Determine if an expression should be treated as a DWARF alias binding.
+/// This is a purely syntactic check (parser phase) and does not consult DWARF.
+fn is_alias_expr(e: &Expr) -> bool {
+    use crate::script::ast::BinaryOp as BO;
+    use crate::script::ast::Expr as E;
+    match e {
+        E::AddressOf(_) => true,
+        // Constant offset on top of an alias-eligible expression
+        E::BinaryOp {
+            left,
+            op: BO::Add,
+            right,
+        } => {
+            let is_nonneg_lit = |x: &E| matches!(x, E::Int(v) if *v >= 0);
+            (is_alias_expr(left) && is_nonneg_lit(right))
+                || (is_alias_expr(right) && is_nonneg_lit(left))
+        }
+        _ => false,
     }
 }
 
@@ -835,24 +877,10 @@ fn parse_builtin_call(pair: Pair<Rule>) -> Result<Expr> {
             })
         }
         Rule::strncmp_call => {
-            // grammar: strncmp "(" expr "," string "," int ")"
-            let expr_node = it.next().ok_or(ParseError::InvalidExpression)?; // expr
-            let arg0 = parse_expr(expr_node)?;
-            if matches!(arg0, Expr::Bool(_)) {
-                return Err(ParseError::TypeError(
-                    "strncmp first argument cannot be boolean; provide an address or string"
-                        .to_string(),
-                ));
-            }
-            let lit_node = it.next().ok_or(ParseError::InvalidExpression)?; // string
-            if lit_node.as_rule() != Rule::string {
-                return Err(ParseError::TypeError(
-                    "strncmp second argument must be a string literal".to_string(),
-                ));
-            }
-            let raw = lit_node.as_str();
-            let lit = raw[1..raw.len() - 1].to_string();
-            let n_node = it.next().ok_or(ParseError::InvalidExpression)?; // int
+            // grammar: strncmp("(" expr "," expr "," int ")")
+            let arg0 = parse_expr(it.next().ok_or(ParseError::InvalidExpression)?)?;
+            let arg1 = parse_expr(it.next().ok_or(ParseError::InvalidExpression)?)?;
+            let n_node = it.next().ok_or(ParseError::InvalidExpression)?; // int literal
             if n_node.as_rule() != Rule::int {
                 return Err(ParseError::TypeError(
                     "strncmp third argument must be a non-negative integer literal".to_string(),
@@ -864,45 +892,32 @@ fn parse_builtin_call(pair: Pair<Rule>) -> Result<Expr> {
                     "strncmp length must be non-negative".to_string(),
                 ));
             }
-            // Constant folding when both sides are string literals
-            if let Expr::String(lhs) = &arg0 {
+            // Optional constant fold when both sides are string literals
+            if let (Expr::String(a), Expr::String(b)) = (&arg0, &arg1) {
                 let ln = n_val.max(0) as usize;
-                let a = lhs.as_bytes();
-                let b = lit.as_bytes();
-                let eq = a.iter().take(ln).eq(b.iter().take(ln));
+                let eq = a
+                    .as_bytes()
+                    .iter()
+                    .take(ln)
+                    .eq(b.as_bytes().iter().take(ln));
                 return Ok(Expr::Bool(eq));
             }
             Ok(Expr::BuiltinCall {
                 name: "strncmp".to_string(),
-                args: vec![arg0, Expr::String(lit), Expr::Int(n_val)],
+                args: vec![arg0, arg1, Expr::Int(n_val)],
             })
         }
         Rule::starts_with_call => {
-            // grammar: starts_with "(" expr "," string ")"
-            let expr_node = it.next().ok_or(ParseError::InvalidExpression)?;
-            let arg0 = parse_expr(expr_node)?;
-            if matches!(arg0, Expr::Bool(_)) {
-                return Err(ParseError::TypeError(
-                    "starts_with first argument cannot be boolean; provide an address or string"
-                        .to_string(),
-                ));
-            }
-            let lit_node = it.next().ok_or(ParseError::InvalidExpression)?;
-            if lit_node.as_rule() != Rule::string {
-                return Err(ParseError::TypeError(
-                    "starts_with second argument must be a string literal".to_string(),
-                ));
-            }
-            let raw = lit_node.as_str();
-            let lit = raw[1..raw.len() - 1].to_string();
-            // Constant folding when both sides are string literals
-            if let Expr::String(lhs) = &arg0 {
-                let ok = lhs.as_bytes().starts_with(lit.as_bytes());
-                return Ok(Expr::Bool(ok));
+            // grammar: starts_with("(" expr "," expr ")")
+            let arg0 = parse_expr(it.next().ok_or(ParseError::InvalidExpression)?)?;
+            let arg1 = parse_expr(it.next().ok_or(ParseError::InvalidExpression)?)?;
+            // Constant fold when both are string literals
+            if let (Expr::String(a), Expr::String(b)) = (&arg0, &arg1) {
+                return Ok(Expr::Bool(a.as_bytes().starts_with(b.as_bytes())));
             }
             Ok(Expr::BuiltinCall {
                 name: "starts_with".to_string(),
-                args: vec![arg0, Expr::String(lit)],
+                args: vec![arg0, arg1],
             })
         }
         Rule::hex_call => {
@@ -1413,6 +1428,62 @@ trace foo {
     }
 
     #[test]
+    fn parse_alias_declaration_address_of_and_member_access() {
+        let script = r#"
+trace foo {
+    let p = &buf[0];
+    let s = obj.field;
+}
+"#;
+        let prog = parse(script).expect("parse ok");
+        let stmt0 = prog.statements.first().expect("trace");
+        match stmt0 {
+            Statement::TracePoint { body, .. } => {
+                // Only the address-of form should be alias; member access is a value binding
+                assert!(matches!(body[0], Statement::AliasDeclaration { .. }));
+                assert!(matches!(body[1], Statement::VarDeclaration { .. }));
+            }
+            other => panic!("expected TracePoint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_alias_declaration_with_constant_offset() {
+        let script = r#"
+trace foo {
+    let p = &arr[0] + 16;
+    let q = 32 + &arr[0];
+}
+"#;
+        let prog = parse(script).expect("parse ok");
+        let stmt0 = prog.statements.first().expect("trace");
+        match stmt0 {
+            Statement::TracePoint { body, .. } => {
+                assert!(matches!(body[0], Statement::AliasDeclaration { .. }));
+                assert!(matches!(body[1], Statement::AliasDeclaration { .. }));
+            }
+            other => panic!("expected TracePoint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_member_access_scalar_not_alias() {
+        let script = r#"
+trace foo {
+    let level = record.level;
+}
+"#;
+        let prog = parse(script).expect("parse ok");
+        let stmt0 = prog.statements.first().expect("trace");
+        match stmt0 {
+            Statement::TracePoint { body, .. } => {
+                assert!(matches!(body[0], Statement::VarDeclaration { .. }));
+            }
+            other => panic!("expected TracePoint, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_memcmp_rejects_string_literal() {
         let script = r#"
 trace foo {
@@ -1466,6 +1537,21 @@ trace foo {
             },
             other => panic!("expected TracePoint, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_strncmp_requires_one_string_side_error() {
+        let s = r#"
+trace foo {
+    if strncmp(1, 2, 1) { print "X"; }
+}
+"#;
+        let r = parse(s);
+        // Parser now accepts generic expr, so error will occur in compiler stage; ensure parse ok here
+        assert!(
+            r.is_ok(),
+            "parse should succeed; semantic error in compiler"
+        );
     }
 
     #[test]

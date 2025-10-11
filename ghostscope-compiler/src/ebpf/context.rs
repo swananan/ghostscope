@@ -96,6 +96,16 @@ pub struct EbpfContext<'ctx> {
 
     // === Control-flow expression error capture (soft abort) ===
     pub condition_context_active: bool,
+
+    // === DWARF alias variables (script-level symbolic references) ===
+    // These variables do not store pointer values; instead they remember the RHS
+    // expression and are resolved to runtime addresses at use sites.
+    pub alias_vars: HashMap<String, crate::script::Expr>,
+
+    // === Script string variables (store literal bytes for content printing) ===
+    // When a variable is bound from a string literal (or copied from another string var),
+    // we keep its bytes (including optional NUL) here for content printing via ImmediateBytes.
+    pub string_vars: HashMap<String, Vec<u8>>,
 }
 
 // Temporary alias for backward compatibility during refactoring
@@ -192,6 +202,11 @@ impl<'ctx> EbpfContext<'ctx> {
 
             // Control-flow expression context
             condition_context_active: false,
+
+            // Alias variables
+            alias_vars: HashMap::new(),
+            // String variables
+            string_vars: HashMap::new(),
         })
     }
 

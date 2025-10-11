@@ -59,6 +59,12 @@ pub enum Statement {
         name: String,
         value: Expr,
     },
+    /// DWARF alias binding: `let name = <alias_expr>;` where alias_expr is address-of,
+    /// member/array/pointer deref/chain, or alias+constant offset. Resolved at use time.
+    AliasDeclaration {
+        name: String,
+        target: Expr,
+    },
     TracePoint {
         pattern: TracePattern,
         body: Vec<Statement>,

@@ -61,10 +61,23 @@ impl<'ctx> EbpfContext<'ctx> {
 
     /// Resolve an expression to an i64 pointer value. Accepts integer (address) and pointer values;
     /// falls back to DWARF evaluation for complex expressions.
-    fn resolve_ptr_i64_from_expr(&mut self, e: &Expr) -> Result<inkwell::values::IntValue<'ctx>> {
+    pub(crate) fn resolve_ptr_i64_from_expr(
+        &mut self,
+        e: &Expr,
+    ) -> Result<inkwell::values::IntValue<'ctx>> {
+        use crate::script::ast::BinaryOp as BO;
+        use crate::script::ast::Expr as E;
         use inkwell::values::BasicValueEnum::*;
+        // Alias variable indirection: resolve its target expression first
+        if let E::Variable(name) = e {
+            if self.alias_variable_exists(name) {
+                if let Some(target) = self.get_alias_variable(name) {
+                    return self.resolve_ptr_i64_from_expr(&target);
+                }
+            }
+        }
         // Special-case: explicit address-of must yield a pointer-sized address
-        if let Expr::AddressOf(inner) = e {
+        if let E::AddressOf(inner) = e {
             if let Some(var) = self.query_dwarf_for_complex_expr(inner)? {
                 let module_hint = self.current_resolved_var_module_path.clone();
                 let status_ptr = if self.condition_context_active {
@@ -81,6 +94,37 @@ impl<'ctx> EbpfContext<'ctx> {
                 return Err(CodeGenError::TypeError(
                     "cannot take address of unresolved expression".into(),
                 ));
+            }
+        }
+
+        // Support constant-offset addressing: (alias_expr + K) or (K + alias_expr)
+        if let E::BinaryOp { left, op, right } = e {
+            if matches!(op, BO::Add) {
+                let is_nonneg_lit = |x: &E| matches!(x, E::Int(v) if *v >= 0);
+                // alias + K
+                if is_nonneg_lit(right) {
+                    if let Ok(base) = self.resolve_ptr_i64_from_expr(left) {
+                        if let E::Int(k) = &**right {
+                            let off = self.context.i64_type().const_int(*k as u64, false);
+                            return self
+                                .builder
+                                .build_int_add(base, off, "ptr_add")
+                                .map_err(|e| CodeGenError::Builder(e.to_string()));
+                        }
+                    }
+                }
+                // K + alias
+                if is_nonneg_lit(left) {
+                    if let Ok(base) = self.resolve_ptr_i64_from_expr(right) {
+                        if let E::Int(k) = &**left {
+                            let off = self.context.i64_type().const_int(*k as u64, false);
+                            return self
+                                .builder
+                                .build_int_add(base, off, "ptr_add")
+                                .map_err(|e| CodeGenError::Builder(e.to_string()));
+                        }
+                    }
+                }
             }
         }
         // Prefer DWARF-based address resolution first so that array/aggregate
@@ -150,20 +194,10 @@ impl<'ctx> EbpfContext<'ctx> {
                 )
             }
         } else {
-            // Fallback: accept script-defined pointer values (but not bare integer addresses)
-            match self.compile_expr(e) {
-                Ok(inkwell::values::BasicValueEnum::PointerValue(pv)) => self
-                    .builder
-                    .build_ptr_to_int(pv, self.context.i64_type(), "ptr_as_i64_fallback")
-                    .map_err(|er| CodeGenError::Builder(er.to_string())),
-                Ok(inkwell::values::BasicValueEnum::IntValue(_)) => Err(CodeGenError::TypeError(
-                    "expression is not a pointer/address".into(),
-                )),
-                Ok(_) => Err(CodeGenError::TypeError(
-                    "expression is not a pointer/address".into(),
-                )),
-                Err(e) => Err(e),
-            }
+            // No DWARF-backed address and not an address-of/alias+const: reject script-level pointers.
+            Err(CodeGenError::TypeError(
+                "expression is not a pointer/address".into(),
+            ))
         }
     }
     /// Builtin memcmp (boolean variant): returns true iff first `len` bytes equal.
@@ -636,91 +670,115 @@ impl<'ctx> EbpfContext<'ctx> {
         lit: &str,
         n: u32,
     ) -> Result<BasicValueEnum<'ctx>> {
-        // Resolve DWARF expression to get address or pointer value
-        let var = self
-            .query_dwarf_for_complex_expr(dwarf_expr)?
-            .ok_or_else(|| CodeGenError::TypeError("builtin requires DWARF expression".into()))?;
-
-        // Enforce DWARF pointer OR array type for the first argument
-        let mut ty = var.dwarf_type.as_ref().ok_or_else(|| {
-            CodeGenError::TypeError("strncmp first argument lacks DWARF type".into())
-        })?;
-        loop {
-            match ty {
-                DwarfType::TypedefType {
-                    underlying_type, ..
-                } => ty = underlying_type.as_ref(),
-                DwarfType::QualifiedType {
-                    underlying_type, ..
-                } => ty = underlying_type.as_ref(),
-                _ => break,
-            }
-        }
-        let is_ptr = matches!(ty, DwarfType::PointerType { .. });
-        let is_arr = matches!(ty, DwarfType::ArrayType { .. });
-        if !(is_ptr || is_arr) {
-            return Err(CodeGenError::TypeError(
-                "strncmp first argument must be a pointer or array DWARF variable".into(),
-            ));
-        }
-
-        // Determine pointer value (i64) of the target memory
-        let ptr_i64 = if let Some(dty0) = var.dwarf_type.as_ref() {
-            // Try full value first
-            // Unwrap aliases for branching
-            let mut dty = dty0;
-            loop {
-                match dty {
-                    DwarfType::TypedefType {
-                        underlying_type, ..
-                    } => dty = underlying_type.as_ref(),
-                    DwarfType::QualifiedType {
-                        underlying_type, ..
-                    } => dty = underlying_type.as_ref(),
-                    _ => break,
+        // Fast path: if the first argument is a script string variable or a string literal,
+        // perform a compile-time bounded comparison and return a constant boolean.
+        let immediate_bytes_opt = match dwarf_expr {
+            Expr::Variable(name) => {
+                if self
+                    .get_variable_type(name)
+                    .is_some_and(|t| matches!(t, crate::script::VarType::String))
+                {
+                    self.get_string_variable_bytes(name).cloned()
+                } else {
+                    None
                 }
             }
-            match dty {
-                DwarfType::PointerType { .. } => {
-                    let val_any = self.evaluate_result_to_llvm_value(
-                        &var.evaluation_result,
-                        dty,
-                        &var.name,
-                        self.get_compile_time_context()?.pc_address,
-                    )?;
-                    match val_any {
-                        BasicValueEnum::IntValue(iv) => iv,
-                        BasicValueEnum::PointerValue(pv) => self
-                            .builder
-                            .build_ptr_to_int(pv, self.context.i64_type(), "ptr_as_i64")
-                            .map_err(|e| CodeGenError::Builder(e.to_string()))?,
-                        _ => {
-                            return Err(CodeGenError::TypeError(
-                                "strncmp requires pointer/integer value for pointer; got unsupported DWARF value".into(),
-                            ))
+            Expr::String(s) => {
+                let mut b = s.as_bytes().to_vec();
+                b.push(0);
+                Some(b)
+            }
+            _ => None,
+        };
+
+        if let Some(bytes) = immediate_bytes_opt {
+            // Treat as bounded byte compare between two immediate strings
+            let lit_bytes = lit.as_bytes();
+            let cap = self.compile_options.compare_cap as usize;
+            let n_usize = std::cmp::min(n as usize, cap);
+            // compute source content length up to NUL
+            let content_len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+            let cmp_len = std::cmp::min(n_usize, std::cmp::min(content_len, lit_bytes.len()));
+            let equal =
+                bytes.get(0..cmp_len).unwrap_or(&[]) == lit_bytes.get(0..cmp_len).unwrap_or(&[]);
+            let bool_val = self
+                .context
+                .bool_type()
+                .const_int(if equal { 1 } else { 0 }, false);
+            return Ok(bool_val.into());
+        }
+
+        // Determine pointer value (i64) of the target memory (DWARF or alias)
+        // Prefer DWARF resolution for richer status/hints; fallback to generic pointer resolver.
+        let ptr_i64 = match self.query_dwarf_for_complex_expr(dwarf_expr)? {
+            Some(var) => {
+                if let Some(mut ty) = var.dwarf_type.as_ref() {
+                    loop {
+                        match ty {
+                            DwarfType::TypedefType {
+                                underlying_type, ..
+                            } => ty = underlying_type.as_ref(),
+                            DwarfType::QualifiedType {
+                                underlying_type, ..
+                            } => ty = underlying_type.as_ref(),
+                            _ => break,
                         }
                     }
+                    match ty {
+                        DwarfType::PointerType { .. } => {
+                            let val_any = self.evaluate_result_to_llvm_value(
+                                &var.evaluation_result,
+                                ty,
+                                &var.name,
+                                self.get_compile_time_context()?.pc_address,
+                            )?;
+                            match val_any {
+                                BasicValueEnum::IntValue(iv) => iv,
+                                BasicValueEnum::PointerValue(pv) => self
+                                    .builder
+                                    .build_ptr_to_int(pv, self.context.i64_type(), "ptr_as_i64")
+                                    .map_err(|e| CodeGenError::Builder(e.to_string()))?,
+                                _ => {
+                                    return Err(CodeGenError::TypeError(
+                                        "strncmp requires pointer/integer value for pointer; got unsupported DWARF value".into(),
+                                    ))
+                                }
+                            }
+                        }
+                        DwarfType::ArrayType { .. } => {
+                            let module_hint = self.current_resolved_var_module_path.clone();
+                            let status_ptr = if self.condition_context_active {
+                                Some(self.get_or_create_cond_error_global())
+                            } else {
+                                None
+                            };
+                            self.evaluation_result_to_address_with_hint(
+                                &var.evaluation_result,
+                                status_ptr,
+                                module_hint.as_deref(),
+                            )?
+                        }
+                        _ => {
+                            // Not a pointer/array -> treat as error
+                            return Err(CodeGenError::TypeError(
+                                "strncmp requires the non-string side to be an address expression (pointer/array)".into(),
+                            ));
+                        }
+                    }
+                } else {
+                    return Err(CodeGenError::TypeError(
+                        "strncmp non-string side lacks DWARF type info".into(),
+                    ));
                 }
-                DwarfType::ArrayType { .. } => {
-                    // Use base address of array
-                    let module_hint = self.current_resolved_var_module_path.clone();
-                    let status_ptr = if self.condition_context_active {
-                        Some(self.get_or_create_cond_error_global())
-                    } else {
-                        None
-                    };
-                    self.evaluation_result_to_address_with_hint(
-                        &var.evaluation_result,
-                        status_ptr,
-                        module_hint.as_deref(),
-                    )?
-                }
-                _ => unreachable!(),
             }
-        } else {
-            return Err(CodeGenError::TypeError(
-                "strncmp first argument lacks DWARF type".into(),
-            ));
+            None => {
+                // Generic pointer expr (e.g., alias); resolve to i64
+                self.resolve_ptr_i64_from_expr(dwarf_expr).map_err(|_| {
+                    CodeGenError::TypeError(
+                        "strncmp requires at least one string argument, and the other side must be an address expression (DWARF pointer/array or alias)".to_string(),
+                    )
+                })?
+            }
         };
 
         // Cap read length for safety
@@ -873,7 +931,26 @@ impl<'ctx> EbpfContext<'ctx> {
             Expr::Variable(var_name) => {
                 debug!("compile_expr: Compiling variable expression: {}", var_name);
 
-                // First check if it's a script-defined variable
+                // First: DWARF alias variable takes precedence
+                if self.alias_variable_exists(var_name) {
+                    debug!(
+                        "compile_expr: '{}' is an alias variable; resolving to runtime address",
+                        var_name
+                    );
+                    let aliased = self
+                        .get_alias_variable(var_name)
+                        .expect("alias existence just checked");
+                    // Resolve to i64 address then cast to ptr
+                    let addr_i64 = self.resolve_ptr_i64_from_expr(&aliased)?;
+                    let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                    let as_ptr = self
+                        .builder
+                        .build_int_to_ptr(addr_i64, ptr_ty, "alias_as_ptr")
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                    return Ok(as_ptr.into());
+                }
+
+                // Then check if it's a concrete script-defined variable
                 if self.variable_exists(var_name) {
                     debug!("compile_expr: Found script variable: {}", var_name);
                     let loaded_value = self.load_variable(var_name)?;
@@ -899,7 +976,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     return Ok(loaded_value);
                 }
 
-                // If not found in script variables, try DWARF variables
+                // If not found in script variables nor alias map, try DWARF variables
                 debug!(
                     "Variable '{}' not found in script variables, checking DWARF",
                     var_name
@@ -932,15 +1009,42 @@ impl<'ctx> EbpfContext<'ctx> {
                             ))
                         }
                     };
-                    let lit = match &args[1] {
-                        Expr::String(s) => s.as_str(),
-                        _ => {
-                            return Err(CodeGenError::TypeError(
-                                "strncmp second argument must be a string literal".into(),
-                            ))
+                    // Accept string on either side: string literal or script string variable
+                    fn extract_script_string<'a>(
+                        this: &mut EbpfContext<'a>,
+                        e: &Expr,
+                    ) -> Option<String> {
+                        match e {
+                            Expr::String(s) => Some(s.clone()),
+                            Expr::Variable(name) => this
+                                .get_variable_type(name)
+                                .is_some_and(|t| matches!(t, crate::script::VarType::String))
+                                .then(|| {
+                                    this.get_string_variable_bytes(name).map(|b| {
+                                        let cut = b.iter().position(|&x| x == 0).unwrap_or(b.len());
+                                        String::from_utf8_lossy(&b[..cut]).to_string()
+                                    })
+                                })
+                                .flatten(),
+                            _ => None,
                         }
-                    };
-                    self.compile_strncmp_builtin(&args[0], lit, n)
+                    }
+                    let left_str = extract_script_string(self, &args[0]);
+                    let right_str = extract_script_string(self, &args[1]);
+                    match (left_str, right_str) {
+                        (Some(ls), Some(rs)) => {
+                            // Both sides strings -> compile-time fold
+                            let ln = n as usize;
+                            let eq = ls.as_bytes().iter().take(ln).eq(rs.as_bytes().iter().take(ln));
+                            let bv = self.context.bool_type().const_int(eq as u64, false);
+                            Ok(bv.into())
+                        }
+                        (Some(ls), None) => self.compile_strncmp_builtin(&args[1], &ls, n),
+                        (None, Some(rs)) => self.compile_strncmp_builtin(&args[0], &rs, n),
+                        (None, None) => Err(CodeGenError::TypeError(
+                            "strncmp requires at least one string argument (string literal or script string variable) as the first or second parameter".into(),
+                        )),
+                    }
                 }
                 "starts_with" => {
                     if args.len() != 2 {
@@ -948,15 +1052,41 @@ impl<'ctx> EbpfContext<'ctx> {
                             "starts_with expects 2 arguments".into(),
                         ));
                     }
-                    let lit = match &args[1] {
-                        Expr::String(s) => s.as_str(),
-                        _ => {
-                            return Err(CodeGenError::TypeError(
-                                "starts_with second argument must be a string literal".into(),
-                            ))
+                    // Accept string on either side (literal or script string var)
+                    fn extract_script_string<'a>(
+                        this: &mut EbpfContext<'a>,
+                        e: &Expr,
+                    ) -> Option<String> {
+                        match e {
+                            Expr::String(s) => Some(s.clone()),
+                            Expr::Variable(name) => this
+                                .get_variable_type(name)
+                                .is_some_and(|t| matches!(t, crate::script::VarType::String))
+                                .then(|| {
+                                    this.get_string_variable_bytes(name).map(|b| {
+                                        let cut = b.iter().position(|&x| x == 0).unwrap_or(b.len());
+                                        String::from_utf8_lossy(&b[..cut]).to_string()
+                                    })
+                                })
+                                .flatten(),
+                            _ => None,
                         }
-                    };
-                    self.compile_strncmp_builtin(&args[0], lit, lit.len() as u32)
+                    }
+                    let s0 = extract_script_string(self, &args[0]);
+                    let s1 = extract_script_string(self, &args[1]);
+                    match (s0, s1) {
+                        (Some(a), Some(b)) => {
+                            // both strings -> compile-time fold
+                            let ok = a.as_bytes().starts_with(b.as_bytes());
+                            let bv = self.context.bool_type().const_int(ok as u64, false);
+                            Ok(bv.into())
+                        }
+                        (Some(a), None) => self.compile_strncmp_builtin(&args[1], &a, a.len() as u32),
+                        (None, Some(b)) => self.compile_strncmp_builtin(&args[0], &b, b.len() as u32),
+                        (None, None) => Err(CodeGenError::TypeError(
+                            "starts_with requires at least one string argument (string literal or script string variable) as the first or second parameter".into(),
+                        )),
+                    }
                 }
                 _ => Err(CodeGenError::NotImplemented(format!(
                     "Unknown builtin function: {name}"
