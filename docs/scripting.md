@@ -561,7 +561,7 @@ Backtrace printing via `backtrace;` or `bt;` is planned but not implemented yet.
 
 ## Examples
 
-This section highlights common and high‑value patterns (inspired by e2e tests).
+This section highlights common patterns.
 
 ### Basic Function Trace & Process Info
 

@@ -17,6 +17,7 @@ ghostscope-platform = { path = "../ghostscope-platform" }
 ghostscope-protocol = { path = "../ghostscope-protocol" }
 rustc-demangle = "0.1"
 cpp_demangle = "0.4"
+rayon = "1.10"
 
 # For parallel loading
 tokio.workspace = true

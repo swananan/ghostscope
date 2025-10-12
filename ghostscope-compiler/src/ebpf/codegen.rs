@@ -555,8 +555,7 @@ impl<'ctx> EbpfContext<'ctx> {
                 }
             }
 
-            // 8) Binary和其它 rvalue → 计算为 computed int
-            // 7) Binary and other rvalue expressions → compile to computed int
+            // Binary and other rvalue expressions → compile to computed int
             other => {
                 let compiled = self.compile_expr(other)?;
                 if let BasicValueEnum::IntValue(iv) = compiled {

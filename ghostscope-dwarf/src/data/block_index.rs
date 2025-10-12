@@ -6,7 +6,7 @@
 //! - Provides fast lookup of in-scope variables at a given PC
 
 use crate::parser::RangeExtractor;
-use gimli::{EndianArcSlice, LittleEndian, Reader};
+use gimli::{EndianArcSlice, LittleEndian};
 use std::collections::BTreeMap;
 
 /// Reference to a variable DIE within a unit (minimal info)
@@ -65,7 +65,6 @@ impl BlockNode {
 /// Block vector for a single function (root is the function scope)
 #[derive(Debug, Clone)]
 pub struct FunctionBlocks {
-    pub name: Option<String>,
     pub cu_offset: gimli::DebugInfoOffset,
     pub die_offset: gimli::UnitOffset,
     /// Function ranges
@@ -77,16 +76,11 @@ pub struct FunctionBlocks {
 }
 
 impl FunctionBlocks {
-    fn new(
-        name: Option<String>,
-        cu_offset: gimli::DebugInfoOffset,
-        die_offset: gimli::UnitOffset,
-    ) -> Self {
+    fn new(cu_offset: gimli::DebugInfoOffset, die_offset: gimli::UnitOffset) -> Self {
         let mut root = BlockNode::new();
         root.die_offset = Some(die_offset);
         let nodes = vec![root]; // root at 0
         Self {
-            name,
             cu_offset,
             die_offset,
             ranges: Vec::new(),
@@ -213,13 +207,7 @@ impl<'a> BlockIndexBuilder<'a> {
         let mut out: Vec<FunctionBlocks> = Vec::new();
         while let Ok(Some((_depth, entry))) = entries.next_dfs() {
             if entry.tag() == gimli::constants::DW_TAG_subprogram {
-                let name = entry
-                    .attr(gimli::constants::DW_AT_name)
-                    .ok()
-                    .and_then(|a| a)
-                    .and_then(|a| self.dwarf.attr_string(&unit, a.value()).ok())
-                    .and_then(|s| s.to_string_lossy().ok().map(|cow| cow.into_owned()));
-                let mut fb = FunctionBlocks::new(name, cu_offset, entry.offset());
+                let mut fb = FunctionBlocks::new(cu_offset, entry.offset());
                 if let Ok(ranges) = RangeExtractor::extract_all_ranges(entry, &unit, self.dwarf) {
                     fb.ranges = ranges;
                 }
@@ -250,13 +238,7 @@ impl<'a> BlockIndexBuilder<'a> {
         if entry.tag() != gimli::constants::DW_TAG_subprogram {
             return None;
         }
-        let name = entry
-            .attr(gimli::constants::DW_AT_name)
-            .ok()
-            .and_then(|a| a)
-            .and_then(|a| self.dwarf.attr_string(&unit, a.value()).ok())
-            .and_then(|s| s.to_string_lossy().ok().map(|cow| cow.into_owned()));
-        let mut fb = FunctionBlocks::new(name, cu_offset, die_offset);
+        let mut fb = FunctionBlocks::new(cu_offset, die_offset);
         if let Ok(ranges) = RangeExtractor::extract_all_ranges(&entry, &unit, self.dwarf) {
             fb.ranges = ranges;
         }

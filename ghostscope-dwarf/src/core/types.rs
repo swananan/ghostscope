@@ -1,6 +1,7 @@
 //! Core data types for DWARF analysis
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Module address pair - combines module path with address offset
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -75,7 +76,7 @@ pub struct MappedFile {
 #[derive(Debug, Clone)]
 pub struct IndexEntry {
     /// Entry name (function/variable name) - copied from DWARF
-    pub name: String,
+    pub name: Arc<str>,
     /// DIE offset in DWARF data (gimli native type)
     pub die_offset: gimli::UnitOffset,
     /// Compilation unit offset (gimli native type)
@@ -116,9 +117,9 @@ pub struct IndexFlags {
 #[derive(Debug, Clone)]
 pub struct LineEntry {
     pub address: u64,
-    pub file_path: String,        // Full file path for direct lookup
-    pub file_index: u64,          // Original DWARF file index (kept for compatibility)
-    pub compilation_unit: String, // Compilation unit name for scoped file_index lookup
+    pub file_path: String, // Full file path for direct lookup
+    pub file_index: u64,   // Original DWARF file index (kept for compatibility)
+    pub compilation_unit: std::sync::Arc<str>, // Pooled CU name to reduce duplication
     pub line: u64,
     pub column: u64,
     pub is_stmt: bool,

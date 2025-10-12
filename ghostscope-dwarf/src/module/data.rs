@@ -769,20 +769,9 @@ impl ModuleData {
         // Try block index fast path. If no function yet, build lazily for the CU containing this address.
         if self.block_index.find_function_by_pc(address).is_none() {
             let b0 = Instant::now();
-            if let Some(e) = self.lightweight_index.find_die_at_address(address) {
-                let cu_off = e.unit_offset;
+            if let Some(cu_off) = self.lightweight_index.find_cu_by_address(address) {
                 let builder = crate::data::BlockIndexBuilder::new(self.resolver.dwarf_ref());
-                if e.tag == gimli::constants::DW_TAG_subprogram {
-                    if let Some(fb) = builder.build_for_function(cu_off, e.die_offset) {
-                        tracing::info!(
-                            "BlockIndex: built 1 function '{}' for CU {:?}",
-                            fb.name.clone().unwrap_or_else(|| "<anon>".to_string()),
-                            cu_off
-                        );
-                        self.block_index.add_functions(vec![fb]);
-                        built_funcs += 1;
-                    }
-                } else if let Some(funcs) = builder.build_for_unit(cu_off) {
+                if let Some(funcs) = builder.build_for_unit(cu_off) {
                     tracing::info!(
                         "BlockIndex: built {} functions for CU {:?}",
                         funcs.len(),
@@ -942,9 +931,8 @@ impl ModuleData {
                     self.block_index.add_functions(vec![fb]);
                     built_funcs += 1;
                 }
-            } else if let Some(e) = self.lightweight_index.find_die_at_address(address) {
-                // Fallback: if we only found a non-subprogram DIE, try to identify CU and build-for-unit
-                let cu_off = e.unit_offset;
+            } else if let Some(cu_off) = self.lightweight_index.find_cu_by_address(address) {
+                // Fallback: identify CU via fast map and build-for-unit
                 if let Some(funcs) = builder.build_for_unit(cu_off) {
                     built_funcs += funcs.len();
                     self.block_index.add_functions(funcs);
@@ -1241,7 +1229,7 @@ impl ModuleData {
                         || full_path.ends_with(".cpp")
                         || full_path.ends_with(".cc")
                         || full_path.ends_with(".rs")
-                        || (full_path.contains(&entry.compilation_unit)
+                        || (full_path.contains(&*entry.compilation_unit)
                             && !full_path.ends_with(".h"));
 
                     if is_source {
@@ -1334,7 +1322,8 @@ impl ModuleData {
 
         // Rule 2: Prefer files where compilation unit matches filename
         if let Some(filename) = std::path::Path::new(&file_path).file_stem() {
-            if let Some(cu_stem) = std::path::Path::new(&entry.compilation_unit).file_stem() {
+            if let Some(cu_stem) = std::path::Path::new(entry.compilation_unit.as_ref()).file_stem()
+            {
                 if filename == cu_stem {
                     score += file_selection_scoring::COMPILATION_UNIT_MATCH_BONUS;
                 }
@@ -1372,7 +1361,7 @@ impl ModuleData {
             return Some(full_path);
         }
 
-        Some(entry.compilation_unit.clone())
+        Some(entry.compilation_unit.to_string())
     }
 
     /// Create SourceLocation from line entry
@@ -1418,7 +1407,7 @@ impl ModuleData {
                         line_entry.compilation_unit
                     );
                     return Some(SourceLocation {
-                        file_path: line_entry.compilation_unit.clone(),
+                        file_path: line_entry.compilation_unit.to_string(),
                         line_number: line_entry.line as u32,
                         column: Some(line_entry.column as u32),
                         address: line_entry.address,
@@ -1428,7 +1417,7 @@ impl ModuleData {
 
             // Fallback to CU string if resolution failed
             return Some(SourceLocation {
-                file_path: line_entry.compilation_unit.clone(),
+                file_path: line_entry.compilation_unit.to_string(),
                 line_number: line_entry.line as u32,
                 column: Some(line_entry.column as u32),
                 address: line_entry.address,
@@ -1471,12 +1460,12 @@ impl ModuleData {
                     line_entry.file_path
                 );
                 line_entry.file_path.clone()
-            } else if self.is_path_like(&line_entry.compilation_unit) {
+            } else if self.is_path_like(line_entry.compilation_unit.as_ref()) {
                 tracing::debug!(
                     "create_source_location_from_entry: using CU path: '{}' (scoped result was bare)",
                     line_entry.compilation_unit
                 );
-                line_entry.compilation_unit.clone()
+                line_entry.compilation_unit.to_string()
             } else {
                 // Last resort: keep the bare filename
                 current_path
@@ -1776,6 +1765,9 @@ impl ModuleData {
         let mut var_full: NameIndex = HashMap::new();
         let mut var_leaf: NameIndex = HashMap::new();
 
+        // Cache demangled results to avoid repeated demangle cost for identical (lang, name)
+        let mut demangle_cache: HashMap<(u16, std::sync::Arc<str>), String> = HashMap::new();
+
         // Normalize a demangled signature string by removing extra spaces
         // e.g., "ns1::add(int, int)" -> "ns1::add(int,int)"
         let normalize_sig = |s: &str| -> String {
@@ -1786,12 +1778,25 @@ impl ModuleData {
             out
         };
 
+        // demangle_cache declared above; reuse it here
         let (_, _, total) = ix.get_stats();
         for idx in 0..total {
             if let Some(entry) = ix.entry(idx) {
                 let tag = entry.tag;
                 // Prefer demangled names when applicable
-                if let Some(d) = crate::core::demangle_by_lang(entry.language, &entry.name) {
+                let lang_code: u16 = entry.language.map(|l| l.0).unwrap_or(u16::MAX);
+                let key = (lang_code, entry.name.clone());
+                let demangled_opt = if let Some(cached) = demangle_cache.get(&key) {
+                    Some(cached.clone())
+                } else {
+                    let d = crate::core::demangle_by_lang(entry.language, entry.name.as_ref());
+                    if let Some(ref s) = d {
+                        demangle_cache.insert(key.clone(), s.clone());
+                    }
+                    d
+                };
+
+                if let Some(d) = demangled_opt {
                     let leaf = crate::core::demangled_leaf(&d);
                     let d_norm = normalize_sig(&d);
                     let leaf_norm = normalize_sig(&leaf);
@@ -2162,8 +2167,8 @@ impl ModuleData {
                 if e.tag != gimli::constants::DW_TAG_variable {
                     continue;
                 }
-                let last = e.name.rsplit("::").next().unwrap_or(&e.name);
-                if last == name || e.name == name {
+                let last = e.name.rsplit("::").next().unwrap_or(e.name.as_ref());
+                if last == name || e.name == name.into() {
                     let link_address =
                         e.address_ranges
                             .first()
@@ -2176,7 +2181,7 @@ impl ModuleData {
                         {
                             name.to_string()
                         } else {
-                            e.name.clone()
+                            e.name.to_string()
                         },
                         link_address,
                         section,
@@ -2267,9 +2272,13 @@ impl ModuleData {
 
     /// Find symbol name by address (compatibility method)
     pub(crate) fn find_symbol_by_address(&self, address: u64) -> Option<String> {
+        // Prefer optimized function lookup for readability; fallback to any DIE
+        if let Some(entry) = self.lightweight_index.find_function_by_address(address) {
+            return Some(entry.name.to_string());
+        }
         self.lightweight_index
             .find_die_at_address(address)
-            .map(|entry| entry.name.clone())
+            .map(|entry| entry.name.to_string())
     }
 
     /// Get all source files from stored compilation unit metadata
@@ -2306,7 +2315,7 @@ impl ModuleData {
                             .first()
                             .and_then(|(lo, hi)| if lo == hi { Some(*lo) } else { None });
                     out.push(GlobalVariableInfo {
-                        name: e.name.clone(),
+                        name: e.name.to_string(),
                         link_address,
                         section: None,
                         die_offset: e.die_offset,
@@ -2326,7 +2335,7 @@ impl ModuleData {
             let section = link_address.and_then(|addr| self.classify_section(&obj, addr));
 
             out.push(GlobalVariableInfo {
-                name: e.name.clone(),
+                name: e.name.to_string(),
                 link_address,
                 section,
                 die_offset: e.die_offset,
