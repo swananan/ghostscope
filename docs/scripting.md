@@ -386,18 +386,63 @@ trace foo.c:42 {
 
 ### Cross‑type Operations with DWARF Values
 
-- Arithmetic (+, -, *, /)
-  - Supported: script int/bool with DWARF integer‑like scalars
-    - BaseType (signed/unsigned 1/2/4/8 bytes), Enum (as underlying), Bitfield (extracted integer), char/unsigned char (1 byte)
-  - Not supported: aggregates (struct/union/array), pointers, floats
-- Comparisons (==, !=, <, <=, >, >=)
-  - Supported: script int/bool with DWARF integer‑like types
-  - Pointers: only equality/inequality (pointer==pointer, pointer==0)
-  - CString equality: DWARF char* or char[] vs script string literal via bounded read
-  - Not supported: relational string comparisons; aggregates; floats
-- Floats: not supported (eBPF runtime)
+#### Arithmetic (+, -, *, /)
 
-Error semantics: If a DWARF read fails (null deref/read error/offsets unavailable), comparisons return false and arithmetic returns 0; event status carries the error code.
+- Supported: script int/bool with DWARF integer‑like scalars
+  - BaseType (signed/unsigned 1/2/4/8 bytes), Enum (as underlying), Bitfield (extracted integer), char/unsigned char (1 byte)
+- Booleans participate as `0/1` when used arithmetically.
+- Not supported: aggregates (struct/union/array), pointers, floats
+
+Examples (Arithmetic)
+
+```ghostscope
+// DWARF integer with script integer
+trace foo.c:42 {
+    print "sum:{}", s.counter + 5;
+}
+
+// Enum/bitfield (as integer)
+trace foo.c:43 {
+    print "active:{}", a.active == 1;
+}
+
+// Boolean participates as 0/1
+trace foo.c:60 {
+    let ok = true;
+    print "S:{}", ok + 41; // 42
+}
+```
+
+#### Comparisons (==, !=, <, <=, >, >=)
+
+- Supported: script int/bool with DWARF integer‑like scalars; values are unified to 64‑bit before compare.
+- Semantics for ordered comparisons:
+  - Script values are always signed `i64`.
+  - DWARF integer‑like scalars are normalized to 64‑bit integers before arithmetic/compare (width unification).
+  - Current implementation uses signed predicates for `< <= > >=`. If a DWARF value is an unsigned type that can exceed `i64::MAX` (e.g., 64‑bit `size_t`), results can be surprising (treated as negative under signed compare).
+    - Example: `let t = 1; if len > t { ... }` where `len = 2^63` may evaluate as false.
+    - Recommendation: prefer `==/!=`, or ensure both operands are within the signed range for ordered compares; print decimal + hex to sanity‑check.
+- Pointers: equality/inequality only (pointer==pointer, pointer==0)
+- CString equality: DWARF `char*` or `char[N]` vs script string literal via bounded read
+- Not supported: relational string comparisons; aggregates; floats
+
+Examples (Comparisons)
+
+```ghostscope
+// Safe equality across signed/unsigned
+if count == size { print "EQ"; }
+
+// Ordered compare (signed semantics) — be careful with large unsigned DWARF values
+let t = 1024;
+if size > t { print ">1K"; } // if size is a size_t > i64::MAX, result can be surprising
+
+// Pointer equality (no ordering)
+trace foo.c:50 {
+    print "isNull:{}", p == 0;       // pointer vs NULL
+}
+```
+
+Error semantics: If a DWARF read fails (null deref/read error/offsets unavailable), comparisons return false and arithmetic returns 0; event status carries the error code. See “Runtime Expression Failures (ExprError)” below for details.
 
 ### CString Equality (char*/char[])
 
