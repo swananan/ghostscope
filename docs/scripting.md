@@ -742,3 +742,4 @@ The comparison operators are `==`, `!=`, `<`, `<=`, `>`, `>=`.
 - Operands may be script integers/bools and DWARF integer‑like scalars; the engine normalizes width/sign before comparing.
 - For C strings (char*/char[]), use equality `==`/`!=` with string literals or script string variables under “CString Equality”, or prefer the built‑ins `strncmp`/`starts_with` for bounded and prefix checks.
 - Pointer equality supports `==`/`!=` on pointers (including auto‑dereferenced locals/params/globals when applicable).
+  - Note: Ordered pointer comparisons (`<`, `<=`, `>`, `>=`) are not supported and are rejected at compile time with a friendly message. Use `==`/`!=` to compare addresses. If you need to adjust an address, use `&expr + <non‑negative literal>` in an alias/address context; to compare values, select a scalar field (e.g., `obj.field`).

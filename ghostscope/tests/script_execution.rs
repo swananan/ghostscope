@@ -513,6 +513,37 @@ trace calculate_something {
 }
 
 #[tokio::test]
+async fn test_pointer_ordered_comparison_is_rejected_e2e() -> anyhow::Result<()> {
+    init();
+    ensure_global_cleanup_registered();
+
+    // Ordered comparisons on pointers/addresses (<, <=, >, >=) are forbidden at compile time.
+    // process_data(const char* message) provides a pointer parameter for this check.
+    let script_content = r#"
+trace process_data {
+    if message > 0 { print "BAD"; }
+}
+"#;
+
+    let (exit_code, _stdout, stderr) = run_ghostscope_with_script(script_content, 2).await?;
+    assert!(
+        exit_code != 0,
+        "expected non-zero exit due to compile error; stderr={stderr}"
+    );
+
+    // Expect banner + friendly pointer-ordered-comparison message
+    let has_banner = stderr.contains("No uprobe configurations created")
+        || stderr.contains("Script compilation failed");
+    let has_reason =
+        stderr.contains("Pointer ordered comparison ('<', '<=', '>', '>=') is not supported");
+    assert!(
+        has_banner && has_reason,
+        "Expected pointer ordered comparison rejection with banner. stderr={stderr}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_string_variable_copy_allowed_e2e() -> anyhow::Result<()> {
     init();
     ensure_global_cleanup_registered();
