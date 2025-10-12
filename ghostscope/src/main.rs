@@ -7,6 +7,7 @@ mod logging;
 mod runtime;
 mod script;
 mod tracing;
+mod util;
 
 use anyhow::Result;
 use crossterm::execute;

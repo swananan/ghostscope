@@ -27,7 +27,7 @@ async fn run_ghostscope_with_script_for_pid(
     timeout_secs: u64,
     pid: u32,
 ) -> anyhow::Result<(i32, String, String)> {
-    run_ghostscope_with_script_for_pid_impl(script_content, timeout_secs, pid, false).await
+    run_ghostscope_with_script_for_pid_impl(script_content, timeout_secs, pid, false, false).await
 }
 
 async fn run_ghostscope_with_script_for_pid_perf(
@@ -35,7 +35,16 @@ async fn run_ghostscope_with_script_for_pid_perf(
     timeout_secs: u64,
     pid: u32,
 ) -> anyhow::Result<(i32, String, String)> {
-    run_ghostscope_with_script_for_pid_impl(script_content, timeout_secs, pid, true).await
+    run_ghostscope_with_script_for_pid_impl(script_content, timeout_secs, pid, true, false).await
+}
+
+// Helper that enables CLI logging to console for capturing compile-time failures clearly
+async fn run_ghostscope_with_script_for_pid_with_log(
+    script_content: &str,
+    timeout_secs: u64,
+    pid: u32,
+) -> anyhow::Result<(i32, String, String)> {
+    run_ghostscope_with_script_for_pid_impl(script_content, timeout_secs, pid, false, true).await
 }
 
 async fn run_ghostscope_with_script_for_pid_impl(
@@ -43,6 +52,7 @@ async fn run_ghostscope_with_script_for_pid_impl(
     timeout_secs: u64,
     pid: u32,
     force_perf_event_array: bool,
+    enable_console_log: bool,
 ) -> anyhow::Result<(i32, String, String)> {
     let mut script_file = NamedTempFile::new()?;
     script_file.write_all(script_content.as_bytes())?;
@@ -57,8 +67,13 @@ async fn run_ghostscope_with_script_for_pid_impl(
         OsString::from("--no-save-llvm-ir"),
         OsString::from("--no-save-ebpf"),
         OsString::from("--no-save-ast"),
-        OsString::from("--no-log"),
     ];
+    if enable_console_log {
+        args.push(OsString::from("--log"));
+        args.push(OsString::from("--log-console"));
+    } else {
+        args.push(OsString::from("--no-log"));
+    }
 
     if force_perf_event_array {
         args.push(OsString::from("--force-perf-event-array"));
@@ -121,6 +136,30 @@ async fn run_ghostscope_with_script_for_pid_impl(
             }
         }
     };
+    // Drain any remaining output after process has exited to ensure we capture
+    // complete error messages (multi-line banners, friendly diagnostics, etc.)
+    {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match stdout_reader.read_line(&mut line).await {
+                Ok(0) => break,
+                Ok(_) => stdout_content.push_str(&line),
+                Err(_) => break,
+            }
+        }
+    }
+    {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match stderr_reader.read_line(&mut line).await {
+                Ok(0) => break,
+                Ok(_) => stderr_content.push_str(&line),
+                Err(_) => break,
+            }
+        }
+    }
     if exit_code == -1 && (!stdout_content.is_empty() || !stderr_content.is_empty()) {
         exit_code = 0;
     }
@@ -198,10 +237,6 @@ trace globals_program.c:32 {
     let _ = prog.kill().await;
     assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
 
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={} ", stderr, stdout);
-
     // Should have ExprError line and AFTER; should not see THEN/ELSE
     assert!(
         stdout.contains("ExprError"),
@@ -219,6 +254,51 @@ trace globals_program.c:32 {
         stdout
     );
     assert!(stdout.contains("ELSE"), "Expected ELSE. STDOUT: {}", stdout);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_struct_arithmetic_is_rejected_with_friendly_error() -> anyhow::Result<()> {
+    init();
+
+    // Launch the globals_program fixture to obtain a PID
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let prog = tokio::process::Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Script attempts struct arithmetic: should be rejected at compile with friendly message
+    // Use a stable function entry to avoid source-path resolution flakiness
+    let script = r#"
+trace tick_once {
+    print G_STATE + 1;
+}
+"#;
+
+    // Use helper with logging enabled to capture error message
+    let (_exit_code, stdout_buf, stderr_buf) =
+        run_ghostscope_with_script_for_pid_with_log(script, 3, pid).await?;
+
+    // Expect a compile/load failure banner and the friendly TypeError message
+    // Banner can be either the direct compilation failure or the final summary with zero configs
+    let has_banner = stderr_buf.contains("Script compilation failed")
+        || stderr_buf.contains("No uprobe configurations created");
+    let has_friendly = stderr_buf
+        .contains("Unsupported arithmetic/ordered comparison involving struct/union/array");
+    assert!(
+        has_banner && has_friendly,
+        "Expected friendly struct arithmetic rejection.\nSTDERR: {}\nSTDOUT: {}",
+        stderr_buf,
+        stdout_buf
+    );
+
     Ok(())
 }
 
@@ -477,6 +557,29 @@ async fn run_ghostscope_with_script_for_target(
             }
         }
     };
+    // Drain any remaining output to capture complete diagnostics
+    {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match stdout_reader.read_line(&mut line).await {
+                Ok(0) => break,
+                Ok(_) => stdout_content.push_str(&line),
+                Err(_) => break,
+            }
+        }
+    }
+    {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match stderr_reader.read_line(&mut line).await {
+                Ok(0) => break,
+                Ok(_) => stderr_content.push_str(&line),
+                Err(_) => break,
+            }
+        }
+    }
     if exit_code == -1 && (!stdout_content.is_empty() || !stderr_content.is_empty()) {
         exit_code = 0;
     }

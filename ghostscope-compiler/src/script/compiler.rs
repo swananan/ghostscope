@@ -646,10 +646,13 @@ impl<'a> AstCompiler<'a> {
                     );
                     Ok(())
                 } else {
-                    // All addresses failed to process - this is an error
-                    Err(CompileError::Other(format!(
-                    "All {failed_addresses} addresses for function '{func_name}' failed to process"
-                )))
+                    // All addresses failed to process — record failures already captured above
+                    // Defer final error shaping to the caller based on aggregated results
+                    error!(
+                        "All {} addresses for function '{}' failed to process",
+                        failed_addresses, func_name
+                    );
+                    Ok(())
                 }
             }
             _ => {

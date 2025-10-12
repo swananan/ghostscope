@@ -96,17 +96,7 @@ async fn run_cli_with_session(
     }
 
     // Step 6: Build compile options from merged config
-    let binary_path_hint = session
-        .process_analyzer
-        .as_ref()
-        .and_then(|analyzer| analyzer.get_main_executable())
-        .map(|main_module| {
-            std::path::Path::new(&main_module.path)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown")
-                .to_string()
-        });
+    let binary_path_hint = crate::util::derive_binary_path_hint(&session);
 
     let compile_options = config.get_compile_options(
         config.should_save_llvm_ir,

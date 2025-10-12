@@ -77,17 +77,7 @@ async fn run_tui_coordinator_with_ui_config_and_merged_config(
             Ok(Ok(session)) => {
                 // Build compile options from merged config using the same logic as CLI
                 // Derive a binary path hint from the session (main executable), if available
-                let binary_path_hint = session
-                    .process_analyzer
-                    .as_ref()
-                    .and_then(|analyzer| analyzer.get_main_executable())
-                    .map(|main_module| {
-                        std::path::Path::new(&main_module.path)
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("unknown")
-                            .to_string()
-                    });
+                let binary_path_hint = crate::util::derive_binary_path_hint(&session);
 
                 let compile_options = merged_config.get_compile_options(
                     parsed_args.should_save_llvm_ir,

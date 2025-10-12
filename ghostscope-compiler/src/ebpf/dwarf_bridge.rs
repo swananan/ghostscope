@@ -12,6 +12,29 @@ use inkwell::values::{BasicValueEnum, IntValue, PointerValue};
 use tracing::{debug, warn};
 
 impl<'ctx> EbpfContext<'ctx> {
+    /// Helper: unwrap typedef/qualified wrappers to the underlying type
+    fn unwrap_type_aliases(mut t: &TypeInfo) -> &TypeInfo {
+        loop {
+            match t {
+                TypeInfo::TypedefType {
+                    underlying_type, ..
+                } => t = underlying_type.as_ref(),
+                TypeInfo::QualifiedType {
+                    underlying_type, ..
+                } => t = underlying_type.as_ref(),
+                _ => break,
+            }
+        }
+        t
+    }
+
+    /// Helper: determine if a DWARF type represents an aggregate (struct/union/array)
+    fn is_aggregate_type(&self, t: &TypeInfo) -> bool {
+        matches!(
+            Self::unwrap_type_aliases(t),
+            TypeInfo::StructType { .. } | TypeInfo::UnionType { .. } | TypeInfo::ArrayType { .. }
+        )
+    }
     /// Convert EvaluationResult to LLVM value
     pub fn evaluate_result_to_llvm_value(
         &mut self,
@@ -574,6 +597,15 @@ impl<'ctx> EbpfContext<'ctx> {
                     status_ptr,
                     module_hint.as_deref(),
                 )?;
+                // Aggregate types (struct/union/array) are represented as pointers in expressions
+                if self.is_aggregate_type(dwarf_type) {
+                    let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+                    let as_ptr = self
+                        .builder
+                        .build_int_to_ptr(rt_addr, ptr_ty, "aggregate_addr_as_ptr")
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    return Ok(as_ptr.into());
+                }
                 // Use DWARF type size for memory access
                 let access_size = self.dwarf_type_to_memory_access_size(dwarf_type);
                 if self.condition_context_active {
@@ -616,7 +648,15 @@ impl<'ctx> EbpfContext<'ctx> {
                         "Register value is not integer".to_string(),
                     ));
                 };
-
+                // Aggregate types: return pointer instead of reading as scalar
+                if self.is_aggregate_type(dwarf_type) {
+                    let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+                    let as_ptr = self
+                        .builder
+                        .build_int_to_ptr(final_addr, ptr_ty, "aggregate_addr_as_ptr")
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    return Ok(as_ptr.into());
+                }
                 // Determine memory access size - prefer LocationResult size if available, otherwise use DWARF type
                 let access_size = size
                     .map(|s| match s {
@@ -645,6 +685,15 @@ impl<'ctx> EbpfContext<'ctx> {
                 let addr_value =
                     self.generate_compute_steps(steps, pt_regs_ptr, None, status_ptr, None)?;
                 if let BasicValueEnum::IntValue(addr) = addr_value {
+                    // For aggregate types, return pointer to address instead of loading a value
+                    if self.is_aggregate_type(dwarf_type) {
+                        let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+                        let as_ptr = self
+                            .builder
+                            .build_int_to_ptr(addr, ptr_ty, "aggregate_addr_as_ptr")
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        return Ok(as_ptr.into());
+                    }
                     // Use DWARF type size for memory access
                     let access_size = self.dwarf_type_to_memory_access_size(dwarf_type);
                     if self.condition_context_active {
@@ -1964,5 +2013,76 @@ impl<'ctx> EbpfContext<'ctx> {
         steps.push(ComputeStep::Add); // base_address + (index * element_size)
 
         steps
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use inkwell::context::Context as LlvmContext;
+
+    #[test]
+    fn aggregate_address_returns_pointer_for_struct_and_array() {
+        let llctx = LlvmContext::create();
+        let opts = crate::CompileOptions::default();
+        let mut ctx = EbpfContext::new(&llctx, "agg_ptr", Some(0), &opts).expect("ctx");
+        // Ensure we have a function/pt_regs to satisfy builders
+        ctx.create_basic_ebpf_function("f").expect("fn");
+
+        // Struct type
+        let st = ghostscope_protocol::TypeInfo::StructType {
+            name: "S".to_string(),
+            size: 80,
+            members: vec![],
+        };
+        let eval = EvaluationResult::MemoryLocation(LocationResult::Address(0x1000));
+        let v = ctx
+            .evaluate_result_to_llvm_value(&eval, &st, "S", 0)
+            .expect("eval");
+        match v {
+            BasicValueEnum::PointerValue(_) => {}
+            other => panic!("expected PointerValue for struct, got {other:?}"),
+        }
+
+        // Array type
+        let arr = ghostscope_protocol::TypeInfo::ArrayType {
+            element_type: Box::new(ghostscope_protocol::TypeInfo::BaseType {
+                name: "int".to_string(),
+                size: 4,
+                encoding: ghostscope_dwarf::constants::DW_ATE_signed.0 as u16,
+            }),
+            element_count: Some(4),
+            total_size: Some(16),
+        };
+        let v2 = ctx
+            .evaluate_result_to_llvm_value(&eval, &arr, "A", 0)
+            .expect("eval2");
+        match v2 {
+            BasicValueEnum::PointerValue(_) => {}
+            other => panic!("expected PointerValue for array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scalar_address_reads_value() {
+        let llctx = LlvmContext::create();
+        let opts = crate::CompileOptions::default();
+        let mut ctx = EbpfContext::new(&llctx, "scalar_val", Some(0), &opts).expect("ctx");
+        ctx.create_basic_ebpf_function("f").expect("fn");
+
+        // Base int type
+        let bt = ghostscope_protocol::TypeInfo::BaseType {
+            name: "int".to_string(),
+            size: 4,
+            encoding: ghostscope_dwarf::constants::DW_ATE_signed.0 as u16,
+        };
+        let eval = EvaluationResult::MemoryLocation(LocationResult::Address(0x2000));
+        let v = ctx
+            .evaluate_result_to_llvm_value(&eval, &bt, "x", 0)
+            .expect("eval");
+        match v {
+            BasicValueEnum::IntValue(_) => {}
+            other => panic!("expected IntValue for scalar, got {other:?}"),
+        }
     }
 }

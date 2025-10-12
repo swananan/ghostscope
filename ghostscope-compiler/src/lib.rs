@@ -116,10 +116,31 @@ pub fn compile_script(
     // Step 3: Compile using unified interface
     let result = compiler.compile_program(&program, pid)?;
 
+    if result.uprobe_configs.is_empty() {
+        if !result.failed_targets.is_empty() {
+            tracing::warn!(
+                "Compilation produced 0 uprobe configs; {} target(s) failed to compile",
+                result.failed_targets.len()
+            );
+        } else {
+            tracing::warn!(
+                "Compilation completed with 0 uprobe configs (no attachable targets resolved)"
+            );
+        }
+    } else {
+        info!(
+            "Successfully compiled script: {} trace points, {} uprobe configs",
+            result.trace_count,
+            result.uprobe_configs.len()
+        );
+    }
+
+    // Concise summary for downstream logs
     info!(
-        "Successfully compiled script: {} trace points, {} uprobe configs",
+        "Compilation summary: trace_points={}, uprobe_configs={}, failed_targets={}",
         result.trace_count,
-        result.uprobe_configs.len()
+        result.uprobe_configs.len(),
+        result.failed_targets.len()
     );
 
     Ok(result)

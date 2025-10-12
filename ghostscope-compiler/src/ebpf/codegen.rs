@@ -4826,4 +4826,32 @@ mod tests {
         assert!(s.ends_with("..."));
         assert!(s.chars().count() <= 96);
     }
+
+    #[test]
+    fn pointer_int_arithmetic_is_rejected_with_friendly_error() {
+        let context = inkwell::context::Context::create();
+        let opts = CompileOptions::default();
+        let mut ctx = EbpfContext::new(&context, "ptr_arith", Some(0), &opts).expect("ctx");
+        ctx.create_basic_ebpf_function("f").expect("fn");
+
+        // Create a script variable 'p' of pointer type (null pointer)
+        let ptr_ty = ctx.context.ptr_type(inkwell::AddressSpace::default());
+        let null_ptr = ptr_ty.const_null();
+        ctx.store_variable("p", null_ptr.into()).expect("store ptr");
+
+        // Expression: p + 1
+        let expr = crate::script::Expr::BinaryOp {
+            left: Box::new(crate::script::Expr::Variable("p".to_string())),
+            op: crate::script::BinaryOp::Add,
+            right: Box::new(crate::script::Expr::Int(1)),
+        };
+        let res = ctx.compile_expr(&expr);
+        assert!(res.is_err(), "expected pointer-int arithmetic error");
+        let msg = format!("{:?}", res.err());
+        assert!(
+            msg.contains("pointer and integer")
+                || msg.contains("Unsupported operation between pointer and integer"),
+            "unexpected error message: {msg}"
+        );
+    }
 }

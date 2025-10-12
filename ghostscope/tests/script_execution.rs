@@ -395,6 +395,30 @@ async fn run_ghostscope_with_script_opt(
         }
     };
 
+    // After process exit/kill, drain any remaining lines to capture full diagnostics
+    {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match stdout_reader.read_line(&mut line).await {
+                Ok(0) => break,
+                Ok(_) => stdout_content.push_str(&line),
+                Err(_) => break,
+            }
+        }
+    }
+    {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match stderr_reader.read_line(&mut line).await {
+                Ok(0) => break,
+                Ok(_) => stderr_content.push_str(&line),
+                Err(_) => break,
+            }
+        }
+    }
+
     if forced_termination
         && exit_code == -1
         && (!stdout_content.trim().is_empty() || !stderr_content.trim().is_empty())
@@ -475,9 +499,15 @@ trace calculate_something {
         exit_code != 0,
         "expected non-zero exit due to compile error; stderr={stderr}"
     );
+    // Expect the consolidated failed-targets banner with the pointer/address type error and tip
+    let has_banner = stderr.contains("No uprobe configurations created")
+        || stderr.contains("Script compilation failed");
+    let has_failed_targets = stderr.contains("Failed targets:");
+    let has_reason = stderr.contains("expression is not a pointer/address");
+    let has_tip = stderr.contains("Tip: fix the reported compile-time errors above");
     assert!(
-        stderr.contains("Script compilation failed"),
-        "stderr should contain compilation error. stderr={stderr}"
+        has_banner && has_failed_targets && has_reason && has_tip,
+        "Expected failed-targets details with pointer/address reason and tip. stderr={stderr}"
     );
     Ok(())
 }
