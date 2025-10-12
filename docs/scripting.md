@@ -354,7 +354,7 @@ let complex = (x + y) / (a - b);
 
 - `!` (logical NOT), `&&` (logical AND), `||` (logical OR)
 - Non‑zero is true
-- `||`/`&&` short‑circuit
+- `||`/`&&` short-circuit
 
 Examples:
 
@@ -743,3 +743,25 @@ The comparison operators are `==`, `!=`, `<`, `<=`, `>`, `>=`.
 - For C strings (char*/char[]), use equality `==`/`!=` with string literals or script string variables under “CString Equality”, or prefer the built‑ins `strncmp`/`starts_with` for bounded and prefix checks.
 - Pointer equality supports `==`/`!=` on pointers (including auto‑dereferenced locals/params/globals when applicable).
   - Note: Ordered pointer comparisons (`<`, `<=`, `>`, `>=`) are not supported and are rejected at compile time with a friendly message. Use `==`/`!=` to compare addresses. If you need to adjust an address, use `&expr + <non‑negative literal>` in an alias/address context; to compare values, select a scalar field (e.g., `obj.field`).
+### Pointer Arithmetic
+
+GhostScope supports C-style pointer arithmetic in a restricted, safe form:
+
+- Allowed: `ptr + int`, `int + ptr`, `ptr - int`.
+- Scaling: the integer offset is scaled by the element size of the pointer target type (C semantics). For example, for `int* p`, `p + 2` advances by `2 * sizeof(int)`.
+- Typed read in print: when used in `print`, `p ± n` reads and renders the value at the computed address using the pointed-to DWARF type. This enables, e.g., `print numbers + 1;` to show the second `int` in an `int* numbers` argument.
+- Unknown/void*: if the pointed-to type is `void` or unavailable, scaling falls back to 1 byte.
+- Not supported: pointer arithmetic on function pointers; pointer–pointer arithmetic (`p + q`, `p - q`). Ordered comparisons on pointers (`<`, `<=`, `>`, `>=`) are rejected; use `==`/`!=`.
+
+Examples:
+
+```ghostscope
+trace calculate_average {
+    print numbers;       // prints address or first element depending on context
+    print numbers + 1;   // prints the second int (scaled by sizeof(int))
+}
+
+trace log_activity {
+    print activity + 1;  // for const char* activity, prints the next character
+}
+```

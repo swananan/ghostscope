@@ -32,4 +32,7 @@ int get_random_value(int min, int max);
 void init_test_lib();
 void cleanup_test_lib();
 
+// Void pointer sink for pointer-arithmetic fallback tests
+void sink_void(const void* p);
+
 #endif // TEST_LIB_H

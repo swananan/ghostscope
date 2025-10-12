@@ -88,3 +88,9 @@ void init_test_lib() {
 // Library cleanup function
 void cleanup_test_lib() {
 }
+
+// Void pointer sink for pointer-arithmetic fallback tests
+void sink_void(const void* p) {
+    call_counter++;
+    (void)p;
+}
