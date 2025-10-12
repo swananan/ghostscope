@@ -467,24 +467,29 @@ impl ModuleData {
             "Starting parallel DWARF parsing with true debug_line || debug_info parallelism..."
         );
 
-        // Parse three components in parallel: debug_line || debug_info || CFI
-        let (line_result, info_result, cfi_index_result) = tokio::try_join!(
-            // Parse debug_line only
+        // Parse DWARF components with reduced blocking threads:
+        // - One spawn_blocking orchestrates debug_line || debug_info via rayon::join
+        // - One spawn_blocking builds CFI
+        let (pair_result, cfi_index_result) = tokio::try_join!(
             tokio::task::spawn_blocking({
                 let dwarf = std::sync::Arc::clone(&dwarf);
                 let module_path = module_mapping.path.to_string_lossy().to_string();
-                move || -> Result<crate::parser::LineParseResult> {
-                    let parser = crate::parser::DwarfParser::new(&dwarf);
-                    parser.parse_line_info(&module_path)
-                }
-            }),
-            // Parse debug_info only
-            tokio::task::spawn_blocking({
-                let dwarf = std::sync::Arc::clone(&dwarf);
-                let module_path = module_mapping.path.to_string_lossy().to_string();
-                move || -> Result<crate::parser::DebugParseResult> {
-                    let parser = crate::parser::DwarfParser::new(&dwarf);
-                    parser.parse_debug_info(&module_path)
+                move || -> Result<(crate::parser::LineParseResult, crate::parser::DebugParseResult)> {
+                    let (line_res, info_res) = rayon::join(
+                        || {
+                            let parser = crate::parser::DwarfParser::new(&dwarf);
+                            parser.parse_line_info(&module_path)
+                        },
+                        || {
+                            let parser = crate::parser::DwarfParser::new(&dwarf);
+                            parser.parse_debug_info(&module_path)
+                        },
+                    );
+                    match (line_res, info_res) {
+                        (Ok(l), Ok(i)) => Ok((l, i)),
+                        (Err(e), _) => Err(e),
+                        (_, Err(e)) => Err(e),
+                    }
                 }
             }),
             // Parse CFI independently from binary file (not debug file)
@@ -516,8 +521,7 @@ impl ModuleData {
         )?;
 
         // Unwrap the spawn_blocking results
-        let line_result = line_result?;
-        let info_result = info_result?;
+        let (line_result, info_result) = pair_result?;
         let cfi_index = cfi_index_result?;
 
         // Assemble parallel results into unified result
