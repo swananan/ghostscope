@@ -289,6 +289,8 @@ Notes:
 
 ## Conditional Statements
 
+Rust‑like if-else conditions:
+
 ```ghostscope
 // Simple if
 if x > 100 {
@@ -342,13 +344,6 @@ let neg = -0x10;       // unary minus is parsed as 0 - 16
 6. Comparisons `==`, `!=`, `<`, `<=`, `>`, `>=`
 7. Logical AND `&&`
 8. Logical OR `||`
-
-### Grouping
-
-```ghostscope
-let result = (a + b) * c;
-let complex = (x + y) / (a - b);
-```
 
 ### Logical Operators
 
@@ -413,6 +408,28 @@ trace foo.c:60 {
 }
 ```
 
+#### Pointer Arithmetic
+
+GhostScope supports C-style pointer arithmetic in a restricted, safe form:
+
+- Allowed: `ptr + int`, `int + ptr`, `ptr - int`.
+- Scaling: the integer offset is scaled by the element size of the pointer target type (C semantics). For example, for `int* p`, `p + 2` advances by `2 * sizeof(int)`.
+- Typed read in print: when used in `print`, `p ± n` reads and renders the value at the computed address using the pointed-to DWARF type. This enables, e.g., `print numbers + 1;` to show the second `int` in an `int* numbers` argument.
+- Unknown/void*: if the pointed-to type is `void` or unavailable, scaling falls back to 1 byte.
+- Not supported: pointer arithmetic on function pointers; pointer–pointer arithmetic (`p + q`, `p - q`). Ordered comparisons on pointers (`<`, `<=`, `>`, `>=`) are rejected; use `==`/`!=`.
+
+Examples:
+
+```ghostscope
+trace calculate_average {
+    print numbers;       // prints address or first element depending on context
+    print numbers + 1;   // prints the second int (scaled by sizeof(int))
+}
+
+trace log_activity {
+    print activity + 1;  // for const char* activity, prints the next character
+}
+```
 #### Comparisons (==, !=, <, <=, >, >=)
 
 - Supported: script int/bool with DWARF integer‑like scalars; values are unified to 64‑bit before compare.
@@ -455,6 +472,12 @@ GhostScope supports equality/inequality between a script string literal and a DW
   - For `char[N]`: perform a bounded `bpf_probe_read_user` of `min(N, L+1)` bytes. Equality requires `L+1 <= N`, the byte at index `L` to be `\0`, and the first `L` bytes to match the literal.
   - Any read failure (invalid address, permission, etc.) evaluates to `false`.
 
+```ghostscope
+trace foo.c:60 {
+    print "greet-ok:{}", gm == "Hello, Global!"; // gm: const char* or char[]
+}
+```
+
 ## Built-in Functions
 
 ### `strncmp(a, b, n)`
@@ -463,26 +486,6 @@ GhostScope supports equality/inequality between a script string literal and a DW
   - The other side can be: DWARF pointer/array, DWARF alias, or another string.
   - If both sides are strings, the result folds at compile time. If exactly one side is a string, runtime reads the other side and compares (read failures produce ExprError).
   - `n` must be a non‑negative integer literal; effective length is `min(n, compare_cap, string length, readable bytes)` (compare_cap defaults to 64).
-
-### `starts_with(a, b)`
-  - Check if `a` starts with `b`, equivalent to `strncmp(a, b, len(b))`.
-  - At least one side must be a string (literal or script string variable); the other side can be an address expression (DWARF pointer/array or alias) or a string.
-  - If both sides are strings, the result folds at compile time; if exactly one side is a string, runtime reads `len(b)` bytes from the other side and compares (read failures produce ExprError).
-
-### `memcmp(expr_a, expr_b, len)`
-  - Boolean semantics: returns `true` if the first `len` bytes at `expr_a` and `expr_b` are identical.
-  - Pointer sources: `expr_a`/`expr_b` may be DWARF pointer or array (any element type), or address‑of forms (e.g., `&expr`, `&arr[0]`). For literal string comparisons, use `strncmp`/`starts_with`.
-  - Bare integer addresses as pointer arguments are not supported. To match raw bytes, use `hex("...")`.
-    - If either operand is `hex("...")`, `len` may be omitted; the parser infers `len` from the hex size. If both sides are `hex(...)`, sizes must match.
-    - With a literal `len` and `hex(...)`, negative lengths and lengths greater than the hex size are rejected at parse time.
-  - `len` accepts script integer expressions (decimal, `0x..`, `0o..`, `0b..`). At runtime, negative values are clamped to 0; literal negatives are rejected by the parser.
-  - No NUL semantics; raw byte comparison (length in bytes).
-  - If `len == 0`, result is `true` (no user‑memory reads).
-  - Any DWARF read failure on either side evaluates to `false` (see ExprError).
-
-Verifier friendliness and performance:
-- Compiles to branch‑light byte comparisons (e.g., XOR/OR accumulation) to avoid verifier state explosion.
-- Avoid packing many large string checks into a single hot probe; consider splitting trace points or attaching at less‑hot sites.
 
 Examples: `strncmp`
 
@@ -503,6 +506,11 @@ trace process_record {
 }
 ```
 
+### `starts_with(a, b)`
+  - Check if `a` starts with `b`, equivalent to `strncmp(a, b, len(b))`.
+  - At least one side must be a string (literal or script string variable); the other side can be an address expression (DWARF pointer/array or alias) or a string.
+  - If both sides are strings, the result folds at compile time; if exactly one side is a string, runtime reads `len(b)` bytes from the other side and compares (read failures produce ExprError).
+
 Examples: `starts_with`
 
 ```ghostscope
@@ -515,6 +523,21 @@ trace globals_program.c:32 {
     print "gm_hello:{}", starts_with(gm, "Hello"); // gm: const char*
 }
 ```
+
+### `memcmp(expr_a, expr_b, len)`
+  - Boolean semantics: returns `true` if the first `len` bytes at `expr_a` and `expr_b` are identical.
+  - Pointer sources: `expr_a`/`expr_b` may be DWARF pointer or array (any element type), or address‑of forms (e.g., `&expr`, `&arr[0]`). For literal string comparisons, use `strncmp`/`starts_with`.
+  - Bare integer addresses as pointer arguments are not supported. To match raw bytes, use `hex("...")`.
+    - If either operand is `hex("...")`, `len` may be omitted; the parser infers `len` from the hex size. If both sides are `hex(...)`, sizes must match.
+    - With a literal `len` and `hex(...)`, negative lengths and lengths greater than the hex size are rejected at parse time.
+  - `len` accepts script integer expressions (decimal, `0x..`, `0o..`, `0b..`). At runtime, negative values are clamped to 0; literal negatives are rejected by the parser.
+  - No NUL semantics; raw byte comparison (length in bytes).
+  - If `len == 0`, result is `true` (no user‑memory reads).
+  - Any DWARF read failure on either side evaluates to `false` (see ExprError).
+
+Verifier friendliness and performance:
+- Compiles to branch‑light byte comparisons (e.g., XOR/OR accumulation) to avoid verifier state explosion.
+- Avoid packing many large string checks into a single hot probe; consider splitting trace points or attaching at less‑hot sites.
 
 Examples: `memcmp`
 
@@ -530,12 +553,6 @@ trace globals_program.c:32 {
     // Dynamic length from script variable
     let n = 10;
     if memcmp(&lib_pattern[0], &lib_pattern[0], n) { print "DYN_EQ"; }
-}
-
-// Match against byte patterns (hex)
-trace foo {
-    if memcmp(buf, hex("50 4F"), 2) { print "HDR"; }          // first 2 bytes are "PO"
-    if memcmp(ptr, hex("DE AD BE EF"), 4) { print "MAGIC"; }  // 4-byte magic
 }
 ```
 
@@ -734,34 +751,4 @@ When the failing address is zero:
 
 ```
 ExprError: memcmp(G_STATE.lib, hex("00"), 1) (read error at NULL, flags: first-arg read-fail)
-```
-### Comparison Operators
-
-The comparison operators are `==`, `!=`, `<`, `<=`, `>`, `>=`.
-
-- Operands may be script integers/bools and DWARF integer‑like scalars; the engine normalizes width/sign before comparing.
-- For C strings (char*/char[]), use equality `==`/`!=` with string literals or script string variables under “CString Equality”, or prefer the built‑ins `strncmp`/`starts_with` for bounded and prefix checks.
-- Pointer equality supports `==`/`!=` on pointers (including auto‑dereferenced locals/params/globals when applicable).
-  - Note: Ordered pointer comparisons (`<`, `<=`, `>`, `>=`) are not supported and are rejected at compile time with a friendly message. Use `==`/`!=` to compare addresses. If you need to adjust an address, use `&expr + <non‑negative literal>` in an alias/address context; to compare values, select a scalar field (e.g., `obj.field`).
-### Pointer Arithmetic
-
-GhostScope supports C-style pointer arithmetic in a restricted, safe form:
-
-- Allowed: `ptr + int`, `int + ptr`, `ptr - int`.
-- Scaling: the integer offset is scaled by the element size of the pointer target type (C semantics). For example, for `int* p`, `p + 2` advances by `2 * sizeof(int)`.
-- Typed read in print: when used in `print`, `p ± n` reads and renders the value at the computed address using the pointed-to DWARF type. This enables, e.g., `print numbers + 1;` to show the second `int` in an `int* numbers` argument.
-- Unknown/void*: if the pointed-to type is `void` or unavailable, scaling falls back to 1 byte.
-- Not supported: pointer arithmetic on function pointers; pointer–pointer arithmetic (`p + q`, `p - q`). Ordered comparisons on pointers (`<`, `<=`, `>`, `>=`) are rejected; use `==`/`!=`.
-
-Examples:
-
-```ghostscope
-trace calculate_average {
-    print numbers;       // prints address or first element depending on context
-    print numbers + 1;   // prints the second int (scaled by sizeof(int))
-}
-
-trace log_activity {
-    print activity + 1;  // for const char* activity, prints the next character
-}
 ```

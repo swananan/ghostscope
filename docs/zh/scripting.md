@@ -364,14 +364,6 @@ let neg = -0x10;       // 一元负号作用于字面量（解析为 0 - 16）
 7. 逻辑与 `&&`
 8. 逻辑或 `||`
 
-### 表达式分组
-
-```ghostscope
-// 使用括号明确优先级
-let result = (a + b) * c;
-let complex = (x + y) / (a - b);
-```
-
 ### 逻辑运算符
 
 - `!`（逻辑非）、`&&`（逻辑与）、`||`（逻辑或）
@@ -449,6 +441,31 @@ trace foo.c:60 {
 }
 ```
 
+#### 指针算术
+
+GhostScope 以受控且安全的方式支持 C 风格的指针算术：
+
+- 允许：ptr + int、int + ptr、ptr - int。
+- 步长缩放：整数偏移按指针目标类型的元素大小缩放（C 语义）。例如，对于 int* p，p + 2 会前进 2 * sizeof(int) 个字节。
+- 在 print 中的类型化读取：当用于 print 时，p ± n 会在计算出的地址上，按指向的 DWARF 类型读取并渲染该值。例如，print numbers + 1;
+  可显示 int* numbers 的第二个 int。
+- void*/未知类型：如果指向的类型为 void 或不可获取，则缩放退化为 1 字节。
+- 不支持：函数指针上的指针算术；指针—指针算术（p + q、p - q）。指针的有序比较（<、<=、>、>=）会被拒绝；请使用 ==/!=。
+
+示例：
+
+```ghostscope
+trace calculate_average {
+    // numbers 类型是 int*
+    print numbers;       // 根据上下文打印地址或第一个元素
+    print numbers + 1;   // 打印第二个 int（按 sizeof(int) 缩放）
+}
+
+trace log_activity {
+    print activity + 1;  // 对于 const char* activity，打印下一个字符
+}
+```
+
 #### 比较（==、!=、<、<=、>、>=）
 
 - 支持：脚本变量（整数/布尔） 与上述 DWARF 整数类标量；比较前会统一为 64 位整型。
@@ -480,6 +497,7 @@ trace foo.c:50 {
 ```
 
 注意：当 DWARF 变量运行时读取失败的呈现与分支行为，参见下文“运行时表达式失败（ExprError）”。
+
 ### C 字符串等值比较（char*/char[]）
 
 GhostScope 支持将脚本字符串字面量与 DWARF 侧的 C 字符串进行等值比较：
@@ -783,8 +801,6 @@ trace foo {
 ```
 ExprError: memcmp(buf, hex("504f"), 2) (read error at 0x0000000100000000, flags: first-arg read-fail,len-clamped)
 ```
-
-TUI 会以警告样式展示该行（无 emoji），并支持 3 行预览与展开查看。
 
 当失败地址为 0 时，会显示为 `at NULL`：
 
