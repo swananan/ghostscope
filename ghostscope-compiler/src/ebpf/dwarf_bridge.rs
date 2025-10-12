@@ -1014,7 +1014,104 @@ impl<'ctx> EbpfContext<'ctx> {
     ) -> Result<Option<VariableWithEvaluation>> {
         use crate::script::Expr;
 
-        match expr {
+        // Expand script alias variables inside the expression so downstream
+        // DWARF resolvers see the actual DWARF-based expression tree.
+        // Guard against self-referential or cyclic aliases.
+        fn expand_aliases(
+            ctx: &crate::ebpf::context::EbpfContext<'_>,
+            e: &crate::script::Expr,
+            visited: &mut std::collections::HashSet<String>,
+            depth: usize,
+        ) -> std::result::Result<crate::script::Expr, super::context::CodeGenError> {
+            use crate::script::Expr as E;
+            const MAX_DEPTH: usize = 64;
+            if depth > MAX_DEPTH {
+                return Err(super::context::CodeGenError::TypeError(
+                    "alias expansion depth exceeded (cycle?)".to_string(),
+                ));
+            }
+            Ok(match e {
+                E::Variable(name) => {
+                    if ctx.alias_variable_exists(name) {
+                        if !visited.insert(name.clone()) {
+                            return Err(super::context::CodeGenError::TypeError(format!(
+                                "alias cycle detected for '{name}'"
+                            )));
+                        }
+                        if let Some(t) = ctx.get_alias_variable(name) {
+                            let res = expand_aliases(ctx, &t, visited, depth + 1)?;
+                            visited.remove(name);
+                            res
+                        } else {
+                            e.clone()
+                        }
+                    } else {
+                        e.clone()
+                    }
+                }
+                E::MemberAccess(obj, field) => {
+                    let base = expand_aliases(ctx, obj, visited, depth + 1)?;
+                    E::MemberAccess(Box::new(base), field.clone())
+                }
+                E::ArrayAccess(arr, idx) => {
+                    let base = expand_aliases(ctx, arr, visited, depth + 1)?;
+                    let idx2 = expand_aliases(ctx, idx, visited, depth + 1)?;
+                    E::ArrayAccess(Box::new(base), Box::new(idx2))
+                }
+                E::PointerDeref(inner) => {
+                    let in2 = expand_aliases(ctx, inner, visited, depth + 1)?;
+                    E::PointerDeref(Box::new(in2))
+                }
+                E::AddressOf(inner) => {
+                    let in2 = expand_aliases(ctx, inner, visited, depth + 1)?;
+                    E::AddressOf(Box::new(in2))
+                }
+                E::ChainAccess(chain) => {
+                    if chain.is_empty() {
+                        return Ok(e.clone());
+                    }
+                    let head = &chain[0];
+                    if ctx.alias_variable_exists(head) {
+                        if !visited.insert(head.clone()) {
+                            return Err(super::context::CodeGenError::TypeError(format!(
+                                "alias cycle detected for '{head}'"
+                            )));
+                        }
+                        if let Some(alias_expr) = ctx.get_alias_variable(head) {
+                            // Expand the alias head, then append member segments
+                            let mut acc = expand_aliases(ctx, &alias_expr, visited, depth + 1)?;
+                            for seg in &chain[1..] {
+                                acc = E::MemberAccess(Box::new(acc), seg.clone());
+                            }
+                            visited.remove(head);
+                            acc
+                        } else {
+                            e.clone()
+                        }
+                    } else {
+                        e.clone()
+                    }
+                }
+                E::BuiltinCall { name, args } => E::BuiltinCall {
+                    name: name.clone(),
+                    args: args
+                        .iter()
+                        .map(|a| expand_aliases(ctx, a, visited, depth + 1))
+                        .collect::<std::result::Result<Vec<_>, _>>()?,
+                },
+                E::BinaryOp { left, op, right } => E::BinaryOp {
+                    left: Box::new(expand_aliases(ctx, left, visited, depth + 1)?),
+                    op: op.clone(),
+                    right: Box::new(expand_aliases(ctx, right, visited, depth + 1)?),
+                },
+                _ => e.clone(),
+            })
+        }
+
+        let mut visited = std::collections::HashSet::new();
+        let expanded = expand_aliases(self, expr, &mut visited, 0)?;
+
+        match &expanded {
             // Simple variable lookup
             Expr::Variable(var_name) => self.query_dwarf_for_variable(var_name),
 

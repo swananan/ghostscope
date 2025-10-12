@@ -193,6 +193,10 @@ trace globals_program.c:32 {
     print "AFTER";
 }
 "#;
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_pid_perf(script, 3, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
     let _ = prog.kill().await;
@@ -1547,6 +1551,264 @@ trace globals_program.c:32 {
 
     assert!(has_hex, "Expected hex dump CH=. STDOUT: {}", stdout);
     assert!(has_cl, "Expected capture-len ASCII CL=. STDOUT: {}", stdout);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_alias_to_complex_dwarf_expr_index_and_address_of() -> anyhow::Result<()> {
+    // Validate that script alias can bind to a complex DWARF expression (array member),
+    // and support both address-of and constant index on the alias.
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let script = r#"
+trace globals_program.c:32 {
+    let a = G_STATE.array;      // alias to DWARF array member
+    print "APTR={:p}", &a;      // address-of alias
+    print "A0={}", a[0];        // index on alias
+    print "A1={}", a[1];
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    // Expect pointer print and at least one A0/A1 line
+    assert!(
+        stdout.contains("APTR=0x"),
+        "Expected APTR pointer line. STDOUT: {}",
+        stdout
+    );
+    let has_a0 = stdout
+        .lines()
+        .any(|l| l.trim_start().starts_with("A0=") || l.trim_start().starts_with("A0:"));
+    let has_a1 = stdout
+        .lines()
+        .any(|l| l.trim_start().starts_with("A1=") || l.trim_start().starts_with("A1:"));
+    assert!(
+        has_a0,
+        "Expected A0 line from alias index. STDOUT: {}",
+        stdout
+    );
+    assert!(
+        has_a1,
+        "Expected A1 line from alias index. STDOUT: {}",
+        stdout
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_alias_to_aggregate_and_chain_and_string_prefix() -> anyhow::Result<()> {
+    // Simulate nginx-like alias-to-aggregate + deep chain string access:
+    // let a = s; print a.inner.x; starts_with(a.name, "RUN"/"INI");
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let script = r#"
+trace globals_program.c:32 {
+    let a = s;                    // alias to pointer-to-aggregate (GlobalState*)
+    print "AX:{}", a.inner.x;     // member chain from alias
+    // probe string prefix on nested char[N]
+    print "RUN?{}", starts_with(a.name, "RUN");
+    print "INI?{}", starts_with(a.name, "INI");
+    // also alias a nested aggregate and read numeric
+    let b = a.inner;
+    print "BX:{}", b.x;
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    // Should see numeric AX and BX lines
+    let re_ax = Regex::new(r"^\s*AX:(-?\d+)").unwrap();
+    let re_bx = Regex::new(r"^\s*BX:(-?\d+)").unwrap();
+    let has_ax = stdout.lines().any(|l| re_ax.is_match(l));
+    let has_bx = stdout.lines().any(|l| re_bx.is_match(l));
+    assert!(
+        has_ax,
+        "Expected AX numeric via alias chain. STDOUT: {}",
+        stdout
+    );
+    assert!(
+        has_bx,
+        "Expected BX numeric via nested alias. STDOUT: {}",
+        stdout
+    );
+
+    // At runtime name toggles (INIT -> RUNNING occasionally). Accept either prefix condition being true
+    let saw_run_true = stdout.lines().any(|l| l.contains("RUN?true"));
+    let saw_ini_true = stdout.lines().any(|l| l.contains("INI?true"));
+    assert!(
+        saw_run_true || saw_ini_true,
+        "Expected one of RUN?true/INI?true. STDOUT: {}",
+        stdout
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_alias_rodata_string_builtins() -> anyhow::Result<()> {
+    // Alias to rodata strings (locals gm/lm) and validate starts_with/strncmp
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let script = r#"
+trace globals_program.c:32 {
+    let sg = gm; // alias to g_message (const char*)
+    let sl = lm; // alias to lib_message (const char*)
+    print "GST:{}", starts_with(sg, "Hell");
+    print "GSN:{}", strncmp(sg, "Hello", 5);
+    print "LST:{}", starts_with(sl, "LIB_");
+    print "LSN:{}", strncmp(sl, "LIB_", 4);
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    // All should be true at least once
+    for tag in ["GST:true", "GSN:true", "LST:true", "LSN:true"] {
+        assert!(
+            stdout.contains(tag),
+            "Expected {} at least once. STDOUT: {}",
+            tag,
+            stdout
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_alias_rodata_string_builtins_perf() -> anyhow::Result<()> {
+    // Same as above but using perf_event array transport
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let script = r#"
+trace globals_program.c:32 {
+    let sg = gm; // alias to g_message (const char*)
+    let sl = lm; // alias to lib_message (const char*)
+    print "GST:{}", starts_with(sg, "Hell");
+    print "GSN:{}", strncmp(sg, "Hello", 5);
+    print "LST:{}", starts_with(sl, "LIB_");
+    print "LSN:{}", strncmp(sl, "LIB_", 4);
+}
+"#;
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_pid_perf(script, 3, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    for tag in ["GST:true", "GSN:true", "LST:true", "LSN:true"] {
+        assert!(
+            stdout.contains(tag),
+            "Expected {} at least once. STDOUT: {}",
+            tag,
+            stdout
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_alias_address_of_cross_module_uses_correct_hint() -> anyhow::Result<()> {
+    // Validate that taking &alias where alias resolves to a library global
+    // uses the library's ASLR offsets (module hint captured after DWARF query).
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Touch an executable symbol first (to set a prior module hint), then
+    // alias a library global and take its address; compare with &LIB_STATE.
+    let script = r#"
+trace globals_program.c:32 {
+    print "MX:{}", G_STATE.counter;  // touch main exe symbol first
+    let a = LIB_STATE;               // alias to library global (cross-module)
+    print "PA={:p}", &a;             // &alias must equal &LIB_STATE
+    print "PL={:p}", &LIB_STATE;
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
+    let _ = prog.kill().await;
+    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+
+    let re_pa = Regex::new(r"PA=0x([0-9a-fA-F]+)").unwrap();
+    let re_pl = Regex::new(r"PL=0x([0-9a-fA-F]+)").unwrap();
+    let mut last_pa: Option<u64> = None;
+    let mut last_pl: Option<u64> = None;
+    for line in stdout.lines() {
+        if let Some(c) = re_pa.captures(line) {
+            if let Ok(v) = u64::from_str_radix(&c[1], 16) {
+                last_pa = Some(v);
+            }
+        }
+        if let Some(c) = re_pl.captures(line) {
+            if let Ok(v) = u64::from_str_radix(&c[1], 16) {
+                last_pl = Some(v);
+            }
+        }
+    }
+    let pa = last_pa.ok_or_else(|| anyhow::anyhow!("missing PA"))?;
+    let pl = last_pl.ok_or_else(|| anyhow::anyhow!("missing PL"))?;
+    assert_eq!(pa, pl, "&alias should equal &LIB_STATE (cross-module hint)");
     Ok(())
 }
 

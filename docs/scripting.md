@@ -115,10 +115,23 @@ let result = a + b;
 | Integer (i64) | `123`, `-42` | 64‑bit signed integer | +, -, *, /; mixes with DWARF integer‑like scalars |
 | Boolean (bool) | `true`, `false`, or from comparison `a < b` | From literals/comparisons/logical ops | logical AND/OR; when mixing with DWARF integers, treated as 0/1 |
 | String | `"hello"` | UTF‑8 string literal | Equality `==`, `!=` with DWARF C strings; no ordering |
-| Alias (address alias) | `let p = &buf[0];` (created via `&expr` or `&expr + <const>`) | A named alias to a DWARF address expression (pointer/array/member address). Useful to give simple names to complex DWARF types/expressions. | Address‑only usage: pass to `memcmp/strncmp/starts_with`, or use with `{:x.N}`/`{:s.N}`/`{:p}`. Not a general pointer: no deref; no arithmetic beyond the bind‑time constant offset; not used for generic comparisons. |
+| Alias (DWARF expr alias) | `let a = global.arr;`, `let p = &buf[0];` | A named alias to any DWARF expression (variable, member, array, pointer deref, or address‑of). Lets you give short names to complex types/paths and reuse them. | Supports the same complex access as the underlying DWARF type: member access (`a.field`), constant index (`a[0]`), address‑of (`&a`), and use in `memcmp/strncmp/starts_with` and `{:x.N}`/`{:s.N}`/`{:p}`. Pointer arithmetic remains limited to adding a non‑negative constant. |
 
 Notes:
-1. Script variables do not expose structs/arrays/pointers. Access those through DWARF variables (member access, deref, constant index) to obtain scalars first. The only exception is an alias variable created via address‑of (`&expr` or `&expr + <const>`), which serves as a named address for use in memory operations and pointer/byte formatting.
+1. Script variables do not expose structs/arrays/pointers. Access those through DWARF variables (member access, deref, constant index) to obtain scalars first. The exception is an alias variable, which can bind to any DWARF expression and be used as a reusable base for member/index access, address‑of, and memory formatting.
+
+Examples:
+
+```ghostscope
+// Alias a complex DWARF path and reuse it
+let a = global_var.arr;   // arr is DWARF array/aggregate
+print "ptr={:p}", &a;     // take address of alias
+print a[1];               // index on alias
+
+// Address-of aliases still work
+let p = &conn.buf[0];
+print "h={:x.16}", p;
+```
 2. Floats are not supported in scripts or runtime.
 3. Unary minus `-` is supported and can nest (e.g., `-1`, `-(-1)`), parsed as `0 - expr`.
 4. Transport encodes booleans as 0/1; renderers display `true/false`.
