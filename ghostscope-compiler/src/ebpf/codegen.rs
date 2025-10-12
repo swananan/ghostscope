@@ -998,41 +998,9 @@ impl<'ctx> EbpfContext<'ctx> {
                 (self.is_alias_candidate_expr(left) && is_const_nonneg(right))
                     || (self.is_alias_candidate_expr(right) && is_const_nonneg(left))
             }
-            // Otherwise, probe DWARF type: only pointer/array expressions are treated as alias
-            other => {
-                match self.query_dwarf_for_complex_expr(other) {
-                    Ok(Some(var)) => {
-                        // unwrap typedef/qualified
-                        let mut ty_opt = var.dwarf_type.as_ref();
-                        while let Some(ty) = ty_opt {
-                            match ty {
-                                ghostscope_dwarf::TypeInfo::TypedefType {
-                                    underlying_type, ..
-                                } => {
-                                    ty_opt = Some(underlying_type.as_ref());
-                                }
-                                ghostscope_dwarf::TypeInfo::QualifiedType {
-                                    underlying_type,
-                                    ..
-                                } => {
-                                    ty_opt = Some(underlying_type.as_ref());
-                                }
-                                _ => break,
-                            }
-                        }
-                        if let Some(ty) = ty_opt {
-                            matches!(
-                                ty,
-                                ghostscope_dwarf::TypeInfo::PointerType { .. }
-                                    | ghostscope_dwarf::TypeInfo::ArrayType { .. }
-                            )
-                        } else {
-                            false
-                        }
-                    }
-                    _ => false,
-                }
-            }
+            // Otherwise, probe DWARF type: any DWARF-backed expression (pointer/array/struct/union/enum)
+            // is treated as an alias so it can be used as a reusable base for member/index/address-of.
+            other => matches!(self.query_dwarf_for_complex_expr(other), Ok(Some(_))),
         }
     }
 
@@ -4603,6 +4571,64 @@ mod tests {
         let program = crate::script::Program::new();
         let res = ctx.compile_program(&program, "alias_copy", &[a, b], None, None, None);
         assert!(res.is_ok(), "expected alias-to-alias copy to compile");
+    }
+
+    #[test]
+    fn alias_self_reference_is_rejected_with_cycle_error() {
+        let context = inkwell::context::Context::create();
+        let opts = CompileOptions::default();
+        let mut ctx = EbpfContext::new(&context, "test_mod", Some(0), &opts).expect("ctx");
+
+        // let a = &a; print a;
+        let a = crate::script::Statement::AliasDeclaration {
+            name: "a".to_string(),
+            target: crate::script::Expr::AddressOf(Box::new(crate::script::Expr::Variable(
+                "a".to_string(),
+            ))),
+        };
+        let p = crate::script::Statement::Print(crate::script::PrintStatement::ComplexVariable(
+            crate::script::Expr::Variable("a".to_string()),
+        ));
+        let program = crate::script::Program::new();
+        let res = ctx.compile_program(&program, "alias_self", &[a, p], None, None, None);
+        assert!(res.is_err(), "expected cycle error, got {res:?}");
+        let msg = format!("{:?}", res.err());
+        assert!(
+            msg.contains("alias cycle") || msg.contains("depth exceeded"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn alias_mutual_cycle_is_rejected_with_cycle_error() {
+        let context = inkwell::context::Context::create();
+        let opts = CompileOptions::default();
+        let mut ctx = EbpfContext::new(&context, "test_mod", Some(0), &opts).expect("ctx");
+
+        // let a = &b; let b = &a; print a;
+        let a = crate::script::Statement::AliasDeclaration {
+            name: "a".to_string(),
+            target: crate::script::Expr::AddressOf(Box::new(crate::script::Expr::Variable(
+                "b".to_string(),
+            ))),
+        };
+        let b = crate::script::Statement::AliasDeclaration {
+            name: "b".to_string(),
+            target: crate::script::Expr::AddressOf(Box::new(crate::script::Expr::Variable(
+                "a".to_string(),
+            ))),
+        };
+        let p = crate::script::Statement::Print(crate::script::PrintStatement::ComplexVariable(
+            crate::script::Expr::Variable("a".to_string()),
+        ));
+        let program = crate::script::Program::new();
+        let res = ctx.compile_program(&program, "alias_cycle", &[a, b, p], None, None, None);
+        assert!(res.is_err(), "expected cycle error, got {res:?}");
+        let msg = format!("{:?}", res.err());
+        assert!(
+            msg.contains("alias cycle") || msg.contains("depth exceeded"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]

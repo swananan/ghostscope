@@ -65,20 +65,77 @@ impl<'ctx> EbpfContext<'ctx> {
         &mut self,
         e: &Expr,
     ) -> Result<inkwell::values::IntValue<'ctx>> {
+        let mut visited = std::collections::HashSet::new();
+        self.resolve_ptr_i64_from_expr_internal(e, &mut visited, 0)
+    }
+
+    fn resolve_ptr_i64_from_expr_internal(
+        &mut self,
+        e: &Expr,
+        visited: &mut std::collections::HashSet<String>,
+        depth: usize,
+    ) -> Result<inkwell::values::IntValue<'ctx>> {
         use crate::script::ast::BinaryOp as BO;
         use crate::script::ast::Expr as E;
         use inkwell::values::BasicValueEnum::*;
+        const MAX_DEPTH: usize = 64;
+        if depth > MAX_DEPTH {
+            return Err(CodeGenError::TypeError(
+                "alias expansion depth exceeded (cycle?)".into(),
+            ));
+        }
         // Alias variable indirection: resolve its target expression first
         if let E::Variable(name) = e {
             if self.alias_variable_exists(name) {
+                if !visited.insert(name.clone()) {
+                    return Err(CodeGenError::TypeError(format!(
+                        "alias cycle detected for '{name}'"
+                    )));
+                }
                 if let Some(target) = self.get_alias_variable(name) {
-                    return self.resolve_ptr_i64_from_expr(&target);
+                    let r = self.resolve_ptr_i64_from_expr_internal(&target, visited, depth + 1);
+                    visited.remove(name);
+                    return r;
                 }
             }
         }
         // Special-case: explicit address-of must yield a pointer-sized address
         if let E::AddressOf(inner) = e {
-            if let Some(var) = self.query_dwarf_for_complex_expr(inner)? {
+            // Support alias variables transparently: &alias -> address of aliased DWARF expr
+            let resolved_inner: &E = if let E::Variable(name) = inner.as_ref() {
+                if self.alias_variable_exists(name) {
+                    // Owned target for query
+                    if let Some(target) = self.get_alias_variable(name) {
+                        if let Some(var) = self.query_dwarf_for_complex_expr(&target)? {
+                            let module_hint = self.current_resolved_var_module_path.clone();
+                            let status_ptr = if self.condition_context_active {
+                                Some(self.get_or_create_cond_error_global())
+                            } else {
+                                None
+                            };
+                            return self.evaluation_result_to_address_with_hint(
+                                &var.evaluation_result,
+                                status_ptr,
+                                module_hint.as_deref(),
+                            );
+                        } else {
+                            return Err(CodeGenError::TypeError(
+                                "cannot take address of unresolved expression".into(),
+                            ));
+                        }
+                    } else {
+                        return Err(CodeGenError::TypeError(
+                            "cannot take address of unresolved expression".into(),
+                        ));
+                    }
+                } else {
+                    inner.as_ref()
+                }
+            } else {
+                inner.as_ref()
+            };
+
+            if let Some(var) = self.query_dwarf_for_complex_expr(resolved_inner)? {
                 let module_hint = self.current_resolved_var_module_path.clone();
                 let status_ptr = if self.condition_context_active {
                     Some(self.get_or_create_cond_error_global())
@@ -103,7 +160,9 @@ impl<'ctx> EbpfContext<'ctx> {
                 let is_nonneg_lit = |x: &E| matches!(x, E::Int(v) if *v >= 0);
                 // alias + K
                 if is_nonneg_lit(right) {
-                    if let Ok(base) = self.resolve_ptr_i64_from_expr(left) {
+                    if let Ok(base) =
+                        self.resolve_ptr_i64_from_expr_internal(left, visited, depth + 1)
+                    {
                         if let E::Int(k) = &**right {
                             let off = self.context.i64_type().const_int(*k as u64, false);
                             return self
@@ -115,7 +174,9 @@ impl<'ctx> EbpfContext<'ctx> {
                 }
                 // K + alias
                 if is_nonneg_lit(left) {
-                    if let Ok(base) = self.resolve_ptr_i64_from_expr(right) {
+                    if let Ok(base) =
+                        self.resolve_ptr_i64_from_expr_internal(right, visited, depth + 1)
+                    {
                         if let E::Int(k) = &**left {
                             let off = self.context.i64_type().const_int(*k as u64, false);
                             return self
@@ -1283,11 +1344,56 @@ impl<'ctx> EbpfContext<'ctx> {
             }
             Expr::AddressOf(inner) => {
                 // Address-of with ASLR-aware hint: compute runtime address using module hint
-                let var = self.query_dwarf_for_complex_expr(inner)?.ok_or_else(|| {
-                    super::context::CodeGenError::TypeError(
-                        "cannot take address of unresolved expression".to_string(),
-                    )
-                })?;
+                // Transparently support alias variables: &alias -> address of aliased DWARF expression
+                let target_inner: &Expr = if let Expr::Variable(var_name) = inner.as_ref() {
+                    if self.alias_variable_exists(var_name) {
+                        // Use the aliased target expression (by-value) and query DWARF on it
+                        let aliased = self
+                            .get_alias_variable(var_name)
+                            .expect("alias existence just checked");
+                        // First perform the DWARF query so that current_resolved_var_module_path
+                        // is set for the aliased symbol's module; then capture the hint.
+                        let var =
+                            self.query_dwarf_for_complex_expr(&aliased)?
+                                .ok_or_else(|| {
+                                    super::context::CodeGenError::TypeError(
+                                        "cannot take address of unresolved expression".to_string(),
+                                    )
+                                })?;
+                        let module_hint = self.current_resolved_var_module_path.clone();
+                        match self.evaluation_result_to_address_with_hint(
+                            &var.evaluation_result,
+                            None,
+                            module_hint.as_deref(),
+                        ) {
+                            Ok(addr_i64) => {
+                                let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                                let as_ptr = self
+                                    .builder
+                                    .build_int_to_ptr(addr_i64, ptr_ty, "addr_as_ptr")
+                                    .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                                return Ok(as_ptr.into());
+                            }
+                            Err(_) => {
+                                return Err(super::context::CodeGenError::TypeError(
+                                    "cannot take address of rvalue".to_string(),
+                                ));
+                            }
+                        }
+                    } else {
+                        inner.as_ref()
+                    }
+                } else {
+                    inner.as_ref()
+                };
+
+                let var = self
+                    .query_dwarf_for_complex_expr(target_inner)?
+                    .ok_or_else(|| {
+                        super::context::CodeGenError::TypeError(
+                            "cannot take address of unresolved expression".to_string(),
+                        )
+                    })?;
                 // Use current resolved hint if available (set during DWARF resolution)
                 let module_hint = self.current_resolved_var_module_path.clone();
                 match self.evaluation_result_to_address_with_hint(
