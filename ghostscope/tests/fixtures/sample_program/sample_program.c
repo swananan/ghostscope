@@ -68,6 +68,9 @@ int main() {
         if (counter % 10 == 0) {
             double avg = calculate_average(numbers, 5);
         }
+
+        // Void pointer sink call for pointer-arithmetic fallback tests
+        sink_void(numbers);
         
         // printf("Sleeping for 2 seconds...\n");
         sleep(2);  // Sleep for 2 seconds

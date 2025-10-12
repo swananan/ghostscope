@@ -2014,6 +2014,92 @@ impl<'ctx> EbpfContext<'ctx> {
 
         steps
     }
+
+    /// Compute a typed pointed-to location for expressions like `ptr +/- K` where K is an element index.
+    /// Returns a computed location EvaluationResult along with the pointed-to DWARF type.
+    /// The offset is scaled by the element size of the pointer/array target type.
+    pub fn compute_pointed_location_with_index(
+        &mut self,
+        ptr_expr: &crate::script::Expr,
+        index: i64,
+    ) -> Result<(EvaluationResult, TypeInfo)> {
+        use ghostscope_dwarf::{
+            ComputeStep, EvaluationResult as ER, LocationResult as LR, TypeInfo,
+        };
+
+        // Resolve the pointer expression via DWARF
+        let ptr_var = self
+            .query_dwarf_for_complex_expr(ptr_expr)?
+            .ok_or_else(|| CodeGenError::VariableNotFound(format!("{ptr_expr:?}")))?;
+
+        let ptr_ty = ptr_var.dwarf_type.as_ref().ok_or_else(|| {
+            CodeGenError::DwarfError("Expression has no DWARF type information".to_string())
+        })?;
+
+        // Unwrap typedef/qualified wrappers
+        let mut ty = ptr_ty;
+        loop {
+            match ty {
+                TypeInfo::TypedefType {
+                    underlying_type, ..
+                } => ty = underlying_type.as_ref(),
+                TypeInfo::QualifiedType {
+                    underlying_type, ..
+                } => ty = underlying_type.as_ref(),
+                _ => break,
+            }
+        }
+
+        // Extract pointed-to (element) type and element size
+        let (elem_ty, elem_size) = match ty {
+            TypeInfo::PointerType { target_type, .. } => {
+                let et = target_type.as_ref().clone();
+                let es = et.size();
+                let es = if es == 0 { 1 } else { es };
+                (et, es)
+            }
+            TypeInfo::ArrayType { element_type, .. } => {
+                let et = element_type.as_ref().clone();
+                let es = et.size();
+                let es = if es == 0 { 1 } else { es };
+                (et, es)
+            }
+            TypeInfo::FunctionType { .. } => {
+                return Err(CodeGenError::TypeError(
+                    "Pointer arithmetic is not supported on function pointers".to_string(),
+                ))
+            }
+            _ => {
+                return Err(CodeGenError::TypeError(
+                    "Pointer arithmetic requires a pointer or array expression".to_string(),
+                ))
+            }
+        };
+
+        // First compute the base pointed-to location for `*ptr_expr`
+        let base_loc_eval = self.compute_pointer_dereference(&ptr_var.evaluation_result)?;
+        let base_loc = match &base_loc_eval {
+            ER::MemoryLocation(loc) => loc,
+            _ => {
+                return Err(CodeGenError::DwarfError(
+                    "Failed to compute base location for pointer arithmetic".to_string(),
+                ))
+            }
+        };
+
+        // Build compute steps: base_address + index * elem_size
+        let steps = {
+            let mut s = self.location_to_compute_steps(base_loc);
+            // scale index by element size (can be negative)
+            s.push(ComputeStep::PushConstant(index));
+            s.push(ComputeStep::PushConstant(elem_size as i64));
+            s.push(ComputeStep::Mul);
+            s.push(ComputeStep::Add);
+            s
+        };
+
+        Ok((ER::MemoryLocation(LR::ComputedLocation { steps }), elem_ty))
+    }
 }
 
 #[cfg(test)]

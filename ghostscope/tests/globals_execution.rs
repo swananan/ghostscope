@@ -291,7 +291,8 @@ trace tick_once {
     let has_banner = stderr_buf.contains("Script compilation failed")
         || stderr_buf.contains("No uprobe configurations created");
     let has_friendly = stderr_buf
-        .contains("Unsupported arithmetic/ordered comparison involving struct/union/array");
+        .contains("Unsupported arithmetic/ordered comparison involving struct/union/array")
+        || stderr_buf.contains("Pointer arithmetic requires a pointer or array expression");
     assert!(
         has_banner && has_friendly,
         "Expected friendly struct arithmetic rejection.\nSTDERR: {}\nSTDOUT: {}",

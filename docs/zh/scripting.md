@@ -397,6 +397,29 @@ trace main:entry {
 }
 ```
 
+### 指针算术（按 C 语义）
+
+受控地支持 C 风格的指针算术：
+
+- 允许：`ptr + int`、`int + ptr`、`ptr - int`。
+- 步长缩放：按指针目标类型的元素大小缩放偏移量（C 语义）。例如 `int* p`，`p + 2` 前进 `2 * sizeof(int)` 个字节。
+- 在 `print` 中的行为：当用于 `print` 参数时，`p ± n` 会在计算出的地址按被指向的 DWARF 类型读取并展示内容。比如在 `int* numbers` 上 `print numbers + 1;` 会显示第二个整型。
+- `void*`/未知类型：若无法获得类型信息，则按 1 字节缩放。
+- 不支持：函数指针的算术；指针与指针的算术（`p + q`、`p - q`）。指针的有序比较（`<`、`<=`、`>`、`>=`）会被编译期拒绝；使用 `==`/`!=`。
+
+示例：
+
+```ghostscope
+trace calculate_average {
+    print numbers;       // 依据上下文打印地址或首元素
+    print numbers + 1;   // 打印第二个 int（按照 sizeof(int) 缩放）
+}
+
+trace log_activity {
+    print activity + 1;  // 对于 const char* activity，打印下一个字符
+}
+```
+
 ### 脚本变量与 DWARF 变量的跨类型运算
 
 #### 算术（+、-、*、/）

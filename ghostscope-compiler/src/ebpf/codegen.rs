@@ -431,6 +431,131 @@ impl<'ctx> EbpfContext<'ctx> {
                 }
             }
 
+            // 7) Pointer arithmetic (ptr +/- K) → typed runtime read at computed address
+            E::BinaryOp { left, op, right } => {
+                use crate::script::ast::BinaryOp as BO;
+                // Support: ptr + int, int + ptr, ptr - int (int may be negative)
+                // Only allow when ptr side resolves to DWARF pointer/array; the offset must be an integer literal for now.
+                // We emit a RuntimeRead with computed location, preserving the pointed-to DWARF type.
+                let (ptr_side, int_side, sign) = match (&**left, op, &**right) {
+                    (l, BO::Add, E::Int(k)) => (l, *k, 1),
+                    (E::Int(k), BO::Add, r) => (r, *k, 1),
+                    (l, BO::Subtract, E::Int(k)) => (l, *k, -1),
+                    _ => {
+                        // Fallback to generic expression handling below
+                        let compiled = self.compile_expr(expr)?;
+                        if let BasicValueEnum::IntValue(iv) = compiled {
+                            let bitw = iv.get_type().get_bit_width();
+                            let (kind, byte_len) = if bitw == 1 {
+                                (TypeKind::Bool, 1)
+                            } else if bitw <= 8 {
+                                (TypeKind::I8, 1)
+                            } else if bitw <= 16 {
+                                (TypeKind::I16, 2)
+                            } else if bitw <= 32 {
+                                (TypeKind::I32, 4)
+                            } else {
+                                (TypeKind::I64, 8)
+                            };
+                            return Ok(ComplexArg {
+                                var_name_index: self
+                                    .trace_context
+                                    .add_variable_name(self.expr_to_name(expr)),
+                                type_index: self.add_synthesized_type_index_for_kind(kind),
+                                access_path: Vec::new(),
+                                data_len: byte_len,
+                                source: ComplexArgSource::ComputedInt {
+                                    value: iv,
+                                    byte_len,
+                                },
+                            });
+                        } else {
+                            return Err(CodeGenError::TypeError(
+                                "Non-integer expression not supported in print".to_string(),
+                            ));
+                        }
+                    }
+                };
+
+                // Try DWARF resolution for the pointer side
+                if let Some(var) = self.query_dwarf_for_complex_expr(ptr_side)? {
+                    if var.dwarf_type.is_some() {
+                        // Determine pointed-to/element type and compute location with scaled offset
+                        let index = sign * int_side;
+                        let (eval_result, elem_ty) =
+                            self.compute_pointed_location_with_index(ptr_side, index)?;
+                        let data_len = Self::compute_read_size_for_type(&elem_ty);
+                        let module_hint = self.take_module_hint();
+                        if data_len == 0 {
+                            // Fallback for unsized/void targets: print computed address as pointer
+                            let ptr_ti = ghostscope_dwarf::TypeInfo::PointerType {
+                                target_type: Box::new(elem_ty.clone()),
+                                size: 8,
+                            };
+                            return Ok(ComplexArg {
+                                var_name_index: self
+                                    .trace_context
+                                    .add_variable_name(self.expr_to_name(expr)),
+                                type_index: self.trace_context.add_type(ptr_ti),
+                                access_path: Vec::new(),
+                                data_len: 8,
+                                source: ComplexArgSource::AddressValue {
+                                    eval_result,
+                                    module_for_offsets: module_hint,
+                                },
+                            });
+                        }
+                        return Ok(ComplexArg {
+                            var_name_index: self
+                                .trace_context
+                                .add_variable_name(self.expr_to_name(expr)),
+                            type_index: self.trace_context.add_type(elem_ty.clone()),
+                            access_path: Vec::new(),
+                            data_len,
+                            source: ComplexArgSource::RuntimeRead {
+                                eval_result,
+                                dwarf_type: elem_ty,
+                                module_for_offsets: module_hint,
+                            },
+                        });
+                    }
+                }
+
+                // If pointer side cannot be resolved as DWARF pointer/array, fall back to computed int
+                let compiled = self.compile_expr(expr)?;
+                if let BasicValueEnum::IntValue(iv) = compiled {
+                    let bitw = iv.get_type().get_bit_width();
+                    let (kind, byte_len) = if bitw == 1 {
+                        (TypeKind::Bool, 1)
+                    } else if bitw <= 8 {
+                        (TypeKind::I8, 1)
+                    } else if bitw <= 16 {
+                        (TypeKind::I16, 2)
+                    } else if bitw <= 32 {
+                        (TypeKind::I32, 4)
+                    } else {
+                        (TypeKind::I64, 8)
+                    };
+                    Ok(ComplexArg {
+                        var_name_index: self
+                            .trace_context
+                            .add_variable_name(self.expr_to_name(expr)),
+                        type_index: self.add_synthesized_type_index_for_kind(kind),
+                        access_path: Vec::new(),
+                        data_len: byte_len,
+                        source: ComplexArgSource::ComputedInt {
+                            value: iv,
+                            byte_len,
+                        },
+                    })
+                } else {
+                    Err(CodeGenError::TypeError(
+                        "Non-integer expression not supported in print".to_string(),
+                    ))
+                }
+            }
+
+            // 8) Binary和其它 rvalue → 计算为 computed int
             // 7) Binary and other rvalue expressions → compile to computed int
             other => {
                 let compiled = self.compile_expr(other)?;
