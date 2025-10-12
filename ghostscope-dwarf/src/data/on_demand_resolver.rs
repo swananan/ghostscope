@@ -57,7 +57,6 @@ impl OnDemandResolver {
         chain: ChainSpec,
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
     ) -> Result<Option<crate::parser::VariableWithEvaluation>> {
-        let t0 = std::time::Instant::now();
         tracing::info!(
             "DWARF:plan_from_var addr=0x{:x} cu_off={:?} subprogram={:?} var_die={:?} base='{}' chain_len={}",
             address,
@@ -72,7 +71,6 @@ impl OnDemandResolver {
         let var_entry = unit.entry(var_die)?;
 
         // Evaluate base variable (without heavy type resolution)
-        let eval_t = std::time::Instant::now();
         let base_var = self.detailed_parser.parse_variable_entry_with_mode(
             &var_entry,
             &unit,
@@ -81,10 +79,7 @@ impl OnDemandResolver {
             get_cfa,
             0,
         )?;
-        tracing::info!(
-            "DWARF:plan_from_var eval_loc_ms={}",
-            eval_t.elapsed().as_millis()
-        );
+        tracing::debug!("DWARF:plan_from_var done",);
         let Some(base_var) = base_var else {
             return Ok(None);
         };
@@ -201,7 +196,7 @@ impl OnDemandResolver {
             is_parameter: base_var.is_parameter,
             is_artificial: base_var.is_artificial,
         };
-        tracing::info!("DWARF:plan_from_var total_ms={}", t0.elapsed().as_millis());
+        tracing::debug!("DWARF:plan_from_var done");
         Ok(Some(var))
     }
 

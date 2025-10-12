@@ -199,7 +199,8 @@ trace sink_void {
         "unexpected error: stderr={stderr}\nstdout={stdout}"
     );
 
-    // Expect something like: (p+1) = 0x... 或直接 0x... (void*)（AddressValue 走 ComplexFormat 的情况）
+    // Expect something like: (p+1) = 0x... or plain 0x... (void*)
+    // This covers the AddressValue path rendered via ComplexFormat
     let mut saw_addr = false;
     for line in stdout.lines() {
         let t = line.trim();

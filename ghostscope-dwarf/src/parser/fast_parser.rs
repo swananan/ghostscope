@@ -9,6 +9,7 @@ use crate::{
     parser::RangeExtractor,
 };
 use gimli::{EndianArcSlice, LittleEndian, Reader};
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use tracing::debug;
 
@@ -40,6 +41,23 @@ pub(crate) struct SourceFile {
     pub filename: String,
     /// Full resolved path.
     pub full_path: String,
+}
+
+// Shard container for per-CU parsed results (functions/variables/types)
+#[derive(Default)]
+struct InfoShard {
+    functions: HashMap<String, Vec<IndexEntry>>,
+    variables: HashMap<String, Vec<IndexEntry>>,
+    types: HashMap<String, Vec<IndexEntry>>,
+}
+
+// Shard for line info per CU
+#[derive(Default)]
+struct LineShard {
+    line_entries: Vec<crate::core::LineEntry>,
+    compilation_units: HashMap<String, CompilationUnit>,
+    file_indices: Vec<(String, LightweightFileIndex)>,
+    files_count: usize,
 }
 
 /// Complete result of DWARF parsing
@@ -83,6 +101,245 @@ pub(crate) struct DwarfParser<'a> {
 
 /// Internal builder for accumulating parse results
 impl<'a> DwarfParser<'a> {
+    fn process_unit_shard(
+        &self,
+        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
+        unit_offset: gimli::DebugInfoOffset,
+        cu_language: Option<gimli::DwLang>,
+    ) -> Result<InfoShard> {
+        let mut shard = InfoShard::default();
+        let mut entries = unit.entries();
+        let mut metadata_cache: HashMap<gimli::UnitOffset, FunctionMetadata> = HashMap::new();
+        let mut tag_stack: Vec<gimli::DwTag> = Vec::new();
+        while let Some((depth, entry)) = entries.next_dfs()? {
+            let d: usize = depth as usize;
+            while tag_stack.len() > d {
+                tag_stack.pop();
+            }
+            match entry.tag() {
+                gimli::constants::DW_TAG_subprogram => {
+                    let mut visited = HashSet::new();
+                    let metadata = self.resolve_function_metadata(
+                        self.dwarf,
+                        unit,
+                        entry,
+                        &mut metadata_cache,
+                        &mut visited,
+                    )?;
+                    if let Some(name) = metadata.name.clone() {
+                        let is_main = self.is_main_function(entry, &name).unwrap_or(false);
+                        let is_static = metadata
+                            .is_external
+                            .map(|external| !external)
+                            .unwrap_or_else(|| self.is_static_symbol(entry).unwrap_or(false));
+                        let flags = crate::core::IndexFlags {
+                            is_static,
+                            is_main,
+                            is_inline: metadata.is_inline,
+                            is_linkage: metadata.is_linkage_name,
+                            ..Default::default()
+                        };
+                        let address_ranges =
+                            self.extract_address_ranges(self.dwarf, unit, entry)?;
+                        let entry_pc_cached = self.extract_entry_pc(entry)?;
+                        let index_entry = IndexEntry {
+                            name: std::sync::Arc::from(name.as_str()),
+                            die_offset: entry.offset(),
+                            unit_offset,
+                            tag: entry.tag(),
+                            flags,
+                            language: cu_language,
+                            address_ranges: address_ranges.clone(),
+                            entry_pc: entry_pc_cached,
+                        };
+                        shard
+                            .functions
+                            .entry(name.clone())
+                            .or_default()
+                            .push(index_entry);
+                        if let Some((linkage_name, _)) =
+                            self.extract_linkage_name(self.dwarf, unit, entry)?
+                        {
+                            if linkage_name != metadata.name.clone().unwrap_or_default() {
+                                let mut alias_flags = flags;
+                                alias_flags.is_linkage = true;
+                                let index_entry_linkage = IndexEntry {
+                                    name: std::sync::Arc::from(linkage_name.as_str()),
+                                    die_offset: entry.offset(),
+                                    unit_offset,
+                                    tag: entry.tag(),
+                                    flags: alias_flags,
+                                    language: cu_language,
+                                    address_ranges: address_ranges.clone(),
+                                    entry_pc: entry_pc_cached,
+                                };
+                                shard
+                                    .functions
+                                    .entry(linkage_name)
+                                    .or_default()
+                                    .push(index_entry_linkage);
+                            }
+                        }
+                    }
+                }
+                gimli::constants::DW_TAG_inlined_subroutine => {
+                    let mut visited = HashSet::new();
+                    let metadata = self.resolve_function_metadata(
+                        self.dwarf,
+                        unit,
+                        entry,
+                        &mut metadata_cache,
+                        &mut visited,
+                    )?;
+                    if let Some(name) = metadata.name.clone() {
+                        let is_static = metadata
+                            .is_external
+                            .map(|external| !external)
+                            .unwrap_or(false);
+                        let flags = crate::core::IndexFlags {
+                            is_static,
+                            is_inline: true,
+                            is_linkage: metadata.is_linkage_name,
+                            ..Default::default()
+                        };
+                        let address_ranges =
+                            self.extract_address_ranges(self.dwarf, unit, entry)?;
+                        let entry_pc_cached = self.extract_entry_pc(entry)?;
+                        let index_entry = IndexEntry {
+                            name: std::sync::Arc::from(name.as_str()),
+                            die_offset: entry.offset(),
+                            unit_offset,
+                            tag: entry.tag(),
+                            flags,
+                            language: cu_language,
+                            address_ranges: address_ranges.clone(),
+                            entry_pc: entry_pc_cached,
+                        };
+                        shard
+                            .functions
+                            .entry(name.clone())
+                            .or_default()
+                            .push(index_entry);
+                        if let Some((linkage_name, _)) =
+                            self.extract_linkage_name(self.dwarf, unit, entry)?
+                        {
+                            if linkage_name != metadata.name.clone().unwrap_or_default() {
+                                let mut alias_flags = flags;
+                                alias_flags.is_linkage = true;
+                                let index_entry_linkage = IndexEntry {
+                                    name: std::sync::Arc::from(linkage_name.as_str()),
+                                    die_offset: entry.offset(),
+                                    unit_offset,
+                                    tag: entry.tag(),
+                                    flags: alias_flags,
+                                    language: cu_language,
+                                    address_ranges: address_ranges.clone(),
+                                    entry_pc: entry_pc_cached,
+                                };
+                                shard
+                                    .functions
+                                    .entry(linkage_name)
+                                    .or_default()
+                                    .push(index_entry_linkage);
+                            }
+                        }
+                    }
+                }
+                gimli::constants::DW_TAG_variable => {
+                    let in_function_scope = tag_stack.iter().any(|t| {
+                        *t == gimli::constants::DW_TAG_subprogram
+                            || *t == gimli::constants::DW_TAG_inlined_subroutine
+                    });
+                    if in_function_scope {
+                        // Skip local variables
+                        tag_stack.push(entry.tag());
+                        continue;
+                    }
+                    if Self::is_declaration(entry).unwrap_or(false) {
+                        tag_stack.push(entry.tag());
+                        continue;
+                    }
+                    if let Some(name) = self.extract_name(self.dwarf, unit, entry)? {
+                        let flags = crate::core::IndexFlags {
+                            is_static: self.is_static_symbol(entry).unwrap_or(false),
+                            ..Default::default()
+                        };
+                        // Restore variable address for globals/statics via DW_AT_location
+                        let var_addr = self.extract_variable_address(entry, unit)?;
+                        let var_ranges = var_addr.map(|a| vec![(a, a)]).unwrap_or_default();
+                        let index_entry = IndexEntry {
+                            name: std::sync::Arc::from(name.as_str()),
+                            die_offset: entry.offset(),
+                            unit_offset,
+                            tag: entry.tag(),
+                            flags,
+                            language: cu_language,
+                            address_ranges: var_ranges.clone(),
+                            entry_pc: None,
+                        };
+                        shard
+                            .variables
+                            .entry(name.clone())
+                            .or_default()
+                            .push(index_entry);
+                        if let Some((linkage_name, _)) =
+                            self.extract_linkage_name(self.dwarf, unit, entry)?
+                        {
+                            if linkage_name != name {
+                                let mut alias_flags = flags;
+                                alias_flags.is_linkage = true;
+                                let index_entry_linkage = IndexEntry {
+                                    name: std::sync::Arc::from(linkage_name.as_str()),
+                                    die_offset: entry.offset(),
+                                    unit_offset,
+                                    tag: entry.tag(),
+                                    flags: alias_flags,
+                                    language: cu_language,
+                                    address_ranges: var_ranges,
+                                    entry_pc: None,
+                                };
+                                shard
+                                    .variables
+                                    .entry(linkage_name)
+                                    .or_default()
+                                    .push(index_entry_linkage);
+                            }
+                        }
+                    }
+                }
+                gimli::constants::DW_TAG_structure_type
+                | gimli::constants::DW_TAG_class_type
+                | gimli::constants::DW_TAG_union_type
+                | gimli::constants::DW_TAG_enumeration_type
+                | gimli::constants::DW_TAG_typedef => {
+                    if let Some(name) = self.extract_name(self.dwarf, unit, entry)? {
+                        let is_decl = match entry.attr(gimli::constants::DW_AT_declaration)? {
+                            Some(attr) => matches!(attr.value(), gimli::AttributeValue::Flag(true)),
+                            None => false,
+                        };
+                        let flags = crate::core::IndexFlags {
+                            is_type_declaration: is_decl,
+                            ..Default::default()
+                        };
+                        let index_entry = IndexEntry {
+                            name: std::sync::Arc::from(name.as_str()),
+                            die_offset: entry.offset(),
+                            unit_offset,
+                            tag: entry.tag(),
+                            flags,
+                            language: cu_language,
+                            address_ranges: Vec::new(),
+                            entry_pc: None,
+                        };
+                        shard.types.entry(name).or_default().push(index_entry);
+                    }
+                }
+                _ => {}
+            }
+            tag_stack.push(entry.tag());
+        }
+        Ok(shard)
+    }
     pub fn new(dwarf: &'a gimli::Dwarf<EndianArcSlice<LittleEndian>>) -> Self {
         Self { dwarf }
     }
@@ -453,102 +710,117 @@ impl<'a> DwarfParser<'a> {
     pub fn parse_line_info(&self, module_path: &str) -> Result<LineParseResult> {
         debug!("Starting debug_line-only parsing for: {}", module_path);
 
+        // Collect CU headers once
+        let mut headers: Vec<gimli::UnitHeader<EndianArcSlice<LittleEndian>>> = Vec::new();
+        let mut units = self.dwarf.units();
+        while let Ok(Some(h)) = units.next() {
+            headers.push(h);
+        }
+
+        // Sort headers by size (descending) for better load balance under work-stealing
+        headers.sort_by_key(|h| std::cmp::Reverse(h.length_including_self() as u64));
+
+        // Parallel process each CU into shards
+        let shard_results: Vec<Result<LineShard>> = headers
+            .into_par_iter()
+            .map(|unit_header| -> Result<LineShard> {
+                let mut shard = LineShard::default();
+                let version = unit_header.version();
+                let unit = self.dwarf.unit(unit_header)?;
+                if let Some(ref line_program) = unit.line_program {
+                    // CU name and comp_dir
+                    let cu_name = Self::extract_cu_name_from_dwarf(self.dwarf, &unit)
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let comp_dir = Self::extract_comp_dir_from_dwarf(self.dwarf, &unit);
+
+                    // Build file index for this CU
+                    let mut file_index = LightweightFileIndex::new(comp_dir, version);
+                    let header = line_program.header();
+                    for dir_entry in header.include_directories() {
+                        if let Ok(dir_path) = self.dwarf.attr_string(&unit, dir_entry.clone()) {
+                            if let Ok(s_str) = dir_path.to_string_lossy() {
+                                file_index.add_directory(s_str.into_owned());
+                            }
+                        }
+                    }
+                    for (file_idx, file_entry) in header.file_names().iter().enumerate() {
+                        let file_index_value = if header.version() >= 5 {
+                            file_idx as u64
+                        } else {
+                            (file_idx + 1) as u64
+                        };
+                        if let Ok(filename) = self.dwarf.attr_string(&unit, file_entry.path_name())
+                        {
+                            let dir_index = file_entry.directory_index();
+                            if let Ok(s_str) = filename.to_string_lossy() {
+                                file_index.add_file_entry(
+                                    file_index_value,
+                                    dir_index,
+                                    s_str.into_owned(),
+                                );
+                            }
+                        }
+                    }
+
+                    // Build rich compilation unit metadata
+                    let compilation_unit = Self::extract_file_info_from_line_program_static(
+                        self.dwarf,
+                        &unit,
+                        line_program,
+                    )?;
+                    shard.files_count += compilation_unit.files.len();
+                    shard
+                        .compilation_units
+                        .insert(cu_name.clone(), compilation_unit);
+                    shard.file_indices.push((cu_name.clone(), file_index));
+
+                    // Extract line rows for this CU
+                    let (line_program, sequences) = line_program.clone().sequences()?;
+                    for seq in sequences {
+                        let mut rows = line_program.resume_from(&seq);
+                        while let Some((_, line_row)) = rows.next_row()? {
+                            let column = match line_row.column() {
+                                gimli::ColumnType::LeftEdge => 0,
+                                gimli::ColumnType::Column(x) => x.get(),
+                            };
+                            shard.line_entries.push(crate::core::LineEntry {
+                                address: line_row.address(),
+                                file_path: String::new(),
+                                file_index: line_row.file_index(),
+                                compilation_unit: std::sync::Arc::from(cu_name.as_str()),
+                                line: line_row.line().map(|l| l.get()).unwrap_or(0),
+                                column,
+                                is_stmt: line_row.is_stmt(),
+                                prologue_end: line_row.prologue_end(),
+                                epilogue_begin: line_row.epilogue_begin(),
+                                end_sequence: line_row.end_sequence(),
+                            });
+                        }
+                    }
+                }
+                Ok(shard)
+            })
+            .collect();
+
+        // Combine shards
         let mut scoped_file_manager = ScopedFileIndexManager::new();
         let mut line_entries = Vec::new();
-        let mut compilation_units = HashMap::new();
-        let mut total_files = 0;
+        let mut compilation_units: HashMap<String, CompilationUnit> = HashMap::new();
+        let mut total_files = 0usize;
 
-        // Parse all compilation units for line information only
-        let mut units = self.dwarf.units();
-        while let Ok(Some(unit_header)) = units.next() {
-            let version = unit_header.version();
-            let unit = self.dwarf.unit(unit_header)?;
-            if let Some(ref line_program) = unit.line_program {
-                // Get compilation unit name
-                let cu_name = Self::extract_cu_name_from_dwarf(self.dwarf, &unit)
-                    .unwrap_or_else(|| "unknown".to_string());
-                let comp_dir = Self::extract_comp_dir_from_dwarf(self.dwarf, &unit);
-
-                // Create lightweight file index for this CU
-                let mut file_index = LightweightFileIndex::new(comp_dir, version);
-
-                let header = line_program.header();
-
-                // Add directories from line program
-                for dir_entry in header.include_directories() {
-                    if let Ok(dir_path) = self.dwarf.attr_string(&unit, dir_entry.clone()) {
-                        if let Ok(s_str) = dir_path.to_string_lossy() {
-                            file_index.add_directory(s_str.into_owned());
-                        }
-                    }
-                }
-
-                // Add files from line program (minimal storage)
-                for (file_idx, file_entry) in header.file_names().iter().enumerate() {
-                    let file_index_value = if header.version() >= 5 {
-                        file_idx as u64 // DWARF 5: 0-based
-                    } else {
-                        (file_idx + 1) as u64 // DWARF 4: 1-based
-                    };
-
-                    if let Ok(filename) = self.dwarf.attr_string(&unit, file_entry.path_name()) {
-                        let dir_index = file_entry.directory_index();
-                        if let Ok(s_str) = filename.to_string_lossy() {
-                            file_index.add_file_entry(
-                                file_index_value,
-                                dir_index,
-                                s_str.into_owned(),
-                            );
-                        }
-                    }
-                }
-
-                // Build rich compilation unit metadata (directories + files)
-                let compilation_unit = Self::extract_file_info_from_line_program_static(
-                    self.dwarf,
-                    &unit,
-                    line_program,
-                )?;
-
-                total_files += compilation_unit.files.len();
-
-                compilation_units.insert(cu_name.clone(), compilation_unit);
-
-                // Add to scoped manager
-                scoped_file_manager.add_compilation_unit(cu_name.clone(), file_index);
-
-                // Extract line entries (file_index only, file_path resolved later via ScopedFileIndexManager)
-                let (line_program, sequences) = line_program.clone().sequences()?;
-                for seq in sequences {
-                    let mut rows = line_program.resume_from(&seq);
-                    while let Some((_, line_row)) = rows.next_row()? {
-                        let column = match line_row.column() {
-                            gimli::ColumnType::LeftEdge => 0,
-                            gimli::ColumnType::Column(x) => x.get(),
-                        };
-
-                        // Create LineEntry with file_index only (file_path resolved later via ScopedFileIndexManager)
-                        let line_entry = crate::core::LineEntry {
-                            address: line_row.address(),
-                            file_path: String::new(), // Placeholder, resolved later via ScopedFileIndexManager
-                            file_index: line_row.file_index(),
-                            compilation_unit: cu_name.clone(),
-                            line: line_row.line().map(|l| l.get()).unwrap_or(0),
-                            column,
-                            is_stmt: line_row.is_stmt(),
-                            prologue_end: line_row.prologue_end(),
-                            epilogue_begin: line_row.epilogue_begin(),
-                            end_sequence: line_row.end_sequence(),
-                        };
-
-                        line_entries.push(line_entry);
-                    }
-                }
+        for sr in shard_results {
+            let shard = sr?;
+            total_files += shard.files_count;
+            line_entries.extend(shard.line_entries);
+            for (cu, cuinfo) in shard.compilation_units {
+                compilation_units.insert(cu, cuinfo);
+            }
+            for (cu, fi) in shard.file_indices {
+                scoped_file_manager.add_compilation_unit(cu, fi);
             }
         }
 
-        // Build line mapping with canonical paths using the scoped file index manager
-        // Avoid cloning the potentially large line_entries vector
+        // Build final line mapping
         let total_line_entries = line_entries.len();
         let line_mapping =
             LineMappingTable::from_entries_with_scoped_manager(line_entries, &scoped_file_manager);
@@ -573,277 +845,67 @@ impl<'a> DwarfParser<'a> {
     /// Parse debug_info sections (for parallel processing)
     pub fn parse_debug_info(&self, module_path: &str) -> Result<DebugParseResult> {
         debug!("Starting debug_info-only parsing for: {}", module_path);
+        // Collect headers once
+        let mut headers: Vec<gimli::UnitHeader<EndianArcSlice<LittleEndian>>> = Vec::new();
+        let mut units = self.dwarf.units();
+        while let Ok(Some(h)) = units.next() {
+            headers.push(h);
+        }
 
         let mut functions: HashMap<String, Vec<IndexEntry>> = HashMap::new();
         let mut variables: HashMap<String, Vec<IndexEntry>> = HashMap::new();
         let mut types: HashMap<String, Vec<IndexEntry>> = HashMap::new();
-        // Parse all compilation units for debug info only
-        let mut units = self.dwarf.units();
-        while let Ok(Some(header)) = units.next() {
-            let unit_offset = match header.offset() {
-                gimli::UnitSectionOffset::DebugInfoOffset(offset) => offset,
-                _ => continue,
-            };
 
-            let unit = self.dwarf.unit(header)?;
-            let cu_language = self.extract_language(self.dwarf, &unit);
-
-            // Parse DIEs without file path resolution (will be resolved later)
-            let mut entries = unit.entries();
-            let mut metadata_cache: HashMap<gimli::UnitOffset, FunctionMetadata> = HashMap::new();
-            // Track lexical context to distinguish CU/file-scope vs function-scope
-            let mut tag_stack: Vec<gimli::DwTag> = Vec::new();
-            while let Some((depth, entry)) = entries.next_dfs()? {
-                // Maintain tag stack to current depth
-                let d: usize = depth as usize;
-                // Unwind to parent scope so siblings don't inherit previous scope tag
-                while tag_stack.len() > d {
-                    tag_stack.pop();
+        // Always process in parallel at CU granularity, and propagate per-CU errors
+        let shard_results: Vec<Result<InfoShard>> = headers
+            .into_par_iter()
+            .map(|header| -> Result<InfoShard> {
+                match header.offset() {
+                    gimli::UnitSectionOffset::DebugInfoOffset(unit_off) => {
+                        let unit = self.dwarf.unit(header)?;
+                        let cu_lang = self.extract_language(self.dwarf, &unit);
+                        self.process_unit_shard(&unit, unit_off, cu_lang)
+                    }
+                    _ => Ok(InfoShard::default()),
                 }
-                match entry.tag() {
-                    gimli::constants::DW_TAG_subprogram => {
-                        let mut visited = HashSet::new();
-                        let metadata = self.resolve_function_metadata(
-                            self.dwarf,
-                            &unit,
-                            entry,
-                            &mut metadata_cache,
-                            &mut visited,
-                        )?;
-                        if let Some(name) = metadata.name.clone() {
-                            let is_main = self.is_main_function(entry, &name).unwrap_or(false);
-                            let is_static = metadata
-                                .is_external
-                                .map(|external| !external)
-                                .unwrap_or_else(|| self.is_static_symbol(entry).unwrap_or(false));
-                            let flags = crate::core::IndexFlags {
-                                is_static,
-                                is_main,
-                                is_inline: metadata.is_inline,
-                                is_linkage: metadata.is_linkage_name,
-                                ..Default::default()
-                            };
+            })
+            .collect();
 
-                            let address_ranges =
-                                self.extract_address_ranges(self.dwarf, &unit, entry)?;
-
-                            let index_entry = IndexEntry {
-                                name: name.clone(),
-                                die_offset: entry.offset(),
-                                unit_offset,
-                                tag: entry.tag(),
-                                flags,
-                                language: cu_language,
-                                address_ranges,
-                                entry_pc: self.extract_entry_pc(entry)?,
-                            };
-
-                            functions.entry(name).or_default().push(index_entry);
-
-                            // If a distinct linkage name exists, add an alias entry (GDB-like behavior)
-                            if let Some((linkage_name, _)) =
-                                self.extract_linkage_name(self.dwarf, &unit, entry)?
-                            {
-                                if linkage_name != metadata.name.clone().unwrap_or_default() {
-                                    let mut alias_flags = flags;
-                                    alias_flags.is_linkage = true;
-                                    let index_entry_linkage = IndexEntry {
-                                        name: linkage_name.clone(),
-                                        die_offset: entry.offset(),
-                                        unit_offset,
-                                        tag: entry.tag(),
-                                        flags: alias_flags,
-                                        language: cu_language,
-                                        address_ranges: self
-                                            .extract_address_ranges(self.dwarf, &unit, entry)?,
-                                        entry_pc: self.extract_entry_pc(entry)?,
-                                    };
-                                    functions
-                                        .entry(linkage_name)
-                                        .or_default()
-                                        .push(index_entry_linkage);
-                                }
-                            }
-                        }
-                    }
-                    gimli::constants::DW_TAG_inlined_subroutine => {
-                        let mut visited = HashSet::new();
-                        let metadata = self.resolve_function_metadata(
-                            self.dwarf,
-                            &unit,
-                            entry,
-                            &mut metadata_cache,
-                            &mut visited,
-                        )?;
-                        if let Some(name) = metadata.name.clone() {
-                            let is_static = metadata
-                                .is_external
-                                .map(|external| !external)
-                                .unwrap_or(false);
-                            let flags = crate::core::IndexFlags {
-                                is_static,
-                                is_inline: true,
-                                is_linkage: metadata.is_linkage_name,
-                                ..Default::default()
-                            };
-
-                            let address_ranges =
-                                self.extract_address_ranges(self.dwarf, &unit, entry)?;
-
-                            let index_entry = IndexEntry {
-                                name: name.clone(),
-                                die_offset: entry.offset(),
-                                unit_offset,
-                                tag: entry.tag(),
-                                flags,
-                                language: cu_language,
-                                address_ranges,
-                                entry_pc: self.extract_entry_pc(entry)?,
-                            };
-
-                            functions.entry(name).or_default().push(index_entry);
-
-                            // Add linkage alias for inlined subroutine if present
-                            if let Some((linkage_name, _)) =
-                                self.extract_linkage_name(self.dwarf, &unit, entry)?
-                            {
-                                if linkage_name != metadata.name.clone().unwrap_or_default() {
-                                    let mut alias_flags = flags;
-                                    alias_flags.is_linkage = true;
-                                    let index_entry_linkage = IndexEntry {
-                                        name: linkage_name.clone(),
-                                        die_offset: entry.offset(),
-                                        unit_offset,
-                                        tag: entry.tag(),
-                                        flags: alias_flags,
-                                        language: cu_language,
-                                        address_ranges: self
-                                            .extract_address_ranges(self.dwarf, &unit, entry)?,
-                                        entry_pc: self.extract_entry_pc(entry)?,
-                                    };
-                                    functions
-                                        .entry(linkage_name)
-                                        .or_default()
-                                        .push(index_entry_linkage);
-                                }
-                            }
-                        }
-                    }
-                    gimli::constants::DW_TAG_variable => {
-                        // Exclude variables declared within function scope (subprogram/inlined)
-                        let in_function_scope = tag_stack.iter().any(|t| {
-                            *t == gimli::constants::DW_TAG_subprogram
-                                || *t == gimli::constants::DW_TAG_inlined_subroutine
-                        });
-                        if in_function_scope {
-                            continue;
-                        }
-                        // Skip pure declarations (no definition in this CU)
-                        if Self::is_declaration(entry).unwrap_or(false) {
-                            continue;
-                        }
-                        if let Some(name) = self.extract_name(self.dwarf, &unit, entry)? {
-                            let flags = crate::core::IndexFlags {
-                                is_static: self.is_static_symbol(entry).unwrap_or(false),
-                                ..Default::default()
-                            };
-
-                            let address_ranges = self
-                                .extract_variable_address(entry, &unit)
-                                .ok()
-                                .flatten()
-                                .map(|addr| vec![(addr, addr)])
-                                .unwrap_or_default();
-
-                            let index_entry = IndexEntry {
-                                name: name.clone(),
-                                die_offset: entry.offset(),
-                                unit_offset,
-                                tag: entry.tag(),
-                                flags,
-                                language: cu_language,
-                                address_ranges,
-                                entry_pc: None,
-                            };
-
-                            variables.entry(name).or_default().push(index_entry);
-
-                            // Add linkage alias for variable if present
-                            if let Some((linkage_name, _)) =
-                                self.extract_linkage_name(self.dwarf, &unit, entry)?
-                            {
-                                if linkage_name
-                                    != self
-                                        .extract_name(self.dwarf, &unit, entry)?
-                                        .unwrap_or_default()
-                                {
-                                    let mut alias_flags = flags;
-                                    alias_flags.is_linkage = true;
-                                    let index_entry_linkage = IndexEntry {
-                                        name: linkage_name.clone(),
-                                        die_offset: entry.offset(),
-                                        unit_offset,
-                                        tag: entry.tag(),
-                                        flags: alias_flags,
-                                        language: cu_language,
-                                        address_ranges: self
-                                            .extract_variable_address(entry, &unit)
-                                            .ok()
-                                            .flatten()
-                                            .map(|addr| vec![(addr, addr)])
-                                            .unwrap_or_default(),
-                                        entry_pc: None,
-                                    };
-                                    variables
-                                        .entry(linkage_name)
-                                        .or_default()
-                                        .push(index_entry_linkage);
-                                }
-                            }
-                        }
-                    }
-                    gimli::constants::DW_TAG_structure_type
-                    | gimli::constants::DW_TAG_class_type
-                    | gimli::constants::DW_TAG_union_type
-                    | gimli::constants::DW_TAG_enumeration_type
-                    | gimli::constants::DW_TAG_typedef => {
-                        // No-op for scope; pushing is handled after match
-                        if let Some(name) = self.extract_name(self.dwarf, &unit, entry)? {
-                            // DW_AT_declaration indicates a declaration-only (no definition)
-                            let is_decl = match entry.attr(gimli::constants::DW_AT_declaration)? {
-                                Some(attr) => match attr.value() {
-                                    gimli::AttributeValue::Flag(f) => f,
-                                    _ => false,
-                                },
-                                None => false,
-                            };
-                            let flags = crate::core::IndexFlags {
-                                is_type_declaration: is_decl,
-                                ..Default::default()
-                            };
-                            let index_entry = IndexEntry {
-                                name: name.clone(),
-                                die_offset: entry.offset(),
-                                unit_offset,
-                                tag: entry.tag(),
-                                flags,
-                                language: cu_language,
-                                address_ranges: Vec::new(),
-                                entry_pc: None,
-                            };
-                            types.entry(name).or_default().push(index_entry);
-                        }
-                    }
-                    _ => {} // Skip other DIE types
-                }
-                // Push current entry to stack to become ancestor of its children
-                tag_stack.push(entry.tag());
+        for sr in shard_results {
+            let shard = sr?;
+            for (k, mut v) in shard.functions {
+                functions.entry(k).or_default().append(&mut v);
+            }
+            for (k, mut v) in shard.variables {
+                variables.entry(k).or_default().append(&mut v);
+            }
+            for (k, mut v) in shard.types {
+                types.entry(k).or_default().append(&mut v);
             }
         }
 
+        // Stabilize entry order for determinism: sort by (unit_offset, die_offset)
+        let sort_entries = |m: &mut HashMap<String, Vec<IndexEntry>>| {
+            for vec in m.values_mut() {
+                vec.sort_by(|a, b| {
+                    let ka = (a.unit_offset.0, a.die_offset.0);
+                    let kb = (b.unit_offset.0, b.die_offset.0);
+                    ka.cmp(&kb)
+                });
+            }
+        };
+        sort_entries(&mut functions);
+        sort_entries(&mut variables);
+        sort_entries(&mut types);
+
         let functions_count = functions.len();
         let variables_count = variables.len();
-        let lightweight_index = LightweightIndex::from_builder_data(functions, variables, types);
+        let mut lightweight_index =
+            LightweightIndex::from_builder_data(functions, variables, types);
+        // Build per-CU function address maps
+        lightweight_index.build_cu_maps();
+        // Prefer CU range map from .debug_aranges if available
+        let _ = lightweight_index.build_cu_maps_from_aranges(self.dwarf);
 
         debug!(
             "Completed debug_info parsing for {}: {} functions, {} variables",
@@ -921,7 +983,7 @@ impl<'a> DwarfParser<'a> {
                     .ok()
                     .and_then(|s| s.to_string_lossy().ok().map(|cow| cow.into_owned()))
                     .unwrap_or_else(|| format!("unknown_dir_{i}"));
-                debug!("Include directory [{}]: '{}'", i + 1, path_str);
+                tracing::trace!("Include directory [{}]: '{}'", i + 1, path_str);
                 path_str
             })
             .collect();
@@ -941,12 +1003,12 @@ impl<'a> DwarfParser<'a> {
                     compilation_unit.files.push(source_file);
                 }
                 Err(e) => {
-                    debug!("Skipping file entry {}: {}", file_index, e);
+                    tracing::trace!("Skipping file entry {}: {}", file_index, e);
                 }
             }
         }
 
-        debug!(
+        tracing::trace!(
             "Extracted {} files from compilation unit {}",
             compilation_unit.files.len(),
             cu_name
@@ -1029,7 +1091,7 @@ impl<'a> DwarfParser<'a> {
             &filename,
         );
 
-        debug!(
+        tracing::trace!(
             "extract_source_file_static: cu='{}', file_index={}, dir_index={}, directory_path='{}', filename='{}', full_path='{}'",
             compilation_unit, file_index, dir_index, directory_path, filename, full_path
         );
