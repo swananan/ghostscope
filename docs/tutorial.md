@@ -167,6 +167,11 @@ Run it:
 sudo ghostscope -p $(pidof your_app) --script-file trace.gs
 ```
 
+You can also load it directly from the TUI’s command panel using `source <filename>`:
+
+![Source Trace File](images/source-file.png)
+*Use the source command to load a script file directly*
+
 **💡 Tip**: After setting multiple trace points in the TUI, you can use the `save trace <filename>` command to save all current trace points to a file for later reuse. See [Command Reference](input-commands.md) for details.
 
 

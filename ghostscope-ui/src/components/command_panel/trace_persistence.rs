@@ -278,6 +278,8 @@ impl TracePersistence {
         let mut in_script = false;
         let mut script_lines = Vec::new();
         let mut pending_disabled = false;
+        // Track nested braces so inner blocks (e.g., if { ... }) don't terminate the trace section
+        let mut brace_depth: usize = 0;
 
         for line in content.lines() {
             let trimmed = line.trim();
@@ -300,11 +302,13 @@ impl TracePersistence {
                 current_target = Some(target);
                 in_script = true;
                 script_lines.clear();
+                // Opening brace for the trace section
+                brace_depth = 1;
                 continue;
             }
 
-            // Check for script end
-            if in_script && trimmed == "}" {
+            // Check for script end: only close when this '}' matches the outer trace block
+            if in_script && trimmed == "}" && brace_depth == 1 {
                 if let Some(target) = current_target.take() {
                     let script = script_lines.join("\n");
                     traces.push(TraceDefinition {
@@ -315,6 +319,7 @@ impl TracePersistence {
                     pending_disabled = false;
                 }
                 in_script = false;
+                brace_depth = 0;
                 continue;
             }
 
@@ -327,6 +332,13 @@ impl TracePersistence {
                     line
                 };
                 script_lines.push(script_line.to_string());
+
+                // Update brace depth based on current line content so nested '}' are preserved
+                // Note: naïve count, acceptable because braces rarely appear in string literals in our scripts
+                let opens = script_line.chars().filter(|&c| c == '{').count();
+                let closes = script_line.chars().filter(|&c| c == '}').count();
+                // Saturating arithmetic to avoid underflow on malformed input
+                brace_depth = brace_depth.saturating_add(opens).saturating_sub(closes);
             }
         }
 

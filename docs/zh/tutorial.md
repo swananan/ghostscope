@@ -149,7 +149,7 @@ info address <0xADDR>       # 查看地址的可用变量
 *使用 info line 命令查看可用变量*
 
 
-## 使用脚本文件
+### 使用脚本文件
 
 为了重复使用，我们可以将追踪脚本保存在文件中：
 
@@ -164,10 +164,15 @@ trace sample_program.c:16 {
 }
 ```
 
-运行它：
+我们既可以通过命令行直接运行它：
 ```bash
 sudo ghostscope -p $(pidof your_app) --script-file trace.gs
 ```
+
+我们也可以在 TUI 的命令交互面板上，通过 `source <脚本名称>` 的方式直接加载脚本：
+
+![Source Trace File](../images/source-file.png)
+*使用 source file 命令直接加载脚本*
 
 **💡 小贴士**：在 TUI 中设置了多个追踪点后，可以使用 `save trace <文件名>` 命令将所有当前追踪点保存到文件中，方便后续复用。详见[命令参考](input-commands.md)。
 
