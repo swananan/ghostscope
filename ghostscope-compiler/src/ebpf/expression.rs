@@ -41,6 +41,39 @@ impl<'ctx> EbpfContext<'ctx> {
         }
         false
     }
+
+    /// Heuristic check: whether an expression should be treated as a pointer/address
+    /// Returns true for:
+    /// - Explicit address-of forms (&expr)
+    /// - Script string literals (compile to pointer data)
+    /// - Alias variables bound to addresses
+    /// - DWARF-backed expressions whose type is pointer or array
+    fn is_pointer_like_expr(&mut self, expr: &Expr) -> bool {
+        use crate::script::Expr as E;
+        match expr {
+            E::AddressOf(_) => return true,
+            E::String(_) => return true,
+            E::Variable(name) => {
+                if self.alias_variable_exists(name) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+
+        if let Ok(Some(var)) = self.query_dwarf_for_complex_expr(expr) {
+            if let Some(ref ty) = var.dwarf_type {
+                let t = Self::unwrap_dwarf_type_aliases(ty);
+                if matches!(
+                    t,
+                    DwarfType::PointerType { .. } | DwarfType::ArrayType { .. }
+                ) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
     /// Ensure that when an expression refers to a DWARF-backed variable (not via address-of),
     /// the variable's DWARF type is a pointer or array (decays to pointer for memcmp/strncmp).
     fn ensure_dwarf_pointer_arg(&mut self, e: &Expr, where_ctx: &str) -> Result<()> {
@@ -1207,6 +1240,16 @@ impl<'ctx> EbpfContext<'ctx> {
                             .to_string(),
                     ));
                 }
+
+                // Guard: disallow ordered comparisons on pointers/addresses; only ==/!= are allowed
+                if is_ordered
+                    && (self.is_pointer_like_expr(left) || self.is_pointer_like_expr(right))
+                {
+                    return Err(CodeGenError::TypeError(
+                        "Pointer ordered comparison ('<', '<=', '>', '>=') is not supported. Use '==' or '!=' to compare addresses. If you need to adjust an address, use '&expr + <non-negative literal>' in an alias/address context; to compare values, select a scalar field (e.g., 'obj.field')."
+                            .to_string(),
+                    ));
+                }
                 // String comparison fast-path: script string vs DWARF char*/char[N]
                 if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual) {
                     if let (Expr::String(lit), other) = (&**left, &**right) {
@@ -1741,7 +1784,8 @@ impl<'ctx> EbpfContext<'ctx> {
                     Ok(cmp.into())
                 }
                 _ => Err(CodeGenError::TypeError(
-                    "Unsupported arithmetic/ordered comparison between pointers: only '==' and '!=' are allowed.".to_string(),
+                    "Pointer ordered comparison ('<', '<=', '>', '>=') is not supported. Use '==' or '!=' to compare addresses. If you need to adjust an address, use '&expr + <non-negative literal>' in an alias/address context; to compare values, select a scalar field (e.g., 'obj.field')."
+                        .to_string(),
                 )),
             },
             (FloatValue(left_float), FloatValue(right_float)) => match op {
