@@ -350,23 +350,6 @@ pub async fn compile_and_load_script_for_cli(
         .as_mut()
         .ok_or_else(|| anyhow::anyhow!("Process analyzer is required for script compilation"))?;
 
-    // Determine an effective binary path for logging/reporting purposes.
-    // In PID mode, prefer main executable; in target mode (-t <binary>, including .so),
-    // fall back to the target binary path.
-    let _binary_path_string = if let Some(main_module) = process_analyzer.get_main_executable() {
-        main_module.path.clone()
-    } else if let Some(bin) = session.target_binary.clone() {
-        bin
-    } else {
-        // As a last resort, try to pick the first shared library (target mode analyzer)
-        let libs = process_analyzer.get_shared_library_info();
-        if libs.len() == 1 {
-            libs[0].library_path.clone()
-        } else {
-            return Err(anyhow::anyhow!("No main executable found in process"));
-        }
-    };
-
     // Step 2: Get starting trace ID from trace manager and use unified compilation interface with DwarfAnalyzer
     let starting_trace_id = session.trace_manager.get_next_trace_id();
 
@@ -437,9 +420,35 @@ pub async fn compile_and_load_script_for_cli(
     }
 
     // Step 3: Prepare and attach uprobe configurations
-    let uprobe_configs = compilation_result.uprobe_configs;
+    let ghostscope_compiler::CompilationResult {
+        uprobe_configs,
+        failed_targets,
+        ..
+    } = compilation_result;
 
     if uprobe_configs.is_empty() {
+        // If we had resolved targets but all failed to compile, surface the real compile errors
+        if !failed_targets.is_empty() {
+            let mut details = String::new();
+            for failed in &failed_targets {
+                let _ = std::fmt::Write::write_fmt(
+                    &mut details,
+                    format_args!(
+                        "  - {} at 0x{:x}: {}\n",
+                        failed.target_name, failed.pc_address, failed.error_message
+                    ),
+                );
+            }
+            let full = format!(
+                "No uprobe configurations created because all {} target(s) failed to compile.\n\nFailed targets:\n{}\n\nTip: fix the reported compile-time errors above (e.g., avoid struct/union/array arithmetic; select a scalar field or use '&expr + <non-negative literal>' in an alias/address context).",
+                failed_targets.len(),
+                details
+            );
+            // Log the full multi-line error to ensure it appears in stderr when logging is enabled
+            error!("{}", full);
+            return Err(anyhow::anyhow!(full));
+        }
+
         // Check if we have debug info - this is checked during module loading
         let available_functions = session.list_functions();
 

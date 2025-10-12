@@ -13,6 +13,34 @@ use tracing::debug;
 // compare cap is provided via compile_options.compare_cap (config: ebpf.compare_cap)
 
 impl<'ctx> EbpfContext<'ctx> {
+    fn unwrap_dwarf_type_aliases(mut t: &DwarfType) -> &DwarfType {
+        loop {
+            match t {
+                DwarfType::TypedefType {
+                    underlying_type, ..
+                } => t = underlying_type.as_ref(),
+                DwarfType::QualifiedType {
+                    underlying_type, ..
+                } => t = underlying_type.as_ref(),
+                _ => break,
+            }
+        }
+        t
+    }
+
+    fn is_dwarf_aggregate_expr(&mut self, expr: &Expr) -> bool {
+        if let Ok(Some(var)) = self.query_dwarf_for_complex_expr(expr) {
+            if let Some(ref ty) = var.dwarf_type {
+                return matches!(
+                    Self::unwrap_dwarf_type_aliases(ty),
+                    DwarfType::StructType { .. }
+                        | DwarfType::UnionType { .. }
+                        | DwarfType::ArrayType { .. }
+                );
+            }
+        }
+        false
+    }
     /// Ensure that when an expression refers to a DWARF-backed variable (not via address-of),
     /// the variable's DWARF type is a pointer or array (decays to pointer for memcmp/strncmp).
     fn ensure_dwarf_pointer_arg(&mut self, e: &Expr, where_ctx: &str) -> Result<()> {
@@ -1159,6 +1187,26 @@ impl<'ctx> EbpfContext<'ctx> {
                 ))),
             },
             Expr::BinaryOp { left, op, right } => {
+                // Guard: disallow arithmetic/ordered comparisons that involve DWARF aggregates
+                let is_arith = matches!(
+                    op,
+                    BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide
+                );
+                let is_ordered = matches!(
+                    op,
+                    BinaryOp::LessThan
+                        | BinaryOp::LessEqual
+                        | BinaryOp::GreaterThan
+                        | BinaryOp::GreaterEqual
+                );
+                if (is_arith || is_ordered)
+                    && (self.is_dwarf_aggregate_expr(left) || self.is_dwarf_aggregate_expr(right))
+                {
+                    return Err(CodeGenError::TypeError(
+                        "Unsupported arithmetic/ordered comparison involving struct/union/array. Select a scalar field (e.g., 'obj.field'), or use '&expr + <non-negative literal>' in an alias/address context if you need a raw address."
+                            .to_string(),
+                    ));
+                }
                 // String comparison fast-path: script string vs DWARF char*/char[N]
                 if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual) {
                     if let (Expr::String(lit), other) = (&**left, &**right) {
@@ -1177,13 +1225,17 @@ impl<'ctx> EbpfContext<'ctx> {
                 }
                 // Implement short-circuit for logical OR (||) and logical AND (&&)
                 if matches!(op, BinaryOp::LogicalOr) {
-                    // Evaluate LHS to boolean (non-zero => true)
+                    // Evaluate LHS to boolean (non-zero => true). Accept integer or pointer.
                     let lhs_val = self.compile_expr(left)?;
                     let lhs_int = match lhs_val {
                         BasicValueEnum::IntValue(iv) => iv,
+                        BasicValueEnum::PointerValue(pv) => self
+                            .builder
+                            .build_ptr_to_int(pv, self.context.i64_type(), "lor_lhs_ptr_as_i64")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?,
                         _ => {
                             return Err(CodeGenError::TypeError(
-                                "Logical OR requires integer operands".to_string(),
+                                "Logical OR requires integer or pointer operands".to_string(),
                             ))
                         }
                     };
@@ -1218,9 +1270,13 @@ impl<'ctx> EbpfContext<'ctx> {
                     let rhs_val = self.compile_expr(right)?;
                     let rhs_int = match rhs_val {
                         BasicValueEnum::IntValue(iv) => iv,
+                        BasicValueEnum::PointerValue(pv) => self
+                            .builder
+                            .build_ptr_to_int(pv, self.context.i64_type(), "lor_rhs_ptr_as_i64")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?,
                         _ => {
                             return Err(CodeGenError::TypeError(
-                                "Logical OR requires integer operands".to_string(),
+                                "Logical OR requires integer or pointer operands".to_string(),
                             ))
                         }
                     };
@@ -1253,13 +1309,17 @@ impl<'ctx> EbpfContext<'ctx> {
                     phi.add_incoming(&[(&one, curr_block), (&rhs_bool, rhs_end_block)]);
                     return Ok(phi.as_basic_value());
                 } else if matches!(op, BinaryOp::LogicalAnd) {
-                    // Evaluate LHS to boolean (non-zero => true)
+                    // Evaluate LHS to boolean (non-zero => true). Accept integer or pointer.
                     let lhs_val = self.compile_expr(left)?;
                     let lhs_int = match lhs_val {
                         BasicValueEnum::IntValue(iv) => iv,
+                        BasicValueEnum::PointerValue(pv) => self
+                            .builder
+                            .build_ptr_to_int(pv, self.context.i64_type(), "land_lhs_ptr_as_i64")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?,
                         _ => {
                             return Err(CodeGenError::TypeError(
-                                "Logical AND requires integer operands".to_string(),
+                                "Logical AND requires integer or pointer operands".to_string(),
                             ))
                         }
                     };
@@ -1294,9 +1354,13 @@ impl<'ctx> EbpfContext<'ctx> {
                     let rhs_val = self.compile_expr(right)?;
                     let rhs_int = match rhs_val {
                         BasicValueEnum::IntValue(iv) => iv,
+                        BasicValueEnum::PointerValue(pv) => self
+                            .builder
+                            .build_ptr_to_int(pv, self.context.i64_type(), "land_rhs_ptr_as_i64")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?,
                         _ => {
                             return Err(CodeGenError::TypeError(
-                                "Logical AND requires integer operands".to_string(),
+                                "Logical AND requires integer or pointer operands".to_string(),
                             ))
                         }
                     };
@@ -1650,9 +1714,9 @@ impl<'ctx> EbpfContext<'ctx> {
                             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
                         Ok(cmp.into())
                     }
-                    _ => Err(CodeGenError::TypeError(format!(
-                        "Type mismatch in binary operation {op:?}"
-                    ))),
+                    _ => Err(CodeGenError::TypeError(
+                        "Unsupported operation between aggregate address/pointer and integer: only '==' and '!=' are allowed. If you meant to offset an address, use '&expr + <non-negative literal>' in an alias/address context, or access a scalar field.".to_string(),
+                    )),
                 }
             }
             (PointerValue(lp), PointerValue(rp)) => match op {
@@ -1676,9 +1740,9 @@ impl<'ctx> EbpfContext<'ctx> {
                         .map_err(|e| CodeGenError::Builder(e.to_string()))?;
                     Ok(cmp.into())
                 }
-                _ => Err(CodeGenError::TypeError(format!(
-                    "Type mismatch in binary operation {op:?}"
-                ))),
+                _ => Err(CodeGenError::TypeError(
+                    "Unsupported arithmetic/ordered comparison between pointers: only '==' and '!=' are allowed.".to_string(),
+                )),
             },
             (FloatValue(left_float), FloatValue(right_float)) => match op {
                 BinaryOp::Add => {
