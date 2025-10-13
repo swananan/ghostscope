@@ -6,6 +6,11 @@
 )]
 
 //! Common test utilities shared across integration tests
+//!
+//! This module also exposes a small async runner (`runner`) to invoke the
+//! `ghostscope` CLI in a consistent way across tests (PID/target attach,
+//! timeout/read/drain behavior, and common flags). Prefer using it instead
+//! of re-implementing process management in each test file.
 
 use lazy_static::lazy_static;
 use std::path::PathBuf;
@@ -417,6 +422,9 @@ impl TestFixtures {
 lazy_static! {
     pub static ref FIXTURES: TestFixtures = TestFixtures::new();
 }
+
+// Re-export the shared runner for convenience in tests
+pub mod runner;
 
 static COMPILE_GLOBALS: Once = Once::new();
 static COMPILE_RUST_GLOBAL: Once = Once::new();

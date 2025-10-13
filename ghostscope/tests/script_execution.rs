@@ -9,19 +9,20 @@
 //!
 //! Tests for ghostscope script execution and tracing functionality.
 //! Assumes tests are run with sudo permissions for eBPF attachment.
+//!
+//! Concurrency note: these tests intentionally exercise multiple scripts
+//! against a single long-lived sample_program process (per optimization
+//! level). This is by design to validate real-world multi-attachment
+//! scenarios and reduce test startup overhead. Do not serialize this file.
 
 mod common;
 
 use common::{init, OptimizationLevel, FIXTURES};
 use lazy_static::lazy_static;
 use std::collections::HashMap;
-use std::ffi::OsString;
-use std::io::Write;
 use std::process::Stdio;
 use std::sync::{Arc, Once};
 use std::time::Duration;
-use tempfile::NamedTempFile;
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::RwLock;
 use tokio::time::timeout;
@@ -412,151 +413,18 @@ async fn run_ghostscope_with_script_opt(
     // Get PID of running sample_program with specific optimization level
     let test_pid = get_global_test_pid_with_opt(opt_level).await?;
 
-    let mut script_file = NamedTempFile::new()?;
-    script_file.write_all(script_content.as_bytes())?;
-    let script_path = script_file.path();
-
     println!(
         "🔍 Running ghostscope with {} binary (PID: {})",
         opt_level.description(),
         test_pid
     );
 
-    let binary_path = "../target/debug/ghostscope";
-    let args: Vec<OsString> = vec![
-        OsString::from("-p"),
-        OsString::from(test_pid.to_string()),
-        OsString::from("--script-file"),
-        script_path.as_os_str().to_os_string(),
-        OsString::from("--no-save-llvm-ir"),
-        OsString::from("--no-save-ebpf"),
-        OsString::from("--no-save-ast"),
-    ];
-    let command_display = format!(
-        "{} {}",
-        binary_path,
-        args.iter()
-            .map(|arg| arg.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
-
-    let mut command = Command::new(binary_path);
-    command.args(args);
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
-
-    let mut child = command.spawn()?;
-
-    // Rest of the function implementation - collect output and handle termination
-    let stdout_handle = child.stdout.take().unwrap();
-    let stderr_handle = child.stderr.take().unwrap();
-
-    let mut stdout_reader = BufReader::new(stdout_handle);
-    let mut stderr_reader = BufReader::new(stderr_handle);
-
-    let mut stdout_content = String::new();
-    let mut stderr_content = String::new();
-
-    // Read output with timeout
-    let read_task = async {
-        let mut stdout_line = String::new();
-        let mut stderr_line = String::new();
-
-        for _ in 0..100 {
-            // Try to read stdout
-            stdout_line.clear();
-            if let Ok(Ok(n)) = timeout(
-                Duration::from_millis(50),
-                stdout_reader.read_line(&mut stdout_line),
-            )
-            .await
-            {
-                if n > 0 {
-                    stdout_content.push_str(&stdout_line);
-                }
-            }
-
-            // Try to read stderr
-            stderr_line.clear();
-            if let Ok(Ok(n)) = timeout(
-                Duration::from_millis(50),
-                stderr_reader.read_line(&mut stderr_line),
-            )
-            .await
-            {
-                if n > 0 {
-                    stderr_content.push_str(&stderr_line);
-                }
-            }
-
-            // Check if process has exited (for quick failures)
-            if let Ok(Some(_)) = child.try_wait() {
-                // Process exited, break and collect remaining output
-                break;
-            }
-
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    };
-
-    // Run the read task with overall timeout
-    let _ = timeout(Duration::from_secs(timeout_secs), read_task).await;
-
-    // Terminate the child process
-    let mut forced_termination = false;
-    let mut exit_code = match child.try_wait() {
-        Ok(Some(status)) => status.code().unwrap_or(-1),
-        _ => {
-            forced_termination = true;
-            let _ = child.kill().await;
-            match timeout(Duration::from_secs(2), child.wait()).await {
-                Ok(Ok(status)) => status.code().unwrap_or(-1),
-                _ => -1,
-            }
-        }
-    };
-
-    // After process exit/kill, drain any remaining lines to capture full diagnostics
-    {
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match stdout_reader.read_line(&mut line).await {
-                Ok(0) => break,
-                Ok(_) => stdout_content.push_str(&line),
-                Err(_) => break,
-            }
-        }
-    }
-    {
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match stderr_reader.read_line(&mut line).await {
-                Ok(0) => break,
-                Ok(_) => stderr_content.push_str(&line),
-                Err(_) => break,
-            }
-        }
-    }
-
-    if forced_termination
-        && exit_code == -1
-        && (!stdout_content.trim().is_empty() || !stderr_content.trim().is_empty())
-    {
-        println!(
-            "ℹ️ Ghostscope terminated after timeout; treating as success: {}",
-            command_display
-        );
-        exit_code = 0;
-    }
-
-    if exit_code != 0 {
-        println!("❌ Ghostscope invocation failed: {}", command_display);
-    }
-
-    Ok((exit_code, stdout_content, stderr_content))
+    common::runner::GhostscopeRunner::new()
+        .with_script(script_content)
+        .with_pid(test_pid)
+        .timeout_secs(timeout_secs)
+        .run()
+        .await
 }
 
 /// Helper to run ghostscope with script and capture results (defaults to Debug optimization)
@@ -1649,90 +1517,12 @@ async fn run_ghostscope_with_specific_pid(
     target_pid: u32,
     timeout_secs: u64,
 ) -> anyhow::Result<(i32, String, String)> {
-    let mut script_file = NamedTempFile::new()?;
-    script_file.write_all(script_content.as_bytes())?;
-    let script_path = script_file.path();
-
-    let mut child = Command::new("../target/debug/ghostscope")
-        .args(&[
-            "-p",
-            &target_pid.to_string(), // Use the specific PID
-            "--script-file",
-            script_path.to_str().unwrap(),
-            "--no-log",
-            "--no-save-llvm-ir",
-            "--no-save-ebpf",
-            "--no-save-ast",
-        ])
-        .env("RUST_LOG", "off")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    // Give process a moment to start and potentially fail fast
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Check if process already exited (for quick failures like invalid PID)
-    if let Ok(Some(status)) = child.try_wait() {
-        let output = child.wait_with_output().await?;
-        return Ok((
-            status.code().unwrap_or(1),
-            String::from_utf8_lossy(&output.stdout).to_string(),
-            String::from_utf8_lossy(&output.stderr).to_string(),
-        ));
-    }
-
-    // For successful cases, collect output with timeout
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
-
-    let mut stdout_lines = Vec::new();
-    let mut stderr_lines = Vec::new();
-
-    let stdout_reader = BufReader::new(stdout);
-    let stderr_reader = BufReader::new(stderr);
-
-    let collect_task = async {
-        let stdout_task = async {
-            let mut lines = stdout_reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                stdout_lines.push(line);
-            }
-        };
-
-        let stderr_task = async {
-            let mut lines = stderr_reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                stderr_lines.push(line);
-            }
-        };
-
-        tokio::join!(stdout_task, stderr_task);
-    };
-
-    let _ = timeout(Duration::from_secs(timeout_secs), collect_task).await;
-
-    // Kill the process
-    let _ = child.kill().await;
-
-    // Wait for process to actually terminate
-    let final_status = timeout(Duration::from_secs(2), child.wait()).await;
-
-    let exit_code = match final_status {
-        Ok(Ok(status)) => {
-            println!("✓ Process terminated with status: {:?}", status);
-            status.code().unwrap_or(0)
-        }
-        _ => {
-            println!("⚠️ Force killed process");
-            0
-        }
-    };
-
-    let stdout = stdout_lines.join("\n");
-    let stderr = stderr_lines.join("\n");
-
-    Ok((exit_code, stdout, stderr))
+    common::runner::GhostscopeRunner::new()
+        .with_script(script_content)
+        .with_pid(target_pid)
+        .timeout_secs(timeout_secs)
+        .run()
+        .await
 }
 
 #[tokio::test]
