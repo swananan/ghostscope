@@ -183,7 +183,7 @@ impl GhostscopeRunner {
         let mut exit_code = match child.try_wait() {
             Ok(Some(status)) => status.code().unwrap_or(-1),
             _ => {
-                let _ = child.kill().await; // best-effort
+                let _ = child.kill().await.is_ok(); // best-effort
                 match timeout(Duration::from_secs(2), child.wait()).await {
                     Ok(Ok(status)) => status.code().unwrap_or(-1),
                     _ => -1,

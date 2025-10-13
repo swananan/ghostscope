@@ -1,10 +1,3 @@
-// Clippy: allow some lints in tests
-#![allow(
-    clippy::uninlined_format_args,
-    clippy::needless_borrows_for_generic_args,
-    dead_code
-)]
-
 //! Complex types script execution test
 //! - Uses a long-running test program with complex DWARF types
 //! - Validates struct/array/member/bitfield/union/enum formatting and array index
@@ -66,17 +59,17 @@ trace update_complex {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 2, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     assert!(
         stdout.contains("ARR_EQ"),
-        "Expected ARR_EQ. STDOUT: {}",
-        stdout
+        "Expected ARR_EQ. STDOUT: {stdout}"
     );
     Ok(())
 }
 
+#[tokio::test]
 async fn test_entry_prints() -> anyhow::Result<()> {
     init();
 
@@ -106,32 +99,29 @@ trace complex_types_program.c:7 {
 
     assert_eq!(
         exit_code, 0,
-        "ghostscope should run successfully (stderr={}, stdout={})",
-        stderr, stdout
+        "ghostscope should run successfully (stderr={stderr}, stdout={stdout})"
     );
 
     // Validate pointer prints include type suffix and hex
     let has_any_ptr = stdout.contains("0x") && stdout.contains("(Complex*)");
     assert!(
         has_any_ptr,
-        "Expected pointer print with type suffix. STDOUT: {}",
-        stdout
+        "Expected pointer print with type suffix. STDOUT: {stdout}"
     );
 
     // Validate c.name renders as a quoted string
     let has_name = stdout.contains("\"Alice\"") || stdout.contains("\"Bob\"");
-    assert!(has_name, "Expected c.name string. STDOUT: {}", stdout);
+    assert!(has_name, "Expected c.name string. STDOUT: {stdout}");
 
     // Validate deref prints either a pretty struct or a null-deref error
     let has_deref_struct = stdout.contains("*c.friend_ref")
         && (stdout.contains("Complex {") || stdout.contains("<error: null pointer dereference>"));
     assert!(
         has_deref_struct,
-        "Expected deref output (struct or null-deref). STDOUT: {}",
-        stdout
+        "Expected deref output (struct or null-deref). STDOUT: {stdout}"
     );
 
-    let _ = prog.kill().await;
+    let _ = prog.kill().await.is_ok();
     Ok(())
 }
 
@@ -159,18 +149,16 @@ trace update_complex {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     assert!(
         stdout.contains("CNAME_EQ"),
-        "Expected CNAME_EQ. STDOUT: {}",
-        stdout
+        "Expected CNAME_EQ. STDOUT: {stdout}"
     );
     assert!(
         stdout.contains("CNAME_NE"),
-        "Expected CNAME_NE. STDOUT: {}",
-        stdout
+        "Expected CNAME_NE. STDOUT: {stdout}"
     );
     Ok(())
 }
@@ -204,19 +192,17 @@ trace update_complex {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
-    assert!(stdout.contains("Z0"), "Expected Z0. STDOUT: {}", stdout);
+    assert!(stdout.contains("Z0"), "Expected Z0. STDOUT: {stdout}");
     assert!(
         stdout.contains("DYN_OK"),
-        "Expected DYN_OK. STDOUT: {}",
-        stdout
+        "Expected DYN_OK. STDOUT: {stdout}"
     );
     assert!(
         stdout.contains("NEG_OK"),
-        "Expected NEG_OK. STDOUT: {}",
-        stdout
+        "Expected NEG_OK. STDOUT: {stdout}"
     );
     Ok(())
 }
@@ -247,16 +233,15 @@ trace update_complex {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // We expect to see at least one of the names captured within the window
     let saw_a = stdout.contains("CNAME_A");
     let saw_b = stdout.contains("CNAME_B");
     assert!(
         saw_a || saw_b,
-        "Expected to see at least Alice or Bob. STDOUT: {}",
-        stdout
+        "Expected to see at least Alice or Bob. STDOUT: {stdout}"
     );
     Ok(())
 }
@@ -285,8 +270,8 @@ trace complex_types_program.c:25 {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     use regex::Regex;
     let re_arr = Regex::new(r"ARR:(-?\d+)").unwrap();
@@ -295,13 +280,11 @@ trace complex_types_program.c:25 {
     let has_brr = stdout.lines().any(|l| re_brr.is_match(l));
     assert!(
         has_arr,
-        "Expected formatted ARR value from a.arr[1]. STDOUT: {}",
-        stdout
+        "Expected formatted ARR value from a.arr[1]. STDOUT: {stdout}"
     );
     assert!(
         has_brr,
-        "Expected formatted BRR value from b.arr[0]. STDOUT: {}",
-        stdout
+        "Expected formatted BRR value from b.arr[0]. STDOUT: {stdout}"
     );
 
     Ok(())
@@ -332,8 +315,8 @@ trace complex_types_program.c:25 {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     use regex::Regex;
     let re_cf = Regex::new(r"CF:(-?\d+)").unwrap();
@@ -342,14 +325,9 @@ trace complex_types_program.c:25 {
     let has_af = stdout.lines().any(|l| re_af.is_match(l));
     assert!(
         has_cf,
-        "Expected CF value from b.friend_ref.arr[1]. STDOUT: {}",
-        stdout
+        "Expected CF value from b.friend_ref.arr[1]. STDOUT: {stdout}"
     );
-    assert!(
-        has_af,
-        "Expected AF value from a.arr[2]. STDOUT: {}",
-        stdout
-    );
+    assert!(has_af, "Expected AF value from a.arr[2]. STDOUT: {stdout}");
 
     Ok(())
 }
@@ -379,8 +357,8 @@ trace complex_types_program.c:25 {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     use regex::Regex;
     let re_ar = Regex::new(r"AR:(-?\d+)").unwrap();
@@ -389,13 +367,11 @@ trace complex_types_program.c:25 {
     let has_br = stdout.lines().any(|l| re_br.is_match(l));
     assert!(
         has_ar,
-        "Expected at least one numeric a.arr[1] sample. STDOUT: {}",
-        stdout
+        "Expected at least one numeric a.arr[1] sample. STDOUT: {stdout}"
     );
     assert!(
         has_br,
-        "Expected at least one numeric b.arr[0] sample. STDOUT: {}",
-        stdout
+        "Expected at least one numeric b.arr[0] sample. STDOUT: {stdout}"
     );
 
     Ok(())
@@ -434,8 +410,8 @@ trace complex_types_program.c:25 {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     use regex::Regex;
     let re =
@@ -452,13 +428,11 @@ trace complex_types_program.c:25 {
     }
     assert!(
         saw_line,
-        "Expected at least one comparison line. STDOUT: {}",
-        stdout
+        "Expected at least one comparison line. STDOUT: {stdout}"
     );
     assert!(
         saw_pz_true,
-        "Expected PZ:1 for pointer==0. STDOUT: {}",
-        stdout
+        "Expected PZ:1 for pointer==0. STDOUT: {stdout}"
     );
 
     Ok(())
@@ -486,17 +460,15 @@ async fn test_special_vars_pid_tid_timestamp_complex() -> anyhow::Result<()> {
     );
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(&script, 3, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
     assert!(
         stdout.contains("PID_OK"),
-        "Expected PID_OK. STDOUT: {}",
-        stdout
+        "Expected PID_OK. STDOUT: {stdout}"
     );
     assert!(
         stdout.contains("PID=") || stdout.contains("PID:"),
-        "Expected PID field in output. STDOUT: {}",
-        stdout
+        "Expected PID field in output. STDOUT: {stdout}"
     );
 
     Ok(())
@@ -532,8 +504,8 @@ trace complex_types_program.c:25 {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Expect at least one bare expr line for (a.status==0) = true/false
     let has_status_line = stdout
@@ -541,8 +513,7 @@ trace complex_types_program.c:25 {
         .any(|l| l.contains("(a.status==0) = true") || l.contains("(a.status==0) = false"));
     assert!(
         has_status_line,
-        "Expected bare expression output for a.status==0. STDOUT: {}",
-        stdout
+        "Expected bare expression output for a.status==0. STDOUT: {stdout}"
     );
 
     // Expect either the then branch literal or the else-if branch expr at least once across samples
@@ -552,8 +523,7 @@ trace complex_types_program.c:25 {
         .any(|l| l.contains("(a.age==0) = true") || l.contains("(a.age==0) = false"));
     assert!(
         has_then || has_elseif_expr,
-        "Expected either then-branch 'wtf' or else-if expr output. STDOUT: {}",
-        stdout
+        "Expected either then-branch 'wtf' or else-if expr output. STDOUT: {stdout}"
     );
 
     Ok(())
@@ -586,8 +556,8 @@ trace complex_types_program.c:25 {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     use regex::Regex;
     let re = Regex::new(r"AND:(true|false) OR:(true|false)").unwrap();
@@ -598,7 +568,7 @@ trace complex_types_program.c:25 {
             break;
         }
     }
-    assert!(saw_fmt, "Expected logical fmt line. STDOUT: {}", stdout);
+    assert!(saw_fmt, "Expected logical fmt line. STDOUT: {stdout}");
 
     Ok(())
 }
@@ -628,18 +598,16 @@ trace update_complex {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     assert!(
         stdout.contains("true"),
-        "Expected true result. STDOUT: {}",
-        stdout
+        "Expected true result. STDOUT: {stdout}"
     );
     assert!(
         !stdout.contains("<error: null pointer dereference>"),
-        "Short-circuit should avoid null-deref RHS. STDOUT: {}",
-        stdout
+        "Short-circuit should avoid null-deref RHS. STDOUT: {stdout}"
     );
     Ok(())
 }
@@ -668,18 +636,16 @@ trace update_complex {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     assert!(
         stdout.contains("false"),
-        "Expected false result. STDOUT: {}",
-        stdout
+        "Expected false result. STDOUT: {stdout}"
     );
     assert!(
         !stdout.contains("<error: null pointer dereference>"),
-        "Short-circuit should avoid null-deref RHS. STDOUT: {}",
-        stdout
+        "Short-circuit should avoid null-deref RHS. STDOUT: {stdout}"
     );
     Ok(())
 }
@@ -714,16 +680,12 @@ trace complex_types_program.c:25 {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Top-level &a should produce a hex pointer
     let has_hex_ptr = stdout.contains("0x");
-    assert!(
-        has_hex_ptr,
-        "Expected hex pointer for &a. STDOUT: {}",
-        stdout
-    );
+    assert!(has_hex_ptr, "Expected hex pointer for &a. STDOUT: {stdout}");
 
     // (&a != 0) should produce bare expr with name and boolean value
     let has_expr_bool = stdout
@@ -731,17 +693,12 @@ trace complex_types_program.c:25 {
         .any(|l| l.contains("(&a!=0) = true") || l.contains("(&a!=0) = false"));
     assert!(
         has_expr_bool,
-        "Expected bare expr output for (&a!=0). STDOUT: {}",
-        stdout
+        "Expected bare expr output for (&a!=0). STDOUT: {stdout}"
     );
 
     // Then-branch literal
     let has_then = stdout.lines().any(|l| l.contains("ADDR"));
-    assert!(
-        has_then,
-        "Expected then-branch ADDR line. STDOUT: {}",
-        stdout
-    );
+    assert!(has_then, "Expected then-branch ADDR line. STDOUT: {stdout}");
 
     Ok(())
 }
@@ -768,8 +725,8 @@ trace complex_types_program.c:25 {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
     // Expect SE:true at least once near main where a.name=="Alice"
     assert!(stdout.contains("SE:true") || stdout.contains("SE:false"));
     Ok(())
@@ -803,18 +760,16 @@ trace complex_types_program.c:7 {
 
     assert_eq!(
         exit_code, 0,
-        "ghostscope should run successfully (stderr={}, stdout={})",
-        stderr, stdout
+        "ghostscope should run successfully (stderr={stderr}, stdout={stdout})"
     );
 
     // Expect at least one pointer value with type suffix
     assert!(
         stdout.contains("0x") && stdout.contains("(Complex*)"),
-        "Expected pointer formatting with type suffix. STDOUT: {}",
-        stdout
+        "Expected pointer formatting with type suffix. STDOUT: {stdout}"
     );
 
-    let _ = prog.kill().await;
+    let _ = prog.kill().await.is_ok();
     Ok(())
 }
 
@@ -844,13 +799,13 @@ trace complex_types_program.c:7 {
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
 
-    let _ = prog.kill().await;
+    let _ = prog.kill().await.is_ok();
 
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Check c.name renders correctly
     let has_name = stdout.contains("\"Alice\"") || stdout.contains("\"Bob\"");
-    assert!(has_name, "Expected c.name string. STDOUT: {}", stdout);
+    assert!(has_name, "Expected c.name string. STDOUT: {stdout}");
 
     // Look for at least one deref with full struct fields
     let mut found_struct = false;
@@ -870,8 +825,7 @@ trace complex_types_program.c:7 {
     }
     assert!(
         found_struct,
-        "Expected at least one full struct deref with fields. STDOUT: {}",
-        stdout
+        "Expected at least one full struct deref with fields. STDOUT: {stdout}"
     );
 
     Ok(())
@@ -901,9 +855,9 @@ trace complex_types_program.c:7 {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await;
+    let _ = prog.kill().await.is_ok();
 
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // We expect across events to see either NULL or non-NULL friend_ref at least once,
     // and when non-NULL, deref should produce a struct.
@@ -914,13 +868,11 @@ trace complex_types_program.c:7 {
 
     assert!(
         saw_null_ptr || saw_non_null_ptr,
-        "Expected at least one friend_ref pointer print. STDOUT: {}",
-        stdout
+        "Expected at least one friend_ref pointer print. STDOUT: {stdout}"
     );
     assert!(
         saw_struct_deref || saw_null_deref_err,
-        "Expected deref to produce either struct or null-deref error. STDOUT: {}",
-        stdout
+        "Expected deref to produce either struct or null-deref error. STDOUT: {stdout}"
     );
 
     Ok(())
@@ -959,14 +911,13 @@ async fn test_trace_by_address_nopie_complex_types() -> anyhow::Result<()> {
 
     // 4) Run ghostscope in PID mode (-p). Default module resolves to the main executable.
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(&script, 2, pid).await?;
-    let _ = prog.kill().await;
+    let _ = prog.kill().await.is_ok();
 
     // 5) Validate: we should see the marker at least once
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
     assert!(
         stdout.lines().any(|l| l.contains("NP_ADDR_OK")),
-        "Expected NP_ADDR_OK in output. STDOUT: {}",
-        stdout
+        "Expected NP_ADDR_OK in output. STDOUT: {stdout}"
     );
 
     Ok(())
@@ -1002,13 +953,12 @@ trace complex_types_program.c:25 {
         run_ghostscope_with_script_for_pid(script_content, 3, pid).await?;
 
     // Cleanup program
-    let _ = prog.kill().await;
+    let _ = prog.kill().await.is_ok();
 
     // Basic assertions (no fallback, attach failure is failure)
     assert_eq!(
         exit_code, 0,
-        "ghostscope should run successfully. stderr={} stdout={}",
-        stderr, stdout
+        "ghostscope should run successfully. stderr={stderr} stdout={stdout}"
     );
 
     // Check struct formatted line is present
@@ -1016,32 +966,28 @@ trace complex_types_program.c:25 {
         stdout.contains("Complex {") && stdout.contains("name:") && stdout.contains("age:");
     assert!(
         has_struct,
-        "Expected struct output with fields. STDOUT: {}",
-        stdout
+        "Expected struct output with fields. STDOUT: {stdout}"
     );
 
     // Ensure c.name renders as a quoted string (Alice/Bob)
     let has_name_str = stdout.contains("\"Alice\"") || stdout.contains("\"Bob\"");
     assert!(
         has_name_str,
-        "Expected name string output. STDOUT: {}",
-        stdout
+        "Expected name string output. STDOUT: {stdout}"
     );
 
     // Optional: struct print contains 'arr:' field (do not require arr index due to grammar limits)
     let has_arr_field = stdout.contains("arr:");
     assert!(
         has_arr_field,
-        "Expected struct output contains arr field. STDOUT: {}",
-        stdout
+        "Expected struct output contains arr field. STDOUT: {stdout}"
     );
 
     // Ensure formatted print line exists
     let has_formatted = stdout.contains("User:") && stdout.contains("Age:");
     assert!(
         has_formatted,
-        "Expected formatted print output. STDOUT: {}",
-        stdout
+        "Expected formatted print output. STDOUT: {stdout}"
     );
 
     Ok(())
@@ -1076,28 +1022,25 @@ trace update_complex {
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
 
     // Cleanup program
-    let _ = prog.kill().await;
+    let _ = prog.kill().await.is_ok();
 
     assert_eq!(
         exit_code, 0,
-        "ghostscope should run successfully. stderr={} stdout={}",
-        stderr, stdout
+        "ghostscope should run successfully. stderr={stderr} stdout={stdout}"
     );
 
     // Expect at least one line referencing the name string from pointer-deref path
     let has_name = stdout.contains("\"Alice\"") || stdout.contains("\"Bob\"");
     assert!(
         has_name,
-        "Expected dereferenced name (\"Alice\" or \"Bob\"). STDOUT: {}",
-        stdout
+        "Expected dereferenced name (\"Alice\" or \"Bob\"). STDOUT: {stdout}"
     );
 
     // Ensure formatted print line exists with both fields
     let has_formatted = stdout.contains("U:") && stdout.contains("A:");
     assert!(
         has_formatted,
-        "Expected formatted pointer-deref output. STDOUT: {}",
-        stdout
+        "Expected formatted pointer-deref output. STDOUT: {stdout}"
     );
 
     Ok(())
@@ -1132,28 +1075,25 @@ trace complex_types_program.c:6 {
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
 
     // Cleanup program
-    let _ = prog.kill().await;
+    let _ = prog.kill().await.is_ok();
 
     assert_eq!(
         exit_code, 0,
-        "ghostscope should run successfully. stderr={} stdout={}",
-        stderr, stdout
+        "ghostscope should run successfully. stderr={stderr} stdout={stdout}"
     );
 
     // Name should be readable via auto-deref
     let has_name = stdout.contains("\"Alice\"") || stdout.contains("\"Bob\"");
     assert!(
         has_name,
-        "Expected dereferenced name at entry (\"Alice\" or \"Bob\"). STDOUT: {}",
-        stdout
+        "Expected dereferenced name at entry (\"Alice\" or \"Bob\"). STDOUT: {stdout}"
     );
 
     // Ensure formatted print line exists
     let has_formatted = stdout.contains("U:") && stdout.contains("A:");
     assert!(
         has_formatted,
-        "Expected formatted pointer-deref output at entry. STDOUT: {}",
-        stdout
+        "Expected formatted pointer-deref output at entry. STDOUT: {stdout}"
     );
 
     Ok(())
@@ -1185,37 +1125,32 @@ trace complex_types_program.c:25 {
 
     let (exit_code, stdout, stderr) =
         run_ghostscope_with_script_for_pid(script_content, 3, pid).await?;
-    let _ = prog.kill().await;
+    let _ = prog.kill().await.is_ok();
 
     assert_eq!(
         exit_code, 0,
-        "ghostscope should run successfully. stderr={} stdout={}",
-        stderr, stdout
+        "ghostscope should run successfully. stderr={stderr} stdout={stdout}"
     );
     let has_struct =
         stdout.contains("Complex {") && stdout.contains("name:") && stdout.contains("age:");
     assert!(
         has_struct,
-        "Expected struct output with fields. STDOUT: {}",
-        stdout
+        "Expected struct output with fields. STDOUT: {stdout}"
     );
     let has_name_str = stdout.contains("\"Alice\"") || stdout.contains("\"Bob\"");
     assert!(
         has_name_str,
-        "Expected name string output. STDOUT: {}",
-        stdout
+        "Expected name string output. STDOUT: {stdout}"
     );
     let has_arr_field = stdout.contains("arr:");
     assert!(
         has_arr_field,
-        "Expected struct output contains arr field. STDOUT: {}",
-        stdout
+        "Expected struct output contains arr field. STDOUT: {stdout}"
     );
     let has_formatted = stdout.contains("User:") && stdout.contains("Age:");
     assert!(
         has_formatted,
-        "Expected formatted print output. STDOUT: {}",
-        stdout
+        "Expected formatted print output. STDOUT: {stdout}"
     );
 
     Ok(())
@@ -1242,24 +1177,21 @@ trace update_complex {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await;
+    let _ = prog.kill().await.is_ok();
 
     assert_eq!(
         exit_code, 0,
-        "ghostscope should run successfully. stderr={} stdout={}",
-        stderr, stdout
+        "ghostscope should run successfully. stderr={stderr} stdout={stdout}"
     );
     let has_name = stdout.contains("\"Alice\"") || stdout.contains("\"Bob\"");
     assert!(
         has_name,
-        "Expected dereferenced name (\"Alice\" or \"Bob\"). STDOUT: {}",
-        stdout
+        "Expected dereferenced name (\"Alice\" or \"Bob\"). STDOUT: {stdout}"
     );
     let has_formatted = stdout.contains("U:") && stdout.contains("A:");
     assert!(
         has_formatted,
-        "Expected formatted pointer-deref output. STDOUT: {}",
-        stdout
+        "Expected formatted pointer-deref output. STDOUT: {stdout}"
     );
 
     Ok(())
@@ -1294,12 +1226,11 @@ trace complex_types_program.c:25 {
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script_fn, 3, pid).await?;
 
     // Cleanup program
-    let _ = prog.kill().await;
+    let _ = prog.kill().await.is_ok();
 
     assert_eq!(
         exit_code, 0,
-        "ghostscope should run successfully. stderr={} stdout={}",
-        stderr, stdout
+        "ghostscope should run successfully. stderr={stderr} stdout={stdout}"
     );
 
     // Parse values from output
@@ -1343,37 +1274,29 @@ trace complex_types_program.c:25 {
         }
     }
 
-    let i_val = found_i.ok_or_else(|| anyhow::anyhow!("Missing I=... line. STDOUT: {}", stdout))?;
+    let i_val = found_i.ok_or_else(|| anyhow::anyhow!("Missing I=... line. STDOUT: {stdout}"))?;
     let active_val =
-        found_active.ok_or_else(|| anyhow::anyhow!("Missing active line. STDOUT: {}", stdout))?;
+        found_active.ok_or_else(|| anyhow::anyhow!("Missing active line. STDOUT: {stdout}"))?;
     let flags_val =
-        found_flags.ok_or_else(|| anyhow::anyhow!("Missing flags line. STDOUT: {}", stdout))?;
+        found_flags.ok_or_else(|| anyhow::anyhow!("Missing flags line. STDOUT: {stdout}"))?;
 
     assert!(
         active_val <= 1,
-        "active should be 0 or 1, got {}. STDOUT: {}",
-        active_val,
-        stdout
+        "active should be 0 or 1, got {active_val}. STDOUT: {stdout}"
     );
     assert!(
         flags_val <= 7,
-        "flags should be 0..7, got {}. STDOUT: {}",
-        flags_val,
-        stdout
+        "flags should be 0..7, got {flags_val}. STDOUT: {stdout}"
     );
     assert_eq!(
         active_val,
         i_val & 1,
-        "active must equal i&1 (i={}, active={})",
-        i_val,
-        active_val
+        "active must equal i&1 (i={i_val}, active={active_val})"
     );
     assert_eq!(
         flags_val,
         i_val & 7,
-        "flags must equal i&7 (i={}, flags={})",
-        i_val,
-        flags_val
+        "flags must equal i&7 (i={i_val}, flags={flags_val})"
     );
 
     Ok(())
@@ -1415,32 +1338,29 @@ trace complex_types_program.c:7 {
 
     assert_eq!(
         exit_code, 0,
-        "ghostscope should run successfully (stderr={}, stdout={})",
-        stderr, stdout
+        "ghostscope should run successfully (stderr={stderr}, stdout={stdout})"
     );
 
     // Validate pointer prints include type suffix and hex
     let has_any_ptr = stdout.contains("0x") && stdout.contains("(Complex*)");
     assert!(
         has_any_ptr,
-        "Expected pointer print with type suffix. STDOUT: {}",
-        stdout
+        "Expected pointer print with type suffix. STDOUT: {stdout}"
     );
 
     // Validate c.name renders as a quoted string
     let has_name = stdout.contains("\"Alice\"") || stdout.contains("\"Bob\"");
-    assert!(has_name, "Expected c.name string. STDOUT: {}", stdout);
+    assert!(has_name, "Expected c.name string. STDOUT: {stdout}");
 
     // Validate deref prints either a pretty struct or a null-deref error
     let has_deref_struct = stdout.contains("*c.friend_ref")
         && (stdout.contains("Complex {") || stdout.contains("<error: null pointer dereference>"));
     assert!(
         has_deref_struct,
-        "Expected deref output (struct or null-deref). STDOUT: {}",
-        stdout
+        "Expected deref output (struct or null-deref). STDOUT: {stdout}"
     );
 
-    let _ = prog.kill().await;
+    let _ = prog.kill().await.is_ok();
     Ok(())
 }
 
@@ -1469,8 +1389,8 @@ trace complex_types_program.c:25 {
 
     let (exit_code, stdout, stderr) =
         run_ghostscope_with_script_for_pid_perf(script, 3, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     use regex::Regex;
     let re_arr = Regex::new(r"ARR:(-?\d+)").unwrap();
@@ -1479,13 +1399,11 @@ trace complex_types_program.c:25 {
     let has_brr = stdout.lines().any(|l| re_brr.is_match(l));
     assert!(
         has_arr,
-        "Expected formatted ARR value from a.arr[1]. STDOUT: {}",
-        stdout
+        "Expected formatted ARR value from a.arr[1]. STDOUT: {stdout}"
     );
     assert!(
         has_brr,
-        "Expected formatted BRR value from b.arr[0]. STDOUT: {}",
-        stdout
+        "Expected formatted BRR value from b.arr[0]. STDOUT: {stdout}"
     );
 
     Ok(())
@@ -1522,13 +1440,12 @@ trace complex_types_program.c:25 {
         run_ghostscope_with_script_for_pid_perf(script_content, 3, pid).await?;
 
     // Cleanup program
-    let _ = prog.kill().await;
+    let _ = prog.kill().await.is_ok();
 
     // Basic assertions (no fallback, attach failure is failure)
     assert_eq!(
         exit_code, 0,
-        "ghostscope should run successfully. stderr={} stdout={}",
-        stderr, stdout
+        "ghostscope should run successfully. stderr={stderr} stdout={stdout}"
     );
 
     // Check struct formatted line is present
@@ -1536,32 +1453,28 @@ trace complex_types_program.c:25 {
         stdout.contains("Complex {") && stdout.contains("name:") && stdout.contains("age:");
     assert!(
         has_struct,
-        "Expected struct output with fields. STDOUT: {}",
-        stdout
+        "Expected struct output with fields. STDOUT: {stdout}"
     );
 
     // Ensure c.name renders as a quoted string (Alice/Bob)
     let has_name_str = stdout.contains("\"Alice\"") || stdout.contains("\"Bob\"");
     assert!(
         has_name_str,
-        "Expected name string output. STDOUT: {}",
-        stdout
+        "Expected name string output. STDOUT: {stdout}"
     );
 
     // Optional: struct print contains 'arr:' field (do not require arr index due to grammar limits)
     let has_arr_field = stdout.contains("arr:");
     assert!(
         has_arr_field,
-        "Expected struct output contains arr field. STDOUT: {}",
-        stdout
+        "Expected struct output contains arr field. STDOUT: {stdout}"
     );
 
     // Ensure formatted print line exists
     let has_formatted = stdout.contains("User:") && stdout.contains("Age:");
     assert!(
         has_formatted,
-        "Expected formatted print output. STDOUT: {}",
-        stdout
+        "Expected formatted print output. STDOUT: {stdout}"
     );
 
     Ok(())

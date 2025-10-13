@@ -1,10 +1,3 @@
-// Clippy: allow some lints in test utilities
-#![allow(
-    clippy::uninlined_format_args,
-    clippy::needless_borrows_for_generic_args,
-    dead_code
-)]
-
 //! Common test utilities shared across integration tests
 //!
 //! This module also exposes a small async runner (`runner`) to invoke the
@@ -39,6 +32,27 @@ pub fn init() {
             .with_env_filter("off")
             .try_init()
             .ok();
+
+        // Touch rarely-used symbols so they aren't considered dead code
+        // in test binaries that don't exercise every helper.
+        let _ = &COMPILE_COMPLEX_NOPIE;
+        let _use_method_ptr: fn(&TestFixtures) -> anyhow::Result<PathBuf> =
+            TestFixtures::get_test_binary_complex_nopie;
+        let _use_method_ptr2: fn(&TestFixtures, &str) -> anyhow::Result<PathBuf> =
+            TestFixtures::get_test_binary;
+
+        // Reference all OptimizationLevel variants so clippy does not flag
+        // them as dead code in bins that don't use some levels.
+        let _ = OptimizationLevel::O1;
+        let _ = OptimizationLevel::O2;
+        let _ = OptimizationLevel::O3;
+        let _ = OptimizationLevel::Stripped;
+
+        // Exercise runner builder methods so they are referenced in all bins.
+        let _ = runner::GhostscopeRunner::new()
+            .with_target("/")
+            .force_perf_event_array(false)
+            .enable_console_log(false);
     });
 
     // Register an atexit cleanup to remove built fixtures after all tests
@@ -51,36 +65,41 @@ pub fn init() {
             let sample_dir = base.join("sample_program");
             let _ = Command::new("make")
                 .arg("clean")
-                .current_dir(&sample_dir)
-                .output();
+                .current_dir(sample_dir)
+                .status()
+                .is_ok();
 
             // complex_types_program (also remove Non-PIE target)
             let complex_dir = base.join("complex_types_program");
             let _ = Command::new("make")
                 .arg("clean")
-                .current_dir(&complex_dir)
-                .output();
+                .current_dir(complex_dir)
+                .status()
+                .is_ok();
 
             // globals_program
             let globals_dir = base.join("globals_program");
             let _ = Command::new("make")
                 .arg("clean")
-                .current_dir(&globals_dir)
-                .output();
+                .current_dir(globals_dir)
+                .status()
+                .is_ok();
 
             // cpp_complex_program
             let cpp_complex_dir = base.join("cpp_complex_program");
             let _ = Command::new("make")
                 .arg("clean")
-                .current_dir(&cpp_complex_dir)
-                .output();
+                .current_dir(cpp_complex_dir)
+                .status()
+                .is_ok();
 
             // rust_global_program
             let rust_global_dir = base.join("rust_global_program");
             let _ = Command::new("cargo")
                 .arg("clean")
-                .current_dir(&rust_global_dir)
-                .output();
+                .current_dir(rust_global_dir)
+                .status()
+                .is_ok();
         }
         libc::atexit(cleanup_fixtures);
     });
@@ -131,11 +150,6 @@ impl OptimizationLevel {
     }
 }
 
-/// Compile test program (call once for all tests)
-pub fn ensure_test_program_compiled() -> anyhow::Result<()> {
-    ensure_test_program_compiled_with_opt(OptimizationLevel::Debug)
-}
-
 /// Compile test program with specific optimization level
 pub fn ensure_test_program_compiled_with_opt(opt_level: OptimizationLevel) -> anyhow::Result<()> {
     match opt_level {
@@ -146,7 +160,7 @@ pub fn ensure_test_program_compiled_with_opt(opt_level: OptimizationLevel) -> an
             });
             match COMPILE_DEBUG_RESULT.lock().unwrap().as_ref() {
                 Some(Ok(())) => Ok(()),
-                Some(Err(e)) => Err(anyhow::anyhow!("{}", e)),
+                Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
                 None => panic!("Compilation result should be set after call_once"),
             }
         }
@@ -157,7 +171,7 @@ pub fn ensure_test_program_compiled_with_opt(opt_level: OptimizationLevel) -> an
             });
             match COMPILE_STRIPPED_RESULT.lock().unwrap().as_ref() {
                 Some(Ok(())) => Ok(()),
-                Some(Err(e)) => Err(anyhow::anyhow!("{}", e)),
+                Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
                 None => panic!("Compilation result should be set after call_once"),
             }
         }
@@ -168,7 +182,7 @@ pub fn ensure_test_program_compiled_with_opt(opt_level: OptimizationLevel) -> an
             });
             match COMPILE_OPT_RESULT.lock().unwrap().as_ref() {
                 Some(Ok(())) => Ok(()),
-                Some(Err(e)) => Err(anyhow::anyhow!("{}", e)),
+                Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
                 None => panic!("Compilation result should be set after call_once"),
             }
         }
@@ -180,15 +194,14 @@ fn compile_sample_program(opt_level: OptimizationLevel) -> anyhow::Result<()> {
     let sample_program_dir = fixtures_path.join("sample_program");
 
     println!(
-        "Compiling sample_program {} in {:?}",
-        opt_level.description(),
-        sample_program_dir
+        "Compiling sample_program {} in {sample_program_dir:?}",
+        opt_level.description()
     );
 
     // Compile specific optimization level
     let output = Command::new("make")
         .arg(opt_level.as_make_target())
-        .current_dir(&sample_program_dir)
+        .current_dir(sample_program_dir)
         .output()
         .map_err(|e| {
             anyhow::anyhow!(
@@ -227,7 +240,7 @@ fn ensure_complex_program_compiled_with_opt(opt_level: OptimizationLevel) -> any
             });
             match COMPILE_COMPLEX_DEBUG_RESULT.lock().unwrap().as_ref() {
                 Some(Ok(())) => Ok(()),
-                Some(Err(e)) => Err(anyhow::anyhow!("{}", e)),
+                Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
                 None => panic!("Compilation result should be set after call_once"),
             }
         }
@@ -238,7 +251,7 @@ fn ensure_complex_program_compiled_with_opt(opt_level: OptimizationLevel) -> any
             });
             match COMPILE_COMPLEX_OPT_RESULT.lock().unwrap().as_ref() {
                 Some(Ok(())) => Ok(()),
-                Some(Err(e)) => Err(anyhow::anyhow!("{}", e)),
+                Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
                 None => panic!("Compilation result should be set after call_once"),
             }
         }
@@ -250,9 +263,8 @@ fn compile_complex_program(opt_level: OptimizationLevel) -> anyhow::Result<()> {
     let program_dir = fixtures_path.join("complex_types_program");
 
     println!(
-        "Compiling complex_types_program {} in {:?}",
-        opt_level.description(),
-        program_dir
+        "Compiling complex_types_program {} in {program_dir:?}",
+        opt_level.description()
     );
 
     let target = match opt_level {
@@ -267,7 +279,7 @@ fn compile_complex_program(opt_level: OptimizationLevel) -> anyhow::Result<()> {
 
     let output = Command::new("make")
         .arg(target)
-        .current_dir(&program_dir)
+        .current_dir(program_dir)
         .output()
         .map_err(|e| {
             anyhow::anyhow!(
@@ -373,14 +385,11 @@ impl TestFixtures {
 
         COMPILE_COMPLEX_NOPIE.call_once(|| {
             let compile_result = (|| -> anyhow::Result<()> {
-                println!(
-                    "Compiling complex_types_program Non-PIE (ET_EXEC) in {:?}",
-                    program_dir
-                );
+                println!("Compiling complex_types_program Non-PIE (ET_EXEC) in {program_dir:?}");
 
                 let output = Command::new("make")
                     .arg("complex_types_program_nopie")
-                    .current_dir(&program_dir)
+                    .current_dir(program_dir.clone())
                     .output()
                     .map_err(|e| {
                         anyhow::anyhow!(
@@ -407,7 +416,7 @@ impl TestFixtures {
         // Check compilation result
         match COMPILE_COMPLEX_NOPIE_RESULT.lock().unwrap().as_ref() {
             Some(Ok(())) => {}
-            Some(Err(e)) => return Err(anyhow::anyhow!("{}", e)),
+            Some(Err(e)) => return Err(anyhow::anyhow!("{e}")),
             None => panic!("Compilation result should be set after call_once"),
         }
 
@@ -434,12 +443,13 @@ fn ensure_globals_program_compiled() -> anyhow::Result<()> {
     let mut result = Ok(());
     COMPILE_GLOBALS.call_once(|| {
         let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/globals_program");
-        println!("Compiling globals_program (Debug) in {:?}", base);
+        println!("Compiling globals_program (Debug) in {base:?}");
         let _ = Command::new("make")
             .arg("clean")
-            .current_dir(&base)
-            .output();
-        match Command::new("make").arg("all").current_dir(&base).output() {
+            .current_dir(base.clone())
+            .status()
+            .is_ok();
+        match Command::new("make").arg("all").current_dir(base).output() {
             Ok(out) => {
                 if out.status.success() {
                     println!("✓ Successfully compiled globals_program and libgvars.so");
@@ -467,10 +477,10 @@ fn ensure_rust_global_program_compiled() -> anyhow::Result<()> {
     COMPILE_RUST_GLOBAL.call_once(|| {
         let base =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rust_global_program");
-        println!("Compiling rust_global_program (Debug) in {:?}", base);
+        println!("Compiling rust_global_program (Debug) in {base:?}");
         match Command::new("cargo")
             .arg("build")
-            .current_dir(&base)
+            .current_dir(base)
             .output()
         {
             Ok(out) => {
@@ -500,12 +510,13 @@ fn ensure_cpp_complex_program_compiled() -> anyhow::Result<()> {
     COMPILE_CPP_COMPLEX.call_once(|| {
         let base =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cpp_complex_program");
-        println!("Compiling cpp_complex_program (Debug) in {:?}", base);
+        println!("Compiling cpp_complex_program (Debug) in {base:?}");
         let _ = Command::new("make")
             .arg("clean")
-            .current_dir(&base)
-            .output();
-        match Command::new("make").arg("all").current_dir(&base).output() {
+            .current_dir(base.clone())
+            .status()
+            .is_ok();
+        match Command::new("make").arg("all").current_dir(base).output() {
             Ok(out) => {
                 if out.status.success() {
                     println!("✓ Successfully compiled cpp_complex_program");

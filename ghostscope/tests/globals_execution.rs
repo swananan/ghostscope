@@ -1,10 +1,3 @@
-// Clippy: allow some lints in tests
-#![allow(
-    clippy::uninlined_format_args,
-    clippy::needless_borrows_for_generic_args,
-    dead_code
-)]
-
 //! Globals program script execution tests
 //! - Validates printing of globals via local aliases in function scope
 //! - Checks struct formatting, string extraction, and formatted prints
@@ -64,9 +57,9 @@ async fn test_memcmp_hex_helper_on_globals() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -85,17 +78,15 @@ trace globals_program.c:32 {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
     assert!(
         stdout.contains("HEX_OK"),
-        "Expected HEX_OK. STDOUT: {}",
-        stdout
+        "Expected HEX_OK. STDOUT: {stdout}"
     );
     assert!(
         stdout.contains("HEX_LM"),
-        "Expected HEX_LM. STDOUT: {}",
-        stdout
+        "Expected HEX_LM. STDOUT: {stdout}"
     );
     Ok(())
 }
@@ -105,9 +96,9 @@ async fn test_if_memcmp_failure_emits_exprerror_and_suppress_else() -> anyhow::R
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -127,26 +118,20 @@ trace globals_program.c:32 {
 "#;
     let (exit_code, stdout, stderr) =
         run_ghostscope_with_script_for_pid_perf(script, 3, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Should have ExprError line and AFTER; should not see THEN/ELSE
     assert!(
         stdout.contains("ExprError"),
-        "Expected ExprError warning. STDOUT: {}",
-        stdout
+        "Expected ExprError warning. STDOUT: {stdout}"
     );
-    assert!(
-        stdout.contains("AFTER"),
-        "Expected AFTER. STDOUT: {}",
-        stdout
-    );
+    assert!(stdout.contains("AFTER"), "Expected AFTER. STDOUT: {stdout}");
     assert!(
         !stdout.contains("THEN"),
-        "THEN should be suppressed. STDOUT: {}",
-        stdout
+        "THEN should be suppressed. STDOUT: {stdout}"
     );
-    assert!(stdout.contains("ELSE"), "Expected ELSE. STDOUT: {}", stdout);
+    assert!(stdout.contains("ELSE"), "Expected ELSE. STDOUT: {stdout}");
     Ok(())
 }
 
@@ -156,9 +141,9 @@ async fn test_struct_arithmetic_is_rejected_with_friendly_error() -> anyhow::Res
 
     // Launch the globals_program fixture to obtain a PID
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let prog = tokio::process::Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -188,9 +173,7 @@ trace tick_once {
         || stderr_buf.contains("Pointer arithmetic requires a pointer or array expression");
     assert!(
         has_banner && has_friendly,
-        "Expected friendly struct arithmetic rejection.\nSTDERR: {}\nSTDOUT: {}",
-        stderr_buf,
-        stdout_buf
+        "Expected friendly struct arithmetic rejection.\nSTDERR: {stderr_buf}\nSTDOUT: {stdout_buf}"
     );
 
     Ok(())
@@ -201,9 +184,9 @@ async fn test_else_if_continues_after_error() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -223,14 +206,13 @@ trace globals_program.c:32 {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={} ", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout} ");
 
     // Expect ExprError (from first if, when G_STATE.lib is NULL), and B printed; A/C should not appear
     assert!(
         stdout.contains("ExprError"),
-        "Expected ExprError warning. STDOUT: {}",
-        stdout
+        "Expected ExprError warning. STDOUT: {stdout}"
     );
     // Check per-line tokens to avoid false positives on 'A' letter inside other words
     let mut saw_b_token = false;
@@ -248,12 +230,11 @@ trace globals_program.c:32 {
             saw_c_token = true;
         }
     }
-    assert!(saw_b_token, "Expected B from else-if. STDOUT: {}", stdout);
-    assert!(!saw_a_token, "A should not be printed. STDOUT: {}", stdout);
+    assert!(saw_b_token, "Expected B from else-if. STDOUT: {stdout}");
+    assert!(!saw_a_token, "A should not be printed. STDOUT: {stdout}");
     assert!(
         !saw_c_token,
-        "C should be suppressed due to else-if true. STDOUT: {}",
-        stdout
+        "C should be suppressed due to else-if true. STDOUT: {stdout}"
     );
     Ok(())
 }
@@ -263,9 +244,9 @@ async fn test_script_signed_ints_regression() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -287,30 +268,26 @@ trace globals_program.c:32 {
 }
 "#;
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 2, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Variable prints
     assert!(
         stdout.contains("a = -1"),
-        "Expected a = -1. STDOUT: {}",
-        stdout
+        "Expected a = -1. STDOUT: {stdout}"
     );
     assert!(
         stdout.contains("b = -2"),
-        "Expected b = -2. STDOUT: {}",
-        stdout
+        "Expected b = -2. STDOUT: {stdout}"
     );
     assert!(
         stdout.contains("c = -3"),
-        "Expected c = -3. STDOUT: {}",
-        stdout
+        "Expected c = -3. STDOUT: {stdout}"
     );
     // Formatted prints
     assert!(
         stdout.contains("FMT:-1|-2|-3"),
-        "Expected formatted signed values. STDOUT: {}",
-        stdout
+        "Expected formatted signed values. STDOUT: {stdout}"
     );
     Ok(())
 }
@@ -322,9 +299,9 @@ async fn test_trace_by_address_via_dwarf_line_lookup() -> anyhow::Result<()> {
 
     // 1) Start the fixture program
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -353,14 +330,13 @@ async fn test_trace_by_address_via_dwarf_line_lookup() -> anyhow::Result<()> {
     // 4) Run ghostscope with -p and the script; in -p mode the default module is the main executable
     // Allow a bit more time for the shared library function to trigger
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(&script, 4, pid).await?;
-    let _ = prog.kill().await;
+    let _ = prog.kill().await.is_ok();
 
     // 5) Validate output: should see the marker at least once
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
     assert!(
         stdout.lines().any(|l| l.contains("ADDR_OK")),
-        "Expected ADDR_OK in output. STDOUT: {}",
-        stdout
+        "Expected ADDR_OK in output. STDOUT: {stdout}"
     );
 
     Ok(())
@@ -384,9 +360,9 @@ async fn test_special_vars_pid_tid_timestamp_globals() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -401,17 +377,15 @@ async fn test_special_vars_pid_tid_timestamp_globals() -> anyhow::Result<()> {
     );
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(&script, 3, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
     assert!(
         stdout.contains("PID_EQ"),
-        "Expected PID_EQ. STDOUT: {}",
-        stdout
+        "Expected PID_EQ. STDOUT: {stdout}"
     );
     assert!(
         stdout.contains("PID=") || stdout.contains("PID:"),
-        "Expected PID print. STDOUT: {}",
-        stdout
+        "Expected PID print. STDOUT: {stdout}"
     );
 
     Ok(())
@@ -424,9 +398,9 @@ async fn test_trace_address_with_target_shared_library() -> anyhow::Result<()> {
 
     // Start an app that maps libgvars.so so that uprobe events occur
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -458,18 +432,15 @@ async fn test_trace_address_with_target_shared_library() -> anyhow::Result<()> {
     // Run ghostscope in target mode (-t <libgvars.so>) with the script, collect output briefly
     let (exit_code, stdout, stderr) =
         run_ghostscope_with_script_for_target(&script, 2, &lib_path).await?;
-    let _ = prog.kill().await;
+    let _ = prog.kill().await.is_ok();
 
     assert_eq!(
         exit_code, 0,
-        "stderr={} stdout={} script={}",
-        stderr, stdout, script
+        "stderr={stderr} stdout={stdout} script={script}",
     );
     assert!(
         stdout.lines().any(|l| l.contains("LIB_ADDR_OK")),
-        "Expected LIB_ADDR_OK in output. STDOUT: {}, script {}",
-        stdout,
-        script
+        "Expected LIB_ADDR_OK in output. STDOUT: {stdout}, script {script}"
     );
     Ok(())
 }
@@ -482,9 +453,9 @@ async fn test_trace_module_qualified_address_in_pid_mode() -> anyhow::Result<()>
 
     // Start the fixture program which loads libgvars.so
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -514,18 +485,15 @@ async fn test_trace_module_qualified_address_in_pid_mode() -> anyhow::Result<()>
     let script = format!("trace libgvars.so:0x{pc:x} {{\n    print \"LIB_MQUAL_OK\";\n}}\n");
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(&script, 2, pid).await?;
-    let _ = prog.kill().await;
+    let _ = prog.kill().await.is_ok();
 
     assert_eq!(
         exit_code, 0,
-        "stderr={} stdout={}, script={}",
-        stderr, stdout, script
+        "stderr={stderr} stdout={stdout}, script={script}",
     );
     assert!(
         stdout.lines().any(|l| l.contains("LIB_MQUAL_OK")),
-        "Expected LIB_MQUAL_OK in output. STDOUT: {}, script: {}",
-        stdout,
-        script
+        "Expected LIB_MQUAL_OK in output. STDOUT: {stdout}, script: {script}"
     );
 
     Ok(())
@@ -536,9 +504,9 @@ async fn test_address_of_with_hint_regression() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -554,12 +522,11 @@ trace globals_program.c:32 {
 }
 "#;
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 1, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
     assert!(
         stdout.contains("0x"),
-        "Expected hex address. STDOUT: {}",
-        stdout
+        "Expected hex address. STDOUT: {stdout}"
     );
     Ok(())
 }
@@ -569,9 +536,9 @@ async fn test_unary_minus_nested() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -589,17 +556,12 @@ trace globals_program.c:32 {
 }
 "#;
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 1, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
-    assert!(
-        stdout.contains("d = 1"),
-        "Expected d = 1. STDOUT: {}",
-        stdout
-    );
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(stdout.contains("d = 1"), "Expected d = 1. STDOUT: {stdout}");
     assert!(
         stdout.contains("X:1"),
-        "Expected formatted 1. STDOUT: {}",
-        stdout
+        "Expected formatted 1. STDOUT: {stdout}"
     );
     Ok(())
 }
@@ -609,9 +571,9 @@ async fn test_string_comparison_globals_char_ptr_and_array() -> anyhow::Result<(
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -631,25 +593,22 @@ trace globals_program.c:32 {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Expect to see both char* matches (gm,lm)
     assert!(
         stdout.contains("GM_OK"),
-        "Expected GM_OK for g_message. STDOUT: {}",
-        stdout
+        "Expected GM_OK for g_message. STDOUT: {stdout}"
     );
     assert!(
         stdout.contains("LM_OK"),
-        "Expected LM_OK for lib_message. STDOUT: {}",
-        stdout
+        "Expected LM_OK for lib_message. STDOUT: {stdout}"
     );
     // And ideally G_STATE.name comparison as RUNNING
     assert!(
         stdout.contains("GNAME_RUN"),
-        "Expected GNAME_RUN for G_STATE.name. STDOUT: {}",
-        stdout
+        "Expected GNAME_RUN for G_STATE.name. STDOUT: {stdout}"
     );
     Ok(())
 }
@@ -659,9 +618,9 @@ async fn test_print_format_current_global_member_leaf() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -678,8 +637,8 @@ trace globals_program.c:32 {
 "#;
     // Collect exactly 2 events for deterministic delta/null checks
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 2, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let re = Regex::new(r"GY:([0-9]+(?:\.[0-9]+)?)").unwrap();
     let mut vals: Vec<f64> = Vec::new();
@@ -688,23 +647,17 @@ trace globals_program.c:32 {
             // Ensure scalar print (no struct pretty-print)
             assert!(
                 !line.contains("Inner {"),
-                "Expected scalar for G_STATE.inner.y, got struct: {}",
-                line
+                "Expected scalar for G_STATE.inner.y, got struct: {line}"
             );
             vals.push(c[1].parse().unwrap_or(0.0));
         }
     }
-    assert!(
-        vals.len() >= 2,
-        "Insufficient GY events. STDOUT: {}",
-        stdout
-    );
+    assert!(vals.len() >= 2, "Insufficient GY events. STDOUT: {stdout}");
     // inner.y increments by 0.5 per tick in globals_program
     let d = ((vals[1] - vals[0]) * 100.0).round() as i64;
     assert_eq!(
         d, 50,
-        "G_STATE.inner.y should +0.5 per tick. STDOUT: {}",
-        stdout
+        "G_STATE.inner.y should +0.5 per tick. STDOUT: {stdout}"
     );
     Ok(())
 }
@@ -714,9 +667,9 @@ async fn test_print_format_global_autoderef_pointer_member() -> anyhow::Result<(
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -732,8 +685,8 @@ trace globals_program.c:32 {
 }
 "#;
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Expect both a normal numeric output and a NullDeref error output while lib toggles
     let num_re = Regex::new(r"X:\s*(-?\d+)").unwrap();
@@ -748,8 +701,8 @@ trace globals_program.c:32 {
             has_err = true;
         }
     }
-    assert!(has_num, "Expected numeric X line. STDOUT: {}", stdout);
-    assert!(has_err, "Expected NullDeref X line. STDOUT: {}", stdout);
+    assert!(has_num, "Expected numeric X line. STDOUT: {stdout}");
+    assert!(has_err, "Expected NullDeref X line. STDOUT: {stdout}");
     Ok(())
 }
 
@@ -758,9 +711,9 @@ async fn test_cross_type_comparisons_globals() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -784,8 +737,8 @@ trace globals_program.c:32 {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let re = Regex::new(r"SI_GT5:(true|false) PIN0:(true|false) SI_GT_TH:(true|false)").unwrap();
     let mut saw_line = false;
@@ -801,10 +754,9 @@ trace globals_program.c:32 {
     }
     assert!(
         saw_line,
-        "Expected at least one comparison line. STDOUT: {}",
-        stdout
+        "Expected at least one comparison line. STDOUT: {stdout}"
     );
-    assert!(saw_pin0_flag, "Expected PIN0 present. STDOUT: {}", stdout);
+    assert!(saw_pin0_flag, "Expected PIN0 present. STDOUT: {stdout}");
 
     Ok(())
 }
@@ -814,9 +766,9 @@ async fn test_if_else_if_and_bare_expr_globals() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -840,8 +792,8 @@ trace globals_program.c:32 {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Expect bare expr name preserved for (s_internal>5) = true/false
     let has_expr_line = stdout
@@ -849,8 +801,7 @@ trace globals_program.c:32 {
         .any(|l| l.contains("(s_internal>5) = true") || l.contains("(s_internal>5) = false"));
     assert!(
         has_expr_line,
-        "Expected bare expression output for s_internal>5. STDOUT: {}",
-        stdout
+        "Expected bare expression output for s_internal>5. STDOUT: {stdout}"
     );
 
     // Branch outputs are environment-dependent (timing-sensitive). If they appear it's ok,
@@ -865,9 +816,9 @@ async fn test_if_else_if_logical_ops_globals() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -884,12 +835,12 @@ trace globals_program.c:32 {
 }
 "#;
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Expect deterministic AND branch
     let has_and = stdout.lines().any(|l| l.contains("AND"));
-    assert!(has_and, "Expected AND branch output. STDOUT: {}", stdout);
+    assert!(has_and, "Expected AND branch output. STDOUT: {stdout}");
 
     Ok(())
 }
@@ -899,9 +850,9 @@ async fn test_address_of_and_comparisons_globals() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -920,14 +871,13 @@ trace globals_program.c:32 {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Hex pointer expected for &G_STATE
     assert!(
         stdout.contains("0x"),
-        "Expected hex pointer for &G_STATE. STDOUT: {}",
-        stdout
+        "Expected hex pointer for &G_STATE. STDOUT: {stdout}"
     );
 
     // Bare expr boolean with name
@@ -936,15 +886,13 @@ trace globals_program.c:32 {
         .any(|l| l.contains("(&G_STATE!=0) = true") || l.contains("(&G_STATE!=0) = false"));
     assert!(
         has_expr,
-        "Expected (&G_STATE!=0) bare expr. STDOUT: {}",
-        stdout
+        "Expected (&G_STATE!=0) bare expr. STDOUT: {stdout}"
     );
 
     // Then branch
     assert!(
         stdout.contains("ADDR"),
-        "Expected then-branch ADDR line. STDOUT: {}",
-        stdout
+        "Expected then-branch ADDR line. STDOUT: {stdout}"
     );
 
     Ok(())
@@ -955,9 +903,9 @@ async fn test_string_equality_globals() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -973,8 +921,8 @@ trace globals_program.c:32 {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
     // Expect GM_EQ:true at least once
     assert!(stdout.contains("GM_EQ:true") || stdout.contains("GM_EQ:false"));
     Ok(())
@@ -985,9 +933,9 @@ async fn test_chain_tail_array_constant_index_increments() -> anyhow::Result<()>
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -1004,8 +952,8 @@ trace globals_program.c:32 {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // At this PC, G_STATE.lib may still be NULL (set later in tick_once), so A0 can alternate
     // between NULL error and numeric values. Require at least two A0 lines and at least one
@@ -1024,17 +972,15 @@ trace globals_program.c:32 {
             // count but no-op; we only enforce presence via a0_lines
         }
     }
-    assert!(a0_lines >= 2, "Insufficient A0 events. STDOUT: {}", stdout);
+    assert!(a0_lines >= 2, "Insufficient A0 events. STDOUT: {stdout}");
     assert!(
         !vals.is_empty(),
-        "Expected at least one numeric A0 sample. STDOUT: {}",
-        stdout
+        "Expected at least one numeric A0 sample. STDOUT: {stdout}"
     );
     if vals.len() >= 2 {
         assert!(
             vals[1] >= vals[0],
-            "A0 should not decrease. STDOUT: {}",
-            stdout
+            "A0 should not decrease. STDOUT: {stdout}"
         );
     }
     Ok(())
@@ -1045,9 +991,9 @@ async fn test_builtins_strncmp_starts_with_globals() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -1066,24 +1012,21 @@ trace globals_program.c:32 {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Expect true for SN1 and SW1; LM starts with LIB_ should be true as well
     assert!(
         stdout.lines().any(|l| l.contains("SN1:true")),
-        "Expected SN1:true. STDOUT: {}",
-        stdout
+        "Expected SN1:true. STDOUT: {stdout}"
     );
     assert!(
         stdout.lines().any(|l| l.contains("SW1:true")),
-        "Expected SW1:true. STDOUT: {}",
-        stdout
+        "Expected SW1:true. STDOUT: {stdout}"
     );
     assert!(
         stdout.lines().any(|l| l.contains("SN2:true")),
-        "Expected SN2:true. STDOUT: {}",
-        stdout
+        "Expected SN2:true. STDOUT: {stdout}"
     );
     Ok(())
 }
@@ -1093,9 +1036,9 @@ async fn test_builtin_strncmp_generic_ptr_and_null() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -1114,20 +1057,15 @@ trace globals_program.c:32 {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 5, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let saw_true = stdout.lines().any(|l| l.contains("SL:true"));
     let saw_false = stdout.lines().any(|l| l.contains("SL:false"));
-    assert!(
-        saw_true,
-        "Expected SL:true at least once. STDOUT: {}",
-        stdout
-    );
+    assert!(saw_true, "Expected SL:true at least once. STDOUT: {stdout}");
     assert!(
         saw_false,
-        "Expected SL:false at least once. STDOUT: {}",
-        stdout
+        "Expected SL:false at least once. STDOUT: {stdout}"
     );
     Ok(())
 }
@@ -1137,9 +1075,9 @@ async fn test_rodata_char_element() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -1161,8 +1099,8 @@ trace globals_program.c:32 {
 }
 "#;
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Expect char-literal outputs (or numeric+char if simple path is used)
     // Accept either:
@@ -1186,14 +1124,13 @@ trace globals_program.c:32 {
         .any(|l| re_l1.is_match(l) || re_l2.is_match(l) || re_l3.is_match(l));
     // Also expect formatted outputs; accept char or numeric depending on DWARF encoding
     let re_fmt_val = r"(?:'[^']'|\d+)";
-    let re_fmt_g = Regex::new(&format!(r"^\s*G0:{}", re_fmt_val)).unwrap();
-    let re_fmt_l = Regex::new(&format!(r"^\s*L0:{}", re_fmt_val)).unwrap();
+    let re_fmt_g = Regex::new(&format!(r"^\s*G0:{re_fmt_val}")).unwrap();
+    let re_fmt_l = Regex::new(&format!(r"^\s*L0:{re_fmt_val}")).unwrap();
     let has_fmt_g = stdout.lines().any(|l| re_fmt_g.is_match(l));
     let has_fmt_l = stdout.lines().any(|l| re_fmt_l.is_match(l));
     assert!(
         has_g && has_l && has_fmt_g && has_fmt_l,
-        "Expected variable and formatted char outputs. STDOUT: {}",
-        stdout
+        "Expected variable and formatted char outputs. STDOUT: {stdout}"
     );
     Ok(())
 }
@@ -1203,9 +1140,9 @@ async fn test_format_specifiers_memory_and_pointer() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -1228,8 +1165,8 @@ trace globals_program.c:32 {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     use regex::Regex;
     // Expect hex bytes pattern (four bytes)
@@ -1248,14 +1185,10 @@ trace globals_program.c:32 {
     let has_ptr = stdout.lines().any(|l| l.contains("P=0x"));
 
     let has_hex = stdout.lines().any(|l| re_hex4.is_match(l));
-    assert!(has_hex, "Expected hex dump HX=. STDOUT: {}", stdout);
-    assert!(has_as, "Expected ASCII dump AS=. STDOUT: {}", stdout);
-    assert!(
-        has_ds,
-        "Expected dynamic star ASCII DS=. STDOUT: {}",
-        stdout
-    );
-    assert!(has_ptr, "Expected pointer P=0x.... STDOUT: {}", stdout);
+    assert!(has_hex, "Expected hex dump HX=. STDOUT: {stdout}");
+    assert!(has_as, "Expected ASCII dump AS=. STDOUT: {stdout}");
+    assert!(has_ds, "Expected dynamic star ASCII DS=. STDOUT: {stdout}");
+    assert!(has_ptr, "Expected pointer P=0x.... STDOUT: {stdout}");
     Ok(())
 }
 
@@ -1264,9 +1197,9 @@ async fn test_large_pattern_dump_and_checks() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -1289,8 +1222,8 @@ trace globals_program.c:32 {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     use regex::Regex;
     let re_first16 = Regex::new(r"LPX16=00(\s+01)(\s+02)(\s+03)(\s+04)(\s+05)(\s+06)(\s+07)(\s+08)(\s+09)(\s+0a)(\s+0b)(\s+0c)(\s+0d)(\s+0e)(\s+0f)").unwrap();
@@ -1303,16 +1236,14 @@ trace globals_program.c:32 {
 
     assert!(
         has_first16,
-        "Expected first 16 bytes 00..0f. STDOUT: {}",
-        stdout
+        "Expected first 16 bytes 00..0f. STDOUT: {stdout}"
     );
     assert!(
         has_dyn10,
-        "Expected dynamic 10 bytes 00..09. STDOUT: {}",
-        stdout
+        "Expected dynamic 10 bytes 00..09. STDOUT: {stdout}"
     );
-    assert!(has_b100, "Expected B100=100. STDOUT: {}", stdout);
-    assert!(has_b255, "Expected B255=255. STDOUT: {}", stdout);
+    assert!(has_b100, "Expected B100=100. STDOUT: {stdout}");
+    assert!(has_b255, "Expected B255=255. STDOUT: {stdout}");
     Ok(())
 }
 
@@ -1321,9 +1252,9 @@ async fn test_format_capture_len_zero_and_exceed_cap() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -1345,8 +1276,8 @@ trace globals_program.c:32 {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     use regex::Regex;
     // Z0 should be exactly 'Z0=' with no hex bytes following
@@ -1357,11 +1288,10 @@ trace globals_program.c:32 {
     let re_64_hex = Regex::new(r"XC=([0-9a-fA-F]{2}(\s+[0-9a-fA-F]{2}){63})").unwrap();
     let has_trunc_64 = stdout.lines().any(|l| re_64_hex.is_match(l));
 
-    assert!(has_z0_empty, "Expected Z0= (empty). STDOUT: {}", stdout);
+    assert!(has_z0_empty, "Expected Z0= (empty). STDOUT: {stdout}");
     assert!(
         has_trunc_64,
-        "Expected XC= to contain exactly 64 bytes due to cap. STDOUT: {}",
-        stdout
+        "Expected XC= to contain exactly 64 bytes due to cap. STDOUT: {stdout}"
     );
 
     Ok(())
@@ -1372,9 +1302,9 @@ async fn test_format_negative_len_clamped_to_zero() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -1393,8 +1323,8 @@ trace globals_program.c:32 {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     use regex::Regex;
     let re_empty1 = Regex::new(r"^\s*ZN1=\s*$").unwrap();
@@ -1402,8 +1332,8 @@ trace globals_program.c:32 {
     let has_zn1 = stdout.lines().any(|l| re_empty1.is_match(l));
     let has_zn2 = stdout.lines().any(|l| re_empty2.is_match(l));
 
-    assert!(has_zn1, "Expected ZN1= (empty). STDOUT: {}", stdout);
-    assert!(has_zn2, "Expected ZN2= (empty). STDOUT: {}", stdout);
+    assert!(has_zn1, "Expected ZN1= (empty). STDOUT: {stdout}");
+    assert!(has_zn2, "Expected ZN2= (empty). STDOUT: {stdout}");
     Ok(())
 }
 
@@ -1412,9 +1342,9 @@ async fn test_format_specifiers_capture_len() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -1433,8 +1363,8 @@ trace globals_program.c:32 {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     use regex::Regex;
     // Hex 4 bytes
@@ -1445,8 +1375,8 @@ trace globals_program.c:32 {
         .lines()
         .any(|l| l.contains("CL=LIB_") || l.contains("CL=Hell"));
 
-    assert!(has_hex, "Expected hex dump CH=. STDOUT: {}", stdout);
-    assert!(has_cl, "Expected capture-len ASCII CL=. STDOUT: {}", stdout);
+    assert!(has_hex, "Expected hex dump CH=. STDOUT: {stdout}");
+    assert!(has_cl, "Expected capture-len ASCII CL=. STDOUT: {stdout}");
     Ok(())
 }
 
@@ -1457,9 +1387,9 @@ async fn test_alias_to_complex_dwarf_expr_index_and_address_of() -> anyhow::Resu
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -1478,14 +1408,13 @@ trace globals_program.c:32 {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Expect pointer print and at least one A0/A1 line
     assert!(
         stdout.contains("APTR=0x"),
-        "Expected APTR pointer line. STDOUT: {}",
-        stdout
+        "Expected APTR pointer line. STDOUT: {stdout}"
     );
     let has_a0 = stdout
         .lines()
@@ -1495,13 +1424,11 @@ trace globals_program.c:32 {
         .any(|l| l.trim_start().starts_with("A1=") || l.trim_start().starts_with("A1:"));
     assert!(
         has_a0,
-        "Expected A0 line from alias index. STDOUT: {}",
-        stdout
+        "Expected A0 line from alias index. STDOUT: {stdout}"
     );
     assert!(
         has_a1,
-        "Expected A1 line from alias index. STDOUT: {}",
-        stdout
+        "Expected A1 line from alias index. STDOUT: {stdout}"
     );
     Ok(())
 }
@@ -1513,9 +1440,9 @@ async fn test_alias_to_aggregate_and_chain_and_string_prefix() -> anyhow::Result
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -1538,8 +1465,8 @@ trace globals_program.c:32 {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Should see numeric AX and BX lines
     let re_ax = Regex::new(r"^\s*AX:(-?\d+)").unwrap();
@@ -1548,13 +1475,11 @@ trace globals_program.c:32 {
     let has_bx = stdout.lines().any(|l| re_bx.is_match(l));
     assert!(
         has_ax,
-        "Expected AX numeric via alias chain. STDOUT: {}",
-        stdout
+        "Expected AX numeric via alias chain. STDOUT: {stdout}"
     );
     assert!(
         has_bx,
-        "Expected BX numeric via nested alias. STDOUT: {}",
-        stdout
+        "Expected BX numeric via nested alias. STDOUT: {stdout}"
     );
 
     // At runtime name toggles (INIT -> RUNNING occasionally). Accept either prefix condition being true
@@ -1562,8 +1487,7 @@ trace globals_program.c:32 {
     let saw_ini_true = stdout.lines().any(|l| l.contains("INI?true"));
     assert!(
         saw_run_true || saw_ini_true,
-        "Expected one of RUN?true/INI?true. STDOUT: {}",
-        stdout
+        "Expected one of RUN?true/INI?true. STDOUT: {stdout}"
     );
     Ok(())
 }
@@ -1574,9 +1498,9 @@ async fn test_alias_rodata_string_builtins() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -1597,15 +1521,13 @@ trace globals_program.c:32 {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
     // All should be true at least once
     for tag in ["GST:true", "GSN:true", "LST:true", "LSN:true"] {
         assert!(
             stdout.contains(tag),
-            "Expected {} at least once. STDOUT: {}",
-            tag,
-            stdout
+            "Expected {tag} at least once. STDOUT: {stdout}"
         );
     }
     Ok(())
@@ -1617,9 +1539,9 @@ async fn test_alias_rodata_string_builtins_perf() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -1640,14 +1562,12 @@ trace globals_program.c:32 {
 "#;
     let (exit_code, stdout, stderr) =
         run_ghostscope_with_script_for_pid_perf(script, 3, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
     for tag in ["GST:true", "GSN:true", "LST:true", "LSN:true"] {
         assert!(
             stdout.contains(tag),
-            "Expected {} at least once. STDOUT: {}",
-            tag,
-            stdout
+            "Expected {tag} at least once. STDOUT: {stdout}"
         );
     }
     Ok(())
@@ -1660,9 +1580,9 @@ async fn test_alias_address_of_cross_module_uses_correct_hint() -> anyhow::Resul
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -1683,8 +1603,8 @@ trace globals_program.c:32 {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let re_pa = Regex::new(r"PA=0x([0-9a-fA-F]+)").unwrap();
     let re_pl = Regex::new(r"PL=0x([0-9a-fA-F]+)").unwrap();
@@ -1713,9 +1633,9 @@ async fn test_top_level_array_member_struct_field() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -1731,15 +1651,14 @@ trace globals_program.c:32 {
 }
 "#;
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let re = Regex::new(r"SX:(-?\d+)").unwrap();
     let has = stdout.lines().any(|l| re.is_match(l));
     assert!(
         has,
-        "Expected struct field numeric via g_slots[1].x. STDOUT: {}",
-        stdout
+        "Expected struct field numeric via g_slots[1].x. STDOUT: {stdout}"
     );
     Ok(())
 }
@@ -1750,9 +1669,9 @@ async fn test_tick_once_entry_strings_and_structs() -> anyhow::Result<()> {
 
     // Build and start globals_program (Debug)
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -1772,27 +1691,25 @@ trace globals_program.c:26 {
 "#;
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 2, pid).await?;
 
-    let _ = prog.kill().await;
+    let _ = prog.kill().await.is_ok();
 
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // s.name should be a quoted string (either "INIT" or updated value)
     let has_s_name = stdout.contains("\"INIT\"") || stdout.contains("\"RUNNING\"");
-    assert!(has_s_name, "Expected s.name string. STDOUT: {}", stdout);
+    assert!(has_s_name, "Expected s.name string. STDOUT: {stdout}");
 
     // ls.name (library) should be "LIB"
     assert!(
         stdout.contains("\"LIB\""),
-        "Expected ls.name == \"LIB\". STDOUT: {}",
-        stdout
+        "Expected ls.name == \"LIB\". STDOUT: {stdout}"
     );
 
     // Pretty struct prints for s or *ls should be present
     let has_struct = stdout.contains("GlobalState {") || stdout.contains("*ls = GlobalState {");
     assert!(
         has_struct,
-        "Expected pretty struct output. STDOUT: {}",
-        stdout
+        "Expected pretty struct output. STDOUT: {stdout}"
     );
 
     Ok(())
@@ -1803,9 +1720,9 @@ async fn test_tick_once_formatted_counters() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -1821,13 +1738,12 @@ trace tick_once {
 }
 "#;
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 2, pid).await?;
-    let _ = prog.kill().await;
+    let _ = prog.kill().await.is_ok();
 
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
     assert!(
         stdout.contains("G:") && stdout.contains("L:"),
-        "Expected formatted counters. STDOUT: {}",
-        stdout
+        "Expected formatted counters. STDOUT: {stdout}"
     );
 
     Ok(())
@@ -1838,9 +1754,9 @@ async fn test_tick_once_pointer_values() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -1857,13 +1773,12 @@ trace globals_program.c:26 {
 }
 "#;
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 2, pid).await?;
-    let _ = prog.kill().await;
+    let _ = prog.kill().await.is_ok();
 
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
     assert!(
         stdout.contains("0x"),
-        "Expected hexadecimal pointer output. STDOUT: {}",
-        stdout
+        "Expected hexadecimal pointer output. STDOUT: {stdout}"
     );
     Ok(())
 }
@@ -1874,9 +1789,9 @@ async fn test_two_events_evolution_and_statics() -> anyhow::Result<()> {
 
     // Build and start globals_program (Debug)
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -1897,8 +1812,8 @@ trace globals_program.c:26 {
 
 "#;
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Parse first two occurrences for each metric
     let re_s = Regex::new(r"s\.counter\s*=\s*(\d+)").unwrap();
@@ -1938,8 +1853,7 @@ trace globals_program.c:26 {
     // Ensure exactly two events captured for deterministic checks on exe-side
     assert!(
         s_vals.len() >= 2 && ls_vals.len() >= 2 && si_vals.len() >= 2 && sb_vals.len() >= 2,
-        "Insufficient events for delta checks (exe-side). STDOUT: {}",
-        stdout
+        "Insufficient events for delta checks (exe-side). STDOUT: {stdout}"
     );
 
     // Check program logic deltas between first two hits
@@ -1964,8 +1878,7 @@ trace globals_program.c:26 {
     } else {
         assert!(
             (li_vals.len() == 1 && li_errs >= 1) || (li_vals.is_empty() && li_errs >= 2),
-            "Expected lib_internal to be numeric twice, or NULL twice, or mixed once over two events. STDOUT: {}",
-            stdout
+            "Expected lib_internal to be numeric twice, or NULL twice, or mixed once over two events. STDOUT: {stdout}"
         );
     }
 
@@ -1976,9 +1889,9 @@ async fn test_direct_globals_current_module() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -1998,14 +1911,13 @@ trace globals_program.c:32 {
 }
 "#;
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Expect at least some struct pretty print and integer values present
     assert!(
         stdout.contains("G_STATE") && stdout.contains("GlobalState"),
-        "Expected G_STATE struct print. STDOUT: {}",
-        stdout
+        "Expected G_STATE struct print. STDOUT: {stdout}"
     );
 
     let re_si = Regex::new(r"s_internal\s*=\s*(-?\d+)").unwrap();
@@ -2023,8 +1935,7 @@ trace globals_program.c:32 {
     // We expect at least 2 hits for each
     assert!(
         si_vals.len() >= 2 && sb_vals.len() >= 2,
-        "Insufficient events. STDOUT: {}",
-        stdout
+        "Insufficient events. STDOUT: {stdout}"
     );
     // Check deltas align with logic: +2 and +3 per tick
     assert_eq!(si_vals[1] - si_vals[0], 2, "s_internal should +2 per tick");
@@ -2045,8 +1956,7 @@ trace globals_program.c:32 {
     }
     assert!(
         f_a.len() >= 2 && f_b.len() >= 2,
-        "Insufficient FMT events. STDOUT: {}",
-        stdout
+        "Insufficient FMT events. STDOUT: {stdout}"
     );
     assert_eq!(f_a[1] - f_a[0], 2, "FMT s_internal delta +2");
     assert_eq!(f_b[1] - f_b[0], 3, "FMT s_bss_counter delta +3");
@@ -2058,9 +1968,9 @@ async fn test_direct_global_cross_module() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -2078,20 +1988,18 @@ trace globals_program.c:32 {
 }
 "#;
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 2, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Expect pretty struct output for LIB_STATE
     assert!(
         stdout.contains("LIB_STATE"),
-        "Expected LIB_STATE in output. STDOUT: {}",
-        stdout
+        "Expected LIB_STATE in output. STDOUT: {stdout}"
     );
     // Accept either typedef name or resolved struct display
     assert!(
         stdout.contains("GlobalState {") || (stdout.contains("{") && stdout.contains("name:")),
-        "Expected pretty struct print for LIB_STATE. STDOUT: {}",
-        stdout
+        "Expected pretty struct print for LIB_STATE. STDOUT: {stdout}"
     );
     // Verify formatted LIBCNT increments across at least two events
     let re = Regex::new(r"LIBCNT:(-?\d+)").unwrap();
@@ -2103,8 +2011,7 @@ trace globals_program.c:32 {
     }
     assert!(
         vals.len() >= 2,
-        "Insufficient LIBCNT events. STDOUT: {}",
-        stdout
+        "Insufficient LIBCNT events. STDOUT: {stdout}"
     );
     assert_eq!(vals[1] - vals[0], 2, "LIB_STATE.counter should +2 per tick");
     Ok(())
@@ -2115,9 +2022,9 @@ async fn test_rodata_direct_strings() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -2136,8 +2043,8 @@ trace globals_program.c:32 {
 }
 "#;
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 2, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Expect two quoted strings present (best-effort; content may vary across builds)
     let got_g_message = stdout
@@ -2148,8 +2055,7 @@ trace globals_program.c:32 {
         .any(|l| l.contains("lib_message = \"") && l.contains("\""));
     assert!(
         got_g_message && got_lib_message,
-        "Expected direct string prints for rodata. STDOUT: {}",
-        stdout
+        "Expected direct string prints for rodata. STDOUT: {stdout}"
     );
     // Look for a formatted line with both quoted strings
     let fmt_has_strings = stdout
@@ -2157,8 +2063,7 @@ trace globals_program.c:32 {
         .any(|l| l.contains("FMT:") && l.matches('"').count() >= 2);
     assert!(
         fmt_has_strings,
-        "Expected formatted strings line. STDOUT: {}",
-        stdout
+        "Expected formatted strings line. STDOUT: {stdout}"
     );
     Ok(())
 }
@@ -2170,7 +2075,7 @@ async fn test_bss_first_byte_evolves() -> anyhow::Result<()> {
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
     let bin_dir = binary_path.parent().unwrap().to_path_buf();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -2189,8 +2094,8 @@ trace globals_program.c:32 {
 }
 "#;
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let re_gb = Regex::new(r"\*gb\s*=\s*(-?\d+)").unwrap();
     let re_lb = Regex::new(r"\*lb\s*=\s*(-?\d+)").unwrap();
@@ -2206,19 +2111,16 @@ trace globals_program.c:32 {
     }
     assert!(
         gb_vals.len() >= 2 && lb_vals.len() >= 2,
-        "Insufficient events. STDOUT: {}",
-        stdout
+        "Insufficient events. STDOUT: {stdout}"
     );
     // Each tick_once increments first byte by 1
     assert!(
         gb_vals[1] >= gb_vals[0],
-        "gb[0] should not decrease. STDOUT: {}",
-        stdout
+        "gb[0] should not decrease. STDOUT: {stdout}"
     );
     assert!(
         lb_vals[1] >= lb_vals[0],
-        "lb[0] should not decrease. STDOUT: {}",
-        stdout
+        "lb[0] should not decrease. STDOUT: {stdout}"
     );
     // Ensure formatted BF line present and non-decreasing as well
     let re = Regex::new(r"BF:(-?\d+)\|(-?\d+)").unwrap();
@@ -2232,13 +2134,11 @@ trace globals_program.c:32 {
     }
     assert!(
         fa.len() >= 2 && fb.len() >= 2,
-        "Insufficient BF events. STDOUT: {}",
-        stdout
+        "Insufficient BF events. STDOUT: {stdout}"
     );
     assert!(
         fa[1] >= fa[0] && fb[1] >= fb[0],
-        "BF values should not decrease. STDOUT: {}",
-        stdout
+        "BF values should not decrease. STDOUT: {stdout}"
     );
     Ok(())
 }
@@ -2250,7 +2150,7 @@ async fn test_print_variable_global_member_direct() -> anyhow::Result<()> {
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
     let bin_dir = binary_path.parent().unwrap().to_path_buf();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -2267,8 +2167,8 @@ trace globals_program.c:32 {
 }
 "#;
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let re_g = Regex::new(r"G_STATE\.counter\s*=\s*(-?\d+)").unwrap();
     let re_l = Regex::new(r"LIB_STATE\.counter\s*=\s*(-?\d+)").unwrap();
@@ -2284,8 +2184,7 @@ trace globals_program.c:32 {
     }
     assert!(
         gv.len() >= 2 && lv.len() >= 2,
-        "Insufficient events. STDOUT: {}",
-        stdout
+        "Insufficient events. STDOUT: {stdout}"
     );
     // Ensure non-decreasing for current-module counter
     assert!(gv[1] >= gv[0], "G_STATE.counter should be non-decreasing");
@@ -2301,7 +2200,7 @@ async fn test_print_format_global_member_direct() -> anyhow::Result<()> {
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
     let bin_dir = binary_path.parent().unwrap().to_path_buf();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -2317,8 +2216,8 @@ trace globals_program.c:32 {
 }
 "#;
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let re = Regex::new(r"LIBCNT:(-?\d+)").unwrap();
     let mut vals = Vec::new();
@@ -2329,8 +2228,7 @@ trace globals_program.c:32 {
     }
     assert!(
         vals.len() >= 2,
-        "Insufficient LIBCNT events. STDOUT: {}",
-        stdout
+        "Insufficient LIBCNT events. STDOUT: {stdout}"
     );
     assert_eq!(vals[1] - vals[0], 2, "LIB_STATE.counter should +2 per tick");
     Ok(())
@@ -2343,7 +2241,7 @@ async fn test_print_format_global_member_leaf() -> anyhow::Result<()> {
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
     let bin_dir = binary_path.parent().unwrap().to_path_buf();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -2359,8 +2257,8 @@ trace globals_program.c:32 {
 }
 "#;
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Capture floating values and ensure delta ~ 1.25 between first two events
     let re = Regex::new(r"LIBY:([0-9]+(?:\.[0-9]+)?)").unwrap();
@@ -2371,23 +2269,20 @@ trace globals_program.c:32 {
             // Line should not include full struct formatting
             assert!(
                 !line.contains("Inner {"),
-                "Leaf member should print scalar, got struct: {}",
-                line
+                "Leaf member should print scalar, got struct: {line}"
             );
             vals.push(v);
         }
     }
     assert!(
         vals.len() >= 2,
-        "Insufficient LIBY events. STDOUT: {}",
-        stdout
+        "Insufficient LIBY events. STDOUT: {stdout}"
     );
     // Compare with tolerance by scaling to centi-precision
     let d = ((vals[1] - vals[0]) * 100.0).round() as i64;
     assert_eq!(
         d, 125,
-        "LIB_STATE.inner.y should +1.25 per tick. STDOUT: {}",
-        stdout
+        "LIB_STATE.inner.y should +1.25 per tick. STDOUT: {stdout}"
     );
     Ok(())
 }
@@ -2399,7 +2294,7 @@ async fn test_print_variable_global_member_leaf() -> anyhow::Result<()> {
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
     let bin_dir = binary_path.parent().unwrap().to_path_buf();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -2415,8 +2310,8 @@ trace globals_program.c:32 {
 }
 "#;
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let re = Regex::new(r"LIB_STATE\.inner\.y\s*=\s*(-?[0-9]+(?:\.[0-9]+)?)").unwrap();
     let mut vals: Vec<f64> = Vec::new();
@@ -2428,11 +2323,10 @@ trace globals_program.c:32 {
     }
     assert!(
         vals.len() >= 2,
-        "Insufficient LIB_STATE.inner.y events. STDOUT: {}",
-        stdout
+        "Insufficient LIB_STATE.inner.y events. STDOUT: {stdout}"
     );
     let d = ((vals[1] - vals[0]) * 100.0).round() as i64;
-    assert_eq!(d, 125, "inner.y should +1.25 per tick. STDOUT: {}", stdout);
+    assert_eq!(d, 125, "inner.y should +1.25 per tick. STDOUT: {stdout}");
     Ok(())
 }
 
@@ -2448,7 +2342,7 @@ async fn test_print_format_current_global_member_leaf_perf() -> anyhow::Result<(
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
     let bin_dir = binary_path.parent().unwrap().to_path_buf();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -2466,8 +2360,8 @@ trace globals_program.c:32 {
     // Collect exactly 2 events for deterministic delta/null checks
     let (exit_code, stdout, stderr) =
         run_ghostscope_with_script_for_pid_perf(script, 2, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let re = Regex::new(r"GY:([0-9]+(?:\.[0-9]+)?)").unwrap();
     let mut vals: Vec<f64> = Vec::new();
@@ -2476,23 +2370,17 @@ trace globals_program.c:32 {
             // Ensure scalar print (no struct pretty-print)
             assert!(
                 !line.contains("Inner {"),
-                "Expected scalar for G_STATE.inner.y, got struct: {}",
-                line
+                "Expected scalar for G_STATE.inner.y, got struct: {line}"
             );
             vals.push(c[1].parse().unwrap_or(0.0));
         }
     }
-    assert!(
-        vals.len() >= 2,
-        "Insufficient GY events. STDOUT: {}",
-        stdout
-    );
+    assert!(vals.len() >= 2, "Insufficient GY events. STDOUT: {stdout}");
     // inner.y increments by 0.5 per tick in globals_program
     let d = ((vals[1] - vals[0]) * 100.0).round() as i64;
     assert_eq!(
         d, 50,
-        "G_STATE.inner.y should +0.5 per tick. STDOUT: {}",
-        stdout
+        "G_STATE.inner.y should +0.5 per tick. STDOUT: {stdout}"
     );
     Ok(())
 }
@@ -2504,7 +2392,7 @@ async fn test_tick_once_entry_strings_and_structs_perf() -> anyhow::Result<()> {
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
     let bin_dir = binary_path.parent().unwrap().to_path_buf();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -2526,27 +2414,25 @@ trace globals_program.c:26 {
     let (exit_code, stdout, stderr) =
         run_ghostscope_with_script_for_pid_perf(script, 2, pid).await?;
 
-    let _ = prog.kill().await;
+    let _ = prog.kill().await.is_ok();
 
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // s.name should be a quoted string (either "INIT" or updated value)
     let has_s_name = stdout.contains("\"INIT\"") || stdout.contains("\"RUNNING\"");
-    assert!(has_s_name, "Expected s.name string. STDOUT: {}", stdout);
+    assert!(has_s_name, "Expected s.name string. STDOUT: {stdout}");
 
     // ls.name (library) should be "LIB"
     assert!(
         stdout.contains("\"LIB\""),
-        "Expected ls.name == \"LIB\". STDOUT: {}",
-        stdout
+        "Expected ls.name == \"LIB\". STDOUT: {stdout}"
     );
 
     // Pretty struct prints for s or *ls should be present
     let has_struct = stdout.contains("GlobalState {") || stdout.contains("*ls = GlobalState {");
     assert!(
         has_struct,
-        "Expected pretty struct output. STDOUT: {}",
-        stdout
+        "Expected pretty struct output. STDOUT: {stdout}"
     );
 
     Ok(())
@@ -2559,7 +2445,7 @@ async fn test_memcmp_numeric_pointer_literal_and_hex_len() -> anyhow::Result<()>
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
     let bin_dir = binary_path.parent().unwrap().to_path_buf();
     let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
+        .current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -2576,14 +2462,13 @@ trace globals_program.c:32 {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // hex static length path succeeds
     assert!(
         stdout.contains("LENHEX"),
-        "Expected LENHEX. STDOUT: {}",
-        stdout
+        "Expected LENHEX. STDOUT: {stdout}"
     );
     // no numeric pointer literal checks anymore
     Ok(())
