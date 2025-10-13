@@ -1,10 +1,3 @@
-// Clippy: allow some lints in tests
-#![allow(
-    clippy::uninlined_format_args,
-    clippy::needless_borrows_for_generic_args,
-    dead_code
-)]
-
 //! Rust program script execution tests (end-to-end)
 
 mod common;
@@ -32,15 +25,15 @@ async fn test_rust_script_print_globals() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("rust_global_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     struct KillOnDrop(tokio::process::Child);
     impl Drop for KillOnDrop {
         fn drop(&mut self) {
-            let _ = self.0.start_kill();
+            let _ = self.0.start_kill().is_ok();
         }
     }
     let mut cmd = Command::new(&binary_path);
-    cmd.current_dir(&bin_dir)
+    cmd.current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     let child = cmd.spawn()?;
@@ -57,18 +50,16 @@ trace do_stuff {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.0.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.0.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     assert!(
         stdout.contains("RCNT:"),
-        "Expected RCNT output. STDOUT: {}",
-        stdout
+        "Expected RCNT output. STDOUT: {stdout}"
     );
     assert!(
         stdout.contains("CFA:"),
-        "Expected CFA output. STDOUT: {}",
-        stdout
+        "Expected CFA output. STDOUT: {stdout}"
     );
 
     Ok(())
@@ -79,15 +70,15 @@ async fn test_rust_script_counter_increments() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("rust_global_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     struct KillOnDrop(tokio::process::Child);
     impl Drop for KillOnDrop {
         fn drop(&mut self) {
-            let _ = self.0.start_kill();
+            let _ = self.0.start_kill().is_ok();
         }
     }
     let mut cmd = Command::new(&binary_path);
-    cmd.current_dir(&bin_dir)
+    cmd.current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     let child = cmd.spawn()?;
@@ -101,8 +92,8 @@ trace do_stuff {
 }
 "#;
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 5, pid).await?;
-    let _ = prog.0.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.0.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let mut vals: Vec<i64> = Vec::new();
     for line in stdout.lines() {
@@ -114,11 +105,7 @@ trace do_stuff {
             }
         }
     }
-    assert!(
-        vals.len() >= 2,
-        "Insufficient RC events. STDOUT: {}",
-        stdout
-    );
+    assert!(vals.len() >= 2, "Insufficient RC events. STDOUT: {stdout}");
     let mut non_decreasing = true;
     for w in vals.windows(2) {
         if w[1] < w[0] {
@@ -128,8 +115,7 @@ trace do_stuff {
     }
     assert!(
         non_decreasing,
-        "Counter decreased unexpectedly. vals={:?}",
-        vals
+        "Counter decreased unexpectedly. vals={vals:?}"
     );
     Ok(())
 }
@@ -139,15 +125,15 @@ async fn test_rust_script_address_of_global() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("rust_global_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     struct KillOnDrop(tokio::process::Child);
     impl Drop for KillOnDrop {
         fn drop(&mut self) {
-            let _ = self.0.start_kill();
+            let _ = self.0.start_kill().is_ok();
         }
     }
     let mut cmd = Command::new(&binary_path);
-    cmd.current_dir(&bin_dir)
+    cmd.current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     let child = cmd.spawn()?;
@@ -161,18 +147,16 @@ trace do_stuff {
 }
 "#;
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.0.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.0.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     assert!(
         stdout.contains("&RC:"),
-        "Expected address-of output. STDOUT: {}",
-        stdout
+        "Expected address-of output. STDOUT: {stdout}"
     );
     assert!(
         stdout.contains("0x"),
-        "Expected hex address. STDOUT: {}",
-        stdout
+        "Expected hex address. STDOUT: {stdout}"
     );
     Ok(())
 }

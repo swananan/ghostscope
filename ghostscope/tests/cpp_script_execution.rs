@@ -1,10 +1,3 @@
-// Clippy: allow some lints in tests
-#![allow(
-    clippy::uninlined_format_args,
-    clippy::needless_borrows_for_generic_args,
-    dead_code
-)]
-
 //! C++ program script execution tests (end-to-end)
 
 mod common;
@@ -32,15 +25,15 @@ async fn test_cpp_script_print_globals() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("cpp_complex_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     struct KillOnDrop(tokio::process::Child);
     impl Drop for KillOnDrop {
         fn drop(&mut self) {
-            let _ = self.0.start_kill();
+            let _ = self.0.start_kill().is_ok();
         }
     }
     let mut cmd = Command::new(&binary_path);
-    cmd.current_dir(&bin_dir)
+    cmd.current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     let child = cmd.spawn()?;
@@ -58,23 +51,20 @@ trace add {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.0.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.0.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     assert!(
         stdout.contains("GCNT:"),
-        "Expected GCNT output. STDOUT: {}",
-        stdout
+        "Expected GCNT output. STDOUT: {stdout}"
     );
     assert!(
         stdout.contains("SINT:"),
-        "Expected SINT output. STDOUT: {}",
-        stdout
+        "Expected SINT output. STDOUT: {stdout}"
     );
     assert!(
         stdout.contains("SVAL:"),
-        "Expected SVAL output. STDOUT: {}",
-        stdout
+        "Expected SVAL output. STDOUT: {stdout}"
     );
 
     Ok(())
@@ -85,15 +75,15 @@ async fn test_cpp_script_counter_increments() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("cpp_complex_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     struct KillOnDrop(tokio::process::Child);
     impl Drop for KillOnDrop {
         fn drop(&mut self) {
-            let _ = self.0.start_kill();
+            let _ = self.0.start_kill().is_ok();
         }
     }
     let mut cmd = Command::new(&binary_path);
-    cmd.current_dir(&bin_dir)
+    cmd.current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     let child = cmd.spawn()?;
@@ -108,8 +98,8 @@ trace add {
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 5, pid).await?;
-    let _ = prog.0.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.0.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let mut vals: Vec<i64> = Vec::new();
     for line in stdout.lines() {
@@ -121,11 +111,7 @@ trace add {
             }
         }
     }
-    assert!(
-        vals.len() >= 2,
-        "Insufficient CNT events. STDOUT: {}",
-        stdout
-    );
+    assert!(vals.len() >= 2, "Insufficient CNT events. STDOUT: {stdout}");
     let mut non_decreasing = true;
     let mut has_increase = false;
     for w in vals.windows(2) {
@@ -139,13 +125,11 @@ trace add {
     }
     assert!(
         non_decreasing,
-        "Counter decreased unexpectedly. vals={:?}",
-        vals
+        "Counter decreased unexpectedly. vals={vals:?}"
     );
     assert!(
         has_increase,
-        "Counter did not increase across events. vals={:?}",
-        vals
+        "Counter did not increase across events. vals={vals:?}"
     );
     Ok(())
 }
@@ -155,15 +139,15 @@ async fn test_cpp_script_addresses_and_static_member() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("cpp_complex_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let bin_dir = binary_path.parent().unwrap();
     struct KillOnDrop(tokio::process::Child);
     impl Drop for KillOnDrop {
         fn drop(&mut self) {
-            let _ = self.0.start_kill();
+            let _ = self.0.start_kill().is_ok();
         }
     }
     let mut cmd = Command::new(&binary_path);
-    cmd.current_dir(&bin_dir)
+    cmd.current_dir(bin_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     let child = cmd.spawn()?;
@@ -178,8 +162,8 @@ trace add {
 }
 "#;
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.0.kill().await;
-    assert_eq!(exit_code, 0, "stderr={} stdout={}", stderr, stdout);
+    let _ = prog.0.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let mut gc_addrs: Vec<String> = Vec::new();
     let mut sv_vals: Vec<i64> = Vec::new();
@@ -202,8 +186,7 @@ trace add {
     }
     assert!(
         gc_addrs.iter().any(|a| a.starts_with("0x")),
-        "Expected GC address. STDOUT: {}",
-        stdout
+        "Expected GC address. STDOUT: {stdout}"
     );
     if gc_addrs.len() >= 2 {
         assert_eq!(gc_addrs[0], gc_addrs[1], "Address should be stable.");
