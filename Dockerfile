@@ -15,7 +15,7 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     ninja-build \
     python3 \
-    libzstd-dev zlib1g-dev libxml2-dev libffi-dev \
+    libzstd-dev zlib1g-dev libxml2-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install a modern CMake (>=3.20) from official binary tarball to avoid slow APT mirrors

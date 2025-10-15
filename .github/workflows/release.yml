@@ -13,23 +13,13 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Select base image (GHCR or local fallback)
+    - name: Use GHCR base image (pinned digest)
       run: |
         set -euo pipefail
-        IMAGE="ghcr.io/swananan/ghostscope-build:ubuntu20.04-llvm18.1.8"
-        if docker pull "$IMAGE" >/dev/null 2>&1; then
-          echo "Using GHCR base image: $IMAGE"
-          echo "BASE_IMAGE=$IMAGE" >> "$GITHUB_ENV"
-          echo "BASE_IMAGE_FROM=ghcr" >> "$GITHUB_ENV"
-        else
-          echo "GHCR image not found; will build local image."
-          echo "BASE_IMAGE=ghostscope-build" >> "$GITHUB_ENV"
-          echo "BASE_IMAGE_FROM=local" >> "$GITHUB_ENV"
-        fi
-
-    - name: Build container image (Ubuntu 20.04)
-      if: ${{ env.BASE_IMAGE_FROM == 'local' }}
-      run: docker build -t ghostscope-build -f Dockerfile .
+        IMAGE="ghcr.io/swananan/ghostscope-build@sha256:3f0f6184919e7527bb6c74e897f650e672809e5cbfecb6f70c775da851ea99e0"
+        docker pull "$IMAGE" >/dev/null
+        echo "Using GHCR base image (pinned digest): $IMAGE"
+        echo "BASE_IMAGE=$IMAGE" >> "$GITHUB_ENV"
 
     - name: Verify LLVM in container (no libffi)
       run: |
@@ -49,12 +39,6 @@ jobs:
           -w /workspace \
           "${BASE_IMAGE}" \
           bash -lc 'export LLVM_SYS_181_PREFIX=/opt/llvm-18; export LLVM_CONFIG_PATH=/opt/llvm-18/bin/llvm-config; export RUSTFLAGS="-C link-arg=-Wl,--as-needed"; rustup show; llvm-config --version; echo "llvm-config system-libs:"; llvm-config --system-libs; cargo clean; cargo build --release'
-
-    - name: glibc version in container
-      run: |
-        docker run --rm -w /workspace \
-          -v "${{ github.workspace }}:/workspace" \
-          "${BASE_IMAGE}" bash -lc 'ldd --version | head -1'
 
     - name: Check glibc dependency
       run: |
