@@ -482,6 +482,7 @@ pub enum CommandType {
     InfoTraceAll,
     InfoSource,
     InfoShare,
+    InfoShareAll,
     InfoFile,
     SaveTraces,
     LoadTraces,

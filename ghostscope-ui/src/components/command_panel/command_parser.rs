@@ -497,7 +497,8 @@ impl CommandParser {
             "  info file            - Show executable file info and sections (i f, i file)",
             "  info trace [id]      - Show trace status (i t [id])",
             "  info source          - Show all source files (i s)",
-            "  info share           - Show loaded shared libraries (i sh)",
+            "  info share           - Show shared libraries WITH debug info (i sh)",
+            "  info share all       - Show ALL loaded shared libraries (i sh all)",
             "  info function <name> [verbose|v] - Show debug info for function (i f <name> [v])",
             "  info line <file:line> [verbose|v] - Show debug info for line (i l <file:line> [v])",
             "  info address <addr> [verbose|v]   - Show debug info for address (i a <addr> [v]) [TODO]",
@@ -607,6 +608,7 @@ impl CommandParser {
             "info trace",
             "info source",
             "info share",
+            "info share all",
             "info function",
             "info line",
             "info address",
@@ -622,6 +624,7 @@ impl CommandParser {
             "i file",
             "i s",
             "i sh",
+            "i sh all",
             "i t",
             "i f",
             "i l",
@@ -884,6 +887,16 @@ impl CommandParser {
                 sent_time: Instant::now(),
                 command_type: CommandType::InfoShare,
             };
+            return Some(vec![Action::SendRuntimeCommand(RuntimeCommand::InfoShare)]);
+        }
+
+        if command == "info share all" {
+            state.input_state = InputState::WaitingResponse {
+                command: command.to_string(),
+                sent_time: Instant::now(),
+                command_type: CommandType::InfoShareAll,
+            };
+            // Runtime returns full list; UI decides to show all vs filter
             return Some(vec![Action::SendRuntimeCommand(RuntimeCommand::InfoShare)]);
         }
 
@@ -1407,6 +1420,16 @@ impl CommandParser {
             return Some(vec![Action::SendRuntimeCommand(RuntimeCommand::InfoShare)]);
         }
 
+        // Handle "i sh all" -> "info share all"
+        if command == "i sh all" {
+            state.input_state = InputState::WaitingResponse {
+                command: "info share all".to_string(),
+                sent_time: Instant::now(),
+                command_type: CommandType::InfoShareAll,
+            };
+            return Some(vec![Action::SendRuntimeCommand(RuntimeCommand::InfoShare)]);
+        }
+
         // Handle "i file" or "i f" (no args) -> "info file"
         if command == "i file" || command == "i f" {
             state.input_state = InputState::WaitingResponse {
@@ -1474,7 +1497,8 @@ impl CommandParser {
             "  info file             - Show executable file info and sections (i f, i file)",
             "  info trace [id]       - Show trace status (i t [id])",
             "  info source           - Show all source files by module (i s)",
-            "  info share            - Show loaded shared libraries (i sh)",
+            "  info share            - Show shared libraries WITH debug info (i sh)",
+            "  info share all        - Show ALL loaded shared libraries (i sh all)",
             "  info function <name>  - Show debug info for function (i f <name>)",
             "  info line <file:line> - Show debug info for source line (i l <file:line>)",
             "  info address <addr>   - Show debug info for address (i a <addr>) [TODO]",
@@ -1483,6 +1507,7 @@ impl CommandParser {
             "  i f / i file          - Same as 'info file'",
             "  i s                   - Same as 'info source'",
             "  i sh                  - Same as 'info share'",
+            "  i sh all              - Same as 'info share all'",
             "  i t [id]              - Same as 'info trace [id]'",
             "  i f <name>            - Same as 'info function <name>'",
             "  i l <file:line>       - Same as 'info line <file:line>'",

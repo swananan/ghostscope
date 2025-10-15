@@ -790,7 +790,8 @@ impl DwarfAnalyzer {
                     from_address: mapping.loaded_address.unwrap_or(0),
                     to_address: mapping.loaded_address.map_or(0, |addr| addr + mapping.size),
                     symbols_read: !module_data.get_function_names().is_empty(),
-                    debug_info_available: true, // DWARF modules always have debug info
+                    // Reflect actual DWARF availability (embedded or via .gnu_debuglink)
+                    debug_info_available: module_data.has_dwarf_info(),
                     library_path: path.to_string_lossy().to_string(),
                     size: mapping.size,
                     debug_file_path,

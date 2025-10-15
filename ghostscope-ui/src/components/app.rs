@@ -2350,22 +2350,56 @@ impl App {
                 let _ = self.handle_action(action);
             }
             RuntimeStatus::ShareInfo { libraries } => {
+                // Determine whether to show all libraries or only those with debug info
+                let show_all = matches!(
+                    self.state.command_panel.input_state,
+                    crate::model::panel_state::InputState::WaitingResponse {
+                        command_type: crate::model::panel_state::CommandType::InfoShareAll,
+                        ..
+                    }
+                );
+
                 self.clear_waiting_state();
-                let formatted_info =
-                    crate::components::command_panel::ResponseFormatter::format_shared_library_info(
-                        &libraries, false,
-                    );
-                let styled_lines =
-                    crate::components::command_panel::ResponseFormatter::format_shared_library_info_styled(
-                        &libraries,
-                        false,
-                    );
-                let action = Action::AddResponseWithStyle {
-                    content: formatted_info,
-                    styled_lines: Some(styled_lines),
-                    response_type: crate::action::ResponseType::Success,
+
+                let total = libraries.len();
+                let display_libs: Vec<_> = if show_all {
+                    libraries
+                } else {
+                    libraries
+                        .into_iter()
+                        .filter(|l| l.debug_info_available)
+                        .collect()
                 };
-                let _ = self.handle_action(action);
+
+                // If filtering removed all entries, avoid misleading "No shared libraries" message
+                if !show_all && display_libs.is_empty() && total > 0 {
+                    let content = format!(
+                        "📚 Shared Libraries ({total} total)\n\n⚠️  No libraries with debug info found. Use 'info share all' to view all libraries."
+                    );
+                    let styled = crate::components::command_panel::ResponseFormatter::style_generic_message_lines(&content);
+                    let action = Action::AddResponseWithStyle {
+                        content,
+                        styled_lines: Some(styled),
+                        response_type: crate::action::ResponseType::Success,
+                    };
+                    let _ = self.handle_action(action);
+                } else {
+                    let formatted_info =
+                        crate::components::command_panel::ResponseFormatter::format_shared_library_info(
+                            &display_libs, false,
+                        );
+                    let styled_lines =
+                        crate::components::command_panel::ResponseFormatter::format_shared_library_info_styled(
+                            &display_libs,
+                            false,
+                        );
+                    let action = Action::AddResponseWithStyle {
+                        content: formatted_info,
+                        styled_lines: Some(styled_lines),
+                        response_type: crate::action::ResponseType::Success,
+                    };
+                    let _ = self.handle_action(action);
+                }
             }
             RuntimeStatus::ShareInfoFailed { error } => {
                 self.clear_waiting_state();

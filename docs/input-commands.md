@@ -335,17 +335,22 @@ i f                 # Shortest form
 
 **Syntax:**
 ```
-info share
-i sh                # Short form
+info share          # Show libraries WITH debug info (default)
+info share all      # Show ALL loaded shared libraries
+i sh                 # Short form for `info share`
+i sh all             # Short form for `info share all`
 ```
 
 **Description:**
-Display all loaded shared libraries (dynamic libraries) with:
+Display loaded shared libraries (dynamic libraries) with:
 - Memory address ranges (from/to)
 - Symbol table status
 - Debug information status
 - Library file paths
 - Separate debug files (if using .gnu_debuglink)
+
+By default, `info share` only lists libraries that have debug information available.
+Use `info share all` to list every loaded library regardless of debug info.
 
 **Output Format:**
 ```
@@ -687,7 +692,8 @@ Exit GhostScope. You can also use `Ctrl+C` twice to quit.
 | `info file` | `i f`, `i file` | View executable file info |
 | `info trace` | `i t` | View trace status |
 | `info source` | `i s` | View source files |
-| `info share` | `i sh` | View shared libraries |
+| `info share` | `i sh` | View libraries WITH debug info |
+| `info share all` | `i sh all` | View all shared libraries |
 | `info function` | `i f <name>` | View function info |
 | `info line` | `i l` | View line info |
 | `info address` | `i a` | View address info |
