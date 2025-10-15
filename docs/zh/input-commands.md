@@ -331,17 +331,22 @@ i f                 # 最短形式
 
 **语法：**
 ```
-info share
-i sh                # 缩写形式
+info share          # 仅显示包含调试信息的共享库（默认）
+info share all      # 显示所有已加载的共享库
+i sh                 # 等同于 `info share`
+i sh all             # 等同于 `info share all`
 ```
 
 **说明：**
-显示所有已加载的共享库（动态库），包括：
+显示已加载的共享库（动态库），包括：
 - 内存地址范围（起始/结束）
 - 符号表状态
 - 调试信息状态
 - 库文件路径
 - 独立调试文件（使用 .gnu_debuglink 时）
+
+默认情况下，`info share` 只列出“存在调试信息”的动态库。
+如需查看所有动态库，请使用 `info share all`。
 
 **输出格式：**
 ```
@@ -712,7 +717,8 @@ exit
 | `info file` | `i f`, `i file` | 查看可执行文件信息 |
 | `info trace` | `i t` | 查看追踪状态 |
 | `info source` | `i s` | 查看源文件 |
-| `info share` | `i sh` | 查看共享库 |
+| `info share` | `i sh` | 查看包含调试信息的共享库 |
+| `info share all` | `i sh all` | 查看所有共享库 |
 | `info function` | `i f <name>` | 查看函数信息 |
 | `info line` | `i l` | 查看行信息 |
 | `info address` | `i a` | 查看地址信息 |

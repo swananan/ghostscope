@@ -256,6 +256,7 @@ impl AutoSuggestionState {
             "info trace",
             "info source",
             "info share",
+            "info share all",
             "info function",
             "info line",
             "info address",
