@@ -180,6 +180,43 @@ trace tick_once {
 }
 
 #[tokio::test]
+async fn test_unknown_member_on_global_reports_members() -> anyhow::Result<()> {
+    // Friendly error when accessing a non-existent member of a global struct
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Access a member that does not exist; expect a concise member list in error
+    let script = r#"
+trace globals_program.c:32 {
+    print G_STATE.no_such_member;
+}
+"#;
+    let (_exit_code, _stdout, stderr) =
+        run_ghostscope_with_script_for_pid_with_log(script, 3, pid).await?;
+    let _ = prog.kill().await.is_ok();
+
+    // Look for our friendly message
+    let has_msg = stderr.contains("Unknown member 'no_such_member' in struct")
+        || stderr.contains("Unknown member 'no_such_member' in union");
+    assert!(
+        has_msg,
+        "Expected unknown-member friendly message. STDERR: {stderr}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_else_if_continues_after_error() -> anyhow::Result<()> {
     init();
 

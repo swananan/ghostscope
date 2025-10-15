@@ -268,6 +268,7 @@ impl<'dwarf> AccessPlanner<'dwarf> {
                     let mut entries = unit_now2.entries_at_offset(def_die.offset())?;
                     let _ = entries.next_entry()?; // self
                     let mut next_type: Option<gimli::UnitOffset> = None;
+                    let mut found_member = false;
                     while let Some((_, e)) = entries.next_dfs()? {
                         if e.tag() == gimli::DW_TAG_member {
                             if let Some(attr) = e.attr(gimli::DW_AT_name)? {
@@ -362,6 +363,7 @@ impl<'dwarf> AccessPlanner<'dwarf> {
                                                 parent_die_off: def_off,
                                                 member_name: field.clone(),
                                             });
+                                            found_member = true;
                                             break;
                                         }
                                     }
@@ -369,7 +371,29 @@ impl<'dwarf> AccessPlanner<'dwarf> {
                             }
                         }
                     }
-                    idx += 1; // consumed one field
+                    if found_member {
+                        // consumed one field
+                        idx += 1;
+                    } else {
+                        // Field not found on this aggregate — report an error instead of
+                        // silently returning the base aggregate.
+                        // Try to get a friendly type name for diagnostics
+                        let type_name = if let Some(attr) = def_die.attr(gimli::DW_AT_name)? {
+                            if let Ok(s) = self.dwarf.attr_string(&unit_now2, attr.value()) {
+                                s.to_string_lossy().ok().unwrap_or_default().into_owned()
+                            } else {
+                                String::new()
+                            }
+                        } else {
+                            String::new()
+                        };
+                        let msg = if type_name.is_empty() {
+                            format!("member '{field}' not found")
+                        } else {
+                            format!("member '{field}' not found on type '{type_name}'")
+                        };
+                        return Err(anyhow::anyhow!(msg));
+                    }
                 }
                 _ => {
                     // Can't descend further

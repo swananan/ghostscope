@@ -92,7 +92,8 @@ factor = {
 }
 
 // Builtin function calls (phase 1)
-strncmp_call = { "strncmp" ~ "(" ~ expr ~ "," ~ expr ~ "," ~ int ~ ")" }
+// Accept expr for len to surface friendly parser error; we still enforce literal in parser.rs
+strncmp_call = { "strncmp" ~ "(" ~ expr ~ "," ~ expr ~ "," ~ expr ~ ")" }
 starts_with_call = { "starts_with" ~ "(" ~ expr ~ "," ~ expr ~ ")" }
 memcmp_call = { "memcmp" ~ "(" ~ expr ~ "," ~ expr ~ ("," ~ expr)? ~ ")" }
 hex_call = { "hex" ~ "(" ~ string ~ ")" }

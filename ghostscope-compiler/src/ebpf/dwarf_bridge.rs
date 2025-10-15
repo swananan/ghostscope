@@ -1487,7 +1487,90 @@ impl<'ctx> EbpfContext<'ctx> {
                         Some(mpath.to_string_lossy().to_string());
                     Ok(Some(v))
                 }
-                None => Ok(None),
+                None => {
+                    // Friendly unknown-member message for globals: try to resolve the base's type
+                    // and list available members.
+                    // We only attempt this for globals to avoid scanning locals aggressively.
+                    let mut matches = analyzer.find_global_variables_by_name(base_name);
+                    if !matches.is_empty() {
+                        // Prefer current module
+                        let preferred: Vec<(
+                            std::path::PathBuf,
+                            ghostscope_dwarf::core::GlobalVariableInfo,
+                        )> = matches
+                            .iter()
+                            .filter(|(p, _)| p.to_string_lossy() == ctx.module_path.as_str())
+                            .cloned()
+                            .collect();
+                        let chosen = if preferred.len() == 1 {
+                            Some(preferred[0].clone())
+                        } else if preferred.is_empty() && matches.len() == 1 {
+                            Some(matches.remove(0))
+                        } else {
+                            None
+                        };
+                        if let Some((mp, info)) = chosen {
+                            if let Ok(var) = analyzer.resolve_variable_by_offsets_in_module(
+                                &mp,
+                                info.unit_offset,
+                                info.die_offset,
+                            ) {
+                                if let Some(ty) = var.dwarf_type.as_ref() {
+                                    // Unwrap aliases
+                                    let mut t = ty;
+                                    loop {
+                                        match t {
+                                            ghostscope_dwarf::TypeInfo::TypedefType {
+                                                underlying_type,
+                                                ..
+                                            } => t = underlying_type.as_ref(),
+                                            ghostscope_dwarf::TypeInfo::QualifiedType {
+                                                underlying_type,
+                                                ..
+                                            } => t = underlying_type.as_ref(),
+                                            _ => break,
+                                        }
+                                    }
+                                    let mut kind: Option<&'static str> = None;
+                                    let mut member_names: Vec<String> = Vec::new();
+                                    match t {
+                                        ghostscope_dwarf::TypeInfo::StructType {
+                                            members, ..
+                                        } => {
+                                            kind = Some("struct");
+                                            member_names =
+                                                members.iter().map(|m| m.name.clone()).collect();
+                                        }
+                                        ghostscope_dwarf::TypeInfo::UnionType {
+                                            members, ..
+                                        } => {
+                                            kind = Some("union");
+                                            member_names =
+                                                members.iter().map(|m| m.name.clone()).collect();
+                                        }
+                                        _ => {}
+                                    }
+                                    if let Some(k) = kind {
+                                        // Form friendly message consistent with tests
+                                        // Example: Unknown member 'no_such_member' in struct 'G_STATE'. Known members: a, b, c
+                                        member_names.sort();
+                                        member_names.dedup();
+                                        let list = if member_names.is_empty() {
+                                            "<none>".to_string()
+                                        } else {
+                                            member_names.join(", ")
+                                        };
+                                        let msg = format!(
+                                            "Unknown member '{field_name}' in {k} '{base_name}' (known members: {list})"
+                                        );
+                                        return Err(CodeGenError::TypeError(msg));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(None)
+                }
             }
         } else {
             Err(CodeGenError::NotImplemented(
@@ -1684,7 +1767,88 @@ impl<'ctx> EbpfContext<'ctx> {
                 self.current_resolved_var_module_path = Some(mpath.to_string_lossy().to_string());
                 Ok(Some(v))
             }
-            None => Ok(None),
+            None => {
+                // Friendly message for unknown member on global in simple two-segment chains
+                if chain.len() == 2 {
+                    let field_name = &chain[1];
+                    let mut matches = analyzer.find_global_variables_by_name(base);
+                    if !matches.is_empty() {
+                        let preferred: Vec<(
+                            std::path::PathBuf,
+                            ghostscope_dwarf::core::GlobalVariableInfo,
+                        )> = matches
+                            .iter()
+                            .filter(|(p, _)| p.to_string_lossy() == ctx.module_path.as_str())
+                            .cloned()
+                            .collect();
+                        let chosen = if preferred.len() == 1 {
+                            Some(preferred[0].clone())
+                        } else if preferred.is_empty() && matches.len() == 1 {
+                            Some(matches.remove(0))
+                        } else {
+                            None
+                        };
+                        if let Some((mp, info)) = chosen {
+                            if let Ok(var) = analyzer.resolve_variable_by_offsets_in_module(
+                                &mp,
+                                info.unit_offset,
+                                info.die_offset,
+                            ) {
+                                if let Some(ty) = var.dwarf_type.as_ref() {
+                                    // Unwrap typedef/qualified
+                                    let mut t = ty;
+                                    loop {
+                                        match t {
+                                            ghostscope_dwarf::TypeInfo::TypedefType {
+                                                underlying_type,
+                                                ..
+                                            } => t = underlying_type.as_ref(),
+                                            ghostscope_dwarf::TypeInfo::QualifiedType {
+                                                underlying_type,
+                                                ..
+                                            } => t = underlying_type.as_ref(),
+                                            _ => break,
+                                        }
+                                    }
+                                    let mut kind: Option<&'static str> = None;
+                                    let mut member_names: Vec<String> = Vec::new();
+                                    match t {
+                                        ghostscope_dwarf::TypeInfo::StructType {
+                                            members, ..
+                                        } => {
+                                            kind = Some("struct");
+                                            member_names =
+                                                members.iter().map(|m| m.name.clone()).collect();
+                                        }
+                                        ghostscope_dwarf::TypeInfo::UnionType {
+                                            members, ..
+                                        } => {
+                                            kind = Some("union");
+                                            member_names =
+                                                members.iter().map(|m| m.name.clone()).collect();
+                                        }
+                                        _ => {}
+                                    }
+                                    if let Some(k) = kind {
+                                        member_names.sort();
+                                        member_names.dedup();
+                                        let list = if member_names.is_empty() {
+                                            "<none>".to_string()
+                                        } else {
+                                            member_names.join(", ")
+                                        };
+                                        let msg = format!(
+                                            "Unknown member '{field_name}' in {k} '{base}' (known members: {list})"
+                                        );
+                                        return Err(CodeGenError::TypeError(msg));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(None)
+            }
         }
         // unreachable
     }

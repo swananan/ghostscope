@@ -149,6 +149,18 @@ fn parse_statement(pair: Pair<Rule>) -> Result<Statement> {
 
             let mut body = Vec::new();
             for stmt_pair in inner_pairs {
+                // Disallow nested trace statements (trace is top-level only)
+                if stmt_pair.as_rule() == Rule::statement {
+                    let mut peek = stmt_pair.clone().into_inner();
+                    if let Some(first) = peek.next() {
+                        if first.as_rule() == Rule::trace_stmt {
+                            return Err(ParseError::SyntaxError(
+                                "'trace' cannot be nested; it is only allowed at the top level"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                }
                 let stmt = parse_statement(stmt_pair)?;
                 body.push(stmt);
             }
@@ -681,12 +693,10 @@ fn parse_factor(pair: Pair<Rule>) -> Result<Expr> {
                         )),
                     }
                 }
-                Rule::float => match inner.as_str().parse::<f64>() {
-                    Ok(value) => Ok(Expr::Float(value)),
-                    Err(_) => Err(ParseError::TypeError(
-                        "invalid floating literal".to_string(),
-                    )),
-                },
+                // Floats are not supported by scripts/runtime; reject early with friendly error
+                Rule::float => Err(ParseError::TypeError(
+                    "float literals are not supported".to_string(),
+                )),
                 Rule::string => {
                     // Remove quotes at the beginning and end
                     let raw_value = inner.as_str();
@@ -877,21 +887,18 @@ fn parse_builtin_call(pair: Pair<Rule>) -> Result<Expr> {
             })
         }
         Rule::strncmp_call => {
-            // grammar: strncmp("(" expr "," expr "," int ")")
+            // grammar: strncmp("(" expr "," expr "," expr ")") [len must be non-negative integer literal]
             let arg0 = parse_expr(it.next().ok_or(ParseError::InvalidExpression)?)?;
             let arg1 = parse_expr(it.next().ok_or(ParseError::InvalidExpression)?)?;
-            let n_node = it.next().ok_or(ParseError::InvalidExpression)?; // int literal
-            if n_node.as_rule() != Rule::int {
-                return Err(ParseError::TypeError(
-                    "strncmp third argument must be a non-negative integer literal".to_string(),
-                ));
-            }
-            let n_val: i64 = n_node.as_str().parse().unwrap_or(0);
-            if n_val < 0 {
-                return Err(ParseError::TypeError(
-                    "strncmp length must be non-negative".to_string(),
-                ));
-            }
+            let n_expr_parsed = parse_expr(it.next().ok_or(ParseError::InvalidExpression)?)?;
+            let n_val: i64 = match n_expr_parsed {
+                Expr::Int(v) if v >= 0 => v,
+                _ => {
+                    return Err(ParseError::TypeError(
+                        "strncmp third argument must be a non-negative integer literal".to_string(),
+                    ))
+                }
+            };
             // Optional constant fold when both sides are string literals
             if let (Expr::String(a), Expr::String(b)) = (&arg0, &arg1) {
                 let ln = n_val.max(0) as usize;
@@ -974,8 +981,14 @@ fn parse_trace_pattern(pair: Pair<Rule>) -> Result<TracePattern> {
                 .as_str()
                 .to_string();
             let hex = parts.next().ok_or(ParseError::InvalidExpression)?.as_str();
-            let addr =
-                u64::from_str_radix(&hex[2..], 16).map_err(|_| ParseError::InvalidExpression)?;
+            let addr = match u64::from_str_radix(&hex[2..], 16) {
+                Ok(v) => v,
+                Err(_) => {
+                    return Err(ParseError::SyntaxError(format!(
+                        "module-qualified address '{hex}' is invalid or too large for u64"
+                    )))
+                }
+            };
             Ok(TracePattern::AddressInModule {
                 module,
                 address: addr,
@@ -985,8 +998,14 @@ fn parse_trace_pattern(pair: Pair<Rule>) -> Result<TracePattern> {
             let addr_str = inner.as_str();
             // Remove "0x" prefix and parse as hex
             let addr_hex = &addr_str[2..];
-            let addr =
-                u64::from_str_radix(addr_hex, 16).map_err(|_| ParseError::InvalidExpression)?;
+            let addr = match u64::from_str_radix(addr_hex, 16) {
+                Ok(v) => v,
+                Err(_) => {
+                    return Err(ParseError::SyntaxError(format!(
+                        "address '{addr_str}' is invalid or too large for u64"
+                    )))
+                }
+            };
             Ok(TracePattern::Address(addr))
         }
         Rule::wildcard_pattern => {
@@ -1777,6 +1796,27 @@ trace foo {
     }
 
     #[test]
+    fn parse_strncmp_nonliteral_len_rejected_with_friendly_message() {
+        // len is variable -> reject with friendly message
+        let script = r#"
+trace foo {
+    let n = 3;
+    if strncmp(lhs, rhs, n) { print "X"; }
+}
+"#;
+        let r = parse(script);
+        match r {
+            Err(ParseError::TypeError(msg)) => {
+                assert!(
+                    msg.contains("third argument must be a non-negative integer literal"),
+                    "{msg}"
+                );
+            }
+            other => panic!("expected TypeError for non-literal len, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_memcmp_missing_len_without_hex_should_fail() {
         let script = r#"
 trace foo {
@@ -1849,7 +1889,20 @@ trace foo {
         // Address exceeds u64 (17 hex digits) -> parse error, not 0 fallback
         let s = r#"trace libfoo.so:0x10000000000000000 { print "X"; }"#;
         let r = parse(s);
-        assert!(r.is_err(), "expected parse error for overflow address");
+        match r {
+            Err(ParseError::SyntaxError(msg)) => assert!(msg.contains("too large for u64")),
+            other => panic!("expected friendly SyntaxError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_hex_address_overflow_should_error() {
+        let s = r#"trace 0x10000000000000000 { print "X"; }"#;
+        let r = parse(s);
+        match r {
+            Err(ParseError::SyntaxError(msg)) => assert!(msg.contains("too large for u64")),
+            other => panic!("expected friendly SyntaxError, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1895,6 +1948,36 @@ trace foo {
     }
 
     #[test]
+    fn parse_nested_trace_is_rejected() {
+        let s = r#"
+trace foo {
+    trace bar { print "X"; }
+}
+"#;
+        let r = parse(s);
+        match r {
+            Err(ParseError::SyntaxError(msg)) => assert!(msg.contains("cannot be nested")),
+            other => panic!("expected SyntaxError for nested trace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_float_literal_is_rejected() {
+        let s = r#"
+trace foo {
+    let x = 1.23;
+}
+"#;
+        let r = parse(s);
+        match r {
+            Err(ParseError::TypeError(msg)) => {
+                assert!(msg.contains("float literals are not supported"))
+            }
+            other => panic!("expected TypeError for float literal, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_unclosed_print_string_reports_friendly_error() {
         let bad = r#"
 trace foo {
@@ -1906,5 +1989,154 @@ trace foo {
             Err(ParseError::SyntaxError(msg)) => assert!(msg.contains("Unclosed string literal")),
             other => panic!("expected SyntaxError, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_array_index_must_be_literal() {
+        // Dynamic index on top-level array
+        let s1 = r#"
+trace foo {
+    print arr[i];
+}
+"#;
+        let r1 = parse(s1);
+        assert!(r1.is_err(), "expected error for non-literal array index");
+        if let Err(ParseError::UnsupportedFeature(msg)) = r1 {
+            assert!(
+                msg.contains("array index must be a literal integer"),
+                "unexpected msg: {msg}"
+            );
+        }
+
+        // Dynamic index at chain tail
+        let s2 = r#"
+trace foo {
+    print obj.arr[i];
+}
+"#;
+        let r2 = parse(s2);
+        assert!(r2.is_err(), "expected error for non-literal chain index");
+        if let Err(ParseError::UnsupportedFeature(msg)) = r2 {
+            assert!(msg.contains("literal integer"), "unexpected msg: {msg}");
+        }
+    }
+
+    #[test]
+    fn parse_print_format_arg_mismatch_reports_error() {
+        // format_expr form
+        let s1 = r#"
+trace foo {
+    print "A {} {}", x;
+}
+"#;
+        let r1 = parse(s1);
+        match r1 {
+            Err(ParseError::TypeError(msg)) => {
+                assert!(msg.contains("expects 2 argument(s)"), "unexpected: {msg}");
+            }
+            other => panic!("expected TypeError from format arg mismatch, got {other:?}"),
+        }
+
+        // flattened string + args form
+        let s2 = r#"
+trace foo {
+    print "B {} {}", y;
+}
+"#;
+        let r2 = parse(s2);
+        match r2 {
+            Err(ParseError::TypeError(msg)) => {
+                assert!(msg.contains("expects 2 argument(s)"));
+            }
+            other => panic!("expected TypeError from format arg mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_print_invalid_format_specifier_errors() {
+        // Missing ':' prefix inside { }
+        let s1 = r#"
+trace foo { print "Bad {x}", 1; }
+"#;
+        let r1 = parse(s1);
+        match r1 {
+            Err(ParseError::TypeError(msg)) => {
+                assert!(msg.contains("Invalid format specifier"), "{msg}");
+            }
+            other => panic!("expected TypeError, got {other:?}"),
+        }
+
+        // Unsupported conversion {:q}
+        let s2 = r#"
+trace foo { print "Bad {:q}", 1; }
+"#;
+        let r2 = parse(s2);
+        match r2 {
+            Err(ParseError::TypeError(msg)) => {
+                assert!(msg.contains("Unsupported format conversion"), "{msg}");
+            }
+            other => panic!("expected TypeError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_hex_with_tab_is_rejected() {
+        let s = r#"
+trace foo {
+    if memcmp(&buf[0], hex("50\t4f"), 2) { print "X"; }
+}
+"#;
+        let r = parse(s);
+        match r {
+            Err(ParseError::TypeError(msg)) => {
+                assert!(msg.contains("non-hex character"), "{msg}");
+            }
+            other => panic!("expected TypeError for tab in hex literal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_starts_with_constant_folds_on_literals() {
+        let s = r#"
+trace foo {
+    if starts_with("abcdef", "abc") { print "T"; } else { print "F"; }
+}
+"#;
+        let prog = parse(s).expect("parse ok");
+        let stmt0 = prog.statements.first().expect("trace");
+        match stmt0 {
+            Statement::TracePoint { body, .. } => match &body[0] {
+                Statement::If { condition, .. } => {
+                    assert!(matches!(condition, Expr::Bool(true)));
+                }
+                other => panic!("expected If, got {other:?}"),
+            },
+            other => panic!("expected TracePoint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_backtrace_and_bt_statements() {
+        let s = r#"
+trace foo {
+    backtrace;
+    bt;
+}
+"#;
+        let r = parse(s);
+        assert!(r.is_ok(), "parse failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn parse_print_capture_len_suffix() {
+        // {:s.name$} uses capture; does not consume extra arg
+        let s = r#"
+trace foo {
+    let n = 3;
+    print "tail={:s.n$}", p;
+}
+"#;
+        let r = parse(s);
+        assert!(r.is_ok(), "parse failed: {:?}", r.err());
     }
 }
