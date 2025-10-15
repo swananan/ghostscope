@@ -8,43 +8,57 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
 
     steps:
     - uses: actions/checkout@v4
 
-    - name: Install LLVM 18 and dependencies
+    - name: Select base image (GHCR or local fallback)
       run: |
-        wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
-        sudo add-apt-repository "deb http://apt.llvm.org/focal/ llvm-toolchain-focal-18 main"
-        sudo apt-get update
-        sudo apt-get install -y \
-          llvm-18 llvm-18-dev llvm-18-runtime \
-          clang-18 libclang-18-dev \
-          libpolly-18-dev \
-          libzstd-dev zlib1g-dev libtinfo-dev libxml2-dev
+        set -euo pipefail
+        IMAGE="ghcr.io/swananan/ghostscope-build:ubuntu20.04-llvm18.1.8"
+        if docker pull "$IMAGE" >/dev/null 2>&1; then
+          echo "Using GHCR base image: $IMAGE"
+          echo "BASE_IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          echo "BASE_IMAGE_FROM=ghcr" >> "$GITHUB_ENV"
+        else
+          echo "GHCR image not found; will build local image."
+          echo "BASE_IMAGE=ghostscope-build" >> "$GITHUB_ENV"
+          echo "BASE_IMAGE_FROM=local" >> "$GITHUB_ENV"
+        fi
 
-    - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
+    - name: Build container image (Ubuntu 20.04)
+      if: ${{ env.BASE_IMAGE_FROM == 'local' }}
+      run: docker build -t ghostscope-build -f Dockerfile .
 
-    - name: Set LLVM environment
+    - name: Verify LLVM in container (no libffi)
       run: |
-        echo "LLVM_SYS_181_PREFIX=/usr/lib/llvm-18" >> $GITHUB_ENV
-        echo "/usr/lib/llvm-18/bin" >> $GITHUB_PATH
+        docker run --rm \
+          -v "${{ github.workspace }}:/workspace" \
+          -w /workspace \
+          "${BASE_IMAGE}" bash -lc '
+            echo "llvm-config version:" && llvm-config --version && \
+            echo "Checking libLLVM for libffi dependency (should be none)..." && \
+            (ldd "$(llvm-config --libdir)"/libLLVM* | grep -i ffi && exit 1 || echo "OK: no libffi referenced")
+          '
 
-    - name: Verify LLVM installation
+    - name: Build release inside container
       run: |
-        llvm-config-18 --version
-        llvm-config-18 --prefix
+        docker run --rm \
+          -v "${{ github.workspace }}:/workspace" \
+          -w /workspace \
+          "${BASE_IMAGE}" \
+          bash -lc 'export LLVM_SYS_181_PREFIX=/opt/llvm-18; export LLVM_CONFIG_PATH=/opt/llvm-18/bin/llvm-config; export RUSTFLAGS="-C link-arg=-Wl,--as-needed"; rustup show; llvm-config --version; echo "llvm-config system-libs:"; llvm-config --system-libs; cargo clean; cargo build --release'
 
-    - name: Build release
-      run: cargo build --release
+    - name: glibc version in container
+      run: |
+        docker run --rm -w /workspace \
+          -v "${{ github.workspace }}:/workspace" \
+          "${BASE_IMAGE}" bash -lc 'ldd --version | head -1'
 
     - name: Check glibc dependency
       run: |
-        echo "=== glibc version on build system ==="
-        ldd --version | head -1
-        echo "=== Required glibc versions ==="
+        echo "=== Required glibc versions (from binary) ==="
         objdump -T ./target/release/ghostscope | grep GLIBC | sed 's/.*GLIBC_\([.0-9]*\).*/\1/g' | sort -Vu
         echo "=== Binary info ==="
         file ./target/release/ghostscope
