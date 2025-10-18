@@ -16,8 +16,8 @@ Commands for setting and managing trace points in your application.
 
 **Syntax:**
 ```
-trace <target>
-t <target>          # Short form
+trace <target> [index]
+t <target> [index]          # Short form
 ```
 
 **Parameters:**
@@ -36,8 +36,10 @@ t <target>          # Short form
 **Examples:**
 ```
 trace main                    # Trace main function
+trace main 2                  # Trace only the 2nd address of 'main' (see 'info function main')
 trace calculate_something     # Trace specific function
 trace /home/user/src/sample.c:42    # Full path
+trace /home/user/src/sample.c:42 1  # Trace only the 1st address for that line
 trace src/sample.c:42         # Relative path
 trace sample.c:42            # Filename only (fuzzy match)
 trace sample:42              # Partial filename (fuzzy match)
@@ -99,6 +101,7 @@ trace main          # Your previous script is restored!
 - Source line target (`trace <file:line> { ... }`):
   - Resolves to the statement boundary on that line for each occurrence (one per inline instance across callers), i.e., statement-level semantics.
   - Typically yields one address per instance where that source line is active.
+  - You can restrict to a single address with `trace <file:line> [index]`.
 
 ### enable - Enable Traces
 
@@ -171,6 +174,10 @@ s t [file]          # Short form
 - `[file]`: Optional filename (uses default if not provided)
 - `enabled`: Save only enabled traces
 - `disabled`: Save only disabled traces
+
+**Behavior:**
+- Saves each trace as a `trace <target> { ... }` block with metadata.
+- If a trace was created with `trace <target> [index]`, the selected address index is preserved in the save file and restored on load.
 
 **Examples:**
 ```
@@ -265,6 +272,10 @@ s <file>            # Short form (but not "s t")
 
 **Parameters:**
 - `<file>`: Script file to load
+
+**Behavior:**
+- Loads all `trace <target> { ... }` blocks in the file.
+- If a block includes an address index (saved from a prior session), only that indexed address is reattached for the target.
 
 **Examples:**
 ```

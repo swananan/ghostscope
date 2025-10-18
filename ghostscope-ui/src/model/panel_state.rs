@@ -510,12 +510,13 @@ pub struct SavedScript {
 
 #[derive(Debug, Clone)]
 pub struct ScriptCache {
-    pub target: String,           // Trace target (function name or file:line)
-    pub original_command: String, // Original trace command (e.g., "trace main")
-    pub lines: Vec<String>,       // Script lines
-    pub cursor_line: usize,       // Current cursor line (0-based)
-    pub cursor_col: usize,        // Current cursor column (0-based)
-    pub status: ScriptStatus,     // Current script status
+    pub target: String,                // Trace target (function name or file:line)
+    pub original_command: String,      // Original trace command (e.g., "trace main")
+    pub selected_index: Option<usize>, // Optional index to filter a single address (1-based)
+    pub lines: Vec<String>,            // Script lines
+    pub cursor_line: usize,            // Current cursor line (0-based)
+    pub cursor_col: usize,             // Current cursor column (0-based)
+    pub status: ScriptStatus,          // Current script status
     pub saved_scripts: HashMap<String, SavedScript>, // target -> complete script cache
 }
 

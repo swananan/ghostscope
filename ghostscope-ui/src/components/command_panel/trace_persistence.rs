@@ -16,10 +16,11 @@ use crate::events::{TraceDefinition, TraceStatus};
 #[derive(Debug, Clone)]
 pub struct TraceConfig {
     pub id: u32,
-    pub target: String,      // Function name or file:line
-    pub script: String,      // Full script content
-    pub status: TraceStatus, // Active, Disabled, or Failed
-    pub binary_path: String, // Associated binary
+    pub target: String,                // Function name or file:line
+    pub script: String,                // Full script content
+    pub status: TraceStatus,           // Active, Disabled, or Failed
+    pub binary_path: String,           // Associated binary
+    pub selected_index: Option<usize>, // Optional selected index for multi-address targets
 }
 
 /// Filter options for saving traces
@@ -249,6 +250,9 @@ impl TracePersistence {
         ));
         section.push_str(&format!("// Target: {}\n", trace.target));
         section.push_str(&format!("// Status: {}\n", trace.status));
+        if let Some(idx) = trace.selected_index {
+            section.push_str(&format!("// Index: {idx}\n"));
+        }
         section.push_str("// ========================================\n");
 
         // Add disabled marker if needed
@@ -278,6 +282,7 @@ impl TracePersistence {
         let mut in_script = false;
         let mut script_lines = Vec::new();
         let mut pending_disabled = false;
+        let mut pending_index: Option<usize> = None;
         // Track nested braces so inner blocks (e.g., if { ... }) don't terminate the trace section
         let mut brace_depth: usize = 0;
 
@@ -287,6 +292,15 @@ impl TracePersistence {
             // Check for disabled marker
             if trimmed == "//@disabled" {
                 pending_disabled = true;
+                continue;
+            }
+
+            // Parse optional index metadata line (e.g., "// Index: 3")
+            if let Some(rest) = trimmed.strip_prefix("// Index:") {
+                let val = rest.trim();
+                if let Ok(idx) = val.parse::<usize>() {
+                    pending_index = Some(idx);
+                }
                 continue;
             }
 
@@ -315,8 +329,10 @@ impl TracePersistence {
                         target,
                         script,
                         enabled: !pending_disabled,
+                        selected_index: pending_index,
                     });
                     pending_disabled = false;
+                    pending_index = None;
                 }
                 in_script = false;
                 brace_depth = 0;

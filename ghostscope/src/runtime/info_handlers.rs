@@ -565,21 +565,26 @@ fn process_module_addresses_for_variables(
     let mut modules = Vec::new();
     let mut first_module_address: Option<ModuleAddress> = None;
 
-    // Group module addresses by module path for UI display structure
+    // Build ordered modules and per-module address lists preserving input order
+    let mut module_order: Vec<std::path::PathBuf> = Vec::new();
     let mut grouped_by_module: HashMap<std::path::PathBuf, Vec<&ModuleAddress>> = HashMap::new();
-    for module_address in module_addresses {
+    for ma in module_addresses {
+        if !grouped_by_module.contains_key(&ma.module_path) {
+            module_order.push(ma.module_path.clone());
+        }
         grouped_by_module
-            .entry(module_address.module_path.clone())
+            .entry(ma.module_path.clone())
             .or_default()
-            .push(module_address);
+            .push(ma);
 
-        // Remember the first module address for source location lookup
         if first_module_address.is_none() {
-            first_module_address = Some(module_address.clone());
+            first_module_address = Some(ma.clone());
         }
     }
 
-    for (module_path, module_addresses_in_module) in &grouped_by_module {
+    let mut global_index: usize = 1;
+    for module_path in module_order {
+        let module_addresses_in_module = grouped_by_module.get(&module_path).unwrap();
         info!(
             "Processing {} in module '{}' at {} addresses",
             target_description,
@@ -670,7 +675,9 @@ fn process_module_addresses_for_variables(
                 source_file: src_loc.as_ref().map(|sl| sl.file_path.clone()),
                 source_line: src_loc.as_ref().map(|sl| sl.line_number),
                 is_inline,
+                index: Some(global_index),
             });
+            global_index += 1;
         }
 
         // Create ModuleDebugInfo for this module
