@@ -89,6 +89,17 @@ trace main          # Your previous script is restored!
 - The command panel shows these as: `— inline|call @ file:line` next to each address.
 - This helps distinguish whether your probe lands in an inlined body or a normal function location.
 
+#### Function vs Line Targets
+
+- Function target (`trace <function_name> { ... }`):
+  - Non-inline: selects the first executable instruction after the function prologue (prologue-skip).
+  - Inline: selects the inline instance start (low_pc semantics of the inline DIE); this is an entry-like point and may not align to a statement boundary. Use a line target if you need precise statement alignment.
+  - Multiple inline instances: if a function is inlined at multiple call sites, you’ll see one address per instance (plus one for the non-inline definition, if present).
+
+- Source line target (`trace <file:line> { ... }`):
+  - Resolves to the statement boundary on that line for each occurrence (one per inline instance across callers), i.e., statement-level semantics.
+  - Typically yields one address per instance where that source line is active.
+
 ### enable - Enable Traces
 
 **Syntax:**
