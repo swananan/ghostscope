@@ -81,6 +81,14 @@ trace main          # Your previous script is restored!
 # 6. Edit and press Ctrl+S again
 ```
 
+#### Inline vs Call Annotations
+
+- When tracing, compilation results now annotate each target with its code origin:
+  - `inline`: The target address is inside an inlined function instance (DW_TAG_inlined_subroutine).
+  - `call`: The target address is in a non-inlined context (regular function body/entry).
+- The command panel shows these as: `— inline|call @ file:line` next to each address.
+- This helps distinguish whether your probe lands in an inlined body or a normal function location.
+
 ### enable - Enable Traces
 
 **Syntax:**
@@ -430,6 +438,13 @@ info address 0x401234      # Use default module (depends on -t/-p)
 info address libc.so.6:0x1234  # Suffix match shared library + address
 info address /usr/bin/nginx:0xdeadbeef v  # Full path + verbose
 ```
+
+#### Inline vs Call (Info Output)
+
+- For `info function`, `info line`, and `info address`, each address line includes:
+  - `— inline` if the PC falls in an inlined subroutine instance, otherwise `— call`.
+  - `@ file:line` with the resolved source location when available.
+- Same source line may appear multiple times (one per inline instance across different callers).
 
 ---
 

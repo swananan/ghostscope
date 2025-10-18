@@ -64,6 +64,17 @@ impl DwarfAnalyzer {
         Self::from_pid_parallel(pid).await
     }
 
+    /// Classify whether an address is inside an inlined subroutine instance
+    /// Returns Some(true) if inline, Some(false) if a normal (non-inline) context,
+    /// or None if the module/address cannot be resolved.
+    pub fn is_inline_at(&mut self, module_address: &ModuleAddress) -> Option<bool> {
+        if let Some(module_data) = self.modules.get_mut(&module_address.module_path) {
+            module_data.is_inline_at(module_address.address)
+        } else {
+            None
+        }
+    }
+
     /// Resolve struct/class by name (shallow) in a specific module using only indexes
     pub fn resolve_struct_type_shallow_by_name_in_module<P: AsRef<Path>>(
         &mut self,

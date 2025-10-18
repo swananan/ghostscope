@@ -254,8 +254,15 @@ impl ModuleDebugInfo {
                 (false, false) => "│  ├─",
             };
 
-            // Enhanced PC address display
-            let pc_description = format!("🎯 0x{:x}", mapping.address);
+            // Enhanced PC address display with classification/source
+            let mut pc_description = format!("🎯 0x{:x}", mapping.address);
+            if let Some(is_inline) = mapping.is_inline {
+                pc_description
+                    .push_str(&format!(" — {}", if is_inline { "inline" } else { "call" }));
+            }
+            if let (Some(ref file), Some(line)) = (&mapping.source_file, mapping.source_line) {
+                pc_description.push_str(&format!(" @ {file}:{line}"));
+            }
 
             result.push_str(&format!("{addr_prefix} {pc_description}\n"));
 
@@ -429,6 +436,9 @@ pub struct AddressMapping {
     pub function_name: Option<String>,
     pub variables: Vec<VariableDebugInfo>,
     pub parameters: Vec<VariableDebugInfo>,
+    pub source_file: Option<String>,
+    pub source_line: Option<u32>,
+    pub is_inline: Option<bool>,
 }
 
 impl AddressMapping {
@@ -450,13 +460,28 @@ impl AddressMapping {
             (false, false) => "│  ├─",
         };
 
-        lines.push(
-            StyledLineBuilder::new()
-                .styled(prefix, StylePresets::TREE)
-                .text(" 🎯 ")
-                .address(self.address)
-                .build(),
-        );
+        // Header line with address + optional classification and source location
+        let mut header = StyledLineBuilder::new()
+            .styled(prefix, StylePresets::TREE)
+            .text(" 🎯 ")
+            .address(self.address);
+
+        if let Some(is_inline) = self.is_inline {
+            header = header
+                .text(" ")
+                .key("—")
+                .text(" ")
+                .styled(if is_inline { "inline" } else { "call" }, StylePresets::KEY);
+        }
+        if let (Some(ref file), Some(line)) = (&self.source_file, self.source_line) {
+            header = header
+                .text(" ")
+                .key("@")
+                .text(" ")
+                .value(format!("{file}:{line}"));
+        }
+
+        lines.push(header.build());
 
         if !self.parameters.is_empty() {
             let param_prefix = match (is_last_module, is_last_addr) {
@@ -680,7 +705,9 @@ pub struct ScriptExecutionResult {
     pub target_name: String,
     pub binary_path: String, // Full path to the binary
     pub status: ExecutionStatus,
-    // TODO: Add source_file: Option<String> and source_line: Option<usize> for function traces
+    pub source_file: Option<String>,
+    pub source_line: Option<u32>,
+    pub is_inline: Option<bool>,
 }
 
 /// Detailed compilation result for a script with multiple targets

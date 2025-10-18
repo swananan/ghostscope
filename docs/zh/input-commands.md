@@ -79,6 +79,14 @@ trace main          # 你之前的脚本会被恢复！
 # 6. 编辑后再次按 Ctrl+S
 ```
 
+#### 内联 vs 调用 标注
+
+- 追踪编译结果现在会对每个目标标注来源语义：
+  - `inline`：目标地址位于某个内联函数实例（DW_TAG_inlined_subroutine）内部。
+  - `call`：目标地址位于非内联上下文（普通函数体/入口）。
+- 命令面板会在每个地址旁显示：`— inline|call @ file:line`。
+- 便于分辨你的探针究竟落在“内联体”还是“常规函数位置”。
+
 ### enable - 启用追踪
 
 **语法：**
@@ -426,6 +434,13 @@ info address 0x401234          # 使用默认模块（取决于 -t/-p）
 info address libc.so.6:0x1234  # 共享库后缀 + 地址（后缀匹配）
 info address /usr/bin/nginx:0xdeadbeef v  # 全路径 + 详细信息
 ```
+
+#### 内联 vs 调用（Info 输出）
+
+- 对 `info function`、`info line`、`info address` 的每个地址行，都会附加：
+  - 若 PC 落在某个内联实例内，显示 `— inline`，否则显示 `— call`；
+  - 以及 `@ file:line` 源码位置信息（若可解析）。
+- 同一源码行可能在多个调用点处被内联，因此会出现多处地址（每个内联实例各一处）。
 
 ---
 

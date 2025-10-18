@@ -749,16 +749,43 @@ impl ScriptEditor {
             match &exec_result.status {
                 crate::events::ExecutionStatus::Success => {
                     let trace_id = compilation_details.trace_ids.get(trace_idx).copied();
+                    // Build classification + source string if available
+                    let class_part = match exec_result.is_inline {
+                        Some(true) => "inline",
+                        Some(false) => "call",
+                        None => "",
+                    };
+                    let src_part = match (&exec_result.source_file, exec_result.source_line) {
+                        (Some(f), Some(l)) => format!(" @ {f}:{l}"),
+                        _ => String::new(),
+                    };
+
                     if let Some(tid) = trace_id {
-                        result.push(format!(
-                            "  • {} (0x{:x}) → trace_id: {}",
-                            exec_result.target_name, exec_result.pc_address, tid
-                        ));
+                        if class_part.is_empty() && src_part.is_empty() {
+                            result.push(format!(
+                                "  • {} (0x{:x}) → trace_id: {}",
+                                exec_result.target_name, exec_result.pc_address, tid
+                            ));
+                        } else {
+                            result.push(format!(
+                                "  • {} (0x{:x}) — {}{} → trace_id: {}",
+                                exec_result.target_name,
+                                exec_result.pc_address,
+                                class_part,
+                                src_part,
+                                tid
+                            ));
+                        }
                         trace_idx += 1;
-                    } else {
+                    } else if class_part.is_empty() && src_part.is_empty() {
                         result.push(format!(
                             "  • {} (0x{:x}) → trace attached",
                             exec_result.target_name, exec_result.pc_address
+                        ));
+                    } else {
+                        result.push(format!(
+                            "  • {} (0x{:x}) — {}{} → trace attached",
+                            exec_result.target_name, exec_result.pc_address, class_part, src_part
                         ));
                     }
                 }
