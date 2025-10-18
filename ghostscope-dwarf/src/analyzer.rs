@@ -738,24 +738,6 @@ impl DwarfAnalyzer {
         all_functions
     }
 
-    /// Find symbol by name in a specific module (compatibility method)
-    pub fn find_symbol_by_name_in_module(
-        &self,
-        module_path: &std::path::Path,
-        function_name: &str,
-    ) -> Option<Vec<u64>> {
-        if let Some(module_data) = self.modules.get(&module_path.to_path_buf()) {
-            let addresses = module_data.lookup_function_addresses(function_name);
-            if !addresses.is_empty() {
-                Some(addresses)
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    }
-
     /// Lookup functions by pattern (simplified - exact match only for now)
     pub fn lookup_functions_by_pattern(&self, pattern: &str) -> Vec<String> {
         let all_functions = self.list_functions();
