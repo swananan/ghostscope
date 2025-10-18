@@ -254,8 +254,12 @@ impl ModuleDebugInfo {
                 (false, false) => "│  ├─",
             };
 
-            // Enhanced PC address display with classification/source
-            let mut pc_description = format!("🎯 0x{:x}", mapping.address);
+            // Enhanced PC address display with optional index + classification/source
+            let mut pc_description = if let Some(i) = mapping.index {
+                format!("[{}] 🎯 0x{:x}", i, mapping.address)
+            } else {
+                format!("🎯 0x{:x}", mapping.address)
+            };
             if let Some(is_inline) = mapping.is_inline {
                 pc_description
                     .push_str(&format!(" — {}", if is_inline { "inline" } else { "call" }));
@@ -439,6 +443,7 @@ pub struct AddressMapping {
     pub source_file: Option<String>,
     pub source_line: Option<u32>,
     pub is_inline: Option<bool>,
+    pub index: Option<usize>, // 1-based global index for selection
 }
 
 impl AddressMapping {
@@ -460,11 +465,14 @@ impl AddressMapping {
             (false, false) => "│  ├─",
         };
 
-        // Header line with address + optional classification and source location
-        let mut header = StyledLineBuilder::new()
-            .styled(prefix, StylePresets::TREE)
-            .text(" 🎯 ")
-            .address(self.address);
+        // Header line with index + address + optional classification and source location
+        let mut header = StyledLineBuilder::new().styled(prefix, StylePresets::TREE);
+        if let Some(i) = self.index {
+            header = header
+                .text(" ")
+                .styled(format!("[{i}]"), StylePresets::ADDRESS);
+        }
+        header = header.text(" 🎯 ").address(self.address);
 
         if let Some(is_inline) = self.is_inline {
             header = header
@@ -613,6 +621,7 @@ pub struct VariableDebugInfo {
 pub enum RuntimeCommand {
     ExecuteScript {
         command: String,
+        selected_index: Option<usize>,
     },
     RequestSourceCode, // Request source code for current function/address
     DisableTrace(u32), // Disable specific trace by ID
@@ -670,6 +679,7 @@ pub struct TraceDefinition {
     pub target: String,
     pub script: String,
     pub enabled: bool,
+    pub selected_index: Option<usize>,
 }
 
 /// Result of loading a single trace

@@ -167,8 +167,8 @@ async fn run_runtime_coordinator(
             // Handle runtime commands
             Some(command) = runtime_channels.command_receiver.recv() => {
                 match command {
-                    RuntimeCommand::ExecuteScript { command: script } => {
-                        handle_execute_script(&mut session, &mut runtime_channels, script, &compile_options).await;
+                    RuntimeCommand::ExecuteScript { command: script, selected_index } => {
+                        handle_execute_script(&mut session, &mut runtime_channels, script, selected_index, &compile_options).await;
                     }
                     RuntimeCommand::InfoTrace { trace_id } => {
                         match trace_id {
@@ -358,42 +358,48 @@ async fn handle_execute_script(
     session: &mut Option<GhostSession>,
     runtime_channels: &mut RuntimeChannels,
     script: String,
+    selected_index: Option<usize>,
     compile_options: &ghostscope_compiler::CompileOptions,
 ) {
     info!("Executing script: {}", script);
 
     if let Some(ref mut session) = session {
-        let details =
-            match crate::script::compile_and_load_script_for_tui(&script, session, compile_options)
-                .await
-            {
-                Ok(details) => {
-                    info!(
-                        "✓ Script compilation completed: {} total, {} success, {} failed",
-                        details.total_count, details.success_count, details.failed_count
-                    );
-                    details
+        // Clone compile options to inject selected index filter for this compile
+        let mut options = compile_options.clone();
+        options.selected_index = selected_index;
+
+        let details = match crate::script::compile_and_load_script_for_tui(
+            &script, session, &options,
+        )
+        .await
+        {
+            Ok(details) => {
+                info!(
+                    "✓ Script compilation completed: {} total, {} success, {} failed",
+                    details.total_count, details.success_count, details.failed_count
+                );
+                details
+            }
+            Err(e) => {
+                error!("❌ Script compilation failed: {}", e);
+                // Return details with all failures
+                ghostscope_ui::events::ScriptCompilationDetails {
+                    trace_ids: vec![],
+                    results: vec![ghostscope_ui::events::ScriptExecutionResult {
+                        pc_address: 0,
+                        target_name: script.clone(),
+                        binary_path: String::new(),
+                        status: ghostscope_ui::events::ExecutionStatus::Failed(e.to_string()),
+                        source_file: None,
+                        source_line: None,
+                        is_inline: None,
+                    }],
+                    total_count: 1,
+                    success_count: 0,
+                    failed_count: 1,
                 }
-                Err(e) => {
-                    error!("❌ Script compilation failed: {}", e);
-                    // Return details with all failures
-                    ghostscope_ui::events::ScriptCompilationDetails {
-                        trace_ids: vec![],
-                        results: vec![ghostscope_ui::events::ScriptExecutionResult {
-                            pc_address: 0,
-                            target_name: script.clone(),
-                            binary_path: String::new(),
-                            status: ghostscope_ui::events::ExecutionStatus::Failed(e.to_string()),
-                            source_file: None,
-                            source_line: None,
-                            is_inline: None,
-                        }],
-                        total_count: 1,
-                        success_count: 0,
-                        failed_count: 1,
-                    }
-                }
-            };
+            }
+        };
 
         let _ = runtime_channels
             .status_sender
@@ -449,21 +455,27 @@ async fn handle_save_traces(
         persistence.set_pid(pid);
     }
 
-    // Collect trace information from session
-    let traces = session.get_traces();
-    for trace in &traces {
-        let config = TraceConfig {
-            id: trace.trace_id,
-            target: trace.target_display.clone(),
-            script: trace.script.clone(),
-            status: if trace.enabled {
-                ghostscope_ui::events::TraceStatus::Active
-            } else {
-                ghostscope_ui::events::TraceStatus::Disabled
-            },
-            binary_path: trace.binary_path.clone().unwrap_or_default(),
-        };
-        persistence.add_trace(config);
+    // Collect trace information directly from trace manager snapshots (includes pc)
+    let trace_ids = session.trace_manager.get_all_trace_ids();
+    for trace_id in trace_ids {
+        if let Some(snapshot) = session.trace_manager.get_trace_snapshot(trace_id) {
+            // Prefer the index stored in the trace snapshot; fallback to None
+            let selected_index = snapshot.address_global_index;
+
+            let config = TraceConfig {
+                id: snapshot.trace_id,
+                target: snapshot.target_display.clone(),
+                script: snapshot.script_content.clone(),
+                status: if snapshot.is_enabled {
+                    ghostscope_ui::events::TraceStatus::Active
+                } else {
+                    ghostscope_ui::events::TraceStatus::Disabled
+                },
+                binary_path: snapshot.binary_path.clone(),
+                selected_index,
+            };
+            persistence.add_trace(config);
+        }
     }
 
     // Save traces to file
@@ -518,6 +530,7 @@ async fn handle_load_traces(
             session,
             runtime_channels,
             script_command,
+            trace.selected_index,
             &default_compile_options,
         )
         .await;

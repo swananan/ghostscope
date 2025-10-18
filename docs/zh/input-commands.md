@@ -14,8 +14,8 @@
 
 **语法：**
 ```
-trace <target>
-t <target>          # 缩写形式
+trace <target> [index]
+t <target> [index]          # 缩写形式
 ```
 
 **参数：**
@@ -34,8 +34,10 @@ t <target>          # 缩写形式
 **示例：**
 ```
 trace main                    # 追踪 main 函数
+trace main 2                  # 只追踪 main 的第 2 个地址（参考 info function main 的编号）
 trace calculate_something     # 追踪特定函数
 trace /home/user/src/sample.c:42    # 完整路径
+trace /home/user/src/sample.c:42 1  # 只追踪该行的第 1 个地址
 trace src/sample.c:42         # 相对路径
 trace sample.c:42            # 仅文件名（模糊匹配）
 trace sample:42              # 部分文件名（模糊匹配）
@@ -97,6 +99,7 @@ trace main          # 你之前的脚本会被恢复！
 - 源码行号目标（`trace <file:line> { ... }`）：
   - 对应“语句级”语义：解析到该行的语句边界（is_stmt）并在每个出现处各给一个地址（每个内联实例各一处）。
   - 通常会在所有出现该行的实例处各有 1 个地址。
+  - 可以通过 `trace <file:line> [index]` 只追踪其中一个地址。
 
 ### enable - 启用追踪
 
@@ -169,6 +172,10 @@ s t [file]          # 缩写形式
 - `[file]`: 可选文件名（未提供时使用默认文件名）
 - `enabled`: 只保存启用的追踪
 - `disabled`: 只保存禁用的追踪
+
+**行为：**
+- 以 `trace <target> { ... }` 区块形式保存每条追踪及元信息。
+- 若追踪是通过 `trace <target> [index]` 创建的，会将所选“地址序号”一并保存，并在加载时恢复该序号。
 
 **示例：**
 ```
@@ -263,6 +270,10 @@ s <file>            # 缩写形式（但不包括 "s t"）
 
 **参数：**
 - `<file>`: 要加载的脚本文件
+
+**行为：**
+- 加载文件中的所有 `trace <target> { ... }` 区块。
+- 若区块内包含保存的“地址序号”，则仅为该目标重新挂载对应序号的地址。
 
 **示例：**
 ```

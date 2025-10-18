@@ -15,6 +15,7 @@ pub struct TraceInstance {
     pub is_enabled: bool, // Whether the uprobe is currently enabled
     pub loader: Option<GhostScopeLoader>, // eBPF loader for this trace
     pub ebpf_function_name: String, // eBPF function name for uprobe attachment
+    pub address_global_index: Option<usize>, // Global 1-based index of the resolved address
 }
 
 pub struct TraceInstanceArgs {
@@ -27,6 +28,7 @@ pub struct TraceInstanceArgs {
     pub target_pid: Option<u32>,
     pub loader: Option<ghostscope_loader::GhostScopeLoader>,
     pub ebpf_function_name: String,
+    pub address_global_index: Option<usize>,
 }
 
 impl TraceInstance {
@@ -42,6 +44,7 @@ impl TraceInstance {
             is_enabled: false,
             loader: args.loader,
             ebpf_function_name: args.ebpf_function_name,
+            address_global_index: args.address_global_index,
         }
     }
 

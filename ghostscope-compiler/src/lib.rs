@@ -68,6 +68,9 @@ pub struct CompileOptions {
     pub compare_cap: u32,
     /// Max total bytes in a single trace event (used for PerfEventArray accumulation buffer size).
     pub max_trace_event_size: u32,
+    /// Optional single-address filter: if set, only the Nth (1-based) address
+    /// resolved for a target will be compiled. When None, compile all.
+    pub selected_index: Option<usize>,
 }
 
 impl Default for CompileOptions {
@@ -84,6 +87,7 @@ impl Default for CompileOptions {
             mem_dump_cap: 4096,                    // Default per-arg dump cap (bytes)
             compare_cap: 64,                       // Default compare cap for strncmp/memcmp (bytes)
             max_trace_event_size: 32768,           // Default event size cap (32KB)
+            selected_index: None,
         }
     }
 }

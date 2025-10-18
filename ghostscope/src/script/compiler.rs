@@ -305,6 +305,7 @@ pub async fn compile_and_load_script_for_tui(
                                 target_display,
                                 config.assigned_trace_id
                             ),
+                            address_global_index: config.resolved_address_index,
                         },
                     );
 
@@ -571,6 +572,7 @@ pub async fn compile_and_load_script_for_cli(
                             target_display,
                             config.assigned_trace_id
                         ),
+                        address_global_index: config.resolved_address_index,
                     },
                 );
 

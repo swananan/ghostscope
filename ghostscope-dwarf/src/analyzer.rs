@@ -305,6 +305,15 @@ impl DwarfAnalyzer {
             }
         }
 
+        // Deterministic ordering: module path asc, then address asc
+        results.sort_by(|a, b| {
+            let pa = a.module_path.to_string_lossy();
+            let pb = b.module_path.to_string_lossy();
+            match pa.cmp(&pb) {
+                std::cmp::Ordering::Equal => a.address.cmp(&b.address),
+                other => other,
+            }
+        });
         results
     }
 
@@ -631,6 +640,14 @@ impl DwarfAnalyzer {
             );
         }
 
+        results.sort_by(|a, b| {
+            let pa = a.module_path.to_string_lossy();
+            let pb = b.module_path.to_string_lossy();
+            match pa.cmp(&pb) {
+                std::cmp::Ordering::Equal => a.address.cmp(&b.address),
+                other => other,
+            }
+        });
         results
     }
 
