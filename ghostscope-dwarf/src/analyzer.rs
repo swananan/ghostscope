@@ -64,6 +64,17 @@ impl DwarfAnalyzer {
         Self::from_pid_parallel(pid).await
     }
 
+    /// Classify whether an address is inside an inlined subroutine instance
+    /// Returns Some(true) if inline, Some(false) if a normal (non-inline) context,
+    /// or None if the module/address cannot be resolved.
+    pub fn is_inline_at(&mut self, module_address: &ModuleAddress) -> Option<bool> {
+        if let Some(module_data) = self.modules.get_mut(&module_address.module_path) {
+            module_data.is_inline_at(module_address.address)
+        } else {
+            None
+        }
+    }
+
     /// Resolve struct/class by name (shallow) in a specific module using only indexes
     pub fn resolve_struct_type_shallow_by_name_in_module<P: AsRef<Path>>(
         &mut self,
@@ -294,6 +305,15 @@ impl DwarfAnalyzer {
             }
         }
 
+        // Deterministic ordering: module path asc, then address asc
+        results.sort_by(|a, b| {
+            let pa = a.module_path.to_string_lossy();
+            let pb = b.module_path.to_string_lossy();
+            match pa.cmp(&pb) {
+                std::cmp::Ordering::Equal => a.address.cmp(&b.address),
+                other => other,
+            }
+        });
         results
     }
 
@@ -620,6 +640,14 @@ impl DwarfAnalyzer {
             );
         }
 
+        results.sort_by(|a, b| {
+            let pa = a.module_path.to_string_lossy();
+            let pb = b.module_path.to_string_lossy();
+            match pa.cmp(&pb) {
+                std::cmp::Ordering::Equal => a.address.cmp(&b.address),
+                other => other,
+            }
+        });
         results
     }
 
@@ -736,24 +764,6 @@ impl DwarfAnalyzer {
         );
 
         all_functions
-    }
-
-    /// Find symbol by name in a specific module (compatibility method)
-    pub fn find_symbol_by_name_in_module(
-        &self,
-        module_path: &std::path::Path,
-        function_name: &str,
-    ) -> Option<Vec<u64>> {
-        if let Some(module_data) = self.modules.get(&module_path.to_path_buf()) {
-            let addresses = module_data.lookup_function_addresses(function_name);
-            if !addresses.is_empty() {
-                Some(addresses)
-            } else {
-                None
-            }
-        } else {
-            None
-        }
     }
 
     /// Lookup functions by pattern (simplified - exact match only for now)

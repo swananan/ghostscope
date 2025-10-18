@@ -50,6 +50,9 @@ pub struct UProbeConfig {
 
     /// Trace context containing all strings, types, and variable names used in this uprobe
     pub trace_context: ghostscope_protocol::TraceContext,
+
+    /// Global 1-based index of this address within the resolved target list (if applicable)
+    pub resolved_address_index: Option<usize>,
 }
 
 /// Compilation result containing all uprobe configurations
@@ -345,11 +348,29 @@ impl<'a> AstCompiler<'a> {
                     index
                 );
 
-                // Process each module and its addresses - continue even if some fail
+                // Validate optional single-index selection (1-based)
+                if let Some(idx) = self.compile_options.selected_index {
+                    if idx == 0 || idx > module_addresses.len() {
+                        return Err(CompileError::Other(format!(
+                            "Selected index {idx} is out of range for {file_path}:{line_number} (valid 1..={}). Use 'info' to view indices.",
+                            module_addresses.len()
+                        )));
+                    }
+                }
+
+                // Optional single-index filter (1-based); otherwise process all
                 let mut successful_addresses = 0;
                 let mut failed_addresses = 0;
+                // Iterate with indices (1-based) so we can propagate the global address index
+                let iterator: Box<dyn Iterator<Item = (usize, &ghostscope_dwarf::ModuleAddress)>> =
+                    if let Some(idx) = self.compile_options.selected_index {
+                        let i = idx - 1; // safe due to validation above
+                        Box::new(std::iter::once((idx, &module_addresses[i])))
+                    } else {
+                        Box::new(module_addresses.iter().enumerate().map(|(i, m)| (i + 1, m)))
+                    };
 
-                for module_address in &module_addresses {
+                for (global_idx, module_address) in iterator {
                     // Convert DWARF PC (vaddr) to ELF file offset for uprobe
                     let file_off = self.process_analyzer.as_ref().and_then(|an| {
                         an.vaddr_to_file_offset(&module_address.module_path, module_address.address)
@@ -365,7 +386,12 @@ impl<'a> AstCompiler<'a> {
                         pattern: pattern.clone(),
                     };
 
-                    match self.generate_ebpf_for_target(&target_info, statements, pid) {
+                    match self.generate_ebpf_for_target(
+                        &target_info,
+                        statements,
+                        pid,
+                        Some(global_idx),
+                    ) {
                         Ok(uprobe_config) => {
                             self.uprobe_configs.push(uprobe_config);
                             successful_addresses += 1;
@@ -461,7 +487,7 @@ impl<'a> AstCompiler<'a> {
                     pattern: pattern.clone(),
                 };
 
-                match self.generate_ebpf_for_target(&target_info, statements, pid) {
+                match self.generate_ebpf_for_target(&target_info, statements, pid, None) {
                     Ok(uprobe_config) => {
                         self.uprobe_configs.push(uprobe_config);
                         info!("✓ Successfully generated eBPF for address 0x{:x}", addr);
@@ -542,7 +568,7 @@ impl<'a> AstCompiler<'a> {
                     pattern: pattern.clone(),
                 };
 
-                match self.generate_ebpf_for_target(&target_info, statements, pid) {
+                match self.generate_ebpf_for_target(&target_info, statements, pid, None) {
                     Ok(uprobe_config) => {
                         self.uprobe_configs.push(uprobe_config);
                         info!(
@@ -585,12 +611,31 @@ impl<'a> AstCompiler<'a> {
                     module_addresses.len()
                 );
 
+                // Validate optional single-index selection (1-based)
+                if let Some(idx) = self.compile_options.selected_index {
+                    if idx == 0 || idx > module_addresses.len() {
+                        return Err(CompileError::Other(format!(
+                            "Selected index {idx} is out of range for function '{func_name}' (valid 1..={}). Use 'info function {func_name}' to view indices.",
+                            module_addresses.len()
+                        )));
+                    }
+                }
+
                 // We may need analyzer again to compute precise uprobe offsets
-                // Process each address - continue even if some fail
+                // Optional single-index filter (1-based); otherwise process all addresses
                 let mut successful_addresses = 0;
                 let mut failed_addresses = 0;
 
-                for module_address in &module_addresses {
+                // Iterate with indices (1-based) so we can propagate the global address index
+                let iterator: Box<dyn Iterator<Item = (usize, &ghostscope_dwarf::ModuleAddress)>> =
+                    if let Some(idx) = self.compile_options.selected_index {
+                        let i = idx - 1; // safe due to validation above
+                        Box::new(std::iter::once((idx, &module_addresses[i])))
+                    } else {
+                        Box::new(module_addresses.iter().enumerate().map(|(i, m)| (i + 1, m)))
+                    };
+
+                for (global_idx, module_address) in iterator {
                     // Convert DWARF function address (vaddr) to ELF file offset for uprobe attach
                     let file_off = self.process_analyzer.as_ref().and_then(|an| {
                         an.vaddr_to_file_offset(&module_address.module_path, module_address.address)
@@ -604,7 +649,12 @@ impl<'a> AstCompiler<'a> {
                         pattern: pattern.clone(),
                     };
 
-                    match self.generate_ebpf_for_target(&target_info, statements, pid) {
+                    match self.generate_ebpf_for_target(
+                        &target_info,
+                        statements,
+                        pid,
+                        Some(global_idx),
+                    ) {
                         Ok(uprobe_config) => {
                             self.uprobe_configs.push(uprobe_config);
                             successful_addresses += 1;
@@ -667,6 +717,7 @@ impl<'a> AstCompiler<'a> {
         target: &ResolvedTarget,
         statements: &[Statement],
         pid: Option<u32>,
+        resolved_address_index: Option<usize>,
     ) -> Result<UProbeConfig, CompileError> {
         let context = Context::create();
 
@@ -757,6 +808,7 @@ impl<'a> AstCompiler<'a> {
             ebpf_function_name,
             assigned_trace_id,
             trace_context,
+            resolved_address_index,
         })
     }
 

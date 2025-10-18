@@ -12,6 +12,7 @@ pub struct TraceSnapshot {
     pub pc: u64,
     #[allow(dead_code)]
     pub ebpf_function_name: String,
+    pub address_global_index: Option<usize>,
 }
 
 /// Summary statistics for all traces

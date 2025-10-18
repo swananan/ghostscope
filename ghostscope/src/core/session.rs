@@ -5,16 +5,6 @@ use anyhow::Result;
 use ghostscope_dwarf::{DwarfAnalyzer, ModuleStats};
 use tracing::{info, warn};
 
-/// Trace information for save/load operations
-#[derive(Debug, Clone)]
-pub struct TraceInfo {
-    pub trace_id: u32,
-    pub target_display: String,
-    pub script: String,
-    pub enabled: bool,
-    pub binary_path: Option<String>,
-}
-
 /// Ghost session state - manages binary analysis, process tracking, and trace instances
 #[derive(Debug)]
 pub struct GhostSession {
@@ -213,21 +203,6 @@ impl GhostSession {
         } else {
             Vec::new()
         }
-    }
-
-    /// Get all traces for save/export operations
-    pub fn get_traces(&self) -> Vec<TraceInfo> {
-        self.trace_manager
-            .get_all_traces()
-            .into_iter()
-            .map(|trace| TraceInfo {
-                trace_id: trace.trace_id,
-                target_display: trace.target_display.clone(),
-                script: trace.script_content.clone(),
-                enabled: trace.is_enabled,
-                binary_path: Some(trace.binary_path.clone()),
-            })
-            .collect()
     }
 
     /// Get binary path if available

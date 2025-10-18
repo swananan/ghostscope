@@ -2925,12 +2925,25 @@ impl App {
                 total_count,
             } => {
                 self.clear_waiting_state();
-                let text = format!("✅ Saved {saved_count} of {total_count} traces to {filename}");
+                let mut text =
+                    format!("✅ Saved {saved_count} of {total_count} traces to {filename}\n");
+                text.push_str("   • Selected indices are preserved in the save file\n");
+
+                use crate::components::command_panel::style_builder::{
+                    StylePresets, StyledLineBuilder,
+                };
                 let styled = vec![
-                    crate::components::command_panel::style_builder::StyledLineBuilder::new()
+                    StyledLineBuilder::new()
                         .styled(
-                            text.clone(),
-                            crate::components::command_panel::style_builder::StylePresets::SUCCESS,
+                            format!("✅ Saved {saved_count} of {total_count} traces to {filename}"),
+                            StylePresets::SUCCESS,
+                        )
+                        .build(),
+                    StyledLineBuilder::new()
+                        .text("   • ")
+                        .styled(
+                            "Selected indices are preserved in the save file",
+                            StylePresets::TIP,
                         )
                         .build(),
                 ];
@@ -2974,6 +2987,8 @@ impl App {
                         success_count - disabled_count,
                         disabled_count
                     ));
+                    response.push('\n');
+                    response.push_str("   • Selected indices from the file are restored\n");
                 } else {
                     // Some traces failed
                     response.push_str(&format!("⚠️ Partially loaded traces from {filename}\n"));
@@ -2983,6 +2998,8 @@ impl App {
                         success_count - disabled_count,
                         disabled_count
                     ));
+                    response
+                        .push_str("  • Selected indices from the file are restored when present\n");
 
                     // Show failed traces
                     for detail in &details {
@@ -3014,6 +3031,15 @@ impl App {
                             )
                             .build(),
                     );
+                    styled.push(
+                        StyledLineBuilder::new()
+                            .text("   • ")
+                            .styled(
+                                "Selected indices from the file are restored",
+                                StylePresets::TIP,
+                            )
+                            .build(),
+                    );
                 } else {
                     styled.push(
                         StyledLineBuilder::new()
@@ -3034,6 +3060,15 @@ impl App {
                                     disabled_count
                                 ),
                                 StylePresets::SUCCESS,
+                            )
+                            .build(),
+                    );
+                    styled.push(
+                        StyledLineBuilder::new()
+                            .text("  • ")
+                            .styled(
+                                "Selected indices from the file are restored when present",
+                                StylePresets::TIP,
                             )
                             .build(),
                     );

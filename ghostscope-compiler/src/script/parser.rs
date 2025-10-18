@@ -67,6 +67,10 @@ pub fn parse(input: &str) -> Result<Program> {
             if let Some(msg) = detect_unclosed_print_string(input) {
                 return Err(ParseError::SyntaxError(msg));
             }
+            // Heuristic: detect likely misspelled or unknown keywords and suggest fixes
+            if let Some(msg) = detect_unknown_keyword(input) {
+                return Err(ParseError::SyntaxError(msg));
+            }
             return Err(ParseError::Pest(Box::new(e)));
         }
     };
@@ -119,6 +123,121 @@ fn detect_unclosed_print_string(input: &str) -> Option<String> {
                     "Unclosed string literal in print at line {}.",
                     i + 1
                 ));
+            }
+        }
+    }
+    None
+}
+
+// Try to detect lines that start with an unknown/misspelled keyword and suggest known ones.
+fn detect_unknown_keyword(input: &str) -> Option<String> {
+    // Suggest only currently supported top-level keywords.
+    const SUGGEST: &[&str] = &["trace", "print", "if", "else", "let"];
+    // Valid statement starters that should not be flagged as unknown
+    const SUPPORTED_HEADS: &[&str] = &["trace", "print", "if", "else", "let", "backtrace", "bt"];
+    // Builtin call names allowed at expression head
+    const BUILTIN_CALLS: &[&str] = &["memcmp", "strncmp", "starts_with", "hex"];
+
+    // Helper: simple Levenshtein distance (small strings, few keywords)
+    fn levenshtein(a: &str, b: &str) -> usize {
+        let (n, m) = (a.len(), b.len());
+        let mut dp = vec![0usize; (n + 1) * (m + 1)];
+        let idx = |i: usize, j: usize| i * (m + 1) + j;
+        for i in 0..=n {
+            dp[idx(i, 0)] = i;
+        }
+        for j in 0..=m {
+            dp[idx(0, j)] = j;
+        }
+        let ac: Vec<char> = a.chars().collect();
+        let bc: Vec<char> = b.chars().collect();
+        for i in 1..=n {
+            for j in 1..=m {
+                let cost = if ac[i - 1] == bc[j - 1] { 0 } else { 1 };
+                let del = dp[idx(i - 1, j)] + 1;
+                let ins = dp[idx(i, j - 1)] + 1;
+                let sub = dp[idx(i - 1, j - 1)] + cost;
+                dp[idx(i, j)] = del.min(ins).min(sub);
+            }
+        }
+        dp[idx(n, m)]
+    }
+
+    // Helper: check a slice for a command-like unknown keyword
+    fn check_slice(slice: &str, line_no_1based: usize) -> Option<String> {
+        let s = slice.trim_start();
+        if s.is_empty() || s.starts_with("//") {
+            return None;
+        }
+        let mut token = String::new();
+        for ch in s.chars() {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                token.push(ch);
+            } else {
+                break;
+            }
+        }
+        if token.is_empty() {
+            return None;
+        }
+        if SUPPORTED_HEADS.iter().any(|k| *k == token) {
+            return None;
+        }
+        let rest_untrimmed = &s[token.len()..];
+        let rest = rest_untrimmed.trim_start();
+        if rest.starts_with('=') || rest.starts_with('[') || rest.starts_with('.') {
+            // likely an expression starting with identifier
+            return None;
+        }
+        // Allow builtin calls as expression statements
+        if BUILTIN_CALLS.iter().any(|k| *k == token) && rest.starts_with('(') {
+            return None;
+        }
+        if rest.starts_with('(')
+            || rest.starts_with('{')
+            || rest.starts_with('"')
+            || rest_untrimmed.starts_with(char::is_whitespace)
+        {
+            let mut suggestions: Vec<(&str, usize)> = SUGGEST
+                .iter()
+                .map(|&k| (k, levenshtein(&token, k)))
+                .collect();
+            suggestions.sort_by_key(|&(_, d)| d);
+            if let Some((cand, dist)) = suggestions.first().copied() {
+                if dist <= 2 {
+                    return Some(format!(
+                        "Unknown keyword '{token}' at line {line_no_1based}. Did you mean '{cand}'?"
+                    ));
+                }
+            }
+            return Some(format!(
+                "Unknown keyword '{token}' at line {}. Expected one of: {}",
+                line_no_1based,
+                SUGGEST.join(", ")
+            ));
+        }
+        None
+    }
+
+    for (i, raw_line) in input.lines().enumerate() {
+        let line = raw_line;
+        // Scan potential statement starts: at line start, and right after '{' ';' or '}' that are outside of strings
+        let mut quote_open = false;
+        let mut positions: Vec<usize> = vec![0]; // include start-of-line
+        for (idx, ch) in line.char_indices() {
+            if ch == '"' {
+                quote_open = !quote_open;
+            }
+            if !quote_open && (ch == '{' || ch == ';' || ch == '}') {
+                let next = idx + ch.len_utf8();
+                if next < line.len() {
+                    positions.push(next);
+                }
+            }
+        }
+        for &pos in &positions {
+            if let Some(msg) = check_slice(&line[pos..], i + 1) {
+                return Some(msg);
             }
         }
     }
@@ -2138,5 +2257,120 @@ trace foo {
 "#;
         let r = parse(s);
         assert!(r.is_ok(), "parse failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn parse_unknown_keyword_inside_trace_suggests_print() {
+        let s = r#"
+trace foo {
+    pront "hello";
+}
+"#;
+        let r = parse(s);
+        match r {
+            Err(ParseError::SyntaxError(msg)) => {
+                assert!(
+                    msg.contains("Unknown keyword 'pront'"),
+                    "unexpected msg: {msg}"
+                );
+                assert!(
+                    msg.contains("Did you mean 'print'"),
+                    "no suggestion in msg: {msg}"
+                );
+            }
+            other => panic!("expected friendly SyntaxError for unknown keyword, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unknown_keyword_same_line_after_brace_suggests_print() {
+        // Unknown keyword immediately after '{' on the same line
+        let s = r#"trace foo {pirnt \"sa\";}"#;
+        let r = parse(s);
+        match r {
+            Err(ParseError::SyntaxError(msg)) => {
+                assert!(
+                    msg.contains("Unknown keyword 'pirnt'"),
+                    "unexpected msg: {msg}"
+                );
+                assert!(
+                    msg.contains("Did you mean 'print'"),
+                    "no suggestion in msg: {msg}"
+                );
+            }
+            other => {
+                panic!("expected friendly SyntaxError for same-line unknown keyword, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn parse_unknown_top_level_keyword_suggests_trace() {
+        let s = r#"
+traec bar {
+    print "x";
+}
+"#;
+        let r = parse(s);
+        match r {
+            Err(ParseError::SyntaxError(msg)) => {
+                assert!(
+                    msg.contains("Unknown keyword 'traec'"),
+                    "unexpected msg: {msg}"
+                );
+                assert!(
+                    msg.contains("Did you mean 'trace'"),
+                    "no suggestion in msg: {msg}"
+                );
+            }
+            other => panic!("expected friendly SyntaxError for unknown keyword, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_builtin_then_misspelled_keyword_should_point_to_misspell() {
+        // Ensure builtin calls are not flagged; the real typo should be reported
+        let s = r#"
+trace foo {
+    starts_with("a", "b"); prnit "oops";
+}
+"#;
+        let r = parse(s);
+        match r {
+            Err(ParseError::SyntaxError(msg)) => {
+                assert!(
+                    msg.contains("prnit"),
+                    "should point to misspelled 'prnit': {msg}"
+                );
+                assert!(
+                    !msg.contains("starts_with"),
+                    "should not flag builtin call: {msg}"
+                );
+            }
+            other => panic!("expected friendly SyntaxError for misspelled print, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unknown_keyword_generic_expected_list() {
+        let s = r#"
+foobarbaz {
+    print "x";
+}
+"#;
+        let r = parse(s);
+        match r {
+            Err(ParseError::SyntaxError(msg)) => {
+                assert!(
+                    msg.contains("Unknown keyword 'foobarbaz'"),
+                    "unexpected msg: {msg}"
+                );
+                assert!(
+                    msg.contains("Expected one of"),
+                    "missing expected list in msg: {msg}"
+                );
+            }
+            other => panic!("expected friendly SyntaxError with expected list, got {other:?}"),
+        }
     }
 }

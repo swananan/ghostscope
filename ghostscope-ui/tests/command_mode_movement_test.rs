@@ -458,6 +458,7 @@ mod script_editor_cursor_tests {
             script_cache: Some(ScriptCache {
                 target: "test_function".to_string(),
                 original_command: "trace test_function".to_string(),
+                selected_index: None,
                 lines: vec![
                     "First line".to_string(),
                     "Second line here".to_string(),

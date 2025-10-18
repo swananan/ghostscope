@@ -32,6 +32,7 @@ pub struct AddTraceParams {
     pub target_pid: Option<u32>,
     pub loader: Option<GhostScopeLoader>,
     pub ebpf_function_name: String,
+    pub address_global_index: Option<usize>,
 }
 
 impl TraceManager {
@@ -80,6 +81,7 @@ impl TraceManager {
             target_pid: params.target_pid,
             loader: params.loader,
             ebpf_function_name: params.ebpf_function_name,
+            address_global_index: params.address_global_index,
         });
 
         self.traces.insert(params.trace_id, trace_instance);
@@ -191,6 +193,7 @@ impl TraceManager {
             is_enabled: trace.is_enabled,
             pc: trace.pc,
             ebpf_function_name: trace.ebpf_function_name.clone(),
+            address_global_index: trace.address_global_index,
         })
     }
 
@@ -284,11 +287,6 @@ impl TraceManager {
             }
             // No events received after draining ready traces, continue looping.
         }
-    }
-
-    /// Get all traces for save/export operations
-    pub fn get_all_traces(&self) -> Vec<&TraceInstance> {
-        self.traces.values().collect()
     }
 }
 

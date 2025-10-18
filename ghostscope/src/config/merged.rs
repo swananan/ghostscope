@@ -262,6 +262,7 @@ impl MergedConfig {
             mem_dump_cap: self.ebpf_config.mem_dump_cap,
             compare_cap: self.ebpf_config.compare_cap,
             max_trace_event_size: self.ebpf_config.max_trace_event_size,
+            selected_index: None,
         }
     }
 }

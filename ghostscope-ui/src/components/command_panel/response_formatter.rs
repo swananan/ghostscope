@@ -234,6 +234,15 @@ impl ResponseFormatter {
             format!("  Total: {total_count}, Success: {success_count}, Failed: {failed_count}")
         };
         lines.push(StyledLineBuilder::new().value(&summary).build());
+        lines.push(
+            StyledLineBuilder::new()
+                .text("  • ")
+                .styled(
+                    "Selected indices from the file are restored when present",
+                    StylePresets::TIP,
+                )
+                .build(),
+        );
 
         // Details
         if !details.is_empty() {

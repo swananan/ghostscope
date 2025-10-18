@@ -16,8 +16,8 @@ Commands for setting and managing trace points in your application.
 
 **Syntax:**
 ```
-trace <target>
-t <target>          # Short form
+trace <target> [index]
+t <target> [index]          # Short form
 ```
 
 **Parameters:**
@@ -36,8 +36,10 @@ t <target>          # Short form
 **Examples:**
 ```
 trace main                    # Trace main function
+trace main 2                  # Trace only the 2nd address of 'main' (see 'info function main')
 trace calculate_something     # Trace specific function
 trace /home/user/src/sample.c:42    # Full path
+trace /home/user/src/sample.c:42 1  # Trace only the 1st address for that line
 trace src/sample.c:42         # Relative path
 trace sample.c:42            # Filename only (fuzzy match)
 trace sample:42              # Partial filename (fuzzy match)
@@ -80,6 +82,26 @@ trace main          # Your previous script is restored!
 
 # 6. Edit and press Ctrl+S again
 ```
+
+#### Inline vs Call Annotations
+
+- When tracing, compilation results now annotate each target with its code origin:
+  - `inline`: The target address is inside an inlined function instance (DW_TAG_inlined_subroutine).
+  - `call`: The target address is in a non-inlined context (regular function body/entry).
+- The command panel shows these as: `— inline|call @ file:line` next to each address.
+- This helps distinguish whether your probe lands in an inlined body or a normal function location.
+
+#### Function vs Line Targets
+
+- Function target (`trace <function_name> { ... }`):
+  - Non-inline: selects the first executable instruction after the function prologue (prologue-skip).
+  - Inline: selects the inline instance start (low_pc semantics of the inline DIE); this is an entry-like point and may not align to a statement boundary. Use a line target if you need precise statement alignment.
+  - Multiple inline instances: if a function is inlined at multiple call sites, you’ll see one address per instance (plus one for the non-inline definition, if present).
+
+- Source line target (`trace <file:line> { ... }`):
+  - Resolves to the statement boundary on that line for each occurrence (one per inline instance across callers), i.e., statement-level semantics.
+  - Typically yields one address per instance where that source line is active.
+  - You can restrict to a single address with `trace <file:line> [index]`.
 
 ### enable - Enable Traces
 
@@ -152,6 +174,10 @@ s t [file]          # Short form
 - `[file]`: Optional filename (uses default if not provided)
 - `enabled`: Save only enabled traces
 - `disabled`: Save only disabled traces
+
+**Behavior:**
+- Saves each trace as a `trace <target> { ... }` block with metadata.
+- If a trace was created with `trace <target> [index]`, the selected address index is preserved in the save file and restored on load.
 
 **Examples:**
 ```
@@ -246,6 +272,10 @@ s <file>            # Short form (but not "s t")
 
 **Parameters:**
 - `<file>`: Script file to load
+
+**Behavior:**
+- Loads all `trace <target> { ... }` blocks in the file.
+- If a block includes an address index (saved from a prior session), only that indexed address is reattached for the target.
 
 **Examples:**
 ```
@@ -430,6 +460,13 @@ info address 0x401234      # Use default module (depends on -t/-p)
 info address libc.so.6:0x1234  # Suffix match shared library + address
 info address /usr/bin/nginx:0xdeadbeef v  # Full path + verbose
 ```
+
+#### Inline vs Call (Info Output)
+
+- For `info function`, `info line`, and `info address`, each address line includes:
+  - `— inline` if the PC falls in an inlined subroutine instance, otherwise `— call`.
+  - `@ file:line` with the resolved source location when available.
+- Same source line may appear multiple times (one per inline instance across different callers).
 
 ---
 

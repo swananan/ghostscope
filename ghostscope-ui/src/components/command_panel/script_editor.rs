@@ -28,9 +28,13 @@ pub struct ScriptEditor;
 impl ScriptEditor {
     /// Enter script editing mode for a trace command
     pub fn enter_script_mode(state: &mut CommandPanelState, command: &str) -> Vec<Action> {
-        let target = command.trim_start_matches("trace").trim();
+        let rest = command.trim_start_matches("trace").trim();
+        // Support optional index: trace <target> [index]
+        let mut parts = rest.split_whitespace();
+        let base_target = parts.next().unwrap_or("");
+        let index_opt = parts.next().and_then(|s| s.parse::<usize>().ok());
 
-        if target.is_empty() {
+        if base_target.is_empty() {
             let plain =
                 "Usage: trace <function_name|file:line|0xADDR|module_suffix:0xADDR>".to_string();
             let styled = vec![
@@ -51,7 +55,7 @@ impl ScriptEditor {
         // Check if we have a cached script for this target
         let (lines, cursor_line, cursor_col, restored_from_cache) =
             if let Some(ref cache) = state.script_cache {
-                if let Some(saved_script) = cache.saved_scripts.get(target) {
+                if let Some(saved_script) = cache.saved_scripts.get(base_target) {
                     let mut lines: Vec<String> =
                         saved_script.content.lines().map(String::from).collect();
                     // Ensure at least one line exists (empty string.lines() returns empty iterator)
@@ -73,8 +77,9 @@ impl ScriptEditor {
 
         // Create or update script cache
         state.script_cache = Some(ScriptCache {
-            target: target.to_string(),
+            target: base_target.to_string(),
             original_command: command.to_string(),
+            selected_index: index_opt,
             lines,
             cursor_line,
             cursor_col,
@@ -90,9 +95,15 @@ impl ScriptEditor {
         state.mode = InteractionMode::ScriptEditor;
 
         let message = if restored_from_cache {
-            format!("📝 Script editor opened for '{target}' (restored from cache)\nPress Ctrl+S to submit, ESC to cancel")
+            if let Some(idx) = index_opt {
+                format!("📝 Script editor opened for '{base_target}' (index {idx}, restored)\nPress Ctrl+S to submit, ESC to cancel")
+            } else {
+                format!("📝 Script editor opened for '{base_target}' (restored from cache)\nPress Ctrl+S to submit, ESC to cancel")
+            }
+        } else if let Some(idx) = index_opt {
+            format!("📝 Script editor opened for '{base_target}' (index {idx})\nPress Ctrl+S to submit, ESC to cancel")
         } else {
-            format!("📝 Script editor opened for '{target}'\nPress Ctrl+S to submit, ESC to cancel")
+            format!("📝 Script editor opened for '{base_target}'\nPress Ctrl+S to submit, ESC to cancel")
         };
 
         let styled = vec![
@@ -186,7 +197,11 @@ impl ScriptEditor {
 
             // Set waiting state for trace command
             state.input_state = crate::model::panel_state::InputState::WaitingResponse {
-                command: format!("trace {}", cache.target),
+                command: if let Some(idx) = cache.selected_index {
+                    format!("trace {} {}", cache.target, idx)
+                } else {
+                    format!("trace {}", cache.target)
+                },
                 sent_time: std::time::Instant::now(),
                 command_type: crate::model::panel_state::CommandType::Script,
             };
@@ -197,6 +212,7 @@ impl ScriptEditor {
             return vec![Action::SendRuntimeCommand(
                 crate::action::RuntimeCommand::ExecuteScript {
                     command: full_script,
+                    selected_index: cache.selected_index,
                 },
             )];
         }
@@ -749,16 +765,43 @@ impl ScriptEditor {
             match &exec_result.status {
                 crate::events::ExecutionStatus::Success => {
                     let trace_id = compilation_details.trace_ids.get(trace_idx).copied();
+                    // Build classification + source string if available
+                    let class_part = match exec_result.is_inline {
+                        Some(true) => "inline",
+                        Some(false) => "call",
+                        None => "",
+                    };
+                    let src_part = match (&exec_result.source_file, exec_result.source_line) {
+                        (Some(f), Some(l)) => format!(" @ {f}:{l}"),
+                        _ => String::new(),
+                    };
+
                     if let Some(tid) = trace_id {
-                        result.push(format!(
-                            "  • {} (0x{:x}) → trace_id: {}",
-                            exec_result.target_name, exec_result.pc_address, tid
-                        ));
+                        if class_part.is_empty() && src_part.is_empty() {
+                            result.push(format!(
+                                "  • {} (0x{:x}) → trace_id: {}",
+                                exec_result.target_name, exec_result.pc_address, tid
+                            ));
+                        } else {
+                            result.push(format!(
+                                "  • {} (0x{:x}) — {}{} → trace_id: {}",
+                                exec_result.target_name,
+                                exec_result.pc_address,
+                                class_part,
+                                src_part,
+                                tid
+                            ));
+                        }
                         trace_idx += 1;
-                    } else {
+                    } else if class_part.is_empty() && src_part.is_empty() {
                         result.push(format!(
                             "  • {} (0x{:x}) → trace attached",
                             exec_result.target_name, exec_result.pc_address
+                        ));
+                    } else {
+                        result.push(format!(
+                            "  • {} (0x{:x}) — {}{} → trace attached",
+                            exec_result.target_name, exec_result.pc_address, class_part, src_part
                         ));
                     }
                 }

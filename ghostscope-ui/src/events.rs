@@ -254,8 +254,19 @@ impl ModuleDebugInfo {
                 (false, false) => "│  ├─",
             };
 
-            // Enhanced PC address display
-            let pc_description = format!("🎯 0x{:x}", mapping.address);
+            // Enhanced PC address display with optional index + classification/source
+            let mut pc_description = if let Some(i) = mapping.index {
+                format!("[{}] 🎯 0x{:x}", i, mapping.address)
+            } else {
+                format!("🎯 0x{:x}", mapping.address)
+            };
+            if let Some(is_inline) = mapping.is_inline {
+                pc_description
+                    .push_str(&format!(" — {}", if is_inline { "inline" } else { "call" }));
+            }
+            if let (Some(ref file), Some(line)) = (&mapping.source_file, mapping.source_line) {
+                pc_description.push_str(&format!(" @ {file}:{line}"));
+            }
 
             result.push_str(&format!("{addr_prefix} {pc_description}\n"));
 
@@ -429,6 +440,10 @@ pub struct AddressMapping {
     pub function_name: Option<String>,
     pub variables: Vec<VariableDebugInfo>,
     pub parameters: Vec<VariableDebugInfo>,
+    pub source_file: Option<String>,
+    pub source_line: Option<u32>,
+    pub is_inline: Option<bool>,
+    pub index: Option<usize>, // 1-based global index for selection
 }
 
 impl AddressMapping {
@@ -450,13 +465,31 @@ impl AddressMapping {
             (false, false) => "│  ├─",
         };
 
-        lines.push(
-            StyledLineBuilder::new()
-                .styled(prefix, StylePresets::TREE)
-                .text(" 🎯 ")
-                .address(self.address)
-                .build(),
-        );
+        // Header line with index + address + optional classification and source location
+        let mut header = StyledLineBuilder::new().styled(prefix, StylePresets::TREE);
+        if let Some(i) = self.index {
+            header = header
+                .text(" ")
+                .styled(format!("[{i}]"), StylePresets::ADDRESS);
+        }
+        header = header.text(" 🎯 ").address(self.address);
+
+        if let Some(is_inline) = self.is_inline {
+            header = header
+                .text(" ")
+                .key("—")
+                .text(" ")
+                .styled(if is_inline { "inline" } else { "call" }, StylePresets::KEY);
+        }
+        if let (Some(ref file), Some(line)) = (&self.source_file, self.source_line) {
+            header = header
+                .text(" ")
+                .key("@")
+                .text(" ")
+                .value(format!("{file}:{line}"));
+        }
+
+        lines.push(header.build());
 
         if !self.parameters.is_empty() {
             let param_prefix = match (is_last_module, is_last_addr) {
@@ -588,6 +621,7 @@ pub struct VariableDebugInfo {
 pub enum RuntimeCommand {
     ExecuteScript {
         command: String,
+        selected_index: Option<usize>,
     },
     RequestSourceCode, // Request source code for current function/address
     DisableTrace(u32), // Disable specific trace by ID
@@ -645,6 +679,7 @@ pub struct TraceDefinition {
     pub target: String,
     pub script: String,
     pub enabled: bool,
+    pub selected_index: Option<usize>,
 }
 
 /// Result of loading a single trace
@@ -680,7 +715,9 @@ pub struct ScriptExecutionResult {
     pub target_name: String,
     pub binary_path: String, // Full path to the binary
     pub status: ExecutionStatus,
-    // TODO: Add source_file: Option<String> and source_line: Option<usize> for function traces
+    pub source_file: Option<String>,
+    pub source_line: Option<u32>,
+    pub is_inline: Option<bool>,
 }
 
 /// Detailed compilation result for a script with multiple targets
