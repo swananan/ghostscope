@@ -24,7 +24,7 @@ impl LineMappingTable {
 
     /// Create from entries, resolving file paths via ScopedFileIndexManager.
     /// This builds canonical path-based indices so basename lookups can take the fast path.
-    pub fn from_entries_with_scoped_manager(
+    pub(crate) fn from_entries_with_scoped_manager(
         mut entries: Vec<LineEntry>,
         scoped: &crate::data::ScopedFileIndexManager,
     ) -> Self {
@@ -73,7 +73,7 @@ impl LineMappingTable {
     }
 
     /// Find best matching line (closest address <= target address)
-    pub fn lookup_line(&self, address: u64) -> Option<&LineEntry> {
+    pub(crate) fn lookup_line(&self, address: u64) -> Option<&LineEntry> {
         // Use BTreeMap's range to find the largest address <= target address
         let result = self
             .address_to_line_map
@@ -98,7 +98,7 @@ impl LineMappingTable {
 
     /// Find all line entries at exact address (for handling overlapping instructions)
     /// Current map stores a single entry per address; use O(1) get to avoid O(N) scans.
-    pub fn lookup_all_lines_at_address(&self, address: u64) -> Vec<&LineEntry> {
+    pub(crate) fn lookup_all_lines_at_address(&self, address: u64) -> Vec<&LineEntry> {
         if let Some(entry) = self.address_to_line_map.get(&address) {
             tracing::debug!(
                 "LineMapping::lookup_all_lines_at_address: address=0x{:x} -> 1 entry (file='{}', line={}, cu='{}', is_stmt={})",
@@ -125,7 +125,7 @@ impl LineMappingTable {
     /// 3. Unique basename match (O(1))
     ///
     /// For consecutive addresses on the same line, returns only the first is_stmt address
-    pub fn lookup_addresses_by_path(&self, file_path: &str, line_number: u64) -> Vec<u64> {
+    pub(crate) fn lookup_addresses_by_path(&self, file_path: &str, line_number: u64) -> Vec<u64> {
         // Strategy 1: Try exact match first
         if let Some(addresses) = self
             .path_line_to_addresses
@@ -305,7 +305,7 @@ impl LineMappingTable {
 
         // 1. Try DWARF prologue_end flag first
         if let Some(addr) = self.find_prologue_end_from_dwarf(function_start) {
-            tracing::debug!(
+            tracing::info!(
                 "LineMappingTable: found prologue_end at 0x{:x} (offset +{})",
                 addr,
                 addr - function_start
@@ -315,7 +315,7 @@ impl LineMappingTable {
 
         // 2. Fall back to is_stmt=true search
         if let Some(addr) = self.find_next_stmt_address(function_start) {
-            tracing::debug!(
+            tracing::info!(
                 "LineMappingTable: using is_stmt=true address at 0x{:x} (offset +{})",
                 addr,
                 addr - function_start
@@ -324,7 +324,7 @@ impl LineMappingTable {
         }
 
         // 3. Cannot determine prologue end, return original address
-        tracing::debug!(
+        tracing::info!(
             "LineMappingTable: no prologue information found, using original address 0x{:x}",
             function_start
         );
@@ -379,8 +379,8 @@ impl LineMappingTable {
         best_address
     }
 
-    /// Find the next is_stmt=true address after the given function start address
     /// This is used for prologue detection following GDB's approach
+    /// Find the next is_stmt=true address after the given function start address
     fn find_next_stmt_address(&self, function_start: u64) -> Option<u64> {
         tracing::debug!(
             "LineMappingTable: searching for next is_stmt=true address after 0x{:x}",
@@ -397,6 +397,16 @@ impl LineMappingTable {
                     entry.file_path
                 );
                 return Some(address);
+            } else {
+                // Extra diagnostics to understand why we didn't pick nearer addresses
+                tracing::debug!(
+                    "LineMappingTable: skipping non-is_stmt at 0x{:x} (offset +{}, line {}, file {}, prologue_end={})",
+                    address,
+                    address.saturating_sub(function_start),
+                    entry.line,
+                    entry.file_path,
+                    entry.prologue_end
+                );
             }
         }
 
@@ -409,7 +419,7 @@ impl LineMappingTable {
 
     /// Get all line entries within an address range
     /// Returns an iterator over (address, line_entry) pairs in the specified range
-    pub fn get_entries_in_range(
+    pub(crate) fn get_entries_in_range(
         &self,
         start_addr: u64,
         end_addr: u64,
