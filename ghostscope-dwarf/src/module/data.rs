@@ -702,7 +702,7 @@ impl ModuleData {
         None
     }
 
-    /// Lookup function addresses by name with prologue skipping for real functions
+    /// Lookup function addresses by name
     pub(crate) fn lookup_function_addresses(&self, name: &str) -> Vec<u64> {
         tracing::debug!("ModuleData: looking up function '{}'", name);
 
@@ -711,41 +711,7 @@ impl ModuleData {
         let mut addresses = Vec::new();
 
         for entry in entries {
-            if entry.flags.is_inline {
-                let mut candidate_addresses: Vec<u64> = entry
-                    .address_ranges
-                    .iter()
-                    .map(|(start_addr, _)| *start_addr)
-                    .collect();
-
-                if let Some(entry_pc) = entry.entry_pc {
-                    candidate_addresses.push(entry_pc);
-                }
-
-                candidate_addresses.sort_unstable();
-                candidate_addresses.dedup();
-
-                for candidate in candidate_addresses {
-                    tracing::debug!(
-                        "ModuleData: function '{}' is inline at 0x{:x}, registering address",
-                        name,
-                        candidate
-                    );
-                    if !addresses.contains(&candidate) {
-                        addresses.push(candidate);
-                    }
-                }
-            } else {
-                for (start_addr, _end_addr) in &entry.address_ranges {
-                    let executable_addr =
-                        self.line_mapping.find_first_executable_address(*start_addr);
-                    tracing::debug!(
-                        "ModuleData: function '{}' is real function at 0x{:x}, first executable at 0x{:x} (offset +{})",
-                        name, start_addr, executable_addr, executable_addr - start_addr
-                    );
-                    addresses.push(executable_addr);
-                }
-            }
+            addresses.extend(self.compute_addresses_for_entry(entry));
         }
 
         tracing::debug!(
@@ -754,6 +720,8 @@ impl ModuleData {
             addresses.len(),
             addresses
         );
+        addresses.sort_unstable();
+        addresses.dedup();
         addresses
     }
 
@@ -1901,26 +1869,87 @@ impl ModuleData {
         (fn_full, fn_leaf, var_full, var_leaf)
     }
 
-    /// Compute addresses for a function entry (inline vs real function with prologue-skip)
+    /// Compute addresses for a function entry (deterministic ordering)
+    ///
+    /// Semantics
+    /// - Inline (DW_TAG_inlined_subroutine):
+    ///   Return exactly one address per inline DIE, using the inline instance
+    ///   "start" (low_pc) semantics. Implemented as the minimum of all range
+    ///   starts when ranges exist; otherwise fall back to entry_pc. Intentionally
+    ///   do not scan for is_stmt here to preserve entry-like behavior and keep
+    ///   entry-view locations available.
+    /// - Non-inline (DW_TAG_subprogram):
+    ///   For each range, return the first executable address after the prologue
+    ///   (prologue-skip). If any formal parameter uses DW_OP_entry_value, prefer
+    ///   the true entry (range start) to preserve entry context.
+    ///
+    /// Determinism
+    /// - A sorted copy of the DIE's ranges (ascending by start) is used for all
+    ///   computations to ensure stable behavior across compilers/toolchains.
     fn compute_addresses_for_entry(&self, entry: &crate::core::IndexEntry) -> Vec<u64> {
         let mut out = Vec::new();
         if entry.flags.is_inline {
-            let mut cand: Vec<u64> = entry.address_ranges.iter().map(|(s, _)| *s).collect();
-            if let Some(ep) = entry.entry_pc {
-                cand.push(ep);
+            // Debug: print ranges & entry_pc once per inline entry
+            let mut ranges = entry.address_ranges.clone();
+            ranges.sort_unstable_by_key(|(s, _)| *s);
+            if !ranges.is_empty() {
+                let parts: Vec<String> = ranges
+                    .iter()
+                    .map(|(s, e)| format!("(0x{s:x},0x{e:x})"))
+                    .collect();
+                let epc_dbg = entry
+                    .entry_pc
+                    .map(|v| format!("0x{v:x}"))
+                    .unwrap_or("None".to_string());
+                let rlen = ranges.len();
+                let rlist = parts.join(", ");
+                tracing::debug!(
+                    "Inline '{}' entry_pc={epc_dbg} ranges({rlen}): [{rlist}]",
+                    entry.name
+                );
+            } else {
+                let epc_dbg = entry
+                    .entry_pc
+                    .map(|v| format!("0x{v:x}"))
+                    .unwrap_or("None".to_string());
+                tracing::debug!("Inline '{}' has no ranges; entry_pc={epc_dbg}", entry.name);
             }
-            cand.sort_unstable();
-            cand.dedup();
-            out.extend(cand);
+
+            let low_pc = ranges.iter().map(|(s, _)| *s).min();
+            if let Some(addr) = low_pc.or(entry.entry_pc) {
+                tracing::debug!("Inline '{}' selected=0x{addr:x} (low_pc)", entry.name);
+                out.push(addr);
+            } else {
+                tracing::warn!(
+                    "Inline entry has no usable address (no ranges/entry_pc): unit_off={:?}, die_off={:?}",
+                    entry.unit_offset,
+                    entry.die_offset
+                );
+            }
         } else {
-            // If the function's formal parameters use DW_OP_entry_value, prefer true entry (no prologue skip)
+            // If function parameters use DW_OP_entry_value, prefer the true entry (no prologue skip)
             let prefer_entry = self.function_uses_entry_value(entry).unwrap_or(false);
-            for (start, _end) in &entry.address_ranges {
+            // Work on a sorted copy of ranges for deterministic behavior
+            let mut nranges = entry.address_ranges.clone();
+            nranges.sort_unstable_by_key(|(s, _)| *s);
+            for (start, _end) in &nranges {
                 let addr = if prefer_entry {
                     *start
                 } else {
                     self.line_mapping.find_first_executable_address(*start)
                 };
+                if prefer_entry {
+                    tracing::debug!(
+                        "Non-inline '{}' entry_value=true, using entry start=0x{start:x}",
+                        entry.name
+                    );
+                } else {
+                    let off = addr.saturating_sub(*start);
+                    tracing::debug!(
+                        "Non-inline '{}' start=0x{start:x} first_exec=0x{addr:x} (+0x{off:x})",
+                        entry.name
+                    );
+                }
                 out.push(addr);
             }
         }
