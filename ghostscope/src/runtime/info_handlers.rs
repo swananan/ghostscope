@@ -656,12 +656,20 @@ fn process_module_addresses_for_variables(
             let function_name: Option<String> =
                 process_analyzer.find_symbol_by_module_address(module_address);
 
+            // Source location for this address (per mapping)
+            let src_loc = process_analyzer.lookup_source_location(module_address);
+            // Inline classification
+            let is_inline = process_analyzer.is_inline_at(module_address);
+
             address_mappings.push(AddressMapping {
                 address: module_address.address,
                 binary_path: module_address.module_path.to_string_lossy().to_string(),
                 function_name,
                 variables,
                 parameters,
+                source_file: src_loc.as_ref().map(|sl| sl.file_path.clone()),
+                source_line: src_loc.as_ref().map(|sl| sl.line_number),
+                is_inline,
             });
         }
 

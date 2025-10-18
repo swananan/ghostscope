@@ -116,6 +116,9 @@ pub async fn compile_and_load_script_for_tui(
                     target_name: "compilation_failed".to_string(),
                     binary_path,
                     status: ExecutionStatus::Failed(format!("Compilation error: {friendly}")),
+                    source_file: None,
+                    source_line: None,
+                    is_inline: None,
                 }],
                 total_count: 1,
                 success_count: 0,
@@ -140,6 +143,22 @@ pub async fn compile_and_load_script_for_tui(
         let trace_id = config.assigned_trace_id; // Use the trace_id assigned by compiler
         trace_ids.push(trace_id);
 
+        // Compute source location and inline classification for this target
+        let (source_file, source_line, is_inline) = {
+            let addr = config.function_address.unwrap_or(0);
+            let module_address = ghostscope_dwarf::ModuleAddress::new(
+                std::path::PathBuf::from(&config.binary_path),
+                addr,
+            );
+            let src = process_analyzer.lookup_source_location(&module_address);
+            let inline = process_analyzer.is_inline_at(&module_address);
+            (
+                src.as_ref().map(|s| s.file_path.clone()),
+                src.as_ref().map(|s| s.line_number),
+                inline,
+            )
+        };
+
         results.push(ScriptExecutionResult {
             pc_address: config.function_address.unwrap_or(0),
             target_name: config
@@ -148,6 +167,9 @@ pub async fn compile_and_load_script_for_tui(
                 .unwrap_or_else(|| format!("{:#x}", config.function_address.unwrap_or(0))),
             binary_path: config.binary_path.clone(),
             status: ExecutionStatus::Success,
+            source_file,
+            source_line,
+            is_inline,
         });
         success_count += 1;
     }
@@ -159,6 +181,9 @@ pub async fn compile_and_load_script_for_tui(
             target_name: failed.target_name.clone(),
             binary_path: binary_path.clone(),
             status: ExecutionStatus::Failed(failed.error_message.clone()),
+            source_file: None,
+            source_line: None,
+            is_inline: None,
         });
         failed_count += 1;
     }

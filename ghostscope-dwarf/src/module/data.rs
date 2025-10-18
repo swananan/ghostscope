@@ -1162,6 +1162,47 @@ impl ModuleData {
         self.create_source_location_from_entry(best_entry)
     }
 
+    /// Lightweight classification: determine if the given address is inside an inline instance
+    pub(crate) fn is_inline_at(&mut self, address: u64) -> Option<bool> {
+        // Ensure block index has the containing function built (lazy build similar to variable lookup)
+        if self.block_index.find_function_by_pc(address).is_none() {
+            let builder = crate::data::BlockIndexBuilder::new(self.resolver.dwarf_ref());
+            // Prefer building only the containing subprogram if we can identify it via lightweight index
+            if let Some(func_entry) = self.lightweight_index.find_function_by_address(address) {
+                if let Some(fb) =
+                    builder.build_for_function(func_entry.unit_offset, func_entry.die_offset)
+                {
+                    self.block_index.add_functions(vec![fb]);
+                }
+            } else if let Some(cu_off) = self.lightweight_index.find_cu_by_address(address) {
+                if let Some(funcs) = builder.build_for_unit(cu_off) {
+                    self.block_index.add_functions(funcs);
+                }
+            }
+        }
+
+        let func = self.block_index.find_function_by_pc(address)?;
+
+        // Find the innermost inline-capable node containing this PC
+        if let Some(inline_idx) = Self::find_innermost_inline_node(func, address) {
+            // Verify the DIE tag is actually an inlined_subroutine
+            let dwarf = self.resolver.dwarf_ref();
+            if let Ok(header) = dwarf.debug_info.header_from_offset(func.cu_offset) {
+                if let Ok(unit) = dwarf.unit(header) {
+                    if let Some(off) = func.nodes[inline_idx].die_offset {
+                        if let Ok(entry) = unit.entry(off) {
+                            return Some(
+                                entry.tag() == gimli::constants::DW_TAG_inlined_subroutine,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        Some(false)
+    }
+
     /// Find alternative source file when current entry points to header file
     fn find_alternative_source_file<'a>(
         &'a self,
