@@ -165,12 +165,35 @@ fn detect_unknown_keyword(input: &str) -> Option<String> {
 
     // Helper: check a slice for a command-like unknown keyword
     fn check_slice(slice: &str, line_no_1based: usize) -> Option<String> {
-        let s = slice.trim_start();
+        let mut s = slice.trim_start();
         if s.is_empty() || s.starts_with("//") {
             return None;
         }
+
+        // If this slice begins with an if/else-if header, jump inside the condition
+        if let Some(rest) = s.strip_prefix("if") {
+            if rest.starts_with(char::is_whitespace) {
+                s = rest.trim_start();
+            }
+        } else if let Some(rest) = s.strip_prefix("else") {
+            let rest = rest.trim_start();
+            if let Some(rest2) = rest.strip_prefix("if") {
+                if rest2.starts_with(char::is_whitespace) {
+                    s = rest2.trim_start();
+                }
+            } else {
+                // 'else { ... }' — nothing to inspect here
+            }
+        }
+        // Keywords must start with a letter or underscore; skip numeric heads
+        let mut iter = s.chars();
+        let first = iter.next()?;
+        if !(first.is_ascii_alphabetic() || first == '_') {
+            return None;
+        }
         let mut token = String::new();
-        for ch in s.chars() {
+        token.push(first);
+        for ch in iter {
             if ch.is_ascii_alphanumeric() || ch == '_' {
                 token.push(ch);
             } else {
@@ -198,7 +221,16 @@ fn detect_unknown_keyword(input: &str) -> Option<String> {
             || rest.starts_with('"')
             || rest_untrimmed.starts_with(char::is_whitespace)
         {
-            let mut suggestions: Vec<(&str, usize)> = SUGGEST
+            // If it looks like a call (token + '('), include builtin calls in suggestion candidates
+            let candidates: Vec<&str> = if rest.starts_with('(') {
+                let mut v = Vec::new();
+                v.extend_from_slice(SUGGEST);
+                v.extend_from_slice(BUILTIN_CALLS);
+                v
+            } else {
+                SUGGEST.to_vec()
+            };
+            let mut suggestions: Vec<(&str, usize)> = candidates
                 .iter()
                 .map(|&k| (k, levenshtein(&token, k)))
                 .collect();
@@ -221,14 +253,14 @@ fn detect_unknown_keyword(input: &str) -> Option<String> {
 
     for (i, raw_line) in input.lines().enumerate() {
         let line = raw_line;
-        // Scan potential statement starts: at line start, and right after '{' ';' or '}' that are outside of strings
+        // Scan potential statement starts: at line start, and right after '{', ';', '}', '(', ',' (outside strings)
         let mut quote_open = false;
         let mut positions: Vec<usize> = vec![0]; // include start-of-line
         for (idx, ch) in line.char_indices() {
             if ch == '"' {
                 quote_open = !quote_open;
             }
-            if !quote_open && (ch == '{' || ch == ';' || ch == '}') {
+            if !quote_open && (ch == '{' || ch == ';' || ch == '}' || ch == '(' || ch == ',') {
                 let next = idx + ch.len_utf8();
                 if next < line.len() {
                     positions.push(next);
@@ -2351,6 +2383,74 @@ trace foo {
         }
     }
 
+    #[test]
+    fn parse_misspelled_builtin_suggests_starts_with() {
+        // Misspelled builtin should suggest the correct builtin name
+        let s = r#"
+trace foo {
+    starst_with("a", "b");
+}
+"#;
+        let r = parse(s);
+        match r {
+            Err(ParseError::SyntaxError(msg)) => {
+                assert!(msg.contains("Unknown keyword 'starst_with'"), "{msg}");
+                assert!(msg.contains("Did you mean 'starts_with'"), "{msg}");
+            }
+            other => panic!("expected friendly suggestion for misspelled builtin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_misspelled_builtin_suggests_memcmp() {
+        let s = r#"
+trace foo {
+    memcpm(&buf[0], &buf[1], 16);
+}
+"#;
+        let r = parse(s);
+        match r {
+            Err(ParseError::SyntaxError(msg)) => {
+                assert!(msg.contains("Unknown keyword 'memcpm'"), "{msg}");
+                assert!(msg.contains("Did you mean 'memcmp'"), "{msg}");
+            }
+            other => panic!("expected friendly suggestion for misspelled builtin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_if_condition_misspelled_builtin_suggests() {
+        let s = r#"
+trace foo {
+    if starst_with("a", "b") { print "ok"; }
+}
+"#;
+        let r = parse(s);
+        match r {
+            Err(ParseError::SyntaxError(msg)) => {
+                assert!(msg.contains("Unknown keyword 'starst_with'"), "{msg}");
+                assert!(msg.contains("Did you mean 'starts_with'"), "{msg}");
+            }
+            other => panic!("expected friendly suggestion inside if(), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_else_if_condition_misspelled_builtin_suggests() {
+        let s = r#"
+trace foo {
+    if 1 { print "a"; } else if starst_with("a", "b") { print "b"; }
+}
+"#;
+        let r = parse(s);
+        match r {
+            Err(ParseError::SyntaxError(msg)) => {
+                assert!(msg.contains("Unknown keyword 'starst_with'"), "{msg}");
+                assert!(msg.contains("Did you mean 'starts_with'"), "{msg}");
+            }
+            other => panic!("expected friendly suggestion inside else if(), got {other:?}"),
+        }
+    }
     #[test]
     fn parse_unknown_keyword_generic_expected_list() {
         let s = r#"
