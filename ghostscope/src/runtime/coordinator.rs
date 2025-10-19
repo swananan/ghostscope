@@ -39,6 +39,8 @@ pub async fn run_tui_coordinator_with_config(config: MergedConfig) -> Result<()>
         has_explicit_console_log_flag: false, // Not relevant for TUI conversion
         force_perf_event_array: config.ebpf_config.force_perf_event_array,
         allow_loose_debug_match: config.dwarf_allow_loose_debug_match,
+        source_panel: false,
+        no_source_panel: false,
     };
 
     run_tui_coordinator_with_ui_config_and_merged_config(parsed_args, ui_config, config_for_session)

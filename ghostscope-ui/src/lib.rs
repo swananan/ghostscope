@@ -19,6 +19,8 @@ pub async fn run_tui_mode(event_registry: EventRegistry, layout_mode: LayoutMode
     let ui_config = UiConfig {
         layout_mode,
         panel_ratios: [4, 3, 3], // Default ratios for backward compatibility
+        show_source_panel: true,
+        two_panel_ratios: [3, 3],
         default_focus: crate::action::PanelType::InteractiveCommand,
         history: HistoryConfig::default(),
         ebpf_max_messages: 2000, // Default

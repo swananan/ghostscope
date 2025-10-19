@@ -128,6 +128,14 @@ pub struct Args {
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub force_perf_event_array: bool,
 
+    /// Show the source panel explicitly (overrides config)
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub source_panel: bool,
+
+    /// Hide the source panel (overrides config)
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub no_source_panel: bool,
+
     /// Remaining arguments (when using --args)
     pub remaining: Vec<String>,
 }
@@ -155,6 +163,8 @@ pub struct ParsedArgs {
     pub layout_mode: LayoutMode,
     pub force_perf_event_array: bool,
     pub allow_loose_debug_match: bool,
+    pub source_panel: bool,
+    pub no_source_panel: bool,
 }
 
 impl Args {
@@ -216,6 +226,8 @@ impl Args {
                 layout_mode: parsed.layout,
                 force_perf_event_array: parsed.force_perf_event_array,
                 allow_loose_debug_match: parsed.allow_loose_debug_match,
+                source_panel: parsed.source_panel,
+                no_source_panel: parsed.no_source_panel,
             }
         } else {
             // Normal parsing without --args
@@ -256,6 +268,8 @@ impl Args {
                 layout_mode: parsed.layout,
                 force_perf_event_array: parsed.force_perf_event_array,
                 allow_loose_debug_match: parsed.allow_loose_debug_match,
+                source_panel: parsed.source_panel,
+                no_source_panel: parsed.no_source_panel,
             }
         }
     }
