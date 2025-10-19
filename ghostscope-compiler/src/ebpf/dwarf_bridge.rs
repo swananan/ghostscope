@@ -54,8 +54,9 @@ impl<'ctx> EbpfContext<'ctx> {
         if let Some(analyzer_ptr) = self.process_analyzer {
             let analyzer = unsafe { &mut *analyzer_ptr };
             if let Ok(offsets) = analyzer.compute_section_offsets() {
-                if let Some((_, cookie, _)) =
-                    offsets.iter().find(|(p, _, _)| p.to_string_lossy() == module_path)
+                if let Some((_, cookie, _)) = offsets
+                    .iter()
+                    .find(|(p, _, _)| p.to_string_lossy() == module_path)
                 {
                     return *cookie;
                 }
@@ -161,8 +162,8 @@ impl<'ctx> EbpfContext<'ctx> {
                 let st_code = self.section_code_for_address(&module_for_offsets, *addr);
                 let cookie = self.cookie_for_module_or_fallback(&module_for_offsets);
                 let link_val = self.context.i64_type().const_int(*addr, false);
-                let (rt_addr, found_flag) = self
-                    .generate_runtime_address_from_offsets(link_val, st_code, cookie)?;
+                let (rt_addr, found_flag) =
+                    self.generate_runtime_address_from_offsets(link_val, st_code, cookie)?;
                 if let Some(sp) = status_ptr {
                     let is_miss = self
                         .builder
@@ -196,7 +197,10 @@ impl<'ctx> EbpfContext<'ctx> {
                             should_store,
                             self.context
                                 .i8_type()
-                                .const_int(ghostscope_protocol::VariableStatus::OffsetsUnavailable as u64, false)
+                                .const_int(
+                                    ghostscope_protocol::VariableStatus::OffsetsUnavailable as u64,
+                                    false,
+                                )
                                 .into(),
                             cur_status,
                             "new_status",
@@ -273,8 +277,8 @@ impl<'ctx> EbpfContext<'ctx> {
                     let st_code = self.section_code_for_address(&module_for_offsets, link_addr_u);
                     let cookie = self.cookie_for_module_or_fallback(&module_for_offsets);
                     let link_val = self.context.i64_type().const_int(link_addr_u, false);
-                    let (rt_addr, found_flag) = self
-                        .generate_runtime_address_from_offsets(link_val, st_code, cookie)?;
+                    let (rt_addr, found_flag) =
+                        self.generate_runtime_address_from_offsets(link_val, st_code, cookie)?;
                     if let Some(sp) = status_ptr {
                         let is_miss = self
                             .builder
@@ -308,7 +312,11 @@ impl<'ctx> EbpfContext<'ctx> {
                                 should_store,
                                 self.context
                                     .i8_type()
-                                    .const_int(ghostscope_protocol::VariableStatus::OffsetsUnavailable as u64, false)
+                                    .const_int(
+                                        ghostscope_protocol::VariableStatus::OffsetsUnavailable
+                                            as u64,
+                                        false,
+                                    )
                                     .into(),
                                 cur_status,
                                 "new_status",
@@ -348,11 +356,12 @@ impl<'ctx> EbpfContext<'ctx> {
                             .map(|s| s.to_string())
                             .or_else(|| self.current_resolved_var_module_path.clone())
                             .unwrap_or_else(|| ctx.module_path.clone());
-                        let st_code = self.section_code_for_address(&module_for_offsets, link_addr_u);
+                        let st_code =
+                            self.section_code_for_address(&module_for_offsets, link_addr_u);
                         let cookie = self.cookie_for_module_or_fallback(&module_for_offsets);
                         let link_val = self.context.i64_type().const_int(link_addr_u, false);
-                        let (rt, found_flag) = self
-                            .generate_runtime_address_from_offsets(link_val, st_code, cookie)?;
+                        let (rt, found_flag) =
+                            self.generate_runtime_address_from_offsets(link_val, st_code, cookie)?;
                         if let Some(sp) = status_ptr {
                             let is_miss = self
                                 .builder
@@ -386,7 +395,11 @@ impl<'ctx> EbpfContext<'ctx> {
                                     should_store,
                                     self.context
                                         .i8_type()
-                                        .const_int(ghostscope_protocol::VariableStatus::OffsetsUnavailable as u64, false)
+                                        .const_int(
+                                            ghostscope_protocol::VariableStatus::OffsetsUnavailable
+                                                as u64,
+                                            false,
+                                        )
                                         .into(),
                                     cur_status,
                                     "new_status",

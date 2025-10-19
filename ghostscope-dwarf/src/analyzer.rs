@@ -1040,19 +1040,48 @@ impl DwarfAnalyzer {
                 }
             }
 
-            // Compute module cookie from first candidate mapping (dev:ino)
-            let cookie = if let Some(m) = candidates.first() {
-                // device is like "08:01" (hex); split and parse
-                let mut maj: u64 = 0;
-                let mut min: u64 = 0;
-                if let Some((mj, mn)) = m.device.split_once(':') {
-                    maj = u64::from_str_radix(mj, 16).unwrap_or(0);
-                    min = u64::from_str_radix(mn, 16).unwrap_or(0);
+            // Compute module cookie (unified policy for -t/-p):
+            // 1) Prefer Build-ID when available
+            // 2) Else filesystem dev:ino
+            // 3) Else stable hash of absolute path
+            let cookie: u64 = {
+                // 1) Build-ID
+                if let Ok(Some(build_id)) = obj.build_id() {
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = DefaultHasher::new();
+                    build_id.hash(&mut hasher);
+                    hasher.finish()
+                } else {
+                    // 2) Filesystem dev:ino
+                    #[cfg(target_os = "linux")]
+                    {
+                        use std::os::unix::fs::MetadataExt;
+                        if let Ok(meta) = std::fs::metadata(module_path) {
+                            let dev = meta.dev();
+                            let ino = meta.ino();
+                            ((dev & 0xffff_ffff) << 32) | (ino & 0xffff_ffff)
+                        } else {
+                            // 3) Stable hash of path
+                            use std::collections::hash_map::DefaultHasher;
+                            use std::hash::{Hash, Hasher};
+                            let mut hasher = DefaultHasher::new();
+                            let path_str = module_path.to_string_lossy();
+                            path_str.hash(&mut hasher);
+                            hasher.finish()
+                        }
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        // Non-Linux: directly hash the path
+                        use std::collections::hash_map::DefaultHasher;
+                        use std::hash::{Hash, Hasher};
+                        let mut hasher = DefaultHasher::new();
+                        let path_str = module_path.to_string_lossy();
+                        path_str.hash(&mut hasher);
+                        hasher.finish()
+                    }
                 }
-                // Low-risk packing: major[16]@48, minor[16]@32, inode_low[32]@0
-                ((maj & 0xffffu64) << 48) | ((min & 0xffffu64) << 32) | (m.inode & 0xffff_ffffu64)
-            } else {
-                0
             };
 
             results.push((module_path.clone(), cookie, offsets));

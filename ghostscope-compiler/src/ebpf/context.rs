@@ -351,9 +351,11 @@ impl<'ctx> EbpfContext<'ctx> {
                 "proc_module_offsets",
                 self.compile_options.proc_module_offsets_max_entries,
             )
-            .map_err(|e| CodeGenError::LLVMError(format!(
-                "Failed to create proc_module_offsets map in test: {e}"
-            )))
+            .map_err(|e| {
+                CodeGenError::LLVMError(format!(
+                    "Failed to create proc_module_offsets map in test: {e}"
+                ))
+            })
     }
 
     /// Test helper: allocate per-invocation pm_key on the entry block like create_main_function
