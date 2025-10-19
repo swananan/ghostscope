@@ -753,6 +753,7 @@ dependencies = [
  "aya-obj",
  "bytes",
  "ghostscope-compiler",
+ "ghostscope-process",
  "ghostscope-protocol",
  "thiserror 2.0.12",
  "tokio",
@@ -773,6 +774,9 @@ name = "ghostscope-process"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "aya",
+ "aya-obj",
+ "libc",
  "object 0.36.7",
  "tracing",
 ]

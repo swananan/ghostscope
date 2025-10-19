@@ -26,6 +26,19 @@ async fn create_and_attach_loader(
         config.assigned_trace_id
     );
 
+    // Ensure the per-process pinned proc_module_offsets map exists before creating the loader
+    let max_entries = session
+        .config
+        .as_ref()
+        .map(|c| c.ebpf_config.proc_module_offsets_max_entries as u32)
+        .unwrap_or(4096);
+    if let Err(e) = ghostscope_process::maps::ensure_pinned_proc_offsets_exists(max_entries) {
+        warn!(
+            "Failed to ensure pinned proc_module_offsets map exists ({} entries): {}",
+            max_entries, e
+        );
+    }
+
     let mut loader = GhostScopeLoader::new(&config.ebpf_bytecode)
         .context("Failed to create eBPF loader for uprobe config")?;
 
@@ -48,12 +61,12 @@ async fn create_and_attach_loader(
             prefilled,
             config.binary_path
         );
-        // Apply cached offsets for this module to the loader
+        // Apply cached offsets for this module to the loader's map
         let entries = session
             .coordinator
             .cached_offsets_for_module(&config.binary_path);
         if !entries.is_empty() {
-            use ghostscope_loader::ProcModuleOffsetsValue;
+            use ghostscope_process::maps::ProcModuleOffsetsValue;
             // Group by pid for efficient batch insert
             use std::collections::HashMap;
             let mut by_pid: HashMap<u32, Vec<(u64, ProcModuleOffsetsValue)>> = HashMap::new();
@@ -65,18 +78,19 @@ async fn create_and_attach_loader(
             }
             let mut total = 0usize;
             for (pid, items) in by_pid {
-                if let Err(e) = loader.populate_proc_module_offsets(pid, &items) {
+                if let Err(e) = ghostscope_process::maps::insert_offsets_for_pid(pid, &items) {
                     tracing::warn!(
-                        "Failed to populate proc_module_offsets for PID {}: {}",
+                        "Failed to write offsets to pinned map for PID {}: {}",
                         pid,
                         e
                     );
                 } else {
                     total += items.len();
                 }
+                // Loader no longer manages offsets map; only pinned map is authoritative
             }
             tracing::info!(
-                "Applied {} cached offset entries to loader for module {}",
+                "Applied {} cached offset entries to pinned map for module {}",
                 total,
                 config.binary_path
             );
@@ -282,11 +296,11 @@ pub async fn compile_and_load_script_for_tui(
 
             // Create individual loader for this config
             match create_and_attach_loader(config, session.target_pid, session).await {
-                Ok(mut loader) => {
+                Ok(loader) => {
                     // Apply cached offsets for this PID to the loader (if available)
                     if let Some(pid) = session.target_pid {
                         if let Some(items) = session.coordinator.cached_offsets_pairs_for_pid(pid) {
-                            use ghostscope_loader::ProcModuleOffsetsValue;
+                            use ghostscope_process::maps::ProcModuleOffsetsValue;
                             let adapted: Vec<(u64, ProcModuleOffsetsValue)> = items
                                 .iter()
                                 .map(|(cookie, off)| {
@@ -298,14 +312,16 @@ pub async fn compile_and_load_script_for_tui(
                                     )
                                 })
                                 .collect();
-                            if let Err(e) = loader.populate_proc_module_offsets(pid, &adapted) {
+                            if let Err(e) =
+                                ghostscope_process::maps::insert_offsets_for_pid(pid, &adapted)
+                            {
                                 warn!(
-                                    "Failed to populate proc_module_offsets for PID {}: {}",
+                                    "Failed to write cached offsets to pinned map for PID {}: {}",
                                     pid, e
                                 );
                             } else {
                                 info!(
-                                    "✓ Applied {} cached offsets to loader for PID {}",
+                                    "✓ Applied {} cached offsets to pinned map for PID {}",
                                     adapted.len(),
                                     pid
                                 );
@@ -549,11 +565,11 @@ pub async fn compile_and_load_script_for_cli(
 
         // Create individual loader for this config
         match create_and_attach_loader(config, session.target_pid, session).await {
-            Ok(mut loader) => {
+            Ok(loader) => {
                 // Apply cached offsets for this PID to the loader (if available)
                 if let Some(pid) = session.target_pid {
                     if let Some(items) = session.coordinator.cached_offsets_pairs_for_pid(pid) {
-                        use ghostscope_loader::ProcModuleOffsetsValue;
+                        use ghostscope_process::maps::ProcModuleOffsetsValue;
                         let adapted: Vec<(u64, ProcModuleOffsetsValue)> = items
                             .iter()
                             .map(|(cookie, off)| {
@@ -565,18 +581,21 @@ pub async fn compile_and_load_script_for_cli(
                                 )
                             })
                             .collect();
-                        if let Err(e) = loader.populate_proc_module_offsets(pid, &adapted) {
+                        if let Err(e) =
+                            ghostscope_process::maps::insert_offsets_for_pid(pid, &adapted)
+                        {
                             warn!(
-                                "Failed to populate proc_module_offsets for PID {}: {}",
+                                "Failed to write cached offsets to pinned map for PID {}: {}",
                                 pid, e
                             );
                         } else {
                             info!(
-                                "✓ Applied {} cached offsets to loader for PID {}",
+                                "✓ Applied {} cached offsets to pinned map for PID {}",
                                 adapted.len(),
                                 pid
                             );
                         }
+                        // Loader no longer manages offsets map; only pinned map is authoritative
                     }
                 }
 

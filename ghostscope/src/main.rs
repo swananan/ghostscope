@@ -16,6 +16,12 @@ use std::io::{self, Write};
 
 // Use external tracing crate (not the local tracing module)
 use ::tracing::{info, warn};
+use libc as c;
+
+extern "C" fn cleanup_pinned_maps_on_exit() {
+    // Best effort: ignore errors
+    let _ = ghostscope_process::maps::cleanup_pinned_proc_offsets();
+}
 
 fn setup_panic_hook() {
     // Use existing RUST_BACKTRACE setting from environment
@@ -75,6 +81,10 @@ async fn main() -> Result<()> {
     // Setup panic hook before doing anything else
     setup_panic_hook();
 
+    // Pre-clean any stale per-process pinned offsets map from a previous crashed session.
+    // This prevents PID reuse collisions leaving an old map affecting the new instance.
+    let _ = ghostscope_process::maps::cleanup_pinned_proc_offsets();
+
     // Parse command line arguments
     let parsed_args = config::Args::parse_args();
 
@@ -105,6 +115,11 @@ async fn main() -> Result<()> {
     ) {
         eprintln!("Failed to initialize logging: {e}");
         return Err(anyhow::anyhow!("Failed to initialize logging: {}", e));
+    }
+
+    // Register atexit cleanup for pinned maps (per-process path)
+    unsafe {
+        c::atexit(cleanup_pinned_maps_on_exit);
     }
 
     // Log which configuration file was loaded (after logging is initialized)

@@ -7,3 +7,6 @@ edition = "2021"
 anyhow = { workspace = true }
 tracing = { workspace = true }
 object = { workspace = true }
+aya = { workspace = true }
+aya-obj = { workspace = true }
+libc = "0.2"

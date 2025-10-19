@@ -75,6 +75,8 @@ trace globals_program.c:32 {
     if memcmp(gm, hex("48656c6c6f2c20"), 7) { print "HEX_OK"; }
     if memcmp(lm, hex("4c49425f"), 4) { print "HEX_LM"; }
 }
+
+// -t tests moved to a dedicated module to avoid interference with existing cases
 "#;
 
     let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;

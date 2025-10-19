@@ -387,7 +387,7 @@ impl<'ctx> MapManager<'ctx> {
                 let key_size_ptr = mk_ptr_to_array("key_size", key_size_val);
                 let value_size_ptr = mk_ptr_to_array("value_size", value_size_val);
                 let max_entries_ptr = mk_ptr_to_array("max_entries", max_entries as i64);
-                vec![
+                let mut v = vec![
                     di_builder.create_member_type(
                         scope,
                         "type",
@@ -432,7 +432,24 @@ impl<'ctx> MapManager<'ctx> {
                         0,
                         max_entries_ptr.as_type(),
                     ),
-                ]
+                ];
+                // For proc_module_offsets, include optional 'pinning' to signal Aya ByName pinning
+                if map_name == "proc_module_offsets" {
+                    // ByName is typically encoded as 1 in aya_obj::maps::PinningType
+                    let pinning_ptr = mk_ptr_to_array("pinning", 1);
+                    v.push(di_builder.create_member_type(
+                        scope,
+                        "pinning",
+                        file,
+                        0,
+                        64,
+                        64,
+                        256,
+                        0,
+                        pinning_ptr.as_type(),
+                    ));
+                }
+                v
             }
         };
 
@@ -442,7 +459,13 @@ impl<'ctx> MapManager<'ctx> {
         // Total structure size: pointers (64-bit) per field
         let (total_size_bits, field_count) = match map_type {
             BpfMapType::Ringbuf => (128, 2), // 2 * 64 bits
-            _ => (256, 4),                   // 4 * 64 bits
+            _ => {
+                if map_name == "proc_module_offsets" {
+                    (320, 5) // include 'pinning'
+                } else {
+                    (256, 4)
+                }
+            }
         };
 
         // Create the map structure type (anonymous like reference)

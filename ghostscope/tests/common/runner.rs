@@ -23,6 +23,7 @@ pub struct GhostscopeRunner {
     timeout_secs: u64,
     force_perf_event_array: bool,
     enable_console_log: bool,
+    log_level: Option<String>,
 }
 
 impl Default for GhostscopeRunner {
@@ -34,6 +35,7 @@ impl Default for GhostscopeRunner {
             timeout_secs: 3,
             force_perf_event_array: false,
             enable_console_log: false,
+            log_level: None,
         }
     }
 }
@@ -48,6 +50,7 @@ impl GhostscopeRunner {
         self
     }
 
+    #[allow(dead_code)]
     pub fn with_pid(mut self, pid: u32) -> Self {
         self.pid = Some(pid);
         self
@@ -70,6 +73,12 @@ impl GhostscopeRunner {
 
     pub fn enable_console_log(mut self, yes: bool) -> Self {
         self.enable_console_log = yes;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn with_log_level<S: Into<String>>(mut self, level: S) -> Self {
+        self.log_level = Some(level.into());
         self
     }
 
@@ -119,6 +128,11 @@ impl GhostscopeRunner {
             args.push(OsString::from("--log-console"));
         } else {
             args.push(OsString::from("--no-log"));
+        }
+
+        if let Some(level) = &self.log_level {
+            args.push(OsString::from("--log-level"));
+            args.push(OsString::from(level.clone()));
         }
 
         if self.force_perf_event_array {
