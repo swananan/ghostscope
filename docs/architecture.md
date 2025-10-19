@@ -62,6 +62,7 @@ GhostScope uses Cargo workspace for modular design:
 | **ghostscope-ui** | Terminal user interface - implements interactive TUI with TEA (The Elm Architecture) pattern |
 | **ghostscope-protocol** | Communication protocol - defines message format for eBPF-userspace data exchange |
 | **ghostscope-platform** | Platform abstraction - encapsulates architecture-specific code (calling conventions, ABIs) |
+| **ghostscope-process** | Runtime process introspection and offsets — single source of truth for module cookies and ASLR section offsets in both `-p` and `-t` modes; provides PID/module enumeration and cached offsets for loaders/compilers |
 
 ## Core Architecture Components
 

@@ -9,6 +9,7 @@ ghostscope-loader = { path = "../ghostscope-loader" }
 ghostscope-ui = { path = "../ghostscope-ui" }
 ghostscope-dwarf = { path = "../ghostscope-dwarf" }
 ghostscope-protocol = { path = "../ghostscope-protocol" }
+ghostscope-process = { path = "../ghostscope-process" }
 dirs = "5.0"
 libc = "0.2"
 clap = { version = "4.0", features = ["derive"] }

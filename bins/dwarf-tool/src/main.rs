@@ -1112,7 +1112,7 @@ struct ModuleOffsetsJsonItem {
 }
 
 async fn analyze_offsets(
-    analyzer: &mut DwarfAnalyzer,
+    _analyzer: &mut DwarfAnalyzer,
     pid: Option<u32>,
     options: &Commands,
 ) -> Result<()> {
@@ -1125,32 +1125,36 @@ async fn analyze_offsets(
         ));
     }
 
-    let results = analyzer.compute_section_offsets()?;
+    let mut coord = ghostscope_process::ProcessManager::new();
+    coord.ensure_prefill_pid(pid.unwrap())?;
+    let entries = coord
+        .cached_offsets_with_paths_for_pid(pid.unwrap())
+        .unwrap_or(&[]);
 
     if options.json() {
-        let json_items: Vec<ModuleOffsetsJsonItem> = results
+        let json_items: Vec<ModuleOffsetsJsonItem> = entries
             .iter()
-            .map(|(module, cookie, off)| ModuleOffsetsJsonItem {
-                module: module.display().to_string(),
-                cookie: format!("0x{cookie:x}"),
-                text: format!("0x{:x}", off.text),
-                rodata: format!("0x{:x}", off.rodata),
-                data: format!("0x{:x}", off.data),
-                bss: format!("0x{:x}", off.bss),
+            .map(|e| ModuleOffsetsJsonItem {
+                module: e.module_path.clone(),
+                cookie: format!("0x{:x}", e.cookie),
+                text: format!("0x{:x}", e.offsets.text),
+                rodata: format!("0x{:x}", e.offsets.rodata),
+                data: format!("0x{:x}", e.offsets.data),
+                bss: format!("0x{:x}", e.offsets.bss),
             })
             .collect();
         println!("{}", serde_json::to_string_pretty(&json_items)?);
     } else {
         println!("=== Section Offsets (runtime bias) ===");
-        for (module, cookie, off) in results {
+        for e in entries {
             println!(
                 "- Module: {}\n  cookie=0x{:x}\n  text=0x{:x} rodata=0x{:x} data=0x{:x} bss=0x{:x}\n",
-                module.display(),
-                cookie,
-                off.text,
-                off.rodata,
-                off.data,
-                off.bss
+                e.module_path,
+                e.cookie,
+                e.offsets.text,
+                e.offsets.rodata,
+                e.offsets.data,
+                e.offsets.bss
             );
         }
     }

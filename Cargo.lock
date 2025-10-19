@@ -486,6 +486,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ghostscope-dwarf",
+ "ghostscope-process",
  "serde",
  "serde_json",
  "tokio",
@@ -683,6 +684,7 @@ dependencies = [
  "ghostscope-compiler",
  "ghostscope-dwarf",
  "ghostscope-loader",
+ "ghostscope-process",
  "ghostscope-protocol",
  "ghostscope-ui",
  "lazy_static",
@@ -708,6 +710,7 @@ dependencies = [
  "aya-ebpf-bindings 0.1.1 (git+https://github.com/aya-rs/aya?rev=9261554e3c6ca37e401ec23a287a1ddf9cb1f26d)",
  "ghostscope-dwarf",
  "ghostscope-platform",
+ "ghostscope-process",
  "ghostscope-protocol",
  "inkwell",
  "pest",
@@ -728,6 +731,7 @@ dependencies = [
  "dirs",
  "futures",
  "ghostscope-platform",
+ "ghostscope-process",
  "ghostscope-protocol",
  "gimli 0.32.2",
  "libc",
@@ -761,6 +765,15 @@ version = "0.1.0"
 dependencies = [
  "aya-ebpf-bindings 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde",
+ "tracing",
+]
+
+[[package]]
+name = "ghostscope-process"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "object 0.36.7",
  "tracing",
 ]
 

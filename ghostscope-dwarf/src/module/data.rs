@@ -22,12 +22,13 @@ mod file_selection_scoring {
 }
 
 use crate::{
-    core::{GlobalVariableInfo, MappedFile, Result, SectionType, SourceLocation},
+    core::{
+        mapping::ModuleMapping, GlobalVariableInfo, MappedFile, Result, SectionType, SourceLocation,
+    },
     data::{
         CfiIndex, LightweightIndex, LineMappingTable, OnDemandResolver, ScopedFileIndexManager,
     },
     parser::{CompilationUnit, ExpressionEvaluator, SourceFile},
-    proc_mapping::ModuleMapping,
 };
 use gimli::{LittleEndian, Reader};
 use object::{Object, ObjectSection, ObjectSegment};

@@ -8,28 +8,14 @@ use ghostscope_dwarf::{
     ComputeStep, DirectValueResult, EvaluationResult, LocationResult, MemoryAccessSize, TypeInfo,
     VariableWithEvaluation,
 };
+use ghostscope_process::cookie;
 use inkwell::values::{BasicValueEnum, IntValue, PointerValue};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-#[cfg(target_os = "linux")]
-use std::os::unix::fs::MetadataExt;
 use tracing::{debug, warn};
 
 impl<'ctx> EbpfContext<'ctx> {
-    /// Compute a stable cookie for a module when per-PID offsets are unavailable.
-    /// Prefer filesystem identity (dev, ino); fall back to a 64-bit hash of module_path.
+    /// Compute a stable cookie for a module when per-PID offsets are unavailable (via coordinator).
     fn fallback_cookie_from_module_path(&self, module_path: &str) -> u64 {
-        #[cfg(target_os = "linux")]
-        {
-            if let Ok(meta) = std::fs::metadata(module_path) {
-                let dev = meta.dev();
-                let ino = meta.ino();
-                return ((dev & 0xffff_ffff) << 32) | (ino & 0xffff_ffff);
-            }
-        }
-        let mut hasher = DefaultHasher::new();
-        module_path.hash(&mut hasher);
-        hasher.finish()
+        cookie::from_path(module_path)
     }
 
     /// Compute section code for an address within a module (text=0, rodata=1, data=2, bss=3).
@@ -49,19 +35,8 @@ impl<'ctx> EbpfContext<'ctx> {
         2
     }
 
-    /// Prefer analyzer-provided cookie when available (-p), else fallback (-t).
+    /// Compute cookie for module using coordinator policy.
     fn cookie_for_module_or_fallback(&mut self, module_path: &str) -> u64 {
-        if let Some(analyzer_ptr) = self.process_analyzer {
-            let analyzer = unsafe { &mut *analyzer_ptr };
-            if let Ok(offsets) = analyzer.compute_section_offsets() {
-                if let Some((_, cookie, _)) = offsets
-                    .iter()
-                    .find(|(p, _, _)| p.to_string_lossy() == module_path)
-                {
-                    return *cookie;
-                }
-            }
-        }
         self.fallback_cookie_from_module_path(module_path)
     }
     /// Helper: unwrap typedef/qualified wrappers to the underlying type

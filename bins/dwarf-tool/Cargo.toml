@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 ghostscope-dwarf = { path = "../../ghostscope-dwarf" }
+ghostscope-process = { path = "../../ghostscope-process" }
 
 # Command line parsing
 clap.workspace = true

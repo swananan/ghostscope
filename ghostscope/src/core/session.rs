@@ -3,6 +3,7 @@ use crate::runtime::source_path_resolver::SourcePathResolver;
 use crate::tracing::TraceManager;
 use anyhow::Result;
 use ghostscope_dwarf::{DwarfAnalyzer, ModuleStats};
+use ghostscope_process::ProcessManager;
 use tracing::{info, warn};
 
 /// Ghost session state - manages binary analysis, process tracking, and trace instances
@@ -17,6 +18,7 @@ pub struct GhostSession {
     #[allow(dead_code)]
     pub debug_file: Option<String>, // Optional debug file path
     pub config: Option<MergedConfig>, // Holds the merged configuration
+    pub coordinator: ProcessManager, // Manages PID/module offsets prefill and application
 }
 
 impl GhostSession {
@@ -36,6 +38,7 @@ impl GhostSession {
             trace_manager: TraceManager::new(),
             source_path_resolver: SourcePathResolver::new(&config.source),
             config: Some(config.clone()),
+            coordinator: ProcessManager::new(),
         }
     }
 
@@ -56,6 +59,7 @@ impl GhostSession {
             trace_manager: TraceManager::new(),
             source_path_resolver: SourcePathResolver::new(&Default::default()),
             config: None,
+            coordinator: ProcessManager::new(),
         }
     }
 

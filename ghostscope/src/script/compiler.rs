@@ -1,6 +1,6 @@
 use crate::core::GhostSession;
 use anyhow::{Context, Result};
-use ghostscope_loader::{GhostScopeLoader, ProcModuleOffsetsValue};
+use ghostscope_loader::GhostScopeLoader;
 use ghostscope_ui::events::{ExecutionStatus, ScriptCompilationDetails, ScriptExecutionResult};
 use tracing::{error, info, warn};
 
@@ -17,6 +17,7 @@ fn map_compile_error_message(e: &ghostscope_compiler::CompileError) -> String {
 async fn create_and_attach_loader(
     config: &ghostscope_compiler::UProbeConfig,
     target_pid: Option<u32>,
+    session: &mut crate::core::GhostSession,
 ) -> Result<GhostScopeLoader> {
     // Create a new loader for this uprobe configuration
     info!(
@@ -35,6 +36,52 @@ async fn create_and_attach_loader(
         config.trace_context.variable_name_count()
     );
     loader.set_trace_context(config.trace_context.clone());
+
+    // In -t mode (no target_pid), perform module prefill once per session and apply to this loader
+    if target_pid.is_none() {
+        let prefilled = session
+            .coordinator
+            .ensure_prefill_module(&config.binary_path)
+            .unwrap_or(0);
+        tracing::info!(
+            "Coordinator cached offsets for {} pid(s) for module {}",
+            prefilled,
+            config.binary_path
+        );
+        // Apply cached offsets for this module to the loader
+        let entries = session
+            .coordinator
+            .cached_offsets_for_module(&config.binary_path);
+        if !entries.is_empty() {
+            use ghostscope_loader::ProcModuleOffsetsValue;
+            // Group by pid for efficient batch insert
+            use std::collections::HashMap;
+            let mut by_pid: HashMap<u32, Vec<(u64, ProcModuleOffsetsValue)>> = HashMap::new();
+            for (pid, cookie, off) in entries {
+                by_pid.entry(pid).or_default().push((
+                    cookie,
+                    ProcModuleOffsetsValue::new(off.text, off.rodata, off.data, off.bss),
+                ));
+            }
+            let mut total = 0usize;
+            for (pid, items) in by_pid {
+                if let Err(e) = loader.populate_proc_module_offsets(pid, &items) {
+                    tracing::warn!(
+                        "Failed to populate proc_module_offsets for PID {}: {}",
+                        pid,
+                        e
+                    );
+                } else {
+                    total += items.len();
+                }
+            }
+            tracing::info!(
+                "Applied {} cached offset entries to loader for module {}",
+                total,
+                config.binary_path
+            );
+        }
+    }
 
     if let Some(uprobe_offset) = config.uprobe_offset {
         if let Some(ref function_name) = config.function_name {
@@ -193,48 +240,17 @@ pub async fn compile_and_load_script_for_tui(
         success_count, failed_count
     );
 
-    // Prepare ASLR offsets map items once (for -p mode)
-    let mut offsets_items: Vec<(u64, ProcModuleOffsetsValue)> = Vec::new();
+    // Ensure -p offsets are cached once per session
     if let Some(pid) = session.target_pid {
-        match process_analyzer.compute_section_offsets() {
-            Ok(items) => {
-                // Log cookie ↔ module path mapping for clarity
-                for (path, cookie, off) in &items {
-                    let cookie_hi = (*cookie >> 32) as u32;
-                    let cookie_lo = (*cookie & 0xffff_ffff) as u32;
-                    info!(
-                        "Offsets entry: pid={} module='{}' cookie=0x{:08x}{:08x} text=0x{:x} rodata=0x{:x} data=0x{:x} bss=0x{:x}",
-                        pid,
-                        path.display(),
-                        cookie_hi,
-                        cookie_lo,
-                        off.text,
-                        off.rodata,
-                        off.data,
-                        off.bss
-                    );
-                }
-                offsets_items = items
-                    .into_iter()
-                    .map(|(_path, cookie, off)| {
-                        (
-                            cookie,
-                            ProcModuleOffsetsValue::new(off.text, off.rodata, off.data, off.bss),
-                        )
-                    })
-                    .collect();
-                info!(
-                    "Computed {} module offset entries for PID {}",
-                    offsets_items.len(),
-                    pid
-                );
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to compute section offsets: {} (globals may show OffsetsUnavailable)",
-                    e
-                );
-            }
+        match session.coordinator.ensure_prefill_pid(pid) {
+            Ok(count) => info!(
+                "Coordinator cached {} module offset entries for PID {}",
+                count, pid
+            ),
+            Err(e) => warn!(
+                "Failed to compute section offsets via coordinator: {} (globals may show OffsetsUnavailable)",
+                e
+            ),
         }
     }
 
@@ -265,18 +281,32 @@ pub async fn compile_and_load_script_for_tui(
                 .unwrap_or_else(|| format!("{addr_disp:#x}"));
 
             // Create individual loader for this config
-            match create_and_attach_loader(config, session.target_pid).await {
+            match create_and_attach_loader(config, session.target_pid, session).await {
                 Ok(mut loader) => {
-                    // Populate proc_module_offsets for this loader (if available)
+                    // Apply cached offsets for this PID to the loader (if available)
                     if let Some(pid) = session.target_pid {
-                        if !offsets_items.is_empty() {
-                            if let Err(e) = loader.populate_proc_module_offsets(pid, &offsets_items)
-                            {
-                                warn!("Failed to populate proc_module_offsets: {}", e);
+                        if let Some(items) = session.coordinator.cached_offsets_pairs_for_pid(pid) {
+                            use ghostscope_loader::ProcModuleOffsetsValue;
+                            let adapted: Vec<(u64, ProcModuleOffsetsValue)> = items
+                                .iter()
+                                .map(|(cookie, off)| {
+                                    (
+                                        *cookie,
+                                        ProcModuleOffsetsValue::new(
+                                            off.text, off.rodata, off.data, off.bss,
+                                        ),
+                                    )
+                                })
+                                .collect();
+                            if let Err(e) = loader.populate_proc_module_offsets(pid, &adapted) {
+                                warn!(
+                                    "Failed to populate proc_module_offsets for PID {}: {}",
+                                    pid, e
+                                );
                             } else {
                                 info!(
-                                    "✓ Populated proc_module_offsets ({} entries) for PID {}",
-                                    offsets_items.len(),
+                                    "✓ Applied {} cached offsets to loader for PID {}",
+                                    adapted.len(),
                                     pid
                                 );
                             }
@@ -416,32 +446,17 @@ pub async fn compile_and_load_script_for_cli(
         }
     }
 
-    // Pre-compute ASLR offsets once (for -p mode)
-    let mut offsets_items: Vec<(u64, ProcModuleOffsetsValue)> = Vec::new();
+    // Ensure -p offsets are cached once per session
     if let Some(pid) = session.target_pid {
-        match process_analyzer.compute_section_offsets() {
-            Ok(items) => {
-                offsets_items = items
-                    .into_iter()
-                    .map(|(_path, cookie, off)| {
-                        (
-                            cookie,
-                            ProcModuleOffsetsValue::new(off.text, off.rodata, off.data, off.bss),
-                        )
-                    })
-                    .collect();
-                info!(
-                    "Computed {} module offset entries for PID {}",
-                    offsets_items.len(),
-                    pid
-                );
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to compute section offsets: {} (globals may show OffsetsUnavailable)",
-                    e
-                );
-            }
+        match session.coordinator.ensure_prefill_pid(pid) {
+            Ok(count) => info!(
+                "Coordinator cached {} module offset entries for PID {}",
+                count, pid
+            ),
+            Err(e) => warn!(
+                "Failed to compute section offsets via coordinator: {} (globals may show OffsetsUnavailable)",
+                e
+            ),
         }
     }
 
@@ -533,17 +548,32 @@ pub async fn compile_and_load_script_for_cli(
             .unwrap_or_else(|| format!("{addr_disp:#x}"));
 
         // Create individual loader for this config
-        match create_and_attach_loader(config, session.target_pid).await {
+        match create_and_attach_loader(config, session.target_pid, session).await {
             Ok(mut loader) => {
-                // Populate proc_module_offsets for this loader (if available)
+                // Apply cached offsets for this PID to the loader (if available)
                 if let Some(pid) = session.target_pid {
-                    if !offsets_items.is_empty() {
-                        if let Err(e) = loader.populate_proc_module_offsets(pid, &offsets_items) {
-                            warn!("Failed to populate proc_module_offsets: {}", e);
+                    if let Some(items) = session.coordinator.cached_offsets_pairs_for_pid(pid) {
+                        use ghostscope_loader::ProcModuleOffsetsValue;
+                        let adapted: Vec<(u64, ProcModuleOffsetsValue)> = items
+                            .iter()
+                            .map(|(cookie, off)| {
+                                (
+                                    *cookie,
+                                    ProcModuleOffsetsValue::new(
+                                        off.text, off.rodata, off.data, off.bss,
+                                    ),
+                                )
+                            })
+                            .collect();
+                        if let Err(e) = loader.populate_proc_module_offsets(pid, &adapted) {
+                            warn!(
+                                "Failed to populate proc_module_offsets for PID {}: {}",
+                                pid, e
+                            );
                         } else {
                             info!(
-                                "✓ Populated proc_module_offsets ({} entries) for PID {}",
-                                offsets_items.len(),
+                                "✓ Applied {} cached offsets to loader for PID {}",
+                                adapted.len(),
                                 pid
                             );
                         }
