@@ -170,6 +170,8 @@ async fn main() -> Result<()> {
         has_explicit_console_log_flag: false, // Not needed for validation
         force_perf_event_array: merged_config.ebpf_config.force_perf_event_array,
         allow_loose_debug_match: merged_config.dwarf_allow_loose_debug_match,
+        source_panel: false,
+        no_source_panel: false,
     };
     temp_args.validate()?;
 

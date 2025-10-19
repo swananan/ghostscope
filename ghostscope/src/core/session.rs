@@ -251,6 +251,8 @@ mod tests {
             layout_mode: crate::config::LayoutMode::Horizontal,
             force_perf_event_array: false,
             allow_loose_debug_match: false,
+            source_panel: false,
+            no_source_panel: false,
         };
 
         let config = crate::config::Config {

@@ -425,7 +425,11 @@ impl SourceNavigation {
                       srcpath add /additional/search/directory\n\n\
                     This will map the DWARF compilation directory to your local path,\n\
                     and all files under it will be resolved correctly.\n\n\
-                    Type 'help srcpath' for more information."
+                    Type 'help srcpath' for more information.\n\n\
+                    📘 No source available? You can hide the Source panel:\n\
+                      ui source off            # in UI command mode\n\
+                      --no-source-panel        # CLI flag\n\
+                      [ui].show_source_panel=false  # in config.toml"
                 );
 
                 Self::show_error(state, &file_path, error_message);

@@ -43,16 +43,20 @@ impl App {
 
         let mut state = AppState::new(event_registry, layout_mode);
 
-        // Request initial source code on startup
-        if let Err(e) = state
-            .event_registry
-            .command_sender
-            .send(crate::events::RuntimeCommand::RequestSourceCode)
-        {
-            tracing::warn!("Failed to send initial source code request: {}", e);
-        } else {
-            // Move to connecting state since we've sent the request
-            state.set_loading_state(crate::components::loading::LoadingState::ConnectingToRuntime);
+        // Request initial source code on startup if source panel is enabled
+        if state.ui.config.show_source_panel {
+            if let Err(e) = state
+                .event_registry
+                .command_sender
+                .send(crate::events::RuntimeCommand::RequestSourceCode)
+            {
+                tracing::warn!("Failed to send initial source code request: {}", e);
+            } else {
+                // Move to connecting state since we've sent the request
+                state.set_loading_state(
+                    crate::components::loading::LoadingState::ConnectingToRuntime,
+                );
+            }
         }
 
         Ok(Self {
@@ -79,16 +83,20 @@ impl App {
 
         let mut state = AppState::new_with_config(event_registry, ui_config);
 
-        // Request initial source code on startup
-        if let Err(e) = state
-            .event_registry
-            .command_sender
-            .send(crate::events::RuntimeCommand::RequestSourceCode)
-        {
-            tracing::warn!("Failed to send initial source code request: {}", e);
-        } else {
-            // Move to connecting state since we've sent the request
-            state.set_loading_state(crate::components::loading::LoadingState::ConnectingToRuntime);
+        // Request initial source code on startup if source panel is enabled
+        if state.ui.config.show_source_panel {
+            if let Err(e) = state
+                .event_registry
+                .command_sender
+                .send(crate::events::RuntimeCommand::RequestSourceCode)
+            {
+                tracing::warn!("Failed to send initial source code request: {}", e);
+            } else {
+                // Move to connecting state since we've sent the request
+                state.set_loading_state(
+                    crate::components::loading::LoadingState::ConnectingToRuntime,
+                );
+            }
         }
 
         Ok(Self {
@@ -1135,13 +1143,25 @@ impl App {
                 // and update panel sizes accordingly
             }
             Action::FocusNext => {
-                self.state.ui.focus.cycle_next();
+                let src_enabled = self.state.ui.config.show_source_panel;
+                self.state.ui.focus.cycle_next(src_enabled);
             }
             Action::FocusPrevious => {
-                self.state.ui.focus.cycle_previous();
+                let src_enabled = self.state.ui.config.show_source_panel;
+                self.state.ui.focus.cycle_previous(src_enabled);
             }
             Action::FocusPanel(panel) => {
-                self.state.ui.focus.set_panel(panel);
+                if panel == crate::action::PanelType::Source
+                    && !self.state.ui.config.show_source_panel
+                {
+                    // Ignore focusing hidden source panel; fallback to command panel
+                    self.state
+                        .ui
+                        .focus
+                        .set_panel(crate::action::PanelType::InteractiveCommand);
+                } else {
+                    self.state.ui.focus.set_panel(panel);
+                }
             }
             Action::ToggleFullscreen => {
                 self.state.ui.layout.toggle_fullscreen();
@@ -1156,10 +1176,77 @@ impl App {
                 self.state.ui.focus.expecting_window_nav = false;
             }
             Action::WindowNavMove(direction) => {
-                self.state
-                    .ui
-                    .focus
-                    .move_focus_in_direction(direction, self.state.ui.layout.mode);
+                let src_enabled = self.state.ui.config.show_source_panel;
+                self.state.ui.focus.move_focus_in_direction(
+                    direction,
+                    self.state.ui.layout.mode,
+                    src_enabled,
+                );
+            }
+            Action::SetSourcePanelVisibility(show) => {
+                let currently_shown = self.state.ui.config.show_source_panel;
+                if show == currently_shown {
+                    return Ok(Vec::new());
+                }
+                self.state.ui.config.show_source_panel = show;
+                if show {
+                    // If enabling, request source code immediately
+                    if let Err(e) = self
+                        .state
+                        .event_registry
+                        .command_sender
+                        .send(crate::events::RuntimeCommand::RequestSourceCode)
+                    {
+                        tracing::warn!("Failed to send source request after enabling: {}", e);
+                    }
+                    // Inform user
+                    let plain =
+                        "✅ Source panel enabled. Use 'ui source off' to hide it.".to_string();
+                    let styled = vec![
+                        crate::components::command_panel::style_builder::StyledLineBuilder::new()
+                            .styled(
+                                plain.clone(),
+                                crate::components::command_panel::style_builder::StylePresets::SUCCESS,
+                            )
+                            .build(),
+                    ];
+                    additional_actions.push(Action::AddResponseWithStyle {
+                        content: plain,
+                        styled_lines: Some(styled),
+                        response_type: crate::action::ResponseType::Success,
+                    });
+                } else {
+                    // If disabling and focus is Source or fullscreen Source, move focus away
+                    if self.state.ui.focus.current_panel == crate::action::PanelType::Source {
+                        self.state
+                            .ui
+                            .focus
+                            .set_panel(crate::action::PanelType::InteractiveCommand);
+                    }
+                    if self.state.ui.layout.is_fullscreen
+                        && matches!(
+                            self.state.ui.focus.current_panel,
+                            crate::action::PanelType::Source
+                        )
+                    {
+                        self.state.ui.layout.is_fullscreen = false;
+                    }
+                    // Inform user
+                    let plain = "✅ Source panel disabled. Panels: eBPF output + command. Use 'ui source on' to enable.".to_string();
+                    let styled = vec![
+                        crate::components::command_panel::style_builder::StyledLineBuilder::new()
+                            .styled(
+                                plain.clone(),
+                                crate::components::command_panel::style_builder::StylePresets::SUCCESS,
+                            )
+                            .build(),
+                    ];
+                    additional_actions.push(Action::AddResponseWithStyle {
+                        content: plain,
+                        styled_lines: Some(styled),
+                        response_type: crate::action::ResponseType::Success,
+                    });
+                }
             }
             Action::InsertChar(c) => {
                 let actions = crate::components::command_panel::InputHandler::insert_char(
@@ -1940,7 +2027,12 @@ impl App {
             // In fullscreen mode, give the focused panel the entire screen
             match state.ui.focus.current_panel {
                 PanelType::Source => {
-                    Self::draw_source_panel(f, size, state);
+                    if state.ui.config.show_source_panel {
+                        Self::draw_source_panel(f, size, state);
+                    } else {
+                        // Source hidden: fallback to command panel fullscreen
+                        Self::draw_command_panel(f, size, state);
+                    }
                 }
                 PanelType::EbpfInfo => {
                     Self::draw_ebpf_panel(f, size, state);
@@ -1951,43 +2043,79 @@ impl App {
             }
         } else {
             // Normal multi-panel layout
-            // Get panel ratios from configuration
-            let ratios = &state.ui.config.panel_ratios;
-            let total_ratio: u32 = ratios.iter().map(|&x| x as u32).sum();
+            if state.ui.config.show_source_panel {
+                // 3-panel layout
+                let ratios = &state.ui.config.panel_ratios;
+                let total_ratio: u32 = ratios.iter().map(|&x| x as u32).sum();
 
-            let chunks = match state.ui.layout.mode {
-                LayoutMode::Horizontal => {
-                    Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints(
-                            [
-                                Constraint::Ratio(ratios[0] as u32, total_ratio), // Source code panel
-                                Constraint::Ratio(ratios[1] as u32, total_ratio), // eBPF info panel
-                                Constraint::Ratio(ratios[2] as u32, total_ratio), // Command panel
-                            ]
-                            .as_ref(),
-                        )
-                        .split(size)
-                }
-                LayoutMode::Vertical => {
-                    Layout::default()
-                        .direction(Direction::Vertical)
-                        .constraints(
-                            [
-                                Constraint::Ratio(ratios[0] as u32, total_ratio), // Source code panel
-                                Constraint::Ratio(ratios[1] as u32, total_ratio), // eBPF info panel
-                                Constraint::Ratio(ratios[2] as u32, total_ratio), // Command panel
-                            ]
-                            .as_ref(),
-                        )
-                        .split(size)
-                }
-            };
+                let chunks = match state.ui.layout.mode {
+                    LayoutMode::Horizontal => {
+                        Layout::default()
+                            .direction(Direction::Horizontal)
+                            .constraints(
+                                [
+                                    Constraint::Ratio(ratios[0] as u32, total_ratio), // Source code panel
+                                    Constraint::Ratio(ratios[1] as u32, total_ratio), // eBPF info panel
+                                    Constraint::Ratio(ratios[2] as u32, total_ratio), // Command panel
+                                ]
+                                .as_ref(),
+                            )
+                            .split(size)
+                    }
+                    LayoutMode::Vertical => {
+                        Layout::default()
+                            .direction(Direction::Vertical)
+                            .constraints(
+                                [
+                                    Constraint::Ratio(ratios[0] as u32, total_ratio), // Source code panel
+                                    Constraint::Ratio(ratios[1] as u32, total_ratio), // eBPF info panel
+                                    Constraint::Ratio(ratios[2] as u32, total_ratio), // Command panel
+                                ]
+                                .as_ref(),
+                            )
+                            .split(size)
+                    }
+                };
 
-            // Draw panels in proper layout
-            Self::draw_source_panel(f, chunks[0], state);
-            Self::draw_ebpf_panel(f, chunks[1], state);
-            Self::draw_command_panel(f, chunks[2], state);
+                // Draw panels in proper layout
+                Self::draw_source_panel(f, chunks[0], state);
+                Self::draw_ebpf_panel(f, chunks[1], state);
+                Self::draw_command_panel(f, chunks[2], state);
+            } else {
+                // 2-panel layout: [EbpfInfo, InteractiveCommand]
+                let ratios2 = state.ui.config.two_panel_ratios;
+                let total2: u32 = (ratios2[0] as u32) + (ratios2[1] as u32);
+
+                let chunks = match state.ui.layout.mode {
+                    LayoutMode::Horizontal => {
+                        Layout::default()
+                            .direction(Direction::Horizontal)
+                            .constraints(
+                                [
+                                    Constraint::Ratio(ratios2[0] as u32, total2), // eBPF info panel
+                                    Constraint::Ratio(ratios2[1] as u32, total2), // Command panel
+                                ]
+                                .as_ref(),
+                            )
+                            .split(size)
+                    }
+                    LayoutMode::Vertical => {
+                        Layout::default()
+                            .direction(Direction::Vertical)
+                            .constraints(
+                                [
+                                    Constraint::Ratio(ratios2[0] as u32, total2), // eBPF info panel
+                                    Constraint::Ratio(ratios2[1] as u32, total2), // Command panel
+                                ]
+                                .as_ref(),
+                            )
+                            .split(size)
+                    }
+                };
+
+                Self::draw_ebpf_panel(f, chunks[0], state);
+                Self::draw_command_panel(f, chunks[1], state);
+            }
         }
     }
 
@@ -2072,8 +2200,25 @@ impl App {
                 });
             }
             RuntimeStatus::DwarfLoadingCompleted { .. } => {
-                self.state
-                    .set_loading_state(LoadingState::LoadingSourceCode);
+                if self.state.ui.config.show_source_panel {
+                    self.state
+                        .set_loading_state(LoadingState::LoadingSourceCode);
+                } else {
+                    // If source panel is disabled, we're effectively ready after symbols
+                    self.transition_to_ready_with_completion();
+                    // But we still need file info to power command panel completion/search
+                    tracing::debug!(
+                        "Source panel hidden on startup; requesting file list for completion cache"
+                    );
+                    if let Err(e) = self
+                        .state
+                        .event_registry
+                        .command_sender
+                        .send(crate::events::RuntimeCommand::InfoSource)
+                    {
+                        tracing::warn!("Failed to auto-request file list: {}", e);
+                    }
+                }
             }
             RuntimeStatus::DwarfLoadingFailed(error) => {
                 self.state
@@ -2504,7 +2649,9 @@ impl App {
             }
             RuntimeStatus::SrcPathFailed { error } => {
                 self.clear_waiting_state();
-                let text = format!("✗ {error}");
+                let text = format!(
+                    "✗ {error}\n\n📘 No source available? You can hide the Source panel:\n  ui source off            # in UI command mode\n  --no-source-panel        # CLI flag\n  [ui].show_source_panel=false  # in config.toml"
+                );
                 let styled = crate::components::command_panel::ResponseFormatter::style_generic_message_lines(&text);
                 let action = Action::AddResponseWithStyle {
                     content: text,

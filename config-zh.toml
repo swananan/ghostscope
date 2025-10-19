@@ -97,6 +97,10 @@ save_ast = { debug = true, release = false }
 # 默认值："Horizontal"
 layout = "Horizontal"
 
+# 是否显示源码面板（也可通过命令行 --source-panel/--no-source-panel，或在 UI 命令面板中使用 'ui source on/off' 控制）
+# 默认值：true
+show_source_panel = true
+
 # TUI 启动时的默认焦点面板
 # 可选值："Source"（源代码）, "EbpfInfo"（eBPF输出）, "InteractiveCommand"（命令交互）
 # 默认值："InteractiveCommand"
@@ -107,6 +111,11 @@ default_focus = "InteractiveCommand"
 # 必须是包含 3 个正数的数组
 # 默认值：[4, 3, 3]
 panel_ratios = [4, 3, 3]
+
+# 当源码面板被隐藏时的两面板比例 [EbpfInfo, InteractiveCommand]
+# 若未设置，则回退为 panel_ratios 的后两项（例如 4:3:3 -> 3:3，即 1:1）
+# 默认未设置（回退）
+# two_panel_ratios = [3, 3]
 
 # 命令历史配置
 [ui.history]
