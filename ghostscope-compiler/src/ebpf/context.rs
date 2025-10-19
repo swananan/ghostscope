@@ -340,6 +340,35 @@ impl<'ctx> EbpfContext<'ctx> {
         Ok(())
     }
 
+    /// Test helper: ensure proc_module_offsets map exists in the module
+    #[cfg(test)]
+    pub fn __test_ensure_proc_offsets_map(&mut self) -> Result<()> {
+        self.map_manager
+            .create_proc_module_offsets_map(
+                &self.module,
+                &self.di_builder,
+                &self.compile_unit,
+                "proc_module_offsets",
+                self.compile_options.proc_module_offsets_max_entries,
+            )
+            .map_err(|e| CodeGenError::LLVMError(format!(
+                "Failed to create proc_module_offsets map in test: {e}"
+            )))
+    }
+
+    /// Test helper: allocate per-invocation pm_key on the entry block like create_main_function
+    #[cfg(test)]
+    pub fn __test_alloc_pm_key(&mut self) -> Result<()> {
+        let i32_type = self.context.i32_type();
+        let key_arr_ty = i32_type.array_type(4);
+        let key_alloca = self
+            .builder
+            .build_alloca(key_arr_ty, "pm_key")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.pm_key_alloca = Some(key_alloca);
+        Ok(())
+    }
+
     /// Get the LLVM module reference
     pub fn get_module(&self) -> &Module<'ctx> {
         &self.module
