@@ -78,6 +78,8 @@ pub struct GhostScopeLoader {
     parser: StreamingTraceParser,
     /// String table and metadata for parsing trace events
     trace_context: Option<TraceContext>,
+    /// Optional override for PerfEventArray page count (per CPU buffer size in pages)
+    perf_page_count: Option<usize>,
 }
 
 impl std::fmt::Debug for GhostScopeLoader {
@@ -139,6 +141,7 @@ impl GhostScopeLoader {
                     attachment_params: None,
                     parser: StreamingTraceParser::new(),
                     trace_context: None,
+                    perf_page_count: None,
                 })
             }
             Err(e) => {
@@ -173,6 +176,11 @@ impl GhostScopeLoader {
         pid: Option<i32>,
     ) -> Result<()> {
         self.attach_uprobe_with_program_name(target_binary, function_name, offset, pid, None)
+    }
+
+    /// Set PerfEventArray page count override (applies when using Perf backend)
+    pub fn set_perf_page_count(&mut self, pages: u32) {
+        self.perf_page_count = Some(pages as usize);
     }
 
     /// Attach to a uprobe with a specific eBPF program name
@@ -414,9 +422,20 @@ impl GhostScopeLoader {
             let mut cpu_ids = Vec::new();
 
             for cpu_id in online_cpus {
-                match perf_array.open(cpu_id, None) {
+                let pages = self.perf_page_count;
+                match perf_array.open(cpu_id, pages) {
                     Ok(buffer) => {
-                        info!("Opened PerfEventArray buffer for CPU {}", cpu_id);
+                        if let Some(p) = pages {
+                            info!(
+                                "Opened PerfEventArray buffer for CPU {} with {} pages",
+                                cpu_id, p
+                            );
+                        } else {
+                            info!(
+                                "Opened PerfEventArray buffer for CPU {} (default pages)",
+                                cpu_id
+                            );
+                        }
                         buffers.push(buffer);
                         cpu_ids.push(cpu_id);
                     }

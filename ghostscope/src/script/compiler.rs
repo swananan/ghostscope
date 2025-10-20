@@ -42,6 +42,15 @@ async fn create_and_attach_loader(
     let mut loader = GhostScopeLoader::new(&config.ebpf_bytecode)
         .context("Failed to create eBPF loader for uprobe config")?;
 
+    // Apply PerfEventArray page count from config (for kernels without RingBuf or forced Perf mode)
+    if let Some(cfg) = &session.config {
+        loader.set_perf_page_count(cfg.ebpf_config.perf_page_count);
+        tracing::info!(
+            "Configured PerfEventArray page count: {} pages per CPU",
+            cfg.ebpf_config.perf_page_count
+        );
+    }
+
     // Set the TraceContext for trace event parsing
     info!(
         "Setting TraceContext for loader: {} strings, {} variables",
