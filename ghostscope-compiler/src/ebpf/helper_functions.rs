@@ -905,6 +905,93 @@ impl<'ctx> EbpfContext<'ctx> {
         Ok(())
     }
 
+    /// Create ringbuf output with dynamic size (IntValue)
+    pub fn create_ringbuf_output_dynamic(
+        &mut self,
+        data: PointerValue<'ctx>,
+        size: IntValue<'ctx>,
+    ) -> Result<()> {
+        let i64_type = self.context.i64_type();
+
+        // Get ringbuf map
+        let ringbuf_global = self
+            .map_manager
+            .get_ringbuf_map(&self.module, "ringbuf")
+            .map_err(|e| {
+                CodeGenError::MemoryAccessError(format!("Failed to get ringbuf map: {e}"))
+            })?;
+
+        // Arguments: map, data, size (dynamic), flags
+        let args = [
+            ringbuf_global.into(),
+            data.into(),
+            size.into(),
+            i64_type.const_zero().into(), // flags = 0
+        ];
+
+        let _result = self.create_bpf_helper_call(
+            BPF_FUNC_ringbuf_output as u64,
+            &args,
+            i64_type.into(),
+            "ringbuf_output",
+        )?;
+
+        Ok(())
+    }
+
+    /// Lookup per-CPU map value pointer for a given map name and u32 key constant
+    pub fn lookup_percpu_value_ptr(
+        &mut self,
+        map_name: &str,
+        key_const: u32,
+    ) -> Result<PointerValue<'ctx>> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i32_ty = self.context.i32_type();
+        let map_global = self
+            .map_manager
+            .get_map(&self.module, map_name)
+            .map_err(|e| CodeGenError::LLVMError(format!("Map not found {map_name}: {e}")))?;
+        let map_ptr = self
+            .builder
+            .build_bit_cast(map_global, ptr_ty, "map_ptr")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        // Prepare stack key in the entry-block alloca (reuse pm_key's first i32 slot)
+        let key_arr_ty = i32_ty.array_type(4);
+        let key_alloca = self.pm_key_alloca.ok_or_else(|| {
+            CodeGenError::LLVMError("pm_key not allocated in entry block".to_string())
+        })?;
+        let zero = i32_ty.const_zero();
+        let base_i32_ptr = unsafe {
+            self.builder
+                .build_gep(key_arr_ty, key_alloca, &[zero, zero], "percpu_key_i32_ptr")
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+        };
+        self.builder
+            .build_store(base_i32_ptr, i32_ty.const_int(key_const as u64, false))
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let key_ptr = self
+            .builder
+            .build_bit_cast(base_i32_ptr, ptr_ty, "key_ptr")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        // long bpf_map_lookup_elem(void *map, const void *key) -> void *
+        let ret = self.create_bpf_helper_call(
+            BPF_FUNC_map_lookup_elem as u64,
+            &[map_ptr, key_ptr],
+            ptr_ty.into(),
+            "map_lookup_elem",
+        )?;
+        let val_ptr = if let BasicValueEnum::PointerValue(p) = ret {
+            p
+        } else {
+            return Err(CodeGenError::LLVMError(
+                "map_lookup_elem did not return pointer".to_string(),
+            ));
+        };
+        Ok(val_ptr)
+    }
+
     /// Create perf event output using bpf_perf_event_output (internal implementation)
     fn create_perf_event_output_internal(
         &mut self,

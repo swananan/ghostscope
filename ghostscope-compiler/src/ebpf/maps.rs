@@ -13,6 +13,7 @@ use tracing::{error, info};
 pub enum BpfMapType {
     Ringbuf,
     Array,
+    PerCpuArray,
     Hash,
     PerfEventArray,
 }
@@ -21,6 +22,7 @@ impl BpfMapType {
     fn to_aya_map_type(self) -> u32 {
         match self {
             BpfMapType::Ringbuf => bpf_map_type::BPF_MAP_TYPE_RINGBUF,
+            BpfMapType::PerCpuArray => bpf_map_type::BPF_MAP_TYPE_PERCPU_ARRAY,
             BpfMapType::Array => bpf_map_type::BPF_MAP_TYPE_ARRAY,
             BpfMapType::Hash => bpf_map_type::BPF_MAP_TYPE_HASH,
             BpfMapType::PerfEventArray => bpf_map_type::BPF_MAP_TYPE_PERF_EVENT_ARRAY,
@@ -499,5 +501,27 @@ impl<'ctx> MapManager<'ctx> {
     /// Get a perf event array map by name
     pub fn get_perf_map(&self, module: &Module<'ctx>, name: &str) -> Result<PointerValue<'ctx>> {
         self.get_map(module, name)
+    }
+
+    /// Create a Per-CPU Array map (key=u32, value arbitrary size)
+    pub fn create_percpu_array_map(
+        &mut self,
+        module: &Module<'ctx>,
+        di_builder: &DebugInfoBuilder<'ctx>,
+        compile_unit: &inkwell::debug_info::DICompileUnit<'ctx>,
+        name: &str,
+        max_entries: u64,
+        value_size_bytes: u64,
+    ) -> Result<()> {
+        self.create_map_definition(
+            module,
+            di_builder,
+            compile_unit,
+            name,
+            BpfMapType::PerCpuArray,
+            max_entries,
+            SizedType::integer(32),
+            SizedType::integer(value_size_bytes * 8),
+        )
     }
 }

@@ -2,7 +2,6 @@
 //! Preconditions: target process must be started before GhostScope (no dynamic attach yet)
 
 mod common;
-use serial_test::serial;
 
 use common::{init, FIXTURES};
 use regex::Regex;
@@ -23,7 +22,6 @@ async fn run_ghostscope_with_script_for_target(
         .await
 }
 
-#[serial]
 #[tokio::test]
 async fn test_t_mode_executable_globals_prints() -> anyhow::Result<()> {
     init();
@@ -87,7 +85,6 @@ trace globals_program.c:32 {
     Ok(())
 }
 
-#[serial]
 #[tokio::test]
 async fn test_t_mode_library_globals_prints() -> anyhow::Result<()> {
     init();
@@ -147,7 +144,6 @@ trace lib_tick {
     Ok(())
 }
 
-#[serial]
 #[tokio::test]
 async fn test_t_mode_executable_rodata_and_struct_pretty() -> anyhow::Result<()> {
     init();

@@ -90,6 +90,8 @@ pub struct EbpfContext<'ctx> {
 
     // Per-invocation stack key for proc_module_offsets lookups (allocated in entry block)
     pub pm_key_alloca: Option<inkwell::values::PointerValue<'ctx>>, // [3 x i32] alloca
+    // Per-invocation event accumulation offset (u32) stored on stack (entry block)
+    pub event_offset_alloca: Option<inkwell::values::PointerValue<'ctx>>,
 
     // Compilation options (includes eBPF map configuration)
     pub compile_options: crate::CompileOptions,
@@ -202,6 +204,7 @@ impl<'ctx> EbpfContext<'ctx> {
             trace_context: ghostscope_protocol::TraceContext::new(),
             current_resolved_var_module_path: None,
             pm_key_alloca: None,
+            event_offset_alloca: None,
             compile_options: compile_options.clone(),
 
             // Control-flow expression context
@@ -456,6 +459,22 @@ impl<'ctx> EbpfContext<'ctx> {
             }
         }
 
+        // Create per-CPU accumulation maps for single-record event emission
+        //  - event_accum_buffer: value size = max_trace_event_size bytes, entries = 1
+        //  - event_accum_offset: value size = 4 bytes (u32), entries = 1
+        self.map_manager
+            .create_percpu_array_map(
+                &self.module,
+                &self.di_builder,
+                &self.compile_unit,
+                "event_accum_buffer",
+                1,
+                self.compile_options.max_trace_event_size as u64,
+            )
+            .map_err(|e| {
+                CodeGenError::LLVMError(format!("Failed to create event_accum_buffer: {e}"))
+            })?;
+
         // Create ASLR offsets map for (pid,module) → section offsets
         self.map_manager
             .create_proc_module_offsets_map(
@@ -534,6 +553,16 @@ impl<'ctx> EbpfContext<'ctx> {
             .build_alloca(key_arr_ty, "pm_key")
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         self.pm_key_alloca = Some(key_alloca);
+
+        // Allocate per-invocation event_offset (u32) and initialize to 0
+        let event_off_alloca = self
+            .builder
+            .build_alloca(i32_type, "event_offset")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder
+            .build_store(event_off_alloca, i32_type.const_zero())
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.event_offset_alloca = Some(event_off_alloca);
 
         info!("Created main function: {}", function_name);
         Ok(function)

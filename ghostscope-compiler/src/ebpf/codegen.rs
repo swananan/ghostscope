@@ -11,7 +11,7 @@ use ghostscope_protocol::trace_event::{
     PrintVariableIndexData, VariableStatus,
 };
 use ghostscope_protocol::{InstructionType, TraceContext, TypeKind};
-use inkwell::values::{BasicValueEnum, IntValue, PointerValue};
+use inkwell::values::{BasicValueEnum, IntValue};
 use inkwell::AddressSpace;
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
@@ -653,8 +653,8 @@ impl<'ctx> EbpfContext<'ctx> {
         let total_data_length = data_struct_size + access_path_len + byte_len;
         let total_size = header_size + total_data_length;
 
-        // Create instruction buffer
-        let inst_buffer = self.create_instruction_buffer();
+        // Reserve space directly in the per-CPU accumulation buffer
+        let inst_buffer = self.reserve_instruction_region(total_size as u64);
 
         // Write InstructionHeader.inst_type
         let inst_type_val = self
@@ -974,12 +974,7 @@ impl<'ctx> EbpfContext<'ctx> {
             }
         }
 
-        // Send via ringbuf
-        self.send_instruction_via_ringbuf(
-            inst_buffer,
-            self.context.i64_type().const_int(total_size as u64, false),
-        )?;
-
+        // Already accumulated; EndInstruction will send the whole event
         Ok(())
     }
     /// Determine if a TypeInfo qualifies as a "simple variable" for PrintVariableIndex
@@ -2100,7 +2095,9 @@ impl<'ctx> EbpfContext<'ctx> {
                     static_payload_total += std::cmp::max(a.data_len, 12)
                 }
                 ComplexArgSource::ComputedInt { byte_len, .. } => static_payload_total += *byte_len,
-                ComplexArgSource::MemDump { len, .. } => static_payload_total += *len,
+                ComplexArgSource::MemDump { len, .. } => {
+                    static_payload_total += std::cmp::max(*len, 12)
+                }
                 ComplexArgSource::MemDumpDynamic { max_len, .. } => {
                     dynamic_indices.push((idx, *max_len))
                 }
@@ -2126,7 +2123,7 @@ impl<'ctx> EbpfContext<'ctx> {
                 ComplexArgSource::AddressValue { .. } => 8,
                 ComplexArgSource::RuntimeRead { .. } => std::cmp::max(a.data_len, 12),
                 ComplexArgSource::ComputedInt { byte_len, .. } => *byte_len,
-                ComplexArgSource::MemDump { len, .. } => *len,
+                ComplexArgSource::MemDump { len, .. } => std::cmp::max(*len, 12),
                 ComplexArgSource::MemDumpDynamic { .. } => {
                     // find max_len for this dynamic arg and clamp to remaining
                     let (_, max_len) = dynamic_indices
@@ -2134,7 +2131,9 @@ impl<'ctx> EbpfContext<'ctx> {
                         .copied()
                         .find(|(i, _)| *i == idx)
                         .unwrap_or((idx, 0));
-                    let eff = std::cmp::min(max_len, remaining_for_payload);
+                    // Ensure we always have space for error payload (errno+addr = 12 bytes) if possible
+                    let need = std::cmp::max(12usize, max_len);
+                    let eff = std::cmp::min(need, remaining_for_payload);
                     remaining_for_payload = remaining_for_payload.saturating_sub(eff);
                     eff
                 }
@@ -2148,8 +2147,8 @@ impl<'ctx> EbpfContext<'ctx> {
         let inst_data_size = std::mem::size_of::<PrintComplexFormatData>() + total_args_payload;
         let total_size = std::mem::size_of::<InstructionHeader>() + inst_data_size;
 
-        // Allocate buffer
-        let buffer = self.create_instruction_buffer();
+        // Reserve buffer directly in accumulation buffer to avoid extra copy
+        let buffer = self.reserve_instruction_region(total_size as u64);
 
         // Avoid memset; global buffer is zero-initialized
 
@@ -2438,19 +2437,41 @@ impl<'ctx> EbpfContext<'ctx> {
                     // data_len already set to reserved_len
                 }
                 ComplexArgSource::MemDump { src_addr, len } => {
-                    // Perform bounded read of len bytes from src_addr into payload
-                    let (buf_global, status, arr_ty) = self.read_user_bytes_into_buffer(
-                        *src_addr,
-                        *len as u32,
-                        "_gs_fmt_memdump",
-                    )?;
-                    // status==0 => OK, else store errno at payload and mark fail
+                    // Directly probe-read into payload to avoid byte-wise copies
+                    let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                    let i64_ty = self.context.i64_type();
+                    let i32_ty = self.context.i32_type();
+
+                    // Helper: long bpf_probe_read_user(void *dst, u32 size, const void *src)
+                    let dst_ptr = self
+                        .builder
+                        .build_pointer_cast(var_data_ptr, ptr_ty, "md_dst_ptr")
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    let src_ptr = self
+                        .builder
+                        .build_int_to_ptr(*src_addr, ptr_ty, "md_src_ptr")
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    let ret = self
+                        .create_bpf_helper_call(
+                            aya_ebpf_bindings::bindings::bpf_func_id::BPF_FUNC_probe_read_user
+                                as u64,
+                            &[
+                                dst_ptr.into(),
+                                i32_ty.const_int(*len as u64, false).into(),
+                                src_ptr.into(),
+                            ],
+                            i64_ty.into(),
+                            "probe_read_user_memdump",
+                        )?
+                        .into_int_value();
+
+                    // Branch on ret == 0
                     let ok = self
                         .builder
                         .build_int_compare(
                             inkwell::IntPredicate::EQ,
-                            status,
-                            self.context.i64_type().const_zero(),
+                            ret,
+                            i64_ty.const_zero(),
                             "md_ok",
                         )
                         .map_err(|e| CodeGenError::Builder(e.to_string()))?;
@@ -2462,35 +2483,8 @@ impl<'ctx> EbpfContext<'ctx> {
                     self.builder
                         .build_conditional_branch(ok, ok_b, err_b)
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    // ok: copy bytes into var_data_ptr
+                    // ok: nothing extra to do
                     self.builder.position_at_end(ok_b);
-                    let i32_ty = self.context.i32_type();
-                    let idx0 = i32_ty.const_zero();
-                    for i in 0..*len {
-                        let idx_i = i32_ty.const_int(i as u64, false);
-                        let src_ptr = unsafe {
-                            self.builder
-                                .build_gep(arr_ty, buf_global, &[idx0, idx_i], "src_ptr")
-                                .map_err(|e| CodeGenError::Builder(e.to_string()))?
-                        };
-                        let byte = self
-                            .builder
-                            .build_load(self.context.i8_type(), src_ptr, "b")
-                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-                        let dst_ptr = unsafe {
-                            self.builder
-                                .build_gep(
-                                    self.context.i8_type(),
-                                    var_data_ptr,
-                                    &[self.context.i32_type().const_int(i as u64, false)],
-                                    "dst_ptr",
-                                )
-                                .map_err(|e| CodeGenError::Builder(e.to_string()))?
-                        };
-                        self.builder
-                            .build_store(dst_ptr, byte)
-                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-                    }
                     self.builder
                         .build_unconditional_branch(cont_b)
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
@@ -2505,8 +2499,7 @@ impl<'ctx> EbpfContext<'ctx> {
                                 .const_int(VariableStatus::ReadError as u64, false),
                         )
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    // write errno + addr (12 bytes) to var_data_ptr
-                    let ret = status;
+                    // write errno + addr (12 bytes) to var_data_ptr; reserved sizing ensures this fits
                     let errno_ptr = self
                         .builder
                         .build_pointer_cast(
@@ -2582,6 +2575,7 @@ impl<'ctx> EbpfContext<'ctx> {
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
                         .into_int_value();
 
+                    // Bound length by the reserved space (already ensures >= 12B when possible)
                     let max_const = i32_ty.const_int(eff_max_len as u64, false);
                     let gt = self
                         .builder
@@ -2671,7 +2665,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     self.builder
                         .build_unconditional_branch(cont_b)
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    // err: status+errno+addr
+                    // err: status+errno+addr (clamped by reserved sizing)
                     self.builder.position_at_end(err_b);
                     self.builder
                         .build_store(
@@ -3083,9 +3077,7 @@ impl<'ctx> EbpfContext<'ctx> {
             offset += 2 + 2 + 1 + 1 + a.access_path.len() + 2 + reserved_len;
         }
 
-        // Send via ringbuf (reserved size is sufficient for worst-case payload)
-        self.write_to_accumulation_buffer_or_send(buffer, total_size as u64)
-            .map_err(|e| CodeGenError::LLVMError(format!("Ringbuf output failed: {e}")))?;
+        // Already accumulated; EndInstruction will send the whole event
         Ok(())
     }
 
@@ -3097,7 +3089,11 @@ impl<'ctx> EbpfContext<'ctx> {
         );
 
         // Allocate instruction structure on eBPF stack
-        let inst_buffer = self.create_instruction_buffer();
+        // Reserve space in accumulation buffer for this instruction
+        let inst_buffer = self.reserve_instruction_region(
+            (std::mem::size_of::<InstructionHeader>() + std::mem::size_of::<PrintStringIndexData>())
+                as u64,
+        );
 
         // Clear memory with static size
         let _inst_size = self.context.i64_type().const_int(
@@ -3196,15 +3192,8 @@ impl<'ctx> EbpfContext<'ctx> {
             .build_store(string_index_i16_ptr, string_index_val)
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store string_index: {e}")))?;
 
-        // Compute total instruction size: header + PrintStringIndexData
-        let inst_size = self.context.i64_type().const_int(
-            (std::mem::size_of::<PrintStringIndexData>()
-                + std::mem::size_of::<ghostscope_protocol::trace_event::InstructionHeader>())
-                as u64,
-            false,
-        );
-        // Send via ringbuf
-        self.send_instruction_via_ringbuf(inst_buffer, inst_size)
+        // Already accumulated; EndInstruction will send the whole event
+        Ok(())
     }
 
     /// Generate ExprError instruction with expression string index and error code/flags
@@ -3215,7 +3204,12 @@ impl<'ctx> EbpfContext<'ctx> {
         flags_iv: inkwell::values::IntValue<'ctx>,
         failing_addr_iv: inkwell::values::IntValue<'ctx>,
     ) -> Result<()> {
-        let inst_buffer = self.create_instruction_buffer();
+        // Reserve space in accumulation buffer for this instruction
+        let inst_buffer = self.reserve_instruction_region(
+            (std::mem::size_of::<InstructionHeader>()
+                + std::mem::size_of::<ghostscope_protocol::trace_event::ExprErrorData>())
+                as u64,
+        );
 
         // Store instruction type at offset 0
         let inst_type_val = self
@@ -3390,14 +3384,8 @@ impl<'ctx> EbpfContext<'ctx> {
             .build_store(addr_ptr_cast, addr_i64)
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store failing_addr: {e}")))?;
 
-        // Send instruction
-        let inst_size = self.context.i64_type().const_int(
-            (std::mem::size_of::<ghostscope_protocol::trace_event::ExprErrorData>()
-                + std::mem::size_of::<ghostscope_protocol::trace_event::InstructionHeader>())
-                as u64,
-            false,
-        );
-        self.send_instruction_via_ringbuf(inst_buffer, inst_size)
+        // Already accumulated; EndInstruction will send the whole event
+        Ok(())
     }
 
     /// Generate eBPF code for PrintVariableIndex instruction
@@ -3452,7 +3440,12 @@ impl<'ctx> EbpfContext<'ctx> {
             _ => 8, // Default to 8 bytes for complex types
         };
 
-        let inst_buffer = self.create_instruction_buffer();
+        // Reserve space directly in per-CPU accumulation buffer
+        let inst_buffer = self.reserve_instruction_region(
+            (std::mem::size_of::<InstructionHeader>()
+                + std::mem::size_of::<PrintVariableIndexData>()
+                + data_size as usize) as u64,
+        );
 
         // Avoid memset; global buffer is zero-initialized
 
@@ -3836,15 +3829,8 @@ impl<'ctx> EbpfContext<'ctx> {
             }
         }
 
-        // Compute total instruction size: header + PrintVariableIndexData + payload
-        let inst_size = self.context.i64_type().const_int(
-            (std::mem::size_of::<PrintVariableIndexData>()
-                + std::mem::size_of::<ghostscope_protocol::trace_event::InstructionHeader>()
-                + data_size as usize) as u64,
-            false,
-        );
-        // Send via ringbuf
-        self.send_instruction_via_ringbuf(inst_buffer, inst_size)
+        // Already accumulated; EndInstruction will send the whole event
+        Ok(())
     }
 
     // PrintVariableError instruction has been removed; compile-time errors are returned as Err,
@@ -3854,38 +3840,67 @@ impl<'ctx> EbpfContext<'ctx> {
     pub fn generate_backtrace_instruction(&mut self, depth: u8) -> Result<()> {
         info!("Generating Backtrace instruction: depth={}", depth);
 
-        let inst_buffer = self.create_instruction_buffer();
-
-        // Avoid memset; global instruction buffer is zero-initialized
-        let inst_size = self.context.i64_type().const_int(
-            (std::mem::size_of::<BacktraceData>()
-                + std::mem::size_of::<ghostscope_protocol::trace_event::InstructionHeader>())
+        // Reserve space directly for Backtrace instruction
+        let inst_buffer = self.reserve_instruction_region(
+            (std::mem::size_of::<InstructionHeader>() + std::mem::size_of::<BacktraceData>())
                 as u64,
-            false,
         );
 
-        // Send via ringbuf
-        self.send_instruction_via_ringbuf(inst_buffer, inst_size)
-    }
+        // Write InstructionHeader.inst_type
+        let inst_type_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    inst_buffer,
+                    &[self.context.i32_type().const_int(
+                        std::mem::offset_of!(InstructionHeader, inst_type) as u64,
+                        false,
+                    )],
+                    "bt_inst_type_ptr",
+                )
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get inst_type GEP: {e}")))?
+        };
+        let inst_type_val = self
+            .context
+            .i8_type()
+            .const_int(InstructionType::Backtrace as u64, false);
+        self.builder
+            .build_store(inst_type_ptr, inst_type_val)
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store inst_type: {e}")))?;
 
-    /// Send instruction via ringbuf using bpf_ringbuf_output
-    fn send_instruction_via_ringbuf(
-        &mut self,
-        inst_ptr: PointerValue<'ctx>,
-        inst_size: IntValue<'ctx>,
-    ) -> Result<()> {
-        info!("Sending instruction via ringbuf (size: {:?})", inst_size);
+        // Write InstructionHeader.data_length (u16)
+        let data_length_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    inst_buffer,
+                    &[self.context.i32_type().const_int(
+                        std::mem::offset_of!(InstructionHeader, data_length) as u64,
+                        false,
+                    )],
+                    "bt_data_length_ptr",
+                )
+                .map_err(|e| {
+                    CodeGenError::LLVMError(format!("Failed to get data_length GEP: {e}"))
+                })?
+        };
+        let data_length_i16_ptr = self
+            .builder
+            .build_pointer_cast(
+                data_length_ptr,
+                self.context.ptr_type(AddressSpace::default()),
+                "bt_data_length_i16_ptr",
+            )
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast data_length ptr: {e}")))?;
+        let dl_val = self
+            .context
+            .i16_type()
+            .const_int(std::mem::size_of::<BacktraceData>() as u64, false);
+        self.builder
+            .build_store(data_length_i16_ptr, dl_val)
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_length: {e}")))?;
 
-        // Convert IntValue to u64 for the ringbuf output call
-        let size_value = inst_size.get_zero_extended_constant().ok_or_else(|| {
-            CodeGenError::LLVMError("Failed to get instruction size as constant".to_string())
-        })?;
-
-        // Call the actual bpf_ringbuf_output helper function
-        self.write_to_accumulation_buffer_or_send(inst_ptr, size_value)
-            .map_err(|e| CodeGenError::LLVMError(format!("Ringbuf output failed: {e}")))?;
-
-        debug!("Successfully queued instruction for ringbuf output");
+        // Already accumulated; EndInstruction will send the whole event. Depth currently unused at BPF level.
         Ok(())
     }
 
@@ -3940,8 +3955,6 @@ impl<'ctx> EbpfContext<'ctx> {
         }
     }
 
-    // removed legacy process_complex_variable_print — unified resolver path is used
-
     /// Generate PrintComplexVariable instruction and copy data at runtime using probe_read_user
     fn generate_print_complex_variable_runtime(
         &mut self,
@@ -3959,8 +3972,7 @@ impl<'ctx> EbpfContext<'ctx> {
             eval = ?eval_result,
             "generate_print_complex_variable_runtime: begin"
         );
-        // Create instruction buffer
-        let inst_buffer = self.create_instruction_buffer();
+        // Compute sizes first, then reserve instruction region directly in accumulation buffer
 
         // Compute sizes
         let access_path_bytes = meta.access_path.as_bytes();
@@ -3987,7 +3999,10 @@ impl<'ctx> EbpfContext<'ctx> {
             "generate_print_complex_variable_runtime: sizes computed"
         );
 
-        // Avoid memset; global buffer is zero-initialized
+        // Reserve space now that sizes are known
+        let inst_buffer = self.reserve_instruction_region(total_size as u64);
+
+        // Avoid memset; reserved map value bytes are zero-initialized
 
         // Write InstructionHeader.inst_type at offset 0
         let inst_type_val = self
@@ -4456,16 +4471,7 @@ impl<'ctx> EbpfContext<'ctx> {
         // Continue
         self.builder.position_at_end(cont_block);
 
-        // Send the instruction via ringbuf
-        self.send_instruction_via_ringbuf(
-            inst_buffer,
-            self.context.i64_type().const_int(total_size as u64, false),
-        )?;
-        tracing::trace!(
-            total_size,
-            "generate_print_complex_variable_runtime: sent via ringbuf"
-        );
-
+        // Already accumulated; EndInstruction will send the whole event
         Ok(())
     }
 }
