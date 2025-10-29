@@ -29,6 +29,8 @@ pub struct MergedConfig {
     pub layout_mode: LayoutMode,
     pub default_focus: crate::config::PanelType,
     pub panel_ratios: [u16; 3],
+    pub show_source_panel: bool,
+    pub two_panel_ratios: [u16; 2],
     pub history_enabled: bool,
     pub history_max_entries: usize,
     pub ebpf_max_messages: usize,
@@ -137,6 +139,22 @@ impl MergedConfig {
             config.files.save_ast.release
         };
 
+        // Determine source panel visibility: CLI overrides config
+        let show_source_panel = if args.no_source_panel {
+            false
+        } else if args.source_panel {
+            true
+        } else {
+            config.ui.show_source_panel
+        };
+
+        // Determine two-panel ratios when source hidden
+        let two_panel_ratios = if let Some(r) = config.ui.two_panel_ratios {
+            r
+        } else {
+            [config.ui.panel_ratios[1], config.ui.panel_ratios[2]]
+        };
+
         Self {
             binary_path: args.binary_path,
             target_path: args.target_path,
@@ -156,6 +174,8 @@ impl MergedConfig {
             layout_mode: args.layout_mode, // Command line takes priority
             default_focus: config.ui.default_focus, // UI config from file
             panel_ratios: config.ui.panel_ratios, // UI config from file
+            show_source_panel,
+            two_panel_ratios,
             history_enabled: config.ui.history.enabled,
             history_max_entries: config.ui.history.max_entries,
             ebpf_max_messages: config.ui.ebpf_max_messages,
@@ -216,6 +236,8 @@ impl MergedConfig {
                 LayoutMode::Vertical => ghostscope_ui::LayoutMode::Vertical,
             },
             panel_ratios: self.panel_ratios,
+            show_source_panel: self.show_source_panel,
+            two_panel_ratios: self.two_panel_ratios,
             default_focus: match self.default_focus {
                 crate::config::PanelType::Source => ghostscope_ui::PanelType::Source,
                 crate::config::PanelType::EbpfInfo => ghostscope_ui::PanelType::EbpfInfo,

@@ -186,6 +186,8 @@ async fn main() -> Result<()> {
         force_perf_event_array: merged_config.ebpf_config.force_perf_event_array,
         enable_sysmon_for_shared_lib: merged_config.ebpf_config.enable_sysmon_for_shared_lib,
         allow_loose_debug_match: merged_config.dwarf_allow_loose_debug_match,
+        source_panel: false,
+        no_source_panel: false,
     };
     temp_args.validate()?;
 

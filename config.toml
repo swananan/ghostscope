@@ -104,11 +104,20 @@ layout = "Horizontal"
 # Default: "InteractiveCommand"
 default_focus = "InteractiveCommand"
 
+# Show or hide the source panel (can also be controlled via CLI --source-panel/--no-source-panel, or UI command 'ui source on/off')
+# Default: true
+show_source_panel = true
+
 # Panel size ratios [Source, EbpfInfo, InteractiveCommand]
 # These are relative ratios, e.g., [4, 3, 3] means Source gets 40%, others get 30% each
 # Must be an array of 3 positive numbers
 # Default: [4, 3, 3]
 panel_ratios = [3, 3, 3]
+
+# Two-panel ratios [EbpfInfo, InteractiveCommand] used when source panel is hidden
+# If not set, falls back to the last two values of panel_ratios (e.g., 4:3:3 -> 3:3)
+# Default: not set (fallback to panel_ratios)
+# two_panel_ratios = [3, 3]
 
 # Maximum number of eBPF trace messages to keep in the output panel
 # Older messages are automatically discarded when this limit is reached

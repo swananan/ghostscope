@@ -135,6 +135,14 @@ pub struct Args {
     #[arg(long = "enable-sysmon-shared-lib", action = clap::ArgAction::SetTrue)]
     pub enable_sysmon_shared_lib: bool,
 
+    /// Show the source panel explicitly (overrides config)
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub source_panel: bool,
+
+    /// Hide the source panel (overrides config)
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub no_source_panel: bool,
+
     /// Remaining arguments (when using --args)
     pub remaining: Vec<String>,
 }
@@ -163,6 +171,8 @@ pub struct ParsedArgs {
     pub force_perf_event_array: bool,
     pub enable_sysmon_for_shared_lib: bool,
     pub allow_loose_debug_match: bool,
+    pub source_panel: bool,
+    pub no_source_panel: bool,
 }
 
 impl Args {
@@ -225,6 +235,8 @@ impl Args {
                 force_perf_event_array: parsed.force_perf_event_array,
                 enable_sysmon_for_shared_lib: parsed.enable_sysmon_shared_lib,
                 allow_loose_debug_match: parsed.allow_loose_debug_match,
+                source_panel: parsed.source_panel,
+                no_source_panel: parsed.no_source_panel,
             }
         } else {
             // Normal parsing without --args
@@ -266,6 +278,8 @@ impl Args {
                 force_perf_event_array: parsed.force_perf_event_array,
                 enable_sysmon_for_shared_lib: parsed.enable_sysmon_shared_lib,
                 allow_loose_debug_match: parsed.allow_loose_debug_match,
+                source_panel: parsed.source_panel,
+                no_source_panel: parsed.no_source_panel,
             }
         }
     }

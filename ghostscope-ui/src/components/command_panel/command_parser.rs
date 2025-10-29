@@ -32,6 +32,11 @@ impl CommandParser {
             }];
         }
 
+        // Handle UI commands
+        if let Some(actions) = Self::parse_ui_command(cmd) {
+            return actions;
+        }
+
         // Handle sync commands (enable/disable/delete)
         if let Some(actions) = Self::parse_sync_command(state, cmd) {
             return actions;
@@ -162,10 +167,11 @@ impl CommandParser {
     /// Format comprehensive help message
     fn format_help_message() -> String {
         format!(
-            "📘 Ghostscope Commands:\n\n{}\n\n{}\n\n{}\n\n{}\n\n{}\n\n{}",
+            "📘 Ghostscope Commands:\n\n{}\n\n{}\n\n{}\n\n{}\n\n{}\n\n{}\n\n{}",
             Self::format_tracing_commands(),
             Self::format_info_commands(),
             Self::format_srcpath_commands(),
+            Self::format_ui_commands(),
             Self::format_control_commands(),
             Self::format_navigation_commands(),
             Self::format_general_commands()
@@ -193,6 +199,8 @@ impl CommandParser {
         lines.push(Line::from(""));
         lines.extend(Self::format_section_styled(&Self::format_srcpath_commands()));
         lines.push(Line::from(""));
+        lines.extend(Self::format_section_styled(&Self::format_ui_commands()));
+        lines.push(Line::from(""));
         lines.extend(Self::format_section_styled(&Self::format_control_commands()));
         lines.push(Line::from(""));
         lines.extend(Self::format_section_styled(
@@ -214,7 +222,7 @@ impl CommandParser {
             }
             if matches!(
                 raw.chars().next(),
-                Some('📊' | '🔍' | '🗂' | '⚙' | '🧭' | '🔧')
+                Some('📊' | '🔍' | '🗂' | '⚙' | '🧭' | '🔧' | '🖥')
             ) {
                 out.push(
                     StyledLineBuilder::new()
@@ -532,6 +540,19 @@ impl CommandParser {
         .join("\n")
     }
 
+    /// Format UI control commands
+    fn format_ui_commands() -> String {
+        [
+            "🖥 UI Controls:",
+            "  ui source on         - Enable source panel",
+            "  ui source off        - Disable source panel (keep eBPF & command panels)",
+            "",
+            "  💡 No source available? Use 'ui source off', or start with --no-source-panel,",
+            "     or set [ui].show_source_panel=false in config.",
+        ]
+        .join("\n")
+    }
+
     /// Format navigation command section
     fn format_navigation_commands() -> String {
         [
@@ -583,6 +604,7 @@ impl CommandParser {
             "delete",
             "save",
             "source",
+            "ui",
             "info",
             "help",
             "clear",
@@ -603,6 +625,9 @@ impl CommandParser {
             // Stop subcommands
             "stop output",
             "stop session",
+            // UI
+            "ui source on",
+            "ui source off",
             // Info subcommands
             "info file",
             "info trace",
@@ -1164,6 +1189,38 @@ impl CommandParser {
                         )
                         .build(),
                 ];
+                Some(vec![Action::AddResponseWithStyle {
+                    content: plain,
+                    styled_lines: Some(styled),
+                    response_type: ResponseType::Error,
+                }])
+            }
+        }
+    }
+
+    /// Parse UI control commands
+    fn parse_ui_command(command: &str) -> Option<Vec<Action>> {
+        if !command.starts_with("ui ") {
+            return None;
+        }
+
+        let parts: Vec<&str> = command.split_whitespace().collect();
+        if parts.len() < 3 {
+            let plain = "Usage: ui source <on|off>".to_string();
+            let styled = Self::styled_usage(&plain);
+            return Some(vec![Action::AddResponseWithStyle {
+                content: plain,
+                styled_lines: Some(styled),
+                response_type: ResponseType::Error,
+            }]);
+        }
+
+        match (parts[1], parts[2]) {
+            ("source", "on") => Some(vec![Action::SetSourcePanelVisibility(true)]),
+            ("source", "off") => Some(vec![Action::SetSourcePanelVisibility(false)]),
+            _ => {
+                let plain = "Usage: ui source <on|off>".to_string();
+                let styled = Self::styled_usage(&plain);
                 Some(vec![Action::AddResponseWithStyle {
                     content: plain,
                     styled_lines: Some(styled),

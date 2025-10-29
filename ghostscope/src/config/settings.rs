@@ -203,6 +203,13 @@ pub struct UiConfigToml {
     /// Panel size ratios [Source, EbpfInfo, InteractiveCommand]
     #[serde(default = "default_panel_ratios")]
     pub panel_ratios: [u16; 3],
+    /// Whether to show the source panel (can be overridden by CLI and UI command)
+    #[serde(default = "default_show_source_panel")]
+    pub show_source_panel: bool,
+    /// Two-panel ratios [EbpfInfo, InteractiveCommand] used when source panel is hidden
+    /// If not set, fallback to the last two values of panel_ratios
+    #[serde(default)]
+    pub two_panel_ratios: Option<[u16; 2]>,
     /// Command history configuration
     #[serde(default)]
     pub history: HistoryConfigToml,
@@ -308,6 +315,10 @@ fn default_release_save() -> bool {
 
 fn default_panel_ratios() -> [u16; 3] {
     [4, 3, 3] // Source, EbpfInfo, InteractiveCommand
+}
+
+fn default_show_source_panel() -> bool {
+    true
 }
 
 fn default_history_enabled() -> bool {
@@ -452,6 +463,8 @@ impl Default for UiConfigToml {
             layout: default_layout(),
             default_focus: PanelType::default(),
             panel_ratios: default_panel_ratios(),
+            show_source_panel: default_show_source_panel(),
+            two_panel_ratios: None,
             history: HistoryConfigToml::default(),
             ebpf_max_messages: default_ebpf_max_messages(),
         }
@@ -572,6 +585,39 @@ impl Config {
                                         Panel ratio for {} panel (index {}) is 0, which would hide the panel.\n\n\
                                         💡 Fix: Change the 0 to a positive number (e.g., 1) in your config file:\n\
                                         panel_ratios = [4, 3, 3]  # Example with all positive values\n\n\
+                                        Valid values are positive integers representing relative sizes.",
+                                        file_path,
+                                        panel_names.get(i).unwrap_or(&"Unknown"),
+                                        i
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Validate two_panel_ratios if present
+        if let Some(two_panel_ratios_line) = content.lines().find(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with("two_panel_ratios") && trimmed.contains('=')
+        }) {
+            if let Some(array_part) = two_panel_ratios_line.split('=').nth(1) {
+                let array_str = array_part.trim();
+                if array_str.starts_with('[') && array_str.ends_with(']') {
+                    let inner = &array_str[1..array_str.len() - 1];
+                    let numbers: Vec<&str> = inner.split(',').map(|s| s.trim()).collect();
+                    if numbers.len() == 2 {
+                        for (i, num_str) in numbers.iter().enumerate() {
+                            if let Ok(num) = num_str.parse::<u16>() {
+                                if num == 0 {
+                                    let panel_names = ["EbpfInfo", "InteractiveCommand"];
+                                    return Err(anyhow::anyhow!(
+                                        "❌ Invalid panel configuration in '{}':\n\n\
+                                        two_panel_ratios for {} (index {}) is 0, which would hide the panel.\n\n\
+                                        💡 Fix: Change the 0 to a positive number (e.g., 1) in your config file:\n\
+                                        two_panel_ratios = [3, 3]  # Example with all positive values\n\n\
                                         Valid values are positive integers representing relative sizes.",
                                         file_path,
                                         panel_names.get(i).unwrap_or(&"Unknown"),

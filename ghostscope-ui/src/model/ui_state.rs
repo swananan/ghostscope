@@ -29,6 +29,8 @@ impl Default for HistoryConfig {
 pub struct UiConfig {
     pub layout_mode: LayoutMode,
     pub panel_ratios: [u16; 3], // [Source, EbpfInfo, InteractiveCommand]
+    pub show_source_panel: bool,
+    pub two_panel_ratios: [u16; 2], // [EbpfInfo, InteractiveCommand] when source hidden
     pub default_focus: crate::action::PanelType,
     pub history: HistoryConfig,
     pub ebpf_max_messages: usize,
@@ -44,9 +46,18 @@ pub struct UIState {
 
 impl UIState {
     pub fn new(ui_config: UiConfig) -> Self {
+        // If source panel is hidden but default focus is Source, fallback to InteractiveCommand
+        let effective_default = if !ui_config.show_source_panel
+            && matches!(ui_config.default_focus, PanelType::Source)
+        {
+            PanelType::InteractiveCommand
+        } else {
+            ui_config.default_focus
+        };
+
         Self {
             layout: LayoutState::new(ui_config.layout_mode),
-            focus: FocusState::new_with_default(ui_config.default_focus),
+            focus: FocusState::new_with_default(effective_default),
             config: ui_config,
         }
     }
@@ -56,6 +67,8 @@ impl UIState {
         Self::new(UiConfig {
             layout_mode,
             panel_ratios: [4, 3, 3], // Default ratios
+            show_source_panel: true,
+            two_panel_ratios: [3, 3],
             default_focus: crate::action::PanelType::InteractiveCommand,
             history: HistoryConfig::default(),
             ebpf_max_messages: 2000, // Default value
@@ -110,19 +123,21 @@ impl FocusState {
         }
     }
 
-    pub fn cycle_next(&mut self) {
-        self.current_panel = match self.current_panel {
-            PanelType::Source => PanelType::EbpfInfo,
-            PanelType::EbpfInfo => PanelType::InteractiveCommand,
-            PanelType::InteractiveCommand => PanelType::Source,
+    pub fn cycle_next(&mut self, source_enabled: bool) {
+        self.current_panel = match (self.current_panel, source_enabled) {
+            (PanelType::Source, _) => PanelType::EbpfInfo,
+            (PanelType::EbpfInfo, _) => PanelType::InteractiveCommand,
+            (PanelType::InteractiveCommand, true) => PanelType::Source,
+            (PanelType::InteractiveCommand, false) => PanelType::EbpfInfo,
         };
     }
 
-    pub fn cycle_previous(&mut self) {
-        self.current_panel = match self.current_panel {
-            PanelType::Source => PanelType::InteractiveCommand,
-            PanelType::EbpfInfo => PanelType::Source,
-            PanelType::InteractiveCommand => PanelType::EbpfInfo,
+    pub fn cycle_previous(&mut self, source_enabled: bool) {
+        self.current_panel = match (self.current_panel, source_enabled) {
+            (PanelType::Source, _) => PanelType::InteractiveCommand,
+            (PanelType::EbpfInfo, true) => PanelType::Source,
+            (PanelType::EbpfInfo, false) => PanelType::InteractiveCommand,
+            (PanelType::InteractiveCommand, _) => PanelType::EbpfInfo,
         };
     }
 
@@ -138,6 +153,7 @@ impl FocusState {
         &mut self,
         direction: crate::action::WindowDirection,
         layout_mode: LayoutMode,
+        source_enabled: bool,
     ) {
         use crate::action::WindowDirection;
 
@@ -145,19 +161,21 @@ impl FocusState {
             LayoutMode::Horizontal => {
                 match direction {
                     WindowDirection::Left => {
-                        // Source <- EbpfInfo <- InteractiveCommand (with wrapping)
-                        self.current_panel = match self.current_panel {
-                            PanelType::InteractiveCommand => PanelType::EbpfInfo,
-                            PanelType::EbpfInfo => PanelType::Source,
-                            PanelType::Source => PanelType::InteractiveCommand, // Wrap to rightmost
+                        // Left motion
+                        self.current_panel = match (self.current_panel, source_enabled) {
+                            (PanelType::InteractiveCommand, _) => PanelType::EbpfInfo,
+                            (PanelType::EbpfInfo, true) => PanelType::Source,
+                            (PanelType::EbpfInfo, false) => PanelType::InteractiveCommand,
+                            (PanelType::Source, _) => PanelType::InteractiveCommand, // Wrap to rightmost
                         };
                     }
                     WindowDirection::Right => {
-                        // Source -> EbpfInfo -> InteractiveCommand (with wrapping)
-                        self.current_panel = match self.current_panel {
-                            PanelType::Source => PanelType::EbpfInfo,
-                            PanelType::EbpfInfo => PanelType::InteractiveCommand,
-                            PanelType::InteractiveCommand => PanelType::Source, // Wrap to leftmost
+                        // Right motion
+                        self.current_panel = match (self.current_panel, source_enabled) {
+                            (PanelType::Source, _) => PanelType::EbpfInfo,
+                            (PanelType::EbpfInfo, _) => PanelType::InteractiveCommand,
+                            (PanelType::InteractiveCommand, true) => PanelType::Source, // Wrap to leftmost
+                            (PanelType::InteractiveCommand, false) => PanelType::EbpfInfo,
                         };
                     }
                     _ => {} // Up/Down not relevant in horizontal layout
@@ -166,19 +184,19 @@ impl FocusState {
             LayoutMode::Vertical => {
                 match direction {
                     WindowDirection::Up => {
-                        // Source up from EbpfInfo up from InteractiveCommand (with wrapping)
-                        self.current_panel = match self.current_panel {
-                            PanelType::InteractiveCommand => PanelType::EbpfInfo,
-                            PanelType::EbpfInfo => PanelType::Source,
-                            PanelType::Source => PanelType::InteractiveCommand, // Wrap to bottom
+                        self.current_panel = match (self.current_panel, source_enabled) {
+                            (PanelType::InteractiveCommand, _) => PanelType::EbpfInfo,
+                            (PanelType::EbpfInfo, true) => PanelType::Source,
+                            (PanelType::EbpfInfo, false) => PanelType::InteractiveCommand,
+                            (PanelType::Source, _) => PanelType::InteractiveCommand, // Wrap to bottom
                         };
                     }
                     WindowDirection::Down => {
-                        // Source down to EbpfInfo down to InteractiveCommand (with wrapping)
-                        self.current_panel = match self.current_panel {
-                            PanelType::Source => PanelType::EbpfInfo,
-                            PanelType::EbpfInfo => PanelType::InteractiveCommand,
-                            PanelType::InteractiveCommand => PanelType::Source, // Wrap to top
+                        self.current_panel = match (self.current_panel, source_enabled) {
+                            (PanelType::Source, _) => PanelType::EbpfInfo,
+                            (PanelType::EbpfInfo, _) => PanelType::InteractiveCommand,
+                            (PanelType::InteractiveCommand, true) => PanelType::Source, // Wrap to top
+                            (PanelType::InteractiveCommand, false) => PanelType::EbpfInfo,
                         };
                     }
                     _ => {} // Left/Right not relevant in vertical layout

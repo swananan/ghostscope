@@ -858,3 +858,26 @@ Common error messages and their meanings:
 - [TUI Reference Guide](tui-reference.md) - Complete keyboard shortcuts and panel operations
 - [Script Language Reference](scripting.md) - Trace script syntax
 - [Quick Tutorial](tutorial.md) - Getting started guide
+---
+
+## 🖥 UI Controls
+
+Commands to adjust UI during runtime.
+
+### ui source - Toggle Source Panel
+
+**Syntax:**
+```
+ui source <on|off>
+```
+
+**Description:**
+- `ui source off`: Hide the Source panel and keep only eBPF Output + Command panels. Useful when source code is unavailable on the machine.
+- `ui source on`: Show the Source panel again. When turned on, GhostScope will request source code immediately.
+
+**Tip:** You can also control this via CLI or config:
+- CLI: `--no-source-panel` (hide) / `--source-panel` (show)
+- Config: `[ui].show_source_panel=false`
+
+**Layout Ratio:**
+- When the Source panel is hidden, the two remaining panels follow `[ui].two_panel_ratios` if set; otherwise they fall back to the last two values of `[ui].panel_ratios` (example: `4:3:3` → `3:3`).

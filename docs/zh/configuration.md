@@ -117,6 +117,10 @@ ghostscope --no-save-ast
 # 设置 TUI 布局模式
 ghostscope --layout horizontal  # 面板横向排列（默认）
 ghostscope --layout vertical    # 面板纵向排列
+
+# 显示/隐藏源码面板（当没有源码环境时非常有用）
+ghostscope --no-source-panel    # 隐藏源码面板；仅保留 eBPF 输出 + 命令交互
+ghostscope --source-panel       # 显示源码面板
 ```
 
 ### 高级 eBPF 选项
@@ -155,6 +159,8 @@ ghostscope --enable-sysmon-shared-lib
 | `--save-ast` | | 保存 AST 文件 | Debug: 开, Release: 关 |
 | `--no-save-ast` | | 不保存 AST | - |
 | `--layout <MODE>` | | TUI 布局模式 | horizontal |
+| `--no-source-panel` | | 隐藏源码面板（两面板布局） | 关 |
+| `--source-panel` | | 显示源码面板 | 开 |
 | `--config <PATH>` | | 自定义配置文件 | 自动检测 |
 | `--force-perf-event-array` | | 强制 PerfEventArray（测试） | 关 |
 | `--enable-sysmon-shared-lib` | | -t 目标为共享库时，支持全局变量探测 | 关 |
@@ -247,9 +253,16 @@ layout = "Horizontal"
 # 默认焦点面板：Source, EbpfInfo, 或 InteractiveCommand
 default_focus = "InteractiveCommand"
 
+# 是否显示源码面板（也可通过命令行 --source-panel/--no-source-panel，或在 UI 命令面板中使用 'ui source on/off' 控制）
+show_source_panel = true
+
 # 面板大小比例 [Source, EbpfInfo, InteractiveCommand]
 # 必须是 3 个正整数
 panel_ratios = [4, 3, 3]
+
+# 当源码面板被隐藏时的两面板比例 [EbpfInfo, InteractiveCommand]
+# 若未设置，则回退为 panel_ratios 的后两项（例如 4:3:3 -> 3:3，即 1:1）
+# two_panel_ratios = [3, 3]
 
 # eBPF 输出面板保留的最大跟踪消息数量
 # 超过限制时，旧消息会自动丢弃

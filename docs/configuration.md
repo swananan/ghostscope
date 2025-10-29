@@ -117,6 +117,10 @@ ghostscope --no-save-ast
 # Set TUI layout mode
 ghostscope --layout horizontal  # Panels side by side (default)
 ghostscope --layout vertical    # Panels top to bottom
+
+# Show/hide source panel (useful when source code is unavailable)
+ghostscope --no-source-panel    # Hide source panel; keep eBPF output + command panels
+ghostscope --source-panel       # Show source panel
 ```
 
 ### Advanced eBPF Options
@@ -155,6 +159,8 @@ ghostscope --enable-sysmon-shared-lib
 | `--save-ast` | | Save AST files | Debug: on, Release: off |
 | `--no-save-ast` | | Don't save AST | - |
 | `--layout <MODE>` | | TUI layout mode | horizontal |
+| `--no-source-panel` | | Hide source panel (two-panel layout) | Off |
+| `--source-panel` | | Show source panel | On |
 | `--config <PATH>` | | Custom config file | Auto-detect |
 | `--force-perf-event-array` | | Force PerfEventArray (testing) | Off |
 | `--enable-sysmon-shared-lib` | | Start sysmon for -t shared library, so global variables can be traced | Off |
@@ -250,9 +256,17 @@ layout = "Horizontal"
 # Default focused panel: Source, EbpfInfo, or InteractiveCommand
 default_focus = "InteractiveCommand"
 
+# Show or hide the source panel (can also be controlled via CLI --source-panel/--no-source-panel,
+# or via UI command 'ui source on/off')
+show_source_panel = true
+
 # Panel size ratios [Source, EbpfInfo, InteractiveCommand]
 # Must be 3 positive (non-zero) integers
 panel_ratios = [4, 3, 3]
+
+# Two-panel ratios [EbpfInfo, InteractiveCommand] used when source panel is hidden
+# If not set, it falls back to the last two values of panel_ratios (e.g., 4:3:3 -> 3:3)
+# two_panel_ratios = [3, 3]
 
 # Maximum number of eBPF trace messages to keep in the output panel
 # Older messages are automatically discarded when this limit is reached

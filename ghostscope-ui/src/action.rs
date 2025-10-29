@@ -112,6 +112,9 @@ pub enum Action {
 
     // Internal actions
     NoOp, // No operation - used to prevent event fallback without side effects
+
+    // UI configuration actions
+    SetSourcePanelVisibility(bool),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
