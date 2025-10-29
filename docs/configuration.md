@@ -125,6 +125,11 @@ ghostscope --layout vertical    # Panels top to bottom
 # Force PerfEventArray mode (for testing only)
 # WARNING: Testing purposes only. Forces PerfEventArray even on kernels >= 5.8
 ghostscope --force-perf-event-array
+
+# Start sysmon for -t when target is a shared library (.so)
+# WARNING: Attaches system-wide sched tracepoints (exec/fork/exit) and may add
+# overhead on hosts with high process churn. Default is OFF.
+ghostscope --enable-sysmon-shared-lib
 ```
 
 ### Complete Command Reference
@@ -152,6 +157,7 @@ ghostscope --force-perf-event-array
 | `--layout <MODE>` | | TUI layout mode | horizontal |
 | `--config <PATH>` | | Custom config file | Auto-detect |
 | `--force-perf-event-array` | | Force PerfEventArray (testing) | Off |
+| `--enable-sysmon-shared-lib` | | Start sysmon for -t shared library, so global variables can be traced | Off |
 | `--args <PROGRAM> [ARGS...]` | | Launch program with args | None |
 
 ## Configuration File
@@ -315,6 +321,12 @@ max_trace_event_size = 32768
 # even on kernels that support RingBuf (>= 5.8). PerfEventArray has performance
 # overhead compared to RingBuf and should only be used for compatibility testing.
 force_perf_event_array = false  # Default (auto-detect based on kernel version)
+
+# Start sysmon eBPF for -t when the target is a shared library (.so).
+# Maintains ASLR offsets for late-start processes loading the library.
+# This enables system-wide sched tracepoints and may impact performance
+# when process churn is high.
+enable_sysmon_for_shared_lib = false  # Default
 ```
 
 ### Configuration Examples

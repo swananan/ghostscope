@@ -42,6 +42,7 @@ gimli = { git = "https://github.com/gimli-rs/gimli", rev = "0c2a60c00792b4d3c313
 aya = { git = "https://github.com/aya-rs/aya", rev = "9261554e3c6ca37e401ec23a287a1ddf9cb1f26d" }
 aya-obj = { git = "https://github.com/aya-rs/aya", rev = "9261554e3c6ca37e401ec23a287a1ddf9cb1f26d" }
 aya-ebpf-bindings = { git = "https://github.com/aya-rs/aya", rev = "9261554e3c6ca37e401ec23a287a1ddf9cb1f26d" }
+aya-build = { git = "https://github.com/aya-rs/aya", rev = "9261554e3c6ca37e401ec23a287a1ddf9cb1f26d" }
 
 # Test dependencies
 tempfile = "3.8"

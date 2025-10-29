@@ -171,6 +171,12 @@ pub struct EbpfConfig {
     /// Default: 32768 bytes (32KB). Increase for larger formatted prints.
     #[serde(default = "default_max_trace_event_size")]
     pub max_trace_event_size: u32,
+    /// Start sysmon eBPF for -t when the target is a shared library (.so).
+    /// Maintains ASLR offsets for late-start processes loading the library.
+    /// WARNING: This enables system-wide sched tracepoints and may impact
+    /// performance on hosts with high process churn. Default: false.
+    #[serde(default = "default_enable_sysmon_for_shared_lib")]
+    pub enable_sysmon_for_shared_lib: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -277,6 +283,10 @@ fn default_compare_cap() -> u32 {
     64
 }
 
+fn default_enable_sysmon_for_shared_lib() -> bool {
+    false
+}
+
 fn default_save_option() -> SaveOption {
     SaveOption {
         debug: true,
@@ -344,6 +354,7 @@ impl Default for EbpfConfig {
             mem_dump_cap: default_mem_dump_cap(),
             compare_cap: default_compare_cap(),
             max_trace_event_size: default_max_trace_event_size(),
+            enable_sysmon_for_shared_lib: default_enable_sysmon_for_shared_lib(),
         }
     }
 }

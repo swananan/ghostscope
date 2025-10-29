@@ -109,6 +109,39 @@ docker build -t ghostscope-builder:ubuntu20.04 .
 
 **注意**：开发过程中默认使用 debug 构建，以获得更快的迭代速度和更好的调试体验。
 
+
+### Sysmon eBPF（已预编译）与脚本使用
+
+仓库内已预编译并提交了 sysmon 的 eBPF 字节码（同时包含大小端）。正常开发与使用场景下，无需自行编译 sysmon。构建时，`ghostscope-process/build.rs` 会将预编译产物从 `ghostscope-process/ebpf/obj` 拷贝到 crate 的 `OUT_DIR`，运行时会根据宿主机端序自动选择对应的对象文件。
+
+- 预编译产物（已提交）：
+  - `ghostscope-process/ebpf/obj/sysmon-bpf.bpfel.o`（小端）
+  - `ghostscope-process/ebpf/obj/sysmon-bpf.bpfeb.o`（大端）
+- 构建脚本行为：若文件缺失或无效，sysmon 只会打印告警，不会导致构建失败。
+
+仅当你需要修改 sysmon eBPF 程序本身，或为特定平台/兼容性需求重新生成字节码时，才需要手动重新编译。
+
+#### 重新编译 sysmon eBPF
+
+使用辅助脚本：
+
+```
+./ghostscope-process/ebpf/build_sysmon_bpf.sh
+```
+
+可选环境变量：
+
+- `TOOLCHAIN` — BPF 构建所用的 Rust 工具链（默认：`nightly-2024-07-01`）
+- `TARGET` — `bpfel-unknown-none`、`bpfeb-unknown-none` 或 `both`（默认：`both`）
+- `SKIP_RUST_SRC` — 置为 `1` 时跳过安装 `rust-src`
+
+输出文件位于：
+
+- `ghostscope-process/ebpf/obj/sysmon-bpf.bpfel.o`
+- `ghostscope-process/ebpf/obj/sysmon-bpf.bpfeb.o`
+
+重新编译后，正常工作区构建会自动拾取这些新产物（由构建脚本复制到 `OUT_DIR`）。
+
 ## 测试
 
 ### 集成测试和 UT

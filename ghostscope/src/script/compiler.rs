@@ -61,19 +61,23 @@ async fn create_and_attach_loader(
 
     // In -t mode (no target_pid), perform module prefill once per session and apply to this loader
     if target_pid.is_none() {
-        let prefilled = session
-            .coordinator
-            .ensure_prefill_module(&config.binary_path)
-            .unwrap_or(0);
+        let (prefilled, entries) = {
+            let mut coordinator = session
+                .coordinator
+                .lock()
+                .expect("coordinator mutex poisoned");
+            let prefilled = coordinator
+                .ensure_prefill_module(&config.binary_path)
+                .unwrap_or(0);
+            let entries = coordinator.cached_offsets_for_module(&config.binary_path);
+            (prefilled, entries)
+        };
         tracing::info!(
             "Coordinator cached offsets for {} pid(s) for module {}",
             prefilled,
             config.binary_path
         );
         // Apply cached offsets for this module to the loader's map
-        let entries = session
-            .coordinator
-            .cached_offsets_for_module(&config.binary_path);
         if !entries.is_empty() {
             use ghostscope_process::maps::ProcModuleOffsetsValue;
             // Group by pid for efficient batch insert
@@ -265,7 +269,14 @@ pub async fn compile_and_load_script_for_tui(
 
     // Ensure -p offsets are cached once per session
     if let Some(pid) = session.target_pid {
-        match session.coordinator.ensure_prefill_pid(pid) {
+        let result = {
+            let mut coordinator = session
+                .coordinator
+                .lock()
+                .expect("coordinator mutex poisoned");
+            coordinator.ensure_prefill_pid(pid)
+        };
+        match result {
             Ok(count) => info!(
                 "Coordinator cached {} module offset entries for PID {}",
                 count, pid
@@ -308,7 +319,14 @@ pub async fn compile_and_load_script_for_tui(
                 Ok(loader) => {
                     // Apply cached offsets for this PID to the loader (if available)
                     if let Some(pid) = session.target_pid {
-                        if let Some(items) = session.coordinator.cached_offsets_pairs_for_pid(pid) {
+                        let items = {
+                            let coordinator = session
+                                .coordinator
+                                .lock()
+                                .expect("coordinator mutex poisoned");
+                            coordinator.cached_offsets_pairs_for_pid(pid)
+                        };
+                        if let Some(items) = items {
                             use ghostscope_process::maps::ProcModuleOffsetsValue;
                             let adapted: Vec<(u64, ProcModuleOffsetsValue)> = items
                                 .iter()
@@ -473,7 +491,14 @@ pub async fn compile_and_load_script_for_cli(
 
     // Ensure -p offsets are cached once per session
     if let Some(pid) = session.target_pid {
-        match session.coordinator.ensure_prefill_pid(pid) {
+        let result = {
+            let mut coordinator = session
+                .coordinator
+                .lock()
+                .expect("coordinator mutex poisoned");
+            coordinator.ensure_prefill_pid(pid)
+        };
+        match result {
             Ok(count) => info!(
                 "Coordinator cached {} module offset entries for PID {}",
                 count, pid
@@ -577,7 +602,14 @@ pub async fn compile_and_load_script_for_cli(
             Ok(loader) => {
                 // Apply cached offsets for this PID to the loader (if available)
                 if let Some(pid) = session.target_pid {
-                    if let Some(items) = session.coordinator.cached_offsets_pairs_for_pid(pid) {
+                    let items = {
+                        let coordinator = session
+                            .coordinator
+                            .lock()
+                            .expect("coordinator mutex poisoned");
+                        coordinator.cached_offsets_pairs_for_pid(pid)
+                    };
+                    if let Some(items) = items {
                         use ghostscope_process::maps::ProcModuleOffsetsValue;
                         let adapted: Vec<(u64, ProcModuleOffsetsValue)> = items
                             .iter()

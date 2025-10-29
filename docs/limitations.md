@@ -44,6 +44,10 @@ Compiler optimizations (-O2, -O3) can cause variables to be optimized away or ge
 ### 7. Dynamically Loaded Libraries (dlopen)
 GhostScope scans `/proc/PID/maps` at startup to obtain loaded dynamic library information. As long as GhostScope is started after `dlopen`, tracing works normally. Future plans include dynamically monitoring process `dlopen` behavior for better user experience.
 
-### 8. No Global Variables in `-t` Mode
+### 8. Global Variables in `-t` Mode
 
-When using `-t <exec_path>` (start from an executable path), global variables are currently not supported. Resolving global variables at runtime requires ASLR section offsets derived from the target process's `/proc/<pid>/maps` (per-module offsets for `.text/.rodata/.data/.bss`). In `-t` mode there is no known PID context to safely compute and populate these offsets into the eBPF-side map, so global variables are disabled. Use `-p <pid>` mode to enable globals (offsets are computed and populated automatically).
+- **Executable targets**: When `-t` points to an executable (`-t /path/to/app`), GhostScope treats that binary as the primary module and globals are supported by default.
+- **Shared-library targets (existing processes)**: If GhostScope starts after the library has already been mapped (e.g., tracing a running process that loaded `libfoo.so` earlier), globals work without extra steps.
+- **Shared-library targets (new processes)**: For processes that start after GhostScope, enable `--enable-sysmon-shared-lib` (or the matching config option) so globals can be resolved. This incurs extra system-wide work, so expect higher overhead on hosts with frequent process churn.
+
+> **Note**: The current sysmon pipeline still assumes the library is mapped when the exec event is handled; if a loader pulls it in much later, offsets are not retried yet.

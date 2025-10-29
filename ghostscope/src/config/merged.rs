@@ -171,6 +171,10 @@ impl MergedConfig {
                 if args.force_perf_event_array {
                     ebpf_config.force_perf_event_array = true;
                 }
+                // Command line --enable-sysmon-shared-lib overrides config file
+                if args.enable_sysmon_for_shared_lib {
+                    ebpf_config.enable_sysmon_for_shared_lib = true;
+                }
                 ebpf_config
             },
             source: config.source,

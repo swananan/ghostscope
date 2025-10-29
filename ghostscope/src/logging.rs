@@ -40,6 +40,12 @@ pub fn initialize_logging_with_config(
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level.to_string()));
 
+    let event_format = tracing_subscriber::fmt::format()
+        .with_target(true)
+        .with_level(true)
+        .with_source_location(true)
+        .compact();
+
     // Determine log file path: use provided path or default to current directory
     let log_path = match log_file_path {
         Some(path) => PathBuf::from(path),
@@ -57,15 +63,16 @@ pub fn initialize_logging_with_config(
         Ok(log_file) => {
             // Configure file output
             let file_layer = tracing_subscriber::fmt::layer()
-                .with_file(true)
-                .with_line_number(true)
+                .event_format(event_format.clone())
                 .with_writer(log_file)
-                .with_target(true)
                 .with_ansi(false);
 
             if enable_console_logging {
                 // Console logging enabled: dual output to file and stdout with level filter
-                let stdout_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stdout);
+                let stdout_layer = tracing_subscriber::fmt::layer()
+                    .event_format(event_format.clone())
+                    .with_writer(std::io::stdout)
+                    .with_ansi(true);
 
                 let init_res = tracing_subscriber::registry()
                     .with(env_filter)
@@ -86,9 +93,7 @@ pub fn initialize_logging_with_config(
             // Fallback to stdout only if file creation fails and console logging is enabled
             if enable_console_logging {
                 let stdout_layer = tracing_subscriber::fmt::layer()
-                    .with_file(true)
-                    .with_line_number(true)
-                    .with_target(true)
+                    .event_format(event_format)
                     .with_writer(std::io::stdout);
                 let init_res = tracing_subscriber::registry()
                     .with(env_filter)

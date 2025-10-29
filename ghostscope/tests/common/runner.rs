@@ -22,8 +22,8 @@ pub struct GhostscopeRunner {
     target: Option<PathBuf>,
     timeout_secs: u64,
     force_perf_event_array: bool,
-    enable_console_log: bool,
     log_level: Option<String>,
+    enable_sysmon_shared_lib: bool,
 }
 
 impl Default for GhostscopeRunner {
@@ -34,8 +34,8 @@ impl Default for GhostscopeRunner {
             target: None,
             timeout_secs: 3,
             force_perf_event_array: false,
-            enable_console_log: false,
             log_level: None,
+            enable_sysmon_shared_lib: false,
         }
     }
 }
@@ -71,8 +71,8 @@ impl GhostscopeRunner {
         self
     }
 
-    pub fn enable_console_log(mut self, yes: bool) -> Self {
-        self.enable_console_log = yes;
+    pub fn enable_sysmon_shared_lib(mut self, yes: bool) -> Self {
+        self.enable_sysmon_shared_lib = yes;
         self
     }
 
@@ -110,25 +110,13 @@ impl GhostscopeRunner {
         if let Some(pid) = self.pid {
             args.push(OsString::from("-p"));
             args.push(OsString::from(pid.to_string()));
-        } else if let Some(target) = self.target {
+        } else if let Some(ref target) = self.target {
             args.push(OsString::from("-t"));
-            args.push(target.into_os_string());
+            args.push(target.clone().into_os_string());
         }
 
         args.push(OsString::from("--script-file"));
         args.push(script_path.into_os_string());
-
-        // Common flags: do not persist artifacts; logging off unless enabled
-        args.push(OsString::from("--no-save-llvm-ir"));
-        args.push(OsString::from("--no-save-ebpf"));
-        args.push(OsString::from("--no-save-ast"));
-
-        if self.enable_console_log {
-            args.push(OsString::from("--log"));
-            args.push(OsString::from("--log-console"));
-        } else {
-            args.push(OsString::from("--no-log"));
-        }
 
         if let Some(level) = &self.log_level {
             args.push(OsString::from("--log-level"));
@@ -137,6 +125,11 @@ impl GhostscopeRunner {
 
         if self.force_perf_event_array {
             args.push(OsString::from("--force-perf-event-array"));
+        }
+
+        // Opt-in sysmon for -t shared library tests
+        if self.enable_sysmon_shared_lib {
+            args.push(OsString::from("--enable-sysmon-shared-lib"));
         }
 
         let mut cmd = Command::new(&binary_path);

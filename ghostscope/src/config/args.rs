@@ -128,6 +128,13 @@ pub struct Args {
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub force_perf_event_array: bool,
 
+    /// Enable sysmon eBPF for -t when the target is a shared library (.so).
+    /// This starts system-wide sched exec/fork/exit tracepoints to maintain
+    /// ASLR offsets for late-start processes loading the library. Disabled by
+    /// default due to possible overhead on systems with high process churn.
+    #[arg(long = "enable-sysmon-shared-lib", action = clap::ArgAction::SetTrue)]
+    pub enable_sysmon_shared_lib: bool,
+
     /// Remaining arguments (when using --args)
     pub remaining: Vec<String>,
 }
@@ -154,6 +161,7 @@ pub struct ParsedArgs {
     pub should_save_ast: bool,
     pub layout_mode: LayoutMode,
     pub force_perf_event_array: bool,
+    pub enable_sysmon_for_shared_lib: bool,
     pub allow_loose_debug_match: bool,
 }
 
@@ -215,6 +223,7 @@ impl Args {
                 should_save_ast,
                 layout_mode: parsed.layout,
                 force_perf_event_array: parsed.force_perf_event_array,
+                enable_sysmon_for_shared_lib: parsed.enable_sysmon_shared_lib,
                 allow_loose_debug_match: parsed.allow_loose_debug_match,
             }
         } else {
@@ -255,6 +264,7 @@ impl Args {
                 should_save_ast,
                 layout_mode: parsed.layout,
                 force_perf_event_array: parsed.force_perf_event_array,
+                enable_sysmon_for_shared_lib: parsed.enable_sysmon_shared_lib,
                 allow_loose_debug_match: parsed.allow_loose_debug_match,
             }
         }

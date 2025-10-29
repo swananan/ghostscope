@@ -125,6 +125,11 @@ ghostscope --layout vertical    # 面板纵向排列
 # 强制使用 PerfEventArray 模式（仅用于测试）
 # 警告：仅用于测试目的。即使在内核 >= 5.8 上也强制使用 PerfEventArray
 ghostscope --force-perf-event-array
+
+# 当 -t 目标是共享库（.so）时启动 sysmon，用于维护动态库全局变量的偏移
+# 警告：该选项会全局附加 sched 的 exec/fork/exit tracepoint，在进程频繁
+# 启动/退出的主机上可能带来一定性能开销。默认关闭。
+ghostscope --enable-sysmon-shared-lib
 ```
 
 ### 完整命令参考
@@ -152,6 +157,7 @@ ghostscope --force-perf-event-array
 | `--layout <MODE>` | | TUI 布局模式 | horizontal |
 | `--config <PATH>` | | 自定义配置文件 | 自动检测 |
 | `--force-perf-event-array` | | 强制 PerfEventArray（测试） | 关 |
+| `--enable-sysmon-shared-lib` | | -t 目标为共享库时，支持全局变量探测 | 关 |
 | `--args <PROGRAM> [ARGS...]` | | 启动程序并传递参数 | 无 |
 
 ## 配置文件
@@ -310,6 +316,10 @@ max_trace_event_size = 32768
 # 即使在支持 RingBuf 的内核上（>= 5.8）。PerfEventArray 相比 RingBuf
 # 有性能开销，仅应用于兼容性测试。
 force_perf_event_array = false  # 默认（根据内核版本自动检测）
+
+# 当 -t 目标为共享库（.so）时启动 sysmon eBPF，用于维护动态库全局变量的 ASLR 偏移。
+# 启用后会注册系统范围的 sched tracepoint，进程频繁创建/退出的环境下可能带来性能开销。
+enable_sysmon_for_shared_lib = false  # 默认关闭
 ```
 
 ### 配置示例

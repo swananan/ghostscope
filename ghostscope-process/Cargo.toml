@@ -6,7 +6,16 @@ edition = "2021"
 [dependencies]
 anyhow = { workspace = true }
 tracing = { workspace = true }
+log = { workspace = true }
 object = { workspace = true }
 aya = { workspace = true }
 aya-obj = { workspace = true }
 libc = "0.2"
+bytes = "1"
+
+[build-dependencies]
+aya-build = { workspace = true, optional = true }
+
+[features]
+default = ["sysmon-ebpf"]
+sysmon-ebpf = ["aya-build"]

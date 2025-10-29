@@ -24,6 +24,8 @@ use aya::{
     Ebpf, EbpfLoader, VerifierLogLevel,
 };
 use ghostscope_protocol::{ParsedTraceEvent, StreamingTraceParser, TraceContext};
+use log::log_enabled;
+use log::Level as LogLevel;
 use std::convert::TryInto;
 use std::os::unix::io::AsRawFd;
 use tokio::io::unix::AsyncFd;
@@ -114,9 +116,17 @@ impl GhostScopeLoader {
             )));
         }
 
-        // Load BPF program from bytecode with high verifier log level for debugging
         let mut loader = EbpfLoader::new();
-        loader.verifier_log_level(VerifierLogLevel::VERBOSE | VerifierLogLevel::STATS);
+        let use_verbose = cfg!(debug_assertions)
+            || log_enabled!(LogLevel::Trace)
+            || log_enabled!(LogLevel::Debug);
+        if use_verbose {
+            loader.verifier_log_level(VerifierLogLevel::VERBOSE | VerifierLogLevel::STATS);
+            tracing::info!("BPF verifier logs: VERBOSE (debug build/log)");
+        } else {
+            loader.verifier_log_level(VerifierLogLevel::DEBUG | VerifierLogLevel::STATS);
+            tracing::info!("BPF verifier logs: DEBUG (release/info)");
+        }
         // Configure Aya loader to reuse pinned maps by name under our per-process pin directory.
         // This makes @proc_module_offsets in the eBPF object bind to the already pinned map
         // created by ghostscope-process instead of creating a new private map.
@@ -131,9 +141,6 @@ impl GhostScopeLoader {
         match loader.load(bytecode) {
             Ok(bpf) => {
                 info!("Successfully loaded eBPF program");
-                // Note: we purposefully do NOT (re)pin here. The pinned map must already exist.
-                // Future: hook in Aya's map reuse API to bind this symbol to the pinned FD.
-
                 Ok(Self {
                     bpf,
                     event_map: None,

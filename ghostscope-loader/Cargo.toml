@@ -12,4 +12,5 @@ aya-obj = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "mio", "net"] }
+log = { workspace = true }
 bytes = "1.5"

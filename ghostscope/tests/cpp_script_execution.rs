@@ -16,6 +16,7 @@ async fn run_ghostscope_with_script_for_pid(
         .with_script(script_content)
         .with_pid(pid)
         .timeout_secs(timeout_secs)
+        .enable_sysmon_shared_lib(false)
         .run()
         .await
 }

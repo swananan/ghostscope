@@ -184,6 +184,7 @@ async fn main() -> Result<()> {
         has_explicit_log_flag: false, // Not needed for validation
         has_explicit_console_log_flag: false, // Not needed for validation
         force_perf_event_array: merged_config.ebpf_config.force_perf_event_array,
+        enable_sysmon_for_shared_lib: merged_config.ebpf_config.enable_sysmon_for_shared_lib,
         allow_loose_debug_match: merged_config.dwarf_allow_loose_debug_match,
     };
     temp_args.validate()?;

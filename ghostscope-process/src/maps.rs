@@ -26,6 +26,7 @@ pub fn proc_offsets_pin_dir() -> PathBuf {
 
 /// Map name as embedded in BPF object
 pub const PROC_OFFSETS_MAP_NAME: &str = "proc_module_offsets";
+pub const ALLOWED_PIDS_MAP_NAME: &str = "allowed_pids";
 
 /// Key for proc_module_offsets map: { pid:u32, pad:u32, cookie_lo:u32, cookie_hi:u32 }
 #[repr(C)]
@@ -156,6 +157,8 @@ struct BpfMapUpdateAttr {
 }
 
 const BPF_MAP_UPDATE_ELEM: c::c_long = 2; // from linux/bpf.h
+const BPF_MAP_DELETE_ELEM: c::c_long = 1; // from linux/bpf.h
+const BPF_MAP_GET_NEXT_KEY: c::c_long = 4; // from linux/bpf.h
 
 fn bpf_map_update_elem(
     fd: i32,
@@ -183,6 +186,201 @@ fn bpf_map_update_elem(
     } else {
         Ok(())
     }
+}
+
+#[repr(C)]
+struct BpfMapKeyAttr {
+    map_fd: u32,
+    _pad: u32, // align to 64-bit for following fields
+    key: u64,
+    next_key: u64,
+}
+
+fn bpf_map_get_next_key(
+    fd: i32,
+    key: *const c::c_void,
+    next_key: *mut c::c_void,
+) -> io::Result<()> {
+    let attr = BpfMapKeyAttr {
+        map_fd: fd as u32,
+        _pad: 0,
+        key: key as usize as u64,
+        next_key: next_key as usize as u64,
+    };
+    let ret = unsafe {
+        c::syscall(
+            c::SYS_bpf,
+            BPF_MAP_GET_NEXT_KEY,
+            &attr,
+            std::mem::size_of::<BpfMapKeyAttr>(),
+        )
+    };
+    if ret < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Compute the bpffs pin path for the allowed_pids map for current process
+pub fn allowed_pids_pin_path() -> PathBuf {
+    let pid = std::process::id();
+    PathBuf::from(format!("/sys/fs/bpf/ghostscope/{pid}/allowed_pids"))
+}
+
+/// Ensure the pinned allowed_pids map exists under the per-process directory.
+pub fn ensure_pinned_allowed_pids_exists(max_entries: u32) -> anyhow::Result<()> {
+    let pin_path = allowed_pids_pin_path();
+    ensure_pin_dir(&pin_path)?;
+
+    if pin_path.exists() {
+        if MapData::from_pin(&pin_path).is_ok() {
+            info!("Reusing existing pinned map at {}", pin_path.display());
+            return Ok(());
+        } else {
+            let _ = std::fs::remove_file(&pin_path);
+        }
+    }
+
+    let obj_map = ObjMap::Legacy(LegacyMap {
+        section_index: 0,
+        section_kind: EbpfSectionKind::Maps,
+        symbol_index: None,
+        def: bpf_map_def {
+            map_type: BPF_MAP_TYPE_HASH as u32,
+            key_size: 4,
+            value_size: 1,
+            max_entries,
+            map_flags: 0,
+            id: 0,
+            pinning: aya_obj::maps::PinningType::None,
+        },
+        data: Vec::new(),
+    });
+
+    let map = MapData::create(obj_map, ALLOWED_PIDS_MAP_NAME, None)?;
+    info!(
+        "Created {} map with capacity {} entries",
+        ALLOWED_PIDS_MAP_NAME, max_entries
+    );
+
+    match map.pin(&pin_path) {
+        Ok(()) => {
+            info!("Pinned {} at {}", ALLOWED_PIDS_MAP_NAME, pin_path.display());
+            Ok(())
+        }
+        Err(e) => match MapData::from_pin(&pin_path) {
+            Ok(_) => {
+                info!(
+                    "Pin path {} already exists; reusing existing map ({}).",
+                    pin_path.display(),
+                    e
+                );
+                Ok(())
+            }
+            Err(_) => {
+                let _ = std::fs::remove_file(&pin_path);
+                Err(anyhow::anyhow!(
+                    "Failed to pin {} at {}: {}",
+                    ALLOWED_PIDS_MAP_NAME,
+                    pin_path.display(),
+                    e
+                ))
+            }
+        },
+    }
+}
+
+/// Insert a PID into the allowed_pids pinned map.
+pub fn insert_allowed_pid(pid: u32) -> anyhow::Result<()> {
+    let map_data = MapData::from_pin(allowed_pids_pin_path())?;
+    let fd = map_data.fd().as_fd().as_raw_fd();
+    let key = pid;
+    let val: u8 = 1;
+    bpf_map_update_elem(
+        fd,
+        &key as *const _ as *const _,
+        &val as *const _ as *const _,
+        0,
+    )
+    .map_err(|e| anyhow::anyhow!("allowed_pids update failed for {}: {}", pid, e))
+}
+
+/// Remove a PID from the allowed_pids pinned map.
+pub fn remove_allowed_pid(pid: u32) -> anyhow::Result<()> {
+    let map_data = MapData::from_pin(allowed_pids_pin_path())?;
+    let fd = map_data.fd().as_fd().as_raw_fd();
+    bpf_map_delete_elem(fd, &pid as *const _ as *const _)
+        .map_err(|e| anyhow::anyhow!("allowed_pids delete failed for {}: {}", pid, e))
+}
+
+fn bpf_map_delete_elem(fd: i32, key: *const c::c_void) -> io::Result<()> {
+    let attr = BpfMapUpdateAttr {
+        map_fd: fd as u32,
+        _pad: 0,
+        key: key as usize as u64,
+        value: 0,
+        flags: 0,
+    };
+    let ret = unsafe {
+        c::syscall(
+            c::SYS_bpf,
+            BPF_MAP_DELETE_ELEM,
+            &attr,
+            std::mem::size_of::<BpfMapUpdateAttr>(),
+        )
+    };
+    if ret < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Purge all entries for a given pid in the pinned proc_module_offsets map.
+pub fn purge_offsets_for_pid(pid: u32) -> anyhow::Result<usize> {
+    let map_data = MapData::from_pin(proc_offsets_pin_path())?;
+    let fd = map_data.fd().as_fd().as_raw_fd();
+    let mut deleted = 0usize;
+
+    // Iterate keys with GET_NEXT_KEY
+    let mut prev: Option<ProcModuleKey> = None;
+    loop {
+        let mut next: ProcModuleKey = ProcModuleKey {
+            pid: 0,
+            pad: 0,
+            cookie_lo: 0,
+            cookie_hi: 0,
+        };
+        let key_ptr = prev
+            .as_ref()
+            .map(|k| k as *const _ as *const c::c_void)
+            .unwrap_or(std::ptr::null());
+        let res = bpf_map_get_next_key(fd, key_ptr, &mut next as *mut _ as *mut _);
+        match res {
+            Ok(()) => {
+                // Check pid match
+                if next.pid == pid {
+                    // Delete and continue iteration from the same prev (do not advance prev)
+                    let _ = bpf_map_delete_elem(fd, &next as *const _ as *const _);
+                    deleted += 1;
+                    // Do not set prev = Some(next) to avoid skipping following keys
+                    continue;
+                } else {
+                    prev = Some(next);
+                }
+            }
+            Err(e) => {
+                // ENOENT means end of iteration
+                if e.raw_os_error() == Some(libc::ENOENT) {
+                    break;
+                } else {
+                    return Err(anyhow::anyhow!("bpf_map_get_next_key failed: {}", e));
+                }
+            }
+        }
+    }
+    Ok(deleted)
 }
 
 /// Open the pinned global proc_module_offsets map and insert entries via raw bpf syscall.

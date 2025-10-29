@@ -109,6 +109,38 @@ docker build -t ghostscope-builder:ubuntu20.04 .
 
 **Note**: Debug builds are used by default during development for faster iteration and better debugging experience.
 
+### Sysmon eBPF (prebuilt) and when to rebuild
+
+GhostScope ships with prebuilt sysmon eBPF bytecode for both endiannesses. In normal development and usage, you do not need to build sysmon yourself — the build script copies the artifacts from `ghostscope-process/ebpf/obj` into the crate output directory and the runtime automatically selects the correct object by host endianness.
+
+- Prebuilt artifacts (committed):
+  - `ghostscope-process/ebpf/obj/sysmon-bpf.bpfel.o` (little‑endian)
+  - `ghostscope-process/ebpf/obj/sysmon-bpf.bpfeb.o` (big‑endian)
+- Build script behavior: `ghostscope-process/build.rs` copies these into `OUT_DIR`. If either file is missing or invalid, sysmon runs in a stub mode and logs a warning.
+
+Only rebuild sysmon eBPF if you are actively modifying the sysmon program or need to regenerate objects for platform compatibility.
+
+#### Rebuilding sysmon eBPF
+
+Use the helper script:
+
+```
+./ghostscope-process/ebpf/build_sysmon_bpf.sh
+```
+
+Optional environment variables:
+
+- `TOOLCHAIN` — Rust toolchain for BPF (default: `nightly-2024-07-01`)
+- `TARGET` — `bpfel-unknown-none`, `bpfeb-unknown-none`, or `both` (default: `both`)
+- `SKIP_RUST_SRC` — set to `1` to skip installing `rust-src`
+
+Outputs are written to:
+
+- `ghostscope-process/ebpf/obj/sysmon-bpf.bpfel.o`
+- `ghostscope-process/ebpf/obj/sysmon-bpf.bpfeb.o`
+
+After rebuilding, a regular workspace build will pick up the new objects automatically (the build script copies them to `OUT_DIR`).
+
 ## Testing
 
 ### Integration Tests and Unit Tests

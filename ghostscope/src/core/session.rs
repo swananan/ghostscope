@@ -3,7 +3,9 @@ use crate::runtime::source_path_resolver::SourcePathResolver;
 use crate::tracing::TraceManager;
 use anyhow::Result;
 use ghostscope_dwarf::{DwarfAnalyzer, ModuleStats};
-use ghostscope_process::ProcessManager;
+use ghostscope_process::{ProcessManager, ProcessSysmon, SysmonConfig};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
 /// Ghost session state - manages binary analysis, process tracking, and trace instances
@@ -18,7 +20,8 @@ pub struct GhostSession {
     #[allow(dead_code)]
     pub debug_file: Option<String>, // Optional debug file path
     pub config: Option<MergedConfig>, // Holds the merged configuration
-    pub coordinator: ProcessManager, // Manages PID/module offsets prefill and application
+    pub coordinator: Arc<Mutex<ProcessManager>>, // Manages PID/module offsets prefill and application
+    pub sysmon: Option<Arc<Mutex<ProcessSysmon>>>, // Realtime process monitor (exec/fork/exit)
 }
 
 impl GhostSession {
@@ -26,7 +29,7 @@ impl GhostSession {
     pub fn new_with_config(config: &MergedConfig) -> Self {
         info!("Creating ghost session with merged configuration");
 
-        Self {
+        let mut s = Self {
             process_analyzer: None,
             target_binary: config.target_path.clone(),
             target_args: config.binary_args.clone(),
@@ -38,8 +41,45 @@ impl GhostSession {
             trace_manager: TraceManager::new(),
             source_path_resolver: SourcePathResolver::new(&config.source),
             config: Some(config.clone()),
-            coordinator: ProcessManager::new(),
+            coordinator: Arc::new(Mutex::new(ProcessManager::new())),
+            sysmon: None,
+        };
+
+        // Start sysmon:
+        // -t executable: always start (PID collection is constrained in eBPF)
+        // -t shared library: start only if enabled in config
+        if s.target_pid.is_none() && s.target_binary.is_some() {
+            let tpath = PathBuf::from(s.target_binary.as_ref().unwrap());
+            let is_shared = ghostscope_process::is_shared_object(&tpath);
+            let should_start = if is_shared {
+                config.ebpf_config.enable_sysmon_for_shared_lib
+            } else {
+                true
+            };
+            if should_start {
+                let cfg = SysmonConfig {
+                    target_module: Some(tpath.clone()),
+                    proc_offsets_max_entries: config.ebpf_config.proc_module_offsets_max_entries
+                        as u32,
+                    perf_page_count: Some(config.ebpf_config.perf_page_count as usize),
+                };
+                let mgr = Arc::clone(&s.coordinator);
+                let mut sysmon = ProcessSysmon::new(mgr, cfg);
+                sysmon.start();
+                s.sysmon = Some(Arc::new(Mutex::new(sysmon)));
+                if is_shared {
+                    info!("Sysmon started (-t shared library)");
+                } else {
+                    info!("Sysmon started (-t executable)");
+                }
+            } else {
+                info!("Sysmon not started (-t shared library disabled by config)");
+            }
+        } else {
+            info!("Sysmon not started (no -t target)");
         }
+
+        s
     }
 
     /// Create a new ghost session (without binary analysis - call load_binary separately)
@@ -47,7 +87,7 @@ impl GhostSession {
     pub fn new(args: &ParsedArgs) -> Self {
         info!("Creating ghost session");
 
-        Self {
+        let mut s = Self {
             process_analyzer: None,
             target_binary: args.target_path.clone(),
             target_args: args.binary_args.clone(),
@@ -59,8 +99,25 @@ impl GhostSession {
             trace_manager: TraceManager::new(),
             source_path_resolver: SourcePathResolver::new(&Default::default()),
             config: None,
-            coordinator: ProcessManager::new(),
+            coordinator: Arc::new(Mutex::new(ProcessManager::new())),
+            sysmon: None,
+        };
+        if s.target_pid.is_none() && s.target_binary.is_some() {
+            let target_module = s.target_binary.as_ref().map(PathBuf::from);
+            let cfg = SysmonConfig {
+                target_module,
+                proc_offsets_max_entries: 4096,
+                perf_page_count: None,
+            };
+            let mgr = Arc::clone(&s.coordinator);
+            let mut sysmon = ProcessSysmon::new(mgr, cfg);
+            sysmon.start();
+            s.sysmon = Some(Arc::new(Mutex::new(sysmon)));
+            info!("Sysmon started (-t mode)");
+        } else {
+            info!("Sysmon not started (-p mode)");
         }
+        s
     }
 
     /// Get debug search paths from configuration
@@ -254,6 +311,7 @@ mod tests {
             should_save_ast: false,
             layout_mode: crate::config::LayoutMode::Horizontal,
             force_perf_event_array: false,
+            enable_sysmon_for_shared_lib: false,
             allow_loose_debug_match: false,
         };
 

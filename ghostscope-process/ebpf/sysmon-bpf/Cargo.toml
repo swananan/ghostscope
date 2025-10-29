@@ -1,0 +1,22 @@
+[package]
+name = "sysmon-bpf"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Pin to a crates.io release that does not require Cargo `edition2024`.
+# This avoids nightly drift and keeps compatibility with nightly-2024-07-01.
+aya-ebpf = "0.1.1"
+
+[profile.release]
+debug = false
+lto = false
+opt-level = "z"
+codegen-units = 1
+panic = "abort"

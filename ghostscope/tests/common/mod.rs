@@ -52,7 +52,7 @@ pub fn init() {
         let _ = runner::GhostscopeRunner::new()
             .with_target("/")
             .force_perf_event_array(false)
-            .enable_console_log(false);
+            .enable_sysmon_shared_lib(false);
     });
 
     // Register an atexit cleanup to remove built fixtures after all tests
