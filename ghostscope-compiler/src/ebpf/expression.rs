@@ -475,30 +475,57 @@ impl<'ctx> EbpfContext<'ctx> {
         } else {
             // Resolve pointer for A and read from user memory
             let ptr_a = self.resolve_ptr_i64_from_expr(a_expr)?;
+            let offsets_found_a = self.load_offsets_found_flag()?;
             let dst_a = self
                 .builder
                 .build_bit_cast(buf_a, ptr_ty, "memcmp_dst_a")
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-            let src_a = self
+            let base_src_a = self
                 .builder
                 .build_int_to_ptr(ptr_a, ptr_ty, "memcmp_src_a")
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            let null_ptr = ptr_ty.const_null();
+            let src_a = self
+                .builder
+                .build_select::<BasicValueEnum<'ctx>, _>(
+                    offsets_found_a,
+                    base_src_a.into(),
+                    null_ptr.into(),
+                    "memcmp_src_a_or_null",
+                )
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                .into_pointer_value();
+            let zero_i32 = self.context.i32_type().const_zero();
+            let effective_len_a = self
+                .builder
+                .build_select::<BasicValueEnum<'ctx>, _>(
+                    offsets_found_a,
+                    sel_len.into(),
+                    zero_i32.into(),
+                    "memcmp_len_a_or_zero",
+                )
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                .into_int_value();
             let ret_a = self
                 .create_bpf_helper_call(
                     BPF_FUNC_probe_read_user as u64,
-                    &[dst_a, sel_len.into(), src_a.into()],
+                    &[dst_a, effective_len_a.into(), src_a.into()],
                     self.context.i64_type().into(),
                     "probe_read_user_memcmp_a",
                 )?
                 .into_int_value();
             let i64_ty = self.context.i64_type();
-            self.builder
+            let eq_a = self
+                .builder
                 .build_int_compare(
                     inkwell::IntPredicate::EQ,
                     ret_a,
                     i64_ty.const_zero(),
                     "memcmp_ok_a",
                 )
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            self.builder
+                .build_and(eq_a, offsets_found_a, "memcmp_ok_a")
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?
         };
 
@@ -526,30 +553,57 @@ impl<'ctx> EbpfContext<'ctx> {
         } else {
             // Resolve pointer for B and read from user memory
             let ptr_b = self.resolve_ptr_i64_from_expr(b_expr)?;
+            let offsets_found_b = self.load_offsets_found_flag()?;
             let dst_b = self
                 .builder
                 .build_bit_cast(buf_b, ptr_ty, "memcmp_dst_b")
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-            let src_b = self
+            let base_src_b = self
                 .builder
                 .build_int_to_ptr(ptr_b, ptr_ty, "memcmp_src_b")
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            let null_ptr = ptr_ty.const_null();
+            let src_b = self
+                .builder
+                .build_select::<BasicValueEnum<'ctx>, _>(
+                    offsets_found_b,
+                    base_src_b.into(),
+                    null_ptr.into(),
+                    "memcmp_src_b_or_null",
+                )
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                .into_pointer_value();
+            let zero_i32 = self.context.i32_type().const_zero();
+            let effective_len_b = self
+                .builder
+                .build_select::<BasicValueEnum<'ctx>, _>(
+                    offsets_found_b,
+                    sel_len.into(),
+                    zero_i32.into(),
+                    "memcmp_len_b_or_zero",
+                )
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                .into_int_value();
             let ret_b = self
                 .create_bpf_helper_call(
                     BPF_FUNC_probe_read_user as u64,
-                    &[dst_b, sel_len.into(), src_b.into()],
+                    &[dst_b, effective_len_b.into(), src_b.into()],
                     self.context.i64_type().into(),
                     "probe_read_user_memcmp_b",
                 )?
                 .into_int_value();
             let i64_ty = self.context.i64_type();
-            self.builder
+            let eq_b = self
+                .builder
                 .build_int_compare(
                     inkwell::IntPredicate::EQ,
                     ret_b,
                     i64_ty.const_zero(),
                     "memcmp_ok_b",
                 )
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            self.builder
+                .build_and(eq_b, offsets_found_b, "memcmp_ok_b")
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?
         };
 

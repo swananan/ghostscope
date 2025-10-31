@@ -92,6 +92,8 @@ pub struct EbpfContext<'ctx> {
     pub pm_key_alloca: Option<inkwell::values::PointerValue<'ctx>>, // [3 x i32] alloca
     // Per-invocation event accumulation offset (u32) stored on stack (entry block)
     pub event_offset_alloca: Option<inkwell::values::PointerValue<'ctx>>,
+    // Tracks whether the last proc_module_offsets lookup succeeded (used to skip reads)
+    pub offsets_found_flag: Option<inkwell::values::PointerValue<'ctx>>,
 
     // Compilation options (includes eBPF map configuration)
     pub compile_options: crate::CompileOptions,
@@ -205,6 +207,7 @@ impl<'ctx> EbpfContext<'ctx> {
             current_resolved_var_module_path: None,
             pm_key_alloca: None,
             event_offset_alloca: None,
+            offsets_found_flag: None,
             compile_options: compile_options.clone(),
 
             // Control-flow expression context
@@ -662,6 +665,71 @@ impl<'ctx> EbpfContext<'ctx> {
     /// Mark that at least one variable failed (status!=0)
     pub fn mark_any_fail(&mut self) -> Result<()> {
         self.store_flag_value("_gs_any_fail", 1)
+    }
+
+    /// Get (and create if needed) the global flag tracking the last proc_module_offsets lookup.
+    /// Stored as i8 where 0 = miss, 1 = found.
+    pub fn get_or_create_offsets_found_flag(&mut self) -> inkwell::values::PointerValue<'ctx> {
+        if let Some(ptr) = self.offsets_found_flag {
+            return ptr;
+        }
+        let i8_type = self.context.i8_type();
+        // TODO: Replace this global flag with explicit control-flow checks when memory-read emission is refactored.
+        let global =
+            self.module
+                .add_global(i8_type, Some(AddressSpace::default()), "_gs_offsets_found");
+        global.set_initializer(&i8_type.const_int(1, false));
+        let ptr = global.as_pointer_value();
+        self.offsets_found_flag = Some(ptr);
+        ptr
+    }
+
+    /// Store a boolean into the offsets-found flag (true => found, false => miss).
+    pub fn store_offsets_found_flag(
+        &mut self,
+        flag: inkwell::values::IntValue<'ctx>,
+    ) -> Result<()> {
+        let ptr = self.get_or_create_offsets_found_flag();
+        let i8_type = self.context.i8_type();
+        let flag_i8 = self
+            .builder
+            .build_int_z_extend(flag, i8_type, "offset_flag_i8")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder
+            .build_store(ptr, flag_i8)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Store a constant boolean value into the offsets-found flag.
+    pub fn store_offsets_found_const(&mut self, value: bool) -> Result<()> {
+        let ptr = self.get_or_create_offsets_found_flag();
+        let i8_type = self.context.i8_type();
+        self.builder
+            .build_store(ptr, i8_type.const_int(value as u64, false))
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Load the current offsets-found flag as i1 (true => found, false => miss).
+    pub fn load_offsets_found_flag(&mut self) -> Result<inkwell::values::IntValue<'ctx>> {
+        let ptr = self.get_or_create_offsets_found_flag();
+        let i8_type = self.context.i8_type();
+        let raw = self
+            .builder
+            .build_load(i8_type, ptr, "offsets_found_raw")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_int_value();
+        let is_non_zero = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::NE,
+                raw,
+                i8_type.const_zero(),
+                "offsets_found_bool",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        Ok(is_non_zero)
     }
 
     /// Get or create global for condition error code (i8). Name: _gs_cond_error

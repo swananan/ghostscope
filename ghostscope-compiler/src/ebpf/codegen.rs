@@ -2447,26 +2447,50 @@ impl<'ctx> EbpfContext<'ctx> {
                         .builder
                         .build_pointer_cast(var_data_ptr, ptr_ty, "md_dst_ptr")
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    let src_ptr = self
+                    let base_src_ptr = self
                         .builder
                         .build_int_to_ptr(*src_addr, ptr_ty, "md_src_ptr")
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    let offsets_found = self.load_offsets_found_flag()?;
+                    let not_found = self
+                        .builder
+                        .build_not(offsets_found, "md_offsets_miss")
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    let null_ptr = ptr_ty.const_null();
+                    let src_ptr = self
+                        .builder
+                        .build_select::<BasicValueEnum<'ctx>, _>(
+                            offsets_found,
+                            base_src_ptr.into(),
+                            null_ptr.into(),
+                            "md_src_or_null",
+                        )
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                        .into_pointer_value();
+                    let len_const = i32_ty.const_int(*len as u64, false);
+                    let zero_i32 = i32_ty.const_zero();
+                    let effective_len = self
+                        .builder
+                        .build_select::<BasicValueEnum<'ctx>, _>(
+                            offsets_found,
+                            len_const.into(),
+                            zero_i32.into(),
+                            "md_len_or_zero",
+                        )
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                        .into_int_value();
                     let ret = self
                         .create_bpf_helper_call(
                             aya_ebpf_bindings::bindings::bpf_func_id::BPF_FUNC_probe_read_user
                                 as u64,
-                            &[
-                                dst_ptr.into(),
-                                i32_ty.const_int(*len as u64, false).into(),
-                                src_ptr.into(),
-                            ],
+                            &[dst_ptr.into(), effective_len.into(), src_ptr.into()],
                             i64_ty.into(),
                             "probe_read_user_memdump",
                         )?
                         .into_int_value();
 
-                    // Branch on ret == 0
-                    let ok = self
+                    // Branch on ret == 0 and offsets available
+                    let ok_pred = self
                         .builder
                         .build_int_compare(
                             inkwell::IntPredicate::EQ,
@@ -2475,6 +2499,10 @@ impl<'ctx> EbpfContext<'ctx> {
                             "md_ok",
                         )
                         .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                    let ok = self
+                        .builder
+                        .build_and(ok_pred, offsets_found, "md_ok_with_offsets")
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
                     let curr = self.builder.get_insert_block().unwrap();
                     let func = curr.get_parent().unwrap();
                     let ok_b = self.context.append_basic_block(func, "md_ok");
@@ -2488,9 +2516,27 @@ impl<'ctx> EbpfContext<'ctx> {
                     self.builder
                         .build_unconditional_branch(cont_b)
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    // err: write errno/addr payload like RuntimeRead fail
+                    // err: either offsets missing or helper failure
                     self.builder.position_at_end(err_b);
-                    // set status = ReadError
+                    let offsets_err_b = self.context.append_basic_block(func, "md_offsets_err");
+                    let helper_err_b = self.context.append_basic_block(func, "md_helper_err");
+                    self.builder
+                        .build_conditional_branch(not_found, offsets_err_b, helper_err_b)
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    self.builder.position_at_end(offsets_err_b);
+                    self.builder
+                        .build_store(
+                            apl_ptr,
+                            self.context
+                                .i8_type()
+                                .const_int(VariableStatus::OffsetsUnavailable as u64, false),
+                        )
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    self.mark_any_fail()?;
+                    self.builder
+                        .build_unconditional_branch(cont_b)
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    self.builder.position_at_end(helper_err_b);
                     self.builder
                         .build_store(
                             apl_ptr,
@@ -2630,23 +2676,47 @@ impl<'ctx> EbpfContext<'ctx> {
                             "mdd_dst_ptr",
                         )
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                    let base_src_ptr = self
+                        .builder
+                        .build_int_to_ptr(*src_addr, ptr_ty, "mdd_src_ptr")
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    let offsets_found = self.load_offsets_found_flag()?;
+                    let not_found = self
+                        .builder
+                        .build_not(offsets_found, "mdd_dyn_offsets_miss")
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    let null_ptr = ptr_ty.const_null();
                     let src_ptr = self
                         .builder
-                        .build_int_to_ptr(
-                            *src_addr,
-                            self.context.ptr_type(AddressSpace::default()),
-                            "mdd_src_ptr",
+                        .build_select::<BasicValueEnum<'ctx>, _>(
+                            offsets_found,
+                            base_src_ptr.into(),
+                            null_ptr.into(),
+                            "mdd_src_or_null",
                         )
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                        .into_pointer_value();
+                    let zero_i32 = self.context.i32_type().const_zero();
+                    let effective_len = self
+                        .builder
+                        .build_select::<BasicValueEnum<'ctx>, _>(
+                            offsets_found,
+                            sel_len.into(),
+                            zero_i32.into(),
+                            "mdd_len_or_zero",
+                        )
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                        .into_int_value();
                     let ret = self
                         .create_bpf_helper_call(
                             BPF_FUNC_probe_read_user as u64,
-                            &[dst_ptr, sel_len.into(), src_ptr.into()],
+                            &[dst_ptr, effective_len.into(), src_ptr.into()],
                             self.context.i64_type().into(),
                             "probe_read_user_dyn",
                         )?
                         .into_int_value();
-                    let ok = self
+                    let ok_pred = self
                         .builder
                         .build_int_compare(
                             inkwell::IntPredicate::EQ,
@@ -2655,6 +2725,10 @@ impl<'ctx> EbpfContext<'ctx> {
                             "mdd_ok",
                         )
                         .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                    let ok = self
+                        .builder
+                        .build_and(ok_pred, offsets_found, "mdd_ok_with_offsets")
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
                     let ok_b = self.context.append_basic_block(func, "mdd_ok");
                     let err_b = self.context.append_basic_block(func, "mdd_err");
                     self.builder
@@ -2667,6 +2741,25 @@ impl<'ctx> EbpfContext<'ctx> {
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
                     // err: status+errno+addr (clamped by reserved sizing)
                     self.builder.position_at_end(err_b);
+                    let offsets_err_b = self.context.append_basic_block(func, "mdd_offsets_err");
+                    let helper_err_b = self.context.append_basic_block(func, "mdd_helper_err");
+                    self.builder
+                        .build_conditional_branch(not_found, offsets_err_b, helper_err_b)
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    self.builder.position_at_end(offsets_err_b);
+                    self.builder
+                        .build_store(
+                            apl_ptr,
+                            self.context
+                                .i8_type()
+                                .const_int(VariableStatus::OffsetsUnavailable as u64, false),
+                        )
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    self.mark_any_fail()?;
+                    self.builder
+                        .build_unconditional_branch(cont_b)
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    self.builder.position_at_end(helper_err_b);
                     self.builder
                         .build_store(
                             apl_ptr,
@@ -2904,6 +2997,25 @@ impl<'ctx> EbpfContext<'ctx> {
                         Some(apl_ptr),
                         module_for_offsets.as_deref(),
                     )?;
+                    let offsets_found = self.load_offsets_found_flag()?;
+                    let current_block = self.builder.get_insert_block().unwrap();
+                    let current_fn = current_block.get_parent().unwrap();
+                    let cont2_block = self.context.append_basic_block(current_fn, "after_read");
+                    let skip_block = self.context.append_basic_block(current_fn, "offsets_skip");
+                    let found_block = self.context.append_basic_block(current_fn, "offsets_found");
+                    self.builder
+                        .build_conditional_branch(offsets_found, found_block, skip_block)
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+                    // Offsets missing: record failure and continue without helper access.
+                    self.builder.position_at_end(skip_block);
+                    self.mark_any_fail()?;
+                    self.builder
+                        .build_unconditional_branch(cont2_block)
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+                    // Offsets found: proceed with null check and helper call.
+                    self.builder.position_at_end(found_block);
                     let src_ptr = self
                         .builder
                         .build_int_to_ptr(src_addr, ptr_type, "src_ptr")
@@ -2916,15 +3028,8 @@ impl<'ctx> EbpfContext<'ctx> {
                         .builder
                         .build_int_compare(inkwell::IntPredicate::EQ, src_addr, zero64, "is_null")
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    let current_fn = self
-                        .builder
-                        .get_insert_block()
-                        .unwrap()
-                        .get_parent()
-                        .unwrap();
                     let null_block = self.context.append_basic_block(current_fn, "null_deref");
                     let read_block = self.context.append_basic_block(current_fn, "read_user");
-                    let cont2_block = self.context.append_basic_block(current_fn, "after_read");
                     self.builder
                         .build_conditional_branch(is_null, null_block, read_block)
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
@@ -4305,6 +4410,24 @@ impl<'ctx> EbpfContext<'ctx> {
             .builder
             .build_int_to_ptr(src_addr, ptr_type, "src_ptr")
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let offsets_found = self.load_offsets_found_flag()?;
+        let current_block = self.builder.get_insert_block().unwrap();
+        let current_fn = current_block.get_parent().unwrap();
+        let cont_block = self.context.append_basic_block(current_fn, "after_read");
+        let skip_block = self.context.append_basic_block(current_fn, "offsets_skip");
+        let found_block = self.context.append_basic_block(current_fn, "offsets_found");
+        self.builder
+            .build_conditional_branch(offsets_found, found_block, skip_block)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder.position_at_end(skip_block);
+        self.mark_any_fail()?;
+        self.builder
+            .build_store(data_len_ptr_cast, self.context.i16_type().const_zero())
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder
+            .build_unconditional_branch(cont_block)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder.position_at_end(found_block);
 
         // Branch: NULL deref if src_addr == 0
         let zero64 = i64_type.const_zero();
@@ -4312,15 +4435,8 @@ impl<'ctx> EbpfContext<'ctx> {
             .builder
             .build_int_compare(inkwell::IntPredicate::EQ, src_addr, zero64, "is_null")
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        let current_fn = self
-            .builder
-            .get_insert_block()
-            .unwrap()
-            .get_parent()
-            .unwrap();
         let null_block = self.context.append_basic_block(current_fn, "null_deref");
         let read_block = self.context.append_basic_block(current_fn, "read_user");
-        let cont_block = self.context.append_basic_block(current_fn, "after_read");
         self.builder
             .build_conditional_branch(is_null, null_block, read_block)
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;

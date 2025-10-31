@@ -433,3 +433,127 @@ trace globals_program.c:26 {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_t_mode_library_late_start_without_sysmon_offsets_unavailable() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let lib_path = bin_dir.join("libgvars.so");
+    let script = r#"
+trace lib_tick {
+    print "PID:{} SCALAR={}", $pid, LIB_STATE.counter;
+    print "PID:{} STRUCT_Y={}", $pid, LIB_STATE.inner.y;
+    print "PID:{} ARRAY0={}", $pid, LIB_STATE.array[0];
+    print "PID:{} RODATA={}", $pid, lib_message;
+    print "PID:{} MEMDUMP={:x.4}", $pid, lib_pattern;
+    if memcmp(lib_message, hex("4c"), 1) { print "PID:{} CMP_OK", $pid; }
+    print "PID:{} AFTER_CMP", $pid;
+    print "PID:{} TAIL", $pid;
+}
+"#;
+
+    let gs_task = {
+        let target = lib_path.clone();
+        let sc = script.to_string();
+        tokio::spawn(async move {
+            common::runner::GhostscopeRunner::new()
+                .with_script(&sc)
+                .with_target(&target)
+                .timeout_secs(8)
+                .enable_sysmon_shared_lib(false)
+                .run()
+                .await
+        })
+    };
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut prog = Command::new(&binary_path)
+        .current_dir(&bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog.id().ok_or_else(|| {
+        anyhow::anyhow!("Failed to get PID for late-start shared lib without sysmon")
+    })?;
+
+    let (exit_code, stdout, stderr) = gs_task
+        .await
+        .map_err(|e| anyhow::anyhow!("GhostScope task join error: {e}"))??;
+    let _ = prog.kill().await.is_ok();
+
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+
+    let pid_marker = format!("PID:{pid}");
+    let mut scalar_ok = false;
+    let mut struct_ok = false;
+    let mut array_ok = false;
+    let mut rodata_ok = false;
+    let mut memdump_ok = false;
+
+    for line in stdout.lines() {
+        if !line.contains(&pid_marker) {
+            continue;
+        }
+        if line.contains("SCALAR=<proc offsets unavailable>") {
+            scalar_ok = true;
+        }
+        if line.contains("STRUCT_Y=<proc offsets unavailable>") {
+            struct_ok = true;
+        }
+        if line.contains("ARRAY0=<proc offsets unavailable>") {
+            array_ok = true;
+        }
+        if line.contains("RODATA=<proc offsets unavailable>") {
+            rodata_ok = true;
+        }
+        if line.contains("MEMDUMP=<proc offsets unavailable>") {
+            memdump_ok = true;
+        }
+    }
+
+    assert!(
+        scalar_ok,
+        "Expected SCALAR offsets unavailable for PID {pid}. STDOUT: {stdout}"
+    );
+    assert!(
+        struct_ok,
+        "Expected STRUCT_Y offsets unavailable for PID {pid}. STDOUT: {stdout}"
+    );
+    assert!(
+        array_ok,
+        "Expected ARRAY0 offsets unavailable for PID {pid}. STDOUT: {stdout}"
+    );
+    assert!(
+        rodata_ok,
+        "Expected RODATA offsets unavailable for PID {pid}. STDOUT: {stdout}"
+    );
+    assert!(
+        memdump_ok,
+        "Expected MEMDUMP offsets unavailable for PID {pid}. STDOUT: {stdout}"
+    );
+
+    assert!(
+        stdout.contains("ExprError"),
+        "Expected ExprError line from memcmp failure. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("PID:{pid} AFTER_CMP")),
+        "Expected AFTER_CMP marker for PID {pid}. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("PID:{pid} TAIL")),
+        "Expected TAIL marker for PID {pid}. STDOUT: {stdout}"
+    );
+    assert!(
+        !stdout.contains(&format!("PID:{pid} CMP_OK")),
+        "memcmp should not succeed without offsets. STDOUT: {stdout}"
+    );
+    assert!(
+        !stdout.contains("read_user failed"),
+        "Should not surface raw read_user errors. STDOUT: {stdout}"
+    );
+
+    Ok(())
+}

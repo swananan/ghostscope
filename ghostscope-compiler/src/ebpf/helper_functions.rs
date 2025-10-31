@@ -14,7 +14,6 @@ use ghostscope_platform::register_mapping;
 use inkwell::types::{BasicType, BasicTypeEnum};
 use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, IntValue, PointerValue};
 use inkwell::AddressSpace;
-use tracing::info;
 
 impl<'ctx> EbpfContext<'ctx> {
     /// Get or create a static i8 buffer global of a given size, returning its ArrayType and pointer
@@ -443,6 +442,7 @@ impl<'ctx> EbpfContext<'ctx> {
         flag_phi.add_incoming(&[(&one, found_block), (&zero, miss_block)]);
         let found_flag = flag_phi.as_basic_value().into_int_value();
 
+        self.store_offsets_found_flag(found_flag)?;
         Ok((final_addr, found_flag))
     }
     /// Load a register value from pt_regs
@@ -499,16 +499,18 @@ impl<'ctx> EbpfContext<'ctx> {
     ) -> Result<BasicValueEnum<'ctx>> {
         let i64_type = self.context.i64_type();
         let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let zero_const = i64_type.const_zero();
+        let offsets_found = self.load_offsets_found_flag()?;
+        let not_found = self
+            .builder
+            .build_not(offsets_found, "offsets_miss")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
-        // Use static global buffer instead of dynamic allocation (eBPF doesn't support alloca)
         let result_size = size.bytes();
-
-        // Get or create a static global buffer for temporary reads
         let buffer_name = format!("_temp_read_buffer_{result_size}");
         let global_buffer = match self.module.get_global(&buffer_name) {
             Some(existing) => existing.as_pointer_value(),
             None => {
-                // Create new global buffer
                 let array_type = self.context.i8_type().array_type(result_size as u32);
                 let global =
                     self.module
@@ -519,49 +521,50 @@ impl<'ctx> EbpfContext<'ctx> {
         };
 
         let stack_ptr = global_buffer;
-
-        // Cast addresses to void pointers
         let dst_ptr = self
             .builder
             .build_bit_cast(stack_ptr, ptr_type, "dst_ptr")
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        let src_ptr = self
+        let base_src_ptr = self
             .builder
             .build_int_to_ptr(addr, ptr_type, "src_ptr")
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let null_ptr = ptr_type.const_null();
+        let src_ptr = self
+            .builder
+            .build_select::<BasicValueEnum<'ctx>, _>(
+                offsets_found,
+                base_src_ptr.into(),
+                null_ptr.into(),
+                "src_or_null",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_pointer_value();
 
-        // Use eBPF helper calling convention - convert helper ID to function pointer
         let i32_type = self.context.i32_type();
         let helper_id = i64_type.const_int(BPF_FUNC_probe_read_user as u64, false);
-        info!(
-            "Using eBPF helper function BPF_FUNC_probe_read_user with ID: {}",
-            BPF_FUNC_probe_read_user
-        );
-
-        // Log all helper function IDs for debugging
-        info!("Helper function IDs: probe_read_user={}, ringbuf_output={}, get_current_pid_tgid={}, ktime_get_ns={}",
-              BPF_FUNC_probe_read_user, BPF_FUNC_ringbuf_output, BPF_FUNC_get_current_pid_tgid, BPF_FUNC_ktime_get_ns);
-        let helper_fn_type = i32_type.fn_type(
-            &[
-                ptr_type.into(), // dst
-                i32_type.into(), // size (note: i32, not i64)
-                ptr_type.into(), // src
-            ],
-            false,
-        );
-
+        let helper_fn_type =
+            i32_type.fn_type(&[ptr_type.into(), i32_type.into(), ptr_type.into()], false);
         let helper_fn_ptr = self
             .builder
             .build_int_to_ptr(helper_id, ptr_type, "probe_read_user_fn")
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-
         let size_val = i32_type.const_int(result_size as u64, false);
-
-        // Convert args to BasicMetadataValueEnum for indirect call
+        let zero_i32 = i32_type.const_zero();
+        let effective_size = self
+            .builder
+            .build_select::<BasicValueEnum<'ctx>, _>(
+                offsets_found,
+                size_val.into(),
+                zero_i32.into(),
+                "size_or_zero",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_int_value();
         let call_args: Vec<BasicMetadataValueEnum> =
-            vec![dst_ptr.into(), size_val.into(), src_ptr.into()];
+            vec![dst_ptr.into(), effective_size.into(), src_ptr.into()];
 
-        let _call_result = self
+        let _ = self
             .builder
             .build_indirect_call(
                 helper_fn_type,
@@ -571,14 +574,12 @@ impl<'ctx> EbpfContext<'ctx> {
             )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
-        // Load the result based on size
         let result_type: BasicTypeEnum = match size {
             MemoryAccessSize::U8 => self.context.i8_type().into(),
             MemoryAccessSize::U16 => self.context.i16_type().into(),
             MemoryAccessSize::U32 => self.context.i32_type().into(),
             MemoryAccessSize::U64 => self.context.i64_type().into(),
         };
-
         let typed_ptr = self
             .builder
             .build_bit_cast(
@@ -587,32 +588,62 @@ impl<'ctx> EbpfContext<'ctx> {
                 "typed_ptr",
             )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-
-        if let BasicValueEnum::PointerValue(ptr) = typed_ptr {
-            let loaded_value = self
-                .builder
+        let loaded_value = if let BasicValueEnum::PointerValue(ptr) = typed_ptr {
+            self.builder
                 .build_load(result_type, ptr, "loaded_value")
-                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+        } else {
+            return Err(CodeGenError::MemoryAccessError(
+                "Failed to cast result pointer".to_string(),
+            ));
+        };
 
-            // Extend to i64 if needed
-            if let BasicValueEnum::IntValue(int_val) = loaded_value {
-                if int_val.get_type().get_bit_width() < 64 {
-                    let extended = self
-                        .builder
-                        .build_int_z_extend(int_val, i64_type, "extended")
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    Ok(extended.into())
-                } else {
-                    Ok(loaded_value)
-                }
+        let loaded_i64 = if let BasicValueEnum::IntValue(int_val) = loaded_value {
+            if int_val.get_type().get_bit_width() < 64 {
+                self.builder
+                    .build_int_z_extend(int_val, i64_type, "extended")
+                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
             } else {
-                Ok(loaded_value)
+                int_val
             }
         } else {
-            Err(CodeGenError::MemoryAccessError(
-                "Failed to cast result pointer".to_string(),
-            ))
-        }
+            return Err(CodeGenError::MemoryAccessError(
+                "Expected integer value from memory read".to_string(),
+            ));
+        };
+
+        // Record failure if offsets were missing.
+        let i8_type = self.context.i8_type();
+        let miss_i8 = self
+            .builder
+            .build_int_z_extend(not_found, i8_type, "miss_i8")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let fail_ptr = self.get_or_create_flag_global("_gs_any_fail");
+        let cur_fail = self
+            .builder
+            .build_load(i8_type, fail_ptr, "cur_fail")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_int_value();
+        let new_fail = self
+            .builder
+            .build_or(cur_fail, miss_i8, "fail_or_miss")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder
+            .build_store(fail_ptr, new_fail)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        let zero_bv: BasicValueEnum = zero_const.into();
+        let val_bv: BasicValueEnum = loaded_i64.into();
+        let sel = self
+            .builder
+            .build_select::<BasicValueEnum<'ctx>, _>(
+                offsets_found,
+                val_bv,
+                zero_bv,
+                "offset_value_or_zero",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        Ok(sel)
     }
 
     /// Generate memory read with runtime status capture (for control-flow conditions).
@@ -624,6 +655,13 @@ impl<'ctx> EbpfContext<'ctx> {
     ) -> Result<BasicValueEnum<'ctx>> {
         let i64_type = self.context.i64_type();
         let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let zero_const = i64_type.const_zero();
+
+        let offsets_found = self.load_offsets_found_flag()?;
+        let not_found = self
+            .builder
+            .build_not(offsets_found, "offsets_miss_cf")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
         let result_size = size.bytes();
         let buffer_name = format!("_temp_read_buffer_{result_size}");
@@ -643,10 +681,21 @@ impl<'ctx> EbpfContext<'ctx> {
             .builder
             .build_bit_cast(global_buffer, ptr_type, "dst_ptr")
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        let src_ptr = self
+        let base_src_ptr = self
             .builder
             .build_int_to_ptr(addr, ptr_type, "src_ptr")
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let null_ptr = ptr_type.const_null();
+        let src_ptr = self
+            .builder
+            .build_select::<BasicValueEnum<'ctx>, _>(
+                offsets_found,
+                base_src_ptr.into(),
+                null_ptr.into(),
+                "src_or_null_cf",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_pointer_value();
 
         let i32_type = self.context.i32_type();
         let helper_id = i64_type.const_int(BPF_FUNC_probe_read_user as u64, false);
@@ -656,10 +705,20 @@ impl<'ctx> EbpfContext<'ctx> {
             .builder
             .build_int_to_ptr(helper_id, ptr_type, "probe_read_user_fn")
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-
         let size_val = i32_type.const_int(result_size as u64, false);
+        let zero_i32 = i32_type.const_zero();
+        let effective_size = self
+            .builder
+            .build_select::<BasicValueEnum<'ctx>, _>(
+                offsets_found,
+                size_val.into(),
+                zero_i32.into(),
+                "size_or_zero_cf",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_int_value();
         let call_args: Vec<BasicMetadataValueEnum> =
-            vec![dst_ptr.into(), size_val.into(), src_ptr.into()];
+            vec![dst_ptr.into(), effective_size.into(), src_ptr.into()];
 
         let call_site = self
             .builder
@@ -675,8 +734,7 @@ impl<'ctx> EbpfContext<'ctx> {
         })?;
         let ret_i32 = ret_iv.into_int_value();
 
-        // failure when ret != 0
-        let is_fail = self
+        let read_fail = self
             .builder
             .build_int_compare(
                 inkwell::IntPredicate::NE,
@@ -685,28 +743,19 @@ impl<'ctx> EbpfContext<'ctx> {
                 "read_fail",
             )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let combined_fail = self
+            .builder
+            .build_or(read_fail, not_found, "combined_fail")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
-        // If fail and in condition context, set error code 1 (ProbeReadFailed)
-        // We do not branch; rely on later select to zero value when fail.
-        // side effect: set _gs_cond_error = 1 if currently 0
-        {
-            // store only when active
-            // condition_context_active flag checked inside the setter
-            // we still emit the builder ops unconditionally; setter will early return if inactive
-            // create a separate blockless path using 'is_fail' with a select
-            // Here we implement via speculative write guarded via select logic by reading/storing
-            // but LLVM requires SSA; we call helper method that emits the select/store guarded
-        }
-        // Emit guarded store via a small branch to avoid complex select on store
         let cur_block = self.builder.get_insert_block().unwrap();
         let func = cur_block.get_parent().unwrap();
         let set_block = self.context.append_basic_block(func, "set_cond_err");
         let cont_block = self.context.append_basic_block(func, "read_cont");
         self.builder
-            .build_conditional_branch(is_fail, set_block, cont_block)
+            .build_conditional_branch(combined_fail, set_block, cont_block)
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         self.builder.position_at_end(set_block);
-        // 2 = ReadError; also record failing address
         let _ = self.set_condition_error_if_unset(2u8);
         let _ = self.set_condition_error_addr_if_unset(addr);
         self.builder
@@ -714,7 +763,6 @@ impl<'ctx> EbpfContext<'ctx> {
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         self.builder.position_at_end(cont_block);
 
-        // Load the result and zero it if fail
         let result_type: BasicTypeEnum = match size {
             MemoryAccessSize::U8 => self.context.i8_type().into(),
             MemoryAccessSize::U16 => self.context.i16_type().into(),
@@ -733,33 +781,48 @@ impl<'ctx> EbpfContext<'ctx> {
             .builder
             .build_load(result_type, typed_ptr.into_pointer_value(), "loaded_value")
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        // Zero extend to i64 for uniformity
-        let i64_type = self.context.i64_type();
         let loaded_i64 = if let BasicValueEnum::IntValue(iv) = loaded_value {
             if iv.get_type().get_bit_width() < 64 {
                 self.builder
                     .build_int_z_extend(iv, i64_type, "ext_i64")
                     .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-                    .into()
             } else {
-                loaded_value
+                iv
             }
         } else {
-            loaded_value
+            return Err(CodeGenError::MemoryAccessError(
+                "Expected integer value from memory read".to_string(),
+            ));
         };
-        // mask by is_fail -> return 0 on fail
-        let zero_i64 = i64_type.const_zero();
-        let val_int = loaded_i64.into_int_value();
-        // Build select in BasicValueEnum space to avoid useless conversions
-        let zero_bv: BasicValueEnum = zero_i64.into();
-        let val_bv: BasicValueEnum = val_int.into();
+
+        let zero_bv: BasicValueEnum = zero_const.into();
+        let val_bv: BasicValueEnum = loaded_i64.into();
         let sel_bv = self
             .builder
-            .build_select(is_fail, zero_bv, val_bv, "val_or_zero")
+            .build_select::<BasicValueEnum<'ctx>, _>(combined_fail, zero_bv, val_bv, "val_or_zero")
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        let i8_type = self.context.i8_type();
+        let combined_fail_i8 = self
+            .builder
+            .build_int_z_extend(combined_fail, i8_type, "combined_fail_i8")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let fail_ptr = self.get_or_create_flag_global("_gs_any_fail");
+        let cur_fail = self
+            .builder
+            .build_load(i8_type, fail_ptr, "cur_fail_cf")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_int_value();
+        let new_fail = self
+            .builder
+            .build_or(cur_fail, combined_fail_i8, "fail_or_miss_cf")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder
+            .build_store(fail_ptr, new_fail)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
         Ok(sel_bv)
     }
-
     /// Map DWARF register number to pt_regs offset (simplified)
     pub fn dwarf_reg_to_pt_regs_offset(&self, dwarf_reg: u16) -> Result<usize> {
         // Use platform-specific register mapping to get byte offset

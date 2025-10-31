@@ -126,6 +126,9 @@ impl<'ctx> EbpfContext<'ctx> {
         //   are used as-is and are NOT rebased.
         // The caller signals which path we are on by providing the original evaluation_result.
         let pt_regs_ptr = self.get_pt_regs_parameter()?;
+        // Default assumption: offsets are available unless a lookup proves otherwise.
+        self.store_offsets_found_const(true)?;
+
         match evaluation_result {
             EvaluationResult::MemoryLocation(LocationResult::Address(addr)) => {
                 // Unified: always attempt runtime rebasing via proc_module_offsets
@@ -185,6 +188,7 @@ impl<'ctx> EbpfContext<'ctx> {
                         .build_store(sp, new_status)
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
                 }
+                self.store_offsets_found_flag(found_flag)?;
                 self.current_resolved_var_module_path = None;
                 Ok(rt_addr)
             }
@@ -1131,74 +1135,87 @@ impl<'ctx> EbpfContext<'ctx> {
             pc_address,
         );
 
+        let module_path_owned = module_path.clone();
+        let lookup_globals = |analyzer: &mut ghostscope_dwarf::DwarfAnalyzer| -> Result<
+            Option<(std::path::PathBuf, VariableWithEvaluation)>,
+        > {
+            debug!(
+                "Variable '{}' not found in locals; attempting global lookup",
+                var_name
+            );
+            let mut matches = analyzer.find_global_variables_by_name(var_name);
+            if matches.is_empty() {
+                return Ok(None);
+            }
+            // Prefer globals defined in the current module.
+            let preferred: Vec<(
+                std::path::PathBuf,
+                ghostscope_dwarf::core::GlobalVariableInfo,
+            )> = matches
+                .iter()
+                .filter(|(p, _)| p.to_string_lossy() == module_path_owned.as_str())
+                .cloned()
+                .collect();
+
+            let chosen = if preferred.len() == 1 {
+                Some(preferred[0].clone())
+            } else if preferred.is_empty() && matches.len() == 1 {
+                Some(matches.remove(0))
+            } else {
+                debug!(
+                    "Global '{}' is ambiguous across modules ({} matches)",
+                    var_name,
+                    matches.len()
+                );
+                return Err(CodeGenError::DwarfError(format!(
+                    "Ambiguous global '{}': {} matches",
+                    var_name,
+                    matches.len()
+                )));
+            };
+
+            if let Some((mpath, info)) = chosen {
+                let gv = analyzer
+                    .resolve_variable_by_offsets_in_module(
+                        &mpath,
+                        info.unit_offset,
+                        info.die_offset,
+                    )
+                    .map_err(|err| CodeGenError::DwarfError(err.to_string()))?;
+                Ok(Some((mpath, gv)))
+            } else {
+                Ok(None)
+            }
+        };
+
         match analyzer.get_all_variables_at_address(&module_address) {
             Ok(vars) => {
-                // Look for the specific variable by name
                 if let Some(var_result) = vars.iter().find(|v| v.name == var_name).or_else(|| {
-                    // GCC/Clang may synthesize names like r@entry; try a tolerant match
                     let prefix = format!("{var_name}@");
                     vars.iter().find(|v| v.name.starts_with(&prefix))
                 }) {
-                    debug!("Found DWARF variable: {}", var_name);
+                    debug!("Found DWARF variable '{}' in locals/params", var_name);
                     Ok(Some(var_result.clone()))
+                } else if let Some((mpath, gv)) = lookup_globals(analyzer)? {
+                    self.current_resolved_var_module_path =
+                        Some(mpath.to_string_lossy().to_string());
+                    Ok(Some(gv))
                 } else {
-                    debug!(
-                        "Variable '{}' not found in DWARF locals/params, trying globals",
-                        var_name
-                    );
-                    // Global fallback: search per-module first, then cross-module
-                    let mut matches = analyzer.find_global_variables_by_name(var_name);
-                    if matches.is_empty() {
-                        return Ok(None);
-                    }
-                    // Prefer current module
-                    let preferred: Vec<(
-                        std::path::PathBuf,
-                        ghostscope_dwarf::core::GlobalVariableInfo,
-                    )> = matches
-                        .iter()
-                        .filter(|(p, _)| p.to_string_lossy() == module_path.as_str())
-                        .cloned()
-                        .collect();
-                    let chosen = if preferred.len() == 1 {
-                        Some(preferred[0].clone())
-                    } else if preferred.is_empty() && matches.len() == 1 {
-                        Some(matches.remove(0))
-                    } else {
-                        // Ambiguous across modules; bail out explicitly
-                        debug!(
-                            "Global '{}' is ambiguous across modules ({} matches)",
-                            var_name,
-                            matches.len()
-                        );
-                        return Err(CodeGenError::DwarfError(format!(
-                            "Ambiguous global '{}': {} matches",
-                            var_name,
-                            matches.len()
-                        )));
-                    };
-
-                    if let Some((mpath, info)) = chosen {
-                        // Resolve variable by CU/DIE offsets in that module
-                        let gv = analyzer
-                            .resolve_variable_by_offsets_in_module(
-                                &mpath,
-                                info.unit_offset,
-                                info.die_offset,
-                            )
-                            .map_err(|e| CodeGenError::DwarfError(e.to_string()))?;
-                        // Record module hint for codegen (ASLR offsets lookup)
-                        self.current_resolved_var_module_path =
-                            Some(mpath.to_string_lossy().to_string());
-                        Ok(Some(gv))
-                    } else {
-                        Ok(None)
-                    }
+                    Ok(None)
                 }
             }
             Err(e) => {
-                debug!("DWARF query error for '{}': {}", var_name, e);
-                Err(CodeGenError::DwarfError(format!("DWARF query failed: {e}")))
+                debug!(
+                    "DWARF local lookup error for '{}': {e}; falling back to globals",
+                    var_name
+                );
+                if let Some((mpath, gv)) = lookup_globals(analyzer)? {
+                    self.current_resolved_var_module_path =
+                        Some(mpath.to_string_lossy().to_string());
+                    Ok(Some(gv))
+                } else {
+                    Ok(None)
+                }
             }
         }
     }
