@@ -299,10 +299,8 @@ trace globals_program.c:32 {
             "Late-start: G_STATE.inner.y should +0.5 per tick. STDOUT: {stdout}"
         );
     } else {
-        assert!(
-            !uniq.is_empty(),
-            "Late-start: No events for our PID. STDOUT: {stdout}"
-        );
+        let msg = format!("Late-start: No events for our PID {pid}. STDOUT: {stdout}");
+        assert!(!uniq.is_empty(), "{}", msg);
     }
     Ok(())
 }
@@ -332,6 +330,7 @@ trace lib_tick {
                 .timeout_secs(12)
                 .with_log_level("trace")
                 .enable_sysmon_shared_lib(true)
+                .enable_file_logging(true)
                 .run()
                 .await
         })
@@ -353,6 +352,11 @@ trace lib_tick {
         .await
         .map_err(|e| anyhow::anyhow!("GhostScope task join error: {e}"))??;
     let _ = prog.kill().await.is_ok();
+    if exit_code != 0 {
+        if let Ok(log_contents) = tokio::fs::read_to_string("ghostscope.log").await {
+            eprintln!("ghostscope.log:\n{log_contents}");
+        }
+    }
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let re = Regex::new(r"PID:([0-9]+) LC:([0-9]+)").unwrap();
@@ -379,11 +383,14 @@ trace lib_tick {
             "Late-start: LIB_STATE.counter should +2 per tick. STDOUT: {stdout}"
         );
     } else {
-        assert!(
-            !uniq.is_empty(),
-            "Late-start: No events for our PID. STDOUT: {stdout}"
-        );
+        let log_dump = tokio::fs::read_to_string("ghostscope.log")
+            .await
+            .unwrap_or_else(|_| "<ghostscope.log unavailable>".to_string());
+        let msg =
+            format!("Late-start: No events for our PID {pid}. STDOUT: {stdout}. LOG: {log_dump}");
+        assert!(!uniq.is_empty(), "{}", msg);
     }
+    let _ = tokio::fs::remove_file("ghostscope.log").await;
     Ok(())
 }
 

@@ -1,7 +1,12 @@
-use crate::{maps, offsets::ProcessManager};
+use crate::{
+    maps,
+    offsets::{PidOffsetsEntry, ProcessManager},
+};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
 /// Kind of process lifecycle event
@@ -36,6 +41,66 @@ pub struct SysEvent {
     pub kind: u32, // 1=exec,2=fork,3=exit
 }
 
+const PENDING_POLL_INTERVAL: Duration = Duration::from_millis(150);
+const PENDING_MAX_ATTEMPTS: u32 = 20;
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingOffsetsEntry {
+    target_path: PathBuf,
+    attempts: u32,
+    last_poll: Instant,
+    first_seen: Instant,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct PendingOffsets {
+    entries: HashMap<u32, PendingOffsetsEntry>,
+}
+
+impl PendingOffsets {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    fn register(&mut self, pid: u32, target: &Path) {
+        let now = Instant::now();
+        let last_poll = now.checked_sub(PENDING_POLL_INTERVAL).unwrap_or(now);
+        self.entries
+            .entry(pid)
+            .and_modify(|entry| {
+                entry.target_path = target.to_path_buf();
+                entry.attempts = 0;
+                entry.last_poll = last_poll;
+                entry.first_seen = now;
+            })
+            .or_insert(PendingOffsetsEntry {
+                target_path: target.to_path_buf(),
+                attempts: 0,
+                last_poll,
+                first_seen: now,
+            });
+    }
+
+    fn remove(&mut self, pid: u32) {
+        self.entries.remove(&pid);
+    }
+
+    fn take_due(&mut self) -> Vec<(u32, PathBuf, u32)> {
+        let mut due = Vec::new();
+        let now = Instant::now();
+        for (&pid, entry) in self.entries.iter_mut() {
+            if now.duration_since(entry.last_poll) >= PENDING_POLL_INTERVAL {
+                entry.last_poll = now;
+                entry.attempts = entry.attempts.saturating_add(1);
+                due.push((pid, entry.target_path.clone(), entry.attempts));
+            }
+        }
+        due
+    }
+}
+
 /// Configuration for sysmon
 #[derive(Debug, Clone, Default)]
 pub struct SysmonConfig {
@@ -68,6 +133,7 @@ pub struct ProcessSysmon {
     mgr: Arc<Mutex<ProcessManager>>, // shared manager to compute/prefill offsets
     tx: mpsc::Sender<SysEvent>,
     rx: mpsc::Receiver<SysEvent>,
+    pending_offsets: Arc<Mutex<PendingOffsets>>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -86,6 +152,7 @@ impl ProcessSysmon {
             mgr,
             tx,
             rx,
+            pending_offsets: Arc::new(Mutex::new(PendingOffsets::new())),
             handle: None,
         }
     }
@@ -101,6 +168,7 @@ impl ProcessSysmon {
 
         let tx = self.tx.clone();
         let mgr = Arc::clone(&self.mgr);
+        let pending = Arc::clone(&self.pending_offsets);
         let target = self.cfg.target_module.clone();
         let perf_pages = self.cfg.perf_page_count;
 
@@ -110,12 +178,13 @@ impl ProcessSysmon {
                 info!("ProcessSysmon thread started");
                 #[cfg(feature = "sysmon-ebpf")]
                 {
-                    if let Err(e) = run_sysmon_loop(mgr, target, perf_pages, tx) {
+                    if let Err(e) = run_sysmon_loop(mgr, target, pending, perf_pages, tx) {
                         error!("Sysmon loop error: {}", e);
                     }
                 }
                 #[cfg(not(feature = "sysmon-ebpf"))]
                 {
+                    let _ = pending;
                     warn!("sysmon-ebpf feature is disabled; sysmon is in stub mode");
                     loop {
                         std::thread::sleep(std::time::Duration::from_millis(5000));
@@ -142,9 +211,10 @@ impl ProcessSysmon {
     }
 
     /// Handle one system event: prefill on Exec/Fork, cleanup on Exit.
-    pub fn handle_event(
+    pub(crate) fn handle_event(
         mgr: &Arc<Mutex<ProcessManager>>,
         target: &Option<PathBuf>,
+        pending: &Arc<Mutex<PendingOffsets>>,
         ev: &SysEvent,
     ) -> anyhow::Result<()> {
         let kind = match SysEventKind::from_u32(ev.kind) {
@@ -160,20 +230,23 @@ impl ProcessSysmon {
         };
         match kind {
             SysEventKind::Exec | SysEventKind::Fork => {
-                if let SysEventKind::Exec = kind {
-                    if let Some(tpath) = target {
-                        let path = tpath.as_path();
-                        if crate::util::is_shared_object(path) {
-                            if !pid_maps_target_module(ev.tgid, path) {
-                                tracing::debug!(
-                                    "Sysmon: pid {} does not map target module yet; skip",
-                                    ev.tgid
-                                );
-                                // TODO: Support delayed shared-library mapping by retrying when
-                                // the module finally appears in /proc/<pid>/maps.
-                                return Ok(());
+                if let Some(tpath) = target {
+                    let path = tpath.as_path();
+                    if crate::util::is_shared_object(path) {
+                        if kind == SysEventKind::Exec && !pid_maps_target_module(ev.tgid, path) {
+                            tracing::debug!(
+                                "Sysmon: pid {} does not map target module yet; scheduling retry",
+                                ev.tgid
+                            );
+                            if let Ok(mut guard) = pending.lock() {
+                                guard.register(ev.tgid, path);
                             }
-                        } else if let Some(actual) = get_comm_from_proc(ev.tgid) {
+                            return Ok(());
+                        } else if let Ok(mut guard) = pending.lock() {
+                            guard.remove(ev.tgid);
+                        }
+                    } else if kind == SysEventKind::Exec {
+                        if let Some(actual) = get_comm_from_proc(ev.tgid) {
                             let expected = truncate_basename_to_comm(path);
                             if actual.as_bytes() != expected.as_slice() {
                                 tracing::warn!(
@@ -187,96 +260,12 @@ impl ProcessSysmon {
                         }
                     }
                 }
-                // Prefill all modules for this PID, then insert matched entries into the pinned map
-                if let Ok(mut guard) = mgr.lock() {
-                    let prefilled = guard.ensure_prefill_pid(ev.tgid)?;
-                    if prefilled > 0 {
-                        info!(
-                            "Sysmon: prefilled {} entries for pid {} (exec/fork)",
-                            prefilled, ev.tgid
-                        );
-                    }
-                    // Collect entries to write into pinned map
-                    if let Some(entries) = guard.cached_offsets_with_paths_for_pid(ev.tgid) {
-                        use crate::maps::{insert_offsets_for_pid, ProcModuleOffsetsValue};
-                        use std::fs;
-                        use std::os::unix::fs::MetadataExt;
-                        // Prefer robust dev:inode matching; fall back to cookie, then to path string only as last resort.
-                        let filtered = if let Some(tpath) = target {
-                            match fs::metadata(tpath) {
-                                Ok(tmeta) => {
-                                    let t_dev = tmeta.dev();
-                                    let t_ino = tmeta.ino();
-                                    entries
-                                        .iter()
-                                        .filter(|e| {
-                                            fs::metadata(&e.module_path)
-                                                .map(|m| m.dev() == t_dev && m.ino() == t_ino)
-                                                .unwrap_or(false)
-                                        })
-                                        .collect::<Vec<_>>()
-                                }
-                                Err(_) => {
-                                    // Target metadata missing (e.g., deleted file) — compare by cookie first
-                                    let tc = crate::cookie::from_path(&tpath.to_string_lossy());
-                                    let by_cookie: Vec<_> =
-                                        entries.iter().filter(|e| e.cookie == tc).collect();
-                                    if !by_cookie.is_empty() {
-                                        by_cookie
-                                    } else {
-                                        // Last resort: compare normalized path strings
-                                        let tnorm = tpath.to_string_lossy().replace("/./", "/");
-                                        entries
-                                            .iter()
-                                            .filter(|e| e.module_path == tnorm)
-                                            .collect::<Vec<_>>()
-                                    }
-                                }
-                            }
-                        } else {
-                            entries.iter().collect::<Vec<_>>()
-                        };
-                        if !filtered.is_empty() {
-                            let items: Vec<(u64, ProcModuleOffsetsValue)> = filtered
-                                .iter()
-                                .map(|e| {
-                                    (
-                                        e.cookie,
-                                        ProcModuleOffsetsValue::new(
-                                            e.offsets.text,
-                                            e.offsets.rodata,
-                                            e.offsets.data,
-                                            e.offsets.bss,
-                                        ),
-                                    )
-                                })
-                                .collect();
-                            let inserted = insert_offsets_for_pid(ev.tgid, &items).unwrap_or(0);
-                            if inserted == 0 {
-                                tracing::warn!(
-                                    "Sysmon: no offsets inserted for pid {} (filtered count={})",
-                                    ev.tgid,
-                                    items.len()
-                                );
-                            } else {
-                                tracing::info!(
-                                    "Sysmon: inserted {} offset entries for pid {}",
-                                    inserted,
-                                    ev.tgid
-                                );
-                                // Allowlist this PID so subsequent fork/exit events are delivered
-                                let _ = crate::maps::insert_allowed_pid(ev.tgid);
-                            }
-                        } else if target.is_some() {
-                            tracing::debug!(
-                                "Sysmon: pid {} does not map target module; skip",
-                                ev.tgid
-                            );
-                        }
-                    }
-                }
+                let _ = prefill_offsets_for_pid(mgr, ev.tgid, target.as_deref());
             }
             SysEventKind::Exit => {
+                if let Ok(mut guard) = pending.lock() {
+                    guard.remove(ev.tgid);
+                }
                 // Cleanup: purge keys for this PID in pinned map and remove from allowlist
                 match crate::maps::purge_offsets_for_pid(ev.tgid) {
                     Ok(n) => info!(
@@ -296,6 +285,7 @@ impl ProcessSysmon {
 fn run_sysmon_loop(
     mgr: Arc<Mutex<ProcessManager>>,
     target: Option<PathBuf>,
+    pending: Arc<Mutex<PendingOffsets>>,
     perf_pages: Option<usize>,
     tx: mpsc::Sender<SysEvent>,
 ) -> anyhow::Result<()> {
@@ -433,13 +423,17 @@ fn run_sysmon_loop(
     if let Some(map) = bpf.take_map("sysmon_events") {
         let mut rb: RingBuf<MapData> = map.try_into()?;
         loop {
+            let mut had_event = false;
             if let Some(item) = rb.next() {
                 if item.len() == core::mem::size_of::<SysEvent>() {
                     let ev = unsafe { core::ptr::read_unaligned(item.as_ptr() as *const SysEvent) };
-                    let _ = ProcessSysmon::handle_event(&mgr, &target, &ev);
+                    let _ = ProcessSysmon::handle_event(&mgr, &target, &pending, &ev);
                     let _ = tx.send(ev);
+                    had_event = true;
                 }
-            } else {
+            }
+            poll_pending_offsets(&mgr, &pending);
+            if !had_event {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
@@ -470,7 +464,7 @@ fn run_sysmon_loop(
                                 let ev = unsafe {
                                     core::ptr::read_unaligned(data.as_ptr() as *const SysEvent)
                                 };
-                                let _ = ProcessSysmon::handle_event(&mgr, &target, &ev);
+                                let _ = ProcessSysmon::handle_event(&mgr, &target, &pending, &ev);
                                 let _ = tx.send(ev);
                             }
                         }
@@ -478,6 +472,7 @@ fn run_sysmon_loop(
                     Err(e) => warn!("Perf read_events failed: {}", e),
                 }
             }
+            poll_pending_offsets(&mgr, &pending);
         }
     } else {
         return Err(anyhow::anyhow!("No sysmon events map found (ringbuf/perf)"));
@@ -591,6 +586,185 @@ fn looks_like_shared_object(path: &Path) -> bool {
     false
 }
 */
+
+fn pid_alive(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+fn filter_entries_for_target<'a>(
+    entries: &'a [PidOffsetsEntry],
+    target: Option<&Path>,
+) -> Vec<&'a PidOffsetsEntry> {
+    use std::fs;
+    use std::os::unix::fs::MetadataExt;
+
+    if let Some(tpath) = target {
+        match fs::metadata(tpath) {
+            Ok(meta) => {
+                let t_dev = meta.dev();
+                let t_ino = meta.ino();
+                entries
+                    .iter()
+                    .filter(|e| {
+                        fs::metadata(&e.module_path)
+                            .map(|m| m.dev() == t_dev && m.ino() == t_ino)
+                            .unwrap_or(false)
+                    })
+                    .collect()
+            }
+            Err(_) => {
+                let tc = crate::cookie::from_path(&tpath.to_string_lossy());
+                let by_cookie: Vec<_> = entries.iter().filter(|e| e.cookie == tc).collect();
+                if !by_cookie.is_empty() {
+                    by_cookie
+                } else {
+                    let tnorm = tpath.to_string_lossy().replace("/./", "/");
+                    entries.iter().filter(|e| e.module_path == tnorm).collect()
+                }
+            }
+        }
+    } else {
+        entries.iter().collect()
+    }
+}
+
+fn prefill_offsets_for_pid(
+    mgr: &Arc<Mutex<ProcessManager>>,
+    pid: u32,
+    target: Option<&Path>,
+) -> anyhow::Result<bool> {
+    use crate::maps::{insert_offsets_for_pid, ProcModuleOffsetsValue};
+
+    let mut inserted_any = false;
+    if let Ok(mut guard) = mgr.lock() {
+        let prefilled = guard.ensure_prefill_pid(pid)?;
+        if prefilled > 0 {
+            info!("Sysmon: prefilled {} entries for pid {}", prefilled, pid);
+        }
+        if let Some(entries) = guard.cached_offsets_with_paths_for_pid(pid) {
+            let filtered = filter_entries_for_target(entries, target);
+            if !filtered.is_empty() {
+                let items: Vec<(u64, ProcModuleOffsetsValue)> = filtered
+                    .iter()
+                    .map(|e| {
+                        (
+                            e.cookie,
+                            ProcModuleOffsetsValue::new(
+                                e.offsets.text,
+                                e.offsets.rodata,
+                                e.offsets.data,
+                                e.offsets.bss,
+                            ),
+                        )
+                    })
+                    .collect();
+                match insert_offsets_for_pid(pid, &items) {
+                    Ok(inserted) => {
+                        if inserted == 0 {
+                            tracing::warn!(
+                                "Sysmon: no offsets inserted for pid {} (filtered count={})",
+                                pid,
+                                items.len()
+                            );
+                        } else {
+                            tracing::info!(
+                                "Sysmon: inserted {} offset entries for pid {}",
+                                inserted,
+                                pid
+                            );
+                            let _ = crate::maps::insert_allowed_pid(pid);
+                            inserted_any = true;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Sysmon: failed to insert offsets for pid {}: {}", pid, e);
+                    }
+                }
+            } else if target.is_some() {
+                tracing::debug!("Sysmon: pid {} does not map target module; skip", pid);
+            }
+        }
+    }
+    Ok(inserted_any)
+}
+
+fn poll_pending_offsets(mgr: &Arc<Mutex<ProcessManager>>, pending: &Arc<Mutex<PendingOffsets>>) {
+    let due = if let Ok(mut guard) = pending.lock() {
+        guard.take_due()
+    } else {
+        Vec::new()
+    };
+
+    if due.is_empty() {
+        return;
+    }
+
+    let mut to_remove: Vec<u32> = Vec::new();
+
+    for (pid, target_path, attempts) in due {
+        if !pid_alive(pid) {
+            tracing::debug!(
+                "Sysmon: pid {} exited while waiting for offsets; removing from retry queue",
+                pid
+            );
+            to_remove.push(pid);
+            continue;
+        }
+
+        if !pid_maps_target_module(pid, &target_path) {
+            if attempts >= PENDING_MAX_ATTEMPTS {
+                tracing::warn!(
+                    "Sysmon: pid {} still missing module {} after {} retries; giving up",
+                    pid,
+                    target_path.display(),
+                    attempts
+                );
+                to_remove.push(pid);
+            }
+            continue;
+        }
+
+        match prefill_offsets_for_pid(mgr, pid, Some(target_path.as_path())) {
+            Ok(true) => {
+                tracing::info!(
+                    "Sysmon: deferred prefill succeeded for pid {} (module {})",
+                    pid,
+                    target_path.display()
+                );
+                to_remove.push(pid);
+            }
+            Ok(false) => {
+                if attempts >= PENDING_MAX_ATTEMPTS {
+                    tracing::warn!(
+                        "Sysmon: deferred prefill produced no entries for pid {} after {} retries; giving up",
+                        pid,
+                        attempts
+                    );
+                    to_remove.push(pid);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Sysmon: deferred prefill failed for pid {} (attempt {}): {}",
+                    pid,
+                    attempts,
+                    e
+                );
+                if attempts >= PENDING_MAX_ATTEMPTS {
+                    to_remove.push(pid);
+                }
+            }
+        }
+    }
+
+    if !to_remove.is_empty() {
+        if let Ok(mut guard) = pending.lock() {
+            for pid in to_remove {
+                guard.remove(pid);
+            }
+        }
+    }
+}
 
 fn get_comm_from_proc(pid: u32) -> Option<String> {
     use std::io::Read;

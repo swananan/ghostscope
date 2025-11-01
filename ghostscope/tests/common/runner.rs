@@ -24,6 +24,7 @@ pub struct GhostscopeRunner {
     force_perf_event_array: bool,
     log_level: Option<String>,
     enable_sysmon_shared_lib: bool,
+    enable_file_logging: bool,
 }
 
 impl Default for GhostscopeRunner {
@@ -36,6 +37,7 @@ impl Default for GhostscopeRunner {
             force_perf_event_array: false,
             log_level: None,
             enable_sysmon_shared_lib: false,
+            enable_file_logging: false,
         }
     }
 }
@@ -73,6 +75,11 @@ impl GhostscopeRunner {
 
     pub fn enable_sysmon_shared_lib(mut self, yes: bool) -> Self {
         self.enable_sysmon_shared_lib = yes;
+        self
+    }
+
+    pub fn enable_file_logging(mut self, yes: bool) -> Self {
+        self.enable_file_logging = yes;
         self
     }
 
@@ -130,6 +137,10 @@ impl GhostscopeRunner {
         // Opt-in sysmon for -t shared library tests
         if self.enable_sysmon_shared_lib {
             args.push(OsString::from("--enable-sysmon-shared-lib"));
+        }
+
+        if self.enable_file_logging {
+            args.push(OsString::from("--log"));
         }
 
         let mut cmd = Command::new(&binary_path);
