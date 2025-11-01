@@ -25,7 +25,11 @@ ehthumbs.db
 Thumbs.db
 
 # GhostScope specific output files
+# Ignore all .o files by default...
 *.o
+# ...but keep the prebuilt sysmon eBPF artifacts
+!ghostscope-process/ebpf/obj/sysmon-bpf.bpfel.o
+!ghostscope-process/ebpf/obj/sysmon-bpf.bpfeb.o
 *.ll
 *.dwarf
 *.bpf

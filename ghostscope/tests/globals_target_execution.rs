@@ -330,7 +330,6 @@ trace lib_tick {
                 .timeout_secs(12)
                 .with_log_level("trace")
                 .enable_sysmon_shared_lib(true)
-                .enable_file_logging(true)
                 .run()
                 .await
         })
@@ -352,11 +351,6 @@ trace lib_tick {
         .await
         .map_err(|e| anyhow::anyhow!("GhostScope task join error: {e}"))??;
     let _ = prog.kill().await.is_ok();
-    if exit_code != 0 {
-        if let Ok(log_contents) = tokio::fs::read_to_string("ghostscope.log").await {
-            eprintln!("ghostscope.log:\n{log_contents}");
-        }
-    }
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let re = Regex::new(r"PID:([0-9]+) LC:([0-9]+)").unwrap();

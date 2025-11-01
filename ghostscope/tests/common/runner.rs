@@ -78,6 +78,7 @@ impl GhostscopeRunner {
         self
     }
 
+    #[allow(dead_code)]
     pub fn enable_file_logging(mut self, yes: bool) -> Self {
         self.enable_file_logging = yes;
         self
