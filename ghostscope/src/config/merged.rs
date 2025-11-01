@@ -191,6 +191,10 @@ impl MergedConfig {
                 if args.force_perf_event_array {
                     ebpf_config.force_perf_event_array = true;
                 }
+                // Command line --enable-sysmon-shared-lib overrides config file
+                if args.enable_sysmon_for_shared_lib {
+                    ebpf_config.enable_sysmon_for_shared_lib = true;
+                }
                 ebpf_config
             },
             source: config.source,
@@ -272,6 +276,36 @@ impl MergedConfig {
             ghostscope_compiler::EventMapType::PerfEventArray
         };
 
+        // Derive effective max_trace_event_size with runtime clamping
+        let mut effective_max_event = self.ebpf_config.max_trace_event_size;
+        match event_map_type {
+            ghostscope_compiler::EventMapType::RingBuf => {
+                let ring_cap = self.ebpf_config.ringbuf_size as u32;
+                if effective_max_event > ring_cap {
+                    ::tracing::warn!(
+                        "Clamping max_trace_event_size {} to ringbuf_size {}",
+                        effective_max_event,
+                        ring_cap
+                    );
+                    effective_max_event = ring_cap;
+                }
+            }
+            ghostscope_compiler::EventMapType::PerfEventArray => {
+                // Conservative clamp: do not exceed per-CPU perf buffer size
+                const PAGE_SIZE: u32 = 4096;
+                let perf_cap = self.ebpf_config.perf_page_count.saturating_mul(PAGE_SIZE);
+                if effective_max_event > perf_cap {
+                    ::tracing::warn!(
+                        "Clamping max_trace_event_size {} to perf buffer cap {} (pages={})",
+                        effective_max_event,
+                        perf_cap,
+                        self.ebpf_config.perf_page_count
+                    );
+                    effective_max_event = perf_cap;
+                }
+            }
+        }
+
         ghostscope_compiler::CompileOptions {
             save_llvm_ir,
             save_ebpf,
@@ -283,7 +317,7 @@ impl MergedConfig {
             event_map_type,
             mem_dump_cap: self.ebpf_config.mem_dump_cap,
             compare_cap: self.ebpf_config.compare_cap,
-            max_trace_event_size: self.ebpf_config.max_trace_event_size,
+            max_trace_event_size: effective_max_event,
             selected_index: None,
         }
     }

@@ -38,6 +38,7 @@ pub async fn run_tui_coordinator_with_config(config: MergedConfig) -> Result<()>
         has_explicit_log_flag: false, // Not relevant for TUI conversion
         has_explicit_console_log_flag: false, // Not relevant for TUI conversion
         force_perf_event_array: config.ebpf_config.force_perf_event_array,
+        enable_sysmon_for_shared_lib: config.ebpf_config.enable_sysmon_for_shared_lib,
         allow_loose_debug_match: config.dwarf_allow_loose_debug_match,
         source_panel: false,
         no_source_panel: false,

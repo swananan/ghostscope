@@ -11,190 +11,163 @@ use inkwell::AddressSpace;
 use tracing::info;
 
 impl<'ctx> EbpfContext<'ctx> {
-    /// Get or create the PerfEventArray accumulation buffer
+    /// Reserve `size` bytes in the per-CPU accumulation buffer and return a pointer to the
+    /// beginning of the reserved region. On overflow, resets the event offset and returns
+    /// from the eBPF program early (mirrors existing control-flow style used elsewhere).
+    fn reserve_event_space(&mut self, size: u64) -> PointerValue<'ctx> {
+        let i32_ty = self.context.i32_type();
+        let i64_ty = self.context.i64_type();
+
+        // Lookup accumulation buffer value pointer; early-return if NULL
+        let accum_buffer = self.get_or_create_perf_accumulation_buffer();
+        let offset_ptr = self.get_or_create_perf_buffer_offset();
+
+        // Load current offset
+        let offset_val = self
+            .builder
+            .build_load(i32_ty, offset_ptr, "offset")
+            .expect("Failed to load offset")
+            .into_int_value();
+
+        let buffer_size = i32_ty.const_int(self.compile_options.max_trace_event_size as u64, false);
+        let req_size_i32 = i32_ty.const_int(size, false);
+
+        // Branching blocks
+        let current_block = self.builder.get_insert_block().unwrap();
+        let parent_fn = current_block.get_parent().unwrap();
+        let bb_overflow = self
+            .context
+            .append_basic_block(parent_fn, "reserve_overflow");
+        let bb_check_size = self
+            .context
+            .append_basic_block(parent_fn, "reserve_check_size");
+        let bb_check_fit = self
+            .context
+            .append_basic_block(parent_fn, "reserve_check_fit");
+
+        // if (offset < buffer_size) goto check_size else overflow
+        let off_in = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::ULT,
+                offset_val,
+                buffer_size,
+                "off_in",
+            )
+            .expect("cmp failed");
+        self.builder
+            .build_conditional_branch(off_in, bb_check_size, bb_overflow)
+            .expect("branch failed");
+
+        // overflow: reset offset and return 0
+        self.builder.position_at_end(bb_overflow);
+        self.builder
+            .build_store(offset_ptr, i32_ty.const_zero())
+            .expect("reset store failed");
+        self.builder
+            .build_return(Some(&i32_ty.const_zero()))
+            .expect("return failed");
+
+        // check_size: require size <= buffer_size to avoid underflow in (buffer_size - size)
+        self.builder.position_at_end(bb_check_size);
+        let size_ok = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::ULE,
+                req_size_i32,
+                buffer_size,
+                "size_ok",
+            )
+            .expect("cmp failed");
+        self.builder
+            .build_conditional_branch(size_ok, bb_check_fit, bb_overflow)
+            .expect("branch failed");
+
+        // check_fit: need offset <= buffer_size - size (safe: no underflow)
+        self.builder.position_at_end(bb_check_fit);
+        let limit = self
+            .builder
+            .build_int_sub(buffer_size, req_size_i32, "limit")
+            .expect("sub failed");
+        let fits = self
+            .builder
+            .build_int_compare(inkwell::IntPredicate::ULE, offset_val, limit, "fits")
+            .expect("cmp failed");
+        let bb_ok = self.context.append_basic_block(parent_fn, "reserve_ok");
+        self.builder
+            .build_conditional_branch(fits, bb_ok, bb_overflow)
+            .expect("branch2 failed");
+
+        // ok: compute dest, bump offset, return dest
+        self.builder.position_at_end(bb_ok);
+        let off64 = self
+            .builder
+            .build_int_z_extend(offset_val, i64_ty, "off64")
+            .expect("zext failed");
+        let dest_i8 = unsafe {
+            self.builder
+                .build_gep(self.context.i8_type(), accum_buffer, &[off64], "dest_i8")
+                .expect("gep failed")
+        };
+        let new_off = self
+            .builder
+            .build_int_add(offset_val, req_size_i32, "new_off")
+            .expect("add failed");
+        self.builder
+            .build_store(offset_ptr, new_off)
+            .expect("store new_off failed");
+
+        dest_i8
+    }
+
+    /// Wrapper to reserve instruction region directly in the accumulation buffer.
+    pub(crate) fn reserve_instruction_region(&mut self, size: u64) -> PointerValue<'ctx> {
+        self.reserve_event_space(size)
+    }
+    /// Get per-CPU accumulation buffer pointer (event_accum_buffer[0]) and return early if null.
     fn get_or_create_perf_accumulation_buffer(&mut self) -> PointerValue<'ctx> {
-        // Check if buffer already exists
-        if let Some(existing) = self.module.get_global("_perf_accumulation_buffer") {
-            return existing.as_pointer_value();
-        }
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let val_ptr = self
+            .lookup_percpu_value_ptr("event_accum_buffer", 0)
+            .expect("event_accum_buffer lookup failed");
 
-        // Create buffer for accumulating all trace data (size from protocol)
-        let buffer_size = self.compile_options.max_trace_event_size;
-        let i8_type = self.context.i8_type();
-        let buffer_type = i8_type.array_type(buffer_size);
+        // if (val_ptr == NULL) return 0;
+        let is_null = self
+            .builder
+            .build_is_null(val_ptr, "accum_buf_is_null")
+            .expect("build_is_null failed");
+        let current_fn = self
+            .builder
+            .get_insert_block()
+            .unwrap()
+            .get_parent()
+            .unwrap();
+        let cont_bb = self
+            .context
+            .append_basic_block(current_fn, "accum_buf_cont");
+        let ret_bb = self.context.append_basic_block(current_fn, "accum_buf_ret");
+        self.builder
+            .build_conditional_branch(is_null, ret_bb, cont_bb)
+            .expect("build_conditional_branch failed");
+        // return 0 in ret_bb
+        self.builder.position_at_end(ret_bb);
+        self.builder
+            .build_return(Some(&self.context.i32_type().const_zero()))
+            .expect("build_return failed");
+        // continue in cont_bb
+        self.builder.position_at_end(cont_bb);
 
-        let buffer = self.module.add_global(
-            buffer_type,
-            Some(AddressSpace::default()),
-            "_perf_accumulation_buffer",
-        );
-        buffer.set_initializer(&buffer_type.const_zero());
-        buffer.as_pointer_value()
+        // Cast to i8* if necessary (keep as generic pointer; loads/stores will cast as needed)
+        self.builder
+            .build_bit_cast(val_ptr, ptr_ty, "accum_buf_ptr")
+            .expect("bitcast failed")
+            .into_pointer_value()
     }
 
-    /// Get or create the PerfEventArray buffer offset tracker (i32 global)
+    /// Get pointer to per-invocation stack event offset (u32)
     fn get_or_create_perf_buffer_offset(&mut self) -> PointerValue<'ctx> {
-        // Check if offset tracker already exists
-        if let Some(existing) = self.module.get_global("_perf_buffer_offset") {
-            return existing.as_pointer_value();
-        }
-
-        // Create i32 global for tracking current buffer offset
-        let i32_type = self.context.i32_type();
-        let offset_global = self.module.add_global(
-            i32_type,
-            Some(AddressSpace::default()),
-            "_perf_buffer_offset",
-        );
-        offset_global.set_initializer(&i32_type.const_zero());
-        offset_global.as_pointer_value()
-    }
-
-    /// Write data to accumulation buffer (PerfEventArray) or send immediately (RingBuf)
-    pub fn write_to_accumulation_buffer_or_send(
-        &mut self,
-        data: PointerValue<'ctx>,
-        size: u64,
-    ) -> Result<()> {
-        match self.compile_options.event_map_type {
-            crate::EventMapType::RingBuf => {
-                // RingBuf: Send immediately (existing behavior)
-                self.create_event_output(data, size)?;
-            }
-            crate::EventMapType::PerfEventArray => {
-                // PerfEventArray: Accumulate data into buffer
-                let accum_buffer = self.get_or_create_perf_accumulation_buffer();
-                let offset_ptr = self.get_or_create_perf_buffer_offset();
-
-                // Load current offset
-                let offset_val = self
-                    .builder
-                    .build_load(self.context.i32_type(), offset_ptr, "offset")
-                    .map_err(|e| CodeGenError::LLVMError(format!("Failed to load offset: {e}")))?
-                    .into_int_value();
-
-                let buffer_size = self
-                    .context
-                    .i32_type()
-                    .const_int(self.compile_options.max_trace_event_size as u64, false);
-
-                // Get current block and parent function for branching
-                let current_block = self.builder.get_insert_block().unwrap();
-                let parent_fn = current_block.get_parent().unwrap();
-
-                // Check 1: Ensure offset itself is bounded (offset < buffer_size)
-                // This is critical for eBPF verifier to accept the pointer arithmetic
-                let offset_in_bounds = self
-                    .builder
-                    .build_int_compare(
-                        inkwell::IntPredicate::ULT,
-                        offset_val,
-                        buffer_size,
-                        "offset_in_bounds",
-                    )
-                    .map_err(|e| {
-                        CodeGenError::LLVMError(format!("Failed to compare offset: {e}"))
-                    })?;
-
-                let overflow_block = self
-                    .context
-                    .append_basic_block(parent_fn, "buffer_overflow");
-                let check_write_block = self
-                    .context
-                    .append_basic_block(parent_fn, "check_write_size");
-
-                self.builder
-                    .build_conditional_branch(offset_in_bounds, check_write_block, overflow_block)
-                    .map_err(|e| {
-                        CodeGenError::LLVMError(format!("Failed to build first branch: {e}"))
-                    })?;
-
-                // Check 2: Ensure offset + size doesn't exceed buffer
-                self.builder.position_at_end(check_write_block);
-
-                let size_i32 = self.context.i32_type().const_int(size, false);
-                let new_offset_val = self
-                    .builder
-                    .build_int_add(offset_val, size_i32, "new_offset")
-                    .map_err(|e| CodeGenError::LLVMError(format!("Failed to add size: {e}")))?;
-
-                let write_fits = self
-                    .builder
-                    .build_int_compare(
-                        inkwell::IntPredicate::ULE,
-                        new_offset_val,
-                        buffer_size,
-                        "write_fits",
-                    )
-                    .map_err(|e| {
-                        CodeGenError::LLVMError(format!("Failed to compare write size: {e}"))
-                    })?;
-
-                let continue_block = self
-                    .context
-                    .append_basic_block(parent_fn, "continue_accumulate");
-
-                self.builder
-                    .build_conditional_branch(write_fits, continue_block, overflow_block)
-                    .map_err(|e| {
-                        CodeGenError::LLVMError(format!("Failed to build second branch: {e}"))
-                    })?;
-
-                // Overflow block: Reset offset to 0 and return early
-                // This ensures subsequent trace events can start fresh
-                self.builder.position_at_end(overflow_block);
-                self.builder
-                    .build_store(offset_ptr, self.context.i32_type().const_zero())
-                    .map_err(|e| CodeGenError::LLVMError(format!("Failed to reset offset: {e}")))?;
-                self.builder
-                    .build_return(Some(&self.context.i32_type().const_zero()))
-                    .map_err(|e| CodeGenError::LLVMError(format!("Failed to build return: {e}")))?;
-
-                // Continue block: Both checks passed, safe to write
-                self.builder.position_at_end(continue_block);
-
-                // Manual pointer arithmetic with bounded offset
-                // Zero-extend offset from i32 to i64 (unsigned)
-                let offset_i64 = self
-                    .builder
-                    .build_int_z_extend(offset_val, self.context.i64_type(), "offset_i64")
-                    .map_err(|e| {
-                        CodeGenError::LLVMError(format!("Failed to extend offset: {e}"))
-                    })?;
-
-                // Use GEP with i64 to avoid sign extension
-                let dest_ptr = unsafe {
-                    self.builder
-                        .build_gep(
-                            self.context.i8_type(),
-                            accum_buffer,
-                            &[offset_i64],
-                            "dest_ptr",
-                        )
-                        .map_err(|e| {
-                            CodeGenError::LLVMError(format!("Failed to get dest GEP: {e}"))
-                        })?
-                };
-
-                // memcpy: dest_ptr = data (size bytes)
-                self.builder
-                    .build_memcpy(
-                        dest_ptr,
-                        1,
-                        data,
-                        1,
-                        self.context.i64_type().const_int(size, false),
-                    )
-                    .map_err(|e| CodeGenError::LLVMError(format!("Failed to memcpy: {e}")))?;
-
-                // Update offset: offset += size
-                // Reuse new_offset_val calculated earlier (line 108-115) to avoid redundant computation
-                self.builder
-                    .build_store(offset_ptr, new_offset_val)
-                    .map_err(|e| CodeGenError::LLVMError(format!("Failed to store offset: {e}")))?;
-            }
-        }
-        Ok(())
+        self.event_offset_alloca
+            .expect("event_offset not allocated in entry block")
     }
 
     /// Send TraceEventHeader as first segment
@@ -212,10 +185,9 @@ impl<'ctx> EbpfContext<'ctx> {
                 .map_err(|e| CodeGenError::LLVMError(format!("Failed to reset offset: {e}")))?;
         }
 
-        let header_buffer = self.create_instruction_buffer();
-
-        // Buffer is a zero-initialized global; explicit memset is unnecessary and not BPF-safe.
+        // Buffer is a zero-initialized map value region; explicit memset is unnecessary and not BPF-safe.
         let header_size = std::mem::size_of::<TraceEventHeader>() as u64;
+        let header_buffer = self.reserve_instruction_region(header_size);
 
         // Write TraceEventHeader
         // magic at offset 0 (only field needed)
@@ -236,8 +208,7 @@ impl<'ctx> EbpfContext<'ctx> {
             .build_store(magic_u32_ptr, magic_val)
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store magic: {e}")))?;
 
-        // Send header segment (RingBuf) or accumulate (PerfEventArray)
-        self.write_to_accumulation_buffer_or_send(header_buffer, header_size)?;
+        // Already wrote into the accumulation buffer; no copy needed
 
         Ok(())
     }
@@ -249,10 +220,9 @@ impl<'ctx> EbpfContext<'ctx> {
             trace_id
         );
 
-        let message_buffer = self.create_instruction_buffer();
-
-        // Buffer is zero-initialized; avoid memset which is not allowed in eBPF.
+        // Buffer is zero-initialized in map value; avoid memset which is not allowed in eBPF.
         let message_size = std::mem::size_of::<TraceEventMessage>() as u64;
+        let message_buffer = self.reserve_instruction_region(message_size);
 
         // Write TraceEventMessage
         // trace_id at offset 0
@@ -366,8 +336,7 @@ impl<'ctx> EbpfContext<'ctx> {
             .build_store(tid_u32_ptr, tid)
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store tid: {e}")))?;
 
-        // Send message segment (RingBuf) or accumulate (PerfEventArray)
-        self.write_to_accumulation_buffer_or_send(message_buffer, message_size)?;
+        // Already wrote into the accumulation buffer; no copy needed
 
         Ok(())
     }
@@ -379,12 +348,11 @@ impl<'ctx> EbpfContext<'ctx> {
             total_instructions
         );
 
-        let end_buffer = self.create_instruction_buffer();
-
-        // Avoid memset; buffer is zero-initialized as global
+        // Avoid memset; destination is in accumulation buffer
         let total_size =
             (std::mem::size_of::<ghostscope_protocol::trace_event::InstructionHeader>()
                 + std::mem::size_of::<EndInstructionData>()) as u64;
+        let end_buffer = self.reserve_instruction_region(total_size);
 
         // Write InstructionHeader
         // inst_type at offset 0
@@ -540,36 +508,61 @@ impl<'ctx> EbpfContext<'ctx> {
             .build_store(status_ptr, sel2)
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store status: {e}")))?;
 
-        // Accumulate end instruction (RingBuf sends immediately, PerfEventArray accumulates)
-        self.write_to_accumulation_buffer_or_send(end_buffer, total_size)?;
+        // Already accumulated in per-CPU buffer; no extra copy needed
 
-        // For PerfEventArray: Now send the entire accumulated buffer in one call
-        if matches!(
-            self.compile_options.event_map_type,
-            crate::EventMapType::PerfEventArray
-        ) {
+        // End: send the entire accumulated buffer once (RingBuf or PerfEventArray)
+        {
             let accum_buffer = self.get_or_create_perf_accumulation_buffer();
             let offset_ptr = self.get_or_create_perf_buffer_offset();
 
-            // Load total accumulated size
+            // Load total accumulated size (u32)
             let total_accumulated_size = self
                 .builder
                 .build_load(self.context.i32_type(), offset_ptr, "total_size")
                 .map_err(|e| CodeGenError::LLVMError(format!("Failed to load total size: {e}")))?
                 .into_int_value();
 
+            // Clamp size to [0, max_trace_event_size] to satisfy verifier bounded access
+            let max_size_i32 = self
+                .context
+                .i32_type()
+                .const_int(self.compile_options.max_trace_event_size as u64, false);
+            let size_le_max = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::ULE,
+                    total_accumulated_size,
+                    max_size_i32,
+                    "size_le_max",
+                )
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to compare end size: {e}")))?;
+            let clamped_size_i32 = self
+                .builder
+                .build_select(
+                    size_le_max,
+                    total_accumulated_size,
+                    max_size_i32,
+                    "clamped_size_i32",
+                )
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to select clamp size: {e}")))?
+                .into_int_value();
+
             // Convert i32 to i64 for size parameter
             let total_size_i64 = self
                 .builder
-                .build_int_z_extend(
-                    total_accumulated_size,
-                    self.context.i64_type(),
-                    "total_size_i64",
-                )
+                .build_int_z_extend(clamped_size_i32, self.context.i64_type(), "total_size_i64")
                 .map_err(|e| CodeGenError::LLVMError(format!("Failed to extend size: {e}")))?;
 
-            // Send entire accumulated buffer via perf_event_output
-            self.create_perf_event_output_dynamic(accum_buffer, total_size_i64)?;
+            match self.compile_options.event_map_type {
+                crate::EventMapType::PerfEventArray => {
+                    // Single-shot perf send
+                    self.create_perf_event_output_dynamic(accum_buffer, total_size_i64)?;
+                }
+                crate::EventMapType::RingBuf => {
+                    // Single-shot ringbuf send
+                    self.create_ringbuf_output_dynamic(accum_buffer, total_size_i64)?;
+                }
+            }
 
             // Reset offset to 0 after sending to ensure clean state for next trace event
             self.builder
@@ -577,27 +570,8 @@ impl<'ctx> EbpfContext<'ctx> {
                 .map_err(|e| {
                     CodeGenError::LLVMError(format!("Failed to reset offset after send: {e}"))
                 })?;
-
-            info!("Sent entire accumulated buffer via PerfEventArray and reset offset");
         }
 
         Ok(())
-    }
-
-    /// Create a global instruction buffer to avoid eBPF dynamic stack allocation
-    pub fn create_instruction_buffer(&mut self) -> PointerValue<'ctx> {
-        // Create a global buffer for instructions
-        // Increased to support complex variable payloads up to ~2KB plus headers
-        let buffer_size = 4096; // Sufficient for instruction data
-        let i8_type = self.context.i8_type();
-        let buffer_type = i8_type.array_type(buffer_size);
-
-        let buffer = self.module.add_global(
-            buffer_type,
-            Some(AddressSpace::default()),
-            "_instruction_buffer",
-        );
-        buffer.set_initializer(&buffer_type.const_zero());
-        buffer.as_pointer_value()
     }
 }

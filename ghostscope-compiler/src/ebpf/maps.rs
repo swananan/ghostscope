@@ -13,6 +13,7 @@ use tracing::{error, info};
 pub enum BpfMapType {
     Ringbuf,
     Array,
+    PerCpuArray,
     Hash,
     PerfEventArray,
 }
@@ -21,6 +22,7 @@ impl BpfMapType {
     fn to_aya_map_type(self) -> u32 {
         match self {
             BpfMapType::Ringbuf => bpf_map_type::BPF_MAP_TYPE_RINGBUF,
+            BpfMapType::PerCpuArray => bpf_map_type::BPF_MAP_TYPE_PERCPU_ARRAY,
             BpfMapType::Array => bpf_map_type::BPF_MAP_TYPE_ARRAY,
             BpfMapType::Hash => bpf_map_type::BPF_MAP_TYPE_HASH,
             BpfMapType::PerfEventArray => bpf_map_type::BPF_MAP_TYPE_PERF_EVENT_ARRAY,
@@ -387,7 +389,7 @@ impl<'ctx> MapManager<'ctx> {
                 let key_size_ptr = mk_ptr_to_array("key_size", key_size_val);
                 let value_size_ptr = mk_ptr_to_array("value_size", value_size_val);
                 let max_entries_ptr = mk_ptr_to_array("max_entries", max_entries as i64);
-                vec![
+                let mut v = vec![
                     di_builder.create_member_type(
                         scope,
                         "type",
@@ -432,7 +434,24 @@ impl<'ctx> MapManager<'ctx> {
                         0,
                         max_entries_ptr.as_type(),
                     ),
-                ]
+                ];
+                // For proc_module_offsets, include optional 'pinning' to signal Aya ByName pinning
+                if map_name == "proc_module_offsets" {
+                    // ByName is typically encoded as 1 in aya_obj::maps::PinningType
+                    let pinning_ptr = mk_ptr_to_array("pinning", 1);
+                    v.push(di_builder.create_member_type(
+                        scope,
+                        "pinning",
+                        file,
+                        0,
+                        64,
+                        64,
+                        256,
+                        0,
+                        pinning_ptr.as_type(),
+                    ));
+                }
+                v
             }
         };
 
@@ -442,7 +461,13 @@ impl<'ctx> MapManager<'ctx> {
         // Total structure size: pointers (64-bit) per field
         let (total_size_bits, field_count) = match map_type {
             BpfMapType::Ringbuf => (128, 2), // 2 * 64 bits
-            _ => (256, 4),                   // 4 * 64 bits
+            _ => {
+                if map_name == "proc_module_offsets" {
+                    (320, 5) // include 'pinning'
+                } else {
+                    (256, 4)
+                }
+            }
         };
 
         // Create the map structure type (anonymous like reference)
@@ -476,5 +501,27 @@ impl<'ctx> MapManager<'ctx> {
     /// Get a perf event array map by name
     pub fn get_perf_map(&self, module: &Module<'ctx>, name: &str) -> Result<PointerValue<'ctx>> {
         self.get_map(module, name)
+    }
+
+    /// Create a Per-CPU Array map (key=u32, value arbitrary size)
+    pub fn create_percpu_array_map(
+        &mut self,
+        module: &Module<'ctx>,
+        di_builder: &DebugInfoBuilder<'ctx>,
+        compile_unit: &inkwell::debug_info::DICompileUnit<'ctx>,
+        name: &str,
+        max_entries: u64,
+        value_size_bytes: u64,
+    ) -> Result<()> {
+        self.create_map_definition(
+            module,
+            di_builder,
+            compile_unit,
+            name,
+            BpfMapType::PerCpuArray,
+            max_entries,
+            SizedType::integer(32),
+            SizedType::integer(value_size_bytes * 8),
+        )
     }
 }

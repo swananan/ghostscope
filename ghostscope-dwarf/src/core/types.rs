@@ -151,11 +151,5 @@ pub struct GlobalVariableInfo {
     pub unit_offset: gimli::DebugInfoOffset,
 }
 
-/// Per-module section offsets (runtime bias) computed from /proc/PID/maps
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SectionOffsets {
-    pub text: u64,
-    pub rodata: u64,
-    pub data: u64,
-    pub bss: u64,
-}
+/// Re-export SectionOffsets from coordinator to keep a single definition/source of truth
+pub use ghostscope_process::SectionOffsets;

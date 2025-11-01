@@ -8,13 +8,14 @@ keywords.workspace = true
 
 [dependencies]
 gimli.workspace = true
-object = "0.36"
+object.workspace = true
 memmap2 = "0.9"
 anyhow.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 ghostscope-platform = { path = "../ghostscope-platform" }
 ghostscope-protocol = { path = "../ghostscope-protocol" }
+ghostscope-process = { path = "../ghostscope-process" }
 rustc-demangle = "0.1"
 cpp_demangle = "0.4"
 rayon = "1.10"

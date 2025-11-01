@@ -8,10 +8,37 @@ use ghostscope_dwarf::{
     ComputeStep, DirectValueResult, EvaluationResult, LocationResult, MemoryAccessSize, TypeInfo,
     VariableWithEvaluation,
 };
+use ghostscope_process::cookie;
 use inkwell::values::{BasicValueEnum, IntValue, PointerValue};
 use tracing::{debug, warn};
 
 impl<'ctx> EbpfContext<'ctx> {
+    /// Compute a stable cookie for a module when per-PID offsets are unavailable (via coordinator).
+    fn fallback_cookie_from_module_path(&self, module_path: &str) -> u64 {
+        cookie::from_path(module_path)
+    }
+
+    /// Compute section code for an address within a module (text=0, rodata=1, data=2, bss=3).
+    fn section_code_for_address(&mut self, module_path: &str, link_addr: u64) -> u8 {
+        if let Some(analyzer_ptr) = self.process_analyzer {
+            let analyzer = unsafe { &mut *analyzer_ptr };
+            if let Some(st) = analyzer.classify_section_for_address(module_path, link_addr) {
+                return match st {
+                    ghostscope_dwarf::core::SectionType::Text => 0,
+                    ghostscope_dwarf::core::SectionType::Rodata => 1,
+                    ghostscope_dwarf::core::SectionType::Data => 2,
+                    ghostscope_dwarf::core::SectionType::Bss => 3,
+                    _ => 2,
+                };
+            }
+        }
+        2
+    }
+
+    /// Compute cookie for module using coordinator policy.
+    fn cookie_for_module_or_fallback(&mut self, module_path: &str) -> u64 {
+        self.fallback_cookie_from_module_path(module_path)
+    }
     /// Helper: unwrap typedef/qualified wrappers to the underlying type
     fn unwrap_type_aliases(mut t: &TypeInfo) -> &TypeInfo {
         loop {
@@ -99,99 +126,71 @@ impl<'ctx> EbpfContext<'ctx> {
         //   are used as-is and are NOT rebased.
         // The caller signals which path we are on by providing the original evaluation_result.
         let pt_regs_ptr = self.get_pt_regs_parameter()?;
+        // Default assumption: offsets are available unless a lookup proves otherwise.
+        self.store_offsets_found_const(true)?;
+
         match evaluation_result {
             EvaluationResult::MemoryLocation(LocationResult::Address(addr)) => {
-                // Link-time address (global/static): attempt to apply ASLR offsets if possible
-                if let Some(analyzer_ptr) = self.process_analyzer {
-                    let analyzer = unsafe { &mut *analyzer_ptr };
-                    let ctx = self.get_compile_time_context()?;
-                    let module_for_offsets = module_hint
-                        .map(|s| s.to_string())
-                        .or_else(|| self.current_resolved_var_module_path.clone())
-                        .unwrap_or_else(|| ctx.module_path.clone());
-                    if let Ok(offsets) = analyzer.compute_section_offsets() {
-                        if let Some((_, cookie, sect_offs)) = offsets
-                            .iter()
-                            .find(|(p, _, _)| p.to_string_lossy() == module_for_offsets)
-                        {
-                            let st = analyzer
-                                .classify_section_for_address(&module_for_offsets, *addr)
-                                .unwrap_or(ghostscope_dwarf::core::SectionType::Data);
-                            let st_code: u8 = match st {
-                                ghostscope_dwarf::core::SectionType::Text => 0,
-                                ghostscope_dwarf::core::SectionType::Rodata => 1,
-                                ghostscope_dwarf::core::SectionType::Data => 2,
-                                ghostscope_dwarf::core::SectionType::Bss => 3,
-                                _ => 2,
-                            };
-                            let link_val = self.context.i64_type().const_int(*addr, false);
-                            let sect_bias = match st {
-                                ghostscope_dwarf::core::SectionType::Text => sect_offs.text,
-                                ghostscope_dwarf::core::SectionType::Rodata => sect_offs.rodata,
-                                ghostscope_dwarf::core::SectionType::Data => sect_offs.data,
-                                ghostscope_dwarf::core::SectionType::Bss => sect_offs.bss,
-                                _ => 0,
-                            };
-                            if sect_bias == 0 {
-                                self.current_resolved_var_module_path = None;
-                                return Ok(link_val);
-                            }
-                            let (rt_addr, found_flag) = self
-                                .generate_runtime_address_from_offsets(
-                                    link_val, st_code, *cookie,
-                                )?;
-                            // If offsets miss and we can record status, set OffsetsUnavailable preserving prior non-OK
-                            if let Some(sp) = status_ptr {
-                                let is_miss = self
-                                    .builder
-                                    .build_int_compare(
-                                        inkwell::IntPredicate::EQ,
-                                        found_flag,
-                                        self.context.bool_type().const_zero(),
-                                        "is_off_miss",
-                                    )
-                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                                let cur_status = self
-                                    .builder
-                                    .build_load(self.context.i8_type(), sp, "cur_status")
-                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                                let is_ok = self
-                                    .builder
-                                    .build_int_compare(
-                                        inkwell::IntPredicate::EQ,
-                                        cur_status.into_int_value(),
-                                        self.context.i8_type().const_zero(),
-                                        "status_is_ok",
-                                    )
-                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                                let should_store = self
-                                    .builder
-                                    .build_and(is_miss, is_ok, "store_offsets_unavail")
-                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                                let new_status = self
-                                    .builder
-                                    .build_select(
-                                        should_store,
-                                        self.context
-                                            .i8_type()
-                                            .const_int(ghostscope_protocol::VariableStatus::OffsetsUnavailable as u64, false)
-                                            .into(),
-                                        cur_status,
-                                        "new_status",
-                                    )
-                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                                self.builder
-                                    .build_store(sp, new_status)
-                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                            }
-                            self.current_resolved_var_module_path = None;
-                            return Ok(rt_addr);
-                        }
-                    }
+                // Unified: always attempt runtime rebasing via proc_module_offsets
+                let ctx = self.get_compile_time_context()?;
+                let module_for_offsets = module_hint
+                    .map(|s| s.to_string())
+                    .or_else(|| self.current_resolved_var_module_path.clone())
+                    .unwrap_or_else(|| ctx.module_path.clone());
+                let st_code = self.section_code_for_address(&module_for_offsets, *addr);
+                let cookie = self.cookie_for_module_or_fallback(&module_for_offsets);
+                let link_val = self.context.i64_type().const_int(*addr, false);
+                let (rt_addr, found_flag) =
+                    self.generate_runtime_address_from_offsets(link_val, st_code, cookie)?;
+                if let Some(sp) = status_ptr {
+                    let is_miss = self
+                        .builder
+                        .build_int_compare(
+                            inkwell::IntPredicate::EQ,
+                            found_flag,
+                            self.context.bool_type().const_zero(),
+                            "is_off_miss",
+                        )
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    let cur_status = self
+                        .builder
+                        .build_load(self.context.i8_type(), sp, "cur_status")
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    let is_ok = self
+                        .builder
+                        .build_int_compare(
+                            inkwell::IntPredicate::EQ,
+                            cur_status.into_int_value(),
+                            self.context.i8_type().const_zero(),
+                            "status_is_ok",
+                        )
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    let should_store = self
+                        .builder
+                        .build_and(is_miss, is_ok, "store_offsets_unavail")
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    let new_status = self
+                        .builder
+                        .build_select(
+                            should_store,
+                            self.context
+                                .i8_type()
+                                .const_int(
+                                    ghostscope_protocol::VariableStatus::OffsetsUnavailable as u64,
+                                    false,
+                                )
+                                .into(),
+                            cur_status,
+                            "new_status",
+                        )
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    self.builder
+                        .build_store(sp, new_status)
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
                 }
-                // Fallback: return link-time address
+                self.store_offsets_found_flag(found_flag)?;
                 self.current_resolved_var_module_path = None;
-                Ok(self.context.i64_type().const_int(*addr, false))
+                Ok(rt_addr)
             }
             EvaluationResult::MemoryLocation(LocationResult::RegisterAddress {
                 register,
@@ -249,97 +248,65 @@ impl<'ctx> EbpfContext<'ctx> {
 
                 if foldable && const_stack.len() == 1 {
                     let link_addr_u = const_stack[0] as u64;
-                    if let Some(analyzer_ptr) = self.process_analyzer {
-                        let analyzer = unsafe { &mut *analyzer_ptr };
-                        let ctx = self.get_compile_time_context()?;
-                        let module_for_offsets = module_hint
-                            .map(|s| s.to_string())
-                            .or_else(|| self.current_resolved_var_module_path.clone())
-                            .unwrap_or_else(|| ctx.module_path.clone());
-                        if let Ok(offsets) = analyzer.compute_section_offsets() {
-                            if let Some((_, cookie, sect_offs)) = offsets
-                                .iter()
-                                .find(|(p, _, _)| p.to_string_lossy() == module_for_offsets)
-                            {
-                                let st = analyzer
-                                    .classify_section_for_address(&module_for_offsets, link_addr_u)
-                                    .unwrap_or(ghostscope_dwarf::core::SectionType::Data);
-                                let st_code: u8 = match st {
-                                    ghostscope_dwarf::core::SectionType::Text => 0,
-                                    ghostscope_dwarf::core::SectionType::Rodata => 1,
-                                    ghostscope_dwarf::core::SectionType::Data => 2,
-                                    ghostscope_dwarf::core::SectionType::Bss => 3,
-                                    _ => 2,
-                                };
-                                // If we have no bias at all for this section, return link address
-                                let sect_bias = match st {
-                                    ghostscope_dwarf::core::SectionType::Text => sect_offs.text,
-                                    ghostscope_dwarf::core::SectionType::Rodata => sect_offs.rodata,
-                                    ghostscope_dwarf::core::SectionType::Data => sect_offs.data,
-                                    ghostscope_dwarf::core::SectionType::Bss => sect_offs.bss,
-                                    _ => 0,
-                                };
-                                let link_val =
-                                    self.context.i64_type().const_int(link_addr_u, false);
-                                if sect_bias == 0 {
-                                    self.current_resolved_var_module_path = None;
-                                    return Ok(link_val);
-                                }
-                                let (rt_addr, found_flag) = self
-                                    .generate_runtime_address_from_offsets(
-                                        link_val, st_code, *cookie,
-                                    )?;
-                                if let Some(sp) = status_ptr {
-                                    let is_miss = self
-                                        .builder
-                                        .build_int_compare(
-                                            inkwell::IntPredicate::EQ,
-                                            found_flag,
-                                            self.context.bool_type().const_zero(),
-                                            "is_off_miss",
-                                        )
-                                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                                    let cur_status = self
-                                        .builder
-                                        .build_load(self.context.i8_type(), sp, "cur_status")
-                                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                                    let is_ok = self
-                                        .builder
-                                        .build_int_compare(
-                                            inkwell::IntPredicate::EQ,
-                                            cur_status.into_int_value(),
-                                            self.context.i8_type().const_zero(),
-                                            "status_is_ok",
-                                        )
-                                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                                    let should_store = self
-                                        .builder
-                                        .build_and(is_miss, is_ok, "store_offsets_unavail")
-                                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                                    let new_status = self
-                                        .builder
-                                        .build_select(
-                                            should_store,
-                                            self.context
-                                                .i8_type()
-                                                .const_int(ghostscope_protocol::VariableStatus::OffsetsUnavailable as u64, false)
-                                                .into(),
-                                            cur_status,
-                                            "new_status",
-                                        )
-                                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                                    self.builder
-                                        .build_store(sp, new_status)
-                                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                                }
-                                self.current_resolved_var_module_path = None;
-                                return Ok(rt_addr);
-                            }
-                        }
+                    let ctx = self.get_compile_time_context()?;
+                    let module_for_offsets = module_hint
+                        .map(|s| s.to_string())
+                        .or_else(|| self.current_resolved_var_module_path.clone())
+                        .unwrap_or_else(|| ctx.module_path.clone());
+                    let st_code = self.section_code_for_address(&module_for_offsets, link_addr_u);
+                    let cookie = self.cookie_for_module_or_fallback(&module_for_offsets);
+                    let link_val = self.context.i64_type().const_int(link_addr_u, false);
+                    let (rt_addr, found_flag) =
+                        self.generate_runtime_address_from_offsets(link_val, st_code, cookie)?;
+                    if let Some(sp) = status_ptr {
+                        let is_miss = self
+                            .builder
+                            .build_int_compare(
+                                inkwell::IntPredicate::EQ,
+                                found_flag,
+                                self.context.bool_type().const_zero(),
+                                "is_off_miss",
+                            )
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        let cur_status = self
+                            .builder
+                            .build_load(self.context.i8_type(), sp, "cur_status")
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        let is_ok = self
+                            .builder
+                            .build_int_compare(
+                                inkwell::IntPredicate::EQ,
+                                cur_status.into_int_value(),
+                                self.context.i8_type().const_zero(),
+                                "status_is_ok",
+                            )
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        let should_store = self
+                            .builder
+                            .build_and(is_miss, is_ok, "store_offsets_unavail")
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        let new_status = self
+                            .builder
+                            .build_select(
+                                should_store,
+                                self.context
+                                    .i8_type()
+                                    .const_int(
+                                        ghostscope_protocol::VariableStatus::OffsetsUnavailable
+                                            as u64,
+                                        false,
+                                    )
+                                    .into(),
+                                cur_status,
+                                "new_status",
+                            )
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        self.builder
+                            .build_store(sp, new_status)
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
                     }
-                    // Analyzer missing or offsets not available: return link-time address
                     self.current_resolved_var_module_path = None;
-                    return Ok(self.context.i64_type().const_int(link_addr_u, false));
+                    return Ok(rt_addr);
                 }
 
                 // Attempt: if steps start with PushConstant(base) and first dynamic op is Dereference
@@ -363,124 +330,79 @@ impl<'ctx> EbpfContext<'ctx> {
                     }
                     if saw_deref && !saw_reg {
                         let link_addr_u = *base_const as u64;
-                        if let Some(analyzer_ptr) = self.process_analyzer {
-                            let analyzer = unsafe { &mut *analyzer_ptr };
-                            let ctx = self.get_compile_time_context()?;
-                            let module_for_offsets = module_hint
-                                .map(|s| s.to_string())
-                                .or_else(|| self.current_resolved_var_module_path.clone())
-                                .unwrap_or_else(|| ctx.module_path.clone());
-                            if let Ok(offsets) = analyzer.compute_section_offsets() {
-                                if let Some((_, cookie, sect_offs)) = offsets
-                                    .iter()
-                                    .find(|(p, _, _)| p.to_string_lossy() == module_for_offsets)
-                                {
-                                    let st = analyzer
-                                        .classify_section_for_address(
-                                            &module_for_offsets,
-                                            link_addr_u,
+                        let ctx = self.get_compile_time_context()?;
+                        let module_for_offsets = module_hint
+                            .map(|s| s.to_string())
+                            .or_else(|| self.current_resolved_var_module_path.clone())
+                            .unwrap_or_else(|| ctx.module_path.clone());
+                        let st_code =
+                            self.section_code_for_address(&module_for_offsets, link_addr_u);
+                        let cookie = self.cookie_for_module_or_fallback(&module_for_offsets);
+                        let link_val = self.context.i64_type().const_int(link_addr_u, false);
+                        let (rt, found_flag) =
+                            self.generate_runtime_address_from_offsets(link_val, st_code, cookie)?;
+                        if let Some(sp) = status_ptr {
+                            let is_miss = self
+                                .builder
+                                .build_int_compare(
+                                    inkwell::IntPredicate::EQ,
+                                    found_flag,
+                                    self.context.bool_type().const_zero(),
+                                    "is_off_miss",
+                                )
+                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                            let cur_status = self
+                                .builder
+                                .build_load(self.context.i8_type(), sp, "cur_status")
+                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                            let is_ok = self
+                                .builder
+                                .build_int_compare(
+                                    inkwell::IntPredicate::EQ,
+                                    cur_status.into_int_value(),
+                                    self.context.i8_type().const_zero(),
+                                    "status_is_ok",
+                                )
+                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                            let should_store = self
+                                .builder
+                                .build_and(is_miss, is_ok, "store_offsets_unavail")
+                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                            let new_status = self
+                                .builder
+                                .build_select(
+                                    should_store,
+                                    self.context
+                                        .i8_type()
+                                        .const_int(
+                                            ghostscope_protocol::VariableStatus::OffsetsUnavailable
+                                                as u64,
+                                            false,
                                         )
-                                        .unwrap_or(ghostscope_dwarf::core::SectionType::Data);
-                                    let st_code: u8 = match st {
-                                        ghostscope_dwarf::core::SectionType::Text => 0,
-                                        ghostscope_dwarf::core::SectionType::Rodata => 1,
-                                        ghostscope_dwarf::core::SectionType::Data => 2,
-                                        ghostscope_dwarf::core::SectionType::Bss => 3,
-                                        _ => 2,
-                                    };
-                                    let sect_bias = match st {
-                                        ghostscope_dwarf::core::SectionType::Text => sect_offs.text,
-                                        ghostscope_dwarf::core::SectionType::Rodata => {
-                                            sect_offs.rodata
-                                        }
-                                        ghostscope_dwarf::core::SectionType::Data => sect_offs.data,
-                                        ghostscope_dwarf::core::SectionType::Bss => sect_offs.bss,
-                                        _ => 0,
-                                    };
-                                    let link_val =
-                                        self.context.i64_type().const_int(link_addr_u, false);
-                                    let rt_base = if sect_bias == 0 {
-                                        link_val
-                                    } else {
-                                        let (rt, found_flag) = self
-                                            .generate_runtime_address_from_offsets(
-                                                link_val, st_code, *cookie,
-                                            )?;
-                                        if let Some(sp) = status_ptr {
-                                            let is_miss = self
-                                                .builder
-                                                .build_int_compare(
-                                                    inkwell::IntPredicate::EQ,
-                                                    found_flag,
-                                                    self.context.bool_type().const_zero(),
-                                                    "is_off_miss",
-                                                )
-                                                .map_err(|e| {
-                                                    CodeGenError::LLVMError(e.to_string())
-                                                })?;
-                                            let cur_status = self
-                                                .builder
-                                                .build_load(
-                                                    self.context.i8_type(),
-                                                    sp,
-                                                    "cur_status",
-                                                )
-                                                .map_err(|e| {
-                                                    CodeGenError::LLVMError(e.to_string())
-                                                })?;
-                                            let is_ok = self
-                                                .builder
-                                                .build_int_compare(
-                                                    inkwell::IntPredicate::EQ,
-                                                    cur_status.into_int_value(),
-                                                    self.context.i8_type().const_zero(),
-                                                    "status_is_ok",
-                                                )
-                                                .map_err(|e| {
-                                                    CodeGenError::LLVMError(e.to_string())
-                                                })?;
-                                            let should_store = self
-                                                .builder
-                                                .build_and(is_miss, is_ok, "store_offsets_unavail")
-                                                .map_err(|e| {
-                                                    CodeGenError::LLVMError(e.to_string())
-                                                })?;
-                                            let new_status = self
-                                                .builder
-                                                .build_select(
-                                                    should_store,
-                                                    self.context
-                                                        .i8_type()
-                                                        .const_int(ghostscope_protocol::VariableStatus::OffsetsUnavailable as u64, false)
-                                                        .into(),
-                                                    cur_status,
-                                                    "new_status",
-                                                )
-                                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                                            self.builder.build_store(sp, new_status).map_err(
-                                                |e| CodeGenError::LLVMError(e.to_string()),
-                                            )?;
-                                        }
-                                        rt
-                                    };
-                                    // Execute remaining steps with rt_base pre-pushed
-                                    let rest = &steps[1..];
-                                    let val = self.generate_compute_steps(
-                                        rest,
-                                        pt_regs_ptr,
-                                        None,
-                                        status_ptr,
-                                        Some(rt_base),
-                                    )?;
-                                    if let BasicValueEnum::IntValue(i) = val {
-                                        return Ok(i);
-                                    } else {
-                                        return Err(CodeGenError::LLVMError(
-                                            "Computed location did not produce integer".to_string(),
-                                        ));
-                                    }
-                                }
-                            }
+                                        .into(),
+                                    cur_status,
+                                    "new_status",
+                                )
+                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                            self.builder
+                                .build_store(sp, new_status)
+                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        }
+                        // Execute remaining steps with rt pre-pushed as base
+                        let rest = &steps[1..];
+                        let val = self.generate_compute_steps(
+                            rest,
+                            pt_regs_ptr,
+                            None,
+                            status_ptr,
+                            Some(rt),
+                        )?;
+                        if let BasicValueEnum::IntValue(i) = val {
+                            return Ok(i);
+                        } else {
+                            return Err(CodeGenError::LLVMError(
+                                "Computed location did not produce integer".to_string(),
+                            ));
                         }
                     }
                 }
@@ -1213,74 +1135,87 @@ impl<'ctx> EbpfContext<'ctx> {
             pc_address,
         );
 
+        let module_path_owned = module_path.clone();
+        let lookup_globals = |analyzer: &mut ghostscope_dwarf::DwarfAnalyzer| -> Result<
+            Option<(std::path::PathBuf, VariableWithEvaluation)>,
+        > {
+            debug!(
+                "Variable '{}' not found in locals; attempting global lookup",
+                var_name
+            );
+            let mut matches = analyzer.find_global_variables_by_name(var_name);
+            if matches.is_empty() {
+                return Ok(None);
+            }
+            // Prefer globals defined in the current module.
+            let preferred: Vec<(
+                std::path::PathBuf,
+                ghostscope_dwarf::core::GlobalVariableInfo,
+            )> = matches
+                .iter()
+                .filter(|(p, _)| p.to_string_lossy() == module_path_owned.as_str())
+                .cloned()
+                .collect();
+
+            let chosen = if preferred.len() == 1 {
+                Some(preferred[0].clone())
+            } else if preferred.is_empty() && matches.len() == 1 {
+                Some(matches.remove(0))
+            } else {
+                debug!(
+                    "Global '{}' is ambiguous across modules ({} matches)",
+                    var_name,
+                    matches.len()
+                );
+                return Err(CodeGenError::DwarfError(format!(
+                    "Ambiguous global '{}': {} matches",
+                    var_name,
+                    matches.len()
+                )));
+            };
+
+            if let Some((mpath, info)) = chosen {
+                let gv = analyzer
+                    .resolve_variable_by_offsets_in_module(
+                        &mpath,
+                        info.unit_offset,
+                        info.die_offset,
+                    )
+                    .map_err(|err| CodeGenError::DwarfError(err.to_string()))?;
+                Ok(Some((mpath, gv)))
+            } else {
+                Ok(None)
+            }
+        };
+
         match analyzer.get_all_variables_at_address(&module_address) {
             Ok(vars) => {
-                // Look for the specific variable by name
                 if let Some(var_result) = vars.iter().find(|v| v.name == var_name).or_else(|| {
-                    // GCC/Clang may synthesize names like r@entry; try a tolerant match
                     let prefix = format!("{var_name}@");
                     vars.iter().find(|v| v.name.starts_with(&prefix))
                 }) {
-                    debug!("Found DWARF variable: {}", var_name);
+                    debug!("Found DWARF variable '{}' in locals/params", var_name);
                     Ok(Some(var_result.clone()))
+                } else if let Some((mpath, gv)) = lookup_globals(analyzer)? {
+                    self.current_resolved_var_module_path =
+                        Some(mpath.to_string_lossy().to_string());
+                    Ok(Some(gv))
                 } else {
-                    debug!(
-                        "Variable '{}' not found in DWARF locals/params, trying globals",
-                        var_name
-                    );
-                    // Global fallback: search per-module first, then cross-module
-                    let mut matches = analyzer.find_global_variables_by_name(var_name);
-                    if matches.is_empty() {
-                        return Ok(None);
-                    }
-                    // Prefer current module
-                    let preferred: Vec<(
-                        std::path::PathBuf,
-                        ghostscope_dwarf::core::GlobalVariableInfo,
-                    )> = matches
-                        .iter()
-                        .filter(|(p, _)| p.to_string_lossy() == module_path.as_str())
-                        .cloned()
-                        .collect();
-                    let chosen = if preferred.len() == 1 {
-                        Some(preferred[0].clone())
-                    } else if preferred.is_empty() && matches.len() == 1 {
-                        Some(matches.remove(0))
-                    } else {
-                        // Ambiguous across modules; bail out explicitly
-                        debug!(
-                            "Global '{}' is ambiguous across modules ({} matches)",
-                            var_name,
-                            matches.len()
-                        );
-                        return Err(CodeGenError::DwarfError(format!(
-                            "Ambiguous global '{}': {} matches",
-                            var_name,
-                            matches.len()
-                        )));
-                    };
-
-                    if let Some((mpath, info)) = chosen {
-                        // Resolve variable by CU/DIE offsets in that module
-                        let gv = analyzer
-                            .resolve_variable_by_offsets_in_module(
-                                &mpath,
-                                info.unit_offset,
-                                info.die_offset,
-                            )
-                            .map_err(|e| CodeGenError::DwarfError(e.to_string()))?;
-                        // Record module hint for codegen (ASLR offsets lookup)
-                        self.current_resolved_var_module_path =
-                            Some(mpath.to_string_lossy().to_string());
-                        Ok(Some(gv))
-                    } else {
-                        Ok(None)
-                    }
+                    Ok(None)
                 }
             }
             Err(e) => {
-                debug!("DWARF query error for '{}': {}", var_name, e);
-                Err(CodeGenError::DwarfError(format!("DWARF query failed: {e}")))
+                debug!(
+                    "DWARF local lookup error for '{}': {e}; falling back to globals",
+                    var_name
+                );
+                if let Some((mpath, gv)) = lookup_globals(analyzer)? {
+                    self.current_resolved_var_module_path =
+                        Some(mpath.to_string_lossy().to_string());
+                    Ok(Some(gv))
+                } else {
+                    Ok(None)
+                }
             }
         }
     }
@@ -2278,6 +2213,12 @@ mod tests {
         let mut ctx = EbpfContext::new(&llctx, "agg_ptr", Some(0), &opts).expect("ctx");
         // Ensure we have a function/pt_regs to satisfy builders
         ctx.create_basic_ebpf_function("f").expect("fn");
+        // Ensure the ASLR offsets map exists in the module for unified codegen path
+        ctx.__test_ensure_proc_offsets_map().expect("map");
+        // Allocate per-invocation pm_key on the stack
+        ctx.__test_alloc_pm_key().expect("pm_key");
+        // Provide a minimal compile-time context so address rebasing has a module path
+        ctx.set_compile_time_context(0, "/nonexistent/module".to_string());
 
         // Struct type
         let st = ghostscope_protocol::TypeInfo::StructType {
@@ -2319,6 +2260,12 @@ mod tests {
         let opts = crate::CompileOptions::default();
         let mut ctx = EbpfContext::new(&llctx, "scalar_val", Some(0), &opts).expect("ctx");
         ctx.create_basic_ebpf_function("f").expect("fn");
+        // Ensure the ASLR offsets map exists in the module for unified codegen path
+        ctx.__test_ensure_proc_offsets_map().expect("map");
+        // Allocate per-invocation pm_key on the stack
+        ctx.__test_alloc_pm_key().expect("pm_key");
+        // Provide a minimal compile-time context so address rebasing has a module path
+        ctx.set_compile_time_context(0, "/nonexistent/module".to_string());
 
         // Base int type
         let bt = ghostscope_protocol::TypeInfo::BaseType {

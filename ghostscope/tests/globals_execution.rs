@@ -19,6 +19,7 @@ async fn run_ghostscope_with_script_for_pid(
         .with_script(script_content)
         .with_pid(pid)
         .timeout_secs(timeout_secs)
+        .enable_sysmon_shared_lib(false)
         .run()
         .await
 }
@@ -33,6 +34,7 @@ async fn run_ghostscope_with_script_for_pid_perf(
         .with_pid(pid)
         .timeout_secs(timeout_secs)
         .force_perf_event_array(true)
+        .enable_sysmon_shared_lib(false)
         .run()
         .await
 }
@@ -47,7 +49,7 @@ async fn run_ghostscope_with_script_for_pid_with_log(
         .with_script(script_content)
         .with_pid(pid)
         .timeout_secs(timeout_secs)
-        .enable_console_log(true)
+        .enable_sysmon_shared_lib(false)
         .run()
         .await
 }

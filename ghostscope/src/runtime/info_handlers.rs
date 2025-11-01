@@ -112,7 +112,7 @@ pub async fn handle_info_file(
     runtime_channels: &mut RuntimeChannels,
 ) {
     if let Some(ref session) = session {
-        // Get executable file information from ProcessAnalyzer
+        // Get executable file information from the DWARF analyzer
         if let Some(ref analyzer) = session.process_analyzer {
             // Get primary executable file information
             let file_info = analyzer.get_executable_file_info();
@@ -179,7 +179,7 @@ pub async fn handle_info_share(
     runtime_channels: &mut RuntimeChannels,
 ) {
     if let Some(ref session) = session {
-        // Get shared library information from ProcessAnalyzer
+        // Get shared library information from the DWARF analyzer
         if let Some(ref analyzer) = session.process_analyzer {
             let libraries = analyzer.get_shared_library_info();
 
@@ -602,7 +602,7 @@ fn process_module_addresses_for_variables(
                 module_address.module_display()
             );
 
-            // Get enhanced variables at this address using ProcessAnalyzer encapsulated method
+            // Get enhanced variables at this address using the DWARF analyzer helper
             info!(
                 "Using module '{}' for analysis at binary offset 0x{:x}",
                 module_address.module_display(),

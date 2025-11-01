@@ -2,9 +2,8 @@
 
 use crate::{
     analyzer::{ModuleLoadingEvent, ModuleLoadingStats},
-    core::Result,
+    core::{mapping::ModuleMapping, Result},
     module::ModuleData,
-    proc_mapping::ModuleMapping,
 };
 use std::sync::Arc;
 use tokio::task;

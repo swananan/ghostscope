@@ -16,7 +16,7 @@
 //! adapts to the event source type automatically.
 
 use aya::{
-    maps::{perf::PerfEventArray, HashMap as AyaHashMap, MapData, RingBuf},
+    maps::{perf::PerfEventArray, MapData, RingBuf},
     programs::{
         uprobe::{UProbeAttachLocation, UProbeLinkId},
         ProgramError, UProbe,
@@ -24,6 +24,8 @@ use aya::{
     Ebpf, EbpfLoader, VerifierLogLevel,
 };
 use ghostscope_protocol::{ParsedTraceEvent, StreamingTraceParser, TraceContext};
+use log::log_enabled;
+use log::Level as LogLevel;
 use std::convert::TryInto;
 use std::os::unix::io::AsRawFd;
 use tokio::io::unix::AsyncFd;
@@ -41,10 +43,8 @@ pub use error::{LoaderError, Result};
 mod uprobe;
 use uprobe::UprobeAttachmentParams;
 
-// Internal map module
-mod map;
-use map::ProcModuleKey;
-pub use map::ProcModuleOffsetsValue;
+// Use shared map types from ghostscope-process
+use ghostscope_process::maps::{proc_offsets_pin_dir, proc_offsets_pin_path};
 
 /// Event output map type wrapper
 enum EventMap {
@@ -80,6 +80,8 @@ pub struct GhostScopeLoader {
     parser: StreamingTraceParser,
     /// String table and metadata for parsing trace events
     trace_context: Option<TraceContext>,
+    /// Optional override for PerfEventArray page count (per CPU buffer size in pages)
+    perf_page_count: Option<usize>,
 }
 
 impl std::fmt::Debug for GhostScopeLoader {
@@ -105,11 +107,38 @@ impl GhostScopeLoader {
             bytecode.len()
         );
 
-        // Load BPF program from bytecode with high verifier log level for debugging
-        match EbpfLoader::new()
-            .verifier_log_level(VerifierLogLevel::VERBOSE | VerifierLogLevel::STATS)
-            .load(bytecode)
-        {
+        // Enforce: proc_module_offsets must be provided as a pinned global map by the process layer
+        let pin_path = proc_offsets_pin_path();
+        if !pin_path.exists() {
+            return Err(LoaderError::Generic(format!(
+                "Pinned map '{}' not found. Please call ghostscope-process to create it first.",
+                pin_path.display()
+            )));
+        }
+
+        let mut loader = EbpfLoader::new();
+        let use_verbose = cfg!(debug_assertions)
+            || log_enabled!(LogLevel::Trace)
+            || log_enabled!(LogLevel::Debug);
+        if use_verbose {
+            loader.verifier_log_level(VerifierLogLevel::VERBOSE | VerifierLogLevel::STATS);
+            tracing::info!("BPF verifier logs: VERBOSE (debug build/log)");
+        } else {
+            loader.verifier_log_level(VerifierLogLevel::DEBUG | VerifierLogLevel::STATS);
+            tracing::info!("BPF verifier logs: DEBUG (release/info)");
+        }
+        // Configure Aya loader to reuse pinned maps by name under our per-process pin directory.
+        // This makes @proc_module_offsets in the eBPF object bind to the already pinned map
+        // created by ghostscope-process instead of creating a new private map.
+        let pin_dir = proc_offsets_pin_dir();
+        if pin_dir.exists() {
+            loader.map_pin_path(&pin_dir);
+            tracing::info!(
+                "Configured map pin directory for reuse: {}",
+                pin_dir.display()
+            );
+        }
+        match loader.load(bytecode) {
             Ok(bpf) => {
                 info!("Successfully loaded eBPF program");
                 Ok(Self {
@@ -119,6 +148,7 @@ impl GhostScopeLoader {
                     attachment_params: None,
                     parser: StreamingTraceParser::new(),
                     trace_context: None,
+                    perf_page_count: None,
                 })
             }
             Err(e) => {
@@ -153,6 +183,11 @@ impl GhostScopeLoader {
         pid: Option<i32>,
     ) -> Result<()> {
         self.attach_uprobe_with_program_name(target_binary, function_name, offset, pid, None)
+    }
+
+    /// Set PerfEventArray page count override (applies when using Perf backend)
+    pub fn set_perf_page_count(&mut self, pages: u32) {
+        self.perf_page_count = Some(pages as usize);
     }
 
     /// Attach to a uprobe with a specific eBPF program name
@@ -394,9 +429,20 @@ impl GhostScopeLoader {
             let mut cpu_ids = Vec::new();
 
             for cpu_id in online_cpus {
-                match perf_array.open(cpu_id, None) {
+                let pages = self.perf_page_count;
+                match perf_array.open(cpu_id, pages) {
                     Ok(buffer) => {
-                        info!("Opened PerfEventArray buffer for CPU {}", cpu_id);
+                        if let Some(p) = pages {
+                            info!(
+                                "Opened PerfEventArray buffer for CPU {} with {} pages",
+                                cpu_id, p
+                            );
+                        } else {
+                            info!(
+                                "Opened PerfEventArray buffer for CPU {} (default pages)",
+                                cpu_id
+                            );
+                        }
                         buffers.push(buffer);
                         cpu_ids.push(cpu_id);
                     }
@@ -749,61 +795,5 @@ impl GhostScopeLoader {
             .programs()
             .map(|(name, _prog)| format!("Program: {name}"))
             .collect()
-    }
-
-    // ============================================================================
-    // BPF Map Management
-    // ============================================================================
-
-    /// Populate the proc_module_offsets map with computed offsets for a given PID
-    /// items: iterator of (module_cookie, SectionOffsets {text, rodata, data, bss})
-    pub fn populate_proc_module_offsets(
-        &mut self,
-        pid: u32,
-        items: &[(u64, ProcModuleOffsetsValue)],
-    ) -> Result<()> {
-        // Look up the map by name
-        let map = self
-            .bpf
-            .map_mut("proc_module_offsets")
-            .ok_or_else(|| LoaderError::MapNotFound("proc_module_offsets".to_string()))?;
-
-        let mut hashmap: AyaHashMap<&mut MapData, ProcModuleKey, ProcModuleOffsetsValue> =
-            AyaHashMap::try_from(map)
-                .map_err(|e| LoaderError::Generic(format!("Failed to convert map: {e}")))?;
-
-        for (cookie, off) in items.iter() {
-            // Compose exact 16-byte key matching eBPF side: [pid:u32, pad:u32(0), cookie_lo:u32, cookie_hi:u32]
-            let cookie_lo = (*cookie & 0xffff_ffff) as u32;
-            let cookie_hi = (*cookie >> 32) as u32;
-            let key: ProcModuleKey = ProcModuleKey {
-                pid,
-                pad: 0,
-                cookie_lo,
-                cookie_hi,
-            };
-            let key_words = [key.pid, key.pad, key.cookie_lo, key.cookie_hi];
-            let _key_bytes = [
-                key_words[0].to_le_bytes(),
-                key_words[1].to_le_bytes(),
-                key_words[2].to_le_bytes(),
-                key_words[3].to_le_bytes(),
-            ];
-            tracing::info!(
-                "populate_proc_module_offsets: inserting pid={} cookie=0x{:08x}{:08x} text=0x{:x} rodata=0x{:x} data=0x{:x} bss=0x{:x}",
-                pid,
-                key.cookie_hi,
-                key.cookie_lo,
-                off.text,
-                off.rodata,
-                off.data,
-                off.bss
-            );
-            hashmap
-                .insert(key, off, 0)
-                .map_err(|e| LoaderError::Generic(format!("Failed to insert offsets: {e}")))?;
-        }
-
-        Ok(())
     }
 }

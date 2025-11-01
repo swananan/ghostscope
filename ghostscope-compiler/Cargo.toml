@@ -15,3 +15,4 @@ aya-ebpf-bindings = { workspace = true }
 ghostscope-dwarf = { path = "../ghostscope-dwarf" }
 ghostscope-protocol = { path = "../ghostscope-protocol" }
 ghostscope-platform = { path = "../ghostscope-platform" }
+ghostscope-process = { path = "../ghostscope-process" }

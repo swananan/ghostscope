@@ -90,6 +90,10 @@ pub struct EbpfContext<'ctx> {
 
     // Per-invocation stack key for proc_module_offsets lookups (allocated in entry block)
     pub pm_key_alloca: Option<inkwell::values::PointerValue<'ctx>>, // [3 x i32] alloca
+    // Per-invocation event accumulation offset (u32) stored on stack (entry block)
+    pub event_offset_alloca: Option<inkwell::values::PointerValue<'ctx>>,
+    // Tracks whether the last proc_module_offsets lookup succeeded (used to skip reads)
+    pub offsets_found_flag: Option<inkwell::values::PointerValue<'ctx>>,
 
     // Compilation options (includes eBPF map configuration)
     pub compile_options: crate::CompileOptions,
@@ -202,6 +206,8 @@ impl<'ctx> EbpfContext<'ctx> {
             trace_context: ghostscope_protocol::TraceContext::new(),
             current_resolved_var_module_path: None,
             pm_key_alloca: None,
+            event_offset_alloca: None,
+            offsets_found_flag: None,
             compile_options: compile_options.clone(),
 
             // Control-flow expression context
@@ -340,6 +346,37 @@ impl<'ctx> EbpfContext<'ctx> {
         Ok(())
     }
 
+    /// Test helper: ensure proc_module_offsets map exists in the module
+    #[cfg(test)]
+    pub fn __test_ensure_proc_offsets_map(&mut self) -> Result<()> {
+        self.map_manager
+            .create_proc_module_offsets_map(
+                &self.module,
+                &self.di_builder,
+                &self.compile_unit,
+                "proc_module_offsets",
+                self.compile_options.proc_module_offsets_max_entries,
+            )
+            .map_err(|e| {
+                CodeGenError::LLVMError(format!(
+                    "Failed to create proc_module_offsets map in test: {e}"
+                ))
+            })
+    }
+
+    /// Test helper: allocate per-invocation pm_key on the entry block like create_main_function
+    #[cfg(test)]
+    pub fn __test_alloc_pm_key(&mut self) -> Result<()> {
+        let i32_type = self.context.i32_type();
+        let key_arr_ty = i32_type.array_type(4);
+        let key_alloca = self
+            .builder
+            .build_alloca(key_arr_ty, "pm_key")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.pm_key_alloca = Some(key_alloca);
+        Ok(())
+    }
+
     /// Get the LLVM module reference
     pub fn get_module(&self) -> &Module<'ctx> {
         &self.module
@@ -425,6 +462,22 @@ impl<'ctx> EbpfContext<'ctx> {
             }
         }
 
+        // Create per-CPU accumulation maps for single-record event emission
+        //  - event_accum_buffer: value size = max_trace_event_size bytes, entries = 1
+        //  - event_accum_offset: value size = 4 bytes (u32), entries = 1
+        self.map_manager
+            .create_percpu_array_map(
+                &self.module,
+                &self.di_builder,
+                &self.compile_unit,
+                "event_accum_buffer",
+                1,
+                self.compile_options.max_trace_event_size as u64,
+            )
+            .map_err(|e| {
+                CodeGenError::LLVMError(format!("Failed to create event_accum_buffer: {e}"))
+            })?;
+
         // Create ASLR offsets map for (pid,module) → section offsets
         self.map_manager
             .create_proc_module_offsets_map(
@@ -503,6 +556,16 @@ impl<'ctx> EbpfContext<'ctx> {
             .build_alloca(key_arr_ty, "pm_key")
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         self.pm_key_alloca = Some(key_alloca);
+
+        // Allocate per-invocation event_offset (u32) and initialize to 0
+        let event_off_alloca = self
+            .builder
+            .build_alloca(i32_type, "event_offset")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder
+            .build_store(event_off_alloca, i32_type.const_zero())
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.event_offset_alloca = Some(event_off_alloca);
 
         info!("Created main function: {}", function_name);
         Ok(function)
@@ -602,6 +665,71 @@ impl<'ctx> EbpfContext<'ctx> {
     /// Mark that at least one variable failed (status!=0)
     pub fn mark_any_fail(&mut self) -> Result<()> {
         self.store_flag_value("_gs_any_fail", 1)
+    }
+
+    /// Get (and create if needed) the global flag tracking the last proc_module_offsets lookup.
+    /// Stored as i8 where 0 = miss, 1 = found.
+    pub fn get_or_create_offsets_found_flag(&mut self) -> inkwell::values::PointerValue<'ctx> {
+        if let Some(ptr) = self.offsets_found_flag {
+            return ptr;
+        }
+        let i8_type = self.context.i8_type();
+        // TODO: Replace this global flag with explicit control-flow checks when memory-read emission is refactored.
+        let global =
+            self.module
+                .add_global(i8_type, Some(AddressSpace::default()), "_gs_offsets_found");
+        global.set_initializer(&i8_type.const_int(1, false));
+        let ptr = global.as_pointer_value();
+        self.offsets_found_flag = Some(ptr);
+        ptr
+    }
+
+    /// Store a boolean into the offsets-found flag (true => found, false => miss).
+    pub fn store_offsets_found_flag(
+        &mut self,
+        flag: inkwell::values::IntValue<'ctx>,
+    ) -> Result<()> {
+        let ptr = self.get_or_create_offsets_found_flag();
+        let i8_type = self.context.i8_type();
+        let flag_i8 = self
+            .builder
+            .build_int_z_extend(flag, i8_type, "offset_flag_i8")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder
+            .build_store(ptr, flag_i8)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Store a constant boolean value into the offsets-found flag.
+    pub fn store_offsets_found_const(&mut self, value: bool) -> Result<()> {
+        let ptr = self.get_or_create_offsets_found_flag();
+        let i8_type = self.context.i8_type();
+        self.builder
+            .build_store(ptr, i8_type.const_int(value as u64, false))
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Load the current offsets-found flag as i1 (true => found, false => miss).
+    pub fn load_offsets_found_flag(&mut self) -> Result<inkwell::values::IntValue<'ctx>> {
+        let ptr = self.get_or_create_offsets_found_flag();
+        let i8_type = self.context.i8_type();
+        let raw = self
+            .builder
+            .build_load(i8_type, ptr, "offsets_found_raw")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_int_value();
+        let is_non_zero = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::NE,
+                raw,
+                i8_type.const_zero(),
+                "offsets_found_bool",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        Ok(is_non_zero)
     }
 
     /// Get or create global for condition error code (i8). Name: _gs_cond_error

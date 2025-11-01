@@ -62,6 +62,7 @@ GhostScope 使用 Cargo workspace 进行模块化设计：
 | **ghostscope-ui** | 终端用户界面 - 实现基于 TEA (The Elm Architecture) 模式的交互式 TUI |
 | **ghostscope-protocol** | 通信协议 - 定义 eBPF 与用户态数据交换的消息格式 |
 | **ghostscope-platform** | 平台抽象层 - 封装架构特定代码（调用约定、ABI） |
+| **ghostscope-process** | 运行时进程解析与偏移管理——统一维护模块 Cookie 与 ASLR 段偏移，服务于 `-p`/`-t` 两种模式；提供 PID/模块枚举与偏移缓存，供 Loader/Compiler 复用 |
 
 ## 核心架构组件
 
