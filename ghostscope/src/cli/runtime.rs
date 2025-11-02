@@ -113,7 +113,7 @@ async fn run_cli_with_session(
     )
     .await
     {
-        error!("Failed to compile and load script: {}", e);
+        error!("Failed to compile and load script: {:#}", e);
         info!("GhostScope encountered an error during script compilation. Exiting gracefully.");
         return Err(e);
     }

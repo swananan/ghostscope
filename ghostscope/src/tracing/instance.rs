@@ -54,12 +54,14 @@ impl TraceInstance {
             info!("Trace {} is already enabled", self.trace_id);
             Ok(())
         } else if let Some(ref mut loader) = self.loader {
-            info!(
-                "Enabling trace {} for target '{}' at PC 0x{:x} in binary '{}'",
-                self.trace_id, self.target_display, self.pc, self.binary_path
-            );
-            if loader.is_uprobe_attached() {
-                warn!("Uprobe already attached for trace {}", self.trace_id);
+            let already_attached = loader.is_uprobe_attached();
+            if !already_attached {
+                info!(
+                    "Enabling trace {} for target '{}' at PC 0x{:x} in binary '{}'",
+                    self.trace_id, self.target_display, self.pc, self.binary_path
+                );
+            }
+            if already_attached {
                 self.is_enabled = true;
                 Ok(())
             } else if loader.get_attachment_info().is_some() {
