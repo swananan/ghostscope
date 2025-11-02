@@ -27,8 +27,12 @@ use ghostscope_protocol::{ParsedTraceEvent, StreamingTraceParser, TraceContext};
 use log::log_enabled;
 use log::Level as LogLevel;
 use std::convert::TryInto;
+use std::future::poll_fn;
 use std::os::unix::io::AsRawFd;
+use std::os::unix::io::RawFd;
+use std::task::Poll;
 use tokio::io::unix::AsyncFd;
+use tokio::io::Interest;
 use tracing::{debug, error, info, warn};
 
 // Export kernel capabilities detection
@@ -51,9 +55,23 @@ enum EventMap {
     RingBuf(RingBuf<MapData>),
     PerfEventArray {
         _map: PerfEventArray<MapData>,
-        buffers: Vec<aya::maps::perf::PerfEventArrayBuffer<MapData>>,
-        cpu_ids: Vec<u32>,
+        cpu_buffers: Vec<PerfEventCpuBuffer>,
     },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PerfBufferFd(RawFd);
+
+impl AsRawFd for PerfBufferFd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0
+    }
+}
+
+struct PerfEventCpuBuffer {
+    cpu_id: u32,
+    buffer: aya::maps::perf::PerfEventArrayBuffer<MapData>,
+    readiness: AsyncFd<PerfBufferFd>,
 }
 
 pub fn hello() -> String {
@@ -425,8 +443,7 @@ impl GhostScopeLoader {
             );
 
             // Open buffers for all online CPUs
-            let mut buffers = Vec::new();
-            let mut cpu_ids = Vec::new();
+            let mut cpu_buffers = Vec::new();
 
             for cpu_id in online_cpus {
                 let pages = self.perf_page_count;
@@ -443,8 +460,20 @@ impl GhostScopeLoader {
                                 cpu_id
                             );
                         }
-                        buffers.push(buffer);
-                        cpu_ids.push(cpu_id);
+                        let fd = buffer.as_raw_fd();
+                        let readiness =
+                            AsyncFd::with_interest(PerfBufferFd(fd), Interest::READABLE).map_err(
+                                |err| {
+                                    LoaderError::Generic(format!(
+                                        "Failed to register perf buffer fd for CPU {cpu_id}: {err}"
+                                    ))
+                                },
+                            )?;
+                        cpu_buffers.push(PerfEventCpuBuffer {
+                            cpu_id,
+                            buffer,
+                            readiness,
+                        });
                     }
                     Err(e) => {
                         warn!("Failed to open perf buffer for CPU {}: {}", cpu_id, e);
@@ -452,7 +481,7 @@ impl GhostScopeLoader {
                 }
             }
 
-            if buffers.is_empty() {
+            if cpu_buffers.is_empty() {
                 return Err(LoaderError::Generic(
                     "Failed to open any perf event buffers".to_string(),
                 ));
@@ -460,8 +489,7 @@ impl GhostScopeLoader {
 
             EventMap::PerfEventArray {
                 _map: perf_array,
-                buffers,
-                cpu_ids,
+                cpu_buffers,
             }
         } else {
             return Err(LoaderError::MapNotFound(
@@ -684,13 +712,14 @@ impl GhostScopeLoader {
 
         match event_map {
             EventMap::RingBuf(ringbuf) => {
-                // Create AsyncFd and wait for readable
+                // Create AsyncFd and wait for readable; clear readiness to avoid spin
                 let async_fd = AsyncFd::new(ringbuf.as_raw_fd())
                     .map_err(|e| LoaderError::Generic(format!("Failed to create AsyncFd: {e}")))?;
-                let _guard = async_fd
+                let mut guard = async_fd
                     .readable()
                     .await
                     .map_err(|e| LoaderError::Generic(format!("AsyncFd error: {e}")))?;
+                guard.clear_ready();
 
                 // Read all available events
                 while let Some(item) = ringbuf.next() {
@@ -705,36 +734,31 @@ impl GhostScopeLoader {
                     }
                 }
             }
-            EventMap::PerfEventArray {
-                buffers, cpu_ids, ..
-            } => {
+            EventMap::PerfEventArray { cpu_buffers, .. } => {
                 use bytes::BytesMut;
 
-                // Poll all CPU buffers (non-blocking check)
-                for (idx, buffer) in buffers.iter_mut().enumerate() {
-                    // Check if buffer has events
-                    if !buffer.readable() {
-                        continue;
-                    }
+                let parser = &mut self.parser;
 
-                    // Read events from this CPU's buffer
+                let mut drain_buffer = |entry: &mut PerfEventCpuBuffer| -> Result<bool> {
+                    let mut produced = false;
                     let mut read_bufs = vec![BytesMut::with_capacity(4096)];
-                    match buffer.read_events(&mut read_bufs) {
+
+                    match entry.buffer.read_events(&mut read_bufs) {
                         Ok(result) => {
                             if result.read > 0 {
+                                produced = true;
                                 info!(
                                     "Read {} events from CPU {} buffer",
-                                    result.read, cpu_ids[idx]
+                                    result.read, entry.cpu_id
                                 );
                             }
                             if result.lost > 0 {
                                 warn!(
                                     "Lost {} events from CPU {} buffer",
-                                    result.lost, cpu_ids[idx]
+                                    result.lost, entry.cpu_id
                                 );
                             }
 
-                            // Parse and collect each event
                             for (i, data) in read_bufs.iter().enumerate().take(result.read) {
                                 debug!(
                                     "PerfEvent {}: {} bytes - {:02x?}",
@@ -743,27 +767,80 @@ impl GhostScopeLoader {
                                     &data[..data.len().min(32)]
                                 );
 
-                                match self.parser.process_segment(data, trace_context) {
+                                match parser.process_segment(data, trace_context) {
                                     Ok(Some(parsed_event)) => events.push(parsed_event),
                                     Ok(None) => {}
                                     Err(e) => {
-                                        return Err(LoaderError::Generic(
-                                            format!("Fatal: Failed to parse trace event from PerfEventArray CPU {}: {e}",
-                                                cpu_ids[idx])
-                                        ));
+                                        let cpu = entry.cpu_id;
+                                        return Err(LoaderError::Generic(format!(
+                                            "Fatal: Failed to parse trace event from PerfEventArray CPU {cpu}: {e}"
+                                        )));
                                     }
                                 }
                             }
                         }
                         Err(e) => {
-                            warn!("Failed to read from CPU {} buffer: {}", cpu_ids[idx], e);
+                            warn!("Failed to read from CPU {} buffer: {}", entry.cpu_id, e);
                         }
                     }
-                }
 
-                // If no events were collected, yield to avoid busy waiting
-                if events.is_empty() {
-                    tokio::task::yield_now().await;
+                    Ok(produced)
+                };
+
+                loop {
+                    // Drain any buffers that already report data without waiting.
+                    let mut made_progress = false;
+                    for entry in cpu_buffers.iter_mut() {
+                        if entry.buffer.readable() {
+                            made_progress |= drain_buffer(entry)?;
+                        }
+                    }
+
+                    if made_progress {
+                        break;
+                    }
+
+                    // Wait for at least one buffer to become readable.
+                    let ready_idx = poll_fn(|cx| {
+                        for (idx, entry) in cpu_buffers.iter().enumerate() {
+                            match entry.readiness.poll_read_ready(cx) {
+                                Poll::Ready(Ok(mut guard)) => {
+                                    guard.clear_ready();
+                                    return Poll::Ready(Ok(idx));
+                                }
+                                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                                Poll::Pending => {}
+                            }
+                        }
+                        Poll::Pending
+                    })
+                    .await
+                    .map_err(|e| {
+                        LoaderError::Generic(format!(
+                            "AsyncFd error while waiting for perf events: {e}"
+                        ))
+                    })?;
+
+                    // Drain the buffer that triggered readiness.
+                    made_progress |= drain_buffer(
+                        cpu_buffers
+                            .get_mut(ready_idx)
+                            .expect("ready index should be valid"),
+                    )?;
+
+                    // Drain any other buffers now advertising data.
+                    for (idx, entry) in cpu_buffers.iter_mut().enumerate() {
+                        if idx == ready_idx || !entry.buffer.readable() {
+                            continue;
+                        }
+                        made_progress |= drain_buffer(entry)?;
+                    }
+
+                    if made_progress {
+                        break;
+                    }
+                    // No events were produced despite readiness (eg. lost event markers).
+                    // Loop back and wait again.
                 }
             }
         }
