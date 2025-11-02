@@ -32,11 +32,18 @@ async fn create_and_attach_loader(
         .as_ref()
         .map(|c| c.ebpf_config.proc_module_offsets_max_entries as u32)
         .unwrap_or(4096);
+    let pin_path = ghostscope_process::maps::proc_offsets_pin_path();
     if let Err(e) = ghostscope_process::maps::ensure_pinned_proc_offsets_exists(max_entries) {
-        warn!(
-            "Failed to ensure pinned proc_module_offsets map exists ({} entries): {}",
-            max_entries, e
+        error!(
+            "Failed to ensure pinned proc_module_offsets map exists at {} ({} entries): {:#}",
+            pin_path.display(),
+            max_entries,
+            e
         );
+        return Err(e.context(format!(
+            "Unable to prepare pinned proc_module_offsets map at {}",
+            pin_path.display()
+        )));
     }
 
     let mut loader = GhostScopeLoader::new(&config.ebpf_bytecode)
@@ -398,14 +405,17 @@ pub async fn compile_and_load_script_for_tui(
                 }
                 Err(e) => {
                     error!(
-                        "Failed to attach uprobe for trace_id {}: {}",
+                        "Failed to attach uprobe for trace_id {}: {:#}",
                         config.assigned_trace_id, e
+                    );
+                    tracing::info!(
+                        "Attachment hints: check privileges, target binary availability, PID validity, and function addresses if needed."
                     );
                     // Update corresponding result to failed
                     for result in &mut results {
                         if result.pc_address == config.function_address.unwrap_or(0) {
                             result.status =
-                                ExecutionStatus::Failed(format!("Failed to attach uprobe: {e}"));
+                                ExecutionStatus::Failed(format!("Failed to attach uprobe: {e:#}"));
                             success_count -= 1;
                             failed_count += 1;
                             break;
@@ -682,17 +692,16 @@ pub async fn compile_and_load_script_for_cli(
             }
             Err(e) => {
                 error!(
-                    "Failed to attach uprobe for trace_id {}: {}",
+                    "Failed to attach uprobe for trace_id {}: {:#}",
                     config.assigned_trace_id, e
                 );
-                return Err(anyhow::anyhow!(
-                    "Failed to attach uprobe: {}. Possible reasons: \
-                    1. Need root permissions (run with sudo), \
-                    2. Target binary doesn't exist or lacks debug info, \
-                    3. Process not running or PID invalid, \
-                    4. Function addresses not accessible",
-                    e
-                ));
+                tracing::info!(
+                    "Attachment hints: check privileges, target binary availability, PID validity, and function addresses if needed."
+                );
+                return Err(e.context(format!(
+                    "Failed to attach uprobe for trace_id {}",
+                    config.assigned_trace_id
+                )));
             }
         }
     }
