@@ -48,8 +48,6 @@ pub async fn run_tui_coordinator_with_config(config: MergedConfig) -> Result<()>
         .await
 }
 
-// Removed unused legacy TUI coordinator to satisfy clippy without allow attributes
-
 /// Internal function to run TUI coordinator with UI configuration
 async fn run_tui_coordinator_with_ui_config_and_merged_config(
     parsed_args: ParsedArgs,

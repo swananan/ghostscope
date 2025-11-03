@@ -381,7 +381,6 @@ impl<'ctx> EbpfContext<'ctx> {
                                     if data_len == 0 {
                                         return Err(CodeGenError::TypeSizeNotAvailable(v.name));
                                     }
-                                    // Remove legacy 1993-byte clamp; keep DWARF-reported size
                                     let module_hint = self.take_module_hint();
                                     Ok(ComplexArg {
                                         var_name_index: self
@@ -405,7 +404,6 @@ impl<'ctx> EbpfContext<'ctx> {
                             if data_len == 0 {
                                 return Err(CodeGenError::TypeSizeNotAvailable(v.name));
                             }
-                            // Remove legacy 1993-byte clamp; keep DWARF-reported size
                             let module_hint = self.take_module_hint();
                             Ok(ComplexArg {
                                 var_name_index: self

@@ -21,8 +21,6 @@ pub async fn run_command_line_runtime_with_config(config: MergedConfig) -> Resul
     run_cli_with_session(session, script_content, &config).await
 }
 
-// Removed unused legacy runtime function to satisfy clippy without allow attributes
-
 /// Run CLI session with existing GhostSession and configuration
 async fn run_cli_with_session(
     mut session: GhostSession,

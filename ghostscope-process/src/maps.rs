@@ -146,6 +146,7 @@ pub fn ensure_pinned_proc_offsets_exists(max_entries: u32) -> anyhow::Result<()>
         }
     }
 }
+
 // Low-level bpf syscall wrapper for map update (avoids tight coupling to aya map wrappers)
 #[repr(C)]
 struct BpfMapUpdateAttr {
