@@ -51,3 +51,9 @@ GhostScope scans `/proc/PID/maps` at startup to obtain loaded dynamic library in
 - **Shared-library targets (new processes)**: For processes that start after GhostScope, enable `--enable-sysmon-shared-lib` (or the matching config option) so globals can be resolved. This incurs extra system-wide work, so expect higher overhead on hosts with frequent process churn.
 
 > **Note**: The current sysmon pipeline still assumes the library is mapped when the exec event is handled; if a loader pulls it in much later, offsets are not retried yet.
+
+### 9. `-p <pid>` Mode inside Containers or WSL
+
+- The `-p` workflow filters events using `bpf_get_current_pid_tgid`, which returns the host kernel PID/ TGID. Inside PID namespaces (e.g., Docker, Kubernetes) or Windows Subsystem for Linux, the PID visible inside the container often differs from the host PID.
+- See [PID namespaces manual](https://www.man7.org/linux/man-pages/man7/pid_namespaces.7.html), [WSL issue #12408](https://github.com/microsoft/WSL/issues/12408), and [WSL issue #12115](https://github.com/microsoft/WSL/issues/12115) for details.
+- In these environments, either map the container/WSL PID to the host PID before using `-p`, or prefer `-t <binary>`/`-t <shared library>` where we attach uprobes by module path instead of PID.
