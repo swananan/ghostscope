@@ -11,7 +11,7 @@ use inkwell::context::Context;
 use inkwell::debug_info::DebugInfoBuilder;
 use inkwell::module::Module;
 use inkwell::targets::{Target, TargetTriple};
-use inkwell::values::{FunctionValue, IntValue, PointerValue};
+use inkwell::values::{BasicValueEnum, FunctionValue, IntValue, PointerValue};
 use inkwell::AddressSpace;
 use inkwell::OptimizationLevel;
 use std::collections::HashMap;
@@ -547,6 +547,48 @@ impl<'ctx> EbpfContext<'ctx> {
         // Create basic block and position builder
         let basic_block = self.context.append_basic_block(function, "entry");
         self.builder.position_at_end(basic_block);
+
+        // Temporary debug: emit current PID via bpf_trace_printk using stack-based fmt string
+        let i8_type = self.context.i8_type();
+        let fmt_bytes = b"gs pid: %d\n\0";
+        let fmt_array_type = i8_type.array_type(fmt_bytes.len() as u32);
+        let fmt_alloca = self
+            .builder
+            .build_alloca(fmt_array_type, "trace_pid_fmt")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let fmt_const_elems: Vec<_> = fmt_bytes
+            .iter()
+            .map(|b| i8_type.const_int(*b as u64, false))
+            .collect();
+        let fmt_const = i8_type.const_array(&fmt_const_elems);
+        self.builder
+            .build_store(fmt_alloca, fmt_const)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let fmt_ptr = self
+            .builder
+            .build_pointer_cast(
+                fmt_alloca,
+                i8_type.ptr_type(AddressSpace::default()),
+                "trace_pid_fmt_ptr",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let fmt_size = self
+            .context
+            .i32_type()
+            .const_int(fmt_bytes.len() as u64, false);
+        let pid_tgid = self.get_current_pid_tgid()?;
+        let pid_shift = self.context.i64_type().const_int(32, false);
+        let current_pid = self
+            .builder
+            .build_right_shift(pid_tgid, pid_shift, false, "trace_current_pid")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let trace_args: [BasicValueEnum; 3] = [fmt_ptr.into(), fmt_size.into(), current_pid.into()];
+        let _ = self.create_bpf_helper_call(
+            aya_ebpf_bindings::bindings::bpf_func_id::BPF_FUNC_trace_printk as u64,
+            &trace_args,
+            self.context.i64_type().into(),
+            "trace_pid_print",
+        )?;
 
         // Allocate fixed-size per-invocation key buffer on the eBPF stack (entry block)
         // Layout: [ pid:u32, pad:u32, cookie_lo:u32, cookie_hi:u32 ] to match struct {u32; u64}
