@@ -1,5 +1,3 @@
-// Keep binary clippy-clean without allow attributes
-
 mod cli;
 mod config;
 mod core;
@@ -128,17 +126,6 @@ async fn main() -> Result<()> {
     } else {
         info!("Using default configuration (no config file found)");
     }
-
-    // Log eBPF configuration settings
-    info!("eBPF Configuration:");
-    info!(
-        "  RingBuf size: {} bytes",
-        merged_config.ebpf_config.ringbuf_size
-    );
-    info!(
-        "  PerfEventArray page count: {}",
-        merged_config.ebpf_config.perf_page_count
-    );
 
     // Detect kernel eBPF capabilities once at startup
     if merged_config.ebpf_config.force_perf_event_array {
