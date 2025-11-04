@@ -47,6 +47,8 @@ test_*
 *.sh
 # Keep the sysmon eBPF build script tracked
 !ghostscope-process/ebpf/build_sysmon_bpf.sh
+# Keep installer script tracked
+!scripts/install.sh
 # Keep other C files in test fixtures but exclude random C files in root
 /*.c
 CLA*

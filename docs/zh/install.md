@@ -12,6 +12,27 @@
 
 ## 安装
 
+### 快速安装脚本（推荐）
+
+GhostScope 提供了一个一键安装脚本，会自动下载最新的发布版二进制，复制默认配置到 `~/.ghostscope/config.toml`，并安装到 `~/.ghostscope/bin`（无需 sudo）。
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/swananan/ghostscope/main/scripts/install.sh | bash
+```
+
+**环境要求**
+
+- `curl`、`tar`、`install`
+- `python3`（用于选择最新的 release 版本）
+
+脚本执行完成后，请将以下 PATH 语句写入相应的 shell 配置文件：
+
+- Bash：`echo 'export PATH="$HOME/.ghostscope/bin:$PATH"' >> ~/.bashrc`
+- Zsh：`echo 'export PATH="$HOME/.ghostscope/bin:$PATH"' >> ~/.zshrc`
+- Fish：`echo 'set -Ux PATH $HOME/.ghostscope/bin $PATH' >> ~/.config/fish/config.fish`
+
+重新打开终端后运行 `ghostscope --version` 验证安装。
+
 ### 从 GitHub Releases 下载
 
 1. 从 [GitHub Releases](https://github.com/swananan/ghostscope/releases) 下载最新版本

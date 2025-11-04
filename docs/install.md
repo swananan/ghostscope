@@ -12,6 +12,27 @@
 
 ## Installation
 
+### Quick Install Script (Recommended)
+
+GhostScope ships with an install helper that downloads the latest release binary, copies a default configuration to `~/.ghostscope/config.toml`, and installs everything under `~/.ghostscope/bin` (no sudo required).
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/swananan/ghostscope/main/scripts/install.sh | bash
+```
+
+**Prerequisites**
+
+- `curl`, `tar`, `install` (usually provided by coreutils)
+- `python3` (used to pick the correct release asset)
+
+After the script finishes, add the binary path to your shell configuration:
+
+- Bash: `echo 'export PATH="$HOME/.ghostscope/bin:$PATH"' >> ~/.bashrc`
+- Zsh: `echo 'export PATH="$HOME/.ghostscope/bin:$PATH"' >> ~/.zshrc`
+- Fish: `echo 'set -Ux PATH $HOME/.ghostscope/bin $PATH' >> ~/.config/fish/config.fish`
+
+Restart the terminal and run `ghostscope --version` to verify.
+
 ### Download from GitHub Releases
 
 1. Download the latest release from [GitHub Releases](https://github.com/swananan/ghostscope/releases)
