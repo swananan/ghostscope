@@ -1,1 +1,3 @@
 Dockerfile linguist-vendored
+# Exclude installer scripts from language statistics
+scripts/*.sh linguist-vendored
