@@ -284,7 +284,16 @@ download_and_unpack() {
   local archive="$tmpdir/$archive_name"
 
   log "Downloading ${download_url}"
-  if ! curl -fsSL -o "$archive" "$download_url" 2>/dev/null; then
+  if ! curl -fSL --progress-bar -o "$archive" "$download_url"; then
+    log "curl progress-bar mode failed; retrying without progress display"
+    if ! curl -fSL -o "$archive" "$download_url"; then
+      echo "error: failed to download release asset from ${download_url}" >&2
+      echo "       hint: verify that the requested version and architecture are published" >&2
+      return 1
+    fi
+  fi
+
+  if [[ ! -f "$archive" ]]; then
     echo "error: failed to download release asset from ${download_url}" >&2
     echo "       hint: verify that the requested version and architecture are published" >&2
     return 1

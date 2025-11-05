@@ -1,3 +1,4 @@
 Dockerfile linguist-vendored
 # Exclude installer scripts from language statistics
 scripts/*.sh linguist-vendored
+ghostscope-process/ebpf/build_sysmon_bpf.sh linguist-vendored
