@@ -8,76 +8,14 @@ mod tracing;
 mod util;
 
 use anyhow::Result;
-use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, LeaveAlternateScreen};
-use std::io::{self, Write};
-
 // Use external tracing crate (not the local tracing module)
 use ::tracing::{info, warn};
 use libc as c;
 
-extern "C" fn cleanup_pinned_maps_on_exit() {
-    // Best effort: ignore errors
-    let _ = ghostscope_process::maps::cleanup_pinned_proc_offsets();
-}
-
-fn setup_panic_hook() {
-    // Use existing RUST_BACKTRACE setting from environment
-
-    let original_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |panic_info| {
-        // Flush any pending output before terminal restore
-        let _ = io::stdout().flush();
-        let _ = io::stderr().flush();
-
-        // Attempt to restore terminal state
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
-        let _ = io::stdout().flush();
-
-        // Print panic information to stderr with immediate flushing
-        eprintln!("\n=== GHOSTSCOPE PANIC ===");
-        let _ = io::stderr().flush();
-
-        eprintln!(
-            "Location: {}",
-            panic_info
-                .location()
-                .unwrap_or_else(|| std::panic::Location::caller())
-        );
-        let _ = io::stderr().flush();
-
-        if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
-            eprintln!("Message: {s}");
-        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
-            eprintln!("Message: {s}");
-        } else {
-            eprintln!("Message: (no message available)");
-        }
-        let _ = io::stderr().flush();
-
-        // Print backtrace if available
-        eprintln!("\nBacktrace:");
-        let _ = io::stderr().flush();
-
-        let backtrace = std::backtrace::Backtrace::force_capture();
-        eprintln!("{backtrace}");
-        let _ = io::stderr().flush();
-
-        eprintln!("======================");
-        eprintln!("Terminal state has been restored. You can now see this panic message.");
-        eprintln!("Please report this issue at: https://github.com/swananan/ghostscope/issues");
-        let _ = io::stderr().flush();
-
-        // Call the original hook to preserve any additional panic handling
-        original_hook(panic_info);
-    }));
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     // Setup panic hook before doing anything else
-    setup_panic_hook();
+    crate::util::setup_panic_hook();
 
     // Pre-clean any stale per-process pinned offsets map from a previous crashed session.
     // This prevents PID reuse collisions leaving an old map affecting the new instance.
@@ -117,7 +55,7 @@ async fn main() -> Result<()> {
 
     // Register atexit cleanup for pinned maps (per-process path)
     unsafe {
-        c::atexit(cleanup_pinned_maps_on_exit);
+        c::atexit(crate::util::cleanup_pinned_maps_on_exit);
     }
 
     // Log which configuration file was loaded (after logging is initialized)
@@ -130,6 +68,9 @@ async fn main() -> Result<()> {
             home_hint
         );
     }
+
+    // Ensure we have the privileges needed for eBPF interaction
+    crate::util::ensure_privileges();
 
     // Detect kernel eBPF capabilities once at startup
     if merged_config.ebpf_config.force_perf_event_array {
