@@ -1,24 +1,32 @@
 # GhostScope Roadmap (Milestones)
 
-## Global variables in `-t <exec_path>` mode (planned)
-  - Background: resolving globals requires per-module ASLR offsets computed from `/proc/<pid>/maps`, while `-t` mode has no PID context.
-  - Direction: introduce PID discovery/subscription in the attach flow, or compute and populate offsets once a PID is known at trigger time; ensure safety and ordering.
-  - Until this is available, globals remain disabled in `-t` mode (see “Limitations”).
+GhostScope is still evolving quickly. The milestones below are ordered from “strengthen core capabilities” to “polish experience” and finally “expand language and deployment coverage”.
 
-## Chained array access (`a.b[idx].c`) and dynamic indices (planned)
-  - Support constant indices first; later extend to expression-based indices within eBPF verifier limits.
+## Chained array access & dynamic indices
+- First unlock constant-index access such as `a.b[idx].c`.
+- Once verifier limits are well understood, roll out expression-based/dynamic indices in staged fashion.
+
+## Container tracing enhancements
+- PID-based tracing inside containerized environments (Docker/WSL) still faces soft limitations; see [Limitations](limitations.md#9-container--wsl-limitations-for--p-pid-mode).
+- Once foundational work settles, we’ll revisit improving compatibility in these isolated setups.
 
 ## Stack Unwinding
-  - Capture full call stacks at trace points, implemented via `.eh_frame` parsing.
-  
-  Reference: https://lesenechal.fr/en/linux/unwinding-the-stack-the-hard-way#h5.1-parsing-eh_frame-and-eh_frame_hdr-with-gimli
+- Capture full call stacks at each trace point by parsing `.eh_frame`/`.eh_frame_hdr`.
+- Surface the stack in the TUI with symbol/source awareness.  
+  Reference: <https://lesenechal.fr/en/linux/unwinding-the-stack-the-hard-way#h5.1-parsing-eh_frame-and-eh_frame_hdr-with-gimli>
 
-## Stability and Accuracy Improvements
-  - As a debugging tool, continue fixing defects, improving error handling and data consistency, and raising overall reliability.
+## Stability & accuracy
+- Keep fixing defects, hardening error handling, and ensuring data consistency.
+- Grow automated and regression coverage so the core workflows stay dependable.
 
-## Performance Optimization with bpftime
-  - Evaluate migrating from kernel uprobe to userspace eBPF via [bpftime](https://github.com/eunomia-bpf/bpftime) to reduce context switches.
+## Performance via bpftime
+- Evaluate switching from kernel uprobes to userspace eBPF with [bpftime](https://github.com/eunomia-bpf/bpftime) to cut context-switch overhead.
 
-## Advanced Language Features
-  - Compiled direction: prioritize Rust advanced features (async functions, trait objects, etc.)
-  - Interpreted direction: explore tracing support for specific interpreted languages (e.g., Lua)
+## Advanced language features
+- Compiled languages: prioritize modern Rust features (async functions, trait objects, etc.).
+- Interpreted languages: explore cooperation with runtimes such as Lua to surface variables/stack state.
+
+## Client-server execution model
+- Typical scenario: sources and debug info live in the cloud, while binaries run on test rigs or local hosts.
+- Goal: keep GhostScope’s TUI on the control side and run the eBPF agent on the target machine, similar to `gdb`/`gdbserver`.
+- This will come after the core functionality stabilizes to avoid diluting near-term focus.
