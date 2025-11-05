@@ -135,20 +135,41 @@ async fn main() -> Result<()> {
     if merged_config.ebpf_config.force_perf_event_array {
         warn!("⚠️  TESTING MODE: force_perf_event_array=true - will use PerfEventArray");
         info!("Skipping RingBuf detection, validating PerfEventArray support...");
-        let kernel_caps = ghostscope_loader::KernelCapabilities::get_perf_only();
-        info!("Kernel eBPF capabilities:");
-        info!(
-            "  PerfEventArray support: {}",
-            kernel_caps.supports_perf_event_array
-        );
+        match ghostscope_loader::KernelCapabilities::get_perf_only() {
+            Ok(kernel_caps) => {
+                info!("Kernel eBPF capabilities:");
+                info!(
+                    "  PerfEventArray support: {}",
+                    kernel_caps.supports_perf_event_array
+                );
+            }
+            Err(err) => {
+                eprintln!("Error: {err}");
+                eprintln!("GhostScope requires Linux kernel >= 4.3 with PerfEventArray enabled.");
+                std::process::exit(1);
+            }
+        }
     } else {
-        let kernel_caps = ghostscope_loader::KernelCapabilities::get();
-        info!("Kernel eBPF capabilities:");
-        info!("  RingBuf support: {}", kernel_caps.supports_ringbuf);
+        match ghostscope_loader::KernelCapabilities::get() {
+            Ok(kernel_caps) => {
+                info!("Kernel eBPF capabilities:");
+                info!("  RingBuf support: {}", kernel_caps.supports_ringbuf);
 
-        if !kernel_caps.supports_ringbuf {
-            warn!("⚠️  Kernel does not support RingBuf (requires >= 5.8)");
-            warn!("⚠️  GhostScope will use PerfEventArray as fallback");
+                if !kernel_caps.supports_ringbuf {
+                    warn!("⚠️  Kernel does not support RingBuf (requires >= 5.8)");
+                    warn!("⚠️  GhostScope will use PerfEventArray as fallback");
+                }
+            }
+            Err(err) => {
+                eprintln!("Error: {err}");
+                eprintln!(
+                    "GhostScope requires Linux kernel >= 4.3 with either RingBuf (>= 5.8) or PerfEventArray support."
+                );
+                eprintln!(
+                    "Hint: ensure CONFIG_BPF, CONFIG_BPF_SYSCALL and CONFIG_UPROBE_EVENTS are enabled in your kernel."
+                );
+                std::process::exit(1);
+            }
         }
     }
 
