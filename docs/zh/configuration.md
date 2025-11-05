@@ -10,6 +10,8 @@ GhostScope 可以通过命令行参数、配置文件和环境变量进行配置
 3. 配置文件（~/.ghostscope/config.toml 或 ./ghostscope.toml）
 4. 默认值
 
+> **注意**：GhostScope 通常需要以 sudo/root 身份运行以访问跟踪能力。当以 root 运行时，默认的 `$HOME` 指向 `/root`，因此用户目录下的 `~/.ghostscope/config.toml` 不会自动被读取。请使用 `ghostscope --config /home/<用户名>/.ghostscope/config.toml` 来显式指定个人配置文件。
+
 ## 命令行参数
 
 ### 目标选择

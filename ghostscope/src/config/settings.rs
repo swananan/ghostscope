@@ -1,5 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
@@ -709,7 +710,12 @@ impl Config {
         let mut paths = Vec::new();
 
         // 1. ~/.ghostscope/config.toml (user-level config)
-        if let Some(home_dir) = dirs::home_dir() {
+        if let Some(home_dir) = env::var("HOME")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+            .or_else(dirs::home_dir)
+        {
             paths.push(home_dir.join(".ghostscope").join("config.toml"));
         }
 

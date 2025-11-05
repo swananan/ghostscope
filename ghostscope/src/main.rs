@@ -124,7 +124,11 @@ async fn main() -> Result<()> {
     if let Some(config_path) = &merged_config.config_file_path {
         info!("Configuration loaded from: {}", config_path.display());
     } else {
-        info!("Using default configuration (no config file found)");
+        let home_hint = std::env::var("HOME").unwrap_or_else(|_| "(unset)".into());
+        info!(
+            "Using built-in defaults (no config found at {}/.ghostscope/config.toml or ./ghostscope.toml)",
+            home_hint
+        );
     }
 
     // Detect kernel eBPF capabilities once at startup

@@ -10,6 +10,8 @@ Configuration follows this priority order (highest to lowest):
 3. Configuration file (~/.ghostscope/config.toml or ./ghostscope.toml)
 4. Default values
 
+> **Note**: GhostScope typically runs under sudo to access tracing functionality. When executed as root, `$HOME` points to `/root` by default, so the user-level config at `~/.ghostscope/config.toml` will not be picked up automatically. Use `ghostscope --config /home/<user>/.ghostscope/config.toml` to load your personal configuration when running with sudo.
+
 ## Command-Line Arguments
 
 ### Target Selection
