@@ -442,9 +442,11 @@ impl Args {
 impl ParsedArgs {
     /// Validate command line arguments for consistency and completeness
     pub fn validate(&self) -> Result<()> {
-        // Must have either PID or target path for meaningful operation
+        // Require either PID (-p) or target file (-t)
         if self.pid.is_none() && self.target_path.is_none() {
-            warn!("No target PID or target file specified - running in standalone mode");
+            return Err(anyhow::anyhow!(
+                "No target specified. Please provide either --pid <PID> or --target <PATH>."
+            ));
         }
 
         // Target path validation
