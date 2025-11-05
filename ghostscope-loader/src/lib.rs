@@ -37,7 +37,7 @@ use tracing::{debug, error, info, warn};
 
 // Export kernel capabilities detection
 mod kernel_caps;
-pub use kernel_caps::KernelCapabilities;
+pub use kernel_caps::{KernelCapabilities, KernelCapabilityError};
 
 // Export error types
 mod error;

@@ -4,11 +4,32 @@ use aya_obj::{
     maps::PinningType,
     EbpfSectionKind, Map,
 };
-use std::sync::OnceLock;
+use std::{fmt, sync::OnceLock};
 use tracing::{error, info, warn};
 
 /// Global kernel capabilities cache
-static KERNEL_CAPS: OnceLock<KernelCapabilities> = OnceLock::new();
+static KERNEL_CAPS: OnceLock<Result<KernelCapabilities, KernelCapabilityError>> = OnceLock::new();
+
+#[derive(Debug, Clone)]
+pub struct KernelCapabilityError {
+    message: String,
+}
+
+impl KernelCapabilityError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for KernelCapabilityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for KernelCapabilityError {}
 
 /// Kernel eBPF capabilities detection
 #[derive(Debug, Clone, Copy)]
@@ -21,76 +42,88 @@ pub struct KernelCapabilities {
 
 impl KernelCapabilities {
     /// Get global kernel capabilities (detected once on first call)
-    /// Panics if neither RingBuf nor PerfEventArray is supported
-    pub fn get() -> &'static Self {
-        KERNEL_CAPS.get_or_init(|| {
-            let supports_ringbuf = detect_ringbuf_support();
-            let supports_perf_event_array = if !supports_ringbuf {
-                // Only check PerfEventArray if RingBuf failed
-                detect_perf_event_array_support()
-            } else {
-                // Assume PerfEventArray is supported if RingBuf is (5.8 > 4.3)
-                true
-            };
-
-            if supports_ringbuf {
-                info!("✓ Kernel supports RingBuf (>= 5.8)");
-            } else if supports_perf_event_array {
-                warn!("⚠️  Kernel does not support RingBuf (< 5.8)");
-                warn!("⚠️  Will use PerfEventArray as fallback");
-                info!("✓ Kernel supports PerfEventArray (>= 4.3)");
-            } else {
-                error!("❌ Kernel supports neither RingBuf nor PerfEventArray");
-                error!("❌ GhostScope requires kernel >= 4.3 for eBPF event output");
-                error!("❌ Current kernel appears to be older or eBPF is disabled");
-                panic!(
-                    "Unsupported kernel: Neither RingBuf nor PerfEventArray is available. \
-                     Please upgrade to Linux kernel >= 4.3 or enable eBPF support."
-                );
-            }
-
-            Self {
-                supports_ringbuf,
-                supports_perf_event_array,
-            }
-        })
+    /// Returns an error if neither RingBuf nor PerfEventArray is supported
+    pub fn get() -> Result<&'static Self, KernelCapabilityError> {
+        match KERNEL_CAPS.get_or_init(detect_full_capabilities) {
+            Ok(capabilities) => Ok(capabilities),
+            Err(err) => Err(err.clone()),
+        }
     }
 
     /// Get kernel capabilities with PerfEventArray-only detection (for testing mode)
     /// Skips RingBuf detection and only validates PerfEventArray support
-    /// Panics if PerfEventArray is not supported
-    pub fn get_perf_only() -> &'static Self {
-        KERNEL_CAPS.get_or_init(|| {
-            info!("Testing mode: Only detecting PerfEventArray support");
-            let supports_perf_event_array = detect_perf_event_array_support();
-
-            if !supports_perf_event_array {
-                error!("❌ Kernel does not support PerfEventArray");
-                error!("❌ GhostScope requires kernel >= 4.3 for eBPF event output");
-                panic!(
-                    "Unsupported kernel: PerfEventArray is not available. \
-                     Please upgrade to Linux kernel >= 4.3 or enable eBPF support."
-                );
-            }
-
-            info!("✓ Kernel supports PerfEventArray (>= 4.3)");
-
-            Self {
-                supports_ringbuf: false, // Not detected in testing mode
-                supports_perf_event_array,
-            }
-        })
+    /// Returns an error if PerfEventArray is not supported
+    pub fn get_perf_only() -> Result<&'static Self, KernelCapabilityError> {
+        match KERNEL_CAPS.get_or_init(detect_perf_only_capabilities) {
+            Ok(capabilities) => Ok(capabilities),
+            Err(err) => Err(err.clone()),
+        }
     }
 
     /// Check if RingBuf is supported (convenience method)
     pub fn ringbuf_supported() -> bool {
-        Self::get().supports_ringbuf
+        Self::get()
+            .map(|caps| caps.supports_ringbuf)
+            .unwrap_or(false)
     }
 
     /// Check if PerfEventArray is supported (convenience method)
     pub fn perf_event_array_supported() -> bool {
-        Self::get().supports_perf_event_array
+        Self::get()
+            .map(|caps| caps.supports_perf_event_array)
+            .unwrap_or(false)
     }
+}
+
+fn detect_full_capabilities() -> Result<KernelCapabilities, KernelCapabilityError> {
+    let supports_ringbuf = detect_ringbuf_support();
+    let supports_perf_event_array = if !supports_ringbuf {
+        detect_perf_event_array_support()
+    } else {
+        true
+    };
+
+    if supports_ringbuf {
+        info!("✓ Kernel supports RingBuf (>= 5.8)");
+    } else if supports_perf_event_array {
+        warn!("⚠️  Kernel does not support RingBuf (< 5.8)");
+        warn!("⚠️  Will use PerfEventArray as fallback");
+        info!("✓ Kernel supports PerfEventArray (>= 4.3)");
+    } else {
+        error!("❌ Kernel supports neither RingBuf nor PerfEventArray");
+        error!("❌ GhostScope requires kernel >= 4.3 for eBPF event output");
+        error!("❌ Current kernel appears to be older or eBPF is disabled");
+        return Err(KernelCapabilityError::new(
+            "Kernel lacks both RingBuf (>=5.8) and PerfEventArray (>=4.3) support. \
+             Please upgrade the kernel or enable eBPF features.",
+        ));
+    }
+
+    Ok(KernelCapabilities {
+        supports_ringbuf,
+        supports_perf_event_array,
+    })
+}
+
+fn detect_perf_only_capabilities() -> Result<KernelCapabilities, KernelCapabilityError> {
+    info!("Testing mode: Only detecting PerfEventArray support");
+    let supports_perf_event_array = detect_perf_event_array_support();
+
+    if !supports_perf_event_array {
+        error!("❌ Kernel does not support PerfEventArray");
+        error!("❌ GhostScope requires kernel >= 4.3 for eBPF event output");
+        return Err(KernelCapabilityError::new(
+            "Kernel lacks PerfEventArray support (>=4.3 required). \
+             Please upgrade the kernel or enable eBPF features.",
+        ));
+    }
+
+    info!("✓ Kernel supports PerfEventArray (>= 4.3)");
+
+    Ok(KernelCapabilities {
+        supports_ringbuf: false,
+        supports_perf_event_array,
+    })
 }
 
 /// Detect RingBuf support by attempting to create a minimal map
