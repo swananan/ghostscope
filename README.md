@@ -1,24 +1,21 @@
 <div align="center">
-  <img src="assets/logo.png" alt="GhostScope Logo" width="200"/>
+  <img src="https://raw.githubusercontent.com/swananan/ghostscope/main/assets/logo.png" alt="GhostScope Logo" width="200"/>
   <h1 style="margin-top: 0.2em;">GhostScope</h1>
-  <h3>⚡ Next-Generation eBPF Userspace Runtime Tracer</h3>
+  <h3>⚡ Next-generation eBPF userspace runtime tracer</h3>
   <p>
     <strong>Printf debugging evolved</strong> — Real-time tracing without stopping your application.
   </p>
 
-  <!-- Badges -->
   <p>
-    <img src="https://img.shields.io/badge/version-0.1.0-blue.svg" alt="Version"/>
-    <img src="https://img.shields.io/badge/license-GPL-green.svg" alt="License: GPL"/>
+    <img src="https://img.shields.io/badge/version-0.1.1-blue.svg" alt="Version"/>
+    <img src="https://img.shields.io/badge/license-GPL-green.svg" alt="License"/>
     <img src="https://img.shields.io/badge/Linux-4.4+-orange.svg" alt="Linux 4.4+"/>
     <img src="https://img.shields.io/badge/Rust-1.88.0-red.svg" alt="Rust 1.88.0"/>
   </p>
 
-  <!-- Language Switch -->
   <p>
     <a href="README-zh.md"><strong>中文文档</strong></a>
   </p>
-
 </div>
 
 <br />
@@ -44,7 +41,7 @@ The demo below shows GhostScope tracing an nginx worker process with debug infor
 <br />
 
 <div align="center">
-  <img src="assets/demo.gif" alt="GhostScope Demo" width="100%"/>
+  <img src="https://raw.githubusercontent.com/swananan/ghostscope/main/assets/demo.gif" alt="GhostScope Demo" width="100%"/>
   <p><sub><i>Real-time tracing of a running nginx worker process</i></sub></p>
 </div>
 
@@ -54,28 +51,28 @@ The demo below shows GhostScope tracing an nginx worker process with debug infor
   <table>
     <tr>
       <td align="center" width="25%">
-        <img src="assets/icons/performance.svg" width="60" alt="Performance"/>
+        <img src="https://raw.githubusercontent.com/swananan/ghostscope/main/assets/icons/performance.svg" width="60" alt="Performance"/>
         <br />
         <strong>Zero Overhead</strong>
         <br />
         <sub>One context switch + eBPF execution</sub>
       </td>
       <td align="center" width="25%">
-        <img src="assets/icons/realtime.svg" width="60" alt="Real-time"/>
+        <img src="https://raw.githubusercontent.com/swananan/ghostscope/main/assets/icons/realtime.svg" width="60" alt="Real-time"/>
         <br />
         <strong>Real-Time Tracing</strong>
         <br />
         <sub>Live trace streaming</sub>
       </td>
       <td align="center" width="25%">
-        <img src="assets/icons/dwarf.svg" width="60" alt="DWARF"/>
+        <img src="https://raw.githubusercontent.com/swananan/ghostscope/main/assets/icons/dwarf.svg" width="60" alt="DWARF"/>
         <br />
         <strong>DWARF-Aware</strong>
         <br />
         <sub>Full debug info support</sub>
       </td>
       <td align="center" width="25%">
-        <img src="assets/icons/rust.svg" width="60" alt="Rust"/>
+        <img src="https://raw.githubusercontent.com/swananan/ghostscope/main/assets/icons/rust.svg" width="60" alt="Rust"/>
         <br />
         <strong>Built with Rust</strong>
         <br />

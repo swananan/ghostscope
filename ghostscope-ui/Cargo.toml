@@ -1,10 +1,20 @@
 [package]
 name = "ghostscope-ui"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+readme = "README.md"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Terminal user interface that streams GhostScope traces with async input handling."
 
 [dependencies]
-ghostscope-protocol = { path = "../ghostscope-protocol" }
+ghostscope-protocol = { version = "0.1.1", path = "../ghostscope-protocol" }
 ratatui = "0.28"
 crossterm = { workspace = true }
 futures-util = { workspace = true }

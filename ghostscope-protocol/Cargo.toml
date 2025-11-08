@@ -1,7 +1,17 @@
 [package]
 name = "ghostscope-protocol"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+readme = "README.md"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Shared protocol definitions and serialization glue for GhostScope components."
 
 [dependencies]
 serde = { workspace = true }
@@ -10,5 +20,5 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 aya-ebpf-bindings = { workspace = true }
 gimli = { workspace = true }
-ghostscope-platform = { path = "../ghostscope-platform" }
+ghostscope-platform = { version = "0.1.1", path = "../ghostscope-platform" }
 zerocopy = { version = "0.8", features = ["derive"] }

@@ -17,10 +17,7 @@
 
 use aya::{
     maps::{perf::PerfEventArray, MapData, RingBuf},
-    programs::{
-        uprobe::{UProbeAttachLocation, UProbeLinkId},
-        ProgramError, UProbe,
-    },
+    programs::{uprobe::UProbeLinkId, ProgramError, UProbe},
     Ebpf, EbpfLoader, VerifierLogLevel,
 };
 use ghostscope_protocol::{ParsedTraceEvent, StreamingTraceParser, TraceContext};
@@ -30,6 +27,7 @@ use std::convert::TryInto;
 use std::future::poll_fn;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::io::RawFd;
+use std::path::Path;
 use std::task::Poll;
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
@@ -72,6 +70,27 @@ struct PerfEventCpuBuffer {
     cpu_id: u32,
     buffer: aya::maps::perf::PerfEventArrayBuffer<MapData>,
     readiness: AsyncFd<PerfBufferFd>,
+}
+
+/// Compatibility shim that mimics Aya's newer attach location helper so we can keep
+/// a single call-site regardless of which `UProbe::attach` signature we compile against.
+enum UProbeAttachLocation<'a> {
+    AbsoluteOffset(u64),
+    Function(&'a str),
+}
+
+impl<'a> UProbeAttachLocation<'a> {
+    fn attach<T: AsRef<Path>>(
+        self,
+        program: &mut UProbe,
+        target: T,
+        pid: Option<i32>,
+    ) -> std::result::Result<UProbeLinkId, ProgramError> {
+        match self {
+            Self::AbsoluteOffset(offset) => program.attach(None, offset, target, pid),
+            Self::Function(fn_name) => program.attach(Some(fn_name), 0, target, pid),
+        }
+    }
 }
 
 pub fn hello() -> String {
@@ -349,20 +368,13 @@ impl GhostScopeLoader {
             }
         }
 
-        // Attach the uprobe using aya API
-        // If we have an offset, use it; otherwise fall back to function name
-        let attach_result = if let Some(offset) = offset {
-            // Use absolute offset-based attachment
-            program.attach(
-                UProbeAttachLocation::AbsoluteOffset(offset),
-                target_binary,
-                None,
-                None,
-            )
-        } else {
-            // Use function name-based attachment
-            program.attach(function_name, target_binary, None, None)
+        // Attach the uprobe using Aya API via a compatibility helper
+        // so argument ordering stays explicit regardless of Aya version.
+        let attach_location = match offset {
+            Some(offset) => UProbeAttachLocation::AbsoluteOffset(offset),
+            None => UProbeAttachLocation::Function(function_name),
         };
+        let attach_result = attach_location.attach(program, target_binary, pid);
 
         match attach_result {
             Ok(link) => {
@@ -584,21 +596,11 @@ impl GhostScopeLoader {
         })?;
 
         // Attach the uprobe directly (don't load - it's already loaded)
-        let attach_result = if let Some(offset) = params.offset {
-            program.attach(
-                UProbeAttachLocation::AbsoluteOffset(offset),
-                &params.target_binary,
-                None,
-                None,
-            )
-        } else {
-            program.attach(
-                params.function_name.as_str(),
-                &params.target_binary,
-                None,
-                None,
-            )
+        let attach_location = match params.offset {
+            Some(offset) => UProbeAttachLocation::AbsoluteOffset(offset),
+            None => UProbeAttachLocation::Function(params.function_name.as_str()),
         };
+        let attach_result = attach_location.attach(program, &params.target_binary, params.pid);
 
         match attach_result {
             Ok(link) => {

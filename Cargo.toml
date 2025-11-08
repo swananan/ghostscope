@@ -13,11 +13,18 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
+rust-version = "1.88"
 authors = ["swananan <jt26wzz@gmail.com>"]
-license = "GPL"
+license = "GPL-3.0-only"
+description = "GhostScope brings DWARF-aware eBPF tracing to user-space binaries with a printf-like experience."
+readme = "README.md"
+repository = "https://github.com/swananan/ghostscope"
+homepage = "https://github.com/swananan/ghostscope"
+documentation = "https://github.com/swananan/ghostscope#readme"
 keywords = ["ebpf", "gdb", "dwarf", "debugger"]
+categories = ["development-tools::debugging", "development-tools::profiling"]
 
 [workspace.dependencies]
 log = "0.4.22"
@@ -38,11 +45,11 @@ toml = "0.8"
 dirs = "5.0"
 object = "0.36"
 
-gimli = { git = "https://github.com/gimli-rs/gimli", rev = "0c2a60c00792b4d3c31344d8b5d5c6e8d98b5dd5" }
-aya = { git = "https://github.com/aya-rs/aya", rev = "9261554e3c6ca37e401ec23a287a1ddf9cb1f26d" }
-aya-obj = { git = "https://github.com/aya-rs/aya", rev = "9261554e3c6ca37e401ec23a287a1ddf9cb1f26d" }
-aya-ebpf-bindings = { git = "https://github.com/aya-rs/aya", rev = "9261554e3c6ca37e401ec23a287a1ddf9cb1f26d" }
-aya-build = { git = "https://github.com/aya-rs/aya", rev = "9261554e3c6ca37e401ec23a287a1ddf9cb1f26d" }
+gimli = "0.31.1"
+aya = "0.13.1"
+aya-obj = "0.2.1"
+aya-ebpf-bindings = "0.1.1"
+aya-build = "0.1.2"
 
 # Test dependencies
 tempfile = "3.8"

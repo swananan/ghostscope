@@ -1,19 +1,17 @@
 <div align="center">
-  <img src="assets/logo.png" alt="GhostScope Logo" width="200"/>
+  <img src="https://raw.githubusercontent.com/swananan/ghostscope/main/assets/logo.png" alt="GhostScope Logo" width="200"/>
   <h1 style="margin-top: 0.2em;">GhostScope</h1>
   <h3>⚡ 下一代 eBPF 用户态运行时追踪器</h3>
   <p>
-    <strong>Printf 调试的进化</strong> — 无需停止和修改应用即可实时追踪
+    <strong>Printf 调试的进化</strong> — 无需停止或修改应用即可实时追踪。
   </p>
 
-  <!-- 徽章 -->
   <p>
-    <img src="https://img.shields.io/badge/版本-0.1.0-blue.svg" alt="Version"/>
-    <img src="https://img.shields.io/badge/协议-GPL-green.svg" alt="License: GPL"/>
+    <img src="https://img.shields.io/badge/版本-0.1.1-blue.svg" alt="版本"/>
+    <img src="https://img.shields.io/badge/协议-GPL-green.svg" alt="协议"/>
     <img src="https://img.shields.io/badge/Linux-4.4+-orange.svg" alt="Linux 4.4+"/>
     <img src="https://img.shields.io/badge/Rust-1.88.0-red.svg" alt="Rust 1.88.0"/>
   </p>
-
 </div>
 
 <br />
@@ -39,7 +37,7 @@ GhostScope 将编译后的二进制文件转变为可观测系统。在函数入
 <br />
 
 <div align="center">
-  <img src="assets/demo.gif" alt="GhostScope Demo" width="100%"/>
+  <img src="https://raw.githubusercontent.com/swananan/ghostscope/main/assets/demo.gif" alt="GhostScope Demo" width="100%"/>
   <p><sub><i>实时追踪运行中的 nginx worker 进程</i></sub></p>
 </div>
 
@@ -49,28 +47,28 @@ GhostScope 将编译后的二进制文件转变为可观测系统。在函数入
   <table>
     <tr>
       <td align="center" width="25%">
-        <img src="assets/icons/performance.svg" width="60" alt="Performance"/>
+        <img src="https://raw.githubusercontent.com/swananan/ghostscope/main/assets/icons/performance.svg" width="60" alt="Performance"/>
         <br />
         <strong>零开销</strong>
         <br />
         <sub>仅需一次上下文切换 + eBPF 执行</sub>
       </td>
       <td align="center" width="25%">
-        <img src="assets/icons/realtime.svg" width="60" alt="Real-time"/>
+        <img src="https://raw.githubusercontent.com/swananan/ghostscope/main/assets/icons/realtime.svg" width="60" alt="Real-time"/>
         <br />
         <strong>实时追踪</strong>
         <br />
         <sub>实时跟踪流</sub>
       </td>
       <td align="center" width="25%">
-        <img src="assets/icons/dwarf.svg" width="60" alt="DWARF"/>
+        <img src="https://raw.githubusercontent.com/swananan/ghostscope/main/assets/icons/dwarf.svg" width="60" alt="DWARF"/>
         <br />
         <strong>DWARF 感知</strong>
         <br />
         <sub>完整调试信息支持</sub>
       </td>
       <td align="center" width="25%">
-        <img src="assets/icons/rust.svg" width="60" alt="Rust"/>
+        <img src="https://raw.githubusercontent.com/swananan/ghostscope/main/assets/icons/rust.svg" width="60" alt="Rust"/>
         <br />
         <strong>Rust 构建</strong>
         <br />
