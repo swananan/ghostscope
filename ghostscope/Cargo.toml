@@ -1,15 +1,25 @@
 [package]
 name = "ghostscope"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+readme = "README.md"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Command-line entrypoint that drives GhostScope compiler, loader, and UI end-to-end."
 
 [dependencies]
-ghostscope-compiler = { path = "../ghostscope-compiler" }
-ghostscope-loader = { path = "../ghostscope-loader" }
-ghostscope-ui = { path = "../ghostscope-ui" }
-ghostscope-dwarf = { path = "../ghostscope-dwarf" }
-ghostscope-protocol = { path = "../ghostscope-protocol" }
-ghostscope-process = { path = "../ghostscope-process" }
+ghostscope-compiler = { version = "0.1.1", path = "../ghostscope-compiler" }
+ghostscope-loader = { version = "0.1.1", path = "../ghostscope-loader" }
+ghostscope-ui = { version = "0.1.1", path = "../ghostscope-ui" }
+ghostscope-dwarf = { version = "0.1.1", path = "../ghostscope-dwarf" }
+ghostscope-protocol = { version = "0.1.1", path = "../ghostscope-protocol" }
+ghostscope-process = { version = "0.1.1", path = "../ghostscope-process" }
 dirs = "5.0"
 libc = "0.2"
 clap = { version = "4.0", features = ["derive"] }

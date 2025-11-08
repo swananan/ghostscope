@@ -4,14 +4,22 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Standalone helper binary for inspecting DWARF data with GhostScope parsers."
 
 [[bin]]
 name = "dwarf-tool"
 path = "src/main.rs"
 
 [dependencies]
-ghostscope-dwarf = { path = "../../ghostscope-dwarf" }
-ghostscope-process = { path = "../../ghostscope-process" }
+ghostscope-dwarf = { version = "0.1.1", path = "../../ghostscope-dwarf" }
+ghostscope-process = { version = "0.1.1", path = "../../ghostscope-process" }
 
 # Command line parsing
 clap.workspace = true

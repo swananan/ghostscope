@@ -1,7 +1,17 @@
 [package]
 name = "ghostscope-compiler"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+readme = "README.md"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Compiles GhostScope trace definitions into DWARF-aware eBPF programs ready for injection."
 
 [dependencies]
 inkwell = { version = "0.6.0", features = ["llvm18-1", "target-bpf"] }
@@ -12,7 +22,7 @@ tracing-log = { workspace = true }
 thiserror = { workspace = true }
 tracing-subscriber = { workspace = true }
 aya-ebpf-bindings = { workspace = true }
-ghostscope-dwarf = { path = "../ghostscope-dwarf" }
-ghostscope-protocol = { path = "../ghostscope-protocol" }
-ghostscope-platform = { path = "../ghostscope-platform" }
-ghostscope-process = { path = "../ghostscope-process" }
+ghostscope-dwarf = { version = "0.1.1", path = "../ghostscope-dwarf" }
+ghostscope-protocol = { version = "0.1.1", path = "../ghostscope-protocol" }
+ghostscope-platform = { version = "0.1.1", path = "../ghostscope-platform" }
+ghostscope-process = { version = "0.1.1", path = "../ghostscope-process" }
