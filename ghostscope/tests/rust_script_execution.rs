@@ -50,8 +50,9 @@ trace do_stuff {
 }
 "#;
 
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 9, pid).await?;
     let _ = prog.0.kill().await.is_ok();
+
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     assert!(
@@ -92,7 +93,7 @@ trace do_stuff {
     print "RC:{}", G_COUNTER;
 }
 "#;
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 5, pid).await?;
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 9, pid).await?;
     let _ = prog.0.kill().await.is_ok();
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
@@ -147,7 +148,7 @@ trace do_stuff {
     print "&RC:{}", &G_COUNTER;
 }
 "#;
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 9, pid).await?;
     let _ = prog.0.kill().await.is_ok();
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
@@ -159,5 +160,58 @@ trace do_stuff {
         stdout.contains("0x"),
         "Expected hex address. STDOUT: {stdout}"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rust_script_bss_counter_direct() -> anyhow::Result<()> {
+    // Regression coverage: ensure we can read a pure .bss global (G_COUNTER) directly, without
+    // relying on DWARF locals or pointer aliases.
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("rust_global_program")?;
+    let bin_dir = binary_path.parent().unwrap();
+    struct KillOnDrop(tokio::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.start_kill().is_ok();
+        }
+    }
+    let mut cmd = Command::new(&binary_path);
+    cmd.current_dir(bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let child = cmd.spawn()?;
+    let pid = child.id().ok_or_else(|| anyhow::anyhow!("no pid"))?;
+    let mut prog = KillOnDrop(child);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let script = r#"
+trace touch_globals {
+    print "BSSCNT:{}", G_COUNTER;
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 9, pid).await?;
+    let _ = prog.0.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+
+    let mut vals = Vec::new();
+    for line in stdout.lines() {
+        if let Some(pos) = line.find("BSSCNT:") {
+            if let Some(num_str) = line[pos + "BSSCNT:".len()..].split_whitespace().next() {
+                if let Ok(v) = num_str.parse::<i64>() {
+                    vals.push(v);
+                }
+            }
+        }
+    }
+    assert!(
+        vals.len() >= 2,
+        "Insufficient BSSCNT events. STDOUT: {stdout}"
+    );
+    for pair in vals.windows(2) {
+        assert_eq!(pair[1] - pair[0], 1, "G_COUNTER should +1 per tick");
+    }
     Ok(())
 }

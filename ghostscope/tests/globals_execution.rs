@@ -2003,6 +2003,50 @@ trace globals_program.c:32 {
 }
 
 #[tokio::test]
+async fn test_direct_bss_global_no_alias() -> anyhow::Result<()> {
+    // Focused regression: read the executable's .bss counter directly (without going through
+    // pointer aliases) to ensure rebasing logic works for zero-initialized globals.
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap();
+    let mut prog = Command::new(&binary_path)
+        .current_dir(bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = prog
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let script = r#"
+trace globals_program.c:32 {
+    print "SBSS_ONLY:{}", s_bss_counter;
+}
+"#;
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
+    let _ = prog.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+
+    let re = Regex::new(r"SBSS_ONLY:(-?\d+)").unwrap();
+    let mut vals = Vec::new();
+    for line in stdout.lines() {
+        if let Some(c) = re.captures(line) {
+            vals.push(c[1].parse::<i64>().unwrap_or(0));
+        }
+    }
+    assert!(
+        vals.len() >= 2,
+        "Insufficient SBSS_ONLY events. STDOUT: {stdout}"
+    );
+    for pair in vals.windows(2) {
+        assert_eq!(pair[1] - pair[0], 3, "s_bss_counter should +3 per tick");
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_direct_global_cross_module() -> anyhow::Result<()> {
     init();
 

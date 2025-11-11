@@ -1,6 +1,7 @@
 use crate::config::MergedConfig;
 use crate::core::GhostSession;
 use anyhow::Result;
+use std::io::{self, Write};
 use tracing::{debug, error, info, warn};
 
 /// Run GhostScope in command line mode with merged configuration
@@ -137,6 +138,11 @@ async fn run_cli_with_session(
                                 println!("[Event #{event_count}] Output:");
                                 for line in formatted_output {
                                     println!("  {line}");
+                                }
+                                // When stdout is piped (as in tests), Rust switches to block buffering.
+                                // Flush explicitly so short event bursts appear before the process exits.
+                                if let Err(e) = io::stdout().flush() {
+                                    warn!("Failed to flush event output: {e}");
                                 }
                             }
 

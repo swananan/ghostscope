@@ -385,18 +385,21 @@ impl ProcessManager {
             }
         }
         let mut offsets = SectionOffsets::default();
-        if let Some(a0) = text_addr.and_then(find_bias_for) {
-            offsets.text = a0;
-        }
-        if let Some(a1) = rodata_addr.and_then(find_bias_for) {
-            offsets.rodata = a1;
-        }
-        if let Some(a2) = data_addr.and_then(find_bias_for) {
-            offsets.data = a2;
-        }
-        if let Some(a3) = bss_addr.and_then(find_bias_for) {
-            offsets.bss = a3;
-        }
+        // Each DW_OP_addr we encounter is an absolute link-time virtual address (e.g. 0x5798c for
+        // G_COUNTER). To rebase it we only need the ASLR bias `module_base`, not per-section
+        // runtime starts. Derive that bias from whichever segment we could match, then store it for
+        // all four slots so the eBPF helper can simply do `link_addr + bias`.
+        let module_base = text_addr
+            .and_then(find_bias_for)
+            .or_else(|| rodata_addr.and_then(find_bias_for))
+            .or_else(|| data_addr.and_then(find_bias_for))
+            .or_else(|| bss_addr.and_then(find_bias_for))
+            .unwrap_or(0);
+
+        offsets.text = module_base;
+        offsets.rodata = module_base;
+        offsets.data = module_base;
+        offsets.bss = module_base;
         let cookie = crate::cookie::from_path(module_path);
         let base = min_start.unwrap_or(0);
         let size = max_end.unwrap_or(base).saturating_sub(base);
@@ -419,17 +422,29 @@ impl ProcessManager {
                 );
             }
         }
+        let runtime_text = text_addr
+            .map(|t| module_base.saturating_add(t))
+            .unwrap_or(0);
+        let runtime_ro = rodata_addr
+            .map(|r| module_base.saturating_add(r))
+            .unwrap_or(0);
+        let runtime_data = data_addr
+            .map(|d| module_base.saturating_add(d))
+            .unwrap_or(0);
+        let runtime_bss = bss_addr.map(|b| module_base.saturating_add(b)).unwrap_or(0);
+
         tracing::debug!(
-            "computed offsets: pid={} module='{}' cookie=0x{:016x} base=0x{:x} size=0x{:x} text=0x{:x} rodata=0x{:x} data=0x{:x} bss=0x{:x}",
+            "computed offsets: pid={} module='{}' cookie=0x{:016x} base=0x{:x} size=0x{:x} module_bias=0x{:x} text=0x{:x} rodata=0x{:x} data=0x{:x} bss=0x{:x}",
             pid,
             module_path,
             cookie,
             base,
             size,
             offsets.text,
-            offsets.rodata,
-            offsets.data,
-            offsets.bss
+            runtime_text,
+            runtime_ro,
+            runtime_data,
+            runtime_bss
         );
         Ok((cookie, offsets, base, size))
     }
