@@ -12,6 +12,7 @@ documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "Standalone helper binary for inspecting DWARF data with GhostScope parsers."
+publish = false
 
 [[bin]]
 name = "dwarf-tool"
