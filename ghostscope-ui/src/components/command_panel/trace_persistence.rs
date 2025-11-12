@@ -261,18 +261,134 @@ impl TracePersistence {
         }
 
         // Trace command and script
-        section.push_str(&format!("trace {} {{\n", trace.target));
-
-        // Indent script content
-        for line in trace.script.lines() {
-            section.push_str("    ");
-            section.push_str(line);
-            section.push('\n');
-        }
-
-        section.push_str("}\n");
+        let script_block = Self::format_trace_block(&trace.script, &trace.target);
+        section.push_str(&script_block);
 
         section
+    }
+
+    /// Wrap raw script body with a trace header/brace pair
+    fn wrap_script_body(target: &str, body: &str) -> String {
+        let mut wrapped = String::new();
+        wrapped.push_str(&format!("trace {target} {{\n"));
+
+        if body.trim().is_empty() {
+            wrapped.push_str("}\n");
+            return wrapped;
+        }
+
+        for line in body.lines() {
+            wrapped.push_str("    ");
+            wrapped.push_str(line);
+            wrapped.push('\n');
+        }
+
+        wrapped.push_str("}\n");
+        wrapped
+    }
+
+    /// Normalize script content into canonical trace block format
+    fn format_trace_block(script: &str, target: &str) -> String {
+        if let Some(body) = Self::extract_trace_body(script) {
+            let dedented = Self::dedent_body(&body);
+            let trimmed = dedented.trim_end_matches(['\r', '\n']);
+            Self::wrap_script_body(target, trimmed)
+        } else {
+            Self::wrap_script_body(target, script)
+        }
+    }
+
+    /// Extract the body of an existing trace block, tolerating inline braces
+    fn extract_trace_body(script: &str) -> Option<String> {
+        let trimmed = script.trim();
+        if !trimmed.starts_with("trace ") {
+            return None;
+        }
+
+        let bytes = trimmed.as_bytes();
+        let mut start_brace = None;
+        for (idx, &b) in bytes.iter().enumerate() {
+            if b == b'{' {
+                start_brace = Some(idx);
+                break;
+            }
+        }
+        let start = start_brace?;
+        let mut depth = 1usize;
+        let mut i = start + 1;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let raw_body = &trimmed[start + 1..i];
+                        let normalized = Self::trim_wrapped_body(raw_body);
+                        return Some(normalized.to_string());
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Trim surrounding whitespace/newlines around an extracted body
+    fn trim_wrapped_body(body: &str) -> &str {
+        let mut slice = body.trim_end_matches(['\r', '\n', ' ', '\t']);
+        loop {
+            if slice.starts_with("\r\n") {
+                slice = &slice[2..];
+            } else if slice.starts_with('\n') || slice.starts_with('\r') {
+                slice = &slice[1..];
+            } else {
+                break;
+            }
+        }
+        slice
+    }
+
+    /// Remove common indentation so we can re-indent consistently in the save file
+    fn dedent_body(body: &str) -> String {
+        let lines: Vec<&str> = body.lines().collect();
+        let indent = lines
+            .iter()
+            .filter_map(|line| {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(
+                        line.as_bytes()
+                            .iter()
+                            .take_while(|&&b| b == b' ' || b == b'\t')
+                            .count(),
+                    )
+                }
+            })
+            .min()
+            .unwrap_or(0);
+
+        if indent == 0 {
+            return body.to_string();
+        }
+
+        let mut result = String::new();
+        for (idx, line) in lines.iter().enumerate() {
+            let line = *line;
+            if idx > 0 {
+                result.push('\n');
+            }
+            if line.trim().is_empty() {
+                continue;
+            }
+            let skip = indent.min(line.len());
+            let content = line.get(skip..).unwrap_or("");
+            result.push_str(content.trim_end_matches('\r'));
+        }
+
+        result
     }
 
     /// Parse a saved trace file for loading
@@ -462,5 +578,51 @@ trace foo {
         assert_eq!(traces[1].target, "foo");
         assert!(traces[1].enabled); // enabled trace
         assert_eq!(traces[1].script, "print \"foo\";");
+    }
+
+    #[test]
+    fn test_save_traces_avoids_double_wrapping() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let mut persistence = TracePersistence::new();
+        persistence.add_trace(TraceConfig {
+            id: 1,
+            target: "main".to_string(),
+            script: "trace main {\n    print \"hello\";\n}".to_string(),
+            status: TraceStatus::Active,
+            binary_path: "/bin/app".to_string(),
+            selected_index: None,
+        });
+
+        let filename = std::env::temp_dir().join(format!(
+            "ghostscope_trace_test_{}.gs",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let filename_str = filename.to_string_lossy().to_string();
+
+        let result = persistence
+            .save_traces(Some(&filename_str), SaveFilter::All)
+            .expect("save traces succeeds");
+
+        let saved = std::fs::read_to_string(&result.filename).expect("saved trace file readable");
+
+        assert!(
+            saved.contains("trace main {\n    print \"hello\";\n}\n"),
+            "saved trace missing expected block:\n{saved}"
+        );
+        assert!(
+            !saved.contains("trace main {\n    trace main"),
+            "trace block was double wrapped:\n{saved}"
+        );
+
+        let parsed = TracePersistence::parse_trace_file(&saved).expect("saved file parses");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].target, "main");
+        assert_eq!(parsed[0].script, "print \"hello\";");
+
+        let _ = std::fs::remove_file(&result.filename);
     }
 }
