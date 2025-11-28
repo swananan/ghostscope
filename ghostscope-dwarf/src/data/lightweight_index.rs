@@ -6,7 +6,7 @@
 //! - Support for parallel construction with index shards
 //! - Fast binary search for symbol lookup
 
-use crate::core::IndexEntry;
+use crate::core::{demangle_by_lang, demangled_leaf, IndexEntry};
 use gimli::{DebugInfoOffset, EndianArcSlice, LittleEndian};
 use std::collections::{BTreeMap, HashMap};
 use tracing::debug;
@@ -89,11 +89,11 @@ impl LightweightIndex {
         }
 
         // Add all type entries (struct/class/union/enum)
-        for (name, ty_entries) in types {
+        for (name, ty_entries) in &types {
             let start_idx = entries.len();
-            entries.extend(ty_entries);
+            entries.extend(ty_entries.clone());
             let indices: Vec<usize> = (start_idx..entries.len()).collect();
-            type_map.insert(name, indices);
+            type_map.insert(name.clone(), indices);
         }
 
         // IMPORTANT: Do NOT sort entries! This would invalidate the indices
@@ -117,6 +117,25 @@ impl LightweightIndex {
             "Built lightweight index: {} functions, {} variables, {} total entries, {} with addresses",
             total_functions, total_variables, entries.len(), address_map.len()
         );
+
+        // Ensure demangled aliases exist for variables even if DW_AT_name was missing.
+        for (idx, entry) in entries.iter().enumerate() {
+            if entry.tag == gimli::constants::DW_TAG_variable {
+                if let Some(demangled) = demangle_by_lang(entry.language, entry.name.as_ref()) {
+                    let leaf = demangled_leaf(&demangled);
+                    if leaf != entry.name.as_ref() {
+                        tracing::trace!(
+                            "LightweightIndex: alias '{}' -> '{}' (idx {}, lang={:?})",
+                            entry.name,
+                            leaf,
+                            idx,
+                            entry.language
+                        );
+                        variable_map.entry(leaf).or_default().push(idx);
+                    }
+                }
+            }
+        }
 
         Self {
             entries,

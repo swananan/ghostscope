@@ -164,6 +164,51 @@ trace do_stuff {
 }
 
 #[tokio::test]
+async fn test_rust_script_global_enum_as_int() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("rust_global_program")?;
+    let bin_dir = binary_path.parent().unwrap();
+    struct KillOnDrop(tokio::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.start_kill().is_ok();
+        }
+    }
+    let mut cmd = Command::new(&binary_path);
+    cmd.current_dir(bin_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let child = cmd.spawn()?;
+    let pid = child.id().ok_or_else(|| anyhow::anyhow!("no pid"))?;
+    let mut prog = KillOnDrop(child);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // Read GLOBAL_ENUM by forcing it into an integer slot via reinterpret cast.
+    // This exercises the static-resolution path for globals that only have DW_OP_addr.
+    let script = r#"
+trace do_stuff {
+    print "ENUM_RAW:{}", GLOBAL_ENUM_BITS;
+}
+"#;
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 9, pid).await?;
+    let _ = prog.0.kill().await.is_ok();
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+
+    let mut seen = false;
+    for line in stdout.lines() {
+        if line.contains("ENUM_RAW:") {
+            seen = true;
+            break;
+        }
+    }
+    assert!(seen, "Expected ENUM_RAW output. STDOUT: {stdout}");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_rust_script_bss_counter_direct() -> anyhow::Result<()> {
     // Regression coverage: ensure we can read a pure .bss global (G_COUNTER) directly, without
     // relying on DWARF locals or pointer aliases.

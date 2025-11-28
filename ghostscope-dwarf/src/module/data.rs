@@ -2155,10 +2155,17 @@ impl ModuleData {
         };
 
         let mut out = Vec::new();
+        // Track DIEs we've already emitted (unit_offset, die_offset)
+        let mut seen_offsets: HashSet<(u64, u64)> = HashSet::new();
+
         // Try demangled full (preserve the demangled name that matched)
         if let Some(indices) = self.demangled_variable_map.get(name) {
             for &idx in indices {
                 if let Some(entry) = self.lightweight_index.entry(idx) {
+                    let key = (entry.unit_offset.0 as u64, entry.die_offset.0 as u64);
+                    if !seen_offsets.insert(key) {
+                        continue;
+                    }
                     let link_address = entry.address_ranges.first().and_then(|(lo, hi)| {
                         if lo == hi {
                             Some(*lo)
@@ -2185,6 +2192,10 @@ impl ModuleData {
         if let Some(indices) = self.demangled_variable_leaf_map.get(name) {
             for &idx in indices {
                 if let Some(entry) = self.lightweight_index.entry(idx) {
+                    let key = (entry.unit_offset.0 as u64, entry.die_offset.0 as u64);
+                    if !seen_offsets.insert(key) {
+                        continue;
+                    }
                     let link_address = entry.address_ranges.first().and_then(|(lo, hi)| {
                         if lo == hi {
                             Some(*lo)
@@ -2213,6 +2224,10 @@ impl ModuleData {
         for key in self.lightweight_index.get_variable_names() {
             if key.rsplit("::").next().map(|s| s == name).unwrap_or(false) {
                 for e in self.lightweight_index.find_variables_by_name(key) {
+                    let key = (e.unit_offset.0 as u64, e.die_offset.0 as u64);
+                    if !seen_offsets.insert(key) {
+                        continue;
+                    }
                     let link_address =
                         e.address_ranges
                             .first()
@@ -2240,6 +2255,10 @@ impl ModuleData {
         for i in 0..total {
             if let Some(e) = self.lightweight_index.entry(i) {
                 if e.tag != gimli::constants::DW_TAG_variable {
+                    continue;
+                }
+                let key_offsets = (e.unit_offset.0 as u64, e.die_offset.0 as u64);
+                if !seen_offsets.insert(key_offsets) {
                     continue;
                 }
                 let last = e.name.rsplit("::").next().unwrap_or(e.name.as_ref());
@@ -2378,6 +2397,7 @@ impl ModuleData {
     pub(crate) fn find_global_variables_by_name(&self, name: &str) -> Vec<GlobalVariableInfo> {
         let mut out = Vec::new();
         let entries = self.lightweight_index.find_variables_by_name(name);
+        let mut seen_offsets: HashSet<(u64, u64)> = HashSet::new();
 
         // Parse object file once for section classification
         let obj = match object::File::parse(&self._binary_mapped_file.data[..]) {
@@ -2385,6 +2405,10 @@ impl ModuleData {
             Err(_) => {
                 // Cannot classify sections, but still return entries with link_address
                 for e in entries {
+                    let key = (e.unit_offset.0 as u64, e.die_offset.0 as u64);
+                    if !seen_offsets.insert(key) {
+                        continue;
+                    }
                     let link_address =
                         e.address_ranges
                             .first()
@@ -2402,6 +2426,10 @@ impl ModuleData {
         };
 
         for e in entries {
+            let key = (e.unit_offset.0 as u64, e.die_offset.0 as u64);
+            if !seen_offsets.insert(key) {
+                continue;
+            }
             let link_address =
                 e.address_ranges
                     .first()

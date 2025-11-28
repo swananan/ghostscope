@@ -1,7 +1,10 @@
 //! Unified DWARF parser - true single-pass parsing
 
 use crate::{
-    core::{IndexEntry, Result},
+    core::{
+        demangle::{demangle_by_lang, demangled_leaf},
+        IndexEntry, Result,
+    },
     data::{
         directory_from_index, resolve_file_path, LightweightFileIndex, LightweightIndex,
         LineMappingTable, ScopedFileIndexManager,
@@ -246,65 +249,118 @@ impl<'a> DwarfParser<'a> {
                     }
                 }
                 gimli::constants::DW_TAG_variable => {
+                    tracing::trace!(
+                        "Evaluating global variable DIE {:?} in CU {:?}",
+                        entry.offset(),
+                        unit_offset
+                    );
+                    let is_static_symbol = self.is_static_symbol(entry).unwrap_or(false);
                     let in_function_scope = tag_stack.iter().any(|t| {
                         *t == gimli::constants::DW_TAG_subprogram
                             || *t == gimli::constants::DW_TAG_inlined_subroutine
                     });
-                    if in_function_scope {
+                    if in_function_scope && !is_static_symbol {
+                        tracing::trace!(
+                            "Skipping variable at {:?} (in function scope, stack={:?})",
+                            entry.offset(),
+                            tag_stack
+                        );
                         // Skip local variables
                         tag_stack.push(entry.tag());
                         continue;
+                    } else if in_function_scope {
+                        // Rust (and some C compilers) sometimes nest file-scoped statics under the
+                        // function that first references them, even though DW_AT_location uses
+                        // DW_OP_addr. When DW_AT_external is false we treat them as true globals.
+                        tracing::trace!(
+                            "Treating static variable at {:?} as global despite function scope (stack={:?})",
+                            entry.offset(),
+                            tag_stack
+                        );
                     }
                     if Self::is_declaration(entry).unwrap_or(false) {
+                        tracing::trace!(
+                            "Skipping variable at {:?} (declaration-only DIE)",
+                            entry.offset()
+                        );
                         tag_stack.push(entry.tag());
                         continue;
                     }
+                    let mut collected_names: Vec<(String, bool)> = Vec::new();
+                    let mut push_unique_name = |candidate: String, is_linkage_alias: bool| {
+                        if candidate.is_empty() {
+                            return;
+                        }
+                        if collected_names
+                            .iter()
+                            .any(|(existing, _)| existing == &candidate)
+                        {
+                            return;
+                        }
+                        collected_names.push((candidate, is_linkage_alias));
+                    };
+
+                    let mut have_primary_name = false;
                     if let Some(name) = self.extract_name(self.dwarf, unit, entry)? {
-                        let flags = crate::core::IndexFlags {
-                            is_static: self.is_static_symbol(entry).unwrap_or(false),
-                            ..Default::default()
-                        };
-                        // Restore variable address for globals/statics via DW_AT_location
-                        let var_addr = self.extract_variable_address(entry, unit)?;
-                        let var_ranges = var_addr.map(|a| vec![(a, a)]).unwrap_or_default();
+                        push_unique_name(name, false);
+                        have_primary_name = true;
+                    }
+
+                    if let Some((linkage_name, _)) =
+                        self.extract_linkage_name(self.dwarf, unit, entry)?
+                    {
+                        if let Some(demangled) =
+                            demangle_by_lang(cu_language, linkage_name.as_str())
+                        {
+                            let leaf = demangled_leaf(&demangled);
+                            push_unique_name(leaf, false);
+                            have_primary_name = true;
+                        }
+                        push_unique_name(linkage_name.clone(), true);
+                    }
+
+                    if !have_primary_name {
+                        tracing::trace!(
+                            "DWARF variable at {:?} missing usable name (CU lang={:?}); skipping alias registration",
+                            entry.offset(),
+                            cu_language
+                        );
+                        tag_stack.push(entry.tag());
+                        continue;
+                    }
+
+                    let flags = crate::core::IndexFlags {
+                        is_static: is_static_symbol,
+                        ..Default::default()
+                    };
+                    let var_addr = self.extract_variable_address(entry, unit)?;
+                    let var_ranges = var_addr.map(|a| vec![(a, a)]).unwrap_or_default();
+
+                    for (name, is_linkage_alias) in collected_names {
+                        let mut entry_flags = flags;
+                        entry_flags.is_linkage = is_linkage_alias;
                         let index_entry = IndexEntry {
                             name: std::sync::Arc::from(name.as_str()),
                             die_offset: entry.offset(),
                             unit_offset,
                             tag: entry.tag(),
-                            flags,
+                            flags: entry_flags,
                             language: cu_language,
                             address_ranges: var_ranges.clone(),
                             entry_pc: None,
                         };
+                        tracing::trace!(
+                            "Registering variable alias '{}' (linkage={}, lang={:?}, die={:?})",
+                            name,
+                            entry_flags.is_linkage,
+                            cu_language,
+                            entry.offset()
+                        );
                         shard
                             .variables
                             .entry(name.clone())
                             .or_default()
                             .push(index_entry);
-                        if let Some((linkage_name, _)) =
-                            self.extract_linkage_name(self.dwarf, unit, entry)?
-                        {
-                            if linkage_name != name {
-                                let mut alias_flags = flags;
-                                alias_flags.is_linkage = true;
-                                let index_entry_linkage = IndexEntry {
-                                    name: std::sync::Arc::from(linkage_name.as_str()),
-                                    die_offset: entry.offset(),
-                                    unit_offset,
-                                    tag: entry.tag(),
-                                    flags: alias_flags,
-                                    language: cu_language,
-                                    address_ranges: var_ranges,
-                                    entry_pc: None,
-                                };
-                                shard
-                                    .variables
-                                    .entry(linkage_name)
-                                    .or_default()
-                                    .push(index_entry_linkage);
-                            }
-                        }
                     }
                 }
                 gimli::constants::DW_TAG_structure_type
