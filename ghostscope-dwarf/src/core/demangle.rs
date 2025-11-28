@@ -5,23 +5,32 @@ use gimli::DwLang;
 /// Demangle a symbol string using language hint when available.
 /// Returns None if demangling fails or is not applicable.
 pub fn demangle_by_lang(lang: Option<DwLang>, s: &str) -> Option<String> {
+    // 1) Trust DW_AT_language when available
     match lang {
-        Some(gimli::DW_LANG_Rust) => demangle_rust(s),
+        Some(gimli::DW_LANG_Rust) => {
+            if let Some(d) = demangle_rust(s) {
+                return Some(d);
+            }
+        }
         Some(gimli::DW_LANG_C_plus_plus)
         | Some(gimli::DW_LANG_C_plus_plus_11)
         | Some(gimli::DW_LANG_C_plus_plus_14)
         | Some(gimli::DW_LANG_C_plus_plus_17)
-        | Some(gimli::DW_LANG_C_plus_plus_20) => demangle_cpp(s),
-        _ => {
-            // Try common patterns heuristically
-            if is_rust_mangled(s) {
-                demangle_rust(s)
-            } else if is_itanium_cpp_mangled(s) {
-                demangle_cpp(s)
-            } else {
-                None
+        | Some(gimli::DW_LANG_C_plus_plus_20) => {
+            if let Some(d) = demangle_cpp(s) {
+                return Some(d);
             }
         }
+        _ => {}
+    }
+
+    // 2) Fall back to heuristics if language hint missing or demangle failed
+    if is_rust_mangled(s) || looks_like_legacy_rust(s) {
+        demangle_rust(s)
+    } else if is_itanium_cpp_mangled(s) {
+        demangle_cpp(s)
+    } else {
+        None
     }
 }
 
@@ -53,7 +62,11 @@ pub fn demangled_leaf(full: &str) -> String {
 
 /// Heuristic: Rust v0 mangling starts with "_R".
 pub fn is_rust_mangled(s: &str) -> bool {
-    s.starts_with("_R")
+    s.starts_with("_R") || looks_like_legacy_rust(s)
+}
+
+fn looks_like_legacy_rust(s: &str) -> bool {
+    s.starts_with("_ZN") && s.contains("17h") && s.ends_with('E')
 }
 
 /// Heuristic: Itanium C++ mangling starts with "_Z".
