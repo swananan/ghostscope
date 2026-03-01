@@ -124,6 +124,11 @@ impl App {
         let mut loading_ui_ticker = tokio::time::interval(tokio::time::Duration::from_secs(1));
         loading_ui_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // Periodic housekeeping ticker for lightweight timeout/cleanup checks.
+        // Use an interval instead of recreating sleep futures in each select iteration.
+        let mut housekeeping_ticker = tokio::time::interval(tokio::time::Duration::from_millis(50));
+        housekeeping_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         // Initial render
         self.terminal.draw(|f| Self::draw_ui(f, &mut self.state))?;
 
@@ -175,8 +180,8 @@ impl App {
                     needs_render = true;
                 }
 
-                // Check for jk escape sequence timeout periodically
-                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                // Check for jk escape sequence timeout and periodic cleanup
+                _ = housekeeping_ticker.tick() => {
                     // Check jk timeout
                     if crate::components::command_panel::input_handler::InputHandler::check_jk_timeout(&mut self.state.command_panel) {
                         needs_render = true;
