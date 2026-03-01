@@ -13,7 +13,7 @@ pub struct TestableApp {
 
     /// Channels for mocking runtime communication
     _command_receiver: Arc<Mutex<mpsc::UnboundedReceiver<RuntimeCommand>>>,
-    _trace_sender: mpsc::UnboundedSender<ParsedTraceEvent>,
+    _trace_sender: mpsc::Sender<ParsedTraceEvent>,
     _status_sender: mpsc::UnboundedSender<RuntimeStatus>,
 
     /// Internal app state (simplified for testing)
@@ -40,7 +40,7 @@ impl TestableApp {
     pub fn new(width: u16, height: u16) -> Self {
         // Create mock channels
         let (_command_sender, command_receiver) = mpsc::unbounded_channel();
-        let (trace_sender, _trace_receiver) = mpsc::unbounded_channel();
+        let (trace_sender, _trace_receiver) = mpsc::channel(64);
         let (status_sender, _status_receiver) = mpsc::unbounded_channel();
 
         // Create test terminal

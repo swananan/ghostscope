@@ -127,7 +127,7 @@ impl OptimizedRenderer {
                         }
                     }
                 }
-                LineType::Response => {
+                LineType::Response | LineType::RuntimeAlert => {
                     // Check if we have pre-styled content
                     if let Some(ref styled_content) = static_line.styled_content {
                         let wrapped_lines = self.wrap_styled_line(styled_content, width as usize);
