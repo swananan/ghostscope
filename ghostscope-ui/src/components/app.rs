@@ -3263,6 +3263,17 @@ impl App {
                 };
                 let _ = self.handle_action(action);
             }
+            RuntimeStatus::TraceBackpressure {
+                dropped_since_last,
+                dropped_total,
+                queue_capacity,
+            } => {
+                self.show_trace_backpressure_alert(
+                    dropped_since_last,
+                    dropped_total,
+                    queue_capacity,
+                );
+            }
             _ => {
                 // Handle other runtime status messages (delegate to command panel or other components)
                 // For now, pass them to command panel for display
@@ -3316,6 +3327,28 @@ impl App {
         }
 
         self.state.ebpf_panel.add_trace_event(trace_event);
+    }
+
+    fn show_trace_backpressure_alert(
+        &mut self,
+        dropped_since_last: u64,
+        dropped_total: u64,
+        queue_capacity: usize,
+    ) {
+        let content = format!(
+            "⚠ Trace queue saturated: dropped {dropped_since_last} events in last 1s (total {dropped_total}, capacity {queue_capacity})"
+        );
+        let styled_lines =
+            crate::components::command_panel::ResponseFormatter::style_generic_message_lines(
+                &content,
+            );
+        crate::components::command_panel::ResponseFormatter::upsert_runtime_alert_with_style(
+            &mut self.state.command_panel,
+            content,
+            Some(styled_lines),
+            crate::action::ResponseType::Warning,
+        );
+        self.state.command_renderer.mark_pending_updates();
     }
 
     /// Format runtime status for display in command panel

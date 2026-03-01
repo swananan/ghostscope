@@ -544,6 +544,7 @@ pub struct StaticTextLine {
 pub enum LineType {
     Command,
     Response,
+    RuntimeAlert,
     CurrentInput,
     Welcome,
 }

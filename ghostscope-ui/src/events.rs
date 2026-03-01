@@ -58,7 +58,7 @@ pub struct EventRegistry {
     pub command_sender: mpsc::UnboundedSender<RuntimeCommand>,
 
     // Runtime -> TUI communication
-    pub trace_receiver: mpsc::UnboundedReceiver<ParsedTraceEvent>,
+    pub trace_receiver: mpsc::Receiver<ParsedTraceEvent>,
     pub status_receiver: mpsc::UnboundedReceiver<RuntimeStatus>,
 }
 
@@ -916,6 +916,12 @@ pub enum RuntimeStatus {
     SrcPathFailed {
         error: String,
     },
+    /// Runtime->UI trace channel backpressure warning (events dropped)
+    TraceBackpressure {
+        dropped_since_last: u64,
+        dropped_total: u64,
+        queue_capacity: usize,
+    },
 }
 
 /// Statistics for a loaded module
@@ -998,8 +1004,13 @@ pub struct SectionInfo {
 
 impl EventRegistry {
     pub fn new() -> (Self, RuntimeChannels) {
+        Self::new_with_trace_capacity(DEFAULT_TRACE_CHANNEL_CAPACITY)
+    }
+
+    pub fn new_with_trace_capacity(trace_capacity: usize) -> (Self, RuntimeChannels) {
+        let trace_capacity = trace_capacity.max(1);
         let (command_tx, command_rx) = mpsc::unbounded_channel();
-        let (trace_tx, trace_rx) = mpsc::unbounded_channel::<ParsedTraceEvent>();
+        let (trace_tx, trace_rx) = mpsc::channel::<ParsedTraceEvent>(trace_capacity);
         let (status_tx, status_rx) = mpsc::unbounded_channel();
 
         let registry = EventRegistry {
@@ -1012,18 +1023,23 @@ impl EventRegistry {
             command_receiver: command_rx,
             trace_sender: trace_tx.clone(),
             status_sender: status_tx.clone(),
+            trace_channel_capacity: trace_capacity,
         };
 
         (registry, channels)
     }
 }
 
+/// Default queue size for runtime->UI trace events.
+pub const DEFAULT_TRACE_CHANNEL_CAPACITY: usize = 4096;
+
 /// Channels used by the runtime to receive commands and send events
 #[derive(Debug)]
 pub struct RuntimeChannels {
     pub command_receiver: mpsc::UnboundedReceiver<RuntimeCommand>,
-    pub trace_sender: mpsc::UnboundedSender<ParsedTraceEvent>,
+    pub trace_sender: mpsc::Sender<ParsedTraceEvent>,
     pub status_sender: mpsc::UnboundedSender<RuntimeStatus>,
+    pub trace_channel_capacity: usize,
 }
 
 impl RuntimeChannels {
@@ -1033,7 +1049,7 @@ impl RuntimeChannels {
     }
 
     /// Create a trace sender that can be shared with other tasks
-    pub fn create_trace_sender(&self) -> mpsc::UnboundedSender<ParsedTraceEvent> {
+    pub fn create_trace_sender(&self) -> mpsc::Sender<ParsedTraceEvent> {
         self.trace_sender.clone()
     }
 }
@@ -1203,6 +1219,30 @@ impl RuntimeStatus {
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_event(trace_id: u64) -> ParsedTraceEvent {
+        ParsedTraceEvent {
+            timestamp: 0,
+            trace_id,
+            pid: 42,
+            tid: 42,
+            instructions: vec![],
+        }
+    }
+
+    #[test]
+    fn event_registry_uses_bounded_trace_channel_capacity() {
+        let (_registry, channels) = EventRegistry::new_with_trace_capacity(1);
+        assert_eq!(channels.trace_channel_capacity, 1);
+
+        channels.trace_sender.try_send(sample_event(1)).unwrap();
+        assert!(channels.trace_sender.try_send(sample_event(2)).is_err());
     }
 }
 

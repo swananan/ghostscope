@@ -186,6 +186,50 @@ impl ResponseFormatter {
         Self::update_static_lines(state);
     }
 
+    /// Upsert a runtime alert line that is independent from command history.
+    /// This is used for periodic/system warnings (e.g., backpressure) and must
+    /// remain visible even when no command has been entered yet.
+    pub fn upsert_runtime_alert_with_style(
+        state: &mut CommandPanelState,
+        content: String,
+        styled_lines: Option<Vec<Line<'static>>>,
+        response_type: ResponseType,
+    ) {
+        state
+            .static_lines
+            .retain(|line| line.line_type != LineType::RuntimeAlert);
+
+        if let Some(styled) = styled_lines {
+            for styled_line in styled {
+                let plain: String = styled_line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect();
+                state.static_lines.push(StaticTextLine {
+                    content: plain,
+                    line_type: LineType::RuntimeAlert,
+                    history_index: None,
+                    response_type: Some(response_type),
+                    styled_content: Some(styled_line),
+                });
+            }
+        } else {
+            for line in Self::split_response_lines(&content) {
+                state.static_lines.push(StaticTextLine {
+                    content: line,
+                    line_type: LineType::RuntimeAlert,
+                    history_index: None,
+                    response_type: Some(response_type),
+                    styled_content: None,
+                });
+            }
+        }
+
+        state.styled_buffer = None;
+        state.styled_at_history_index = None;
+    }
+
     /// Helper method to create a simple single-line styled response
     /// This reduces code duplication for common response patterns
     pub fn add_simple_styled_response(
@@ -306,10 +350,10 @@ impl ResponseFormatter {
 
     /// Update the static lines display from command history
     pub fn update_static_lines(state: &mut CommandPanelState) {
-        // Keep welcome messages but remove command/response lines
+        // Keep welcome/runtime alert messages but remove command/response lines
         state
             .static_lines
-            .retain(|line| line.line_type == LineType::Welcome);
+            .retain(|line| matches!(line.line_type, LineType::Welcome | LineType::RuntimeAlert));
         state.styled_buffer = None;
         state.styled_at_history_index = None;
 
@@ -376,7 +420,7 @@ impl ResponseFormatter {
     ) -> Vec<Line<'static>> {
         match line.line_type {
             LineType::Command => Self::format_command_line(&line.content, width),
-            LineType::Response => Self::format_response_line(line, width),
+            LineType::Response | LineType::RuntimeAlert => Self::format_response_line(line, width),
             LineType::Welcome => Self::format_response_line(line, width), // Format welcome messages like responses
             LineType::CurrentInput => {
                 if is_current_input {
@@ -1342,6 +1386,61 @@ impl ResponseFormatter {
 
         let paragraph = Paragraph::new(lines);
         f.render_widget(paragraph, inner_area);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_alert_visible_without_command_history() {
+        let mut state = CommandPanelState::new();
+        let content = "⚠ Trace queue saturated: dropped 10 events in last 1s".to_string();
+        let styled = ResponseFormatter::style_generic_message_lines(&content);
+
+        ResponseFormatter::upsert_runtime_alert_with_style(
+            &mut state,
+            content.clone(),
+            Some(styled),
+            ResponseType::Warning,
+        );
+
+        assert!(state.command_history.is_empty());
+        assert!(state.static_lines.iter().any(|line| {
+            line.line_type == LineType::RuntimeAlert
+                && line.content.contains("Trace queue saturated")
+        }));
+    }
+
+    #[test]
+    fn runtime_alert_is_upserted_and_survives_history_refresh() {
+        let mut state = CommandPanelState::new();
+
+        ResponseFormatter::upsert_runtime_alert_with_style(
+            &mut state,
+            "⚠ old alert".to_string(),
+            None,
+            ResponseType::Warning,
+        );
+        ResponseFormatter::upsert_runtime_alert_with_style(
+            &mut state,
+            "⚠ new alert".to_string(),
+            None,
+            ResponseType::Warning,
+        );
+
+        // Add one command and refresh static lines to simulate normal command flow.
+        state.add_command_entry("info trace");
+        ResponseFormatter::update_static_lines(&mut state);
+
+        let alert_lines: Vec<_> = state
+            .static_lines
+            .iter()
+            .filter(|line| line.line_type == LineType::RuntimeAlert)
+            .collect();
+        assert_eq!(alert_lines.len(), 1);
+        assert!(alert_lines[0].content.contains("new alert"));
     }
 }
 

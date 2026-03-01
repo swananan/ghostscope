@@ -9,8 +9,8 @@ use tokio::sync::mpsc;
 pub struct TuiTestHarness {
     /// Mock channels for runtime communication
     pub command_receiver: mpsc::UnboundedReceiver<RuntimeCommand>,
-    pub trace_sender: mpsc::UnboundedSender<ParsedTraceEvent>,
-    pub trace_receiver: mpsc::UnboundedReceiver<ParsedTraceEvent>,
+    pub trace_sender: mpsc::Sender<ParsedTraceEvent>,
+    pub trace_receiver: mpsc::Receiver<ParsedTraceEvent>,
     pub status_sender: mpsc::UnboundedSender<RuntimeStatus>,
     pub status_receiver: mpsc::UnboundedReceiver<RuntimeStatus>,
 
@@ -23,7 +23,7 @@ impl TuiTestHarness {
     pub fn new(width: u16, height: u16) -> Self {
         // Create mock channels - keep both ends to prevent channel closed errors
         let (_command_sender, command_receiver) = mpsc::unbounded_channel();
-        let (trace_sender, trace_receiver) = mpsc::unbounded_channel();
+        let (trace_sender, trace_receiver) = mpsc::channel(64);
         let (status_sender, status_receiver) = mpsc::unbounded_channel();
 
         // Create test terminal
@@ -44,7 +44,7 @@ impl TuiTestHarness {
     pub fn create_event_registry(&mut self) -> EventRegistry {
         // Create new channels for the EventRegistry
         let (command_sender, command_receiver) = mpsc::unbounded_channel();
-        let (trace_sender, trace_receiver) = mpsc::unbounded_channel();
+        let (trace_sender, trace_receiver) = mpsc::channel(64);
         let (status_sender, status_receiver) = mpsc::unbounded_channel();
 
         // Store the command receiver for later use
@@ -56,7 +56,7 @@ impl TuiTestHarness {
         self.status_sender = status_sender;
 
         // Also create separate channels for the EventRegistry
-        let (_trace_sender_for_registry, trace_receiver_for_registry) = mpsc::unbounded_channel();
+        let (_trace_sender_for_registry, trace_receiver_for_registry) = mpsc::channel(64);
         let (_status_sender_for_registry, status_receiver_for_registry) = mpsc::unbounded_channel();
 
         // Keep the receivers alive
@@ -100,7 +100,9 @@ impl TuiTestHarness {
 
     /// Send a mock trace event
     pub fn send_trace_event(&mut self, event: ParsedTraceEvent) -> Result<()> {
-        self.trace_sender.send(event)?;
+        self.trace_sender
+            .try_send(event)
+            .map_err(|e| anyhow::anyhow!("Failed to enqueue trace event: {e}"))?;
         Ok(())
     }
 

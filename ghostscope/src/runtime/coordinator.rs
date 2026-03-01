@@ -2,8 +2,54 @@ use crate::config::{MergedConfig, ParsedArgs};
 use crate::core::GhostSession;
 use crate::runtime::{dwarf_loader, info_handlers, source_handlers, trace_handlers};
 use anyhow::Result;
+use ghostscope_protocol::ParsedTraceEvent;
 use ghostscope_ui::{EventRegistry, RuntimeChannels, RuntimeCommand, RuntimeStatus};
-use tracing::{error, info};
+use tokio::sync::mpsc::error::TrySendError;
+use tracing::{error, info, warn};
+
+#[derive(Debug, Default)]
+struct TraceBackpressureState {
+    dropped_since_last_report: u64,
+    dropped_total: u64,
+}
+
+impl TraceBackpressureState {
+    fn record_drop(&mut self) {
+        self.dropped_since_last_report += 1;
+        self.dropped_total += 1;
+    }
+
+    fn take_report(&mut self) -> Option<(u64, u64)> {
+        if self.dropped_since_last_report == 0 {
+            return None;
+        }
+
+        let dropped_since_last = self.dropped_since_last_report;
+        self.dropped_since_last_report = 0;
+        Some((dropped_since_last, self.dropped_total))
+    }
+}
+
+enum TraceForwardResult {
+    Delivered,
+    Dropped,
+    ChannelClosed,
+}
+
+fn forward_trace_event(
+    trace_sender: &tokio::sync::mpsc::Sender<ParsedTraceEvent>,
+    event_data: ParsedTraceEvent,
+    backpressure_state: &mut TraceBackpressureState,
+) -> TraceForwardResult {
+    match trace_sender.try_send(event_data) {
+        Ok(()) => TraceForwardResult::Delivered,
+        Err(TrySendError::Full(_)) => {
+            backpressure_state.record_drop();
+            TraceForwardResult::Dropped
+        }
+        Err(TrySendError::Closed(_)) => TraceForwardResult::ChannelClosed,
+    }
+}
 
 /// Run GhostScope in TUI mode with merged configuration
 pub async fn run_tui_coordinator_with_config(config: MergedConfig) -> Result<()> {
@@ -134,6 +180,10 @@ async fn run_runtime_coordinator(
 
     // Create trace sender for event polling task
     let trace_sender = runtime_channels.create_trace_sender();
+    let trace_channel_capacity = runtime_channels.trace_channel_capacity;
+    let mut backpressure_state = TraceBackpressureState::default();
+    let mut backpressure_report_ticker = tokio::time::interval(tokio::time::Duration::from_secs(1));
+    backpressure_report_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -154,7 +204,22 @@ async fn run_runtime_coordinator(
                                 tracing::debug!("Forwarding {} trace events to UI", events.len());
                             }
                             for event_data in events {
-                                let _ = trace_sender.send(event_data);
+                                match forward_trace_event(
+                                    &trace_sender,
+                                    event_data,
+                                    &mut backpressure_state,
+                                ) {
+                                    TraceForwardResult::Delivered => {}
+                                    TraceForwardResult::Dropped => {
+                                        // `forward_trace_event` already increments backpressure counters on drop.
+                                        // We intentionally report drops in the 1s ticker branch below to avoid
+                                        // per-event status/log spam under sustained overload.
+                                    }
+                                    TraceForwardResult::ChannelClosed => {
+                                        warn!("Trace channel closed while forwarding events; stopping runtime coordinator");
+                                        return Ok(());
+                                    }
+                                }
                             }
                         }
                     }
@@ -166,7 +231,11 @@ async fn run_runtime_coordinator(
             }
 
             // Handle runtime commands
-            Some(command) = runtime_channels.command_receiver.recv() => {
+            command = runtime_channels.command_receiver.recv() => {
+                let Some(command) = command else {
+                    info!("Runtime command channel closed; stopping runtime coordinator");
+                    break;
+                };
                 match command {
                     RuntimeCommand::ExecuteScript { command: script, selected_index } => {
                         handle_execute_script(&mut session, &mut runtime_channels, script, selected_index, &compile_options).await;
@@ -345,6 +414,22 @@ async fn run_runtime_coordinator(
                         info!("Shutdown requested");
                         break;
                     }
+                }
+            }
+
+            _ = backpressure_report_ticker.tick() => {
+                if let Some((dropped_since_last, dropped_total)) = backpressure_state.take_report() {
+                    warn!(
+                        "Trace channel backpressure detected: dropped {} events in last interval (total {}, capacity {})",
+                        dropped_since_last,
+                        dropped_total,
+                        trace_channel_capacity
+                    );
+                    let _ = runtime_channels.status_sender.send(RuntimeStatus::TraceBackpressure {
+                        dropped_since_last,
+                        dropped_total,
+                        queue_capacity: trace_channel_capacity,
+                    });
                 }
             }
         }
@@ -543,4 +628,67 @@ async fn handle_load_traces(
 
     // Don't send TracesLoaded here - let the UI track individual completions
     // and send the final summary when all are done
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_event(trace_id: u64) -> ParsedTraceEvent {
+        ParsedTraceEvent {
+            timestamp: 0,
+            trace_id,
+            pid: 1000,
+            tid: 1000,
+            instructions: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn forward_trace_event_records_drop_when_channel_is_full() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let mut state = TraceBackpressureState::default();
+
+        let first = forward_trace_event(&tx, sample_event(1), &mut state);
+        assert!(matches!(first, TraceForwardResult::Delivered));
+
+        let second = forward_trace_event(&tx, sample_event(2), &mut state);
+        assert!(matches!(second, TraceForwardResult::Dropped));
+
+        let report = state.take_report();
+        assert_eq!(report, Some((1, 1)));
+    }
+
+    #[tokio::test]
+    async fn forward_trace_event_detects_closed_channel() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut state = TraceBackpressureState::default();
+        drop(rx);
+
+        let result = forward_trace_event(&tx, sample_event(1), &mut state);
+        assert!(matches!(result, TraceForwardResult::ChannelClosed));
+        assert_eq!(state.take_report(), None);
+    }
+
+    #[tokio::test]
+    async fn runtime_coordinator_exits_when_command_channel_closed() {
+        let (event_registry, runtime_channels) = EventRegistry::new();
+        drop(event_registry);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            run_runtime_coordinator(
+                runtime_channels,
+                None,
+                ghostscope_compiler::CompileOptions::default(),
+            ),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "runtime coordinator should exit promptly when command channel is closed"
+        );
+        assert!(result.unwrap().is_ok());
+    }
 }
