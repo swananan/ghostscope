@@ -145,7 +145,33 @@ docker build -t ghostscope-builder:ubuntu20.04 .
 ## 测试
 
 ### 集成测试和 UT
+
+```bash
 sudo cargo test
+```
+
+### Agent E2E Runner（Codex）
+
+该流程用于在 AI agent 环境中执行 e2e，目的是规避 agent 无法直接执行 `sudo cargo test` 的限制。
+
+`runner service` 需要开发者自行使用 `sudo` 启动：
+
+```bash
+cd /mnt/500g/code/ghostscope
+sudo env HOST=127.0.0.1 PORT=8788 DEFAULT_SUDO=1 DEFAULT_REPO_DIR=/mnt/500g/code/ghostscope ./scripts/e2e_runner/start_e2e_runner_service.sh
+```
+
+启动后，通过 agent 包装脚本触发 e2e：
+
+```bash
+./scripts/e2e_runner/run_e2e_runner.sh
+```
+
+可选变量：
+
+- `E2E_REPO_DIR=/path/to/repo`
+- `E2E_TEST_CASE=<cargo_test_filter>`
+- `E2E_SUDO=1|0`（默认：`1`）
 
 ### 使用 dwarf-tool 测试 DWARF 解析
 

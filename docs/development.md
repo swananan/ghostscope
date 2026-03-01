@@ -149,6 +149,29 @@ After rebuilding, a regular workspace build will pick up the new objects automat
 sudo cargo test
 ```
 
+### Agent E2E Runner (Codex)
+
+This runner path is for running e2e from an AI agent environment, where the agent may not be able to execute `sudo cargo test` directly.
+
+The service must be started by the developer manually with `sudo`:
+
+```bash
+cd /mnt/500g/code/ghostscope
+sudo env HOST=127.0.0.1 PORT=8788 DEFAULT_SUDO=1 DEFAULT_REPO_DIR=/mnt/500g/code/ghostscope ./scripts/e2e_runner/start_e2e_runner_service.sh
+```
+
+Then run e2e through the agent wrapper:
+
+```bash
+./scripts/e2e_runner/run_e2e_runner.sh
+```
+
+Optional variables:
+
+- `E2E_REPO_DIR=/path/to/repo`
+- `E2E_TEST_CASE=<cargo_test_filter>`
+- `E2E_SUDO=1|0` (default: `1`)
+
 ### Testing DWARF Parsing with dwarf-tool
 
 GhostScope provides a standalone `dwarf-tool` for testing and debugging DWARF parsing:
