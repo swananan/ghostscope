@@ -1219,9 +1219,7 @@ async fn test_bitfields_correctness() -> anyhow::Result<()> {
     // Use source-line attach where 'a' and 'i' are in scope
     let script_fn = r#"
 trace complex_types_program.c:25 {
-    print "I={}", i;
-    print a.active;
-    print a.flags;
+    print "I={} ACTIVE={} FLAGS={}", i, a.active, a.flags;
 }
 "#;
 
@@ -1235,52 +1233,21 @@ trace complex_types_program.c:25 {
         "ghostscope should run successfully. stderr={stderr} stdout={stdout}"
     );
 
-    // Parse values from output
-    // Expect lines like:
-    //   : I=1234
-    //   : c.active = 0/1 (or a.active = ... depending on var name)
-    //   : c.flags = 0..7
+    // Parse values from a single formatted line to avoid cross-event line pairing.
+    // Expected line shape:
+    //   : I=1234 ACTIVE=0 FLAGS=4
     use regex::Regex;
-    let re_i = Regex::new(r"I=([0-9]+)").unwrap();
-    let re_active = Regex::new(r"(?i)(?:\b|\.)active\s*=\s*([0-9]+)").unwrap();
-    let re_flags = Regex::new(r"(?i)(?:\b|\.)flags\s*=\s*([0-9]+)").unwrap();
-
-    let mut found_i: Option<u64> = None;
-    let mut found_active: Option<u64> = None;
-    let mut found_flags: Option<u64> = None;
-
-    for line in stdout.lines() {
-        if found_i.is_none() {
-            if let Some(caps) = re_i.captures(line) {
-                if let Ok(val) = caps[1].parse::<u64>() {
-                    found_i = Some(val);
-                }
-            }
-        }
-        if found_active.is_none() {
-            if let Some(caps) = re_active.captures(line) {
-                if let Ok(val) = caps[1].parse::<u64>() {
-                    found_active = Some(val);
-                }
-            }
-        }
-        if found_flags.is_none() {
-            if let Some(caps) = re_flags.captures(line) {
-                if let Ok(val) = caps[1].parse::<u64>() {
-                    found_flags = Some(val);
-                }
-            }
-        }
-        if found_i.is_some() && found_active.is_some() && found_flags.is_some() {
-            break;
-        }
-    }
-
-    let i_val = found_i.ok_or_else(|| anyhow::anyhow!("Missing I=... line. STDOUT: {stdout}"))?;
-    let active_val =
-        found_active.ok_or_else(|| anyhow::anyhow!("Missing active line. STDOUT: {stdout}"))?;
-    let flags_val =
-        found_flags.ok_or_else(|| anyhow::anyhow!("Missing flags line. STDOUT: {stdout}"))?;
+    let re_triplet = Regex::new(r"I=([0-9]+)\s+ACTIVE=([0-9]+)\s+FLAGS=([0-9]+)").unwrap();
+    let (i_val, active_val, flags_val) = stdout
+        .lines()
+        .find_map(|line| {
+            let caps = re_triplet.captures(line)?;
+            let i = caps.get(1)?.as_str().parse::<u64>().ok()?;
+            let active = caps.get(2)?.as_str().parse::<u64>().ok()?;
+            let flags = caps.get(3)?.as_str().parse::<u64>().ok()?;
+            Some((i, active, flags))
+        })
+        .ok_or_else(|| anyhow::anyhow!("Missing I/ACTIVE/FLAGS triplet. STDOUT: {stdout}"))?;
 
     assert!(
         active_val <= 1,
