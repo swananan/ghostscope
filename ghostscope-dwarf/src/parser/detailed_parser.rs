@@ -78,7 +78,7 @@ impl DetailedParser {
             let tag = entry.tag();
             // Utility to read attr string name
             let mut entry_name: Option<String> = None;
-            if let Ok(Some(a)) = entry.attr(DW_AT_NAME) {
+            if let Some(a) = entry.attr(DW_AT_NAME) {
                 if let Ok(s) = dwarf.attr_string(unit, a.value()) {
                     if let Ok(s_str) = s.to_string_lossy() {
                         entry_name = Some(s_str.into_owned());
@@ -90,8 +90,7 @@ impl DetailedParser {
                     if alias_name.is_none() {
                         alias_name = entry_name.clone();
                     }
-                    if let Ok(Some(gimli::AttributeValue::UnitRef(off))) =
-                        entry.attr_value(DW_AT_TYPE)
+                    if let Some(gimli::AttributeValue::UnitRef(off)) = entry.attr_value(DW_AT_TYPE)
                     {
                         type_offset = off;
                         continue;
@@ -106,8 +105,7 @@ impl DetailedParser {
                     });
                 }
                 DW_TAG_CONST_TYPE | DW_TAG_VOLATILE_TYPE | DW_TAG_RESTRICT_TYPE => {
-                    if let Ok(Some(gimli::AttributeValue::UnitRef(off))) =
-                        entry.attr_value(DW_AT_TYPE)
+                    if let Some(gimli::AttributeValue::UnitRef(off)) = entry.attr_value(DW_AT_TYPE)
                     {
                         type_offset = off;
                         continue;
@@ -125,14 +123,14 @@ impl DetailedParser {
                     let mut target: TypeInfo = TypeInfo::UnknownType {
                         name: "void".to_string(),
                     };
-                    if let Ok(Some(a)) = entry.attr(DW_AT_BYTE_SIZE) {
+                    if let Some(a) = entry.attr(DW_AT_BYTE_SIZE) {
                         if let gimli::AttributeValue::Udata(sz) = a.value() {
                             byte_size = sz;
                         }
                     }
                     // Very shallow pointee name resolution: unwrap typedef/qualifiers only, without recursion
                     let mut pointee_name: Option<String> = None;
-                    if let Ok(Some(gimli::AttributeValue::UnitRef(mut toff))) =
+                    if let Some(gimli::AttributeValue::UnitRef(mut toff)) =
                         entry.attr_value(DW_AT_TYPE)
                     {
                         // Unwrap up to a small bound to avoid deep recursion/stack blowups on real-world code
@@ -143,7 +141,7 @@ impl DetailedParser {
                                     | DW_TAG_RESTRICT_TYPE => {
                                         // Capture typedef name as a fallback pointee name
                                         if tentry.tag() == DW_TAG_TYPEDEF {
-                                            if let Ok(Some(na)) = tentry.attr(DW_AT_NAME) {
+                                            if let Some(na) = tentry.attr(DW_AT_NAME) {
                                                 if let Ok(s) = dwarf.attr_string(unit, na.value()) {
                                                     if pointee_name.is_none() {
                                                         if let Ok(s_str) = s.to_string_lossy() {
@@ -153,7 +151,7 @@ impl DetailedParser {
                                                 }
                                             }
                                         }
-                                        if let Ok(Some(gimli::AttributeValue::UnitRef(next))) =
+                                        if let Some(gimli::AttributeValue::UnitRef(next)) =
                                             tentry.attr_value(DW_AT_TYPE)
                                         {
                                             toff = next;
@@ -165,18 +163,18 @@ impl DetailedParser {
                                         // Construct BaseType with size+encoding
                                         let mut byte_size = 0u64;
                                         let mut encoding = gimli::constants::DW_ATE_unsigned;
-                                        if let Ok(Some(a)) = tentry.attr(DW_AT_BYTE_SIZE) {
+                                        if let Some(a) = tentry.attr(DW_AT_BYTE_SIZE) {
                                             if let gimli::AttributeValue::Udata(sz) = a.value() {
                                                 byte_size = sz;
                                             }
                                         }
-                                        if let Ok(Some(a)) = tentry.attr(DW_AT_ENCODING) {
+                                        if let Some(a) = tentry.attr(DW_AT_ENCODING) {
                                             if let gimli::AttributeValue::Encoding(enc) = a.value()
                                             {
                                                 encoding = enc;
                                             }
                                         }
-                                        let name = if let Ok(Some(na)) = tentry.attr(DW_AT_NAME) {
+                                        let name = if let Some(na) = tentry.attr(DW_AT_NAME) {
                                             if let Ok(s) = dwarf.attr_string(unit, na.value()) {
                                                 s.to_string_lossy()
                                                     .ok()
@@ -201,7 +199,7 @@ impl DetailedParser {
                                     | DW_TAG_ENUMERATION_TYPE => {
                                         // Do NOT recursively resolve aggregates here to avoid cycles on self-referential types.
                                         // Only record the name; deref-time upgrade will use analyzer's shallow index safely.
-                                        if let Ok(Some(na)) = tentry.attr(DW_AT_NAME) {
+                                        if let Some(na) = tentry.attr(DW_AT_NAME) {
                                             if let Ok(s) = dwarf.attr_string(unit, na.value()) {
                                                 if let Ok(s_str) = s.to_string_lossy() {
                                                     let n = s_str.into_owned();
@@ -240,8 +238,7 @@ impl DetailedParser {
                     let name = entry_name.unwrap_or_else(|| "<base>".to_string());
                     let mut byte_size = 0u64;
                     let mut encoding = gimli::constants::DW_ATE_unsigned;
-                    let mut attrs = entry.attrs();
-                    while let Ok(Some(a)) = attrs.next() {
+                    for a in entry.attrs() {
                         match a.name() {
                             DW_AT_BYTE_SIZE => {
                                 if let gimli::AttributeValue::Udata(sz) = a.value() {
@@ -267,7 +264,7 @@ impl DetailedParser {
                         entry_name.unwrap_or_else(|| "<anon_struct>".to_string())
                     });
                     let mut byte_size = 0u64;
-                    if let Ok(Some(a)) = entry.attr(DW_AT_BYTE_SIZE) {
+                    if let Some(a) = entry.attr(DW_AT_BYTE_SIZE) {
                         if let gimli::AttributeValue::Udata(sz) = a.value() {
                             byte_size = sz;
                         }
@@ -282,7 +279,7 @@ impl DetailedParser {
                                 if ce.tag() == gimli::DW_TAG_member {
                                     // member name
                                     let mut m_name = String::new();
-                                    if let Ok(Some(na)) = ce.attr(DW_AT_NAME) {
+                                    if let Some(na) = ce.attr(DW_AT_NAME) {
                                         if let Ok(s) = dwarf.attr_string(unit, na.value()) {
                                             if let Ok(s_str) = s.to_string_lossy() {
                                                 m_name = s_str.into_owned();
@@ -293,7 +290,7 @@ impl DetailedParser {
                                     let mut m_type = TypeInfo::UnknownType {
                                         name: "unknown".to_string(),
                                     };
-                                    if let Ok(Some(gimli::AttributeValue::UnitRef(toff))) =
+                                    if let Some(gimli::AttributeValue::UnitRef(toff)) =
                                         ce.attr_value(DW_AT_TYPE)
                                     {
                                         if let Some(ti) =
@@ -304,8 +301,7 @@ impl DetailedParser {
                                     }
                                     // member offset (simple evaluation)
                                     let mut m_offset: u64 = 0;
-                                    if let Ok(Some(ml)) = ce.attr(gimli::DW_AT_data_member_location)
-                                    {
+                                    if let Some(ml) = ce.attr(gimli::DW_AT_data_member_location) {
                                         match ml.value() {
                                             gimli::AttributeValue::Udata(v) => m_offset = v,
                                             gimli::AttributeValue::Exprloc(expr) => {
@@ -322,18 +318,18 @@ impl DetailedParser {
                                     // bit offsets/sizes (optional)
                                     let mut bit_offset: Option<u8> = None;
                                     let mut bit_size: Option<u8> = None;
-                                    if let Ok(Some(bo)) = ce.attr(gimli::DW_AT_bit_offset) {
+                                    if let Some(bo) = ce.attr(gimli::DW_AT_bit_offset) {
                                         if let gimli::AttributeValue::Udata(v) = bo.value() {
                                             bit_offset = u8::try_from(v).ok();
                                         }
                                     }
-                                    if let Ok(Some(bs)) = ce.attr(gimli::DW_AT_data_bit_offset) {
+                                    if let Some(bs) = ce.attr(gimli::DW_AT_data_bit_offset) {
                                         if let gimli::AttributeValue::Udata(v) = bs.value() {
                                             bit_offset = u8::try_from(v % 8).ok();
                                             m_offset = v / 8;
                                         }
                                     }
-                                    if let Ok(Some(bsz)) = ce.attr(gimli::DW_AT_bit_size) {
+                                    if let Some(bsz) = ce.attr(gimli::DW_AT_bit_size) {
                                         if let gimli::AttributeValue::Udata(v) = bsz.value() {
                                             bit_size = u8::try_from(v).ok();
                                         }
@@ -414,7 +410,7 @@ impl DetailedParser {
                         entry_name.unwrap_or_else(|| "<anon_union>".to_string())
                     });
                     let mut byte_size = 0u64;
-                    if let Ok(Some(a)) = entry.attr(DW_AT_BYTE_SIZE) {
+                    if let Some(a) = entry.attr(DW_AT_BYTE_SIZE) {
                         if let gimli::AttributeValue::Udata(sz) = a.value() {
                             byte_size = sz;
                         }
@@ -427,7 +423,7 @@ impl DetailedParser {
                                 let ce = child.entry();
                                 if ce.tag() == gimli::DW_TAG_member {
                                     let mut m_name = String::new();
-                                    if let Ok(Some(na)) = ce.attr(gimli::DW_AT_name) {
+                                    if let Some(na) = ce.attr(gimli::DW_AT_name) {
                                         if let Ok(s) = dwarf.attr_string(unit, na.value()) {
                                             if let Ok(s_str) = s.to_string_lossy() {
                                                 m_name = s_str.into_owned();
@@ -437,7 +433,7 @@ impl DetailedParser {
                                     let mut m_type = TypeInfo::UnknownType {
                                         name: "unknown".to_string(),
                                     };
-                                    if let Ok(Some(gimli::AttributeValue::UnitRef(toff))) =
+                                    if let Some(gimli::AttributeValue::UnitRef(toff)) =
                                         ce.attr_value(DW_AT_TYPE)
                                     {
                                         if let Some(ti) =
@@ -472,7 +468,7 @@ impl DetailedParser {
                         .unwrap_or_else(|| entry_name.unwrap_or_else(|| "<anon_enum>".to_string()));
                     // Parse base type and size
                     let mut byte_size = 0u64;
-                    if let Ok(Some(a)) = entry.attr(DW_AT_BYTE_SIZE) {
+                    if let Some(a) = entry.attr(DW_AT_BYTE_SIZE) {
                         if let gimli::AttributeValue::Udata(sz) = a.value() {
                             byte_size = sz;
                         }
@@ -484,8 +480,7 @@ impl DetailedParser {
                         encoding: gimli::constants::DW_ATE_signed.0 as u16,
                     };
                     // If DW_AT_type refers to a base type, resolve it shallowly
-                    if let Ok(Some(gimli::AttributeValue::UnitRef(toff))) =
-                        entry.attr_value(DW_AT_TYPE)
+                    if let Some(gimli::AttributeValue::UnitRef(toff)) = entry.attr_value(DW_AT_TYPE)
                     {
                         if let Some(ti) = Self::resolve_type_shallow_at_offset(dwarf, unit, toff) {
                             // Accept only base/qualified/typedef chain base type as enum underlying type
@@ -506,7 +501,7 @@ impl DetailedParser {
                                 let ce = child.entry();
                                 if ce.tag() == gimli::DW_TAG_enumerator {
                                     let mut v_name = String::new();
-                                    if let Ok(Some(na)) = ce.attr(gimli::DW_AT_name) {
+                                    if let Some(na) = ce.attr(gimli::DW_AT_name) {
                                         if let Ok(s) = dwarf.attr_string(unit, na.value()) {
                                             if let Ok(s_str) = s.to_string_lossy() {
                                                 v_name = s_str.into_owned();
@@ -514,7 +509,7 @@ impl DetailedParser {
                                         }
                                     }
                                     let mut v_val: i64 = 0;
-                                    if let Ok(Some(cv)) = ce.attr(gimli::DW_AT_const_value) {
+                                    if let Some(cv) = ce.attr(gimli::DW_AT_const_value) {
                                         let signed = match &base_type {
                                             TypeInfo::BaseType { encoding, .. } => {
                                                 *encoding
@@ -591,8 +586,7 @@ impl DetailedParser {
                 DW_TAG_ARRAY_TYPE => {
                     // element_type shallow + total_size if available + subrange element_count (one step deeper)
                     let mut elem_type: Option<TypeInfo> = None;
-                    if let Ok(Some(gimli::AttributeValue::UnitRef(eoff))) =
-                        entry.attr_value(DW_AT_TYPE)
+                    if let Some(gimli::AttributeValue::UnitRef(eoff)) = entry.attr_value(DW_AT_TYPE)
                     {
                         elem_type = Self::resolve_type_shallow_at_offset(dwarf, unit, eoff);
                     }
@@ -600,7 +594,7 @@ impl DetailedParser {
                         name: "<elem>".to_string(),
                     }));
                     let mut total_size: Option<u64> = None;
-                    if let Ok(Some(a)) = entry.attr(DW_AT_BYTE_SIZE) {
+                    if let Some(a) = entry.attr(DW_AT_BYTE_SIZE) {
                         if let gimli::AttributeValue::Udata(sz) = a.value() {
                             total_size = Some(sz);
                         }
@@ -614,7 +608,7 @@ impl DetailedParser {
                                 let ce = child.entry();
                                 if ce.tag() == gimli::DW_TAG_subrange_type {
                                     // Prefer DW_AT_count; fallback to upper_bound (+1)
-                                    if let Ok(Some(cv)) = ce.attr(gimli::DW_AT_count) {
+                                    if let Some(cv) = ce.attr(gimli::DW_AT_count) {
                                         match cv.value() {
                                             gimli::AttributeValue::Udata(u) => {
                                                 element_count = Some(u);
@@ -640,7 +634,7 @@ impl DetailedParser {
                                         }
                                     }
                                     if element_count.is_none() {
-                                        if let Ok(Some(ub)) = ce.attr(gimli::DW_AT_upper_bound) {
+                                        if let Some(ub) = ce.attr(gimli::DW_AT_upper_bound) {
                                             let ub_v: Option<i64> = match ub.value() {
                                                 gimli::AttributeValue::Udata(u) => Some(u as i64),
                                                 gimli::AttributeValue::Sdata(s) => Some(s),
@@ -858,7 +852,7 @@ impl DetailedParser {
         attr: gimli::DwAt,
         visited: &mut HashSet<gimli::UnitOffset>,
     ) -> Result<Option<gimli::AttributeValue<EndianArcSlice<LittleEndian>>>> {
-        if let Some(value) = entry.attr_value(attr)? {
+        if let Some(value) = entry.attr_value(attr) {
             return Ok(Some(value));
         }
 
@@ -866,7 +860,7 @@ impl DetailedParser {
             gimli::constants::DW_AT_abstract_origin,
             gimli::constants::DW_AT_specification,
         ] {
-            if let Some(gimli::AttributeValue::UnitRef(offset)) = entry.attr_value(origin_attr)? {
+            if let Some(gimli::AttributeValue::UnitRef(offset)) = entry.attr_value(origin_attr) {
                 if visited.insert(offset) {
                     let origin_entry = unit.entry(offset)?;
                     if let Some(value) =

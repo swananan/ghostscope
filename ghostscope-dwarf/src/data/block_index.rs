@@ -201,11 +201,11 @@ impl<'a> BlockIndexBuilder<'a> {
 
     /// Build functions for a single CU offset
     pub fn build_for_unit(&self, cu_offset: gimli::DebugInfoOffset) -> Option<Vec<FunctionBlocks>> {
-        let header = self.dwarf.debug_info.header_from_offset(cu_offset).ok()?;
+        let header = self.dwarf.unit_header(cu_offset).ok()?;
         let unit = self.dwarf.unit(header).ok()?;
         let mut entries = unit.entries();
         let mut out: Vec<FunctionBlocks> = Vec::new();
-        while let Ok(Some((_depth, entry))) = entries.next_dfs() {
+        while let Ok(Some(entry)) = entries.next_dfs() {
             if entry.tag() == gimli::constants::DW_TAG_subprogram {
                 let mut fb = FunctionBlocks::new(cu_offset, entry.offset());
                 if let Ok(ranges) = RangeExtractor::extract_all_ranges(entry, &unit, self.dwarf) {
@@ -232,7 +232,7 @@ impl<'a> BlockIndexBuilder<'a> {
         cu_offset: gimli::DebugInfoOffset,
         die_offset: gimli::UnitOffset,
     ) -> Option<FunctionBlocks> {
-        let header = self.dwarf.debug_info.header_from_offset(cu_offset).ok()?;
+        let header = self.dwarf.unit_header(cu_offset).ok()?;
         let unit = self.dwarf.unit(header).ok()?;
         let entry = unit.entry(die_offset).ok()?;
         if entry.tag() != gimli::constants::DW_TAG_subprogram {
@@ -282,8 +282,8 @@ impl<'a> BlockIndexBuilder<'a> {
                 gimli::constants::DW_TAG_formal_parameter | gimli::constants::DW_TAG_variable => {
                     // Only record DIE offsets; evaluation happens on demand
                     let v = VarRef {
-                        cu_offset: match unit.header.offset() {
-                            gimli::UnitSectionOffset::DebugInfoOffset(off) => off,
+                        cu_offset: match unit.header.debug_info_offset() {
+                            Some(off) => off,
                             _ => continue,
                         },
                         die_offset: e.offset(),
@@ -296,7 +296,7 @@ impl<'a> BlockIndexBuilder<'a> {
                     if let Ok(ranges) = RangeExtractor::extract_all_ranges(e, unit, self.dwarf) {
                         bn.ranges = ranges;
                     }
-                    if let Ok(Some(a)) = e.attr(gimli::constants::DW_AT_entry_pc) {
+                    if let Some(a) = e.attr(gimli::constants::DW_AT_entry_pc) {
                         if let gimli::AttributeValue::Addr(addr) = a.value() {
                             bn.entry_pc = Some(addr);
                         }
@@ -315,11 +315,11 @@ impl<'a> BlockIndexBuilder<'a> {
                         if let Ok(mut it) = unit.entries_at_offset(e.offset()) {
                             // skip self
                             let _ = it.next_entry();
-                            while let Ok(Some((depth, ce))) = it.next_dfs() {
-                                if depth == 0 {
+                            while let Ok(Some(ce)) = it.next_dfs() {
+                                if ce.depth() <= 0 {
                                     break;
                                 }
-                                if depth > 1 {
+                                if ce.depth() > 1 {
                                     continue;
                                 }
                                 if ce.tag() == gimli::constants::DW_TAG_formal_parameter {
@@ -329,25 +329,25 @@ impl<'a> BlockIndexBuilder<'a> {
                             }
                         }
                         if !has_inline_params {
-                            if let Ok(Some(attr)) = e.attr(gimli::constants::DW_AT_abstract_origin)
-                            {
+                            if let Some(attr) = e.attr(gimli::constants::DW_AT_abstract_origin) {
                                 if let gimli::AttributeValue::UnitRef(origin_off) = attr.value() {
                                     if let Ok(mut iter) = unit.entries_at_offset(origin_off) {
                                         // Skip the origin DIE itself
                                         let _ = iter.next_entry();
-                                        while let Ok(Some((depth, ce))) = iter.next_dfs() {
+                                        while let Ok(Some(ce)) = iter.next_dfs() {
                                             // Only consider direct children of the origin DIE
-                                            if depth == 0 {
+                                            if ce.depth() <= 0 {
                                                 break;
                                             }
-                                            if depth > 1 {
+                                            if ce.depth() > 1 {
                                                 continue;
                                             }
                                             if ce.tag() == gimli::constants::DW_TAG_formal_parameter
                                             {
                                                 let v = VarRef {
-                                                    cu_offset: match unit.header.offset() {
-                                                        gimli::UnitSectionOffset::DebugInfoOffset(off) => off,
+                                                    cu_offset: match unit.header.debug_info_offset()
+                                                    {
+                                                        Some(off) => off,
                                                         _ => continue,
                                                     },
                                                     die_offset: ce.offset(),

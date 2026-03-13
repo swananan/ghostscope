@@ -17,14 +17,14 @@ pub struct AccessPlanner<'dwarf> {
 /// Location of a type within the DWARF (CU + DIE offset)
 #[derive(Debug, Clone, Copy)]
 pub struct TypeLoc {
-    pub cu_off: gimli::UnitSectionOffset,
+    pub cu_off: gimli::DebugInfoOffset,
     pub die_off: gimli::UnitOffset,
 }
 
 /// Parent struct/class context for the final matched member.
 #[derive(Debug, Clone)]
 pub struct MemberParentCtx {
-    pub parent_cu_off: gimli::UnitSectionOffset,
+    pub parent_cu_off: gimli::DebugInfoOffset,
     pub parent_die_off: gimli::UnitOffset,
     pub member_name: String,
 }
@@ -64,14 +64,14 @@ impl<'dwarf> AccessPlanner<'dwarf> {
             visited: &mut std::collections::HashSet<gimli::UnitOffset>,
         ) -> crate::core::Result<Option<gimli::AttributeValue<EndianArcSlice<LittleEndian>>>>
         {
-            if let Some(value) = entry.attr_value(attr)? {
+            if let Some(value) = entry.attr_value(attr) {
                 return Ok(Some(value));
             }
             for origin_attr in [
                 gimli::constants::DW_AT_abstract_origin,
                 gimli::constants::DW_AT_specification,
             ] {
-                if let Some(gimli::AttributeValue::UnitRef(off)) = entry.attr_value(origin_attr)? {
+                if let Some(gimli::AttributeValue::UnitRef(off)) = entry.attr_value(origin_attr) {
                     if visited.insert(off) {
                         let origin = unit.entry(off)?;
                         if let Some(v) = resolve_attr_with_origins(&origin, unit, attr, visited)? {
@@ -131,10 +131,10 @@ impl<'dwarf> AccessPlanner<'dwarf> {
         &self,
         unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
         die: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
-    ) -> crate::core::Result<(Option<gimli::UnitSectionOffset>, gimli::UnitOffset)> {
+    ) -> crate::core::Result<(Option<gimli::DebugInfoOffset>, gimli::UnitOffset)> {
         // Check declaration flag or childless struct
         let mut is_decl = false;
-        if let Some(attr) = die.attr(gimli::DW_AT_declaration)? {
+        if let Some(attr) = die.attr(gimli::DW_AT_declaration) {
             if let gimli::AttributeValue::Flag(f) = attr.value() {
                 is_decl = f;
             }
@@ -145,7 +145,7 @@ impl<'dwarf> AccessPlanner<'dwarf> {
             (entries.next_dfs()?).is_some()
         };
 
-        let name_opt = if let Some(attr) = die.attr(gimli::DW_AT_name)? {
+        let name_opt = if let Some(attr) = die.attr(gimli::DW_AT_name) {
             self.dwarf
                 .attr_string(unit, attr.value())
                 .ok()
@@ -159,7 +159,7 @@ impl<'dwarf> AccessPlanner<'dwarf> {
             let tag = die.tag();
             if let Some(tix) = &self.type_index {
                 if let Some(loc) = tix.find_aggregate_definition(&name, tag) {
-                    return Ok((Some(loc.cu_offset.into()), loc.die_offset));
+                    return Ok((Some(loc.cu_offset), loc.die_offset));
                 }
                 if self.strict_index {
                     return Err(anyhow::anyhow!(
@@ -199,26 +199,10 @@ impl<'dwarf> AccessPlanner<'dwarf> {
         }
     }
 
-    /// Helper: get UnitHeader from a UnitSectionOffset
-    fn header_from_cu_off(
-        &self,
-        cu_off: gimli::UnitSectionOffset,
-    ) -> crate::core::Result<gimli::UnitHeader<EndianArcSlice<LittleEndian>>> {
-        Ok(match cu_off {
-            gimli::UnitSectionOffset::DebugInfoOffset(off) => {
-                self.dwarf.debug_info.header_from_offset(off)?
-            }
-            gimli::UnitSectionOffset::DebugTypesOffset(_off) => {
-                // Currently we do not support .debug_types units in planner
-                return Err(anyhow::anyhow!("planner: .debug_types units not supported"));
-            }
-        })
-    }
-
     /// Start planning from a known variable (skip variable search)
     pub fn plan_chain_from_known(
         &self,
-        mut current_cu_off: gimli::UnitSectionOffset,
+        mut current_cu_off: gimli::DebugInfoOffset,
         mut type_die_off: gimli::UnitOffset,
         mut current_eval: EvaluationResult,
         chain: &[String],
@@ -228,7 +212,7 @@ impl<'dwarf> AccessPlanner<'dwarf> {
         while idx < chain.len() {
             let field = &chain[idx];
             // Reacquire current unit on each step
-            let header_now = self.header_from_cu_off(current_cu_off)?;
+            let header_now = self.dwarf.unit_header(current_cu_off)?;
             let unit_now = self.dwarf.unit(header_now)?;
 
             // Strip typedef/qualified
@@ -261,7 +245,7 @@ impl<'dwarf> AccessPlanner<'dwarf> {
                         current_cu_off = cu_off;
                     }
                     // Reacquire possibly switched unit and read the definition DIE
-                    let header_now2 = self.header_from_cu_off(current_cu_off)?;
+                    let header_now2 = self.dwarf.unit_header(current_cu_off)?;
                     let unit_now2 = self.dwarf.unit(header_now2)?;
                     let def_die = unit_now2.entry(def_off)?;
                     // Scan members for the field
@@ -269,16 +253,16 @@ impl<'dwarf> AccessPlanner<'dwarf> {
                     let _ = entries.next_entry()?; // self
                     let mut next_type: Option<gimli::UnitOffset> = None;
                     let mut found_member = false;
-                    while let Some((_, e)) = entries.next_dfs()? {
+                    while let Some(e) = entries.next_dfs()? {
                         if e.tag() == gimli::DW_TAG_member {
-                            if let Some(attr) = e.attr(gimli::DW_AT_name)? {
+                            if let Some(attr) = e.attr(gimli::DW_AT_name) {
                                 if let Ok(s) = self.dwarf.attr_string(&unit_now2, attr.value()) {
                                     if let Ok(s_str) = s.to_string_lossy() {
                                         if s_str == field.as_str() {
                                             // offset
                                             let mut off: Option<u64> = None;
                                             if let Some(a) =
-                                                e.attr(gimli::DW_AT_data_member_location)?
+                                                e.attr(gimli::DW_AT_data_member_location)
                                             {
                                                 match a.value() {
                                                     gimli::AttributeValue::Udata(v) => {
@@ -292,7 +276,7 @@ impl<'dwarf> AccessPlanner<'dwarf> {
                                             }
                                             if off.is_none() {
                                                 if let Some(a) =
-                                                    e.attr(gimli::DW_AT_data_bit_offset)?
+                                                    e.attr(gimli::DW_AT_data_bit_offset)
                                                 {
                                                     if let gimli::AttributeValue::Udata(v) =
                                                         a.value()
@@ -351,7 +335,7 @@ impl<'dwarf> AccessPlanner<'dwarf> {
                                                 };
                                             }
                                             // type
-                                            if let Some(a) = e.attr(gimli::DW_AT_type)? {
+                                            if let Some(a) = e.attr(gimli::DW_AT_type) {
                                                 if let gimli::AttributeValue::UnitRef(u) = a.value()
                                                 {
                                                     next_type = Some(u);
@@ -378,7 +362,7 @@ impl<'dwarf> AccessPlanner<'dwarf> {
                         // Field not found on this aggregate — report an error instead of
                         // silently returning the base aggregate.
                         // Try to get a friendly type name for diagnostics
-                        let type_name = if let Some(attr) = def_die.attr(gimli::DW_AT_name)? {
+                        let type_name = if let Some(attr) = def_die.attr(gimli::DW_AT_name) {
                             if let Ok(s) = self.dwarf.attr_string(&unit_now2, attr.value()) {
                                 s.to_string_lossy().ok().unwrap_or_default().into_owned()
                             } else {

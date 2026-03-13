@@ -47,8 +47,7 @@ impl RangeExtractor {
         let mut high_pc = None;
         let mut high_pc_offset = None;
 
-        let mut attrs = entry.attrs();
-        while let Some(attr) = attrs.next()? {
+        for attr in entry.attrs() {
             match attr.name() {
                 gimli::constants::DW_AT_low_pc => {
                     if let gimli::AttributeValue::Addr(addr) = attr.value() {
@@ -82,7 +81,7 @@ impl RangeExtractor {
         dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
     ) -> Result<Option<Vec<(u64, u64)>>> {
         // Check for DW_AT_ranges attribute
-        let ranges_attr = match entry.attr(gimli::constants::DW_AT_ranges)? {
+        let ranges_attr = match entry.attr(gimli::constants::DW_AT_ranges) {
             Some(attr) => attr,
             None => return Ok(None),
         };

@@ -66,7 +66,7 @@ impl OnDemandResolver {
             chain.base,
             chain.fields.len()
         );
-        let header = self.dwarf.debug_info.header_from_offset(cu_offset)?;
+        let header = self.dwarf.unit_header(cu_offset)?;
         let unit = self.dwarf.unit(header)?;
         let var_entry = unit.entry(var_die)?;
 
@@ -110,7 +110,7 @@ impl OnDemandResolver {
 
             let t2 = std::time::Instant::now();
             let (fe, ftl, pctx) = planner.plan_chain_from_known(
-                cu_offset.into(),
+                cu_offset,
                 type_die_off,
                 current_eval,
                 chain.fields,
@@ -129,18 +129,13 @@ impl OnDemandResolver {
         if let Some(ftl) = final_type_loc {
             let t3 = std::time::Instant::now();
             // Base: shallow resolve the resulting DIE's type
-            let mut shallow_final = match ftl.cu_off {
-                gimli::UnitSectionOffset::DebugInfoOffset(off) => {
-                    let h = self.dwarf.debug_info.header_from_offset(off)?;
-                    let u = self.dwarf.unit(h)?;
-                    crate::parser::DetailedParser::resolve_type_shallow_at_offset(
-                        &self.dwarf,
-                        &u,
-                        ftl.die_off,
-                    )
-                }
-                gimli::UnitSectionOffset::DebugTypesOffset(_off) => None,
-            };
+            let h = self.dwarf.unit_header(ftl.cu_off)?;
+            let u = self.dwarf.unit(h)?;
+            let mut shallow_final = crate::parser::DetailedParser::resolve_type_shallow_at_offset(
+                &self.dwarf,
+                &u,
+                ftl.die_off,
+            );
             tracing::info!(
                 "DWARF:plan_from_var final_type_ms={}",
                 t3.elapsed().as_millis()
@@ -149,25 +144,23 @@ impl OnDemandResolver {
             // Minimal parent enrichment: if planner provided parent member context,
             // use parent's shallow members to capture bitfield wrapper and accurate member type.
             if let Some(ctx) = parent_ctx {
-                if let gimli::UnitSectionOffset::DebugInfoOffset(pcu) = ctx.parent_cu_off {
-                    let h = self.dwarf.debug_info.header_from_offset(pcu)?;
-                    let u = self.dwarf.unit(h)?;
-                    if let Some(
-                        crate::TypeInfo::StructType { members, .. }
-                        | crate::TypeInfo::UnionType { members, .. },
-                    ) = crate::parser::DetailedParser::resolve_type_shallow_at_offset(
-                        &self.dwarf,
-                        &u,
-                        ctx.parent_die_off,
-                    ) {
-                        if let Some(m) = members.iter().find(|m| m.name == ctx.member_name) {
-                            tracing::info!(
-                                "DWARF:parent_enrich member='{}' uses BitfieldType={}",
-                                ctx.member_name,
-                                matches!(m.member_type, crate::TypeInfo::BitfieldType { .. })
-                            );
-                            shallow_final = Some(m.member_type.clone());
-                        }
+                let h = self.dwarf.unit_header(ctx.parent_cu_off)?;
+                let u = self.dwarf.unit(h)?;
+                if let Some(
+                    crate::TypeInfo::StructType { members, .. }
+                    | crate::TypeInfo::UnionType { members, .. },
+                ) = crate::parser::DetailedParser::resolve_type_shallow_at_offset(
+                    &self.dwarf,
+                    &u,
+                    ctx.parent_die_off,
+                ) {
+                    if let Some(m) = members.iter().find(|m| m.name == ctx.member_name) {
+                        tracing::info!(
+                            "DWARF:parent_enrich member='{}' uses BitfieldType={}",
+                            ctx.member_name,
+                            matches!(m.member_type, crate::TypeInfo::BitfieldType { .. })
+                        );
+                        shallow_final = Some(m.member_type.clone());
                     }
                 }
             }
@@ -209,7 +202,7 @@ impl OnDemandResolver {
     ) -> Result<Vec<VariableWithEvaluation>> {
         let mut vars = Vec::with_capacity(items.len());
         for (cu_off, die_off) in items.iter().cloned() {
-            let header = self.dwarf.debug_info.header_from_offset(cu_off)?;
+            let header = self.dwarf.unit_header(cu_off)?;
             let unit = self.dwarf.unit(header)?;
             let entry = unit.entry(die_off)?;
             if let Some(v) = self.detailed_parser.parse_variable_entry_with_mode(

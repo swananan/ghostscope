@@ -94,7 +94,7 @@ impl ModuleData {
         get_cfa: &dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>,
     ) {
         let dwarf = self.resolver.dwarf_ref();
-        let header = match dwarf.debug_info.header_from_offset(func.cu_offset) {
+        let header = match dwarf.unit_header(func.cu_offset) {
             Ok(h) => h,
             Err(_) => return,
         };
@@ -112,7 +112,7 @@ impl ModuleData {
         }
         // Get abstract origin to determine parameter order and names
         let origin_off = match inline_die.attr_value(gimli::constants::DW_AT_abstract_origin) {
-            Ok(Some(gimli::AttributeValue::UnitRef(o))) => o,
+            Some(gimli::AttributeValue::UnitRef(o)) => o,
             _ => return,
         };
 
@@ -120,15 +120,15 @@ impl ModuleData {
         let mut origin_param_names: Vec<String> = Vec::new();
         if let Ok(mut it) = unit.entries_at_offset(origin_off) {
             let _ = it.next_entry();
-            while let Ok(Some((depth, e))) = it.next_dfs() {
-                if depth == 0 {
+            while let Ok(Some(e)) = it.next_dfs() {
+                if e.depth() <= 0 {
                     break;
                 }
-                if depth > 1 {
+                if e.depth() > 1 {
                     continue;
                 }
                 if e.tag() == gimli::constants::DW_TAG_formal_parameter {
-                    if let Ok(Some(a)) = e.attr(gimli::constants::DW_AT_name) {
+                    if let Some(a) = e.attr(gimli::constants::DW_AT_name) {
                         if let Ok(s) = dwarf.attr_string(&unit, a.value()) {
                             if let Ok(ss) = s.to_string_lossy() {
                                 origin_param_names.push(ss.into_owned());
@@ -147,11 +147,11 @@ impl ModuleData {
             vec![None; origin_param_names.len()];
         if let Ok(mut it) = unit.entries_at_offset(node.die_offset.unwrap()) {
             let _ = it.next_entry();
-            while let Ok(Some((depth, e))) = it.next_dfs() {
-                if depth == 0 {
+            while let Ok(Some(e)) = it.next_dfs() {
+                if e.depth() <= 0 {
                     break;
                 }
-                if depth > 1 {
+                if e.depth() > 1 {
                     continue;
                 }
                 if e.tag() == gimli::constants::DW_TAG_call_site
@@ -160,21 +160,18 @@ impl ModuleData {
                     // Iterate its children for parameters
                     if let Ok(mut pit) = unit.entries_at_offset(e.offset()) {
                         let _ = pit.next_entry();
-                        while let Ok(Some((pdepth, pe))) = pit.next_dfs() {
-                            if pdepth == 0 {
+                        while let Ok(Some(pe)) = pit.next_dfs() {
+                            if pe.depth() <= 0 {
                                 break;
                             }
-                            if pdepth > 1 {
+                            if pe.depth() > 1 {
                                 continue;
                             }
                             if pe.tag() == gimli::constants::DW_TAG_call_site_parameter
                                 || pe.tag() == gimli::constants::DW_TAG_GNU_call_site_parameter
                             {
                                 // Prefer DW_AT_location (exprloc); fallback to DW_AT_const_value
-                                let loc_attr = pe
-                                    .attr_value(gimli::constants::DW_AT_location)
-                                    .ok()
-                                    .flatten();
+                                let loc_attr = pe.attr_value(gimli::constants::DW_AT_location);
                                 if let Some(gimli::AttributeValue::Exprloc(expr)) = loc_attr {
                                     if let Ok(ev) = ExpressionEvaluator::parse_expression(
                                         expr.0.to_slice().ok().as_deref().unwrap_or(&[]),
@@ -188,7 +185,7 @@ impl ModuleData {
                                             *slot = Some(ev);
                                         }
                                     }
-                                } else if let Ok(Some(cv)) =
+                                } else if let Some(cv) =
                                     pe.attr_value(gimli::constants::DW_AT_const_value)
                                 {
                                     use crate::core::DirectValueResult as DV;
@@ -292,10 +289,10 @@ impl ModuleData {
         // 2) Try typedef by name, then peel one layer to underlying type and shallow resolve
         if let Some(td) = self.type_name_index.find_typedef(name) {
             let dwarf = self.resolver.dwarf_ref();
-            if let Ok(header) = dwarf.debug_info.header_from_offset(td.cu_offset) {
+            if let Ok(header) = dwarf.unit_header(td.cu_offset) {
                 if let Ok(unit) = dwarf.unit(header) {
                     if let Ok(entry) = unit.entry(td.die_offset) {
-                        if let Ok(Some(gimli::AttributeValue::UnitRef(under))) =
+                        if let Some(gimli::AttributeValue::UnitRef(under)) =
                             entry.attr_value(gimli::DW_AT_type)
                         {
                             return self.detailed_shallow_type(td.cu_offset, under);
@@ -328,10 +325,10 @@ impl ModuleData {
 
         if let Some(td) = self.type_name_index.find_typedef(name) {
             let dwarf = self.resolver.dwarf_ref();
-            if let Ok(header) = dwarf.debug_info.header_from_offset(td.cu_offset) {
+            if let Ok(header) = dwarf.unit_header(td.cu_offset) {
                 if let Ok(unit) = dwarf.unit(header) {
                     if let Ok(entry) = unit.entry(td.die_offset) {
-                        if let Ok(Some(gimli::AttributeValue::UnitRef(under))) =
+                        if let Some(gimli::AttributeValue::UnitRef(under)) =
                             entry.attr_value(gimli::DW_AT_type)
                         {
                             return self.detailed_shallow_type(td.cu_offset, under);
@@ -363,10 +360,10 @@ impl ModuleData {
 
         if let Some(td) = self.type_name_index.find_typedef(name) {
             let dwarf = self.resolver.dwarf_ref();
-            if let Ok(header) = dwarf.debug_info.header_from_offset(td.cu_offset) {
+            if let Ok(header) = dwarf.unit_header(td.cu_offset) {
                 if let Ok(unit) = dwarf.unit(header) {
                     if let Ok(entry) = unit.entry(td.die_offset) {
-                        if let Ok(Some(gimli::AttributeValue::UnitRef(under))) =
+                        if let Some(gimli::AttributeValue::UnitRef(under)) =
                             entry.attr_value(gimli::DW_AT_type)
                         {
                             return self.detailed_shallow_type(td.cu_offset, under);
@@ -807,7 +804,7 @@ impl ModuleData {
                 for (idx, var_out) in vars.iter_mut().enumerate() {
                     if var_out.dwarf_type.is_none() {
                         let vr = &var_refs[idx];
-                        if let Ok(header) = dwarf_ref.debug_info.header_from_offset(vr.cu_offset) {
+                        if let Ok(header) = dwarf_ref.unit_header(vr.cu_offset) {
                             if let Ok(unit) = dwarf_ref.unit(header) {
                                 if let Ok(entry) = unit.entry(vr.die_offset) {
                                     let planner = crate::planner::AccessPlanner::new(dwarf_ref);
@@ -934,7 +931,7 @@ impl ModuleData {
 
             // Find variable DIE by name among visible vars
             let dwarf = self.resolver.dwarf_ref();
-            let header = dwarf.debug_info.header_from_offset(func.cu_offset)?;
+            let header = dwarf.unit_header(func.cu_offset)?;
             let unit = dwarf.unit(header)?;
             let candidates = func.variables_at_pc(address);
             tracing::info!(
@@ -948,7 +945,7 @@ impl ModuleData {
             let mut cand_names: Vec<String> = Vec::new();
             for v in &candidates {
                 let e = unit.entry(v.die_offset)?;
-                if let Some(attr) = e.attr(gimli::DW_AT_name)? {
+                if let Some(attr) = e.attr(gimli::DW_AT_name) {
                     if let Ok(s) = dwarf.attr_string(&unit, attr.value()) {
                         if let Ok(s_str) = s.to_string_lossy() {
                             cand_names.push(s_str.into_owned());
@@ -960,7 +957,7 @@ impl ModuleData {
 
             for v in candidates {
                 let e = unit.entry(v.die_offset)?;
-                if let Some(attr) = e.attr(gimli::DW_AT_name)? {
+                if let Some(attr) = e.attr(gimli::DW_AT_name) {
                     if let Ok(s) = dwarf.attr_string(&unit, attr.value()) {
                         if let Ok(n) = s.to_string_lossy() {
                             if n == base_var || n.starts_with(&format!("{base_var}@")) {
@@ -980,9 +977,7 @@ impl ModuleData {
                                         if var0.dwarf_type.is_none() {
                                             // Resolve base variable type strictly via DWARF type DIE
                                             let dwarf = self.resolver.dwarf_ref();
-                                            let header = dwarf
-                                                .debug_info
-                                                .header_from_offset(func.cu_offset)?;
+                                            let header = dwarf.unit_header(func.cu_offset)?;
                                             let unit = dwarf.unit(header)?;
                                             let e = unit.entry(v.die_offset)?;
                                             let planner = crate::planner::AccessPlanner::new(dwarf);
@@ -1156,7 +1151,7 @@ impl ModuleData {
         if let Some(inline_idx) = Self::find_innermost_inline_node(func, address) {
             // Verify the DIE tag is actually an inlined_subroutine
             let dwarf = self.resolver.dwarf_ref();
-            if let Ok(header) = dwarf.debug_info.header_from_offset(func.cu_offset) {
+            if let Ok(header) = dwarf.unit_header(func.cu_offset) {
                 if let Ok(unit) = dwarf.unit(header) {
                     if let Some(off) = func.nodes[inline_idx].die_offset {
                         if let Ok(entry) = unit.entry(off) {
@@ -1643,15 +1638,14 @@ impl ModuleData {
             ) -> gimli::read::Result<
                 Option<gimli::AttributeValue<gimli::EndianArcSlice<LittleEndian>>>,
             > {
-                if let Some(value) = entry.attr_value(attr)? {
+                if let Some(value) = entry.attr_value(attr) {
                     return Ok(Some(value));
                 }
                 for origin_attr in [
                     gimli::constants::DW_AT_abstract_origin,
                     gimli::constants::DW_AT_specification,
                 ] {
-                    if let Some(gimli::AttributeValue::UnitRef(off)) =
-                        entry.attr_value(origin_attr)?
+                    if let Some(gimli::AttributeValue::UnitRef(off)) = entry.attr_value(origin_attr)
                     {
                         if visited.insert(off) {
                             let origin = unit.entry(off)?;
@@ -1667,7 +1661,7 @@ impl ModuleData {
         }
 
         let dwarf = self.resolver.dwarf_ref();
-        let header = dwarf.debug_info.header_from_offset(func.cu_offset).ok()?;
+        let header = dwarf.unit_header(func.cu_offset).ok()?;
         let unit = dwarf.unit(header).ok()?;
         // From innermost block to outermost (root at 0)
         let path = func.block_path_for_pc(pc);
@@ -1961,8 +1955,7 @@ impl ModuleData {
     fn function_uses_entry_value(&self, idx_entry: &crate::core::IndexEntry) -> Result<bool> {
         let dwarf = self.resolver.dwarf_ref();
         let header = dwarf
-            .debug_info
-            .header_from_offset(idx_entry.unit_offset)
+            .unit_header(idx_entry.unit_offset)
             .map_err(|e| anyhow::anyhow!("unit header error: {}", e))?;
         let unit = dwarf
             .unit(header)
@@ -1990,15 +1983,14 @@ impl ModuleData {
             ) -> gimli::read::Result<
                 Option<gimli::AttributeValue<gimli::EndianArcSlice<LittleEndian>>>,
             > {
-                if let Some(v) = entry.attr_value(attr)? {
+                if let Some(v) = entry.attr_value(attr) {
                     return Ok(Some(v));
                 }
                 for origin_attr in [
                     gimli::constants::DW_AT_abstract_origin,
                     gimli::constants::DW_AT_specification,
                 ] {
-                    if let Some(gimli::AttributeValue::UnitRef(off)) =
-                        entry.attr_value(origin_attr)?
+                    if let Some(gimli::AttributeValue::UnitRef(off)) = entry.attr_value(origin_attr)
                     {
                         if visited.insert(off) {
                             let origin = unit.entry(off)?;
@@ -2300,7 +2292,7 @@ impl ModuleData {
         die_off: gimli::UnitOffset,
     ) -> Option<crate::TypeInfo> {
         let dwarf = self.resolver.dwarf_ref();
-        let header = dwarf.debug_info.header_from_offset(cu_off).ok()?;
+        let header = dwarf.unit_header(cu_off).ok()?;
         let unit = dwarf.unit(header).ok()?;
         crate::parser::DetailedParser::resolve_type_shallow_at_offset(dwarf, &unit, die_off)
     }
@@ -2312,7 +2304,7 @@ impl ModuleData {
         die_off: gimli::UnitOffset,
     ) -> Option<crate::TypeInfo> {
         let dwarf = self.resolver.dwarf_ref();
-        let header = dwarf.debug_info.header_from_offset(cu_off).ok()?;
+        let header = dwarf.unit_header(cu_off).ok()?;
         let unit = dwarf.unit(header).ok()?;
         let entry = unit.entry(die_off).ok()?;
         let planner = crate::planner::AccessPlanner::new(dwarf);
