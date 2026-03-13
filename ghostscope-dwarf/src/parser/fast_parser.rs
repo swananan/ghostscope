@@ -114,8 +114,8 @@ impl<'a> DwarfParser<'a> {
         let mut entries = unit.entries();
         let mut metadata_cache: HashMap<gimli::UnitOffset, FunctionMetadata> = HashMap::new();
         let mut tag_stack: Vec<gimli::DwTag> = Vec::new();
-        while let Some((depth, entry)) = entries.next_dfs()? {
-            let d: usize = depth as usize;
+        while let Some(entry) = entries.next_dfs()? {
+            let d: usize = entry.depth() as usize;
             while tag_stack.len() > d {
                 tag_stack.pop();
             }
@@ -369,7 +369,7 @@ impl<'a> DwarfParser<'a> {
                 | gimli::constants::DW_TAG_enumeration_type
                 | gimli::constants::DW_TAG_typedef => {
                     if let Some(name) = self.extract_name(self.dwarf, unit, entry)? {
-                        let is_decl = match entry.attr(gimli::constants::DW_AT_declaration)? {
+                        let is_decl = match entry.attr(gimli::constants::DW_AT_declaration) {
                             Some(attr) => matches!(attr.value(), gimli::AttributeValue::Flag(true)),
                             None => false,
                         };
@@ -422,7 +422,7 @@ impl<'a> DwarfParser<'a> {
         entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
     ) -> Result<Option<String>> {
         // Prefer local DW_AT_name
-        if let Some(attr) = entry.attr(gimli::constants::DW_AT_name)? {
+        if let Some(attr) = entry.attr(gimli::constants::DW_AT_name) {
             if let Ok(name) = dwarf.attr_string(unit, attr.value()) {
                 if let Ok(s_str) = name.to_string_lossy() {
                     return Ok(Some(s_str.into_owned()));
@@ -432,12 +432,12 @@ impl<'a> DwarfParser<'a> {
 
         // Fall back to DW_AT_specification / DW_AT_abstract_origin to resolve name
         // Common for globals defined in .c and declared in headers: definition DIE refers to declaration DIE for the name
-        if let Some(attr) = entry.attr(gimli::constants::DW_AT_specification)? {
+        if let Some(attr) = entry.attr(gimli::constants::DW_AT_specification) {
             if let Some(n) = Self::resolve_name_via_ref(dwarf, unit, attr.value())? {
                 return Ok(Some(n));
             }
         }
-        if let Some(attr) = entry.attr(gimli::constants::DW_AT_abstract_origin)? {
+        if let Some(attr) = entry.attr(gimli::constants::DW_AT_abstract_origin) {
             if let Some(n) = Self::resolve_name_via_ref(dwarf, unit, attr.value())? {
                 return Ok(Some(n));
             }
@@ -454,7 +454,7 @@ impl<'a> DwarfParser<'a> {
         match value {
             gimli::AttributeValue::UnitRef(uoff) => {
                 if let Ok(spec_entry) = unit.entry(uoff) {
-                    if let Some(attr) = spec_entry.attr(gimli::constants::DW_AT_name)? {
+                    if let Some(attr) = spec_entry.attr(gimli::constants::DW_AT_name) {
                         if let Ok(name) = dwarf.attr_string(unit, attr.value()) {
                             if let Ok(s_str) = name.to_string_lossy() {
                                 return Ok(Some(s_str.into_owned()));
@@ -478,12 +478,12 @@ impl<'a> DwarfParser<'a> {
         unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
         entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
     ) -> Result<Option<(String, bool)>> {
-        if let Some(attr) = entry.attr(gimli::constants::DW_AT_linkage_name)? {
+        if let Some(attr) = entry.attr(gimli::constants::DW_AT_linkage_name) {
             if let Some(name) = Self::extract_attr_string(dwarf, unit, attr.value())? {
                 return Ok(Some((name, true)));
             }
         }
-        if let Some(attr) = entry.attr(gimli::constants::DW_AT_MIPS_linkage_name)? {
+        if let Some(attr) = entry.attr(gimli::constants::DW_AT_MIPS_linkage_name) {
             if let Some(name) = Self::extract_attr_string(dwarf, unit, attr.value())? {
                 return Ok(Some((name, true)));
             }
@@ -494,7 +494,7 @@ impl<'a> DwarfParser<'a> {
     fn extract_inline_flag(
         entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
     ) -> Result<bool> {
-        if let Some(attr) = entry.attr(gimli::constants::DW_AT_inline)? {
+        if let Some(attr) = entry.attr(gimli::constants::DW_AT_inline) {
             if let gimli::AttributeValue::Inline(inline_attr) = attr.value() {
                 return Ok(inline_attr == gimli::DW_INL_inlined
                     || inline_attr == gimli::DW_INL_declared_inlined);
@@ -530,7 +530,7 @@ impl<'a> DwarfParser<'a> {
 
         metadata.is_inline = Self::extract_inline_flag(entry)?;
 
-        if let Some(attr) = entry.attr(gimli::constants::DW_AT_external)? {
+        if let Some(attr) = entry.attr(gimli::constants::DW_AT_external) {
             if let gimli::AttributeValue::Flag(flag) = attr.value() {
                 metadata.is_external = Some(flag);
             }
@@ -556,7 +556,7 @@ impl<'a> DwarfParser<'a> {
             Ok(())
         };
 
-        if let Some(attr) = entry.attr(gimli::constants::DW_AT_abstract_origin)? {
+        if let Some(attr) = entry.attr(gimli::constants::DW_AT_abstract_origin) {
             match attr.value() {
                 gimli::AttributeValue::UnitRef(unit_ref) => {
                     merge_from_origin(unit_ref)?;
@@ -570,7 +570,7 @@ impl<'a> DwarfParser<'a> {
             }
         }
 
-        if let Some(attr) = entry.attr(gimli::constants::DW_AT_specification)? {
+        if let Some(attr) = entry.attr(gimli::constants::DW_AT_specification) {
             match attr.value() {
                 gimli::AttributeValue::UnitRef(unit_ref) => {
                     merge_from_origin(unit_ref)?;
@@ -593,7 +593,7 @@ impl<'a> DwarfParser<'a> {
         &self,
         entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
     ) -> Result<bool> {
-        if let Some(attr) = entry.attr(gimli::constants::DW_AT_external)? {
+        if let Some(attr) = entry.attr(gimli::constants::DW_AT_external) {
             if let gimli::AttributeValue::Flag(is_external) = attr.value() {
                 return Ok(!is_external);
             }
@@ -604,7 +604,7 @@ impl<'a> DwarfParser<'a> {
     fn is_declaration(
         entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
     ) -> Result<bool> {
-        if let Some(attr) = entry.attr(gimli::constants::DW_AT_declaration)? {
+        if let Some(attr) = entry.attr(gimli::constants::DW_AT_declaration) {
             if let gimli::AttributeValue::Flag(is_decl) = attr.value() {
                 return Ok(is_decl);
             }
@@ -631,7 +631,7 @@ impl<'a> DwarfParser<'a> {
         entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
         unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
     ) -> Result<Option<u64>> {
-        if let Some(attr) = entry.attr(gimli::constants::DW_AT_location)? {
+        if let Some(attr) = entry.attr(gimli::constants::DW_AT_location) {
             match attr.value() {
                 gimli::AttributeValue::Addr(a) => return Ok(Some(a)),
                 gimli::AttributeValue::Exprloc(expr) => {
@@ -716,7 +716,7 @@ impl<'a> DwarfParser<'a> {
         &self,
         entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
     ) -> Result<Option<u64>> {
-        if let Some(attr) = entry.attr(gimli::constants::DW_AT_entry_pc)? {
+        if let Some(attr) = entry.attr(gimli::constants::DW_AT_entry_pc) {
             if let gimli::AttributeValue::Addr(addr) = attr.value() {
                 return Ok(Some(addr));
             }
@@ -733,7 +733,7 @@ impl<'a> DwarfParser<'a> {
     ) -> Result<bool> {
         // Check for DW_AT_main_subprogram attribute
         if entry
-            .attr(gimli::constants::DW_AT_main_subprogram)?
+            .attr(gimli::constants::DW_AT_main_subprogram)
             .is_some()
         {
             return Ok(true);
@@ -750,9 +750,9 @@ impl<'a> DwarfParser<'a> {
     ) -> Option<gimli::DwLang> {
         // Try to get language from compilation unit
         let mut entries = unit.entries();
-        if let Ok(Some((_, cu_entry))) = entries.next_dfs() {
+        if let Ok(Some(cu_entry)) = entries.next_dfs() {
             if cu_entry.tag() == gimli::constants::DW_TAG_compile_unit {
-                if let Ok(Some(lang_attr)) = cu_entry.attr(gimli::constants::DW_AT_language) {
+                if let Some(lang_attr) = cu_entry.attr(gimli::constants::DW_AT_language) {
                     if let gimli::AttributeValue::Language(lang) = lang_attr.value() {
                         return Some(lang);
                     }
@@ -916,8 +916,8 @@ impl<'a> DwarfParser<'a> {
         let shard_results: Vec<Result<InfoShard>> = headers
             .into_par_iter()
             .map(|header| -> Result<InfoShard> {
-                match header.offset() {
-                    gimli::UnitSectionOffset::DebugInfoOffset(unit_off) => {
+                match header.debug_info_offset() {
+                    Some(unit_off) => {
                         let unit = self.dwarf.unit(header)?;
                         let cu_lang = self.extract_language(self.dwarf, &unit);
                         self.process_unit_shard(&unit, unit_off, cu_lang)
@@ -1078,9 +1078,9 @@ impl<'a> DwarfParser<'a> {
         unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
     ) -> Option<String> {
         let mut entries = unit.entries();
-        let (_, entry) = entries.next_dfs().ok()??;
+        let entry = entries.next_dfs().ok()??;
 
-        if let Ok(Some(name_attr)) = entry.attr_value(gimli::constants::DW_AT_name) {
+        if let Some(name_attr) = entry.attr_value(gimli::constants::DW_AT_name) {
             if let Ok(name) = dwarf.attr_string(unit, name_attr) {
                 if let Ok(s_str) = name.to_string_lossy() {
                     return Some(s_str.into_owned());
@@ -1096,9 +1096,9 @@ impl<'a> DwarfParser<'a> {
         unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
     ) -> Option<String> {
         let mut entries = unit.entries();
-        let (_, entry) = entries.next_dfs().ok()??;
+        let entry = entries.next_dfs().ok()??;
 
-        if let Ok(Some(comp_dir_attr)) = entry.attr_value(gimli::constants::DW_AT_comp_dir) {
+        if let Some(comp_dir_attr) = entry.attr_value(gimli::constants::DW_AT_comp_dir) {
             if let Ok(comp_dir) = dwarf.attr_string(unit, comp_dir_attr) {
                 if let Ok(s_str) = comp_dir.to_string_lossy() {
                     return Some(s_str.into_owned());

@@ -31,14 +31,14 @@ impl ExpressionEvaluator {
             visited: &mut HashSet<gimli::UnitOffset>,
         ) -> gimli::read::Result<Option<gimli::AttributeValue<EndianArcSlice<LittleEndian>>>>
         {
-            if let Some(value) = entry.attr_value(attr)? {
+            if let Some(value) = entry.attr_value(attr) {
                 return Ok(Some(value));
             }
             for origin_attr in [
                 gimli::constants::DW_AT_abstract_origin,
                 gimli::constants::DW_AT_specification,
             ] {
-                if let Some(gimli::AttributeValue::UnitRef(off)) = entry.attr_value(origin_attr)? {
+                if let Some(gimli::AttributeValue::UnitRef(off)) = entry.attr_value(origin_attr) {
                     if visited.insert(off) {
                         let origin = unit.entry(off)?;
                         if let Some(v) = resolve_attr_with_origins(&origin, unit, attr, visited)? {
