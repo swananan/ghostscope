@@ -2,16 +2,19 @@
 //!
 //! Features:
 //! - Attach by PID or by target path (exactly one required)
+//! - Optional sandbox backend for GhostScope itself (host by default)
 //! - Configurable timeout (overall cap) and optional PerfEventArray backend
 //! - Consistent flags: disable artifact saving by default; logging opt-in
 //! - Robust output collection: incremental read during run, drain after exit
 //! - Pragmatic success rule: if process was killed on timeout but produced
 //!   any output, treat exit code -1 as success (0) to keep tests stable
 
+use super::sandbox::SandboxHandle;
+use super::targets::TargetHandle;
 use anyhow::Result;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use tempfile::NamedTempFile;
+use tempfile::{Builder, NamedTempFile};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
@@ -19,12 +22,14 @@ use tokio::time::{timeout, Duration};
 pub struct GhostscopeRunner {
     script_content: String,
     pid: Option<u32>,
+    attach_target: Option<TargetHandle>,
     target: Option<PathBuf>,
     timeout_secs: u64,
     force_perf_event_array: bool,
     log_level: Option<String>,
     enable_sysmon_shared_lib: bool,
     enable_file_logging: bool,
+    sandbox: SandboxHandle,
 }
 
 impl Default for GhostscopeRunner {
@@ -32,12 +37,14 @@ impl Default for GhostscopeRunner {
         Self {
             script_content: String::new(),
             pid: None,
+            attach_target: None,
             target: None,
             timeout_secs: 3,
             force_perf_event_array: false,
             log_level: None,
             enable_sysmon_shared_lib: false,
             enable_file_logging: false,
+            sandbox: SandboxHandle::host(),
         }
     }
 }
@@ -58,8 +65,20 @@ impl GhostscopeRunner {
         self
     }
 
+    #[allow(dead_code)]
+    pub fn attach_to(mut self, target: &TargetHandle) -> Self {
+        self.attach_target = Some(target.clone());
+        self
+    }
+
     pub fn with_target<P: AsRef<Path>>(mut self, target: P) -> Self {
         self.target = Some(target.as_ref().to_path_buf());
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn in_sandbox(mut self, sandbox: &SandboxHandle) -> Self {
+        self.sandbox = sandbox.clone();
         self
     }
 
@@ -90,42 +109,35 @@ impl GhostscopeRunner {
         self
     }
 
-    fn resolve_ghostscope_bin() -> PathBuf {
-        // Highest priority: explicit override for containerized/isolated runs.
-        if let Ok(p) = std::env::var("GHOSTSCOPE_TEST_BIN") {
-            return PathBuf::from(p);
-        }
-
-        // Prefer Cargo-provided binary path, fallback to a relative debug path
-        if let Ok(p) = std::env::var("CARGO_BIN_EXE_ghostscope") {
-            PathBuf::from(p)
-        } else {
-            PathBuf::from("../target/debug/ghostscope")
-        }
-    }
-
     pub async fn run(self) -> Result<(i32, String, String)> {
         // Validate attach mode
         let by_pid = self.pid.is_some();
+        let by_attached_target = self.attach_target.is_some();
         let by_target = self.target.is_some();
-        anyhow::ensure!(by_pid ^ by_target, "Must set exactly one of pid or target");
+        anyhow::ensure!(
+            (by_pid as usize) + (by_attached_target as usize) + (by_target as usize) == 1,
+            "Must set exactly one of pid, attached target, or target path"
+        );
 
         // Write script to a temp file
-        let mut script_file = NamedTempFile::new()?;
+        let mut script_file = create_script_file()?;
         use std::io::Write as _;
         script_file.write_all(self.script_content.as_bytes())?;
-        let script_path = script_file.path().to_path_buf();
+        let script_path = self.sandbox.path_in_sandbox(script_file.path())?;
 
         // Build command + args
-        let binary_path = Self::resolve_ghostscope_bin();
         let mut args: Vec<OsString> = Vec::new();
 
         if let Some(pid) = self.pid {
             args.push(OsString::from("-p"));
             args.push(OsString::from(pid.to_string()));
+        } else if let Some(target) = &self.attach_target {
+            let pid = target.visible_pid_from(&self.sandbox)?;
+            args.push(OsString::from("-p"));
+            args.push(OsString::from(pid.to_string()));
         } else if let Some(ref target) = self.target {
             args.push(OsString::from("-t"));
-            args.push(target.clone().into_os_string());
+            args.push(self.sandbox.path_in_sandbox(target)?.into_os_string());
         }
 
         args.push(OsString::from("--script-file"));
@@ -149,8 +161,11 @@ impl GhostscopeRunner {
             args.push(OsString::from("--log"));
         }
 
-        let mut cmd = Command::new(&binary_path);
-        cmd.args(&args);
+        let (program, mut prefix_args) = self.sandbox.ghostscope_command()?;
+        prefix_args.extend(args);
+
+        let mut cmd = Command::new(&program);
+        cmd.args(&prefix_args);
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
@@ -245,4 +260,16 @@ impl GhostscopeRunner {
 
         Ok((exit_code, stdout_content, stderr_content))
     }
+}
+
+fn create_script_file() -> Result<NamedTempFile> {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("failed to resolve repo root for temp script file"))?
+        .to_path_buf();
+    Builder::new()
+        .prefix(".ghostscope-test-script-")
+        .suffix(".gs")
+        .tempfile_in(repo_root)
+        .map_err(Into::into)
 }

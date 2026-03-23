@@ -434,6 +434,8 @@ lazy_static! {
 
 // Re-export the shared runner for convenience in tests
 pub mod runner;
+pub mod sandbox;
+pub mod targets;
 
 static COMPILE_GLOBALS: Once = Once::new();
 static COMPILE_RUST_GLOBAL: Once = Once::new();

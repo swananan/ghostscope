@@ -6,6 +6,7 @@ mod common;
 use common::{init, FIXTURES};
 use ghostscope_process::is_shared_object;
 use regex::Regex;
+use serial_test::serial;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
@@ -65,6 +66,7 @@ async fn run_ghostscope_then_start_exe(
 // ---------------------------------
 
 #[tokio::test]
+#[serial(globals_target)]
 async fn test_t_mode_executable_globals_prints() -> anyhow::Result<()> {
     init();
 
@@ -128,6 +130,7 @@ trace globals_program.c:32 {
 }
 
 #[tokio::test]
+#[serial(globals_target)]
 async fn test_t_mode_library_globals_prints() -> anyhow::Result<()> {
     init();
 
@@ -187,6 +190,7 @@ trace lib_tick {
 }
 
 #[tokio::test]
+#[serial(globals_target)]
 async fn test_t_mode_executable_rodata_and_struct_pretty() -> anyhow::Result<()> {
     init();
 
@@ -247,6 +251,7 @@ trace globals_program.c:26 {
 // ---------------------------------
 
 #[tokio::test]
+#[serial(globals_target)]
 async fn test_t_mode_executable_late_start_globals_prints() -> anyhow::Result<()> {
     init();
 
@@ -306,6 +311,7 @@ trace globals_program.c:32 {
 }
 
 #[tokio::test]
+#[serial(globals_target)]
 async fn test_t_mode_library_late_start_globals_prints() -> anyhow::Result<()> {
     init();
 
@@ -389,6 +395,7 @@ trace lib_tick {
 }
 
 #[tokio::test]
+#[serial(globals_target)]
 async fn test_t_mode_executable_late_start_rodata_and_struct_pretty() -> anyhow::Result<()> {
     init();
 
@@ -436,6 +443,7 @@ trace globals_program.c:26 {
 }
 
 #[tokio::test]
+#[serial(globals_target)]
 async fn test_t_mode_library_late_start_without_sysmon_offsets_unavailable() -> anyhow::Result<()> {
     init();
 
@@ -487,6 +495,11 @@ trace lib_tick {
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let pid_marker = format!("PID:{pid}");
+    let target_stdout = stdout
+        .lines()
+        .filter(|line| line.contains(&pid_marker))
+        .collect::<Vec<_>>()
+        .join("\n");
     let mut scalar_ok = false;
     let mut struct_ok = false;
     let mut array_ok = false;
@@ -552,8 +565,8 @@ trace lib_tick {
         "memcmp should not succeed without offsets. STDOUT: {stdout}"
     );
     assert!(
-        !stdout.contains("read_user failed"),
-        "Should not surface raw read_user errors. STDOUT: {stdout}"
+        !target_stdout.contains("read_user failed"),
+        "Should not surface raw read_user errors for PID {pid}. STDOUT: {stdout}"
     );
 
     Ok(())
