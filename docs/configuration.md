@@ -21,6 +21,17 @@ Configuration follows this priority order (highest to lowest):
 ghostscope -p <PID>
 ghostscope --pid <PID>
 
+# PID namespace aware behavior (Docker/WSL/container)
+# - Enter the PID as seen in your current shell/namespace.
+# - For a fuller explanation of container scenarios, see docs/container.md
+# - Startup decision order:
+#   1) Detect runtime environment (container/host/unknown)
+#   2) Parse NSpid mapping from /proc/<pid>/status
+#   3) Probe helper support and prefer bpf_get_ns_current_pid_tgid when available
+#   4) Fallback to host PID mapping when helper is unavailable
+# - If the PID is not visible in the current namespace, GhostScope fails fast
+#   and asks you to provide a PID that exists in the current namespace.
+
 # Specify target executable or library (with path resolution)
 ghostscope -t <PATH>
 ghostscope --target <PATH>

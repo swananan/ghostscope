@@ -304,7 +304,14 @@ async fn run_runtime_coordinator(
                         }
                     }
                     RuntimeCommand::LoadTraces { filename, traces } => {
-                        handle_load_traces(&mut session, &mut runtime_channels, filename, traces).await;
+                        handle_load_traces(
+                            &mut session,
+                            &mut runtime_channels,
+                            filename,
+                            traces,
+                            &compile_options,
+                        )
+                        .await;
                     }
                     RuntimeCommand::SrcPathList => {
                         if let Some(ref session) = session {
@@ -591,6 +598,7 @@ async fn handle_load_traces(
     runtime_channels: &mut RuntimeChannels,
     filename: String,
     traces: Vec<ghostscope_ui::events::TraceDefinition>,
+    compile_options: &ghostscope_compiler::CompileOptions,
 ) {
     use ghostscope_ui::RuntimeStatus;
 
@@ -611,13 +619,12 @@ async fn handle_load_traces(
         let script_command = format!("trace {} {{\n{}\n}}", trace.target, trace.script);
 
         // Execute the script (this sends the command but doesn't wait for result)
-        let default_compile_options = ghostscope_compiler::CompileOptions::default();
         handle_execute_script(
             session,
             runtime_channels,
             script_command,
             trace.selected_index,
-            &default_compile_options,
+            compile_options,
         )
         .await;
 

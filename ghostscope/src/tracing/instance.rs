@@ -11,7 +11,8 @@ pub struct TraceInstance {
     pub binary_path: String, // Binary being traced
     pub target_display: String, // Display name for UI (e.g., "main", "file.c:15")
     pub pc: u64,        // Program counter value for this trace (file offset for uprobe)
-    pub target_pid: Option<u32>, // Target PID if specified
+    pub target_pid: Option<u32>, // Host PID used for eBPF attach/filter
+    pub target_proc_pid: Option<u32>, // PID used for userspace /proc display
     pub is_enabled: bool, // Whether the uprobe is currently enabled
     pub loader: Option<GhostScopeLoader>, // eBPF loader for this trace
     pub ebpf_function_name: String, // eBPF function name for uprobe attachment
@@ -26,6 +27,7 @@ pub struct TraceInstanceArgs {
     pub binary_path: String,
     pub target_display: String,
     pub target_pid: Option<u32>,
+    pub target_proc_pid: Option<u32>,
     pub loader: Option<ghostscope_loader::GhostScopeLoader>,
     pub ebpf_function_name: String,
     pub address_global_index: Option<usize>,
@@ -41,6 +43,7 @@ impl TraceInstance {
             binary_path: args.binary_path,
             target_display: args.target_display,
             target_pid: args.target_pid,
+            target_proc_pid: args.target_proc_pid,
             is_enabled: false,
             loader: args.loader,
             ebpf_function_name: args.ebpf_function_name,

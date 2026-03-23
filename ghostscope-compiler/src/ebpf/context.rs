@@ -497,9 +497,15 @@ impl<'ctx> EbpfContext<'ctx> {
         // Create main function
         let main_function = self.create_main_function(function_name)?;
 
-        // Add PID filtering if target_pid is specified
-        if let Some(pid) = target_pid {
-            self.add_pid_filter(pid)?;
+        // Add PID filtering:
+        // 1) explicit compile option override (namespace-aware)
+        // 2) fallback to legacy host TGID filter from target_pid
+        let pid_filter_spec = self
+            .compile_options
+            .pid_filter_spec
+            .or_else(|| target_pid.map(|pid| crate::PidFilterSpec::HostTgid { target_pid: pid }));
+        if let Some(spec) = pid_filter_spec {
+            self.add_pid_filter(spec)?;
         }
 
         // Use new staged transmission system for all statements
@@ -571,10 +577,21 @@ impl<'ctx> EbpfContext<'ctx> {
         Ok(function)
     }
 
-    /// Add PID filtering logic to the current function
-    /// This generates LLVM IR to check current PID against target PID and early return if not matching
-    fn add_pid_filter(&mut self, target_pid: u32) -> Result<()> {
-        info!("Adding PID filter for target PID: {}", target_pid);
+    /// Add PID filtering logic to the current function.
+    /// This generates LLVM IR to check PID and early-return if not matching.
+    fn add_pid_filter(&mut self, spec: crate::PidFilterSpec) -> Result<()> {
+        match spec {
+            crate::PidFilterSpec::HostTgid { target_pid } => self.add_host_pid_filter(target_pid),
+            crate::PidFilterSpec::NamespaceTgid {
+                target_pid,
+                pid_ns_dev,
+                pid_ns_inode,
+            } => self.add_namespace_pid_filter(target_pid, pid_ns_dev, pid_ns_inode),
+        }
+    }
+
+    fn add_host_pid_filter(&mut self, target_pid: u32) -> Result<()> {
+        info!("Adding host TGID filter for target PID: {}", target_pid);
 
         // Get current function and entry block
         let current_fn = self
@@ -629,7 +646,137 @@ impl<'ctx> EbpfContext<'ctx> {
         self.builder.position_at_end(continue_block);
 
         info!(
-            "PID filter added successfully for target PID: {}",
+            "Host TGID filter added successfully for target PID: {}",
+            target_pid
+        );
+        Ok(())
+    }
+
+    fn add_namespace_pid_filter(
+        &mut self,
+        target_pid: u32,
+        pid_ns_dev: u64,
+        pid_ns_inode: u64,
+    ) -> Result<()> {
+        const BPF_FUNC_GET_NS_CURRENT_PID_TGID: u64 = 120;
+        const BPF_PIDNS_INFO_SIZE: u64 = 8; // struct { u32 pid; u32 tgid; }
+
+        info!(
+            "Adding namespace TGID filter: target_pid={} ns_dev={} ns_inode={}",
+            target_pid, pid_ns_dev, pid_ns_inode
+        );
+
+        let current_fn = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| CodeGenError::Builder("No current insert block".to_string()))?
+            .get_parent()
+            .ok_or_else(|| CodeGenError::Builder("No parent function".to_string()))?;
+
+        let helper_ok_block = self
+            .context
+            .append_basic_block(current_fn, "pidns_helper_ok");
+        let continue_block = self
+            .context
+            .append_basic_block(current_fn, "continue_execution");
+        let early_return_block = self
+            .context
+            .append_basic_block(current_fn, "pid_mismatch_return");
+
+        let i32_type = self.context.i32_type();
+        let i64_type = self.context.i64_type();
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+
+        // Stack-allocate bpf_pidns_info-compatible storage: [pid:u32, tgid:u32].
+        let pidns_info_ty = i32_type.array_type(2);
+        let pidns_info_alloca = self
+            .builder
+            .build_alloca(pidns_info_ty, "pidns_info")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder
+            .build_store(pidns_info_alloca, pidns_info_ty.const_zero())
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        let pidns_info_ptr = self
+            .builder
+            .build_bit_cast(pidns_info_alloca, ptr_type, "pidns_info_ptr")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        let helper_args = [
+            i64_type.const_int(pid_ns_dev, false).into(),
+            i64_type.const_int(pid_ns_inode, false).into(),
+            pidns_info_ptr,
+            i64_type.const_int(BPF_PIDNS_INFO_SIZE, false).into(),
+        ];
+        let helper_ret = self.create_bpf_helper_call(
+            BPF_FUNC_GET_NS_CURRENT_PID_TGID,
+            &helper_args,
+            i64_type.into(),
+            "ns_pid_tgid_ret",
+        )?;
+        let helper_ret = match helper_ret {
+            inkwell::values::BasicValueEnum::IntValue(v) => v,
+            _ => {
+                return Err(CodeGenError::LLVMError(
+                    "bpf_get_ns_current_pid_tgid did not return integer".to_string(),
+                ));
+            }
+        };
+
+        let helper_ok = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                helper_ret,
+                i64_type.const_zero(),
+                "pidns_helper_ok",
+            )
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        self.builder
+            .build_conditional_branch(helper_ok, helper_ok_block, early_return_block)
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        self.builder.position_at_end(helper_ok_block);
+        let tgid_ptr = unsafe {
+            self.builder.build_gep(
+                pidns_info_ty,
+                pidns_info_alloca,
+                &[i32_type.const_zero(), i32_type.const_int(1, false)],
+                "pidns_tgid_ptr",
+            )
+        }
+        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let ns_tgid = self
+            .builder
+            .build_load(i32_type, tgid_ptr, "ns_tgid")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_int_value();
+        let ns_tgid_i64 = self
+            .builder
+            .build_int_z_extend(ns_tgid, i64_type, "ns_tgid_i64")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let target_pid_value = i64_type.const_int(target_pid as u64, false);
+        let pid_matches = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                ns_tgid_i64,
+                target_pid_value,
+                "pid_matches_ns",
+            )
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        self.builder
+            .build_conditional_branch(pid_matches, continue_block, early_return_block)
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        self.builder.position_at_end(early_return_block);
+        self.builder
+            .build_return(Some(&self.context.i32_type().const_int(0, false)))
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        self.builder.position_at_end(continue_block);
+        info!(
+            "Namespace TGID filter added successfully for target PID: {}",
             target_pid
         );
         Ok(())

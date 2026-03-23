@@ -13,10 +13,87 @@ fn map_compile_error_message(e: &ghostscope_compiler::CompileError) -> String {
     }
 }
 
+fn offsets_map_target_pids(
+    session: &GhostSession,
+    compile_options: &ghostscope_compiler::CompileOptions,
+) -> Vec<u32> {
+    let mut pids = Vec::new();
+    match compile_options.pid_filter_spec {
+        Some(ghostscope_compiler::PidFilterSpec::NamespaceTgid { target_pid, .. }) => {
+            pids.push(target_pid);
+        }
+        Some(ghostscope_compiler::PidFilterSpec::HostTgid { target_pid }) => {
+            pids.push(target_pid);
+        }
+        None => {
+            if let Some(pid) = session.pid_for_filter() {
+                pids.push(pid);
+            }
+        }
+    }
+    if let Some(proc_pid) = session.pid_for_proc() {
+        if !pids.contains(&proc_pid) {
+            pids.push(proc_pid);
+        }
+    }
+    if let Some(filter_pid) = session.pid_for_filter() {
+        if !pids.contains(&filter_pid) {
+            pids.push(filter_pid);
+        }
+    }
+    pids
+}
+
+fn apply_cached_offsets_for_session_pid(
+    session: &GhostSession,
+    compile_options: &ghostscope_compiler::CompileOptions,
+) {
+    if let Some(proc_pid) = session.pid_for_proc() {
+        let items = {
+            let coordinator = session
+                .coordinator
+                .lock()
+                .expect("coordinator mutex poisoned");
+            coordinator.cached_offsets_pairs_for_pid(proc_pid)
+        };
+        if let Some(items) = items {
+            use ghostscope_process::maps::ProcModuleOffsetsValue;
+            let adapted: Vec<(u64, ProcModuleOffsetsValue)> = items
+                .iter()
+                .map(|(cookie, off)| {
+                    (
+                        *cookie,
+                        ProcModuleOffsetsValue::new(off.text, off.rodata, off.data, off.bss),
+                    )
+                })
+                .collect();
+
+            let target_pids = offsets_map_target_pids(session, compile_options);
+            for target_pid in target_pids {
+                if let Err(e) =
+                    ghostscope_process::maps::insert_offsets_for_pid(target_pid, &adapted)
+                {
+                    warn!(
+                        "Failed to write cached offsets to pinned map for PID {} (proc PID {}): {}",
+                        target_pid, proc_pid, e
+                    );
+                } else {
+                    info!(
+                        "✓ Applied {} cached offsets to pinned map for PID {} (proc PID {})",
+                        adapted.len(),
+                        target_pid,
+                        proc_pid
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Create and attach a loader for a single uprobe configuration
 async fn create_and_attach_loader(
     config: &ghostscope_compiler::UProbeConfig,
-    target_pid: Option<u32>,
+    attach_pid: Option<u32>,
     session: &mut crate::core::GhostSession,
 ) -> Result<GhostScopeLoader> {
     // Create a new loader for this uprobe configuration
@@ -66,8 +143,8 @@ async fn create_and_attach_loader(
     );
     loader.set_trace_context(config.trace_context.clone());
 
-    // In -t mode (no target_pid), perform module prefill once per session and apply to this loader
-    if target_pid.is_none() {
+    // In -t mode (no attach PID), perform module prefill once per session and apply to this loader
+    if attach_pid.is_none() {
         let (prefilled, entries) = {
             let mut coordinator = session
                 .coordinator
@@ -129,7 +206,7 @@ async fn create_and_attach_loader(
                 &config.binary_path,
                 function_name,
                 Some(uprobe_offset),
-                target_pid.map(|p| p as i32),
+                attach_pid.map(|p| p as i32),
                 Some(&config.ebpf_function_name),
             )?;
         } else {
@@ -143,7 +220,7 @@ async fn create_and_attach_loader(
                 &config.binary_path,
                 &format!("0x{uprobe_offset:x}"), // Use address as function name
                 Some(uprobe_offset),
-                target_pid.map(|p| p as i32),
+                attach_pid.map(|p| p as i32),
                 Some(&config.ebpf_function_name),
             )?;
         }
@@ -161,6 +238,8 @@ pub async fn compile_and_load_script_for_tui(
     session: &mut GhostSession,
     compile_options: &ghostscope_compiler::CompileOptions,
 ) -> Result<ScriptCompilationDetails> {
+    let filter_pid = session.pid_for_filter();
+
     // Step 1: Validate process analyzer availability
     let process_analyzer = session
         .process_analyzer
@@ -182,7 +261,7 @@ pub async fn compile_and_load_script_for_tui(
     let compilation_result = match ghostscope_compiler::compile_script(
         script,
         process_analyzer,
-        session.target_pid,
+        filter_pid,
         Some(starting_trace_id), // Use trace_manager's next available ID
         compile_options,
     ) {
@@ -275,18 +354,18 @@ pub async fn compile_and_load_script_for_tui(
     );
 
     // Ensure -p offsets are cached once per session
-    if let Some(pid) = session.target_pid {
+    if let Some(proc_pid) = session.pid_for_proc() {
         let result = {
             let mut coordinator = session
                 .coordinator
                 .lock()
                 .expect("coordinator mutex poisoned");
-            coordinator.ensure_prefill_pid(pid)
+            coordinator.ensure_prefill_pid(proc_pid)
         };
         match result {
             Ok(count) => info!(
                 "Coordinator cached {} module offset entries for PID {}",
-                count, pid
+                count, proc_pid
             ),
             Err(e) => warn!(
                 "Failed to compute section offsets via coordinator: {} (globals may show OffsetsUnavailable)",
@@ -322,46 +401,10 @@ pub async fn compile_and_load_script_for_tui(
                 .unwrap_or_else(|| format!("{addr_disp:#x}"));
 
             // Create individual loader for this config
-            match create_and_attach_loader(config, session.target_pid, session).await {
+            match create_and_attach_loader(config, session.pid_for_attach(), session).await {
                 Ok(loader) => {
-                    // Apply cached offsets for this PID to the loader (if available)
-                    if let Some(pid) = session.target_pid {
-                        let items = {
-                            let coordinator = session
-                                .coordinator
-                                .lock()
-                                .expect("coordinator mutex poisoned");
-                            coordinator.cached_offsets_pairs_for_pid(pid)
-                        };
-                        if let Some(items) = items {
-                            use ghostscope_process::maps::ProcModuleOffsetsValue;
-                            let adapted: Vec<(u64, ProcModuleOffsetsValue)> = items
-                                .iter()
-                                .map(|(cookie, off)| {
-                                    (
-                                        *cookie,
-                                        ProcModuleOffsetsValue::new(
-                                            off.text, off.rodata, off.data, off.bss,
-                                        ),
-                                    )
-                                })
-                                .collect();
-                            if let Err(e) =
-                                ghostscope_process::maps::insert_offsets_for_pid(pid, &adapted)
-                            {
-                                warn!(
-                                    "Failed to write cached offsets to pinned map for PID {}: {}",
-                                    pid, e
-                                );
-                            } else {
-                                info!(
-                                    "✓ Applied {} cached offsets to pinned map for PID {}",
-                                    adapted.len(),
-                                    pid
-                                );
-                            }
-                        }
-                    }
+                    // Apply cached offsets for PID-mode lookups (if available).
+                    apply_cached_offsets_for_session_pid(session, compile_options);
 
                     info!(
                         "✓ Successfully attached uprobe for trace_id {}",
@@ -377,11 +420,12 @@ pub async fn compile_and_load_script_for_tui(
                             pc: config.function_address.unwrap_or(0),
                             binary_path: config.binary_path.clone(),
                             target_display: target_display.clone(),
-                            target_pid: session.target_pid,
+                            target_pid: session.pid_for_filter(),
+                            target_proc_pid: session.pid_for_proc(),
                             loader: Some(loader),
                             ebpf_function_name: format!(
                                 "gs_{}_{}_{}",
-                                session.target_pid.unwrap_or(0),
+                                session.pid_for_filter().unwrap_or(0),
                                 target_display,
                                 config.assigned_trace_id
                             ),
@@ -451,6 +495,8 @@ pub async fn compile_and_load_script_for_cli(
     session: &mut GhostSession,
     compile_options: &ghostscope_compiler::CompileOptions,
 ) -> Result<()> {
+    let filter_pid = session.pid_for_filter();
+
     info!("Starting unified script compilation with DWARF integration...");
 
     // Step 1: Validate process analyzer
@@ -466,7 +512,7 @@ pub async fn compile_and_load_script_for_cli(
     let compilation_result = match ghostscope_compiler::compile_script(
         script,
         process_analyzer,
-        session.target_pid,
+        filter_pid,
         Some(starting_trace_id), // Use trace_manager's next available ID
         compile_options,
     ) {
@@ -500,18 +546,18 @@ pub async fn compile_and_load_script_for_cli(
     }
 
     // Ensure -p offsets are cached once per session
-    if let Some(pid) = session.target_pid {
+    if let Some(proc_pid) = session.pid_for_proc() {
         let result = {
             let mut coordinator = session
                 .coordinator
                 .lock()
                 .expect("coordinator mutex poisoned");
-            coordinator.ensure_prefill_pid(pid)
+            coordinator.ensure_prefill_pid(proc_pid)
         };
         match result {
             Ok(count) => info!(
                 "Coordinator cached {} module offset entries for PID {}",
-                count, pid
+                count, proc_pid
             ),
             Err(e) => warn!(
                 "Failed to compute section offsets via coordinator: {} (globals may show OffsetsUnavailable)",
@@ -608,47 +654,10 @@ pub async fn compile_and_load_script_for_cli(
             .unwrap_or_else(|| format!("{addr_disp:#x}"));
 
         // Create individual loader for this config
-        match create_and_attach_loader(config, session.target_pid, session).await {
+        match create_and_attach_loader(config, session.pid_for_attach(), session).await {
             Ok(loader) => {
-                // Apply cached offsets for this PID to the loader (if available)
-                if let Some(pid) = session.target_pid {
-                    let items = {
-                        let coordinator = session
-                            .coordinator
-                            .lock()
-                            .expect("coordinator mutex poisoned");
-                        coordinator.cached_offsets_pairs_for_pid(pid)
-                    };
-                    if let Some(items) = items {
-                        use ghostscope_process::maps::ProcModuleOffsetsValue;
-                        let adapted: Vec<(u64, ProcModuleOffsetsValue)> = items
-                            .iter()
-                            .map(|(cookie, off)| {
-                                (
-                                    *cookie,
-                                    ProcModuleOffsetsValue::new(
-                                        off.text, off.rodata, off.data, off.bss,
-                                    ),
-                                )
-                            })
-                            .collect();
-                        if let Err(e) =
-                            ghostscope_process::maps::insert_offsets_for_pid(pid, &adapted)
-                        {
-                            warn!(
-                                "Failed to write cached offsets to pinned map for PID {}: {}",
-                                pid, e
-                            );
-                        } else {
-                            info!(
-                                "✓ Applied {} cached offsets to pinned map for PID {}",
-                                adapted.len(),
-                                pid
-                            );
-                        }
-                        // Loader no longer manages offsets map; only pinned map is authoritative
-                    }
-                }
+                // Apply cached offsets for PID-mode lookups (if available).
+                apply_cached_offsets_for_session_pid(session, compile_options);
 
                 info!(
                     "✓ Successfully attached uprobe for trace_id {}",
@@ -664,11 +673,12 @@ pub async fn compile_and_load_script_for_cli(
                         pc: config.function_address.unwrap_or(0),
                         binary_path: config.binary_path.clone(),
                         target_display: target_display.clone(),
-                        target_pid: session.target_pid,
+                        target_pid: session.pid_for_filter(),
+                        target_proc_pid: session.pid_for_proc(),
                         loader: Some(loader),
                         ebpf_function_name: format!(
                             "gs_{}_{}_{}",
-                            session.target_pid.unwrap_or(0),
+                            session.pid_for_filter().unwrap_or(0),
                             target_display,
                             config.assigned_trace_id
                         ),

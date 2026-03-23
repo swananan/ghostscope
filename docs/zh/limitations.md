@@ -56,6 +56,7 @@ GhostScope 启动时会扫描进程的 `/proc/PID/maps` 获取已加载的动态
 
 ### 9. 容器 / WSL 场景下 `-p <pid>` 模式的软限制
 
-- `-p` 模式依赖 `bpf_get_current_pid_tgid` 获取宿主机视角的 PID/TGID。处于 PID namespace（例如 Docker、Kubernetes 容器）或 WSL 中时，容器内部看到的 PID 往往与宿主机不一致。
+- 容器场景、PID namespace 术语、场景矩阵，以及当前实现限制的完整说明，见 [容器环境](container.md)。
+- 本页只保留摘要：容器/WSL 场景下，`-p` 模式是否可靠，取决于 GhostScope 当前 PID 视角、目标 PID 在当前 `/proc` 中是否可见、`NSpid` 是否能提供可靠映射，以及 `bpf_get_ns_current_pid_tgid` helper 是否可用。
+- 用户层面的输入规则不变：始终填写你执行 `ghostscope -p` 时那个环境里可见的 PID。
 - 参考 [PID namespaces 手册](https://www.man7.org/linux/man-pages/man7/pid_namespaces.7.html)、[WSL issue #12408](https://github.com/microsoft/WSL/issues/12408) 和 [WSL issue #12115](https://github.com/microsoft/WSL/issues/12115)。
-- 在这些环境使用 `-p` 时，请先确认宿主机实际 PID；或改用 `-t <二进制>` / `-t <共享库>` 模式，通过模块路径挂载 uprobe，避免 PID 不匹配导致事件过滤失败。

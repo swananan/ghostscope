@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::config::{Config, LayoutMode, ParsedArgs};
+use crate::config::{Config, LayoutMode, ParsedArgs, ResolvedPidInfo, RuntimeEnvironmentInfo};
 
 /// Final merged configuration that combines command line arguments and config file settings
 /// Command line arguments take priority over config file settings
@@ -10,7 +10,18 @@ pub struct MergedConfig {
     pub binary_path: Option<String>,
     pub target_path: Option<String>,
     pub binary_args: Vec<String>,
+    /// PID used for userspace /proc reads in current namespace view.
     pub pid: Option<u32>,
+    /// Host PID used for eBPF PID filtering/attach when namespace differs.
+    pub host_pid: Option<u32>,
+    /// Detailed PID mapping diagnostics (if PID mode is used).
+    pub pid_mapping: Option<ResolvedPidInfo>,
+    /// Runtime environment detection summary (container/host/unknown).
+    pub runtime_env: Option<RuntimeEnvironmentInfo>,
+    /// Effective eBPF-side PID filter strategy used by compiler.
+    pub pid_filter_spec: Option<ghostscope_compiler::PidFilterSpec>,
+    /// Optional namespace context for special vars (`$pid`/`$tid`) in eBPF.
+    pub special_pid_ns: Option<ghostscope_compiler::PidNamespaceSpec>,
     pub log_file: PathBuf,
     pub enable_logging: bool,
     pub enable_console_logging: bool,
@@ -160,6 +171,11 @@ impl MergedConfig {
             target_path: args.target_path,
             binary_args: args.binary_args,
             pid: args.pid,
+            host_pid: args.pid,
+            pid_mapping: None,
+            runtime_env: None,
+            pid_filter_spec: None,
+            special_pid_ns: None,
             log_file,
             enable_logging,
             enable_console_logging,
@@ -319,6 +335,8 @@ impl MergedConfig {
             compare_cap: self.ebpf_config.compare_cap,
             max_trace_event_size: effective_max_event,
             selected_index: None,
+            pid_filter_spec: self.pid_filter_spec,
+            special_pid_ns: self.special_pid_ns,
         }
     }
 }

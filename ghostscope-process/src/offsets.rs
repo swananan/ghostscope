@@ -223,6 +223,12 @@ impl ProcessManager {
             .unwrap_or_default()
     }
 
+    /// Force-refresh per-module cache (used when late-start targets appear after initial prefill).
+    pub fn refresh_prefill_module(&mut self, module_path: &str) -> Result<usize> {
+        self.prefilled_modules.remove(module_path);
+        self.ensure_prefill_module(module_path)
+    }
+
     pub fn ensure_prefill_pid(&mut self, pid: u32) -> Result<usize> {
         if self.prefilled_pids.contains(&pid) {
             return Ok(0);
@@ -264,6 +270,13 @@ impl ProcessManager {
         self.pid_cache.insert(pid, list);
         self.prefilled_pids.insert(pid);
         Ok(self.pid_cache.get(&pid).map(|v| v.len()).unwrap_or(0))
+    }
+
+    /// Force-refresh per-PID cache (used when exec-time prefill raced with module mapping).
+    pub fn refresh_prefill_pid(&mut self, pid: u32) -> Result<usize> {
+        self.prefilled_pids.remove(&pid);
+        self.pid_cache.remove(&pid);
+        self.ensure_prefill_pid(pid)
     }
 
     fn compute_section_offsets_for_process(
@@ -480,6 +493,15 @@ impl ProcessManager {
     pub fn cached_offsets_with_paths_for_pid(&self, pid: u32) -> Option<&[PidOffsetsEntry]> {
         self.pid_cache.get(&pid).map(|v| v.as_slice())
     }
+
+    /// Drop per-PID caches when a process exits so PID reuse can prefill again.
+    pub fn forget_pid(&mut self, pid: u32) {
+        self.prefilled_pids.remove(&pid);
+        self.pid_cache.remove(&pid);
+        for entries in self.module_cache.values_mut() {
+            entries.retain(|entry| entry.pid != pid);
+        }
+    }
 }
 
 fn is_same_executable_as_current(pid: u32) -> bool {
@@ -514,4 +536,48 @@ fn is_same_executable_as_current(pid: u32) -> bool {
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forget_pid_clears_pid_caches_and_module_entries() {
+        let mut mgr = ProcessManager::new();
+        mgr.prefilled_pids.insert(42);
+        mgr.pid_cache.insert(
+            42,
+            vec![PidOffsetsEntry {
+                module_path: "/tmp/a.so".to_string(),
+                cookie: 1,
+                offsets: SectionOffsets::default(),
+                base: 0,
+                size: 0,
+            }],
+        );
+        mgr.module_cache.insert(
+            "/tmp/a.so".to_string(),
+            vec![
+                CachedEntry {
+                    pid: 42,
+                    cookie: 1,
+                    offsets: SectionOffsets::default(),
+                },
+                CachedEntry {
+                    pid: 7,
+                    cookie: 2,
+                    offsets: SectionOffsets::default(),
+                },
+            ],
+        );
+
+        mgr.forget_pid(42);
+
+        assert!(!mgr.prefilled_pids.contains(&42));
+        assert!(!mgr.pid_cache.contains_key(&42));
+        let module_entries = mgr.module_cache.get("/tmp/a.so").unwrap();
+        assert_eq!(module_entries.len(), 1);
+        assert_eq!(module_entries[0].pid, 7);
+    }
 }

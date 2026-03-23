@@ -1216,10 +1216,11 @@ async fn test_bitfields_correctness() -> anyhow::Result<()> {
     // Give it time to start
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Use source-line attach where 'a' and 'i' are in scope
+    // Use source-line attach inside update_complex after bitfield assignments
+    // so c.active/c.flags reflect the current i in the same frame.
     let script_fn = r#"
-trace complex_types_program.c:25 {
-    print "I={} ACTIVE={} FLAGS={}", i, a.active, a.flags;
+trace complex_types_program.c:14 {
+    print "I={} ACTIVE={} FLAGS={}", i, c.active, c.flags;
 }
 "#;
 
@@ -1237,14 +1238,14 @@ trace complex_types_program.c:25 {
     // Expected line shape:
     //   : I=1234 ACTIVE=0 FLAGS=4
     use regex::Regex;
-    let re_triplet = Regex::new(r"I=([0-9]+)\s+ACTIVE=([0-9]+)\s+FLAGS=([0-9]+)").unwrap();
+    let re_triplet = Regex::new(r"I=([0-9]+)\s+ACTIVE=([0-9]+)\s+FLAGS=(-?[0-9]+)").unwrap();
     let (i_val, active_val, flags_val) = stdout
         .lines()
         .find_map(|line| {
             let caps = re_triplet.captures(line)?;
             let i = caps.get(1)?.as_str().parse::<u64>().ok()?;
             let active = caps.get(2)?.as_str().parse::<u64>().ok()?;
-            let flags = caps.get(3)?.as_str().parse::<u64>().ok()?;
+            let flags = caps.get(3)?.as_str().parse::<i64>().ok()?;
             Some((i, active, flags))
         })
         .ok_or_else(|| anyhow::anyhow!("Missing I/ACTIVE/FLAGS triplet. STDOUT: {stdout}"))?;
@@ -1254,18 +1255,20 @@ trace complex_types_program.c:25 {
         "active should be 0 or 1, got {active_val}. STDOUT: {stdout}"
     );
     assert!(
-        flags_val <= 7,
-        "flags should be 0..7, got {flags_val}. STDOUT: {stdout}"
+        (-4..=3).contains(&flags_val),
+        "flags should be in signed 3-bit range [-4,3], got {flags_val}. STDOUT: {stdout}"
     );
     assert_eq!(
         active_val,
         i_val & 1,
         "active must equal i&1 (i={i_val}, active={active_val})"
     );
+    let raw3 = (i_val & 7) as i64;
+    let expected_flags = if raw3 >= 4 { raw3 - 8 } else { raw3 };
     assert_eq!(
         flags_val,
-        i_val & 7,
-        "flags must equal i&7 (i={i_val}, flags={flags_val})"
+        expected_flags,
+        "flags must equal signed(i&7,3-bit) (i={i_val}, expected={expected_flags}, flags={flags_val})"
     );
 
     Ok(())

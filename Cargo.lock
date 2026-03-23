@@ -789,6 +789,7 @@ dependencies = [
  "ghostscope-compiler",
  "ghostscope-process",
  "ghostscope-protocol",
+ "libc",
  "log",
  "thiserror 2.0.12",
  "tokio",

@@ -7,7 +7,10 @@ pub struct TraceSnapshot {
     pub script_content: String,
     pub binary_path: String,
     pub target_display: String,
+    /// Host PID used by eBPF attach/filter.
     pub target_pid: Option<u32>,
+    /// Userspace-visible PID used for /proc reads and user-facing display.
+    pub target_proc_pid: Option<u32>,
     pub is_enabled: bool,
     pub pc: u64,
     #[allow(dead_code)]

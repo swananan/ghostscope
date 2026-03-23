@@ -51,6 +51,8 @@ test_*
 !scripts/install.sh
 # Keep e2e wrapper script tracked
 !scripts/e2e_runner/run_e2e_runner.sh
+# Keep container e2e wrapper script tracked
+!scripts/e2e_runner/run_container_e2e.sh
 # Keep e2e runner service launcher tracked
 !scripts/e2e_runner/start_e2e_runner_service.sh
 # Keep skill installer tracked

@@ -120,9 +120,16 @@ pub async fn initialize_dwarf_processing_with_progress(
                     Ok(session)
                 }
                 None => {
+                    let pid_hint = match (config.pid, config.host_pid) {
+                        (Some(proc_pid), Some(host_pid)) if proc_pid != host_pid => {
+                            format!(" (host PID for eBPF filter: {host_pid})")
+                        }
+                        _ => String::new(),
+                    };
                     let error_msg = format!(
-                        "Binary analysis failed! Cannot load DWARF information for PID {} or binary path {:?}",
+                        "Binary analysis failed! Cannot load DWARF information for PID {}{} or binary path {:?}",
                         config.pid.unwrap_or(0),
+                        pid_hint,
                         config.binary_path
                     );
                     let _ =

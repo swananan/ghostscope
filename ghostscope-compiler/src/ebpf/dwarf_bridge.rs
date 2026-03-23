@@ -1143,11 +1143,16 @@ impl<'ctx> EbpfContext<'ctx> {
                 "Variable '{}' not found in locals; attempting global lookup",
                 var_name
             );
-            let mut matches = analyzer.find_global_variables_by_name(var_name);
+            let matches = analyzer.find_global_variables_by_name(var_name);
             if matches.is_empty() {
                 return Ok(None);
             }
-            // Prefer globals defined in the current module.
+
+            // Candidate ranking:
+            // 1) current module + link address
+            // 2) any module + link address
+            // 3) current module
+            // 4) all matches
             let preferred: Vec<(
                 std::path::PathBuf,
                 ghostscope_dwarf::core::GlobalVariableInfo,
@@ -1156,36 +1161,95 @@ impl<'ctx> EbpfContext<'ctx> {
                 .filter(|(p, _)| p.to_string_lossy() == module_path_owned.as_str())
                 .cloned()
                 .collect();
+            let preferred_with_addr: Vec<(
+                std::path::PathBuf,
+                ghostscope_dwarf::core::GlobalVariableInfo,
+            )> = preferred
+                .iter()
+                .filter(|(_, info)| info.link_address.is_some())
+                .cloned()
+                .collect();
+            let with_addr: Vec<(
+                std::path::PathBuf,
+                ghostscope_dwarf::core::GlobalVariableInfo,
+            )> = matches
+                .iter()
+                .filter(|(_, info)| info.link_address.is_some())
+                .cloned()
+                .collect();
 
-            let chosen = if preferred.len() == 1 {
-                Some(preferred[0].clone())
-            } else if preferred.is_empty() && matches.len() == 1 {
-                Some(matches.remove(0))
+            let candidates: Vec<(
+                std::path::PathBuf,
+                ghostscope_dwarf::core::GlobalVariableInfo,
+            )> = if !preferred_with_addr.is_empty() {
+                preferred_with_addr
+            } else if !with_addr.is_empty() {
+                with_addr
+            } else if !preferred.is_empty() {
+                preferred
             } else {
-                debug!(
-                    "Global '{}' is ambiguous across modules ({} matches)",
-                    var_name,
-                    matches.len()
-                );
-                return Err(CodeGenError::DwarfError(format!(
-                    "Ambiguous global '{}': {} matches",
-                    var_name,
-                    matches.len()
-                )));
+                matches
             };
 
-            if let Some((mpath, info)) = chosen {
+            if candidates.len() == 1 {
+                let (mpath, info) = &candidates[0];
                 let gv = analyzer
                     .resolve_variable_by_offsets_in_module(
-                        &mpath,
+                        mpath,
                         info.unit_offset,
                         info.die_offset,
                     )
                     .map_err(|err| CodeGenError::DwarfError(err.to_string()))?;
-                Ok(Some((mpath, gv)))
-            } else {
-                Ok(None)
+                return Ok(Some((mpath.clone(), gv)));
             }
+
+            // Ambiguous candidates: resolve each candidate and prefer the one with a concrete type size.
+            let mut resolved: Vec<(std::path::PathBuf, VariableWithEvaluation)> = Vec::new();
+            let mut resolved_with_size: Vec<(std::path::PathBuf, VariableWithEvaluation)> =
+                Vec::new();
+            for (mpath, info) in candidates.iter() {
+                let gv = match analyzer.resolve_variable_by_offsets_in_module(
+                    mpath,
+                    info.unit_offset,
+                    info.die_offset,
+                ) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        debug!(
+                            "Skipping unresolved global candidate '{}' in '{}': {}",
+                            var_name,
+                            mpath.display(),
+                            err
+                        );
+                        continue;
+                    }
+                };
+                let ty_size = gv.dwarf_type.as_ref().map(|t| t.size()).unwrap_or(0);
+                if ty_size > 0 {
+                    resolved_with_size.push((mpath.clone(), gv.clone()));
+                }
+                resolved.push((mpath.clone(), gv));
+            }
+
+            if resolved_with_size.len() == 1 {
+                return Ok(resolved_with_size.into_iter().next());
+            }
+
+            if resolved.len() == 1 {
+                return Ok(resolved.into_iter().next());
+            }
+
+            let ambiguous_count = if resolved_with_size.len() > 1 {
+                resolved_with_size.len()
+            } else if !resolved.is_empty() {
+                resolved.len()
+            } else {
+                candidates.len()
+            };
+            debug!("Global '{var_name}' is ambiguous across modules ({ambiguous_count} candidates)");
+            Err(CodeGenError::DwarfError(format!(
+                "Ambiguous global '{var_name}': {ambiguous_count} matches"
+            )))
         };
 
         match analyzer.get_all_variables_at_address(&module_address) {

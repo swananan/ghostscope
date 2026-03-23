@@ -157,13 +157,13 @@ The service must be started by the developer manually with `sudo`:
 
 ```bash
 cd /mnt/500g/code/ghostscope
-sudo env HOST=127.0.0.1 PORT=8788 DEFAULT_SUDO=1 DEFAULT_REPO_DIR=/mnt/500g/code/ghostscope ./scripts/e2e_runner/start_e2e_runner_service.sh
+sudo env HOST=127.0.0.1 PORT=8788 DEFAULT_SUDO=1 DEFAULT_REPO_DIR=/mnt/500g/code/ghostscope ./scripts/e2e/runner/start_e2e_runner_service.sh
 ```
 
 Then run e2e through the agent wrapper:
 
 ```bash
-./scripts/e2e_runner/run_e2e_runner.sh
+./scripts/e2e/runner/run_e2e_runner.sh
 ```
 
 Optional variables:
@@ -171,6 +171,23 @@ Optional variables:
 - `E2E_REPO_DIR=/path/to/repo`
 - `E2E_TEST_CASE=<cargo_test_filter>`
 - `E2E_SUDO=1|0` (default: `1`)
+
+### Container E2E (Docker PID namespace smoke)
+
+Run a focused PID-mode e2e subset in privileged Docker:
+
+```bash
+./scripts/e2e/container/run_container_e2e.sh --pid-mode private
+./scripts/e2e/container/run_container_e2e.sh --pid-mode host
+```
+
+Notes:
+
+- Tests run inside Docker, not on host.
+- Default set is PID-focused smoke cases.
+- Use `--all` for full `cargo test --all-features` in container.
+- Override image with `--image` or `E2E_CONTAINER_IMAGE`.
+- Local runs enable Docker volume cache by default (`E2E_USE_DOCKER_CACHE=1`).
 
 ### Testing DWARF Parsing with dwarf-tool
 

@@ -6,13 +6,165 @@ use super::context::{CodeGenError, EbpfContext, Result};
 use crate::script::{BinaryOp, Expr};
 use aya_ebpf_bindings::bindings::bpf_func_id::BPF_FUNC_probe_read_user;
 use ghostscope_dwarf::TypeInfo as DwarfType;
-use inkwell::values::BasicValueEnum;
+use inkwell::values::{BasicValueEnum, IntValue};
 use inkwell::AddressSpace;
 use tracing::debug;
 
 // compare cap is provided via compile_options.compare_cap (config: ebpf.compare_cap)
 
 impl<'ctx> EbpfContext<'ctx> {
+    fn get_special_pid_tid_values(&mut self) -> Result<(IntValue<'ctx>, IntValue<'ctx>)> {
+        const BPF_FUNC_GET_NS_CURRENT_PID_TGID: u64 = 120;
+        const BPF_PIDNS_INFO_SIZE: u64 = 8; // struct { u32 pid; u32 tgid; }
+
+        let i32_type = self.context.i32_type();
+        let i64_type = self.context.i64_type();
+
+        // Keep legacy behavior for $pid/$tid in host mode:
+        // $pid -> low 32 bits, $tid -> high 32 bits from get_current_pid_tgid.
+        let host_pid_tgid = self.get_current_pid_tgid()?;
+        let host_pid = self
+            .builder
+            .build_and(
+                host_pid_tgid,
+                i64_type.const_int(0xFFFF_FFFF, false),
+                "host_pid",
+            )
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let host_tid = self
+            .builder
+            .build_right_shift(
+                host_pid_tgid,
+                i64_type.const_int(32, false),
+                false,
+                "host_tid",
+            )
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        let ns_spec = if let Some(crate::PidFilterSpec::NamespaceTgid {
+            pid_ns_dev,
+            pid_ns_inode,
+            ..
+        }) = self.compile_options.pid_filter_spec
+        {
+            Some((pid_ns_dev, pid_ns_inode))
+        } else {
+            self.compile_options
+                .special_pid_ns
+                .map(|ns| (ns.pid_ns_dev, ns.pid_ns_inode))
+        };
+        let Some((pid_ns_dev, pid_ns_inode)) = ns_spec else {
+            return Ok((host_pid, host_tid));
+        };
+
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let key_arr_ty = i32_type.array_type(4);
+        let key_alloca = self.pm_key_alloca.ok_or_else(|| {
+            CodeGenError::LLVMError("pm_key not allocated in entry block".to_string())
+        })?;
+        // Reuse entry-allocated stack key storage: helper only needs first 8 bytes.
+        self.builder
+            .build_store(key_alloca, key_arr_ty.const_zero())
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        let pidns_info_ptr = self
+            .builder
+            .build_bit_cast(key_alloca, ptr_type, "special_pidns_info_ptr")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        let helper_args = [
+            i64_type.const_int(pid_ns_dev, false).into(),
+            i64_type.const_int(pid_ns_inode, false).into(),
+            pidns_info_ptr,
+            i64_type.const_int(BPF_PIDNS_INFO_SIZE, false).into(),
+        ];
+        let helper_ret = self.create_bpf_helper_call(
+            BPF_FUNC_GET_NS_CURRENT_PID_TGID,
+            &helper_args,
+            i64_type.into(),
+            "special_ns_pid_tgid_ret",
+        )?;
+        let helper_ret = match helper_ret {
+            BasicValueEnum::IntValue(v) => v,
+            _ => {
+                return Err(CodeGenError::LLVMError(
+                    "bpf_get_ns_current_pid_tgid did not return integer".to_string(),
+                ))
+            }
+        };
+
+        let helper_ok = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                helper_ret,
+                i64_type.const_zero(),
+                "special_ns_helper_ok",
+            )
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        let ns_pid_ptr = unsafe {
+            self.builder.build_gep(
+                key_arr_ty,
+                key_alloca,
+                &[i32_type.const_zero(), i32_type.const_zero()],
+                "special_ns_pid_ptr",
+            )
+        }
+        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let ns_tgid_ptr = unsafe {
+            self.builder.build_gep(
+                key_arr_ty,
+                key_alloca,
+                &[i32_type.const_zero(), i32_type.const_int(1, false)],
+                "special_ns_tgid_ptr",
+            )
+        }
+        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        let ns_pid = self
+            .builder
+            .build_load(i32_type, ns_pid_ptr, "special_ns_pid")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_int_value();
+        let ns_tgid = self
+            .builder
+            .build_load(i32_type, ns_tgid_ptr, "special_ns_tgid")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_int_value();
+
+        let host_pid_i32 = self
+            .builder
+            .build_int_truncate(host_pid, i32_type, "host_pid_i32")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let host_tid_i32 = self
+            .builder
+            .build_int_truncate(host_tid, i32_type, "host_tid_i32")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        let selected_pid_i32 = self
+            .builder
+            .build_select(helper_ok, ns_pid, host_pid_i32, "selected_pid_i32")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?
+            .into_int_value();
+        let selected_tid_i32 = self
+            .builder
+            .build_select(helper_ok, ns_tgid, host_tid_i32, "selected_tid_i32")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?
+            .into_int_value();
+
+        let selected_pid = self
+            .builder
+            .build_int_z_extend(selected_pid_i32, i64_type, "selected_pid")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let selected_tid = self
+            .builder
+            .build_int_z_extend(selected_tid_i32, i64_type, "selected_tid")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        Ok((selected_pid, selected_tid))
+    }
+
     fn unwrap_dwarf_type_aliases(mut t: &DwarfType) -> &DwarfType {
         loop {
             match t {
@@ -1590,27 +1742,11 @@ impl<'ctx> EbpfContext<'ctx> {
     pub fn handle_special_variable(&mut self, name: &str) -> Result<BasicValueEnum<'ctx>> {
         match name {
             "pid" => {
-                // Use BPF helper to get current PID
-                let pid_tgid = self.get_current_pid_tgid()?;
-                let pid_mask = self.context.i64_type().const_int(0xFFFFFFFF, false);
-                let pid = self
-                    .builder
-                    .build_and(pid_tgid, pid_mask, "pid")
-                    .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                let (pid, _tid) = self.get_special_pid_tid_values()?;
                 Ok(pid.into())
             }
             "tid" => {
-                // Use BPF helper to get current TID (thread ID)
-                let pid_tgid = self.get_current_pid_tgid()?;
-                let tid = self
-                    .builder
-                    .build_right_shift(
-                        pid_tgid,
-                        self.context.i64_type().const_int(32, false),
-                        false,
-                        "tid",
-                    )
-                    .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                let (_pid, tid) = self.get_special_pid_tid_values()?;
                 Ok(tid.into())
             }
             "timestamp" => {

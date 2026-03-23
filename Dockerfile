@@ -94,8 +94,18 @@ fi
 rm -rf /tmp/llvm /tmp/llvm-build /tmp/llvm.tar.xz
 SHELL
 
-# Install Rust (version specified in rust-toolchain.toml will be used)
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+# Install Rust toolchain in image to avoid per-run bootstrap downloads
+ARG RUST_TOOLCHAIN=1.88.0
+RUN <<SHELL
+set -eux
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+export PATH="/root/.cargo/bin:$PATH"
+rustup set profile minimal
+rustup toolchain install "${RUST_TOOLCHAIN}" --component rustfmt --component clippy
+rustup default "${RUST_TOOLCHAIN}"
+cargo --version
+rustc --version
+SHELL
 ENV PATH="/root/.cargo/bin:$PATH"
 
 # Expose LLVM to llvm-sys/inkwell

@@ -91,6 +91,11 @@ impl GhostscopeRunner {
     }
 
     fn resolve_ghostscope_bin() -> PathBuf {
+        // Highest priority: explicit override for containerized/isolated runs.
+        if let Ok(p) = std::env::var("GHOSTSCOPE_TEST_BIN") {
+            return PathBuf::from(p);
+        }
+
         // Prefer Cargo-provided binary path, fallback to a relative debug path
         if let Ok(p) = std::env::var("CARGO_BIN_EXE_ghostscope") {
             PathBuf::from(p)
@@ -158,7 +163,6 @@ impl GhostscopeRunner {
 
         let mut stdout_content = String::new();
         let mut stderr_content = String::new();
-
         // Incremental read with periodic polls, bounded by overall timeout
         let read_task = async {
             let mut stdout_line = String::new();

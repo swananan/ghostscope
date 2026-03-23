@@ -815,6 +815,7 @@ pub enum RuntimeStatus {
         target: String,
         status: TraceStatus,
         pid: Option<u32>,
+        host_pid: Option<u32>,
         binary: String,
         script_preview: Option<String>,
         pc: u64,
@@ -1063,6 +1064,7 @@ impl RuntimeStatus {
                 target,
                 status,
                 pid,
+                host_pid,
                 binary,
                 script_preview,
                 pc,
@@ -1081,8 +1083,18 @@ impl RuntimeStatus {
                 fields.push(("🎯 Target", target.clone()));
                 fields.push(("📦 Binary", binary.clone()));
                 fields.push(("📍 Address", format!("{binary_name}+0x{pc:x}")));
-                if let Some(pid_val) = pid {
-                    fields.push(("🏷️ PID", pid_val.to_string()));
+                match (pid, host_pid) {
+                    (Some(proc_pid), Some(host_pid_val)) if proc_pid != host_pid_val => {
+                        fields.push(("🏷️ PID(proc)", proc_pid.to_string()));
+                        fields.push(("🏷️ PID(host)", host_pid_val.to_string()));
+                    }
+                    (Some(proc_pid), _) => {
+                        fields.push(("🏷️ PID", proc_pid.to_string()));
+                    }
+                    (None, Some(host_pid_val)) => {
+                        fields.push(("🏷️ PID(host)", host_pid_val.to_string()));
+                    }
+                    (None, None) => {}
                 }
                 if let Some(ref script) = script_preview {
                     fields.push(("📝 Script", script.clone()));
@@ -1115,6 +1127,7 @@ impl RuntimeStatus {
                 target,
                 status,
                 pid,
+                host_pid,
                 binary,
                 script_preview: _,
                 pc,
@@ -1164,15 +1177,46 @@ impl RuntimeStatus {
                         .build(),
                 );
 
-                if let Some(p) = pid {
-                    lines.push(
-                        StyledLineBuilder::new()
-                            .text("  ")
-                            .key("🏷️ PID:")
-                            .text(" ")
-                            .value(p.to_string())
-                            .build(),
-                    );
+                match (pid, host_pid) {
+                    (Some(proc_pid), Some(host_pid_val)) if proc_pid != host_pid_val => {
+                        lines.push(
+                            StyledLineBuilder::new()
+                                .text("  ")
+                                .key("🏷️ PID(proc):")
+                                .text(" ")
+                                .value(proc_pid.to_string())
+                                .build(),
+                        );
+                        lines.push(
+                            StyledLineBuilder::new()
+                                .text("  ")
+                                .key("🏷️ PID(host):")
+                                .text(" ")
+                                .value(host_pid_val.to_string())
+                                .build(),
+                        );
+                    }
+                    (Some(proc_pid), _) => {
+                        lines.push(
+                            StyledLineBuilder::new()
+                                .text("  ")
+                                .key("🏷️ PID:")
+                                .text(" ")
+                                .value(proc_pid.to_string())
+                                .build(),
+                        );
+                    }
+                    (None, Some(host_pid_val)) => {
+                        lines.push(
+                            StyledLineBuilder::new()
+                                .text("  ")
+                                .key("🏷️ PID(host):")
+                                .text(" ")
+                                .value(host_pid_val.to_string())
+                                .build(),
+                        );
+                    }
+                    (None, None) => {}
                 }
 
                 Some(lines)

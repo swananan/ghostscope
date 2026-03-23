@@ -1,4 +1,4 @@
 interface:
   display_name: "GhostScope E2E Runner"
-  short_description: "Run GhostScope e2e via runner service or fallback flow"
-  default_prompt: "Use this skill to run GhostScope e2e tests through scripts/e2e_runner and report results."
+  short_description: "Run GhostScope e2e via runner service or container scripts"
+  default_prompt: "Use this skill to run GhostScope e2e tests through scripts/e2e and report results."
