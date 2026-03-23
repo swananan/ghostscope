@@ -225,6 +225,7 @@ trace sample.c:42 {
 ```
 
 提示：目前仅支持 `$pid`、`$tid`、`$timestamp`。后续可能按需加入“寄存器相关”的特殊变量。
+在容器 PID namespace 场景下，若内核不支持 `bpf_get_ns_current_pid_tgid`（helper id 120），`$pid/$tid` 可能表现为宿主机 namespace 值，与容器内可见 PID 不一致。
 
 ### 变量查找顺序
 

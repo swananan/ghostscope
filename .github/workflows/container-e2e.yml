@@ -1,0 +1,32 @@
+name: Container E2E
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  container-e2e-smoke:
+    name: Container E2E (${{ matrix.pid_mode }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        pid_mode: [private, host]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Run container e2e smoke
+        env:
+          E2E_CONTAINER_IMAGE: ghcr.io/swananan/ghostscope-build:ubuntu20.04-llvm18.1.8
+        run: |
+          ./scripts/e2e/container/run_container_e2e.sh --pid-mode "${{ matrix.pid_mode }}"

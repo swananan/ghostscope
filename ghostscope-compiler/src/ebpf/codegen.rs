@@ -69,6 +69,8 @@ struct ComplexArg<'ctx> {
 }
 
 impl<'ctx> EbpfContext<'ctx> {
+    const UNKNOWN_CHAR_ARRAY_READ_FALLBACK: usize = 256;
+
     /// Unified expression resolver: returns a ComplexArg carrying
     /// a consistent var_name_index/type_index/access_path/data_len/source
     /// with strict priority: script variables -> DWARF (locals/params/globals).
@@ -997,8 +999,28 @@ impl<'ctx> EbpfContext<'ctx> {
         }
     }
 
+    fn is_char_byte_typeinfo(t: &ghostscope_dwarf::TypeInfo) -> bool {
+        use ghostscope_dwarf::TypeInfo as TI;
+        match t {
+            TI::BaseType { size, encoding, .. } => {
+                *size == 1
+                    && (*encoding == ghostscope_dwarf::constants::DW_ATE_unsigned_char.0 as u16
+                        || *encoding == ghostscope_dwarf::constants::DW_ATE_signed_char.0 as u16
+                        || *encoding == ghostscope_dwarf::constants::DW_ATE_unsigned.0 as u16
+                        || *encoding == ghostscope_dwarf::constants::DW_ATE_signed.0 as u16)
+            }
+            TI::TypedefType {
+                underlying_type, ..
+            }
+            | TI::QualifiedType {
+                underlying_type, ..
+            } => Self::is_char_byte_typeinfo(underlying_type),
+            _ => false,
+        }
+    }
+
     /// Compute read size for a given DWARF type.
-    /// No fallback: if DWARF doesn't provide size for arrays, return 0 and let caller error out.
+    /// Keep strict behavior for general unsized arrays; only apply a bounded fallback for char[].
     fn compute_read_size_for_type(t: &ghostscope_dwarf::TypeInfo) -> usize {
         use ghostscope_dwarf::TypeInfo as TI;
         match t {
@@ -1019,6 +1041,11 @@ impl<'ctx> EbpfContext<'ctx> {
                 if let Some(cnt) = element_count {
                     return elem_size * (*cnt as usize);
                 }
+                // Some toolchains emit extern/definition pairs where char[] has no bound in DWARF.
+                // Keep other unsized arrays strict to avoid silently over-reading unknown layouts.
+                if Self::is_char_byte_typeinfo(element_type) {
+                    return Self::UNKNOWN_CHAR_ARRAY_READ_FALLBACK;
+                }
                 0
             }
             TI::TypedefType {
@@ -1030,8 +1057,6 @@ impl<'ctx> EbpfContext<'ctx> {
             _ => t.size() as usize,
         }
     }
-
-    // (No implicit char[] fallback here; rely on DWARF/type resolver to provide sizes.)
 
     fn expr_to_name(&self, expr: &crate::script::ast::Expr) -> String {
         use crate::script::ast::Expr as E;

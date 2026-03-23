@@ -317,14 +317,17 @@ impl DetailedParser {
                                     }
                                     // bit offsets/sizes (optional)
                                     let mut bit_offset: Option<u8> = None;
+                                    let mut raw_bit_offset: Option<u64> = None;
+                                    let mut has_data_bit_offset = false;
                                     let mut bit_size: Option<u8> = None;
                                     if let Some(bo) = ce.attr(gimli::DW_AT_bit_offset) {
                                         if let gimli::AttributeValue::Udata(v) = bo.value() {
-                                            bit_offset = u8::try_from(v).ok();
+                                            raw_bit_offset = Some(v);
                                         }
                                     }
                                     if let Some(bs) = ce.attr(gimli::DW_AT_data_bit_offset) {
                                         if let gimli::AttributeValue::Udata(v) = bs.value() {
+                                            has_data_bit_offset = true;
                                             bit_offset = u8::try_from(v % 8).ok();
                                             m_offset = v / 8;
                                         }
@@ -332,6 +335,25 @@ impl DetailedParser {
                                     if let Some(bsz) = ce.attr(gimli::DW_AT_bit_size) {
                                         if let gimli::AttributeValue::Udata(v) = bsz.value() {
                                             bit_size = u8::try_from(v).ok();
+                                        }
+                                    }
+                                    // DW_AT_bit_offset (legacy) is typically counted from the MSB
+                                    // of the storage unit; convert to little-endian LSB offset.
+                                    // When DW_AT_data_bit_offset is present we already have LSB-based
+                                    // layout and should not convert again.
+                                    if !has_data_bit_offset {
+                                        if let (Some(raw_bo), Some(bs)) = (raw_bit_offset, bit_size)
+                                        {
+                                            let storage_bits = m_type.size().saturating_mul(8);
+                                            let bs_u64 = bs as u64;
+                                            if storage_bits > 0 && raw_bo + bs_u64 <= storage_bits {
+                                                let le_off = storage_bits - raw_bo - bs_u64;
+                                                bit_offset = u8::try_from(le_off).ok();
+                                            } else {
+                                                bit_offset = u8::try_from(raw_bo).ok();
+                                            }
+                                        } else if let Some(raw_bo) = raw_bit_offset {
+                                            bit_offset = u8::try_from(raw_bo).ok();
                                         }
                                     }
                                     if m_name.is_empty() {

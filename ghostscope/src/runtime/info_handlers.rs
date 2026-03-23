@@ -21,7 +21,8 @@ pub async fn handle_info_trace(
                     } else {
                         TraceStatus::Disabled
                     },
-                    pid: snapshot.target_pid,
+                    pid: snapshot.target_proc_pid.or(snapshot.target_pid),
+                    host_pid: snapshot.target_pid,
                     binary: snapshot.binary_path,
                     script_preview: Some(snapshot.script_content),
                     pc: snapshot.pc,

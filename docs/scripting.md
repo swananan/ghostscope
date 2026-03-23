@@ -219,6 +219,7 @@ trace sample.c:42 {
 ```
 
 Note: Currently only `$pid`, `$tid`, `$timestamp` are supported. Register‑related specials may be added later if needed.
+In container PID-namespace environments, if `bpf_get_ns_current_pid_tgid` (helper id 120) is unavailable, `$pid/$tid` may reflect host-namespace values and differ from container-visible PIDs.
 
 ### Variable Lookup Order
 

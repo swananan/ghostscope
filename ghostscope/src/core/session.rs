@@ -1,4 +1,4 @@
-use crate::config::{MergedConfig, ParsedArgs};
+use crate::config::{MergedConfig, ParsedArgs, ResolvedPidInfo};
 use crate::runtime::source_path_resolver::SourcePathResolver;
 use crate::tracing::TraceManager;
 use anyhow::Result;
@@ -14,7 +14,12 @@ pub struct GhostSession {
     pub process_analyzer: Option<DwarfAnalyzer>,
     pub target_binary: Option<String>,
     pub target_args: Vec<String>,
+    /// PID used for userspace /proc operations.
     pub target_pid: Option<u32>,
+    /// Host PID used by eBPF PID filter and uprobe attach.
+    pub target_host_pid: Option<u32>,
+    /// Optional mapping diagnostics for PID namespace/container scenarios.
+    pub pid_mapping: Option<ResolvedPidInfo>,
     pub trace_manager: TraceManager, // Manages all trace instances with their loaders
     pub source_path_resolver: SourcePathResolver, // Resolves DWARF paths to actual filesystem paths
     #[allow(dead_code)]
@@ -34,6 +39,8 @@ impl GhostSession {
             target_binary: config.target_path.clone(),
             target_args: config.binary_args.clone(),
             target_pid: config.pid,
+            target_host_pid: config.host_pid.or(config.pid),
+            pid_mapping: config.pid_mapping.clone(),
             debug_file: config
                 .debug_file
                 .as_ref()
@@ -44,6 +51,18 @@ impl GhostSession {
             coordinator: Arc::new(Mutex::new(ProcessManager::new())),
             sysmon: None,
         };
+
+        if let Some(ref mapping) = s.pid_mapping {
+            info!("Session PID mapping: {}", mapping.compact_display());
+        }
+        if let Some(cfg) = s.config.as_ref() {
+            if let Some(env) = cfg.runtime_env.as_ref() {
+                info!("Session runtime environment: {}", env.compact_display());
+            }
+            if let Some(filter) = cfg.pid_filter_spec {
+                info!("Session PID filter spec: {:?}", filter);
+            }
+        }
 
         // Start sysmon:
         // -t executable: always start (PID collection is constrained in eBPF)
@@ -92,6 +111,8 @@ impl GhostSession {
             target_binary: args.target_path.clone(),
             target_args: args.binary_args.clone(),
             target_pid: args.pid,
+            target_host_pid: args.pid,
+            pid_mapping: None,
             debug_file: args
                 .debug_file
                 .as_ref()
@@ -102,6 +123,13 @@ impl GhostSession {
             coordinator: Arc::new(Mutex::new(ProcessManager::new())),
             sysmon: None,
         };
+        if let Some(pid) = s.target_pid {
+            info!(
+                "Session PID (legacy mode): proc_pid={} host_pid={}",
+                pid,
+                s.target_host_pid.unwrap_or(pid)
+            );
+        }
         if s.target_pid.is_none() && s.target_binary.is_some() {
             let target_module = s.target_binary.as_ref().map(PathBuf::from);
             let cfg = SysmonConfig {
@@ -274,6 +302,26 @@ impl GhostSession {
     /// Get PID if available
     pub fn pid(&self) -> Option<u32> {
         self.target_pid
+    }
+
+    /// PID to use for userspace /proc reads.
+    pub fn pid_for_proc(&self) -> Option<u32> {
+        self.target_pid
+    }
+
+    /// PID to use for eBPF-side filtering.
+    pub fn pid_for_filter(&self) -> Option<u32> {
+        self.target_host_pid.or(self.target_pid)
+    }
+
+    /// PID to use for uprobe attach and userspace /proc access.
+    pub fn pid_for_attach(&self) -> Option<u32> {
+        self.target_pid
+    }
+
+    /// Get resolved PID mapping diagnostics if available.
+    pub fn pid_mapping(&self) -> Option<&ResolvedPidInfo> {
+        self.pid_mapping.as_ref()
     }
 
     /// Check if session was started with target path (target file mode)

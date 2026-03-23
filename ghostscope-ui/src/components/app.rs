@@ -2670,6 +2670,7 @@ impl App {
                 target,
                 status,
                 pid,
+                host_pid,
                 binary,
                 script_preview,
                 pc,
@@ -2723,8 +2724,18 @@ impl App {
                 response.push_str(&format!("  Status: {status}\n"));
                 response.push_str(&format!("  Binary: {binary}\n"));
                 response.push_str(&format!("  PC: 0x{pc:x}\n"));
-                if let Some(p) = pid {
-                    response.push_str(&format!("  PID: {p}\n"));
+                match (pid, host_pid) {
+                    (Some(proc_pid), Some(host_pid_val)) if proc_pid != host_pid_val => {
+                        response.push_str(&format!("  PID(proc): {proc_pid}\n"));
+                        response.push_str(&format!("  PID(host): {host_pid_val}\n"));
+                    }
+                    (Some(proc_pid), _) => {
+                        response.push_str(&format!("  PID: {proc_pid}\n"));
+                    }
+                    (None, Some(host_pid_val)) => {
+                        response.push_str(&format!("  PID(host): {host_pid_val}\n"));
+                    }
+                    (None, None) => {}
                 }
                 if let Some(ref preview) = script_preview {
                     response.push_str(&format!("  Script:\n{preview}\n"));
@@ -2736,6 +2747,7 @@ impl App {
                         target: target.clone(),
                         status: status.clone(),
                         pid,
+                        host_pid,
                         binary: binary.clone(),
                         script_preview: None,
                         pc,

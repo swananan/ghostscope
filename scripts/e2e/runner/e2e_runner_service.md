@@ -5,7 +5,7 @@
 Install project skill for Codex:
 
 ```bash
-./scripts/e2e_runner/install_codex_skill.sh
+./scripts/e2e/runner/install_codex_skill.sh
 ```
 
 Then restart Codex.
@@ -13,7 +13,7 @@ Then restart Codex.
 ## Start service
 
 ```bash
-./scripts/e2e_runner/start_e2e_runner_service.sh
+./scripts/e2e/runner/start_e2e_runner_service.sh
 ```
 
 Common env vars:
@@ -47,10 +47,19 @@ curl -sS -X POST http://127.0.0.1:8788/runs \
 ## Agent-side trigger
 
 ```bash
-./scripts/e2e_runner/run_e2e_runner.sh
+./scripts/e2e/runner/run_e2e_runner.sh
 ```
 
 Optional env vars for agent trigger:
 
 - `E2E_REPO_DIR=/path/to/repo`
 - `E2E_TEST_CASE=<cargo_test_filter>`
+
+## Container PID smoke (CI/local)
+
+Use the Docker-based smoke runner for `-p` PID behavior validation:
+
+```bash
+./scripts/e2e/container/run_container_e2e.sh --pid-mode private
+./scripts/e2e/container/run_container_e2e.sh --pid-mode host
+```

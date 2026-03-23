@@ -40,8 +40,16 @@ async fn run_cli_with_session(
             info!("Binary arguments: {:?}", session.target_args);
         }
     }
-    if let Some(pid) = session.target_pid {
+    if let Some(mapping) = session.pid_mapping() {
+        info!("PID mapping: {}", mapping.compact_display());
+    } else if let Some(pid) = session.target_pid {
         info!("Target PID: {}", pid);
+    }
+    if let Some(env) = config.runtime_env.as_ref() {
+        info!("Runtime environment: {}", env.compact_display());
+    }
+    if let Some(spec) = config.pid_filter_spec {
+        info!("PID filter strategy: {:?}", spec);
     }
 
     // Step 4: Validate binary analysis
@@ -67,12 +75,17 @@ async fn run_cli_with_session(
                 }
             }
             None => {
+                let host_hint = config
+                    .host_pid
+                    .map(|pid| format!(" (host PID for eBPF filter: {pid})"))
+                    .unwrap_or_default();
                 return Err(anyhow::anyhow!(
                     "Process analysis failed! Cannot proceed without process information. \
                     Possible solutions: 1. Check that PID {} exists: ps -p {}, \
-                    2. Check process permissions, 3. Run with sudo if needed for /proc access",
+                    2. Check process permissions, 3. Run with sudo if needed for /proc access{}",
                     config.pid.unwrap_or(0),
-                    config.pid.unwrap_or(0)
+                    config.pid.unwrap_or(0),
+                    host_hint
                 ));
             }
         }

@@ -21,6 +21,18 @@ GhostScope 可以通过命令行参数、配置文件和环境变量进行配置
 ghostscope -p <PID>
 ghostscope --pid <PID>
 
+# PID namespace 感知行为（Docker/WSL/容器）
+# - 按你实际执行 `ghostscope -p` 命令的环境里看到的 PID 输入即可。
+# - `-p` 的输入语义是“当前可见 PID”，不是“永远填写宿主机 PID”。
+# - 更完整的容器场景解释见 docs/zh/container.md
+# - 启动时的决策顺序：
+#   1) 先检测 GhostScope 自身运行环境（container/host/unknown）
+#   2) 解析 /proc/<pid>/status 的 NSpid 映射
+#   3) 探测 helper 支持，若可用优先使用 bpf_get_ns_current_pid_tgid
+#   4) helper 不可用时回退到 host PID 映射
+# - 若该 PID 在当前命名空间不可见，GhostScope 会直接报错，
+#   并要求你提供当前命名空间内真实存在的 PID。
+
 # 指定目标可执行文件或库（支持路径解析）
 ghostscope -t <PATH>
 ghostscope --target <PATH>

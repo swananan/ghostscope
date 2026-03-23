@@ -1,9 +1,11 @@
 use aya::maps::MapData;
 use aya_obj::{
     generated::bpf_map_type::{BPF_MAP_TYPE_PERF_EVENT_ARRAY, BPF_MAP_TYPE_RINGBUF},
+    generated::{bpf_attr, bpf_cmd, bpf_insn, bpf_prog_type},
     maps::PinningType,
     EbpfSectionKind, Map,
 };
+use libc::SYS_bpf;
 use std::{fmt, sync::OnceLock};
 use tracing::{error, info, warn};
 
@@ -38,6 +40,8 @@ pub struct KernelCapabilities {
     pub supports_ringbuf: bool,
     /// Whether the kernel supports BPF_MAP_TYPE_PERF_EVENT_ARRAY (requires >= 4.3)
     pub supports_perf_event_array: bool,
+    /// Whether bpf_get_ns_current_pid_tgid helper is supported for kprobe/uprobe class programs.
+    pub supports_ns_current_pid_tgid_helper: bool,
 }
 
 impl KernelCapabilities {
@@ -73,6 +77,13 @@ impl KernelCapabilities {
             .map(|caps| caps.supports_perf_event_array)
             .unwrap_or(false)
     }
+
+    /// Check if bpf_get_ns_current_pid_tgid helper is supported.
+    pub fn ns_current_pid_tgid_helper_supported() -> bool {
+        Self::get()
+            .map(|caps| caps.supports_ns_current_pid_tgid_helper)
+            .unwrap_or(false)
+    }
 }
 
 fn detect_full_capabilities() -> Result<KernelCapabilities, KernelCapabilityError> {
@@ -99,9 +110,17 @@ fn detect_full_capabilities() -> Result<KernelCapabilities, KernelCapabilityErro
         ));
     }
 
+    let supports_ns_current_pid_tgid_helper = detect_ns_current_pid_tgid_helper_support();
+    if supports_ns_current_pid_tgid_helper {
+        info!("✓ Kernel supports helper bpf_get_ns_current_pid_tgid (id=120)");
+    } else {
+        warn!("⚠️  Kernel does not support helper bpf_get_ns_current_pid_tgid (id=120)");
+    }
+
     Ok(KernelCapabilities {
         supports_ringbuf,
         supports_perf_event_array,
+        supports_ns_current_pid_tgid_helper,
     })
 }
 
@@ -120,9 +139,17 @@ fn detect_perf_only_capabilities() -> Result<KernelCapabilities, KernelCapabilit
 
     info!("✓ Kernel supports PerfEventArray (>= 4.3)");
 
+    let supports_ns_current_pid_tgid_helper = detect_ns_current_pid_tgid_helper_support();
+    if supports_ns_current_pid_tgid_helper {
+        info!("✓ Kernel supports helper bpf_get_ns_current_pid_tgid (id=120)");
+    } else {
+        warn!("⚠️  Kernel does not support helper bpf_get_ns_current_pid_tgid (id=120)");
+    }
+
     Ok(KernelCapabilities {
         supports_ringbuf: false,
         supports_perf_event_array,
+        supports_ns_current_pid_tgid_helper,
     })
 }
 
@@ -204,4 +231,65 @@ fn detect_perf_event_array_support() -> bool {
             false
         }
     }
+}
+
+fn detect_ns_current_pid_tgid_helper_support() -> bool {
+    const BPF_FUNC_GET_NS_CURRENT_PID_TGID: i32 = 120;
+
+    let insns = [
+        make_bpf_insn(0x85, 0, 0, 0, BPF_FUNC_GET_NS_CURRENT_PID_TGID),
+        make_bpf_insn(0x95, 0, 0, 0, 0),
+    ];
+
+    let license = b"GPL\0";
+    let mut log_buf = [0u8; 4096];
+    let mut attr = unsafe { std::mem::zeroed::<bpf_attr>() };
+    unsafe {
+        let u = &mut attr.__bindgen_anon_3;
+        u.prog_type = bpf_prog_type::BPF_PROG_TYPE_KPROBE as u32;
+        u.insn_cnt = insns.len() as u32;
+        u.insns = insns.as_ptr() as u64;
+        u.license = license.as_ptr() as u64;
+        u.log_level = 1;
+        u.log_buf = log_buf.as_mut_ptr() as u64;
+        u.log_size = log_buf.len() as u32;
+    }
+
+    let ret = unsafe {
+        libc::syscall(
+            SYS_bpf as libc::c_long,
+            bpf_cmd::BPF_PROG_LOAD as libc::c_long,
+            &mut attr as *mut _ as *mut libc::c_void,
+            std::mem::size_of::<bpf_attr>(),
+        )
+    };
+
+    if ret >= 0 {
+        let fd = ret as libc::c_int;
+        let _ = unsafe { libc::close(fd) };
+        return true;
+    }
+
+    let log = String::from_utf8_lossy(&log_buf);
+    if log.contains("invalid func ")
+        || log.contains("unknown func ")
+        || log.contains("program of this type cannot use helper ")
+    {
+        return false;
+    }
+
+    // If verifier produced any non-empty diagnostics but not "unknown helper" patterns,
+    // treat it as supported (typically argument/type mismatch with a known helper).
+    let has_any_log = !log.trim_matches(char::from(0)).trim().is_empty();
+    has_any_log
+}
+
+fn make_bpf_insn(code: u8, dst_reg: u8, src_reg: u8, off: i16, imm: i32) -> bpf_insn {
+    let mut insn = unsafe { std::mem::zeroed::<bpf_insn>() };
+    insn.code = code;
+    insn.set_dst_reg(dst_reg);
+    insn.set_src_reg(src_reg);
+    insn.off = off;
+    insn.imm = imm;
+    insn
 }

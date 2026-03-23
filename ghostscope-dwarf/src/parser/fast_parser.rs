@@ -369,10 +369,8 @@ impl<'a> DwarfParser<'a> {
                 | gimli::constants::DW_TAG_enumeration_type
                 | gimli::constants::DW_TAG_typedef => {
                     if let Some(name) = self.extract_name(self.dwarf, unit, entry)? {
-                        let is_decl = match entry.attr(gimli::constants::DW_AT_declaration) {
-                            Some(attr) => matches!(attr.value(), gimli::AttributeValue::Flag(true)),
-                            None => false,
-                        };
+                        let is_decl = Self::bool_attr(entry, gimli::constants::DW_AT_declaration)?
+                            .unwrap_or(false);
                         let flags = crate::core::IndexFlags {
                             is_type_declaration: is_decl,
                             ..Default::default()
@@ -530,11 +528,7 @@ impl<'a> DwarfParser<'a> {
 
         metadata.is_inline = Self::extract_inline_flag(entry)?;
 
-        if let Some(attr) = entry.attr(gimli::constants::DW_AT_external) {
-            if let gimli::AttributeValue::Flag(flag) = attr.value() {
-                metadata.is_external = Some(flag);
-            }
-        }
+        metadata.is_external = Self::bool_attr(entry, gimli::constants::DW_AT_external)?;
 
         let mut merge_from_origin = |origin_offset: gimli::UnitOffset| -> Result<()> {
             if visited.contains(&origin_offset) {
@@ -589,14 +583,25 @@ impl<'a> DwarfParser<'a> {
         Ok(metadata)
     }
 
+    fn bool_attr(
+        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
+        attr: gimli::DwAt,
+    ) -> Result<Option<bool>> {
+        let Some(attr) = entry.attr(attr)? else {
+            return Ok(None);
+        };
+        Ok(match attr.value() {
+            gimli::AttributeValue::Flag(v) => Some(v),
+            _ => None,
+        })
+    }
+
     fn is_static_symbol(
         &self,
         entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
     ) -> Result<bool> {
-        if let Some(attr) = entry.attr(gimli::constants::DW_AT_external) {
-            if let gimli::AttributeValue::Flag(is_external) = attr.value() {
-                return Ok(!is_external);
-            }
+        if let Some(is_external) = Self::bool_attr(entry, gimli::constants::DW_AT_external)? {
+            return Ok(!is_external);
         }
         Ok(true)
     }
@@ -604,12 +609,7 @@ impl<'a> DwarfParser<'a> {
     fn is_declaration(
         entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
     ) -> Result<bool> {
-        if let Some(attr) = entry.attr(gimli::constants::DW_AT_declaration) {
-            if let gimli::AttributeValue::Flag(is_decl) = attr.value() {
-                return Ok(is_decl);
-            }
-        }
-        Ok(false)
+        Ok(Self::bool_attr(entry, gimli::constants::DW_AT_declaration)?.unwrap_or(false))
     }
 
     /// Extract all address ranges from DIE (for functions)

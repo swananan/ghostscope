@@ -24,3 +24,4 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "mio", "net"] }
 log = { workspace = true }
 bytes = "1.5"
+libc = "0.2"
