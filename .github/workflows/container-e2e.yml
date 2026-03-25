@@ -15,6 +15,8 @@ jobs:
     name: Container E2E Full (${{ matrix.name }})
     runs-on: ubuntu-22.04
     timeout-minutes: 90
+    env:
+      LLVM_SYS_181_PREFIX: /usr/lib/llvm-18
     strategy:
       fail-fast: false
       matrix:
@@ -33,6 +35,40 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Install LLVM 18 and Polly
+        run: |
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 18
+          sudo apt-get install -y llvm-18-dev libpolly-18-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-index-
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-${{ github.job }}-${{ matrix.name }}-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ github.job }}-${{ matrix.name }}-target-
+
       - name: Run container topology full e2e
         env:
           E2E_CONTAINER_IMAGE: ghcr.io/swananan/ghostscope-build:ubuntu20.04-llvm18.1.8
@@ -40,17 +76,19 @@ jobs:
           E2E_TARGET_SANDBOX: ${{ matrix.target_sandbox }}
           E2E_SHARE_SANDBOX: ${{ matrix.share_sandbox }}
         run: |
-          sudo env \
+          sudo -E env \
             E2E_CONTAINER_IMAGE="$E2E_CONTAINER_IMAGE" \
             E2E_GHOSTSCOPE_SANDBOX="$E2E_GHOSTSCOPE_SANDBOX" \
             E2E_TARGET_SANDBOX="$E2E_TARGET_SANDBOX" \
             E2E_SHARE_SANDBOX="$E2E_SHARE_SANDBOX" \
-            cargo test --all-features -- --nocapture
+            "$(which cargo)" test --all-features -- --nocapture
 
   container-e2e-smoke:
     name: Container E2E Smoke (${{ matrix.name }})
     runs-on: ubuntu-22.04
     timeout-minutes: 90
+    env:
+      LLVM_SYS_181_PREFIX: /usr/lib/llvm-18
     strategy:
       fail-fast: false
       matrix:
@@ -65,6 +103,40 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Install LLVM 18 and Polly
+        run: |
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 18
+          sudo apt-get install -y llvm-18-dev libpolly-18-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-index-
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-${{ github.job }}-${{ matrix.name }}-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ github.job }}-${{ matrix.name }}-target-
+
       - name: Run host-PID same-sandbox smoke
         env:
           E2E_CONTAINER_IMAGE: ghcr.io/swananan/ghostscope-build:ubuntu20.04-llvm18.1.8
@@ -77,10 +149,10 @@ jobs:
             test_correct_pid_filtering \
             test_pid_specificity_with_multiple_processes
           do
-            sudo env \
+            sudo -E env \
               E2E_CONTAINER_IMAGE="$E2E_CONTAINER_IMAGE" \
               E2E_GHOSTSCOPE_SANDBOX="$E2E_GHOSTSCOPE_SANDBOX" \
               E2E_TARGET_SANDBOX="$E2E_TARGET_SANDBOX" \
               E2E_SHARE_SANDBOX="$E2E_SHARE_SANDBOX" \
-              cargo test --all-features --test script_execution "$test_case" -- --nocapture
+              "$(which cargo)" test --all-features --test script_execution "$test_case" -- --nocapture
           done

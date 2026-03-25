@@ -10,6 +10,10 @@ use serial_test::serial;
 use std::path::Path;
 use std::time::Duration;
 
+fn visible_pid_for_target(target: &common::targets::TargetHandle) -> anyhow::Result<u32> {
+    target.visible_pid_from(&common::sandbox::SandboxHandle::default_ghostscope()?)
+}
+
 async fn run_ghostscope_with_script_for_target(
     script_content: &str,
     timeout_secs: u64,
@@ -57,7 +61,7 @@ async fn run_ghostscope_then_start_exe(
     // Start target process after a small delay
     tokio::time::sleep(Duration::from_millis(launch_delay_ms)).await;
     let target = spawn_globals_program(launcher_exe).await?;
-    let pid = target.host_pid();
+    let pid = visible_pid_for_target(&target)?;
 
     // Wait for GhostScope to finish (timeout-based)
     let (exit_code, stdout, stderr) = gs_task
@@ -78,7 +82,7 @@ async fn test_t_mode_executable_globals_prints() -> anyhow::Result<()> {
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
     let target = spawn_globals_program(&binary_path).await?;
-    let pid = target.host_pid();
+    let pid = visible_pid_for_target(&target)?;
 
     let script = r#"
 trace globals_program.c:32 {
@@ -136,7 +140,7 @@ async fn test_t_mode_library_globals_prints() -> anyhow::Result<()> {
     let bin_dir = binary_path.parent().unwrap().to_path_buf();
     let lib_path = bin_dir.join("libgvars.so");
     let target = spawn_globals_program(&binary_path).await?;
-    let pid = target.host_pid();
+    let pid = visible_pid_for_target(&target)?;
 
     let script = r#"
 trace lib_tick {
@@ -187,7 +191,7 @@ async fn test_t_mode_executable_rodata_and_struct_pretty() -> anyhow::Result<()>
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
     let target = spawn_globals_program(&binary_path).await?;
-    let pid = target.host_pid();
+    let pid = visible_pid_for_target(&target)?;
 
     // At line 26, aliases (s, ls, gm, etc.) are initialized
     let script = r#"
@@ -328,7 +332,7 @@ trace lib_tick {
     // Start the target process after a short delay
     tokio::time::sleep(Duration::from_millis(700)).await;
     let target = spawn_globals_program(&binary_path).await?;
-    let pid = target.host_pid();
+    let pid = visible_pid_for_target(&target)?;
 
     // Wait for GhostScope to finish
     let (exit_code, stdout, stderr) = gs_task
@@ -457,7 +461,7 @@ trace lib_tick {
 
     tokio::time::sleep(Duration::from_millis(500)).await;
     let target = spawn_globals_program(&binary_path).await?;
-    let pid = target.host_pid();
+    let pid = visible_pid_for_target(&target)?;
 
     let (exit_code, stdout, stderr) = gs_task
         .await

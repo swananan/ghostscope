@@ -587,7 +587,7 @@ impl<'a> DwarfParser<'a> {
         entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
         attr: gimli::DwAt,
     ) -> Result<Option<bool>> {
-        let Some(attr) = entry.attr(attr)? else {
+        let Some(attr) = entry.attr(attr) else {
             return Ok(None);
         };
         Ok(match attr.value() {
