@@ -13,12 +13,8 @@ mod common;
 use common::{init, OptimizationLevel, FIXTURES};
 use lazy_static::lazy_static;
 use std::collections::HashMap;
-use std::process::Stdio;
 use std::sync::{Arc, Once};
-use std::time::Duration;
-use tokio::process::Command;
 use tokio::sync::RwLock;
-use tokio::time::timeout;
 
 // Global test program management
 lazy_static! {
@@ -28,82 +24,61 @@ lazy_static! {
 }
 
 struct GlobalTestProcess {
-    child: tokio::process::Child,
-    pid: u32,
+    target: common::targets::TargetHandle,
     optimization_level: OptimizationLevel,
 }
 
 impl GlobalTestProcess {
     async fn start_with_opt(opt_level: OptimizationLevel) -> anyhow::Result<Self> {
-        let binary_path = FIXTURES.get_test_binary_with_opt("sample_program", opt_level)?;
-
         println!(
-            "🚀 Starting global sample_program ({}): {}",
-            opt_level.description(),
-            binary_path.display()
+            "🚀 Starting global sample_program ({})",
+            opt_level.description()
         );
 
-        let child = Command::new(binary_path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-
-        let pid = child
-            .id()
-            .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-
-        // Give it a moment to start
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        let target = common::targets::TargetLauncher::sample_program_with_opt(opt_level)
+            .spawn()
+            .await?;
+        let host_pid = target.host_pid();
+        let visible_pid =
+            target.visible_pid_from(&common::sandbox::SandboxHandle::default_ghostscope()?)?;
 
         println!(
-            "✓ Started global sample_program ({}) with PID: {}",
+            "✓ Started global sample_program ({}) with host_pid={} visible_pid={}",
             opt_level.description(),
-            pid
+            host_pid,
+            visible_pid
         );
 
         Ok(Self {
-            child,
-            pid,
+            target,
             optimization_level: opt_level,
         })
     }
 
-    fn get_pid(&self) -> u32 {
-        self.pid
+    fn host_pid(&self) -> u32 {
+        self.target.host_pid()
     }
 
-    async fn terminate(mut self) -> anyhow::Result<()> {
+    fn visible_pid(&self) -> anyhow::Result<u32> {
+        self.target
+            .visible_pid_from(&common::sandbox::SandboxHandle::default_ghostscope()?)
+    }
+
+    fn target(&self) -> &common::targets::TargetHandle {
+        &self.target
+    }
+
+    async fn terminate(self) -> anyhow::Result<()> {
         println!(
-            "🛑 Terminating global sample_program ({}, PID: {})",
+            "🛑 Terminating global sample_program ({}, host PID: {})",
             self.optimization_level.description(),
-            self.pid
+            self.host_pid()
         );
-
-        // Try graceful shutdown first
-        let _ = self.child.kill().await.is_ok();
-
-        // Wait for termination with timeout
-        match timeout(Duration::from_secs(2), self.child.wait()).await {
-            Ok(_) => {
-                println!(
-                    "✓ Global sample_program ({}) terminated gracefully",
-                    self.optimization_level.description()
-                );
-            }
-            Err(_) => {
-                // Force kill if it doesn't respond
-                let _ = std::process::Command::new("kill")
-                    .arg("-KILL")
-                    .arg(self.pid.to_string())
-                    .status()
-                    .is_ok();
-                println!(
-                    "⚠️ Force killed global sample_program ({})",
-                    self.optimization_level.description()
-                );
-            }
-        }
-
+        self.target.terminate().await?;
+        println!(
+            "✓ Global sample_program ({}) terminated",
+            self.optimization_level.description()
+        );
         Ok(())
     }
 }
@@ -118,10 +93,10 @@ async fn get_global_test_pid_with_opt(opt_level: OptimizationLevel) -> anyhow::R
         if let Some(process) = read_guard.get(&opt_level) {
             let status = std::process::Command::new("kill")
                 .arg("-0")
-                .arg(process.pid.to_string())
+                .arg(process.host_pid().to_string())
                 .status();
             if status.is_ok_and(|s| s.success()) {
-                return Ok(process.pid);
+                return process.visible_pid();
             }
         }
     }
@@ -133,10 +108,10 @@ async fn get_global_test_pid_with_opt(opt_level: OptimizationLevel) -> anyhow::R
     if let Some(process) = write_guard.get(&opt_level) {
         let status = std::process::Command::new("kill")
             .arg("-0")
-            .arg(process.pid.to_string())
+            .arg(process.host_pid().to_string())
             .status();
         if status.is_ok_and(|s| s.success()) {
-            return Ok(process.pid);
+            return process.visible_pid();
         }
     }
 
@@ -150,12 +125,24 @@ async fn get_global_test_pid_with_opt(opt_level: OptimizationLevel) -> anyhow::R
 
     // Start new process with the requested optimization level
     let new_process = GlobalTestProcess::start_with_opt(opt_level).await?;
-    let pid = new_process.get_pid();
+    let pid = new_process.visible_pid()?;
 
     // Re-acquire write lock to insert the new process
     let mut write_guard = manager.write().await;
     write_guard.insert(opt_level, new_process);
     Ok(pid)
+}
+
+async fn get_global_test_target_with_opt(
+    opt_level: OptimizationLevel,
+) -> anyhow::Result<common::targets::TargetHandle> {
+    let _ = get_global_test_pid_with_opt(opt_level).await?;
+    let manager = GLOBAL_TEST_MANAGER.clone();
+    let read_guard = manager.read().await;
+    let process = read_guard.get(&opt_level).ok_or_else(|| {
+        anyhow::anyhow!("global test target missing for {}", opt_level.description())
+    })?;
+    Ok(process.target().clone())
 }
 
 // Get or start the global test process (defaults to Debug optimization)
@@ -415,9 +402,11 @@ async fn run_ghostscope_with_script_opt(
         test_pid
     );
 
+    let target = get_global_test_target_with_opt(opt_level).await?;
+
     common::runner::GhostscopeRunner::new()
         .with_script(script_content)
-        .with_pid(test_pid)
+        .attach_to(&target)
         .timeout_secs(timeout_secs)
         .enable_sysmon_shared_lib(false)
         .run()
@@ -1415,51 +1404,6 @@ fn parse_custom_variables_line(line: &str) -> Option<(i32, i32, i32, i32, i32)> 
     }
 }
 
-/// Independent test program instance (separate from global shared one)
-struct TestProgramInstance {
-    child: tokio::process::Child,
-    pid: u32,
-}
-
-impl TestProgramInstance {
-    async fn terminate(mut self) -> anyhow::Result<()> {
-        println!("🛑 Terminating sample_program (PID: {})", self.pid);
-        let _ = self.child.kill().await.is_ok();
-
-        // Wait for termination with timeout
-        match timeout(Duration::from_secs(2), self.child.wait()).await {
-            Ok(_) => println!("✓ Test_program terminated gracefully"),
-            Err(_) => {
-                let _ = std::process::Command::new("kill")
-                    .arg("-KILL")
-                    .arg(self.pid.to_string())
-                    .output();
-                println!("⚠️ Force killed sample_program");
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Start an independent sample_program instance (not shared with other tests)
-async fn start_independent_sample_program() -> anyhow::Result<TestProgramInstance> {
-    let binary_path = FIXTURES.get_test_binary("sample_program")?;
-
-    let child = Command::new(binary_path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-
-    let pid = child
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-
-    // Give it a moment to start
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    Ok(TestProgramInstance { child, pid })
-}
-
 /// Run ghostscope with a specific PID (bypass global test program)
 async fn run_ghostscope_with_specific_pid(
     script_content: &str,
@@ -1469,6 +1413,20 @@ async fn run_ghostscope_with_specific_pid(
     common::runner::GhostscopeRunner::new()
         .with_script(script_content)
         .with_pid(target_pid)
+        .timeout_secs(timeout_secs)
+        .enable_sysmon_shared_lib(false)
+        .run()
+        .await
+}
+
+async fn run_ghostscope_attached_to_target(
+    script_content: &str,
+    target: &common::targets::TargetHandle,
+    timeout_secs: u64,
+) -> anyhow::Result<(i32, String, String)> {
+    common::runner::GhostscopeRunner::new()
+        .with_script(script_content)
+        .attach_to(target)
         .timeout_secs(timeout_secs)
         .enable_sysmon_shared_lib(false)
         .run()
@@ -1695,21 +1653,25 @@ trace calculate_something {
     println!("=== Correct PID Filtering Test ===");
 
     // Start two independent sample_program processes
-    let sample_program_1 = start_independent_sample_program().await?;
-    let sample_program_2 = start_independent_sample_program().await?;
+    let sample_program_1 = common::targets::TargetLauncher::sample_program()
+        .spawn()
+        .await?;
+    let sample_program_2 = common::targets::TargetLauncher::sample_program()
+        .spawn()
+        .await?;
 
     println!(
         "Started sample_program_1 with PID: {}",
-        sample_program_1.pid
+        sample_program_1.host_pid()
     );
     println!(
         "Started sample_program_2 with PID: {}",
-        sample_program_2.pid
+        sample_program_2.host_pid()
     );
 
     // Only trace the first process
     let (exit_code, stdout, stderr) =
-        run_ghostscope_with_specific_pid(script_content, sample_program_1.pid, 3).await?;
+        run_ghostscope_attached_to_target(script_content, &sample_program_1, 3).await?;
 
     println!("Exit code: {exit_code}");
     println!("STDOUT: {stdout}");
@@ -1754,19 +1716,29 @@ trace calculate_something {
 
     // Start 3 independent sample_program processes
     let programs = vec![
-        start_independent_sample_program().await?,
-        start_independent_sample_program().await?,
-        start_independent_sample_program().await?,
+        common::targets::TargetLauncher::sample_program()
+            .spawn()
+            .await?,
+        common::targets::TargetLauncher::sample_program()
+            .spawn()
+            .await?,
+        common::targets::TargetLauncher::sample_program()
+            .spawn()
+            .await?,
     ];
 
     for (i, program) in programs.iter().enumerate() {
-        println!("Started sample_program_{} with PID: {}", i + 1, program.pid);
+        println!(
+            "Started sample_program_{} with PID: {}",
+            i + 1,
+            program.host_pid()
+        );
     }
 
     // Only trace the middle process (programs[1])
-    let target_pid = programs[1].pid;
+    let target_pid = programs[1].host_pid();
     let (exit_code, stdout, stderr) =
-        run_ghostscope_with_specific_pid(script_content, target_pid, 4).await?;
+        run_ghostscope_attached_to_target(script_content, &programs[1], 4).await?;
 
     println!("Target PID: {target_pid}");
     println!("Exit code: {exit_code}");
@@ -1848,21 +1820,15 @@ trace add_numbers {
         println!("⚠️ Warning: Binary missing .gnu_debuglink section");
     }
 
-    // Start the stripped binary
-    let mut child = Command::new(&binary_path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-
-    let pid = child.id().expect("Failed to get PID");
-    println!("Started stripped binary with PID: {pid}");
-
-    // Give it time to start
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Start the stripped binary through the shared target launcher.
+    let target = common::targets::TargetLauncher::binary(&binary_path)
+        .spawn()
+        .await?;
+    println!("Started stripped binary with PID: {}", target.host_pid());
 
     // Run ghostscope with the stripped binary
     let (exit_code, stdout, stderr) =
-        run_ghostscope_with_specific_pid(script_content, pid, 3).await?;
+        run_ghostscope_attached_to_target(script_content, &target, 3).await?;
 
     println!("Exit code: {exit_code}");
     println!("STDOUT: {stdout}");
@@ -1870,7 +1836,7 @@ trace add_numbers {
     println!("===============================================");
 
     // Clean up
-    let _ = child.kill().await.is_ok();
+    target.terminate().await?;
 
     // Verify results
     if exit_code == 0 {

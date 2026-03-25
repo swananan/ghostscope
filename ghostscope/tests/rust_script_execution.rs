@@ -3,44 +3,39 @@
 mod common;
 
 use common::{init, FIXTURES};
-use std::process::Stdio;
-use std::time::Duration;
-use tokio::process::Command;
 
-async fn run_ghostscope_with_script_for_pid(
+async fn run_ghostscope_with_script_for_target(
     script_content: &str,
     timeout_secs: u64,
-    pid: u32,
+    target: &common::targets::TargetHandle,
 ) -> anyhow::Result<(i32, String, String)> {
     common::runner::GhostscopeRunner::new()
         .with_script(script_content)
-        .with_pid(pid)
+        .attach_to(target)
         .timeout_secs(timeout_secs)
         .enable_sysmon_shared_lib(false)
         .run()
         .await
 }
 
+async fn spawn_rust_global_program() -> anyhow::Result<common::targets::TargetHandle> {
+    let binary_path = FIXTURES.get_test_binary("rust_global_program")?;
+    let bin_dir = binary_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("rust_global_program has no parent directory"))?;
+    let target = common::targets::TargetLauncher::binary(&binary_path)
+        .current_dir(bin_dir)
+        .spawn()
+        .await?;
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    Ok(target)
+}
+
 #[tokio::test]
 async fn test_rust_script_print_globals() -> anyhow::Result<()> {
     init();
 
-    let binary_path = FIXTURES.get_test_binary("rust_global_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    struct KillOnDrop(tokio::process::Child);
-    impl Drop for KillOnDrop {
-        fn drop(&mut self) {
-            let _ = self.0.start_kill().is_ok();
-        }
-    }
-    let mut cmd = Command::new(&binary_path);
-    cmd.current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let child = cmd.spawn()?;
-    let pid = child.id().ok_or_else(|| anyhow::anyhow!("no pid"))?;
-    let mut prog = KillOnDrop(child);
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let target = spawn_rust_global_program().await?;
 
     // Attach at do_stuff (DW_AT_name likely 'do_stuff'), print Rust globals and a struct field
     let script = r#"
@@ -50,8 +45,9 @@ trace do_stuff {
 }
 "#;
 
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 9, pid).await?;
-    let _ = prog.0.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 9, &target).await?;
+    target.terminate().await?;
 
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
@@ -71,30 +67,16 @@ trace do_stuff {
 async fn test_rust_script_counter_increments() -> anyhow::Result<()> {
     init();
 
-    let binary_path = FIXTURES.get_test_binary("rust_global_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    struct KillOnDrop(tokio::process::Child);
-    impl Drop for KillOnDrop {
-        fn drop(&mut self) {
-            let _ = self.0.start_kill().is_ok();
-        }
-    }
-    let mut cmd = Command::new(&binary_path);
-    cmd.current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let child = cmd.spawn()?;
-    let pid = child.id().ok_or_else(|| anyhow::anyhow!("no pid"))?;
-    let mut prog = KillOnDrop(child);
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let target = spawn_rust_global_program().await?;
 
     let script = r#"
 trace do_stuff {
     print "RC:{}", G_COUNTER;
 }
 "#;
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 9, pid).await?;
-    let _ = prog.0.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 9, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let mut vals: Vec<i64> = Vec::new();
@@ -126,30 +108,16 @@ trace do_stuff {
 async fn test_rust_script_address_of_global() -> anyhow::Result<()> {
     init();
 
-    let binary_path = FIXTURES.get_test_binary("rust_global_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    struct KillOnDrop(tokio::process::Child);
-    impl Drop for KillOnDrop {
-        fn drop(&mut self) {
-            let _ = self.0.start_kill().is_ok();
-        }
-    }
-    let mut cmd = Command::new(&binary_path);
-    cmd.current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let child = cmd.spawn()?;
-    let pid = child.id().ok_or_else(|| anyhow::anyhow!("no pid"))?;
-    let mut prog = KillOnDrop(child);
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let target = spawn_rust_global_program().await?;
 
     let script = r#"
 trace do_stuff {
     print "&RC:{}", &G_COUNTER;
 }
 "#;
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 9, pid).await?;
-    let _ = prog.0.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 9, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     assert!(
@@ -167,22 +135,7 @@ trace do_stuff {
 async fn test_rust_script_global_enum_as_int() -> anyhow::Result<()> {
     init();
 
-    let binary_path = FIXTURES.get_test_binary("rust_global_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    struct KillOnDrop(tokio::process::Child);
-    impl Drop for KillOnDrop {
-        fn drop(&mut self) {
-            let _ = self.0.start_kill().is_ok();
-        }
-    }
-    let mut cmd = Command::new(&binary_path);
-    cmd.current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let child = cmd.spawn()?;
-    let pid = child.id().ok_or_else(|| anyhow::anyhow!("no pid"))?;
-    let mut prog = KillOnDrop(child);
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let target = spawn_rust_global_program().await?;
 
     // Read GLOBAL_ENUM by forcing it into an integer slot via reinterpret cast.
     // This exercises the static-resolution path for globals that only have DW_OP_addr.
@@ -192,8 +145,9 @@ trace do_stuff {
 }
 "#;
 
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 9, pid).await?;
-    let _ = prog.0.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 9, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let mut seen = false;
@@ -214,22 +168,7 @@ async fn test_rust_script_bss_counter_direct() -> anyhow::Result<()> {
     // relying on DWARF locals or pointer aliases.
     init();
 
-    let binary_path = FIXTURES.get_test_binary("rust_global_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    struct KillOnDrop(tokio::process::Child);
-    impl Drop for KillOnDrop {
-        fn drop(&mut self) {
-            let _ = self.0.start_kill().is_ok();
-        }
-    }
-    let mut cmd = Command::new(&binary_path);
-    cmd.current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let child = cmd.spawn()?;
-    let pid = child.id().ok_or_else(|| anyhow::anyhow!("no pid"))?;
-    let mut prog = KillOnDrop(child);
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let target = spawn_rust_global_program().await?;
 
     let script = r#"
 trace touch_globals {
@@ -237,8 +176,9 @@ trace touch_globals {
 }
 "#;
 
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 9, pid).await?;
-    let _ = prog.0.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 9, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let mut vals = Vec::new();

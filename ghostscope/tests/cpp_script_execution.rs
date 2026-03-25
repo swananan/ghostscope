@@ -3,44 +3,39 @@
 mod common;
 
 use common::{init, FIXTURES};
-use std::process::Stdio;
-use std::time::Duration;
-use tokio::process::Command;
 
-async fn run_ghostscope_with_script_for_pid(
+async fn run_ghostscope_with_script_for_target(
     script_content: &str,
     timeout_secs: u64,
-    pid: u32,
+    target: &common::targets::TargetHandle,
 ) -> anyhow::Result<(i32, String, String)> {
     common::runner::GhostscopeRunner::new()
         .with_script(script_content)
-        .with_pid(pid)
+        .attach_to(target)
         .timeout_secs(timeout_secs)
         .enable_sysmon_shared_lib(false)
         .run()
         .await
 }
 
+async fn spawn_cpp_complex_program() -> anyhow::Result<common::targets::TargetHandle> {
+    let binary_path = FIXTURES.get_test_binary("cpp_complex_program")?;
+    let bin_dir = binary_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("cpp_complex_program has no parent directory"))?;
+    let target = common::targets::TargetLauncher::binary(&binary_path)
+        .current_dir(bin_dir)
+        .spawn()
+        .await?;
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    Ok(target)
+}
+
 #[tokio::test]
 async fn test_cpp_script_print_globals() -> anyhow::Result<()> {
     init();
 
-    let binary_path = FIXTURES.get_test_binary("cpp_complex_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    struct KillOnDrop(tokio::process::Child);
-    impl Drop for KillOnDrop {
-        fn drop(&mut self) {
-            let _ = self.0.start_kill().is_ok();
-        }
-    }
-    let mut cmd = Command::new(&binary_path);
-    cmd.current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let child = cmd.spawn()?;
-    let pid = child.id().ok_or_else(|| anyhow::anyhow!("no pid"))?;
-    let mut prog = KillOnDrop(child);
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let target = spawn_cpp_complex_program().await?;
 
     // Attach at a hot function using DW_AT_name (add), print several globals
     let script = r#"
@@ -51,8 +46,9 @@ trace add {
 }
 "#;
 
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.0.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 4, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     assert!(
@@ -75,22 +71,7 @@ trace add {
 async fn test_cpp_script_counter_increments() -> anyhow::Result<()> {
     init();
 
-    let binary_path = FIXTURES.get_test_binary("cpp_complex_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    struct KillOnDrop(tokio::process::Child);
-    impl Drop for KillOnDrop {
-        fn drop(&mut self) {
-            let _ = self.0.start_kill().is_ok();
-        }
-    }
-    let mut cmd = Command::new(&binary_path);
-    cmd.current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let child = cmd.spawn()?;
-    let pid = child.id().ok_or_else(|| anyhow::anyhow!("no pid"))?;
-    let mut prog = KillOnDrop(child);
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let target = spawn_cpp_complex_program().await?;
 
     let script = r#"
 trace add {
@@ -98,8 +79,9 @@ trace add {
 }
 "#;
 
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 5, pid).await?;
-    let _ = prog.0.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 5, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let mut vals: Vec<i64> = Vec::new();
@@ -139,22 +121,7 @@ trace add {
 async fn test_cpp_script_addresses_and_static_member() -> anyhow::Result<()> {
     init();
 
-    let binary_path = FIXTURES.get_test_binary("cpp_complex_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    struct KillOnDrop(tokio::process::Child);
-    impl Drop for KillOnDrop {
-        fn drop(&mut self) {
-            let _ = self.0.start_kill().is_ok();
-        }
-    }
-    let mut cmd = Command::new(&binary_path);
-    cmd.current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let child = cmd.spawn()?;
-    let pid = child.id().ok_or_else(|| anyhow::anyhow!("no pid"))?;
-    let mut prog = KillOnDrop(child);
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let target = spawn_cpp_complex_program().await?;
 
     let script = r#"
 trace add {
@@ -162,8 +129,9 @@ trace add {
     print "SV:{}", s_val;
 }
 "#;
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.0.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 4, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let mut gc_addrs: Vec<String> = Vec::new();

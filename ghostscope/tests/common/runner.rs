@@ -29,7 +29,7 @@ pub struct GhostscopeRunner {
     log_level: Option<String>,
     enable_sysmon_shared_lib: bool,
     enable_file_logging: bool,
-    sandbox: SandboxHandle,
+    sandbox: Option<SandboxHandle>,
 }
 
 impl Default for GhostscopeRunner {
@@ -44,7 +44,7 @@ impl Default for GhostscopeRunner {
             log_level: None,
             enable_sysmon_shared_lib: false,
             enable_file_logging: false,
-            sandbox: SandboxHandle::host(),
+            sandbox: None,
         }
     }
 }
@@ -78,7 +78,7 @@ impl GhostscopeRunner {
 
     #[allow(dead_code)]
     pub fn in_sandbox(mut self, sandbox: &SandboxHandle) -> Self {
-        self.sandbox = sandbox.clone();
+        self.sandbox = Some(sandbox.clone());
         self
     }
 
@@ -110,6 +110,11 @@ impl GhostscopeRunner {
     }
 
     pub async fn run(self) -> Result<(i32, String, String)> {
+        let sandbox = match self.sandbox {
+            Some(sandbox) => sandbox,
+            None => SandboxHandle::default_ghostscope()?,
+        };
+
         // Validate attach mode
         let by_pid = self.pid.is_some();
         let by_attached_target = self.attach_target.is_some();
@@ -123,7 +128,7 @@ impl GhostscopeRunner {
         let mut script_file = create_script_file()?;
         use std::io::Write as _;
         script_file.write_all(self.script_content.as_bytes())?;
-        let script_path = self.sandbox.path_in_sandbox(script_file.path())?;
+        let script_path = sandbox.path_in_sandbox(script_file.path())?;
 
         // Build command + args
         let mut args: Vec<OsString> = Vec::new();
@@ -132,12 +137,12 @@ impl GhostscopeRunner {
             args.push(OsString::from("-p"));
             args.push(OsString::from(pid.to_string()));
         } else if let Some(target) = &self.attach_target {
-            let pid = target.visible_pid_from(&self.sandbox)?;
+            let pid = target.visible_pid_from(&sandbox)?;
             args.push(OsString::from("-p"));
             args.push(OsString::from(pid.to_string()));
         } else if let Some(ref target) = self.target {
             args.push(OsString::from("-t"));
-            args.push(self.sandbox.path_in_sandbox(target)?.into_os_string());
+            args.push(sandbox.path_in_sandbox(target)?.into_os_string());
         }
 
         args.push(OsString::from("--script-file"));
@@ -161,7 +166,7 @@ impl GhostscopeRunner {
             args.push(OsString::from("--log"));
         }
 
-        let (program, mut prefix_args) = self.sandbox.ghostscope_command()?;
+        let (program, mut prefix_args) = sandbox.ghostscope_command()?;
         prefix_args.extend(args);
 
         let mut cmd = Command::new(&program);
