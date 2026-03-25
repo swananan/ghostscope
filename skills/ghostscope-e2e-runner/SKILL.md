@@ -34,6 +34,23 @@ E2E_TEST_CASE=test_rust_script_print_globals \
 ./scripts/e2e/runner/run_e2e_runner.sh
 ```
 
+Run one case with explicit sandbox topology through the runner API:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8788/runs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "sudo": true,
+    "repo": "/mnt/500g/code/ghostscope",
+    "test_case": "test_correct_pid_filtering",
+    "topology": {
+      "ghostscope": "host",
+      "target": "docker-private",
+      "share": false
+    }
+  }'
+```
+
 Run full e2e set (no case filter):
 
 ```bash
@@ -60,15 +77,20 @@ curl -sS http://127.0.0.1:8788/health
 - container e2e through `scripts/e2e/container/run_container_e2e.sh --pid-mode private`
 - container e2e through `scripts/e2e/container/run_container_e2e.sh --pid-mode host`
 2. Check `/health` before submitting runs when the user expects service mode.
-3. Run `scripts/e2e/runner/run_e2e_runner.sh` with explicit env vars:
+3. Run `scripts/e2e/runner/run_e2e_runner.sh` for standard host-host runs:
 - `E2E_REPO_DIR` when repo is not default.
 - `E2E_TEST_CASE` when user asks for a single case.
 - `E2E_SUDO=1` for eBPF tests that require elevated privileges.
-4. Wait for final status and report:
+4. For cross-environment PID scenarios, submit directly to the runner API with a `topology` object:
+ - `ghostscope`: `host|docker-private|docker-host`
+ - `target`: `host|docker-private|docker-host`
+ - `share`: optional boolean; defaults to `false`
+ - If `topology` is omitted, the run defaults to `host -> host`
+5. Wait for final status and report:
 - job id
 - status and exit code
 - failing test name and first actionable error
-5. Avoid silent fallback on test failures:
+6. Avoid silent fallback on test failures:
 - treat failed service test run as real failure, not transport failure.
 
 ## Failure Handling

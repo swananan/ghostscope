@@ -12,7 +12,12 @@ POST /runs body (JSON, optional):
 {
   "sudo": true,
   "repo": "/mnt/500g/code/ghostscope",
-  "test_case": "my_case_name"
+  "test_case": "my_case_name",
+  "topology": {
+    "ghostscope": "host",
+    "target": "docker-private",
+    "share": false
+  }
 }
 
 If E2E_SERVICE_TOKEN is set, POST endpoints require header:
@@ -42,6 +47,16 @@ from urllib.parse import parse_qs, urlparse
 
 DEFAULT_REPO = "/mnt/500g/code/ghostscope"
 MAX_TEST_CASE_LEN = 256
+VALID_SANDBOX_ALIASES = {
+    "host": "host",
+    "docker-private": "docker-private",
+    "private": "docker-private",
+    "container-private": "docker-private",
+    "docker-host": "docker-host",
+    "host-pid": "docker-host",
+    "docker-host-pid": "docker-host",
+    "container-host": "docker-host",
+}
 
 
 def now_iso() -> str:
@@ -64,6 +79,9 @@ class Job:
     requested_repo: Optional[str]
     repo: str
     test_case: Optional[str]
+    ghostscope_sandbox: str
+    target_sandbox: str
+    share_sandbox: bool
     status: str = "queued"
     created_at: str = field(default_factory=now_iso)
     started_at: Optional[str] = None
@@ -96,6 +114,22 @@ def normalize_test_case(value: Optional[str]) -> Optional[str]:
         raise ValueError("test_case cannot contain control characters")
 
     return candidate
+
+
+def normalize_sandbox_selection(name: str, value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+
+    candidate = value.strip().lower()
+    if not candidate:
+        return None
+
+    normalized = VALID_SANDBOX_ALIASES.get(candidate)
+    if normalized is None:
+        raise ValueError(
+            f"{name} must be one of: host, docker-private, docker-host"
+        )
+    return normalized
 
 
 class JobStore:
@@ -135,9 +169,24 @@ class JobStore:
         requested_sudo: Optional[bool],
         requested_repo: Optional[str],
         requested_test_case: Optional[str],
+        requested_ghostscope_sandbox: Optional[str],
+        requested_target_sandbox: Optional[str],
+        requested_share_sandbox: Optional[bool],
     ) -> Job:
         repo = self._resolve_repo(requested_repo)
         test_case = normalize_test_case(requested_test_case)
+        ghostscope_sandbox = normalize_sandbox_selection(
+            "ghostscope_sandbox", requested_ghostscope_sandbox
+        ) or "host"
+        target_sandbox = normalize_sandbox_selection(
+            "target_sandbox", requested_target_sandbox
+        ) or "host"
+        share_sandbox = requested_share_sandbox or False
+        if share_sandbox:
+            if ghostscope_sandbox != target_sandbox:
+                raise ValueError(
+                    "share_sandbox=true requires ghostscope_sandbox and target_sandbox to match"
+                )
 
         job = Job(
             id=uuid.uuid4().hex[:12],
@@ -145,6 +194,9 @@ class JobStore:
             requested_repo=requested_repo,
             repo=str(repo),
             test_case=test_case,
+            ghostscope_sandbox=ghostscope_sandbox,
+            target_sandbox=target_sandbox,
+            share_sandbox=share_sandbox,
         )
         with self._lock:
             self._jobs[job.id] = job
@@ -196,6 +248,14 @@ class JobStore:
             "requested_repo": job.requested_repo,
             "repo": job.repo,
             "test_case": job.test_case,
+            "ghostscope_sandbox": job.ghostscope_sandbox,
+            "target_sandbox": job.target_sandbox,
+            "share_sandbox": job.share_sandbox,
+            "topology": {
+                "ghostscope": job.ghostscope_sandbox,
+                "target": job.target_sandbox,
+                "share": job.share_sandbox,
+            },
             "steps": len(job.steps),
             "log_lines": len(job.logs),
         }
@@ -236,6 +296,9 @@ class JobStore:
         env["LLVM_SYS_181_PREFIX"] = self.llvm_prefix
         if self.cargo_home:
             env["CARGO_HOME"] = self.cargo_home
+        env["E2E_GHOSTSCOPE_SANDBOX"] = job.ghostscope_sandbox
+        env["E2E_TARGET_SANDBOX"] = job.target_sandbox
+        env["E2E_SHARE_SANDBOX"] = "1" if job.share_sandbox else "0"
 
         process = subprocess.Popen(
             step.command,
@@ -273,7 +336,9 @@ class JobStore:
                 (
                     "starting job "
                     f"id={job.id} repo={job.repo} test_case={job.test_case or '<all>'} "
-                    f"requested_sudo={job.requested_sudo}"
+                    f"requested_sudo={job.requested_sudo} "
+                    f"topology={job.ghostscope_sandbox}->{job.target_sandbox} "
+                    f"share={job.share_sandbox}"
                 ),
             )
 
@@ -431,11 +496,58 @@ class Handler(BaseHTTPRequestHandler):
             self._write_json(HTTPStatus.BAD_REQUEST, {"error": "test_case must be a string"})
             return
 
+        topology = body.get("topology")
+        if topology is not None and not isinstance(topology, dict):
+            self._write_json(HTTPStatus.BAD_REQUEST, {"error": "topology must be an object"})
+            return
+
+        requested_ghostscope_sandbox = body.get(
+            "ghostscope_sandbox",
+            topology.get("ghostscope") if topology else None,
+        )
+        if requested_ghostscope_sandbox is not None and not isinstance(
+            requested_ghostscope_sandbox, str
+        ):
+            self._write_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "ghostscope_sandbox must be a string"},
+            )
+            return
+
+        requested_target_sandbox = body.get(
+            "target_sandbox",
+            topology.get("target") if topology else None,
+        )
+        if requested_target_sandbox is not None and not isinstance(
+            requested_target_sandbox, str
+        ):
+            self._write_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "target_sandbox must be a string"},
+            )
+            return
+
+        requested_share_sandbox = body.get(
+            "share_sandbox",
+            topology.get("share") if topology else None,
+        )
+        if requested_share_sandbox is not None and not isinstance(
+            requested_share_sandbox, bool
+        ):
+            self._write_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "share_sandbox must be true/false"},
+            )
+            return
+
         try:
             job = self.store.create_job(
                 requested_sudo=requested_sudo,
                 requested_repo=requested_repo,
                 requested_test_case=requested_test_case,
+                requested_ghostscope_sandbox=requested_ghostscope_sandbox,
+                requested_target_sandbox=requested_target_sandbox,
+                requested_share_sandbox=requested_share_sandbox,
             )
         except ValueError as exc:
             self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
@@ -450,6 +562,14 @@ class Handler(BaseHTTPRequestHandler):
                 "requested_repo": job.requested_repo,
                 "repo": job.repo,
                 "test_case": job.test_case,
+                "ghostscope_sandbox": job.ghostscope_sandbox,
+                "target_sandbox": job.target_sandbox,
+                "share_sandbox": job.share_sandbox,
+                "topology": {
+                    "ghostscope": job.ghostscope_sandbox,
+                    "target": job.target_sandbox,
+                    "share": job.share_sandbox,
+                },
             },
         )
 
