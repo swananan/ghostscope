@@ -13,6 +13,9 @@ POST /runs body (JSON, optional):
   "sudo": true,
   "repo": "/mnt/500g/code/ghostscope",
   "test_case": "my_case_name",
+  "logging": {
+    "level": "debug"
+  },
   "topology": {
     "ghostscope": "host",
     "target": "docker-private",
@@ -57,6 +60,7 @@ VALID_SANDBOX_ALIASES = {
     "docker-host-pid": "docker-host",
     "container-host": "docker-host",
 }
+VALID_LOG_LEVELS = {"error", "warn", "info", "debug", "trace"}
 
 
 def now_iso() -> str:
@@ -79,6 +83,7 @@ class Job:
     requested_repo: Optional[str]
     repo: str
     test_case: Optional[str]
+    ghostscope_log_level: Optional[str]
     ghostscope_sandbox: str
     target_sandbox: str
     share_sandbox: bool
@@ -132,6 +137,20 @@ def normalize_sandbox_selection(name: str, value: Optional[str]) -> Optional[str
     return normalized
 
 
+def normalize_log_level(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+
+    candidate = value.strip().lower()
+    if not candidate:
+        return None
+
+    if candidate not in VALID_LOG_LEVELS:
+        allowed = ", ".join(sorted(VALID_LOG_LEVELS))
+        raise ValueError(f"log level must be one of: {allowed}")
+    return candidate
+
+
 class JobStore:
     def __init__(
         self,
@@ -169,12 +188,14 @@ class JobStore:
         requested_sudo: Optional[bool],
         requested_repo: Optional[str],
         requested_test_case: Optional[str],
+        requested_ghostscope_log_level: Optional[str],
         requested_ghostscope_sandbox: Optional[str],
         requested_target_sandbox: Optional[str],
         requested_share_sandbox: Optional[bool],
     ) -> Job:
         repo = self._resolve_repo(requested_repo)
         test_case = normalize_test_case(requested_test_case)
+        ghostscope_log_level = normalize_log_level(requested_ghostscope_log_level)
         ghostscope_sandbox = normalize_sandbox_selection(
             "ghostscope_sandbox", requested_ghostscope_sandbox
         ) or "host"
@@ -194,6 +215,7 @@ class JobStore:
             requested_repo=requested_repo,
             repo=str(repo),
             test_case=test_case,
+            ghostscope_log_level=ghostscope_log_level,
             ghostscope_sandbox=ghostscope_sandbox,
             target_sandbox=target_sandbox,
             share_sandbox=share_sandbox,
@@ -248,6 +270,7 @@ class JobStore:
             "requested_repo": job.requested_repo,
             "repo": job.repo,
             "test_case": job.test_case,
+            "ghostscope_log_level": job.ghostscope_log_level,
             "ghostscope_sandbox": job.ghostscope_sandbox,
             "target_sandbox": job.target_sandbox,
             "share_sandbox": job.share_sandbox,
@@ -299,6 +322,10 @@ class JobStore:
         env["E2E_GHOSTSCOPE_SANDBOX"] = job.ghostscope_sandbox
         env["E2E_TARGET_SANDBOX"] = job.target_sandbox
         env["E2E_SHARE_SANDBOX"] = "1" if job.share_sandbox else "0"
+        if job.ghostscope_log_level:
+            env["E2E_GHOSTSCOPE_LOG_LEVEL"] = job.ghostscope_log_level
+        else:
+            env.pop("E2E_GHOSTSCOPE_LOG_LEVEL", None)
 
         process = subprocess.Popen(
             step.command,
@@ -337,6 +364,7 @@ class JobStore:
                     "starting job "
                     f"id={job.id} repo={job.repo} test_case={job.test_case or '<all>'} "
                     f"requested_sudo={job.requested_sudo} "
+                    f"log_level={job.ghostscope_log_level or '<default>'} "
                     f"topology={job.ghostscope_sandbox}->{job.target_sandbox} "
                     f"share={job.share_sandbox}"
                 ),
@@ -496,6 +524,24 @@ class Handler(BaseHTTPRequestHandler):
             self._write_json(HTTPStatus.BAD_REQUEST, {"error": "test_case must be a string"})
             return
 
+        logging = body.get("logging")
+        if logging is not None and not isinstance(logging, dict):
+            self._write_json(HTTPStatus.BAD_REQUEST, {"error": "logging must be an object"})
+            return
+
+        requested_ghostscope_log_level = body.get(
+            "ghostscope_log_level",
+            body.get("log_level", logging.get("level") if logging else None),
+        )
+        if requested_ghostscope_log_level is not None and not isinstance(
+            requested_ghostscope_log_level, str
+        ):
+            self._write_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "ghostscope_log_level must be a string"},
+            )
+            return
+
         topology = body.get("topology")
         if topology is not None and not isinstance(topology, dict):
             self._write_json(HTTPStatus.BAD_REQUEST, {"error": "topology must be an object"})
@@ -545,6 +591,7 @@ class Handler(BaseHTTPRequestHandler):
                 requested_sudo=requested_sudo,
                 requested_repo=requested_repo,
                 requested_test_case=requested_test_case,
+                requested_ghostscope_log_level=requested_ghostscope_log_level,
                 requested_ghostscope_sandbox=requested_ghostscope_sandbox,
                 requested_target_sandbox=requested_target_sandbox,
                 requested_share_sandbox=requested_share_sandbox,
@@ -562,6 +609,7 @@ class Handler(BaseHTTPRequestHandler):
                 "requested_repo": job.requested_repo,
                 "repo": job.repo,
                 "test_case": job.test_case,
+                "ghostscope_log_level": job.ghostscope_log_level,
                 "ghostscope_sandbox": job.ghostscope_sandbox,
                 "target_sandbox": job.target_sandbox,
                 "share_sandbox": job.share_sandbox,

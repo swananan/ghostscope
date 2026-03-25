@@ -51,6 +51,26 @@ curl -sS -X POST http://127.0.0.1:8788/runs \
   }'
 ```
 
+Run one case with explicit topology and GhostScope debug logs through the runner API:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8788/runs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "sudo": true,
+    "repo": "/mnt/500g/code/ghostscope",
+    "test_case": "test_correct_pid_filtering",
+    "logging": {
+      "level": "debug"
+    },
+    "topology": {
+      "ghostscope": "host",
+      "target": "docker-private",
+      "share": false
+    }
+  }'
+```
+
 Run full e2e set (no case filter):
 
 ```bash
@@ -82,10 +102,12 @@ curl -sS http://127.0.0.1:8788/health
 - `E2E_TEST_CASE` when user asks for a single case.
 - `E2E_SUDO=1` for eBPF tests that require elevated privileges.
 4. For cross-environment PID scenarios, submit directly to the runner API with a `topology` object:
- - `ghostscope`: `host|docker-private|docker-host`
- - `target`: `host|docker-private|docker-host`
- - `share`: optional boolean; defaults to `false`
+- `ghostscope`: `host|docker-private|docker-host`
+- `target`: `host|docker-private|docker-host`
+- `share`: optional boolean; defaults to `false`
+- Optional `logging.level`: `error|warn|info|debug|trace`
  - If `topology` is omitted, the run defaults to `host -> host`
+  - If `logging.level` is set, the e2e helper enables GhostScope file+console logging for that run
 5. Wait for final status and report:
 - job id
 - status and exit code
