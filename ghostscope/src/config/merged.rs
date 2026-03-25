@@ -22,6 +22,12 @@ pub struct MergedConfig {
     pub pid_filter_spec: Option<ghostscope_compiler::PidFilterSpec>,
     /// Optional namespace context for special vars (`$pid`/`$tid`) in eBPF.
     pub special_pid_ns: Option<ghostscope_compiler::PidNamespaceSpec>,
+    /// Optional namespace context for proc_module_offsets map lookups.
+    ///
+    /// This follows GhostScope's own `/proc` view, so the offsets map key uses
+    /// the same PID namespace that userspace used when reading
+    /// `/proc/<proc_pid>/maps`.
+    pub proc_offsets_pid_ns: Option<ghostscope_compiler::PidNamespaceSpec>,
     pub log_file: PathBuf,
     pub enable_logging: bool,
     pub enable_console_logging: bool,
@@ -176,6 +182,7 @@ impl MergedConfig {
             runtime_env: None,
             pid_filter_spec: None,
             special_pid_ns: None,
+            proc_offsets_pid_ns: None,
             log_file,
             enable_logging,
             enable_console_logging,
@@ -337,6 +344,12 @@ impl MergedConfig {
             selected_index: None,
             pid_filter_spec: self.pid_filter_spec,
             special_pid_ns: self.special_pid_ns,
+            proc_offsets_pid_ns: self.proc_offsets_pid_ns,
+            special_input_pid: self
+                .pid_mapping
+                .as_ref()
+                .map(|mapping| mapping.input_pid)
+                .or(self.pid),
         }
     }
 }

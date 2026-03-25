@@ -72,6 +72,7 @@ async fn test_attach_from_host_to_private_container_target() -> anyhow::Result<(
         return Ok(());
     }
 
+    let host = SandboxHandle::host();
     let Some(private_box) = docker_sandbox_or_skip(DockerSpec::private())? else {
         return Ok(());
     };
@@ -81,6 +82,7 @@ async fn test_attach_from_host_to_private_container_target() -> anyhow::Result<(
         .await?;
 
     let result = GhostscopeRunner::new()
+        .in_sandbox(&host)
         .with_script(pid_filter_script())
         .attach_to(&target)
         .timeout_secs(5)
@@ -109,7 +111,11 @@ async fn test_attach_from_host_pid_container_to_host_target() -> anyhow::Result<
         return Ok(());
     }
 
-    let target = TargetLauncher::sample_program().spawn().await?;
+    let host = SandboxHandle::host();
+    let target = TargetLauncher::sample_program()
+        .in_sandbox(&host)
+        .spawn()
+        .await?;
     let Some(host_pid_box) = docker_sandbox_or_skip(DockerSpec::host_pid())? else {
         return Ok(());
     };
@@ -145,7 +151,11 @@ async fn test_attach_from_private_container_to_host_target_fails_when_pid_invisi
         return Ok(());
     }
 
-    let target = TargetLauncher::sample_program().spawn().await?;
+    let host = SandboxHandle::host();
+    let target = TargetLauncher::sample_program()
+        .in_sandbox(&host)
+        .spawn()
+        .await?;
     let Some(private_box) = docker_sandbox_or_skip(DockerSpec::private())? else {
         return Ok(());
     };

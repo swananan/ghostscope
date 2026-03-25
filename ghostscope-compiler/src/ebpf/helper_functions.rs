@@ -211,18 +211,10 @@ impl<'ctx> EbpfContext<'ctx> {
             ));
         };
 
-        let ns_spec = if let Some(crate::PidFilterSpec::NamespaceTgid {
-            pid_ns_dev,
-            pid_ns_inode,
-            ..
-        }) = self.compile_options.pid_filter_spec
-        {
-            Some((pid_ns_dev, pid_ns_inode))
-        } else {
-            self.compile_options
-                .special_pid_ns
-                .map(|ns| (ns.pid_ns_dev, ns.pid_ns_inode))
-        };
+        let ns_spec = self
+            .compile_options
+            .proc_offsets_pid_ns
+            .map(|ns| (ns.pid_ns_dev, ns.pid_ns_inode));
 
         let pid = if let Some((pid_ns_dev, pid_ns_inode)) = ns_spec {
             // Reuse key_alloca as temporary helper output buffer: [pid:u32, tgid:u32].
@@ -276,6 +268,10 @@ impl<'ctx> EbpfContext<'ctx> {
                 .build_load(i32_type, ns_tgid_ptr, "offset_ns_tgid")
                 .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
                 .into_int_value();
+            // The proc_module_offsets map is populated from `/proc/<proc_pid>/maps`,
+            // so its key must use the same PID namespace view GhostScope used for
+            // those `/proc` reads. This is *not* necessarily the same namespace
+            // used for `$pid`/`$tid` or NamespaceTgid filtering.
             self.builder
                 .build_select(helper_ok, ns_tgid, host_tgid, "offset_pid_key")
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?

@@ -291,9 +291,9 @@ async fn test_special_pid_in_if_condition() -> anyhow::Result<()> {
     let opt_level = OptimizationLevel::Debug;
     let test_pid = get_global_test_pid_with_opt(opt_level).await?;
 
-    // Use $pid in an expression: it should equal the traced process PID
+    // Use $input_pid in an expression: it should equal the PID passed through -p.
     let script_content = format!(
-        "trace sample_program.c:16 {{\n    if $pid == {test_pid} {{ print \"PID_OK\"; }} else {{ print \"PID_BAD\"; }}\n}}\n"
+        "trace sample_program.c:16 {{\n    if $input_pid == {test_pid} {{ print \"PID_OK\"; }} else {{ print \"PID_BAD\"; }}\n}}\n"
     );
 
     let (exit_code, stdout, stderr) =

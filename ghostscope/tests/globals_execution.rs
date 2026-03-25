@@ -353,11 +353,13 @@ async fn test_special_vars_pid_tid_timestamp_globals() -> anyhow::Result<()> {
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
     let target = spawn_globals_program(&binary_path).await?;
-    let pid = target.host_pid();
+    let host_pid = target.host_pid();
+    let input_pid =
+        target.visible_pid_from(&common::sandbox::SandboxHandle::default_ghostscope()?)?;
 
     let script = format!(
-        "trace globals_program.c:32 {{\n    print \"PID={} TID={} TS={}\", $pid, $tid, $timestamp;\n    if $pid == {} {{ print \"PID_EQ\"; }}\n}}\n",
-        "{}", "{}", "{}", pid
+        "trace globals_program.c:32 {{\n    print \"PID={} HOST_PID={} INPUT_PID={} TID={} TS={}\", $pid, $host_pid, $input_pid, $tid, $timestamp;\n    if $host_pid == {} {{ print \"HOST_PID_EQ\"; }}\n    if $input_pid == {} {{ print \"INPUT_PID_EQ\"; }}\n}}\n",
+        "{}", "{}", "{}", "{}", "{}", host_pid, input_pid
     );
 
     let (exit_code, stdout, stderr) =
@@ -365,8 +367,12 @@ async fn test_special_vars_pid_tid_timestamp_globals() -> anyhow::Result<()> {
     target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
     assert!(
-        stdout.contains("PID_EQ"),
-        "Expected PID_EQ. STDOUT: {stdout}"
+        stdout.contains("HOST_PID_EQ"),
+        "Expected HOST_PID_EQ. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("INPUT_PID_EQ"),
+        "Expected INPUT_PID_EQ. STDOUT: {stdout}"
     );
     assert!(
         stdout.contains("PID=") || stdout.contains("PID:"),
