@@ -287,8 +287,10 @@ trace globals_program.c:32 {
             "Late-start: G_STATE.inner.y should +0.5 per tick. STDOUT: {stdout}"
         );
     } else {
-        let msg = format!("Late-start: No events for our PID {pid}. STDOUT: {stdout}");
-        assert!(!uniq.is_empty(), "{}", msg);
+        assert!(
+            !uniq.is_empty(),
+            "Late-start: No events for our PID {pid}. STDOUT: {stdout}"
+        );
     }
     Ok(())
 }
@@ -317,7 +319,6 @@ trace lib_tick {
                 .with_script(&sc)
                 .with_target(&target)
                 .timeout_secs(12)
-                .with_log_level("trace")
                 .enable_sysmon_shared_lib(true)
                 .run()
                 .await

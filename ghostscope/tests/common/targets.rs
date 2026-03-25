@@ -115,6 +115,12 @@ impl TargetLauncher {
     }
 }
 
+pub(crate) fn ensure_target_binary_ready_for_default_sandbox(binary_path: &Path) -> Result<()> {
+    let sandbox = SandboxHandle::default_target()?;
+    let _ = ensure_binary_ready(&sandbox, binary_path)?;
+    Ok(())
+}
+
 impl TargetHandle {
     pub fn sandbox(&self) -> &SandboxHandle {
         &self.inner.sandbox
