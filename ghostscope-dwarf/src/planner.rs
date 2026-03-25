@@ -134,7 +134,7 @@ impl<'dwarf> AccessPlanner<'dwarf> {
     ) -> crate::core::Result<(Option<gimli::DebugInfoOffset>, gimli::UnitOffset)> {
         // Check declaration flag or childless struct
         let mut is_decl = false;
-        if let Some(attr) = die.attr(gimli::DW_AT_declaration)? {
+        if let Some(attr) = die.attr(gimli::DW_AT_declaration) {
             is_decl = matches!(attr.value(), gimli::AttributeValue::Flag(true));
         }
         let has_children = {
