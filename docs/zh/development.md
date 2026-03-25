@@ -258,7 +258,8 @@ done
 - `host -> docker-private` 和 `docker-private -> same docker-private` 是当前在 CI 中跑全量 e2e 的容器场景。
 - `docker-host -> same docker-host` 仍保留为 smoke，因为它更接近默认的 host PID 视角。
 - `docker-private` 这一组通常需要 `sudo`，因为宿主机上的测试 harness 需要检查该 sandbox 的 PID namespace。
-- 可通过 `E2E_CONTAINER_IMAGE` 覆盖容器镜像。
+- topology-aware e2e 默认使用和 CI 一致的 Ubuntu 20.04 发布镜像：`ghcr.io/swananan/ghostscope-build:ubuntu20.04-llvm18.1.8`。
+- 可通过 `E2E_CONTAINER_IMAGE` 覆盖容器镜像；只有在你明确想测试本地镜像时，才建议改成 `ghostscope-builder:ubuntu20.04`。
 
 ### 使用 dwarf-tool 测试 DWARF 解析
 

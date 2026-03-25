@@ -257,7 +257,8 @@ Notes:
 - `host -> docker-private` and `docker-private -> same docker-private` are the container scenarios that run the full e2e suite in CI.
 - `docker-host -> same docker-host` remains a smoke run because it is close to the default host PID view.
 - Running the `docker-private` variant usually requires `sudo` because the host-side test harness must inspect the sandbox PID namespace.
-- Override the Docker image with `E2E_CONTAINER_IMAGE`.
+- By default the topology-aware e2e framework uses the same published Ubuntu 20.04 image as CI: `ghcr.io/swananan/ghostscope-build:ubuntu20.04-llvm18.1.8`.
+- Override the Docker image with `E2E_CONTAINER_IMAGE`. Use this when you explicitly want to test a local image such as `ghostscope-builder:ubuntu20.04`.
 
 ### Testing DWARF Parsing with dwarf-tool
 
