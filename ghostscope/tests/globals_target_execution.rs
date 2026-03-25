@@ -7,9 +7,8 @@ use common::{init, FIXTURES};
 use ghostscope_process::is_shared_object;
 use regex::Regex;
 use serial_test::serial;
-use std::process::Stdio;
+use std::path::Path;
 use std::time::Duration;
-use tokio::process::Command;
 
 async fn run_ghostscope_with_script_for_target(
     script_content: &str,
@@ -26,6 +25,20 @@ async fn run_ghostscope_with_script_for_target(
         .await
 }
 
+async fn spawn_globals_program(
+    binary_path: &Path,
+) -> anyhow::Result<common::targets::TargetHandle> {
+    let bin_dir = binary_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("globals_program has no parent directory"))?;
+    let target = common::targets::TargetLauncher::binary(binary_path)
+        .current_dir(bin_dir)
+        .spawn()
+        .await?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    Ok(target)
+}
+
 // Late-start helper: run GhostScope first, then start the target process after a delay
 async fn run_ghostscope_then_start_exe(
     script_content: &str,
@@ -33,7 +46,7 @@ async fn run_ghostscope_then_start_exe(
     target_path: &std::path::Path,
     launcher_exe: &std::path::Path,
     launch_delay_ms: u64,
-) -> anyhow::Result<(i32, String, String, tokio::process::Child, u32)> {
+) -> anyhow::Result<(i32, String, String, common::targets::TargetHandle, u32)> {
     // Spawn GhostScope in the background
     let runner = common::runner::GhostscopeRunner::new()
         .with_script(script_content)
@@ -43,22 +56,15 @@ async fn run_ghostscope_then_start_exe(
 
     // Start target process after a small delay
     tokio::time::sleep(Duration::from_millis(launch_delay_ms)).await;
-    let bin_dir = launcher_exe.parent().unwrap().to_path_buf();
-    let prog = Command::new(launcher_exe)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID for late-start target"))?;
+    let target = spawn_globals_program(launcher_exe).await?;
+    let pid = target.host_pid();
 
     // Wait for GhostScope to finish (timeout-based)
     let (exit_code, stdout, stderr) = gs_task
         .await
         .map_err(|e| anyhow::anyhow!("GhostScope task join error: {e}"))??;
 
-    Ok((exit_code, stdout, stderr, prog, pid))
+    Ok((exit_code, stdout, stderr, target, pid))
 }
 
 // ---------------------------------
@@ -71,16 +77,8 @@ async fn test_t_mode_executable_globals_prints() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID for -t exec"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
+    let pid = target.host_pid();
 
     let script = r#"
 trace globals_program.c:32 {
@@ -89,7 +87,7 @@ trace globals_program.c:32 {
 "#;
     let (exit_code, stdout, stderr) =
         run_ghostscope_with_script_for_target(script, 5, &binary_path).await?;
-    let _ = prog.kill().await.is_ok();
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let re = Regex::new(r"PID:([0-9]+) GY:([0-9]+(?:\.[0-9]+)?)").unwrap();
@@ -137,15 +135,8 @@ async fn test_t_mode_library_globals_prints() -> anyhow::Result<()> {
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
     let bin_dir = binary_path.parent().unwrap().to_path_buf();
     let lib_path = bin_dir.join("libgvars.so");
-    let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID for -t lib"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
+    let pid = target.host_pid();
 
     let script = r#"
 trace lib_tick {
@@ -154,7 +145,7 @@ trace lib_tick {
 "#;
     let (exit_code, stdout, stderr) =
         run_ghostscope_with_script_for_target(script, 2, &lib_path).await?;
-    let _ = prog.kill().await.is_ok();
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let re = Regex::new(r"PID:([0-9]+) LC:([0-9]+)").unwrap();
@@ -195,16 +186,8 @@ async fn test_t_mode_executable_rodata_and_struct_pretty() -> anyhow::Result<()>
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID for -t rodata/struct"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
+    let pid = target.host_pid();
 
     // At line 26, aliases (s, ls, gm, etc.) are initialized
     let script = r#"
@@ -215,7 +198,7 @@ trace globals_program.c:26 {
 "#;
     let (exit_code, stdout, stderr) =
         run_ghostscope_with_script_for_target(script, 2, &binary_path).await?;
-    let _ = prog.kill().await.is_ok();
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Verify we saw our PID and the expected GM string for that PID (quoted or unquoted)
@@ -263,7 +246,7 @@ trace globals_program.c:32 {
 }
 "#;
 
-    let (exit_code, stdout, stderr, mut prog, pid) = run_ghostscope_then_start_exe(
+    let (exit_code, stdout, stderr, target, pid) = run_ghostscope_then_start_exe(
         script,
         3,            // allow some time for sysmon -> prefill -> events
         &binary_path, // -t target
@@ -272,7 +255,7 @@ trace globals_program.c:32 {
     )
     .await?;
 
-    let _ = prog.kill().await.is_ok();
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let re = Regex::new(r"PID:([0-9]+) GY:([0-9]+(?:\.[0-9]+)?)").unwrap();
@@ -343,20 +326,14 @@ trace lib_tick {
 
     // Start the target process after a short delay
     tokio::time::sleep(Duration::from_millis(700)).await;
-    let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID for -t lib late-start"))?;
+    let target = spawn_globals_program(&binary_path).await?;
+    let pid = target.host_pid();
 
     // Wait for GhostScope to finish
     let (exit_code, stdout, stderr) = gs_task
         .await
         .map_err(|e| anyhow::anyhow!("GhostScope task join error: {e}"))??;
-    let _ = prog.kill().await.is_ok();
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let re = Regex::new(r"PID:([0-9]+) LC:([0-9]+)").unwrap();
@@ -408,10 +385,10 @@ trace globals_program.c:26 {
 }
 "#;
 
-    let (exit_code, stdout, stderr, mut prog, pid) =
+    let (exit_code, stdout, stderr, target, pid) =
         run_ghostscope_then_start_exe(script, 3, &binary_path, &binary_path, 500).await?;
 
-    let _ = prog.kill().await.is_ok();
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Verify we saw our PID and the expected GM string for that PID
@@ -478,19 +455,13 @@ trace lib_tick {
     };
 
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let mut prog = Command::new(&binary_path)
-        .current_dir(&bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog.id().ok_or_else(|| {
-        anyhow::anyhow!("Failed to get PID for late-start shared lib without sysmon")
-    })?;
+    let target = spawn_globals_program(&binary_path).await?;
+    let pid = target.host_pid();
 
     let (exit_code, stdout, stderr) = gs_task
         .await
         .map_err(|e| anyhow::anyhow!("GhostScope task join error: {e}"))??;
-    let _ = prog.kill().await.is_ok();
+    target.terminate().await?;
 
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 

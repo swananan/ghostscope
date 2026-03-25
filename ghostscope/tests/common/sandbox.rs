@@ -1,13 +1,14 @@
 #![allow(dead_code)]
 
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_LOCAL_IMAGE: &str = "ghostscope-builder:ubuntu20.04";
@@ -17,6 +18,52 @@ const CONTAINER_TARGET_DIR: &str = "/tmp/ghostscope-target";
 const CONTAINER_GHOSTSCOPE_BIN: &str = "/tmp/ghostscope-target/debug/ghostscope";
 
 static NEXT_SANDBOX_ID: AtomicU64 = AtomicU64::new(1);
+static DEFAULT_SANDBOX_PAIR: OnceLock<Result<DefaultSandboxPair, String>> = OnceLock::new();
+
+#[derive(Debug, Clone)]
+struct DefaultSandboxPair {
+    ghostscope: SandboxHandle,
+    target: SandboxHandle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DefaultSandboxSelection {
+    Host,
+    DockerPrivate,
+    DockerHost,
+}
+
+impl DefaultSandboxSelection {
+    fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "host" => Ok(Self::Host),
+            "docker-private" | "private" | "container-private" => Ok(Self::DockerPrivate),
+            "docker-host" | "host-pid" | "docker-host-pid" | "container-host" => {
+                Ok(Self::DockerHost)
+            }
+            _ => anyhow::bail!("expected one of: host, docker-private, docker-host"),
+        }
+    }
+
+    fn from_env(name: &str, default: Self) -> Result<Self> {
+        match std::env::var(name) {
+            Ok(value) => {
+                Self::parse(&value).with_context(|| format!("invalid value for {name}: {value}"))
+            }
+            Err(std::env::VarError::NotPresent) => Ok(default),
+            Err(err) => Err(anyhow::Error::new(err))
+                .with_context(|| format!("failed to read environment variable {name}")),
+        }
+    }
+
+    fn instantiate(self) -> Result<SandboxHandle> {
+        match self {
+            Self::Host => Ok(SandboxHandle::host()),
+            Self::DockerPrivate => SandboxHandle::docker(DockerSpec::private()),
+            Self::DockerHost => SandboxHandle::docker(DockerSpec::host_pid()),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DockerPidMode {
@@ -70,6 +117,19 @@ pub struct SandboxHandle {
     inner: Arc<SandboxInner>,
 }
 
+pub enum BackgroundProcess {
+    Host { pid: u32, child: Child },
+    Detached { pid: u32 },
+}
+
+impl BackgroundProcess {
+    pub fn pid(&self) -> u32 {
+        match self {
+            Self::Host { pid, .. } | Self::Detached { pid } => *pid,
+        }
+    }
+}
+
 #[derive(Debug)]
 enum SandboxInner {
     Host,
@@ -86,6 +146,7 @@ struct DockerSandboxInner {
     pid_ns_inode: Option<u64>,
     repo_root: PathBuf,
     build_ready: Mutex<bool>,
+    prepared_fixture_commands: Mutex<HashSet<String>>,
 }
 
 impl Drop for DockerSandboxInner {
@@ -103,6 +164,14 @@ impl SandboxHandle {
         Self {
             inner: Arc::new(SandboxInner::Host),
         }
+    }
+
+    pub fn default_ghostscope() -> Result<Self> {
+        Ok(default_sandbox_pair()?.ghostscope.clone())
+    }
+
+    pub fn default_target() -> Result<Self> {
+        Ok(default_sandbox_pair()?.target.clone())
     }
 
     pub fn docker_available() -> bool {
@@ -123,7 +192,11 @@ impl SandboxHandle {
 
         let repo_root = workspace_root()?;
         let id = NEXT_SANDBOX_ID.fetch_add(1, Ordering::Relaxed);
-        let container_name = format!("ghostscope-test-{id}-{}", unix_timestamp_secs());
+        let container_name = format!(
+            "ghostscope-test-{id}-{}-{}",
+            std::process::id(),
+            unix_timestamp_nanos()
+        );
 
         let mut args: Vec<OsString> = vec![
             "run".into(),
@@ -200,6 +273,7 @@ impl SandboxHandle {
                 pid_ns_inode,
                 repo_root,
                 build_ready: Mutex::new(false),
+                prepared_fixture_commands: Mutex::new(HashSet::new()),
             })),
         };
 
@@ -392,6 +466,34 @@ impl SandboxHandle {
         }
     }
 
+    pub fn ensure_fixture_command_built_once(&self, key: &str, script: &str) -> Result<()> {
+        match &*self.inner {
+            SandboxInner::Host => Ok(()),
+            SandboxInner::Docker(inner) => {
+                let mut prepared = inner.prepared_fixture_commands.lock().unwrap();
+                if prepared.contains(key) {
+                    return Ok(());
+                }
+
+                let output = self.run_shell(script).with_context(|| {
+                    format!(
+                        "failed to prepare fixture inside docker sandbox {}",
+                        inner.container_name
+                    )
+                })?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "failed to prepare fixture inside docker sandbox {}: {}",
+                    inner.container_name,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+
+                prepared.insert(key.to_string());
+                Ok(())
+            }
+        }
+    }
+
     pub fn run_shell(&self, script: &str) -> Result<Output> {
         match &*self.inner {
             SandboxInner::Host => Command::new("bash")
@@ -410,26 +512,37 @@ impl SandboxHandle {
         }
     }
 
-    pub fn spawn_background_binary(&self, binary_path: &Path) -> Result<u32> {
+    pub fn spawn_background_binary(
+        &self,
+        binary_path: &Path,
+        working_dir: Option<&Path>,
+    ) -> Result<BackgroundProcess> {
         match &*self.inner {
             SandboxInner::Host => {
-                let child = Command::new(binary_path)
+                let mut cmd = Command::new(binary_path);
+                if let Some(path) = working_dir {
+                    cmd.current_dir(path);
+                }
+                let child = cmd
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .spawn()
                     .with_context(|| format!("failed to spawn {}", binary_path.display()))?;
-                Ok(child.id())
+                Ok(BackgroundProcess::Host {
+                    pid: child.id(),
+                    child,
+                })
             }
             SandboxInner::Docker(inner) => {
                 let pid_file = format!("/tmp/ghostscope-target-{}.pid", unix_timestamp_nanos());
                 let err_file = format!("/tmp/ghostscope-target-{}.err", unix_timestamp_nanos());
+                let working_dir = working_dir
+                    .map(Path::to_path_buf)
+                    .or_else(|| binary_path.parent().map(Path::to_path_buf))
+                    .unwrap_or_else(|| PathBuf::from(CONTAINER_REPO_ROOT));
                 let script = format!(
                     "rm -f {pid_file} {err_file}; cd {}; {} >/dev/null 2>{err_file} & child=$!; echo $child > {pid_file}; wait $child",
-                    binary_path
-                        .parent()
-                        .map(Path::display)
-                        .map(|p| p.to_string())
-                        .unwrap_or_else(|| CONTAINER_REPO_ROOT.to_string()),
+                    working_dir.display(),
                     binary_path.display()
                 );
                 let output = Command::new("docker")
@@ -488,7 +601,7 @@ impl SandboxHandle {
                             let _ = Command::new("docker")
                                 .args(["exec", &inner.container_name, "rm", "-f", &pid_file])
                                 .status();
-                            return Ok(pid);
+                            return Ok(BackgroundProcess::Detached { pid });
                         }
 
                         let err_output = Command::new("docker")
@@ -565,6 +678,54 @@ impl SandboxHandle {
     }
 }
 
+fn default_sandbox_pair() -> Result<&'static DefaultSandboxPair> {
+    let pair = DEFAULT_SANDBOX_PAIR
+        .get_or_init(|| resolve_default_sandbox_pair().map_err(|err| format!("{err:#}")));
+
+    match pair {
+        Ok(pair) => Ok(pair),
+        Err(message) => anyhow::bail!("{message}"),
+    }
+}
+
+fn resolve_default_sandbox_pair() -> Result<DefaultSandboxPair> {
+    let ghostscope =
+        DefaultSandboxSelection::from_env("E2E_GHOSTSCOPE_SANDBOX", DefaultSandboxSelection::Host)?;
+    let target =
+        DefaultSandboxSelection::from_env("E2E_TARGET_SANDBOX", DefaultSandboxSelection::Host)?;
+    let share = bool_env("E2E_SHARE_SANDBOX")?.unwrap_or(false);
+
+    if share {
+        anyhow::ensure!(
+            ghostscope == target,
+            "E2E_SHARE_SANDBOX=1 requires GhostScope and target to use the same sandbox kind"
+        );
+        let shared = ghostscope.instantiate()?;
+        return Ok(DefaultSandboxPair {
+            ghostscope: shared.clone(),
+            target: shared,
+        });
+    }
+
+    Ok(DefaultSandboxPair {
+        ghostscope: ghostscope.instantiate()?,
+        target: target.instantiate()?,
+    })
+}
+
+fn bool_env(name: &str) -> Result<Option<bool>> {
+    match std::env::var(name) {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(Some(true)),
+            "0" | "false" | "no" | "off" => Ok(Some(false)),
+            _ => anyhow::bail!("invalid boolean value for {name}: {value}"),
+        },
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(err) => Err(anyhow::Error::new(err))
+            .with_context(|| format!("failed to read environment variable {name}")),
+    }
+}
+
 fn resolve_default_image() -> String {
     if let Ok(image) = std::env::var("E2E_CONTAINER_IMAGE") {
         if !image.trim().is_empty() {
@@ -625,10 +786,42 @@ fn parse_nspid_chain(status: &str) -> Option<Vec<u32>> {
 
 fn resolve_host_ghostscope_bin() -> PathBuf {
     if let Ok(path) = std::env::var("GHOSTSCOPE_TEST_BIN") {
-        return PathBuf::from(path);
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return path;
+        }
     }
     if let Ok(path) = std::env::var("CARGO_BIN_EXE_ghostscope") {
-        return PathBuf::from(path);
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return path;
+        }
+    }
+    if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
+        let candidate = PathBuf::from(target_dir).join("debug/ghostscope");
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    if let Ok(current_exe) = std::env::current_exe() {
+        let mut candidates = Vec::new();
+        if let Some(parent) = current_exe.parent() {
+            candidates.push(parent.join("ghostscope"));
+            if let Some(grandparent) = parent.parent() {
+                candidates.push(grandparent.join("ghostscope"));
+            }
+        }
+        for candidate in candidates {
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    if let Ok(root) = workspace_root() {
+        let candidate = root.join("target/debug/ghostscope");
+        if candidate.exists() {
+            return candidate;
+        }
     }
     PathBuf::from("../target/debug/ghostscope")
 }

@@ -6,32 +6,31 @@ mod common;
 
 use common::{init, FIXTURES};
 use regex::Regex;
-use std::process::Stdio;
+use std::path::Path;
 use std::time::Duration;
-use tokio::process::Command;
 
-async fn run_ghostscope_with_script_for_pid(
+async fn run_ghostscope_with_script_for_target(
     script_content: &str,
     timeout_secs: u64,
-    pid: u32,
+    target: &common::targets::TargetHandle,
 ) -> anyhow::Result<(i32, String, String)> {
     common::runner::GhostscopeRunner::new()
         .with_script(script_content)
-        .with_pid(pid)
+        .attach_to(target)
         .timeout_secs(timeout_secs)
         .enable_sysmon_shared_lib(false)
         .run()
         .await
 }
 
-async fn run_ghostscope_with_script_for_pid_perf(
+async fn run_ghostscope_with_script_for_target_perf(
     script_content: &str,
     timeout_secs: u64,
-    pid: u32,
+    target: &common::targets::TargetHandle,
 ) -> anyhow::Result<(i32, String, String)> {
     common::runner::GhostscopeRunner::new()
         .with_script(script_content)
-        .with_pid(pid)
+        .attach_to(target)
         .timeout_secs(timeout_secs)
         .force_perf_event_array(true)
         .enable_sysmon_shared_lib(false)
@@ -40,18 +39,32 @@ async fn run_ghostscope_with_script_for_pid_perf(
 }
 
 // Helper that enables CLI logging to console for capturing compile-time failures clearly
-async fn run_ghostscope_with_script_for_pid_with_log(
+async fn run_ghostscope_with_script_for_target_with_log(
     script_content: &str,
     timeout_secs: u64,
-    pid: u32,
+    target: &common::targets::TargetHandle,
 ) -> anyhow::Result<(i32, String, String)> {
     common::runner::GhostscopeRunner::new()
         .with_script(script_content)
-        .with_pid(pid)
+        .attach_to(target)
         .timeout_secs(timeout_secs)
         .enable_sysmon_shared_lib(false)
         .run()
         .await
+}
+
+async fn spawn_globals_program(
+    binary_path: &Path,
+) -> anyhow::Result<common::targets::TargetHandle> {
+    let bin_dir = binary_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("globals_program has no parent directory"))?;
+    let target = common::targets::TargetLauncher::binary(binary_path)
+        .current_dir(bin_dir)
+        .spawn()
+        .await?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    Ok(target)
 }
 
 #[tokio::test]
@@ -59,16 +72,7 @@ async fn test_memcmp_hex_helper_on_globals() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // gm -> "Hello, Global!" → prefix "Hello, " = 48 65 6c 6c 6f 2c 20
     // lm -> "LIB_MESSAGE" → prefix "LIB_" = 4c 49 42 5f
@@ -79,8 +83,9 @@ trace globals_program.c:32 {
 }
 "#;
 
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 4, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
     assert!(
         stdout.contains("HEX_OK"),
@@ -98,16 +103,7 @@ async fn test_if_memcmp_failure_emits_exprerror_and_suppress_else() -> anyhow::R
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // Force a failing user read in condition via a DWARF pointer that can be NULL at runtime:
     // G_STATE.lib is NULL on some ticks, memcmp will fail probe_read_user.
@@ -119,8 +115,8 @@ trace globals_program.c:32 {
 }
 "#;
     let (exit_code, stdout, stderr) =
-        run_ghostscope_with_script_for_pid_perf(script, 3, pid).await?;
-    let _ = prog.kill().await.is_ok();
+        run_ghostscope_with_script_for_target_perf(script, 3, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Should have ExprError line and AFTER; should not see THEN/ELSE
@@ -143,16 +139,7 @@ async fn test_struct_arithmetic_is_rejected_with_friendly_error() -> anyhow::Res
 
     // Launch the globals_program fixture to obtain a PID
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let prog = tokio::process::Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // Script attempts struct arithmetic: should be rejected at compile with friendly message
     // Use a stable function entry to avoid source-path resolution flakiness
@@ -164,7 +151,8 @@ trace tick_once {
 
     // Use helper with logging enabled to capture error message
     let (_exit_code, stdout_buf, stderr_buf) =
-        run_ghostscope_with_script_for_pid_with_log(script, 3, pid).await?;
+        run_ghostscope_with_script_for_target_with_log(script, 3, &target).await?;
+    target.terminate().await?;
 
     // Expect a compile/load failure banner and the friendly TypeError message
     // Banner can be either the direct compilation failure or the final summary with zero configs
@@ -187,16 +175,7 @@ async fn test_unknown_member_on_global_reports_members() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // Access a member that does not exist; expect a concise member list in error
     let script = r#"
@@ -205,8 +184,8 @@ trace globals_program.c:32 {
 }
 "#;
     let (_exit_code, _stdout, stderr) =
-        run_ghostscope_with_script_for_pid_with_log(script, 3, pid).await?;
-    let _ = prog.kill().await.is_ok();
+        run_ghostscope_with_script_for_target_with_log(script, 3, &target).await?;
+    target.terminate().await?;
 
     // Look for our friendly message
     let has_msg = stderr.contains("Unknown member 'no_such_member' in struct")
@@ -223,16 +202,7 @@ async fn test_else_if_continues_after_error() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // First if may fail at runtime via DWARF read (G_STATE.lib == NULL on even ticks),
     // else-if checks gm first byte == 'H' (0x48) should succeed, else suppressed
@@ -244,8 +214,9 @@ trace globals_program.c:32 {
 }
 "#;
 
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 4, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout} ");
 
     // Expect ExprError (from first if, when G_STATE.lib is NULL), and B printed; A/C should not appear
@@ -283,16 +254,7 @@ async fn test_script_signed_ints_regression() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // Regression: script ints should keep signed semantics (I8/I16/I32), not U*
     let script = r#"
@@ -306,8 +268,9 @@ trace globals_program.c:32 {
     print "FMT:{}|{}|{}", a, b, c;
 }
 "#;
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 2, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 2, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Variable prints
@@ -338,18 +301,7 @@ async fn test_trace_by_address_via_dwarf_line_lookup() -> anyhow::Result<()> {
 
     // 1) Start the fixture program
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-
-    // Give the program some time to start
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // 2) Resolve a module-relative address (DWARF PC) for a stable source line in globals_program.c
     //    We reuse the same file:line that existing tests rely on and pick the first returned PC.
@@ -368,8 +320,9 @@ async fn test_trace_by_address_via_dwarf_line_lookup() -> anyhow::Result<()> {
 
     // 4) Run ghostscope with -p and the script; in -p mode the default module is the main executable
     // Allow a bit more time for the shared library function to trigger
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(&script, 4, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(&script, 4, &target).await?;
+    target.terminate().await?;
 
     // 5) Validate output: should see the marker at least once
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
@@ -381,7 +334,7 @@ async fn test_trace_by_address_via_dwarf_line_lookup() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_ghostscope_with_script_for_target(
+async fn run_ghostscope_with_target_path(
     script_content: &str,
     timeout_secs: u64,
     target_path: &std::path::Path,
@@ -399,24 +352,17 @@ async fn test_special_vars_pid_tid_timestamp_globals() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
+    let pid = target.host_pid();
 
     let script = format!(
         "trace globals_program.c:32 {{\n    print \"PID={} TID={} TS={}\", $pid, $tid, $timestamp;\n    if $pid == {} {{ print \"PID_EQ\"; }}\n}}\n",
         "{}", "{}", "{}", pid
     );
 
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(&script, 3, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(&script, 3, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
     assert!(
         stdout.contains("PID_EQ"),
@@ -437,16 +383,10 @@ async fn test_trace_address_with_target_shared_library() -> anyhow::Result<()> {
 
     // Start an app that maps libgvars.so so that uprobe events occur
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let _pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
+    let bin_dir = binary_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("globals_program has no parent directory"))?;
 
     // Resolve a function address inside libgvars.so (e.g., lib_tick entry)
     let lib_path = bin_dir.join("libgvars.so");
@@ -470,8 +410,8 @@ async fn test_trace_address_with_target_shared_library() -> anyhow::Result<()> {
 
     // Run ghostscope in target mode (-t <libgvars.so>) with the script, collect output briefly
     let (exit_code, stdout, stderr) =
-        run_ghostscope_with_script_for_target(&script, 2, &lib_path).await?;
-    let _ = prog.kill().await.is_ok();
+        run_ghostscope_with_target_path(&script, 2, &lib_path).await?;
+    target.terminate().await?;
 
     assert_eq!(
         exit_code, 0,
@@ -492,16 +432,10 @@ async fn test_trace_module_qualified_address_in_pid_mode() -> anyhow::Result<()>
 
     // Start the fixture program which loads libgvars.so
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
+    let bin_dir = binary_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("globals_program has no parent directory"))?;
 
     // Resolve a function address inside libgvars.so (e.g., lib_tick entry)
     let lib_path = bin_dir.join("libgvars.so");
@@ -523,8 +457,9 @@ async fn test_trace_module_qualified_address_in_pid_mode() -> anyhow::Result<()>
     // Use module-qualified address with suffix to target the library
     let script = format!("trace libgvars.so:0x{pc:x} {{\n    print \"LIB_MQUAL_OK\";\n}}\n");
 
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(&script, 2, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(&script, 2, &target).await?;
+    target.terminate().await?;
 
     assert_eq!(
         exit_code, 0,
@@ -543,16 +478,7 @@ async fn test_address_of_with_hint_regression() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // Ensure &LIB_STATE is computed with the correct module hint (prints as hex pointer)
     let script = r#"
@@ -560,8 +486,9 @@ trace globals_program.c:32 {
     print &LIB_STATE;
 }
 "#;
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 1, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 1, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
     assert!(
         stdout.contains("0x"),
@@ -575,16 +502,7 @@ async fn test_unary_minus_nested() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // Nested unary minus should work: -(-1) == 1
     let script = r#"
@@ -594,8 +512,9 @@ trace globals_program.c:32 {
     print "X:{}", d;
 }
 "#;
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 1, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 1, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
     assert!(stdout.contains("d = 1"), "Expected d = 1. STDOUT: {stdout}");
     assert!(
@@ -610,16 +529,7 @@ async fn test_string_comparison_globals_char_ptr_and_array() -> anyhow::Result<(
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // In tick_once, gm/lm are aliases to global rodata strings,
     // and s is alias to &G_STATE with name[32].
@@ -631,8 +541,9 @@ trace globals_program.c:32 {
 }
 "#;
 
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 4, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Expect to see both char* matches (gm,lm)
@@ -657,16 +568,7 @@ async fn test_print_format_current_global_member_leaf() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // Current-module leaf member via formatted print
     let script = r#"
@@ -675,8 +577,9 @@ trace globals_program.c:32 {
 }
 "#;
     // Collect exactly 2 events for deterministic delta/null checks
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 2, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 2, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let re = Regex::new(r"GY:([0-9]+(?:\.[0-9]+)?)").unwrap();
@@ -706,16 +609,7 @@ async fn test_print_format_global_autoderef_pointer_member() -> anyhow::Result<(
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // Test script: global base with one auto-deref in chain
     let script = r#"
@@ -723,8 +617,9 @@ trace globals_program.c:32 {
     print "X: {}", G_STATE.lib.inner.x;
 }
 "#;
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 3, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Expect both a normal numeric output and a NullDeref error output while lib toggles
@@ -750,16 +645,7 @@ async fn test_cross_type_comparisons_globals() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // Cross-type comparisons (string equality separated into its own test):
     // - s_internal > 5 (DWARF int vs script int)
@@ -775,8 +661,9 @@ trace globals_program.c:32 {
 }
 "#;
 
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 3, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let re = Regex::new(r"SI_GT5:(true|false) PIN0:(true|false) SI_GT_TH:(true|false)").unwrap();
@@ -805,16 +692,7 @@ async fn test_if_else_if_and_bare_expr_globals() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // Use globals at a stable attach site; exercise bare expr + conditional with expressions
     let script = r#"
@@ -830,8 +708,9 @@ trace globals_program.c:32 {
 }
 "#;
 
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 4, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Expect bare expr name preserved for (s_internal>5) = true/false
@@ -855,16 +734,7 @@ async fn test_if_else_if_logical_ops_globals() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     let script = r#"
 trace globals_program.c:32 {
@@ -873,8 +743,9 @@ trace globals_program.c:32 {
     else if 1 == 0 || p_lib_internal == 0 { print "OR"; }
 }
 "#;
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 4, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Expect deterministic AND branch
@@ -889,16 +760,7 @@ async fn test_address_of_and_comparisons_globals() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // Address-of on globals and in comparisons
     let script = r#"
@@ -909,8 +771,9 @@ trace globals_program.c:32 {
 }
 "#;
 
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 4, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Hex pointer expected for &G_STATE
@@ -942,16 +805,7 @@ async fn test_string_equality_globals() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     let script = r#"
 trace globals_program.c:32 {
@@ -959,8 +813,9 @@ trace globals_program.c:32 {
 }
 "#;
 
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 3, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
     // Expect GM_EQ:true at least once
     assert!(stdout.contains("GM_EQ:true") || stdout.contains("GM_EQ:false"));
@@ -972,16 +827,7 @@ async fn test_chain_tail_array_constant_index_increments() -> anyhow::Result<()>
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // LIB_STATE.array[i] increments by +1 per tick in lib_tick(); via G_STATE.lib pointer
     let script = r#"
@@ -990,8 +836,9 @@ trace globals_program.c:32 {
 }
 "#;
 
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 3, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // At this PC, G_STATE.lib may still be NULL (set later in tick_once), so A0 can alternate
@@ -1030,16 +877,7 @@ async fn test_builtins_strncmp_starts_with_globals() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // Validate strncmp/starts_with builtins on globals
     let script = r#"
@@ -1050,8 +888,9 @@ trace globals_program.c:32 {
 }
 "#;
 
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 3, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Expect true for SN1 and SW1; LM starts with LIB_ should be true as well
@@ -1075,16 +914,7 @@ async fn test_builtin_strncmp_generic_ptr_and_null() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // At this PC, s.lib flips between NULL and &LIB_STATE each tick
     // When non-NULL, the first bytes are 'LIB' (name field), so strncmp should be true
@@ -1095,8 +925,9 @@ trace globals_program.c:32 {
 }
 "#;
 
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 5, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 5, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let saw_true = stdout.lines().any(|l| l.contains("SL:true"));
@@ -1114,16 +945,7 @@ async fn test_rodata_char_element() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // Print first character of executable/library rodata messages
     let script = r#"
@@ -1137,8 +959,9 @@ trace globals_program.c:32 {
     print "L0:{}", lib_message[0];
 }
 "#;
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 3, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Expect char-literal outputs (or numeric+char if simple path is used)
@@ -1179,16 +1002,7 @@ async fn test_format_specifiers_memory_and_pointer() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     let script = r#"
 trace globals_program.c:32 {
@@ -1203,8 +1017,9 @@ trace globals_program.c:32 {
 }
 "#;
 
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 3, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     use regex::Regex;
@@ -1236,16 +1051,7 @@ async fn test_large_pattern_dump_and_checks() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // Validate:
     // - First 16 bytes of lib_pattern are 00..0f (hex)
@@ -1260,8 +1066,9 @@ trace globals_program.c:32 {
 }
 "#;
 
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 4, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     use regex::Regex;
@@ -1291,16 +1098,7 @@ async fn test_format_capture_len_zero_and_exceed_cap() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // With project-level ghostscope.toml setting mem_dump_cap=64,
     // - len=0 should yield empty
@@ -1314,8 +1112,9 @@ trace globals_program.c:32 {
 }
 "#;
 
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 4, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     use regex::Regex;
@@ -1341,16 +1140,7 @@ async fn test_format_negative_len_clamped_to_zero() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // Negative lengths should clamp to 0 and produce empty output
     let script = r#"
@@ -1361,8 +1151,9 @@ trace globals_program.c:32 {
 }
 "#;
 
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 4, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     use regex::Regex;
@@ -1381,16 +1172,7 @@ async fn test_format_specifiers_capture_len() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     let script = r#"
 trace globals_program.c:32 {
@@ -1401,8 +1183,9 @@ trace globals_program.c:32 {
 }
 "#;
 
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 3, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     use regex::Regex;
@@ -1426,16 +1209,7 @@ async fn test_alias_to_complex_dwarf_expr_index_and_address_of() -> anyhow::Resu
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     let script = r#"
 trace globals_program.c:32 {
@@ -1446,8 +1220,9 @@ trace globals_program.c:32 {
 }
 "#;
 
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 4, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Expect pointer print and at least one A0/A1 line
@@ -1479,16 +1254,7 @@ async fn test_alias_to_aggregate_and_chain_and_string_prefix() -> anyhow::Result
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     let script = r#"
 trace globals_program.c:32 {
@@ -1503,8 +1269,9 @@ trace globals_program.c:32 {
 }
 "#;
 
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 4, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Should see numeric AX and BX lines
@@ -1537,16 +1304,7 @@ async fn test_alias_rodata_string_builtins() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     let script = r#"
 trace globals_program.c:32 {
@@ -1559,8 +1317,9 @@ trace globals_program.c:32 {
 }
 "#;
 
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 3, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
     // All should be true at least once
     for tag in ["GST:true", "GSN:true", "LST:true", "LSN:true"] {
@@ -1578,16 +1337,7 @@ async fn test_alias_rodata_string_builtins_perf() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     let script = r#"
 trace globals_program.c:32 {
@@ -1600,8 +1350,8 @@ trace globals_program.c:32 {
 }
 "#;
     let (exit_code, stdout, stderr) =
-        run_ghostscope_with_script_for_pid_perf(script, 3, pid).await?;
-    let _ = prog.kill().await.is_ok();
+        run_ghostscope_with_script_for_target_perf(script, 3, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
     for tag in ["GST:true", "GSN:true", "LST:true", "LSN:true"] {
         assert!(
@@ -1619,16 +1369,7 @@ async fn test_alias_address_of_cross_module_uses_correct_hint() -> anyhow::Resul
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // Touch an executable symbol first (to set a prior module hint), then
     // alias a library global and take its address; compare with &LIB_STATE.
@@ -1641,8 +1382,9 @@ trace globals_program.c:32 {
 }
 "#;
 
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 4, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let re_pa = Regex::new(r"PA=0x([0-9a-fA-F]+)").unwrap();
@@ -1672,16 +1414,7 @@ async fn test_top_level_array_member_struct_field() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // Top-level array-of-struct member access: g_slots[1].x
     let script = r#"
@@ -1689,8 +1422,9 @@ trace globals_program.c:32 {
     print "SX:{}", g_slots[1].x;
 }
 "#;
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 3, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let re = Regex::new(r"SX:(-?\d+)").unwrap();
@@ -1708,16 +1442,7 @@ async fn test_tick_once_entry_strings_and_structs() -> anyhow::Result<()> {
 
     // Build and start globals_program (Debug)
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // Attach at a source line after local aliases are initialized (line 26 is first non-comment after 19..24)
     let script = r#"
@@ -1728,9 +1453,10 @@ trace globals_program.c:26 {
     print *ls;          // deref pointer to struct
 }
 "#;
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 2, pid).await?;
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 2, &target).await?;
 
-    let _ = prog.kill().await.is_ok();
+    target.terminate().await?;
 
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
@@ -1759,16 +1485,7 @@ async fn test_tick_once_formatted_counters() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // Verify formatted output combining fields from exe and lib globals via locals
     let script = r#"
@@ -1776,8 +1493,9 @@ trace tick_once {
     print "G:{} L:{}", s.counter, ls.counter;
 }
 "#;
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 2, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 2, &target).await?;
+    target.terminate().await?;
 
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
     assert!(
@@ -1793,16 +1511,7 @@ async fn test_tick_once_pointer_values() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // Validate pointers to rodata appear as addresses; attach after locals are set
     let script = r#"
@@ -1811,8 +1520,9 @@ trace globals_program.c:26 {
     print lm; // const char* to library rodata
 }
 "#;
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 2, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 2, &target).await?;
+    target.terminate().await?;
 
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
     assert!(
@@ -1828,16 +1538,7 @@ async fn test_two_events_evolution_and_statics() -> anyhow::Result<()> {
 
     // Build and start globals_program (Debug)
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // Attach at initialized locals line; print counters and statics via local pointers
     let script = r#"
@@ -1850,8 +1551,9 @@ trace globals_program.c:26 {
 }
 
 "#;
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 3, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Parse first two occurrences for each metric
@@ -1928,16 +1630,7 @@ async fn test_direct_globals_current_module() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // Directly print globals without local aliases
     let script = r#"
@@ -1949,8 +1642,9 @@ trace globals_program.c:32 {
     print "FMT:{}|{}", s_internal, s_bss_counter;
 }
 "#;
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 4, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Expect at least some struct pretty print and integer values present
@@ -2009,24 +1703,16 @@ async fn test_direct_bss_global_no_alias() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     let script = r#"
 trace globals_program.c:32 {
     print "SBSS_ONLY:{}", s_bss_counter;
 }
 "#;
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 3, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let re = Regex::new(r"SBSS_ONLY:(-?\d+)").unwrap();
@@ -2051,16 +1737,7 @@ async fn test_direct_global_cross_module() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // Cross-module global: offsets are auto-populated in -p mode; expect successful struct print
     let script = r#"
@@ -2070,8 +1747,9 @@ trace globals_program.c:32 {
     print "LIBCNT:{}", LIB_STATE.counter;
 }
 "#;
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 2, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 2, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Expect pretty struct output for LIB_STATE
@@ -2105,16 +1783,7 @@ async fn test_rodata_direct_strings() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // Directly print rodata arrays as strings (executable + library)
     let script = r#"
@@ -2125,8 +1794,9 @@ trace globals_program.c:32 {
     print "FMT:{}|{}", g_message, lib_message;
 }
 "#;
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 2, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 2, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Expect two quoted strings present (best-effort; content may vary across builds)
@@ -2156,16 +1826,7 @@ async fn test_bss_first_byte_evolves() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // Read first byte of executable/library .bss buffers via locals 'gb'/'lb'
     let script = r#"
@@ -2176,8 +1837,9 @@ trace globals_program.c:32 {
     print "BF:{}|{}", *gb, *lb;
 }
 "#;
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 3, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let re_gb = Regex::new(r"\*gb\s*=\s*(-?\d+)").unwrap();
@@ -2231,16 +1893,7 @@ async fn test_print_variable_global_member_direct() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // Directly print global member fields in variable mode
     let script = r#"
@@ -2249,8 +1902,9 @@ trace globals_program.c:32 {
     print LIB_STATE.counter;
 }
 "#;
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 3, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let re_g = Regex::new(r"G_STATE\.counter\s*=\s*(-?\d+)").unwrap();
@@ -2281,16 +1935,7 @@ async fn test_print_format_global_member_direct() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // Print format with global member (counter int)
     let script = r#"
@@ -2298,8 +1943,9 @@ trace globals_program.c:32 {
     print "LIBCNT:{}", LIB_STATE.counter;
 }
 "#;
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 3, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let re = Regex::new(r"LIBCNT:(-?\d+)").unwrap();
@@ -2322,16 +1968,7 @@ async fn test_print_format_global_member_leaf() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // Ensure formatted multi-level member prints scalar value, not whole struct
     let script = r#"
@@ -2339,8 +1976,9 @@ trace globals_program.c:32 {
     print "LIBY:{}", LIB_STATE.inner.y;
 }
 "#;
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 3, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // Capture floating values and ensure delta ~ 1.25 between first two events
@@ -2375,16 +2013,7 @@ async fn test_print_variable_global_member_leaf() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // Variable mode: nested chain leaf prints as scalar
     let script = r#"
@@ -2392,8 +2021,9 @@ trace globals_program.c:32 {
     print LIB_STATE.inner.y;
 }
 "#;
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 3, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 3, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let re = Regex::new(r"LIB_STATE\.inner\.y\s*=\s*(-?[0-9]+(?:\.[0-9]+)?)").unwrap();
@@ -2423,16 +2053,7 @@ async fn test_print_format_current_global_member_leaf_perf() -> anyhow::Result<(
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // Current-module leaf member via formatted print
     let script = r#"
@@ -2442,8 +2063,8 @@ trace globals_program.c:32 {
 "#;
     // Collect exactly 2 events for deterministic delta/null checks
     let (exit_code, stdout, stderr) =
-        run_ghostscope_with_script_for_pid_perf(script, 2, pid).await?;
-    let _ = prog.kill().await.is_ok();
+        run_ghostscope_with_script_for_target_perf(script, 2, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let re = Regex::new(r"GY:([0-9]+(?:\.[0-9]+)?)").unwrap();
@@ -2473,16 +2094,7 @@ async fn test_tick_once_entry_strings_and_structs_perf() -> anyhow::Result<()> {
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     // Attach at a source line after local aliases are initialized (line 26 is first non-comment after 19..24)
     let script = r#"
@@ -2495,9 +2107,9 @@ trace globals_program.c:26 {
 "#;
 
     let (exit_code, stdout, stderr) =
-        run_ghostscope_with_script_for_pid_perf(script, 2, pid).await?;
+        run_ghostscope_with_script_for_target_perf(script, 2, &target).await?;
 
-    let _ = prog.kill().await.is_ok();
+    target.terminate().await?;
 
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
@@ -2526,16 +2138,7 @@ async fn test_memcmp_numeric_pointer_literal_and_hex_len() -> anyhow::Result<()>
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    let bin_dir = binary_path.parent().unwrap().to_path_buf();
-    let mut prog = Command::new(&binary_path)
-        .current_dir(bin_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let pid = prog
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get PID"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = spawn_globals_program(&binary_path).await?;
 
     let script = r#"
 trace globals_program.c:32 {
@@ -2544,8 +2147,9 @@ trace globals_program.c:32 {
 }
 "#;
 
-    let (exit_code, stdout, stderr) = run_ghostscope_with_script_for_pid(script, 4, pid).await?;
-    let _ = prog.kill().await.is_ok();
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 4, &target).await?;
+    target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     // hex static length path succeeds
