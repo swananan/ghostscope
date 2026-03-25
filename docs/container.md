@@ -146,6 +146,8 @@ From the user's perspective, the rule is still the same: enter the PID visible w
 
 This is one of the most ambiguous and failure-prone cases.
 
+In the current implementation, this scenario is not part of the supported path.
+
 It is mainly useful to explain why GhostScope must not blindly guess PID mappings across namespaces.
 
 Potential problems include:
@@ -154,7 +156,7 @@ Potential problems include:
 - GhostScope may receive some kernel-view events, but cannot reliably map them back to the current namespace's `/proc` path.
 - If helpers are unavailable, fallback behavior may be unsafe.
 
-In these cases, GhostScope should prefer a clear error or fail-fast behavior instead of guessing mappings.
+In these cases, GhostScope should fail clearly and early rather than guessing mappings.
 
 ### Current `-p` Decision Flow
 
@@ -468,6 +470,7 @@ The following limitations used to be scattered in `limitations.md`. They are now
 - If the helper is unavailable, GhostScope falls back to host PID mapping derived from `NSpid`, but only when that mapping is explicit enough to be trusted.
 - `-p` must refer to a PID visible in the current PID namespace. If the PID is not visible in the current `/proc`, GhostScope fails immediately rather than guessing across namespaces.
 - The current implementation is intentionally stricter in one more case: in a container-like environment, if the helper is unavailable and `NSpid` cannot provide an explicit host mapping, GhostScope fails instead of guessing, unless the target remains in the initial PID namespace.
+- Scenario 6 (GhostScope in one private PID namespace, target outside that namespace) is not currently supported. `-p` should fail rather than attempting to guess a cross-namespace PID mapping.
 - In container PID-namespace environments, if the helper is unavailable, `$pid/$tid` in scripts may reflect host-namespace values rather than the PID visible inside the container.
 - `-t` depends on sysmon to maintain runtime process lifecycle state. sysmon's `event_pid` comes from `bpf_get_current_pid_tgid() >> 32` and aligns with host-view PID semantics. In cross-PID-namespace cases, alignment between `event_pid` and `proc_pid` is not currently reliable, so `-t` has a structural limitation in those scenarios.
 
