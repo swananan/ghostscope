@@ -146,6 +146,8 @@ GhostScope 同时依赖两类信息源：
 
 这是最容易产生歧义和失败的场景之一。
 
+当前实现里，这一场景不属于支持路径。
+
 这一场景更多是为了说明为什么 GhostScope 不能跨 namespace 盲目猜测 PID 映射。
 
 可能出现的问题包括：
@@ -154,7 +156,7 @@ GhostScope 同时依赖两类信息源：
 - GhostScope 可以收到某些内核视角事件，但无法稳定反查到当前 namespace 的 `/proc` 路径。
 - helper 不可用时，fallback 可能不可靠。
 
-对于这类场景，GhostScope 更适合明确报错或 fail fast，而不是猜测映射关系。
+对于这类场景，GhostScope 当前应该明确报错或 fail fast，而不是猜测映射关系。
 
 ### 目前 `-p` 模式的判断顺序
 
@@ -468,6 +470,7 @@ WSL 不是容器，但对 GhostScope 来说，WSL 场景会暴露出一组和容
 - 若 helper 不可用，则回退到 `NSpid` 推导出来的 host PID 映射，但只有在映射足够明确时才安全。
 - `-p` 必须是当前 PID namespace 可见的进程号。如果当前 `/proc` 中看不到该 PID，GhostScope 会直接报错，不会跨 namespace 猜测映射。
 - 当前实现里还有一层额外严格策略：在“容器倾向环境 + helper 不可用 + `NSpid` 不能给出明确 host 映射”时，GhostScope 会直接报错，不做猜测。
+- 场景 6（GhostScope 在一个 private PID namespace 容器里、目标不在这个 PID namespace 里）当前不支持；`-p` 模式应直接失败，而不是尝试跨 namespace 猜测 PID 映射。
 - 在容器 PID namespace 环境下，如果 helper 不可用，脚本里的 `$pid/$tid` 可能表现为宿主机 namespace 的值，而不是容器内看到的 PID。
 - `-t` 模式依赖 `sysmon` 维护运行时进程生命周期；而 `sysmon` 的 `event_pid` 来自 `bpf_get_current_pid_tgid() >> 32`，对齐的是 host 视角 PID。跨 PID namespace 场景下，`event_pid` 与 `proc_pid` 的对齐目前并不可靠，因此 `-t` 的生命周期维护链路在这类场景下存在结构性限制。
 
