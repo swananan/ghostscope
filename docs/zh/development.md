@@ -173,6 +173,55 @@ sudo env HOST=127.0.0.1 PORT=8788 DEFAULT_SUDO=1 DEFAULT_REPO_DIR=/mnt/500g/code
 - `E2E_TEST_CASE=<cargo_test_filter>`
 - `E2E_SUDO=1|0`（默认：`1`）
 
+测试框架级环境变量：
+
+- `E2E_GHOSTSCOPE_SANDBOX=host|docker-private|docker-host`
+  控制 Rust e2e 里 GhostScope 自己运行在哪个环境。默认：`host`。
+- `E2E_TARGET_SANDBOX=host|docker-private|docker-host`
+  控制 Rust e2e 里被追踪目标进程运行在哪个环境。默认：`host`。
+- `E2E_SHARE_SANDBOX=1|0`
+  当 GhostScope 和目标使用同一种 sandbox 类型时，是否复用同一个 sandbox。
+  默认：`0`。只有两边使用相同的非 host sandbox 时，这个变量才有意义。
+- `E2E_GHOSTSCOPE_LOG_LEVEL=error|warn|info|debug|trace`
+  为直接执行的 `cargo test` 打开 GhostScope 日志并设置日志级别。
+  设置该变量后，测试 helper 会自动启用 GhostScope 的文件日志和控制台日志。
+
+如果要在直接执行 `cargo test` 时收集 GhostScope 日志，可设置：
+
+```bash
+E2E_GHOSTSCOPE_LOG_LEVEL=debug cargo test --all-features --test script_execution test_correct_pid_filtering -- --nocapture
+```
+
+测试 helper 会在该次运行里自动打开 GhostScope 的文件日志和控制台日志。
+
+如果要按单次 job 配置 runner service，可向 `POST /runs` 提交带 `logging.level` 的 JSON：
+
+```bash
+curl -sS -X POST http://127.0.0.1:8788/runs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "sudo": true,
+    "repo": "/mnt/500g/code/ghostscope",
+    "test_case": "test_correct_pid_filtering",
+    "logging": {
+      "level": "debug"
+    },
+    "topology": {
+      "ghostscope": "host",
+      "target": "docker-private",
+      "share": false
+    }
+  }'
+```
+
+支持的日志级别：
+
+- `error`
+- `warn`
+- `info`
+- `debug`
+- `trace`
+
 ### 容器 E2E（Docker PID namespace smoke）
 
 在特权容器中运行聚焦 `-p` 模式的 e2e 子集：

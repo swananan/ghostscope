@@ -172,6 +172,55 @@ Optional variables:
 - `E2E_TEST_CASE=<cargo_test_filter>`
 - `E2E_SUDO=1|0` (default: `1`)
 
+Test-framework environment variables:
+
+- `E2E_GHOSTSCOPE_SANDBOX=host|docker-private|docker-host`
+  Controls where GhostScope itself runs in Rust e2e tests. Default: `host`.
+- `E2E_TARGET_SANDBOX=host|docker-private|docker-host`
+  Controls where the traced target process runs in Rust e2e tests. Default: `host`.
+- `E2E_SHARE_SANDBOX=1|0`
+  When GhostScope and target use the same sandbox type, reuse a single sandbox for both.
+  Default: `0`. This only makes sense when both sides use the same non-host sandbox.
+- `E2E_GHOSTSCOPE_LOG_LEVEL=error|warn|info|debug|trace`
+  Enables GhostScope logging for direct `cargo test` runs and sets the log level.
+  The test helper automatically turns on GhostScope file+console logging when this is set.
+
+To collect GhostScope logs during a direct `cargo test` run, set:
+
+```bash
+E2E_GHOSTSCOPE_LOG_LEVEL=debug cargo test --all-features --test script_execution test_correct_pid_filtering -- --nocapture
+```
+
+The test helper will enable GhostScope file+console logging automatically for that run.
+
+To configure the runner service per job, submit JSON to `POST /runs` with optional `logging.level`:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8788/runs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "sudo": true,
+    "repo": "/mnt/500g/code/ghostscope",
+    "test_case": "test_correct_pid_filtering",
+    "logging": {
+      "level": "debug"
+    },
+    "topology": {
+      "ghostscope": "host",
+      "target": "docker-private",
+      "share": false
+    }
+  }'
+```
+
+Supported levels:
+
+- `error`
+- `warn`
+- `info`
+- `debug`
+- `trace`
+
 ### Container E2E (Docker PID namespace smoke)
 
 Run a focused PID-mode e2e subset in privileged Docker:

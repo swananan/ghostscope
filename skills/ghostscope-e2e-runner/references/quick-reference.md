@@ -46,6 +46,26 @@ curl -sS -X POST http://127.0.0.1:8788/runs \
   }'
 ```
 
+Run one case with explicit topology and GhostScope debug logs:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8788/runs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "sudo": true,
+    "repo": "/mnt/500g/code/ghostscope",
+    "test_case": "test_correct_pid_filtering",
+    "logging": {
+      "level": "debug"
+    },
+    "topology": {
+      "ghostscope": "host",
+      "target": "docker-private",
+      "share": false
+    }
+  }'
+```
+
 Run all:
 
 ```bash
@@ -99,3 +119,20 @@ curl -sS -X POST http://127.0.0.1:8788/runs \
     }
   }'
 ```
+
+## Local Cargo Logging
+
+Enable GhostScope debug logs for direct `cargo test` runs:
+
+```bash
+E2E_GHOSTSCOPE_LOG_LEVEL=debug \
+cargo test --all-features --test script_execution test_correct_pid_filtering -- --nocapture
+```
+
+Supported levels:
+
+- `error`
+- `warn`
+- `info`
+- `debug`
+- `trace`

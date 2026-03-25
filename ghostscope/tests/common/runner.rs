@@ -12,12 +12,17 @@
 use super::sandbox::SandboxHandle;
 use super::targets::TargetHandle;
 use anyhow::Result;
+use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use tempfile::{Builder, NamedTempFile};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
+
+const ENV_GHOSTSCOPE_LOG_LEVEL: &str = "E2E_GHOSTSCOPE_LOG_LEVEL";
+const ENV_GHOSTSCOPE_ENABLE_LOGGING: &str = "E2E_GHOSTSCOPE_ENABLE_LOGGING";
+const ENV_GHOSTSCOPE_LOG_CONSOLE: &str = "E2E_GHOSTSCOPE_LOG_CONSOLE";
 
 pub struct GhostscopeRunner {
     script_content: String,
@@ -29,6 +34,7 @@ pub struct GhostscopeRunner {
     log_level: Option<String>,
     enable_sysmon_shared_lib: bool,
     enable_file_logging: bool,
+    enable_console_logging: bool,
     sandbox: Option<SandboxHandle>,
 }
 
@@ -44,6 +50,7 @@ impl Default for GhostscopeRunner {
             log_level: None,
             enable_sysmon_shared_lib: false,
             enable_file_logging: false,
+            enable_console_logging: false,
             sandbox: None,
         }
     }
@@ -104,12 +111,19 @@ impl GhostscopeRunner {
     }
 
     #[allow(dead_code)]
+    pub fn enable_console_logging(mut self, yes: bool) -> Self {
+        self.enable_console_logging = yes;
+        self
+    }
+
+    #[allow(dead_code)]
     pub fn with_log_level<S: Into<String>>(mut self, level: S) -> Self {
         self.log_level = Some(level.into());
         self
     }
 
     pub async fn run(self) -> Result<(i32, String, String)> {
+        let logging = self.resolve_logging_config();
         let sandbox = match self.sandbox {
             Some(sandbox) => sandbox,
             None => SandboxHandle::default_ghostscope()?,
@@ -132,7 +146,6 @@ impl GhostscopeRunner {
 
         // Build command + args
         let mut args: Vec<OsString> = Vec::new();
-
         if let Some(pid) = self.pid {
             args.push(OsString::from("-p"));
             args.push(OsString::from(pid.to_string()));
@@ -148,7 +161,7 @@ impl GhostscopeRunner {
         args.push(OsString::from("--script-file"));
         args.push(script_path.into_os_string());
 
-        if let Some(level) = &self.log_level {
+        if let Some(level) = &logging.level {
             args.push(OsString::from("--log-level"));
             args.push(OsString::from(level.clone()));
         }
@@ -162,8 +175,11 @@ impl GhostscopeRunner {
             args.push(OsString::from("--enable-sysmon-shared-lib"));
         }
 
-        if self.enable_file_logging {
+        if logging.enable_logging {
             args.push(OsString::from("--log"));
+        }
+        if logging.enable_console_logging {
+            args.push(OsString::from("--log-console"));
         }
 
         let (program, mut prefix_args) = sandbox.ghostscope_command()?;
@@ -265,6 +281,42 @@ impl GhostscopeRunner {
 
         Ok((exit_code, stdout_content, stderr_content))
     }
+
+    fn resolve_logging_config(&self) -> EffectiveLoggingConfig {
+        let env_log_level = env::var(ENV_GHOSTSCOPE_LOG_LEVEL)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let env_enable_logging = env_bool(ENV_GHOSTSCOPE_ENABLE_LOGGING);
+        let env_console_logging = env_bool(ENV_GHOSTSCOPE_LOG_CONSOLE);
+
+        let level = self.log_level.clone().or(env_log_level);
+        let mut enable_logging = self.enable_file_logging || env_enable_logging.unwrap_or(false);
+        let mut enable_console_logging =
+            self.enable_console_logging || env_console_logging.unwrap_or(false);
+
+        // A requested log level is only useful if GhostScope logging is enabled.
+        // Default to dual file+console logging so `cargo test` and runner jobs
+        // surface the requested logs without additional flags.
+        if level.is_some() && !enable_logging && !enable_console_logging {
+            enable_logging = true;
+            enable_console_logging = true;
+        } else if enable_console_logging {
+            enable_logging = true;
+        }
+
+        EffectiveLoggingConfig {
+            level,
+            enable_logging,
+            enable_console_logging,
+        }
+    }
+}
+
+struct EffectiveLoggingConfig {
+    level: Option<String>,
+    enable_logging: bool,
+    enable_console_logging: bool,
 }
 
 fn create_script_file() -> Result<NamedTempFile> {
@@ -277,4 +329,18 @@ fn create_script_file() -> Result<NamedTempFile> {
         .suffix(".gs")
         .tempfile_in(repo_root)
         .map_err(Into::into)
+}
+
+fn env_bool(name: &str) -> Option<bool> {
+    let raw = env::var(name).ok()?;
+    let value = raw.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
