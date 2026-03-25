@@ -11,7 +11,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const DEFAULT_LOCAL_IMAGE: &str = "ghostscope-builder:ubuntu20.04";
 const DEFAULT_REMOTE_IMAGE: &str = "ghcr.io/swananan/ghostscope-build:ubuntu20.04-llvm18.1.8";
 const CONTAINER_REPO_ROOT: &str = "/workspace";
 const CONTAINER_TARGET_DIR: &str = "/tmp/ghostscope-target";
@@ -732,18 +731,9 @@ fn resolve_default_image() -> String {
             return image;
         }
     }
-    let local = Command::new("docker")
-        .args(["image", "inspect", DEFAULT_LOCAL_IMAGE])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false);
-    if local {
-        DEFAULT_LOCAL_IMAGE.to_string()
-    } else {
-        DEFAULT_REMOTE_IMAGE.to_string()
-    }
+    // Default to the same published image used in CI so local e2e, runner,
+    // and GitHub Actions exercise the same container userspace by default.
+    DEFAULT_REMOTE_IMAGE.to_string()
 }
 
 fn resolve_container_init_host_pid(container_name: &str) -> Result<u32> {
