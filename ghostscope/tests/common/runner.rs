@@ -10,6 +10,7 @@
 //!   any output, treat exit code -1 as success (0) to keep tests stable
 
 use super::sandbox::SandboxHandle;
+use super::targets::ensure_target_binary_ready_for_default_sandbox;
 use super::targets::TargetHandle;
 use anyhow::Result;
 use std::env;
@@ -137,6 +138,14 @@ impl GhostscopeRunner {
             (by_pid as usize) + (by_attached_target as usize) + (by_target as usize) == 1,
             "Must set exactly one of pid, attached target, or target path"
         );
+
+        if let Some(ref target) = self.target {
+            // In late-start -t tests, GhostScope may compile the script before the target
+            // process is launched. Pre-build the target artifact in the sandbox where the
+            // program will later execute so any Build-ID based cookie matches what sysmon
+            // will see from /proc/<pid>/maps after the process starts.
+            ensure_target_binary_ready_for_default_sandbox(target)?;
+        }
 
         // Write script to a temp file
         let mut script_file = create_script_file()?;
