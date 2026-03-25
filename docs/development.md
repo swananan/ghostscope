@@ -221,22 +221,34 @@ Supported levels:
 - `debug`
 - `trace`
 
-### Container E2E (Docker PID namespace smoke)
+### Container Topology Smoke
 
-Run a focused PID-mode e2e subset in privileged Docker:
+Run the PID-focused smoke subset through the topology-aware Rust e2e framework:
 
 ```bash
-./scripts/e2e/container/run_container_e2e.sh --pid-mode private
-./scripts/e2e/container/run_container_e2e.sh --pid-mode host
+for test_case in test_invalid_pid_handling test_correct_pid_filtering test_pid_specificity_with_multiple_processes; do
+  sudo env \
+    E2E_GHOSTSCOPE_SANDBOX=docker-private \
+    E2E_TARGET_SANDBOX=docker-private \
+    E2E_SHARE_SANDBOX=1 \
+    cargo test --all-features --test script_execution "$test_case" -- --nocapture
+done
+
+for test_case in test_invalid_pid_handling test_correct_pid_filtering test_pid_specificity_with_multiple_processes; do
+  sudo env \
+    E2E_GHOSTSCOPE_SANDBOX=docker-host \
+    E2E_TARGET_SANDBOX=docker-host \
+    E2E_SHARE_SANDBOX=1 \
+    cargo test --all-features --test script_execution "$test_case" -- --nocapture
+done
 ```
 
 Notes:
 
-- Tests run inside Docker, not on host.
-- Default set is PID-focused smoke cases.
-- Use `--all` for full `cargo test --all-features` in container.
-- Override image with `--image` or `E2E_CONTAINER_IMAGE`.
-- Local runs enable Docker volume cache by default (`E2E_USE_DOCKER_CACHE=1`).
+- These commands keep the Rust test harness on the host and move GhostScope plus the traced target into the requested container sandbox topology.
+- `docker-private` and `docker-host` correspond to the old private/host PID smoke modes.
+- Running the `docker-private` variant usually requires `sudo` because the host-side test harness must inspect the sandbox PID namespace.
+- Override the Docker image with `E2E_CONTAINER_IMAGE`.
 
 ### Testing DWARF Parsing with dwarf-tool
 

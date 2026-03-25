@@ -12,7 +12,7 @@
 - After code changes, always run formatting and lint checks before handoff.
 - After routine feature development, also run both e2e paths before handoff:
   - Standard e2e through the `ghostscope-e2e-runner` skill, using `./scripts/e2e/runner/run_e2e_runner.sh`
-  - Container e2e through `./scripts/e2e/container/run_container_e2e.sh --pid-mode private` and `--pid-mode host`
+  - Container topology smoke through topology-aware `sudo env ... cargo test`, covering both `docker-private` and `docker-host` same-sandbox modes
 - Use the same commands as CI in `.github/workflows/ci.yml` whenever possible.
 - Local formatting: `cargo fmt --all` (single run is enough).
 - CI uses `cargo fmt --all -- --check` for verification only.
