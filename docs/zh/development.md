@@ -222,22 +222,34 @@ curl -sS -X POST http://127.0.0.1:8788/runs \
 - `debug`
 - `trace`
 
-### 容器 E2E（Docker PID namespace smoke）
+### 容器拓扑 Smoke
 
-在特权容器中运行聚焦 `-p` 模式的 e2e 子集：
+通过 topology-aware Rust e2e 框架运行聚焦 `-p` 模式的 smoke 用例：
 
 ```bash
-./scripts/e2e/container/run_container_e2e.sh --pid-mode private
-./scripts/e2e/container/run_container_e2e.sh --pid-mode host
+for test_case in test_invalid_pid_handling test_correct_pid_filtering test_pid_specificity_with_multiple_processes; do
+  sudo env \
+    E2E_GHOSTSCOPE_SANDBOX=docker-private \
+    E2E_TARGET_SANDBOX=docker-private \
+    E2E_SHARE_SANDBOX=1 \
+    cargo test --all-features --test script_execution "$test_case" -- --nocapture
+done
+
+for test_case in test_invalid_pid_handling test_correct_pid_filtering test_pid_specificity_with_multiple_processes; do
+  sudo env \
+    E2E_GHOSTSCOPE_SANDBOX=docker-host \
+    E2E_TARGET_SANDBOX=docker-host \
+    E2E_SHARE_SANDBOX=1 \
+    cargo test --all-features --test script_execution "$test_case" -- --nocapture
+done
 ```
 
 说明：
 
-- 测试在 Docker 容器内执行，不在宿主机直接执行。
-- 默认只跑 PID 相关 smoke 用例集合。
-- 使用 `--all` 可在容器内执行完整 `cargo test --all-features`。
-- 可通过 `--image` 或 `E2E_CONTAINER_IMAGE` 覆盖镜像。
-- 本地默认启用 Docker volume 缓存（`E2E_USE_DOCKER_CACHE=1`）。
+- Rust 测试 harness 仍运行在宿主机上，GhostScope 和目标进程会按指定拓扑进入对应容器 sandbox。
+- `docker-private` / `docker-host` 分别对应原来的 private / host PID smoke 模式。
+- `docker-private` 这一组通常需要 `sudo`，因为宿主机上的测试 harness 需要检查该 sandbox 的 PID namespace。
+- 可通过 `E2E_CONTAINER_IMAGE` 覆盖容器镜像。
 
 ### 使用 dwarf-tool 测试 DWARF 解析
 

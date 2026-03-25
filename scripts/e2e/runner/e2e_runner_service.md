@@ -55,11 +55,24 @@ Optional env vars for agent trigger:
 - `E2E_REPO_DIR=/path/to/repo`
 - `E2E_TEST_CASE=<cargo_test_filter>`
 
-## Container PID smoke (CI/local)
+## Container topology smoke (CI/local)
 
-Use the Docker-based smoke runner for `-p` PID behavior validation:
+Use topology-aware `cargo test` runs for `-p` PID smoke validation:
 
 ```bash
-./scripts/e2e/container/run_container_e2e.sh --pid-mode private
-./scripts/e2e/container/run_container_e2e.sh --pid-mode host
+for test_case in test_invalid_pid_handling test_correct_pid_filtering test_pid_specificity_with_multiple_processes; do
+  sudo env \
+    E2E_GHOSTSCOPE_SANDBOX=docker-private \
+    E2E_TARGET_SANDBOX=docker-private \
+    E2E_SHARE_SANDBOX=1 \
+    cargo test --all-features --test script_execution "$test_case" -- --nocapture
+done
+
+for test_case in test_invalid_pid_handling test_correct_pid_filtering test_pid_specificity_with_multiple_processes; do
+  sudo env \
+    E2E_GHOSTSCOPE_SANDBOX=docker-host \
+    E2E_TARGET_SANDBOX=docker-host \
+    E2E_SHARE_SANDBOX=1 \
+    cargo test --all-features --test script_execution "$test_case" -- --nocapture
+done
 ```
