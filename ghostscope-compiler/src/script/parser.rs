@@ -2058,12 +2058,12 @@ trace foo {
 
     #[test]
     fn parse_special_variables_basic() {
-        // $pid/$tid/$timestamp in expressions and prints
+        // $pid/$tid/$host_pid/$input_pid/$timestamp in expressions and prints
         let script = r#"
 trace foo {
-    if $pid == 123 && $tid != 0 { print "PID_TID"; }
+    if $pid == 123 && $tid != 0 && $host_pid != 0 && $input_pid == 123 { print "PID_TID"; }
     print $timestamp;
-    print "P:{} T:{} TS:{}", $pid, $tid, $timestamp;
+    print "P:{} T:{} HP:{} IN:{} TS:{}", $pid, $tid, $host_pid, $input_pid, $timestamp;
 }
 "#;
         let r = parse(script);

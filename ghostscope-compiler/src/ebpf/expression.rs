@@ -13,33 +13,51 @@ use tracing::debug;
 // compare cap is provided via compile_options.compare_cap (config: ebpf.compare_cap)
 
 impl<'ctx> EbpfContext<'ctx> {
+    fn get_host_pid_tid_values(&mut self) -> Result<(IntValue<'ctx>, IntValue<'ctx>)> {
+        let i32_type = self.context.i32_type();
+        let i64_type = self.context.i64_type();
+
+        // bpf_get_current_pid_tgid() returns:
+        // - high 32 bits: TGID (process ID / getpid() view)
+        // - low 32 bits: PID (thread ID / gettid() view)
+        let host_pid_tgid = self.get_current_pid_tgid()?;
+        let host_tid = self
+            .builder
+            .build_and(
+                host_pid_tgid,
+                i64_type.const_int(0xFFFF_FFFF, false),
+                "host_tid",
+            )
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let host_pid = self
+            .builder
+            .build_right_shift(
+                host_pid_tgid,
+                i64_type.const_int(32, false),
+                false,
+                "host_pid",
+            )
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        let host_pid_i32 = self
+            .builder
+            .build_int_truncate(host_pid, i32_type, "host_pid_i32")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let host_tid_i32 = self
+            .builder
+            .build_int_truncate(host_tid, i32_type, "host_tid_i32")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        Ok((host_pid_i32, host_tid_i32))
+    }
+
     fn get_special_pid_tid_values(&mut self) -> Result<(IntValue<'ctx>, IntValue<'ctx>)> {
         const BPF_FUNC_GET_NS_CURRENT_PID_TGID: u64 = 120;
         const BPF_PIDNS_INFO_SIZE: u64 = 8; // struct { u32 pid; u32 tgid; }
 
         let i32_type = self.context.i32_type();
         let i64_type = self.context.i64_type();
-
-        // Keep legacy behavior for $pid/$tid in host mode:
-        // $pid -> low 32 bits, $tid -> high 32 bits from get_current_pid_tgid.
-        let host_pid_tgid = self.get_current_pid_tgid()?;
-        let host_pid = self
-            .builder
-            .build_and(
-                host_pid_tgid,
-                i64_type.const_int(0xFFFF_FFFF, false),
-                "host_pid",
-            )
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-        let host_tid = self
-            .builder
-            .build_right_shift(
-                host_pid_tgid,
-                i64_type.const_int(32, false),
-                false,
-                "host_tid",
-            )
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let (host_pid_i32, host_tid_i32) = self.get_host_pid_tid_values()?;
 
         let ns_spec = if let Some(crate::PidFilterSpec::NamespaceTgid {
             pid_ns_dev,
@@ -54,6 +72,14 @@ impl<'ctx> EbpfContext<'ctx> {
                 .map(|ns| (ns.pid_ns_dev, ns.pid_ns_inode))
         };
         let Some((pid_ns_dev, pid_ns_inode)) = ns_spec else {
+            let host_pid = self
+                .builder
+                .build_int_z_extend(host_pid_i32, i64_type, "selected_host_pid")
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            let host_tid = self
+                .builder
+                .build_int_z_extend(host_tid_i32, i64_type, "selected_host_tid")
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
             return Ok((host_pid, host_tid));
         };
 
@@ -133,23 +159,14 @@ impl<'ctx> EbpfContext<'ctx> {
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
             .into_int_value();
 
-        let host_pid_i32 = self
-            .builder
-            .build_int_truncate(host_pid, i32_type, "host_pid_i32")
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-        let host_tid_i32 = self
-            .builder
-            .build_int_truncate(host_tid, i32_type, "host_tid_i32")
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
         let selected_pid_i32 = self
             .builder
-            .build_select(helper_ok, ns_pid, host_pid_i32, "selected_pid_i32")
+            .build_select(helper_ok, ns_tgid, host_pid_i32, "selected_pid_i32")
             .map_err(|e| CodeGenError::Builder(e.to_string()))?
             .into_int_value();
         let selected_tid_i32 = self
             .builder
-            .build_select(helper_ok, ns_tgid, host_tid_i32, "selected_tid_i32")
+            .build_select(helper_ok, ns_pid, host_tid_i32, "selected_tid_i32")
             .map_err(|e| CodeGenError::Builder(e.to_string()))?
             .into_int_value();
 
@@ -1749,13 +1766,34 @@ impl<'ctx> EbpfContext<'ctx> {
                 let (_pid, tid) = self.get_special_pid_tid_values()?;
                 Ok(tid.into())
             }
+            "host_pid" => {
+                let (host_pid, _host_tid) = self.get_host_pid_tid_values()?;
+                let host_pid = self
+                    .builder
+                    .build_int_z_extend(host_pid, self.context.i64_type(), "selected_host_pid")
+                    .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                Ok(host_pid.into())
+            }
+            "input_pid" => {
+                let input_pid = self.compile_options.special_input_pid.ok_or_else(|| {
+                    CodeGenError::NotImplemented(
+                        "Special variable '$input_pid' is only available in -p mode".to_string(),
+                    )
+                })?;
+                Ok(self
+                    .context
+                    .i64_type()
+                    .const_int(input_pid as u64, false)
+                    .into())
+            }
             "timestamp" => {
                 // Use BPF helper to get current timestamp
                 let ts = self.get_current_timestamp()?;
                 Ok(ts.into())
             }
             _ => {
-                let supported = ["$pid", "$tid", "$timestamp"].join(", ");
+                let supported =
+                    ["$pid", "$tid", "$host_pid", "$input_pid", "$timestamp"].join(", ");
                 Err(CodeGenError::NotImplemented(format!(
                     "Unknown special variable '${name}'. Supported: {supported}"
                 )))

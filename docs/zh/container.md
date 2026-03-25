@@ -49,6 +49,10 @@ GhostScope 同时依赖两类信息源：
   GhostScope 当前 userspace `/proc` 视角里可见、可读取 `/proc/<pid>/maps` 的 PID。
 - `host_pid`
   同一个目标进程在 host / 初始 PID namespace 里的 PID；传统 `bpf_get_current_pid_tgid()` 给出的也是这套 PID 视角。
+- 脚本变量 `$host_pid`
+  固定表示当前事件对应进程在 host / 初始 PID namespace 视角下的 PID。
+- 脚本变量 `$input_pid`
+  固定表示 `ghostscope -p <PID>` 中输入的原始 PID，也就是当前执行环境里可见的那个 PID；仅在 `-p` 模式下可用。
 - `event_pid`
   运行时内核事件里携带的 PID。GhostScope 有一条进程生命周期监控链路，会监听进程的 exec / fork / exit 事件；这条链路首先拿到的就是这类 PID。当前实现里，`event_pid` 是通过 `bpf_get_current_pid_tgid() >> 32` 填出来的，因此对应的是 host / 初始 PID namespace 视角下的 TGID；当事件来自某个目标进程时，它通常会与该进程的 `host_pid` 对齐，而不能直接替代 `proc_pid` 去访问当前 `/proc` 或清理以 `proc_pid` 为 key 的缓存。
 
@@ -110,6 +114,7 @@ GhostScope 同时依赖两类信息源：
 - GhostScope 的 `/proc` 读取更接近宿主机视角。
 - 内核事件也通常以 host / 初始 PID namespace 的 PID 来表达。
 - 如果脚本里用到 `$pid/$tid`，或者 helper 不可用时需要 fallback，容器内 PID 与宿主 PID 的差异就会暴露出来。
+- 此时脚本里的 `$input_pid` 仍然是 host 侧输入值，`$host_pid` 也是 host 视角 PID，而 `$pid/$tid` 更接近目标 PID namespace 视角。
 
 当前实现优先支持并重点处理的就是这一类场景。
 

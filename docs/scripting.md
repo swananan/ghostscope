@@ -203,8 +203,10 @@ Tips:
 
 Start with `$` and expose runtime info:
 
-- `$pid` — current process ID (tgid), low 32 bits of `bpf_get_current_pid_tgid`.
-- `$tid` — current thread ID (tid), high 32 bits of `bpf_get_current_pid_tgid`.
+- `$pid` — current process ID (tgid). If a target PID namespace context is configured and the kernel supports `bpf_get_ns_current_pid_tgid`, this uses the target PID namespace view; otherwise it falls back to the host / initial PID namespace view.
+- `$tid` — current thread ID (tid). If a target PID namespace context is configured and the kernel supports `bpf_get_ns_current_pid_tgid`, this uses the target PID namespace view; otherwise it falls back to the host / initial PID namespace view.
+- `$host_pid` — current process ID (tgid) in the host / initial PID namespace view, from `bpf_get_current_pid_tgid() >> 32`.
+- `$input_pid` — the original PID passed to `ghostscope -p <PID>`, meaning the PID visible where `ghostscope -p` was invoked. Only available in `-p` mode.
 - `$timestamp` — monotonic timestamp (ns), from `bpf_ktime_get_ns`.
 
 All behave as integers for comparisons/arithmetic.
@@ -213,13 +215,19 @@ Example:
 
 ```ghostscope
 trace sample.c:42 {
-    if $pid == 12345 { print "match"; }
-    print "PID:{} TID:{} TS:{}", $pid, $tid, $timestamp;
+    if $host_pid == 12345 { print "match"; }
+    print "PID:{} HOST:{} INPUT:{} TID:{} TS:{}", $pid, $host_pid, $input_pid, $tid, $timestamp;
 }
 ```
 
-Note: Currently only `$pid`, `$tid`, `$timestamp` are supported. Register‑related specials may be added later if needed.
-In container PID-namespace environments, if `bpf_get_ns_current_pid_tgid` (helper id 120) is unavailable, `$pid/$tid` may reflect host-namespace values and differ from container-visible PIDs.
+Note: Currently only `$pid`, `$tid`, `$host_pid`, `$input_pid`, and `$timestamp` are supported. Register-related specials may be added later if needed.
+In container PID-namespace environments, `$pid/$tid` and `$host_pid/$input_pid` may differ:
+
+- `$pid/$tid` prefer the target PID-namespace view
+- `$host_pid` is always the host / initial PID-namespace view
+- `$input_pid` is always the original `-p` input value
+
+If `bpf_get_ns_current_pid_tgid` (helper id 120) is unavailable, `$pid/$tid` may fall back to host-namespace values.
 
 ### Variable Lookup Order
 

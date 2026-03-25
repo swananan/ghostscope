@@ -403,11 +403,13 @@ async fn test_special_vars_pid_tid_timestamp_complex() -> anyhow::Result<()> {
     let binary_path =
         FIXTURES.get_test_binary_with_opt("complex_types_program", OptimizationLevel::Debug)?;
     let target = spawn_complex_types_binary(&binary_path).await?;
-    let pid = target.host_pid();
+    let host_pid = target.host_pid();
+    let input_pid =
+        target.visible_pid_from(&common::sandbox::SandboxHandle::default_ghostscope()?)?;
 
     let script = format!(
-        "trace complex_types_program.c:25 {{\n    print \"PID={} TID={} TS={}\", $pid, $tid, $timestamp;\n    if $pid == {} {{ print \"PID_OK\"; }}\n}}\n",
-        "{}", "{}", "{}", pid
+        "trace complex_types_program.c:25 {{\n    print \"PID={} HOST_PID={} INPUT_PID={} TID={} TS={}\", $pid, $host_pid, $input_pid, $tid, $timestamp;\n    if $host_pid == {} {{ print \"HOST_PID_OK\"; }}\n    if $input_pid == {} {{ print \"INPUT_PID_OK\"; }}\n}}\n",
+        "{}", "{}", "{}", "{}", "{}", host_pid, input_pid
     );
 
     let (exit_code, stdout, stderr) =
@@ -415,8 +417,12 @@ async fn test_special_vars_pid_tid_timestamp_complex() -> anyhow::Result<()> {
     target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
     assert!(
-        stdout.contains("PID_OK"),
-        "Expected PID_OK. STDOUT: {stdout}"
+        stdout.contains("HOST_PID_OK"),
+        "Expected HOST_PID_OK. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("INPUT_PID_OK"),
+        "Expected INPUT_PID_OK. STDOUT: {stdout}"
     );
     assert!(
         stdout.contains("PID=") || stdout.contains("PID:"),

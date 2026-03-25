@@ -49,6 +49,10 @@ For clarity, this document uses the following names:
   The PID visible in GhostScope's current userspace `/proc` view, and the PID that can be used to read `/proc/<pid>/maps`.
 - `host_pid`
   The PID of the same target process in the host / initial PID namespace. Traditional `bpf_get_current_pid_tgid()` uses this PID view as well.
+- Script variable `$host_pid`
+  Always represents the current event's process ID in the host / initial PID namespace view.
+- Script variable `$input_pid`
+  Always represents the original `ghostscope -p <PID>` input, meaning the PID visible in the environment where `ghostscope -p` was invoked. It is only available in `-p` mode.
 - `event_pid`
   The PID carried by runtime kernel events. GhostScope has a process-lifecycle monitoring pipeline that listens for `exec`, `fork`, and `exit` events, and this is the PID that pipeline sees first. In the current implementation, `event_pid` is populated from `bpf_get_current_pid_tgid() >> 32`, so it reflects the TGID in the host / initial PID namespace view. When the event comes from a particular target process, it will usually align with that process's `host_pid`, but it cannot directly replace `proc_pid` for accessing the current `/proc` view or for cleaning caches keyed by `proc_pid`.
 
@@ -110,6 +114,7 @@ Common observations in this case:
 - GhostScope's `/proc` access is closer to the host view.
 - Kernel events are also usually expressed using host / initial PID namespace PIDs.
 - If the script uses `$pid/$tid`, or if helper support is unavailable and GhostScope must consider fallback behavior, the difference between host PID and container-local PID becomes visible.
+- In this case, `$input_pid` still reflects the host-side `-p` input value, `$host_pid` still reflects the host PID view, and `$pid/$tid` are closer to the target PID namespace view.
 
 This is the class of scenarios that the current implementation primarily tries to support and reason about.
 

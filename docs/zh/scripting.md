@@ -209,8 +209,10 @@ print arr[0].name;
 
 当前已支持：
 
-- `$pid` — 当前进程 ID（tgid），来自 `bpf_get_current_pid_tgid` 的低 32 位。
-- `$tid` — 当前线程 ID（tid），来自 `bpf_get_current_pid_tgid` 的高 32 位。
+- `$pid` — 当前进程 ID（tgid）。若配置了目标 PID namespace 上下文且内核支持 `bpf_get_ns_current_pid_tgid`，则按目标 PID namespace 视角取值；否则回退到 host / 初始 PID namespace 视角。
+- `$tid` — 当前线程 ID（tid）。若配置了目标 PID namespace 上下文且内核支持 `bpf_get_ns_current_pid_tgid`，则按目标 PID namespace 视角取值；否则回退到 host / 初始 PID namespace 视角。
+- `$host_pid` — 当前进程在 host / 初始 PID namespace 视角下的进程 ID（tgid），来自 `bpf_get_current_pid_tgid() >> 32`。
+- `$input_pid` — `ghostscope -p <PID>` 中输入的原始 PID，也就是当前执行 `ghostscope -p` 环境里可见的 PID。仅在 `-p` 模式下可用。
 - `$timestamp` — 单调时间戳（纳秒），来自 `bpf_ktime_get_ns`。
 
 以上均作为整数参与比较与计算。
@@ -219,13 +221,19 @@ print arr[0].name;
 
 ```ghostscope
 trace sample.c:42 {
-    if $pid == 12345 { print "match"; }
-    print "PID:{} TID:{} TS:{}", $pid, $tid, $timestamp;
+    if $host_pid == 12345 { print "match"; }
+    print "PID:{} HOST:{} INPUT:{} TID:{} TS:{}", $pid, $host_pid, $input_pid, $tid, $timestamp;
 }
 ```
 
-提示：目前仅支持 `$pid`、`$tid`、`$timestamp`。后续可能按需加入“寄存器相关”的特殊变量。
-在容器 PID namespace 场景下，若内核不支持 `bpf_get_ns_current_pid_tgid`（helper id 120），`$pid/$tid` 可能表现为宿主机 namespace 值，与容器内可见 PID 不一致。
+提示：目前仅支持 `$pid`、`$tid`、`$host_pid`、`$input_pid`、`$timestamp`。后续可能按需加入“寄存器相关”的特殊变量。
+在容器 PID namespace 场景下，`$pid/$tid` 与 `$host_pid/$input_pid` 不一定相同：
+
+- `$pid/$tid` 优先表达目标 PID namespace 视角
+- `$host_pid` 固定表达 host / 初始 PID namespace 视角
+- `$input_pid` 固定表达 `-p` 输入语义
+
+若内核不支持 `bpf_get_ns_current_pid_tgid`（helper id 120），`$pid/$tid` 可能回退为宿主机 namespace 值。
 
 ### 变量查找顺序
 

@@ -282,6 +282,56 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Configure namespace context for proc_module_offsets lookups.
+    //
+    // This intentionally follows GhostScope's own `/proc` view rather than the
+    // target namespace used by `$pid`/`$tid`. Offsets are computed from
+    // `/proc/<proc_pid>/maps`, so the lookup key must use the same PID view:
+    //
+    // - host GhostScope => host TGID key
+    // - container GhostScope => self namespace TGID key
+    //
+    // Reusing the target namespace here breaks host -> private-container
+    // tracing, because userspace inserts offsets under host PIDs while eBPF
+    // would look them up under namespace-local PIDs.
+    if kernel_caps.supports_ns_current_pid_tgid_helper
+        && merged_config
+            .runtime_env
+            .as_ref()
+            .map(|env| env.is_container_likely())
+            .unwrap_or(false)
+    {
+        let self_pid = std::process::id();
+        match config::resolve_pid_info(self_pid) {
+            Ok(self_info) => {
+                if let (Some(pid_ns_dev), Some(pid_ns_inode)) =
+                    (self_info.pid_ns_dev, self_info.pid_ns_inode)
+                {
+                    merged_config.proc_offsets_pid_ns =
+                        Some(ghostscope_compiler::PidNamespaceSpec {
+                            pid_ns_dev,
+                            pid_ns_inode,
+                        });
+                    info!(
+                        "proc_module_offsets PID namespace configured from self PID {}: ns_dev={} ns_inode={}",
+                        self_pid, pid_ns_dev, pid_ns_inode
+                    );
+                } else {
+                    warn!(
+                        "Could not derive self pid namespace dev/inode for proc_module_offsets (self pid={})",
+                        self_pid
+                    );
+                }
+            }
+            Err(err) => {
+                warn!(
+                    "Failed to resolve self PID namespace for proc_module_offsets (self pid={}): {}",
+                    self_pid, err
+                );
+            }
+        }
+    }
+
     // Validate core arguments (TODO: move validation to MergedConfig)
     // For now, create a temporary ParsedArgs for validation
     let temp_args = config::ParsedArgs {
