@@ -29,6 +29,23 @@ E2E_TEST_CASE=test_rust_script_print_globals \
 ./scripts/e2e/runner/run_e2e_runner.sh
 ```
 
+Run one case with explicit topology via API:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8788/runs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "sudo": true,
+    "repo": "/mnt/500g/code/ghostscope",
+    "test_case": "test_correct_pid_filtering",
+    "topology": {
+      "ghostscope": "host",
+      "target": "docker-private",
+      "share": false
+    }
+  }'
+```
+
 Run all:
 
 ```bash
@@ -64,4 +81,21 @@ Submit:
 curl -sS -X POST http://127.0.0.1:8788/runs \
   -H 'Content-Type: application/json' \
   -d '{"sudo": true, "repo": "/mnt/500g/code/ghostscope", "test_case": "test_rust_script_print_globals"}'
+```
+
+Submit with sandbox topology:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8788/runs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "sudo": true,
+    "repo": "/mnt/500g/code/ghostscope",
+    "test_case": "test_correct_pid_filtering",
+    "topology": {
+      "ghostscope": "host",
+      "target": "docker-private",
+      "share": false
+    }
+  }'
 ```
