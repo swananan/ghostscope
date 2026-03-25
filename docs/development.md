@@ -221,18 +221,26 @@ Supported levels:
 - `debug`
 - `trace`
 
-### Container Topology Smoke
+### Container Topology E2E
 
-Run the PID-focused smoke subset through the topology-aware Rust e2e framework:
+Run full e2e for the primary supported container scenarios:
 
 ```bash
-for test_case in test_invalid_pid_handling test_correct_pid_filtering test_pid_specificity_with_multiple_processes; do
-  sudo env \
-    E2E_GHOSTSCOPE_SANDBOX=docker-private \
-    E2E_TARGET_SANDBOX=docker-private \
-    E2E_SHARE_SANDBOX=1 \
-    cargo test --all-features --test script_execution "$test_case" -- --nocapture
-done
+sudo env \
+  E2E_GHOSTSCOPE_SANDBOX=host \
+  E2E_TARGET_SANDBOX=docker-private \
+  cargo test --all-features -- --nocapture
+
+sudo env \
+  E2E_GHOSTSCOPE_SANDBOX=docker-private \
+  E2E_TARGET_SANDBOX=docker-private \
+  E2E_SHARE_SANDBOX=1 \
+  cargo test --all-features -- --nocapture
+```
+
+Run the PID-focused smoke subset for the host-PID same-sandbox topology:
+
+```bash
 
 for test_case in test_invalid_pid_handling test_correct_pid_filtering test_pid_specificity_with_multiple_processes; do
   sudo env \
@@ -246,7 +254,8 @@ done
 Notes:
 
 - These commands keep the Rust test harness on the host and move GhostScope plus the traced target into the requested container sandbox topology.
-- `docker-private` and `docker-host` correspond to the old private/host PID smoke modes.
+- `host -> docker-private` and `docker-private -> same docker-private` are the container scenarios that run the full e2e suite in CI.
+- `docker-host -> same docker-host` remains a smoke run because it is close to the default host PID view.
 - Running the `docker-private` variant usually requires `sudo` because the host-side test harness must inspect the sandbox PID namespace.
 - Override the Docker image with `E2E_CONTAINER_IMAGE`.
 

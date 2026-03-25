@@ -11,32 +11,66 @@ permissions:
   contents: read
 
 jobs:
-  container-e2e-smoke:
-    name: Container E2E (${{ matrix.name }})
+  container-e2e-full:
+    name: Container E2E Full (${{ matrix.name }})
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: private
+          - name: host-to-private
+            ghostscope_sandbox: host
+            target_sandbox: docker-private
+            share_sandbox: "0"
+          - name: private-same-sandbox
             ghostscope_sandbox: docker-private
             target_sandbox: docker-private
-          - name: host
-            ghostscope_sandbox: docker-host
-            target_sandbox: docker-host
+            share_sandbox: "1"
 
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Run container topology smoke
+      - name: Run container topology full e2e
         env:
           E2E_CONTAINER_IMAGE: ghcr.io/swananan/ghostscope-build:ubuntu20.04-llvm18.1.8
           E2E_GHOSTSCOPE_SANDBOX: ${{ matrix.ghostscope_sandbox }}
           E2E_TARGET_SANDBOX: ${{ matrix.target_sandbox }}
-          E2E_SHARE_SANDBOX: "1"
+          E2E_SHARE_SANDBOX: ${{ matrix.share_sandbox }}
+        run: |
+          sudo env \
+            E2E_CONTAINER_IMAGE="$E2E_CONTAINER_IMAGE" \
+            E2E_GHOSTSCOPE_SANDBOX="$E2E_GHOSTSCOPE_SANDBOX" \
+            E2E_TARGET_SANDBOX="$E2E_TARGET_SANDBOX" \
+            E2E_SHARE_SANDBOX="$E2E_SHARE_SANDBOX" \
+            cargo test --all-features -- --nocapture
+
+  container-e2e-smoke:
+    name: Container E2E Smoke (${{ matrix.name }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: host-pid-same-sandbox
+            ghostscope_sandbox: docker-host
+            target_sandbox: docker-host
+            share_sandbox: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Run host-PID same-sandbox smoke
+        env:
+          E2E_CONTAINER_IMAGE: ghcr.io/swananan/ghostscope-build:ubuntu20.04-llvm18.1.8
+          E2E_GHOSTSCOPE_SANDBOX: ${{ matrix.ghostscope_sandbox }}
+          E2E_TARGET_SANDBOX: ${{ matrix.target_sandbox }}
+          E2E_SHARE_SANDBOX: ${{ matrix.share_sandbox }}
         run: |
           for test_case in \
             test_invalid_pid_handling \

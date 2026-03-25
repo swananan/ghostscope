@@ -76,13 +76,15 @@ Recommended post-feature sequence:
 
 ```bash
 E2E_USE_SERVICE=1 E2E_SUDO=1 ./scripts/e2e/runner/run_e2e_runner.sh
-for test_case in test_invalid_pid_handling test_correct_pid_filtering test_pid_specificity_with_multiple_processes; do
-  sudo env \
-    E2E_GHOSTSCOPE_SANDBOX=docker-private \
-    E2E_TARGET_SANDBOX=docker-private \
-    E2E_SHARE_SANDBOX=1 \
-    cargo test --all-features --test script_execution "$test_case" -- --nocapture
-done
+sudo env \
+  E2E_GHOSTSCOPE_SANDBOX=host \
+  E2E_TARGET_SANDBOX=docker-private \
+  cargo test --all-features -- --nocapture
+sudo env \
+  E2E_GHOSTSCOPE_SANDBOX=docker-private \
+  E2E_TARGET_SANDBOX=docker-private \
+  E2E_SHARE_SANDBOX=1 \
+  cargo test --all-features -- --nocapture
 for test_case in test_invalid_pid_handling test_correct_pid_filtering test_pid_specificity_with_multiple_processes; do
   sudo env \
     E2E_GHOSTSCOPE_SANDBOX=docker-host \
@@ -92,16 +94,24 @@ for test_case in test_invalid_pid_handling test_correct_pid_filtering test_pid_s
 done
 ```
 
-## Container Topology Smoke
+## Container Topology E2E
 
 ```bash
-for test_case in test_invalid_pid_handling test_correct_pid_filtering test_pid_specificity_with_multiple_processes; do
-  sudo env \
-    E2E_GHOSTSCOPE_SANDBOX=docker-private \
-    E2E_TARGET_SANDBOX=docker-private \
-    E2E_SHARE_SANDBOX=1 \
-    cargo test --all-features --test script_execution "$test_case" -- --nocapture
-done
+sudo env \
+  E2E_GHOSTSCOPE_SANDBOX=host \
+  E2E_TARGET_SANDBOX=docker-private \
+  cargo test --all-features -- --nocapture
+
+sudo env \
+  E2E_GHOSTSCOPE_SANDBOX=docker-private \
+  E2E_TARGET_SANDBOX=docker-private \
+  E2E_SHARE_SANDBOX=1 \
+  cargo test --all-features -- --nocapture
+```
+
+Host-PID same-sandbox smoke:
+
+```bash
 
 for test_case in test_invalid_pid_handling test_correct_pid_filtering test_pid_specificity_with_multiple_processes; do
   sudo env \

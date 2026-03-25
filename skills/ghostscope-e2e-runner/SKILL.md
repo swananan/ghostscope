@@ -1,6 +1,6 @@
 ---
 name: ghostscope-e2e-runner
-description: Run GhostScope e2e tests through the project runner service and topology-aware `cargo test` commands. Use when the user asks to execute e2e tests, run a specific test case, run tests for a specific repo path, diagnose e2e failures, handle sudo or permission issues around eBPF test execution, or run container topology smoke tests.
+description: Run GhostScope e2e tests through the project runner service and topology-aware `cargo test` commands. Use when the user asks to execute e2e tests, run a specific test case, run tests for a specific repo path, diagnose e2e failures, handle sudo or permission issues around eBPF test execution, or run container-topology e2e scenarios.
 ---
 
 # GhostScope E2E Runner
@@ -9,7 +9,7 @@ description: Run GhostScope e2e tests through the project runner service and top
 
 Execute GhostScope e2e with the project-standard runner service and topology-aware `cargo test` commands.
 Use `scripts/e2e/runner/` for the HTTP runner service flow.
-For container topology smoke, use direct `cargo test` with sandbox environment variables.
+For container-topology e2e, use direct `cargo test` with sandbox environment variables.
 This skill is the default path for standard GhostScope e2e execution.
 Prefer the HTTP runner service path for standard e2e, then use local fallback only when the service path is unavailable.
 
@@ -77,16 +77,24 @@ Run full e2e set (no case filter):
 E2E_USE_SERVICE=1 E2E_SUDO=1 ./scripts/e2e/runner/run_e2e_runner.sh
 ```
 
-Run container topology smoke:
+Run full e2e for the primary container topologies:
 
 ```bash
-for test_case in test_invalid_pid_handling test_correct_pid_filtering test_pid_specificity_with_multiple_processes; do
-  sudo env \
-    E2E_GHOSTSCOPE_SANDBOX=docker-private \
-    E2E_TARGET_SANDBOX=docker-private \
-    E2E_SHARE_SANDBOX=1 \
-    cargo test --all-features --test script_execution "$test_case" -- --nocapture
-done
+sudo env \
+  E2E_GHOSTSCOPE_SANDBOX=host \
+  E2E_TARGET_SANDBOX=docker-private \
+  cargo test --all-features -- --nocapture
+
+sudo env \
+  E2E_GHOSTSCOPE_SANDBOX=docker-private \
+  E2E_TARGET_SANDBOX=docker-private \
+  E2E_SHARE_SANDBOX=1 \
+  cargo test --all-features -- --nocapture
+```
+
+Run host-PID same-sandbox smoke:
+
+```bash
 
 for test_case in test_invalid_pid_handling test_correct_pid_filtering test_pid_specificity_with_multiple_processes; do
   sudo env \
@@ -107,8 +115,9 @@ curl -sS http://127.0.0.1:8788/health
 
 1. For routine feature completion, run the full verification set in this order:
 - standard e2e through this skill, using `scripts/e2e/runner/run_e2e_runner.sh`
-- container topology smoke with `docker-private` same-sandbox `sudo env ... cargo test`
-- container topology smoke with `docker-host` same-sandbox `sudo env ... cargo test`
+- full e2e for `host -> docker-private` with `sudo env ... cargo test`
+- full e2e for `docker-private -> same docker-private` with `sudo env ... cargo test`
+- smoke e2e for `docker-host -> same docker-host` with `sudo env ... cargo test`
 2. Check `/health` before submitting runs when the user expects service mode.
 3. Run `scripts/e2e/runner/run_e2e_runner.sh` for standard host-host runs:
 - `E2E_REPO_DIR` when repo is not default.

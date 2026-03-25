@@ -222,18 +222,26 @@ curl -sS -X POST http://127.0.0.1:8788/runs \
 - `debug`
 - `trace`
 
-### 容器拓扑 Smoke
+### 容器拓扑 E2E
 
-通过 topology-aware Rust e2e 框架运行聚焦 `-p` 模式的 smoke 用例：
+通过 topology-aware Rust e2e 框架，对当前主要支持的容器场景运行全量 e2e：
 
 ```bash
-for test_case in test_invalid_pid_handling test_correct_pid_filtering test_pid_specificity_with_multiple_processes; do
-  sudo env \
-    E2E_GHOSTSCOPE_SANDBOX=docker-private \
-    E2E_TARGET_SANDBOX=docker-private \
-    E2E_SHARE_SANDBOX=1 \
-    cargo test --all-features --test script_execution "$test_case" -- --nocapture
-done
+sudo env \
+  E2E_GHOSTSCOPE_SANDBOX=host \
+  E2E_TARGET_SANDBOX=docker-private \
+  cargo test --all-features -- --nocapture
+
+sudo env \
+  E2E_GHOSTSCOPE_SANDBOX=docker-private \
+  E2E_TARGET_SANDBOX=docker-private \
+  E2E_SHARE_SANDBOX=1 \
+  cargo test --all-features -- --nocapture
+```
+
+`docker-host` 同 sandbox 的场景继续保留聚焦 `-p` 的 smoke 用例：
+
+```bash
 
 for test_case in test_invalid_pid_handling test_correct_pid_filtering test_pid_specificity_with_multiple_processes; do
   sudo env \
@@ -247,7 +255,8 @@ done
 说明：
 
 - Rust 测试 harness 仍运行在宿主机上，GhostScope 和目标进程会按指定拓扑进入对应容器 sandbox。
-- `docker-private` / `docker-host` 分别对应原来的 private / host PID smoke 模式。
+- `host -> docker-private` 和 `docker-private -> same docker-private` 是当前在 CI 中跑全量 e2e 的容器场景。
+- `docker-host -> same docker-host` 仍保留为 smoke，因为它更接近默认的 host PID 视角。
 - `docker-private` 这一组通常需要 `sudo`，因为宿主机上的测试 harness 需要检查该 sandbox 的 PID namespace。
 - 可通过 `E2E_CONTAINER_IMAGE` 覆盖容器镜像。
 
