@@ -43,6 +43,15 @@ async fn spawn_globals_program(
     Ok(target)
 }
 
+fn prepare_late_start_launcher(
+    binary_path: &Path,
+) -> anyhow::Result<common::sandbox::SandboxHandle> {
+    // Late-start tests rely on the launcher process starting promptly after GhostScope.
+    // Pre-build the executable in the default target sandbox up front so the later
+    // spawn does not burn most of the timeout compiling inside docker.
+    common::targets::ensure_target_binary_ready_for_default_sandbox(binary_path)
+}
+
 // Late-start helper: run GhostScope first, then start the target process after a delay
 async fn run_ghostscope_then_start_exe(
     script_content: &str,
@@ -306,6 +315,7 @@ async fn test_t_mode_library_late_start_globals_prints() -> anyhow::Result<()> {
 
     // -t points to libgvars.so; GhostScope first, then we run the executable which loads the lib
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let _target_sandbox_guard = prepare_late_start_launcher(&binary_path)?;
     let bin_dir = binary_path.parent().unwrap().to_path_buf();
     let lib_path = bin_dir.join("libgvars.so");
     let script = r#"
@@ -430,6 +440,7 @@ async fn test_t_mode_library_late_start_without_sysmon_offsets_unavailable() -> 
     init();
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let _target_sandbox_guard = prepare_late_start_launcher(&binary_path)?;
     let bin_dir = binary_path.parent().unwrap().to_path_buf();
     let lib_path = bin_dir.join("libgvars.so");
     let script = r#"
