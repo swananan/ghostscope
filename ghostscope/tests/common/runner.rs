@@ -13,6 +13,7 @@ use super::sandbox::SandboxHandle;
 use super::targets::ensure_target_binary_ready_for_default_sandbox;
 use super::targets::TargetHandle;
 use anyhow::Result;
+use ghostscope_process::is_shared_object;
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -139,13 +140,26 @@ impl GhostscopeRunner {
             "Must set exactly one of pid, attached target, or target path"
         );
 
-        if let Some(ref target) = self.target {
+        let _target_sandbox_guard = if let Some(ref target) = self.target {
             // In late-start -t tests, GhostScope may compile the script before the target
             // process is launched. Pre-build the target artifact in the sandbox where the
             // program will later execute so any Build-ID based cookie matches what sysmon
-            // will see from /proc/<pid>/maps after the process starts.
-            ensure_target_binary_ready_for_default_sandbox(target)?;
-        }
+            // will see from /proc/<pid>/maps after the process starts. Keep a strong
+            // reference to that default sandbox for the duration of this run so the later
+            // target spawn reuses the same sandbox instance and artifact cache.
+            //
+            // Restrict this to executable targets. Late-start shared-library tests
+            // intentionally exercise the "no shared-lib sysmon" path, and eagerly
+            // preparing the library sandbox would add enough startup delay to make the
+            // target process appear before GhostScope actually compiles/attaches.
+            if !is_shared_object(target) {
+                Some(ensure_target_binary_ready_for_default_sandbox(target)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         // Write script to a temp file
         let mut script_file = create_script_file()?;
