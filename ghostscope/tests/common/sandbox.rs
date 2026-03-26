@@ -18,6 +18,8 @@ const CONTAINER_GHOSTSCOPE_BIN: &str = "/tmp/ghostscope-target/debug/ghostscope"
 
 static NEXT_SANDBOX_ID: AtomicU64 = AtomicU64::new(1);
 static DEFAULT_SANDBOX_PAIR: OnceLock<Result<DefaultSandboxPair, String>> = OnceLock::new();
+static REGISTERED_DOCKER_SANDBOXES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static DOCKER_SANDBOX_CLEANUP_HOOK: OnceLock<()> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 struct DefaultSandboxPair {
@@ -150,11 +152,8 @@ struct DockerSandboxInner {
 
 impl Drop for DockerSandboxInner {
     fn drop(&mut self) {
-        let _ = Command::new("docker")
-            .args(["rm", "-f", &self.container_name])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        unregister_docker_sandbox(&self.container_name);
+        let _ = remove_docker_sandbox(&self.container_name);
     }
 }
 
@@ -201,6 +200,7 @@ impl SandboxHandle {
             "run".into(),
             "-d".into(),
             "--rm".into(),
+            "--init".into(),
             "--privileged".into(),
             "--name".into(),
             container_name.clone().into(),
@@ -256,6 +256,7 @@ impl SandboxHandle {
             "failed to start docker sandbox: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        register_docker_sandbox_for_exit(&container_name);
         let init_host_pid = resolve_container_init_host_pid(&container_name)?;
         let pid_ns_inode = match spec.pid_mode {
             DockerPidMode::Private => Some(read_pid_ns_inode(init_host_pid)?),
@@ -734,6 +735,49 @@ fn resolve_default_image() -> String {
     // Default to the same published image used in CI so local e2e, runner,
     // and GitHub Actions exercise the same container userspace by default.
     DEFAULT_REMOTE_IMAGE.to_string()
+}
+
+fn registered_docker_sandboxes() -> &'static Mutex<HashSet<String>> {
+    REGISTERED_DOCKER_SANDBOXES.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+extern "C" fn cleanup_registered_docker_sandboxes() {
+    let names: Vec<String> = registered_docker_sandboxes()
+        .lock()
+        .map(|mut names| names.drain().collect())
+        .unwrap_or_default();
+
+    for container_name in names {
+        let _ = remove_docker_sandbox(&container_name);
+    }
+}
+
+fn register_docker_sandbox_for_exit(container_name: &str) {
+    // Tests cache default sandboxes in a OnceLock so they can be reused across
+    // the whole process. That cache means DockerSandboxInner::drop is not a
+    // reliable end-of-process cleanup path, so register an explicit atexit
+    // cleanup hook for any containers we create here.
+    DOCKER_SANDBOX_CLEANUP_HOOK.get_or_init(|| unsafe {
+        libc::atexit(cleanup_registered_docker_sandboxes);
+    });
+
+    if let Ok(mut names) = registered_docker_sandboxes().lock() {
+        names.insert(container_name.to_string());
+    }
+}
+
+fn unregister_docker_sandbox(container_name: &str) {
+    if let Ok(mut names) = registered_docker_sandboxes().lock() {
+        names.remove(container_name);
+    }
+}
+
+fn remove_docker_sandbox(container_name: &str) -> std::io::Result<std::process::ExitStatus> {
+    Command::new("docker")
+        .args(["rm", "-f", container_name])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
 }
 
 fn resolve_container_init_host_pid(container_name: &str) -> Result<u32> {
