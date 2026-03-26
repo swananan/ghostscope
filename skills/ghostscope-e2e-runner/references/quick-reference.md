@@ -21,12 +21,13 @@ sudo env HOST=127.0.0.1 PORT=8788 DEFAULT_SUDO=1 DEFAULT_REPO_DIR=/mnt/500g/code
 Run one case:
 
 ```bash
-E2E_USE_SERVICE=1 \
-E2E_SERVICE_URL=http://127.0.0.1:8788 \
-E2E_SUDO=1 \
-E2E_REPO_DIR=/mnt/500g/code/ghostscope \
-E2E_TEST_CASE=test_rust_script_print_globals \
-./scripts/e2e/runner/run_e2e_runner.sh
+curl -sS -X POST http://127.0.0.1:8788/runs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "sudo": true,
+    "repo": "/mnt/500g/code/ghostscope",
+    "test_case": "test_rust_script_print_globals"
+  }'
 ```
 
 Run one case with explicit topology via API:
@@ -69,13 +70,23 @@ curl -sS -X POST http://127.0.0.1:8788/runs \
 Run all:
 
 ```bash
-E2E_USE_SERVICE=1 E2E_SUDO=1 ./scripts/e2e/runner/run_e2e_runner.sh
+curl -sS -X POST http://127.0.0.1:8788/runs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "sudo": true,
+    "repo": "/mnt/500g/code/ghostscope"
+  }'
 ```
 
 Recommended post-feature sequence:
 
 ```bash
-E2E_USE_SERVICE=1 E2E_SUDO=1 ./scripts/e2e/runner/run_e2e_runner.sh
+curl -sS -X POST http://127.0.0.1:8788/runs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "sudo": true,
+    "repo": "/mnt/500g/code/ghostscope"
+  }'
 sudo env \
   E2E_GHOSTSCOPE_SANDBOX=host \
   E2E_TARGET_SANDBOX=docker-private \

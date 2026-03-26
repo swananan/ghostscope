@@ -161,17 +161,22 @@ cd /mnt/500g/code/ghostscope
 sudo env HOST=127.0.0.1 PORT=8788 DEFAULT_SUDO=1 DEFAULT_REPO_DIR=/mnt/500g/code/ghostscope ./scripts/e2e/runner/start_e2e_runner_service.sh
 ```
 
-启动后，通过 agent 包装脚本触发 e2e：
+启动后，通过 runner service 直接提交 e2e：
 
 ```bash
-./scripts/e2e/runner/run_e2e_runner.sh
+curl -sS -X POST http://127.0.0.1:8788/runs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "sudo": true,
+    "repo": "/mnt/500g/code/ghostscope"
+  }'
 ```
 
 可选变量：
 
-- `E2E_REPO_DIR=/path/to/repo`
-- `E2E_TEST_CASE=<cargo_test_filter>`
-- `E2E_SUDO=1|0`（默认：`1`）
+- `repo`：覆盖仓库根目录
+- `test_case`：指定单个 cargo test filter
+- `sudo`：控制 service 是否用 `sudo` 执行该次运行
 
 测试框架级环境变量：
 

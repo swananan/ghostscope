@@ -6,12 +6,12 @@
 
 ## Scope
 - Keep CI workflows and developer-facing docs on normal project test commands.
-- Treat `scripts/e2e/runner/run_e2e_runner.sh` as an agent-oriented operational helper used through the `ghostscope-e2e-runner` skill for standard e2e.
+- Use the runner service API directly through the `ghostscope-e2e-runner` skill for standard e2e.
 
 ## Verification
 - After code changes, always run formatting and lint checks before handoff.
 - After routine feature development, also run both e2e paths before handoff:
-  - Standard e2e through the `ghostscope-e2e-runner` skill, using `./scripts/e2e/runner/run_e2e_runner.sh`
+  - Standard e2e through the `ghostscope-e2e-runner` skill, using the runner service API
   - Container topology e2e through topology-aware `sudo env ... cargo test`, covering:
     - full e2e for `host -> docker-private`
     - full e2e for `docker-private -> same docker-private`
