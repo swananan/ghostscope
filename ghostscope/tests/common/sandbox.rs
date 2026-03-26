@@ -8,7 +8,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_REMOTE_IMAGE: &str = "ghcr.io/swananan/ghostscope-build:ubuntu20.04-llvm18.1.8";
@@ -17,14 +17,22 @@ const CONTAINER_TARGET_DIR: &str = "/tmp/ghostscope-target";
 const CONTAINER_GHOSTSCOPE_BIN: &str = "/tmp/ghostscope-target/debug/ghostscope";
 
 static NEXT_SANDBOX_ID: AtomicU64 = AtomicU64::new(1);
-static DEFAULT_SANDBOX_PAIR: OnceLock<Result<DefaultSandboxPair, String>> = OnceLock::new();
-static REGISTERED_DOCKER_SANDBOXES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-static DOCKER_SANDBOX_CLEANUP_HOOK: OnceLock<()> = OnceLock::new();
+static DEFAULT_SANDBOX_STATE: OnceLock<Result<DefaultSandboxState, String>> = OnceLock::new();
+static STALE_DOCKER_SANDBOX_SWEEP: OnceLock<Result<(), String>> = OnceLock::new();
 
-#[derive(Debug, Clone)]
-struct DefaultSandboxPair {
-    ghostscope: SandboxHandle,
-    target: SandboxHandle,
+#[derive(Debug)]
+struct DefaultSandboxState {
+    ghostscope: DefaultSandboxSelection,
+    target: DefaultSandboxSelection,
+    share: bool,
+    handles: Mutex<CachedDefaultSandboxes>,
+}
+
+#[derive(Debug, Default)]
+struct CachedDefaultSandboxes {
+    ghostscope: Option<Weak<SandboxInner>>,
+    target: Option<Weak<SandboxInner>>,
+    shared: Option<Weak<SandboxInner>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,7 +160,6 @@ struct DockerSandboxInner {
 
 impl Drop for DockerSandboxInner {
     fn drop(&mut self) {
-        unregister_docker_sandbox(&self.container_name);
         let _ = remove_docker_sandbox(&self.container_name);
     }
 }
@@ -165,11 +172,11 @@ impl SandboxHandle {
     }
 
     pub fn default_ghostscope() -> Result<Self> {
-        Ok(default_sandbox_pair()?.ghostscope.clone())
+        default_sandbox_state()?.ghostscope_handle()
     }
 
     pub fn default_target() -> Result<Self> {
-        Ok(default_sandbox_pair()?.target.clone())
+        default_sandbox_state()?.target_handle()
     }
 
     pub fn docker_available() -> bool {
@@ -187,6 +194,7 @@ impl SandboxHandle {
             Self::docker_available(),
             "docker is not available for container-backed e2e tests"
         );
+        ensure_stale_docker_sandboxes_swept()?;
 
         let repo_root = workspace_root()?;
         let id = NEXT_SANDBOX_ID.fetch_add(1, Ordering::Relaxed);
@@ -204,6 +212,17 @@ impl SandboxHandle {
             "--privileged".into(),
             "--name".into(),
             container_name.clone().into(),
+            "--label".into(),
+            "ghostscope.test-sandbox=1".into(),
+            "--label".into(),
+            format!("ghostscope.owner-pid={}", std::process::id()).into(),
+            "--label".into(),
+            format!(
+                "ghostscope.owner-starttime={}",
+                current_process_starttime()
+                    .context("failed to determine current process starttime for sandbox labels")?
+            )
+            .into(),
             "-v".into(),
             format!("{}:{CONTAINER_REPO_ROOT}", repo_root.display()).into(),
             "-v".into(),
@@ -256,7 +275,6 @@ impl SandboxHandle {
             "failed to start docker sandbox: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        register_docker_sandbox_for_exit(&container_name);
         let init_host_pid = resolve_container_init_host_pid(&container_name)?;
         let pid_ns_inode = match spec.pid_mode {
             DockerPidMode::Private => Some(read_pid_ns_inode(init_host_pid)?),
@@ -678,17 +696,54 @@ impl SandboxHandle {
     }
 }
 
-fn default_sandbox_pair() -> Result<&'static DefaultSandboxPair> {
-    let pair = DEFAULT_SANDBOX_PAIR
-        .get_or_init(|| resolve_default_sandbox_pair().map_err(|err| format!("{err:#}")));
+impl DefaultSandboxState {
+    fn ghostscope_handle(&self) -> Result<SandboxHandle> {
+        let mut handles = self
+            .handles
+            .lock()
+            .map_err(|_| anyhow::anyhow!("default sandbox cache mutex was poisoned"))?;
+        if self.share {
+            return get_or_create_cached_sandbox(&mut handles.shared, self.ghostscope);
+        }
+        get_or_create_cached_sandbox(&mut handles.ghostscope, self.ghostscope)
+    }
 
-    match pair {
-        Ok(pair) => Ok(pair),
+    fn target_handle(&self) -> Result<SandboxHandle> {
+        let mut handles = self
+            .handles
+            .lock()
+            .map_err(|_| anyhow::anyhow!("default sandbox cache mutex was poisoned"))?;
+        if self.share {
+            return get_or_create_cached_sandbox(&mut handles.shared, self.target);
+        }
+        get_or_create_cached_sandbox(&mut handles.target, self.target)
+    }
+}
+
+fn get_or_create_cached_sandbox(
+    slot: &mut Option<Weak<SandboxInner>>,
+    selection: DefaultSandboxSelection,
+) -> Result<SandboxHandle> {
+    if let Some(inner) = slot.as_ref().and_then(Weak::upgrade) {
+        return Ok(SandboxHandle { inner });
+    }
+
+    let handle = selection.instantiate()?;
+    *slot = Some(Arc::downgrade(&handle.inner));
+    Ok(handle)
+}
+
+fn default_sandbox_state() -> Result<&'static DefaultSandboxState> {
+    let state = DEFAULT_SANDBOX_STATE
+        .get_or_init(|| resolve_default_sandbox_state().map_err(|err| format!("{err:#}")));
+
+    match state {
+        Ok(state) => Ok(state),
         Err(message) => anyhow::bail!("{message}"),
     }
 }
 
-fn resolve_default_sandbox_pair() -> Result<DefaultSandboxPair> {
+fn resolve_default_sandbox_state() -> Result<DefaultSandboxState> {
     let ghostscope =
         DefaultSandboxSelection::from_env("E2E_GHOSTSCOPE_SANDBOX", DefaultSandboxSelection::Host)?;
     let target =
@@ -700,16 +755,13 @@ fn resolve_default_sandbox_pair() -> Result<DefaultSandboxPair> {
             ghostscope == target,
             "E2E_SHARE_SANDBOX=1 requires GhostScope and target to use the same sandbox kind"
         );
-        let shared = ghostscope.instantiate()?;
-        return Ok(DefaultSandboxPair {
-            ghostscope: shared.clone(),
-            target: shared,
-        });
     }
 
-    Ok(DefaultSandboxPair {
-        ghostscope: ghostscope.instantiate()?,
-        target: target.instantiate()?,
+    Ok(DefaultSandboxState {
+        ghostscope,
+        target,
+        share,
+        handles: Mutex::new(CachedDefaultSandboxes::default()),
     })
 }
 
@@ -737,47 +789,178 @@ fn resolve_default_image() -> String {
     DEFAULT_REMOTE_IMAGE.to_string()
 }
 
-fn registered_docker_sandboxes() -> &'static Mutex<HashSet<String>> {
-    REGISTERED_DOCKER_SANDBOXES.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
-extern "C" fn cleanup_registered_docker_sandboxes() {
-    let names: Vec<String> = registered_docker_sandboxes()
-        .lock()
-        .map(|mut names| names.drain().collect())
-        .unwrap_or_default();
-
-    for container_name in names {
-        let _ = remove_docker_sandbox(&container_name);
-    }
-}
-
-fn register_docker_sandbox_for_exit(container_name: &str) {
-    // Tests cache default sandboxes in a OnceLock so they can be reused across
-    // the whole process. That cache means DockerSandboxInner::drop is not a
-    // reliable end-of-process cleanup path, so register an explicit atexit
-    // cleanup hook for any containers we create here.
-    DOCKER_SANDBOX_CLEANUP_HOOK.get_or_init(|| unsafe {
-        libc::atexit(cleanup_registered_docker_sandboxes);
-    });
-
-    if let Ok(mut names) = registered_docker_sandboxes().lock() {
-        names.insert(container_name.to_string());
-    }
-}
-
-fn unregister_docker_sandbox(container_name: &str) {
-    if let Ok(mut names) = registered_docker_sandboxes().lock() {
-        names.remove(container_name);
-    }
-}
-
 fn remove_docker_sandbox(container_name: &str) -> std::io::Result<std::process::ExitStatus> {
     Command::new("docker")
         .args(["rm", "-f", container_name])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
+}
+
+fn ensure_stale_docker_sandboxes_swept() -> Result<()> {
+    let result = STALE_DOCKER_SANDBOX_SWEEP
+        .get_or_init(|| sweep_stale_docker_sandboxes().map_err(|err| format!("{err:#}")));
+    match result {
+        Ok(()) => Ok(()),
+        Err(message) => anyhow::bail!("{message}"),
+    }
+}
+
+fn sweep_stale_docker_sandboxes() -> Result<()> {
+    // Default sandboxes are cached in a OnceLock for process-wide reuse, so
+    // they cannot rely on process-exit Drop for final cleanup. Instead, each
+    // new test process garbage-collects stale docker sandboxes left behind by
+    // dead owners before creating fresh ones.
+    for container_id in list_test_sandbox_container_ids()? {
+        let Some(metadata) = inspect_test_sandbox_if_present(&container_id)? else {
+            continue;
+        };
+        if metadata.belongs_to_live_owner() {
+            continue;
+        }
+        let _ = remove_docker_sandbox(&metadata.name);
+    }
+    Ok(())
+}
+
+fn list_test_sandbox_container_ids() -> Result<Vec<String>> {
+    let labeled = docker_ps_ids(&["--filter", "label=ghostscope.test-sandbox=1"])?;
+    let named = docker_ps_ids(&["--filter", "name=^ghostscope-test-"])?;
+
+    let mut ids = labeled;
+    for id in named {
+        if !ids.iter().any(|existing| existing == &id) {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
+fn docker_ps_ids(extra_args: &[&str]) -> Result<Vec<String>> {
+    let output = Command::new("docker")
+        .arg("ps")
+        .arg("-aq")
+        .args(extra_args)
+        .output()
+        .context("failed to enumerate docker sandboxes")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "failed to enumerate docker sandboxes: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
+#[derive(Debug)]
+struct TestSandboxMetadata {
+    name: String,
+    owner_pid: Option<u32>,
+    owner_starttime: Option<u64>,
+}
+
+impl TestSandboxMetadata {
+    fn belongs_to_live_owner(&self) -> bool {
+        match (self.owner_pid, self.owner_starttime) {
+            (Some(pid), Some(starttime)) => process_starttime(pid) == Some(starttime),
+            (Some(pid), None) => process_starttime(pid).is_some(),
+            (None, _) => parse_owner_pid_from_name(&self.name)
+                .and_then(process_starttime)
+                .is_some(),
+        }
+    }
+}
+
+fn inspect_test_sandbox_if_present(container_id: &str) -> Result<Option<TestSandboxMetadata>> {
+    let output = Command::new("docker")
+        .args([
+            "inspect",
+            "-f",
+            "{{.Name}}|{{ index .Config.Labels \"ghostscope.owner-pid\" }}|{{ index .Config.Labels \"ghostscope.owner-starttime\" }}",
+            container_id,
+        ])
+        .output()
+        .with_context(|| format!("failed to inspect docker sandbox {container_id}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if is_missing_docker_container_error(&stderr) {
+            // Another docker-backed test may delete a stale sandbox between our
+            // `docker ps -aq` listing and this inspect call. Treat that race as a
+            // successful cleanup outcome instead of poisoning the process-wide
+            // stale-sandbox sweep cache.
+            return Ok(None);
+        }
+        anyhow::bail!(
+            "failed to inspect docker sandbox {}: {}",
+            container_id,
+            stderr
+        );
+    }
+
+    let line = String::from_utf8(output.stdout)
+        .context("docker inspect output was not valid UTF-8")?
+        .trim()
+        .to_string();
+    let mut parts = line.split('|');
+    let name = parts
+        .next()
+        .unwrap_or_default()
+        .trim_start_matches('/')
+        .to_string();
+    let owner_pid = parts.next().and_then(parse_optional_u32);
+    let owner_starttime = parts.next().and_then(parse_optional_u64);
+
+    Ok(Some(TestSandboxMetadata {
+        name,
+        owner_pid,
+        owner_starttime,
+    }))
+}
+
+fn is_missing_docker_container_error(stderr: &str) -> bool {
+    let normalized = stderr.trim().to_ascii_lowercase();
+    normalized.contains("no such object") || normalized.contains("no such container")
+}
+
+fn parse_optional_u32(value: &str) -> Option<u32> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed == "<no value>" {
+        None
+    } else {
+        trimmed.parse().ok()
+    }
+}
+
+fn parse_optional_u64(value: &str) -> Option<u64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed == "<no value>" {
+        None
+    } else {
+        trimmed.parse().ok()
+    }
+}
+
+fn parse_owner_pid_from_name(name: &str) -> Option<u32> {
+    let mut parts = name.rsplitn(3, '-');
+    let _timestamp = parts.next()?;
+    let pid = parts.next()?;
+    let _id = parts.next()?;
+    pid.parse().ok()
+}
+
+fn current_process_starttime() -> Result<u64> {
+    process_starttime(std::process::id())
+        .with_context(|| "failed to read /proc/self/stat starttime".to_string())
+}
+
+fn process_starttime(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = stat.split_once(") ")?.1;
+    rest.split_whitespace().nth(19)?.parse().ok()
 }
 
 fn resolve_container_init_host_pid(container_name: &str) -> Result<u32> {
