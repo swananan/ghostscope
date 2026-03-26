@@ -2,7 +2,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEFAULT_REPO_DIR="${DEFAULT_REPO_DIR:-${REPO_DIR:-/mnt/500g/code/ghostscope}}"
+SCRIPT_REPO_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+DEFAULT_REPO_DIR="${DEFAULT_REPO_DIR:-${REPO_DIR:-$SCRIPT_REPO_DIR}}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8788}"
 LLVM_PREFIX="${LLVM_PREFIX:-/usr/lib/llvm-18}"

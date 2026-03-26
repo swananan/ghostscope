@@ -26,12 +26,13 @@ Start runner service (user can run with sudo when required):
 Run one case through service:
 
 ```bash
-E2E_USE_SERVICE=1 \
-E2E_SERVICE_URL=http://127.0.0.1:8788 \
-E2E_SUDO=1 \
-E2E_REPO_DIR=/mnt/500g/code/ghostscope \
-E2E_TEST_CASE=test_rust_script_print_globals \
-./scripts/e2e/runner/run_e2e_runner.sh
+curl -sS -X POST http://127.0.0.1:8788/runs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "sudo": true,
+    "repo": "/mnt/500g/code/ghostscope",
+    "test_case": "test_rust_script_print_globals"
+  }'
 ```
 
 Run one case with explicit sandbox topology through the runner API:
@@ -74,7 +75,12 @@ curl -sS -X POST http://127.0.0.1:8788/runs \
 Run full e2e set (no case filter):
 
 ```bash
-E2E_USE_SERVICE=1 E2E_SUDO=1 ./scripts/e2e/runner/run_e2e_runner.sh
+curl -sS -X POST http://127.0.0.1:8788/runs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "sudo": true,
+    "repo": "/mnt/500g/code/ghostscope"
+  }'
 ```
 
 Run full e2e for the primary container topologies:
@@ -114,15 +120,15 @@ curl -sS http://127.0.0.1:8788/health
 ## Execution Flow
 
 1. For routine feature completion, run the full verification set in this order:
-- standard e2e through this skill, using `scripts/e2e/runner/run_e2e_runner.sh`
+- standard e2e through this skill, using the runner service API
 - full e2e for `host -> docker-private` with `sudo env ... cargo test`
 - full e2e for `docker-private -> same docker-private` with `sudo env ... cargo test`
 - smoke e2e for `docker-host -> same docker-host` with `sudo env ... cargo test`
 2. Check `/health` before submitting runs when the user expects service mode.
-3. Run `scripts/e2e/runner/run_e2e_runner.sh` for standard host-host runs:
-- `E2E_REPO_DIR` when repo is not default.
-- `E2E_TEST_CASE` when user asks for a single case.
-- `E2E_SUDO=1` for eBPF tests that require elevated privileges.
+3. Submit `POST /runs` for standard host-host runs:
+- `repo` when the checkout path is not the default repo.
+- `test_case` when the user asks for a single case.
+- `sudo: true` for eBPF tests that require elevated privileges.
 4. For cross-environment PID scenarios, submit directly to the runner API with a `topology` object:
 - `ghostscope`: `host|docker-private|docker-host`
 - `target`: `host|docker-private|docker-host`

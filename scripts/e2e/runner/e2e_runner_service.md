@@ -46,14 +46,17 @@ curl -sS -X POST http://127.0.0.1:8788/runs \
 
 ## Agent-side trigger
 
+Submit runs directly to the service:
+
 ```bash
-./scripts/e2e/runner/run_e2e_runner.sh
+curl -sS -X POST http://127.0.0.1:8788/runs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "sudo": true,
+    "repo": "/mnt/500g/code/ghostscope",
+    "test_case": "test_rust_script_print_globals"
+  }'
 ```
-
-Optional env vars for agent trigger:
-
-- `E2E_REPO_DIR=/path/to/repo`
-- `E2E_TEST_CASE=<cargo_test_filter>`
 
 ## Container topology smoke (CI/local)
 

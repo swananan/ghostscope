@@ -160,17 +160,22 @@ cd /mnt/500g/code/ghostscope
 sudo env HOST=127.0.0.1 PORT=8788 DEFAULT_SUDO=1 DEFAULT_REPO_DIR=/mnt/500g/code/ghostscope ./scripts/e2e/runner/start_e2e_runner_service.sh
 ```
 
-Then run e2e through the agent wrapper:
+Then submit e2e runs to the runner service:
 
 ```bash
-./scripts/e2e/runner/run_e2e_runner.sh
+curl -sS -X POST http://127.0.0.1:8788/runs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "sudo": true,
+    "repo": "/mnt/500g/code/ghostscope"
+  }'
 ```
 
 Optional variables:
 
-- `E2E_REPO_DIR=/path/to/repo`
-- `E2E_TEST_CASE=<cargo_test_filter>`
-- `E2E_SUDO=1|0` (default: `1`)
+- Submit `repo` to override the repository root.
+- Submit `test_case` to run a single cargo-test filter.
+- Submit `sudo` to control whether the service executes the run with `sudo`.
 
 Test-framework environment variables:
 
