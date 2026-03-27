@@ -1,9 +1,11 @@
 use crate::{
+    module_probe::cookie_for_path,
     offsets::{PidOffsetsEntry, ProcessManager},
     pinned_bpf_maps,
-    proc_maps::{parse_maps_line, ModuleIdentity},
+    proc_maps::{visit_proc_maps, ModuleIdentity},
 };
 use std::collections::HashMap;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -681,7 +683,7 @@ fn filter_entries_for_target<'a>(
                     .collect()
             }
             Err(_) => {
-                let tc = crate::cookie::from_path(&tpath.to_string_lossy());
+                let tc = cookie_for_path(&tpath.to_string_lossy());
                 let by_cookie: Vec<_> = entries.iter().filter(|e| e.cookie == tc).collect();
                 if !by_cookie.is_empty() {
                     by_cookie
@@ -1069,23 +1071,20 @@ fn truncate_basename_to_comm(path: &Path) -> Vec<u8> {
 }
 
 fn pid_maps_target_module(pid: u32, target: &Path) -> bool {
-    use std::fs;
-
-    let maps_path = format!("/proc/{pid}/maps");
-    let Ok(content) = fs::read_to_string(&maps_path) else {
-        return false;
-    };
-
     let target = ModuleIdentity::from_path(target);
+    let mut matched = false;
 
-    for line in content.lines() {
-        let Some(entry) = parse_maps_line(line) else {
-            continue;
-        };
+    if visit_proc_maps(pid, |entry| {
         if target.matches(&entry) {
-            return true;
+            matched = true;
+            return ControlFlow::Break(());
         }
+        ControlFlow::Continue(())
+    })
+    .is_err()
+    {
+        return false;
     }
 
-    false
+    matched
 }

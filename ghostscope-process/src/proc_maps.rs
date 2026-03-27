@@ -1,5 +1,7 @@
 use anyhow::Result;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader};
+use std::ops::ControlFlow;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
@@ -99,6 +101,39 @@ pub fn parse_maps_line(line: &str) -> Option<ProcMapEntry<'_>> {
     })
 }
 
+pub fn visit_proc_maps<F>(pid: u32, visitor: F) -> Result<()>
+where
+    F: FnMut(ProcMapEntry<'_>) -> ControlFlow<()>,
+{
+    let maps_path = format!("/proc/{pid}/maps");
+    let file = File::open(&maps_path)?;
+    visit_maps_reader(BufReader::new(file), visitor)
+}
+
+fn visit_maps_reader<R, F>(mut reader: R, mut visitor: F) -> Result<()>
+where
+    R: BufRead,
+    F: FnMut(ProcMapEntry<'_>) -> ControlFlow<()>,
+{
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+
+        let line = line.trim_end_matches(['\n', '\r']);
+        if let Some(entry) = parse_maps_line(line) {
+            if matches!(visitor(entry), ControlFlow::Break(())) {
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 pub fn normalize_mapped_module_path(path: &str) -> &str {
     if let Some(idx) = path.find(" (deleted)") {
         &path[..idx]
@@ -108,28 +143,14 @@ pub fn normalize_mapped_module_path(path: &str) -> &str {
 }
 
 pub fn is_filtered_module_prefix(path: &str) -> bool {
-    matches!(path, "/dev" | "/proc" | "/sys")
-        || path.starts_with("/dev/")
-        || path.starts_with("/proc/")
-        || path.starts_with("/sys/")
+    matches!(path, "/proc" | "/sys") || path.starts_with("/proc/") || path.starts_with("/sys/")
 }
 
 pub fn should_skip_mapped_module_path(path: &str) -> bool {
     let path = normalize_mapped_module_path(path);
-    path.starts_with('[') || is_filtered_module_prefix(path)
-}
-
-pub fn ensure_readable_module_path(path: &str) -> Result<()> {
-    if is_filtered_module_prefix(path) {
-        anyhow::bail!("refusing to read pseudo-filesystem path {path}");
-    }
-
-    let meta = fs::metadata(path)?;
-    if !meta.file_type().is_file() {
-        anyhow::bail!("refusing to read non-regular file {path}");
-    }
-
-    Ok(())
+    path.starts_with('[')
+        || is_filtered_module_prefix(path)
+        || matches!(fs::metadata(path), Ok(meta) if !meta.file_type().is_file())
 }
 
 fn take_field(input: &str) -> Option<(&str, &str)> {
@@ -164,21 +185,14 @@ mod tests {
     #[test]
     fn skips_virtual_and_pseudo_filesystem_mappings() {
         assert!(should_skip_mapped_module_path("[heap]"));
-        assert!(should_skip_mapped_module_path("/dev/dri/renderD128"));
+        assert!(should_skip_mapped_module_path("/dev/null"));
         assert!(should_skip_mapped_module_path("/sys/kernel/tracing"));
         assert!(should_skip_mapped_module_path("/proc/123/maps"));
-        assert!(should_skip_mapped_module_path(
-            "/dev/dri/renderD128 (deleted)"
+        assert!(!is_filtered_module_prefix("/dev/shm/ghostscope-module.so"));
+        assert!(!should_skip_mapped_module_path(
+            "/dev/shm/ghostscope-module.so"
         ));
         assert!(!should_skip_mapped_module_path("/usr/lib/libc.so.6"));
-    }
-
-    #[test]
-    fn rejects_non_regular_module_paths_before_read() {
-        let err = ensure_readable_module_path("/dev/null").unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("refusing to read pseudo-filesystem path /dev/null"));
     }
 
     #[test]
@@ -191,5 +205,26 @@ mod tests {
         .unwrap();
 
         assert!(identity.matches(&entry));
+    }
+
+    #[test]
+    fn visit_proc_maps_stops_when_visitor_breaks() {
+        use std::cell::Cell;
+
+        let lines =
+            b"7f1-7f2 r-xp 00000000 08:02 1 /tmp/a.so\n7f2-7f3 r-xp 00000000 08:02 2 /tmp/b.so\n";
+        let mut reader = BufReader::new(&lines[..]);
+        let seen = Cell::new(0usize);
+
+        visit_maps_reader(&mut reader, |entry| {
+            seen.set(seen.get() + 1);
+            if entry.inode == 1 {
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+
+        assert_eq!(seen.get(), 1);
     }
 }

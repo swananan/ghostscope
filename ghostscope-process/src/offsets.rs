@@ -1,11 +1,12 @@
+use crate::module_probe::ModuleProbe;
 use crate::proc_maps::{
-    ensure_readable_module_path, normalize_mapped_module_path, parse_maps_line,
-    should_skip_mapped_module_path, ModuleIdentity,
+    normalize_mapped_module_path, should_skip_mapped_module_path, visit_proc_maps, ModuleIdentity,
 };
 use anyhow::Result;
 use object::{Object, ObjectSection, ObjectSegment};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::ops::ControlFlow;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 // no extra imports
@@ -100,24 +101,21 @@ impl ProcessManager {
                     if is_same_executable_as_current(pid) {
                         continue; // skip our own processes even if they mmap the target for reading
                     }
-                    let maps_path = format!("/proc/{pid}/maps");
-                    if let Ok(content) = fs::read_to_string(&maps_path) {
-                        let mut hit = false;
-                        for line in content.lines() {
-                            let Some(entry) = parse_maps_line(line) else {
-                                continue;
-                            };
-                            if !entry.executable() {
-                                continue;
-                            }
-                            if target.matches(&entry) {
-                                hit = true;
-                                break; // early stop per PID
-                            }
+                    let mut hit = false;
+                    if visit_proc_maps(pid, |entry| {
+                        if !entry.executable() {
+                            return ControlFlow::Continue(());
                         }
-                        if hit {
-                            pids.insert(pid);
+                        if target.matches(&entry) {
+                            hit = true;
+                            return ControlFlow::Break(());
                         }
+                        ControlFlow::Continue(())
+                    })
+                    .is_ok()
+                        && hit
+                    {
+                        pids.insert(pid);
                     }
                 }
             }
@@ -170,22 +168,18 @@ impl ProcessManager {
         if self.prefilled_pids.contains(&pid) {
             return Ok(0);
         }
-        let maps_path = format!("/proc/{pid}/maps");
-        let content = fs::read_to_string(&maps_path)?;
         let mut modules: BTreeSet<String> = BTreeSet::new();
-        for line in content.lines() {
-            let Some(entry) = parse_maps_line(line) else {
-                continue;
-            };
+        visit_proc_maps(pid, |entry| {
             let Some(path) = entry.path() else {
-                continue;
+                return ControlFlow::Continue(());
             };
             if should_skip_mapped_module_path(path) {
-                continue;
+                return ControlFlow::Continue(());
             }
             let path_trim = normalize_mapped_module_path(path);
             modules.insert(path_trim.to_string());
-        }
+            ControlFlow::Continue(())
+        })?;
         let mut list: Vec<PidOffsetsEntry> = Vec::new();
         for m in modules {
             match self.compute_section_offsets_for_process(pid, &m) {
@@ -219,26 +213,21 @@ impl ProcessManager {
         module_path: &str,
     ) -> Result<(u64, SectionOffsets, u64, u64)> {
         let module_path = normalize_mapped_module_path(module_path);
-        ensure_readable_module_path(module_path)?;
-        let maps = fs::read_to_string(format!("/proc/{pid}/maps"))?;
         let mut candidates: Vec<(u64, u64)> = Vec::new();
         let mut min_start: Option<u64> = None;
         let mut max_end: Option<u64> = None;
         let target = ModuleIdentity::from_path(Path::new(module_path));
-
-        for line in maps.lines() {
-            let Some(entry) = parse_maps_line(line) else {
-                continue;
-            };
+        visit_proc_maps(pid, |entry| {
             if !target.matches(&entry) {
-                continue;
+                return ControlFlow::Continue(());
             }
             min_start = Some(min_start.map_or(entry.start, |v| v.min(entry.start)));
             max_end = Some(max_end.map_or(entry.end, |v| v.max(entry.end)));
             candidates.push((entry.offset, entry.start));
-        }
-        let data = fs::read(module_path)?;
-        let obj = object::File::parse(&data[..])?;
+            ControlFlow::Continue(())
+        })?;
+        let probe = ModuleProbe::open(module_path)?;
+        let obj = probe.object()?;
         let page_mask: u64 = !0xfffu64;
         let mut seg_bias: Vec<(u64, u64, u64)> = Vec::new();
         for seg in obj.segments() {
@@ -307,7 +296,7 @@ impl ProcessManager {
         offsets.rodata = module_base;
         offsets.data = module_base;
         offsets.bss = module_base;
-        let cookie = crate::cookie::from_path(module_path);
+        let cookie = probe.cookie_for_object(&obj);
         let base = min_start.unwrap_or(0);
         let size = max_end.unwrap_or(base).saturating_sub(base);
         if offsets.text == 0 && offsets.rodata == 0 && offsets.data == 0 && offsets.bss == 0 {
