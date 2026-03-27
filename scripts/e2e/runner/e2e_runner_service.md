@@ -31,6 +31,10 @@ Common env vars:
 - `sudo` (`true|false`, optional)
 - `repo` (optional absolute path to repo root; must contain `Cargo.toml`)
 - `test_case` (optional cargo test filter)
+- `logging.level` (`error|warn|info|debug|trace`, optional)
+- `topology.ghostscope` (`host|docker-private|docker-host`, optional)
+- `topology.target` (`host|docker-private|docker-host`, optional)
+- `topology.share` (`true|false`, optional; defaults to `false`)
 
 Example:
 
@@ -58,9 +62,52 @@ curl -sS -X POST http://127.0.0.1:8788/runs \
   }'
 ```
 
-## Container topology smoke (CI/local)
+## Container topology smoke (preferred)
 
-Use topology-aware `cargo test` runs for `-p` PID smoke validation:
+Use runner API topology requests for `-p` PID smoke validation:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8788/runs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "sudo": true,
+    "repo": "/mnt/500g/code/ghostscope",
+    "topology": {
+      "ghostscope": "host",
+      "target": "docker-private",
+      "share": false
+    }
+  }'
+
+curl -sS -X POST http://127.0.0.1:8788/runs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "sudo": true,
+    "repo": "/mnt/500g/code/ghostscope",
+    "topology": {
+      "ghostscope": "docker-private",
+      "target": "docker-private",
+      "share": true
+    }
+  }'
+
+for test_case in test_invalid_pid_handling test_correct_pid_filtering test_pid_specificity_with_multiple_processes; do
+  curl -sS -X POST http://127.0.0.1:8788/runs \
+    -H 'Content-Type: application/json' \
+    -d "{
+      \"sudo\": true,
+      \"repo\": \"/mnt/500g/code/ghostscope\",
+      \"test_case\": \"$test_case\",
+      \"topology\": {
+        \"ghostscope\": \"docker-host\",
+        \"target\": \"docker-host\",
+        \"share\": true
+      }
+    }"
+done
+```
+
+Fallback local CI-style commands:
 
 ```bash
 for test_case in test_invalid_pid_handling test_correct_pid_filtering test_pid_specificity_with_multiple_processes; do

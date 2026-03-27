@@ -6,16 +6,17 @@
 
 ## Scope
 - Keep CI workflows and developer-facing docs on normal project test commands.
-- Use the runner service API directly through the `ghostscope-e2e-runner` skill for standard e2e.
+- Use the runner service API directly through the `ghostscope-e2e-runner` skill for both standard and container-topology e2e.
 
 ## Verification
 - After code changes, always run formatting and lint checks before handoff.
 - After routine feature development, also run both e2e paths before handoff:
   - Standard e2e through the `ghostscope-e2e-runner` skill, using the runner service API
-  - Container topology e2e through topology-aware `sudo env ... cargo test`, covering:
+  - Container topology e2e through the `ghostscope-e2e-runner` skill, using the runner service API with explicit topology, covering:
     - full e2e for `host -> docker-private`
     - full e2e for `docker-private -> same docker-private`
     - smoke e2e for `docker-host -> same docker-host`
+- Use direct topology-aware `sudo env ... cargo test` only as a fallback when the runner service is unavailable or when you are explicitly validating CI parity outside the runner.
 - Use the same commands as CI in `.github/workflows/ci.yml` whenever possible.
 - Local formatting: `cargo fmt --all` (single run is enough).
 - CI uses `cargo fmt --all -- --check` for verification only.
