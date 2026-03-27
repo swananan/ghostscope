@@ -612,8 +612,20 @@ impl<'a> DwarfParser<'a> {
     // DW_AT_external only answers "is this visible outside the CU?".
     // That is enough to identify extern globals, but not enough to separate
     // file-scope statics from function locals: both are commonly non-external.
-    // For variables nested under a function, keep them in the global index only
-    // when DWARF gives us an absolute storage address (DW_OP_addr / Addr).
+    //
+    // For variables nested under a function, only keep them in the global index
+    // when DWARF gives us a true absolute storage location. This distinction is
+    // important for optimized locals:
+    //
+    //   DW_OP_addr <foo>; DW_OP_stack_value
+    //
+    // means "the variable's value is the address <foo>", not "the variable is
+    // stored at <foo>". GCC emits that form for locals such as:
+    //
+    //   const char *p = "hi";
+    //
+    // so we must not treat every address-valued expression as proof of static
+    // storage. Only pure address location expressions should survive this gate.
     fn is_static_variable_symbol(
         &self,
         entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
@@ -647,8 +659,23 @@ impl<'a> DwarfParser<'a> {
         RangeExtractor::extract_all_ranges(entry, unit, dwarf)
     }
 
-    /// Extract variable address from DIE (DW_AT_location)
-    /// Supports direct Addr and simple Exprloc with DW_OP_addr or constant-as-address
+    /// Extract a variable's absolute storage address from DW_AT_location.
+    ///
+    /// This is intentionally narrower than "any expression that mentions an address".
+    /// For indexing globals/statics we only care about expressions that describe a
+    /// storage location, such as:
+    ///
+    ///   - DW_AT_location = Addr(...)
+    ///   - Exprloc([DW_OP_addr ...])
+    ///   - Exprloc([DW_OP_constu ...]) in the legacy constant-as-address form
+    ///
+    /// We must reject value expressions like:
+    ///
+    ///   - DW_OP_addr ...; DW_OP_stack_value
+    ///
+    /// because those describe the variable's value, not a place where the
+    /// variable itself lives. Optimized locals that hold constant addresses are
+    /// commonly encoded this way.
     fn extract_variable_address(
         &self,
         entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
@@ -658,25 +685,10 @@ impl<'a> DwarfParser<'a> {
             match attr.value() {
                 gimli::AttributeValue::Addr(a) => return Ok(Some(a)),
                 gimli::AttributeValue::Exprloc(expr) => {
-                    // Fast-parse the expression to detect absolute address
-                    let mut e = gimli::Expression(expr.0);
-                    // Scan operations; accept first absolute address
-                    while let Ok(op) = gimli::Operation::parse(&mut e.0, unit.encoding()) {
-                        match op {
-                            gimli::Operation::Address { address } => return Ok(Some(address)),
-                            gimli::Operation::UnsignedConstant { value } => {
-                                // If expression is a single unsigned constant and not stack_value,
-                                // DWARF interprets it as memory location (address). We cannot
-                                // easily know if there will be a StackValue later without full scan.
-                                // Do a conservative approach: if there are no more operations, treat as address.
-                                let next = gimli::Operation::parse(&mut e.0, unit.encoding());
-                                if next.is_err() {
-                                    return Ok(Some(value));
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
+                    return Ok(Self::extract_absolute_storage_address_from_expr(
+                        gimli::Expression(expr.0),
+                        unit.encoding(),
+                    ));
                 }
                 gimli::AttributeValue::LocationListsRef(offs) => {
                     if let Ok(mut locations) = self
@@ -684,23 +696,11 @@ impl<'a> DwarfParser<'a> {
                         .locations(unit, gimli::LocationListsOffset(offs.0))
                     {
                         while let Ok(Some(loc)) = locations.next() {
-                            // Try to parse this entry's expression and see if it's a constant address
-                            let mut e = gimli::Expression(loc.data.0);
-                            while let Ok(op) = gimli::Operation::parse(&mut e.0, unit.encoding()) {
-                                match op {
-                                    gimli::Operation::Address { address } => {
-                                        return Ok(Some(address))
-                                    }
-                                    gimli::Operation::UnsignedConstant { value } => {
-                                        // Heuristic: treat single-constant expression as address
-                                        let next =
-                                            gimli::Operation::parse(&mut e.0, unit.encoding());
-                                        if next.is_err() {
-                                            return Ok(Some(value));
-                                        }
-                                    }
-                                    _ => {}
-                                }
+                            if let Some(address) = Self::extract_absolute_storage_address_from_expr(
+                                gimli::Expression(loc.data.0),
+                                unit.encoding(),
+                            ) {
+                                return Ok(Some(address));
                             }
                         }
                     }
@@ -710,21 +710,11 @@ impl<'a> DwarfParser<'a> {
                         self.dwarf.locations(unit, gimli::LocationListsOffset(off))
                     {
                         while let Ok(Some(loc)) = locations.next() {
-                            let mut e = gimli::Expression(loc.data.0);
-                            while let Ok(op) = gimli::Operation::parse(&mut e.0, unit.encoding()) {
-                                match op {
-                                    gimli::Operation::Address { address } => {
-                                        return Ok(Some(address))
-                                    }
-                                    gimli::Operation::UnsignedConstant { value } => {
-                                        let next =
-                                            gimli::Operation::parse(&mut e.0, unit.encoding());
-                                        if next.is_err() {
-                                            return Ok(Some(value));
-                                        }
-                                    }
-                                    _ => {}
-                                }
+                            if let Some(address) = Self::extract_absolute_storage_address_from_expr(
+                                gimli::Expression(loc.data.0),
+                                unit.encoding(),
+                            ) {
+                                return Ok(Some(address));
                             }
                         }
                     }
@@ -733,6 +723,26 @@ impl<'a> DwarfParser<'a> {
             }
         }
         Ok(None)
+    }
+
+    fn extract_absolute_storage_address_from_expr(
+        mut expr: gimli::Expression<EndianArcSlice<LittleEndian>>,
+        encoding: gimli::Encoding,
+    ) -> Option<u64> {
+        let mut operations = Vec::new();
+        while let Ok(op) = gimli::Operation::parse(&mut expr.0, encoding) {
+            operations.push(op);
+        }
+
+        match operations.as_slice() {
+            [gimli::Operation::Address { address }] => Some(*address),
+            [gimli::Operation::UnsignedConstant { value }] => Some(*value),
+            // Anything more complex may be a computed value or a composite
+            // location. In particular, `DW_OP_stack_value` means the expression
+            // yields a value, not a storage address, so treating it as global
+            // storage would misindex optimized locals.
+            _ => None,
+        }
     }
 
     fn extract_entry_pc(
@@ -1180,5 +1190,126 @@ impl<'a> DwarfParser<'a> {
             filename,
             full_path,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gimli::write::{
+        Address, AttributeValue as WriteAttributeValue, Dwarf as WriteDwarf, EndianVec,
+        Expression as WriteExpression, LineProgram, Sections, Unit,
+    };
+    use gimli::{EndianArcSlice, Format};
+    use std::sync::Arc;
+
+    fn build_variable_index_fixture() -> gimli::Dwarf<EndianArcSlice<LittleEndian>> {
+        let encoding = gimli::Encoding {
+            format: Format::Dwarf32,
+            version: 4,
+            address_size: 8,
+        };
+
+        let mut dwarf = WriteDwarf::new();
+        let unit_id = dwarf.units.add(Unit::new(encoding, LineProgram::none()));
+        let unit = dwarf.units.get_mut(unit_id);
+        let root = unit.root();
+
+        let global_id = unit.add(root, gimli::constants::DW_TAG_variable);
+        let global = unit.get_mut(global_id);
+        global.set(
+            gimli::constants::DW_AT_name,
+            WriteAttributeValue::String(b"real_global".to_vec()),
+        );
+        global.set(
+            gimli::constants::DW_AT_external,
+            WriteAttributeValue::Flag(true),
+        );
+        let mut global_loc = WriteExpression::new();
+        global_loc.op_addr(Address::Constant(0x401000));
+        global.set(
+            gimli::constants::DW_AT_location,
+            WriteAttributeValue::Exprloc(global_loc),
+        );
+
+        let subprogram_id = unit.add(root, gimli::constants::DW_TAG_subprogram);
+        unit.get_mut(subprogram_id).set(
+            gimli::constants::DW_AT_name,
+            WriteAttributeValue::String(b"touch".to_vec()),
+        );
+
+        let local_static_id = unit.add(subprogram_id, gimli::constants::DW_TAG_variable);
+        let local_static = unit.get_mut(local_static_id);
+        local_static.set(
+            gimli::constants::DW_AT_name,
+            WriteAttributeValue::String(b"local_static".to_vec()),
+        );
+        let mut local_static_loc = WriteExpression::new();
+        local_static_loc.op_addr(Address::Constant(0x402000));
+        local_static.set(
+            gimli::constants::DW_AT_location,
+            WriteAttributeValue::Exprloc(local_static_loc),
+        );
+
+        let local_ptr_id = unit.add(subprogram_id, gimli::constants::DW_TAG_variable);
+        let local_ptr = unit.get_mut(local_ptr_id);
+        local_ptr.set(
+            gimli::constants::DW_AT_name,
+            WriteAttributeValue::String(b"p".to_vec()),
+        );
+        let mut local_ptr_loc = WriteExpression::new();
+        local_ptr_loc.op_addr(Address::Constant(0x403000));
+        local_ptr_loc.op(gimli::constants::DW_OP_stack_value);
+        local_ptr.set(
+            gimli::constants::DW_AT_location,
+            WriteAttributeValue::Exprloc(local_ptr_loc),
+        );
+
+        let mut sections = Sections::new(EndianVec::new(LittleEndian));
+        dwarf.write(&mut sections).unwrap();
+
+        let dwarf_sections: gimli::DwarfSections<Vec<u8>> = gimli::DwarfSections::load(|id| {
+            Ok::<_, gimli::Error>(
+                sections
+                    .get(id)
+                    .map(|section| section.slice().to_vec())
+                    .unwrap_or_default(),
+            )
+        })
+        .unwrap();
+
+        dwarf_sections.borrow(|section| {
+            EndianArcSlice::new(Arc::<[u8]>::from(section.as_slice()), LittleEndian)
+        })
+    }
+
+    #[test]
+    fn parse_debug_info_skips_stack_value_address_locals_from_global_index() {
+        let dwarf = build_variable_index_fixture();
+        let parser = DwarfParser { dwarf: &dwarf };
+
+        let result = parser.parse_debug_info("synthetic").unwrap();
+        let real_global = result
+            .lightweight_index
+            .find_variables_by_name("real_global");
+        let local_static = result
+            .lightweight_index
+            .find_variables_by_name("local_static");
+        let optimized_local = result.lightweight_index.find_variables_by_name("p");
+
+        assert_eq!(
+            real_global.len(),
+            1,
+            "real global should remain indexed: {real_global:?}"
+        );
+        assert_eq!(
+            local_static.len(),
+            1,
+            "function-scoped static with real storage should remain indexed: {local_static:?}"
+        );
+        assert!(
+            optimized_local.is_empty(),
+            "address-valued optimized local must not be indexed as a global: {optimized_local:?}"
+        );
     }
 }

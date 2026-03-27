@@ -563,8 +563,6 @@ impl ExpressionEvaluator {
         // In a full implementation, we'd need to track PC ranges
         loop {
             let next_result = locations.next();
-            debug!("Location list iteration result: {:?}", next_result);
-
             match next_result {
                 Ok(Some(location_list_entry)) => {
                     entry_count += 1;
