@@ -1,9 +1,8 @@
 pub mod cookie;
 pub mod offsets;
+pub mod pinned_bpf_maps;
 pub mod proc_maps;
 pub use offsets::{PidOffsetsEntry, ProcessManager, SectionOffsets};
-
-pub mod maps;
 pub mod sysmon;
 pub use sysmon::{ProcessSysmon, SysEvent, SysEventKind, SysmonConfig};
 pub mod util;
