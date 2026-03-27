@@ -167,11 +167,7 @@ impl ProcessManager {
                                 if path.starts_with('[') {
                                     continue;
                                 }
-                                let path_trim = if let Some(idx) = path.find(" (deleted)") {
-                                    &path[..idx]
-                                } else {
-                                    path
-                                };
+                                let path_trim = normalize_mapped_module_path(path);
                                 if path_trim == module_path {
                                     hit = true;
                                     break; // early stop per PID
@@ -242,14 +238,10 @@ impl ProcessManager {
                 continue;
             }
             let path = parts[5];
-            if path.starts_with('[') {
+            if should_skip_mapped_module_path(path) {
                 continue;
             }
-            let path_trim = if let Some(idx) = path.find(" (deleted)") {
-                &path[..idx]
-            } else {
-                path
-            };
+            let path_trim = normalize_mapped_module_path(path);
             modules.insert(path_trim.to_string());
         }
         let mut list: Vec<PidOffsetsEntry> = Vec::new();
@@ -284,6 +276,8 @@ impl ProcessManager {
         pid: u32,
         module_path: &str,
     ) -> Result<(u64, SectionOffsets, u64, u64)> {
+        let module_path = normalize_mapped_module_path(module_path);
+        ensure_readable_module_path(module_path)?;
         let maps = fs::read_to_string(format!("/proc/{pid}/maps"))?;
         let mut candidates: Vec<(u64, u64)> = Vec::new();
         let mut min_start: Option<u64> = None;
@@ -322,11 +316,7 @@ impl ProcessManager {
                 }
             } else {
                 let p = parts[5];
-                let path_trim = if let Some(idx) = p.find(" (deleted)") {
-                    &p[..idx]
-                } else {
-                    p
-                };
+                let path_trim = normalize_mapped_module_path(p);
                 matched = path_trim == norm_target;
             }
             if !matched {
@@ -504,6 +494,39 @@ impl ProcessManager {
     }
 }
 
+fn normalize_mapped_module_path(path: &str) -> &str {
+    if let Some(idx) = path.find(" (deleted)") {
+        &path[..idx]
+    } else {
+        path
+    }
+}
+
+fn is_filtered_module_prefix(path: &str) -> bool {
+    matches!(path, "/dev" | "/proc" | "/sys")
+        || path.starts_with("/dev/")
+        || path.starts_with("/proc/")
+        || path.starts_with("/sys/")
+}
+
+fn should_skip_mapped_module_path(path: &str) -> bool {
+    let path = normalize_mapped_module_path(path);
+    path.starts_with('[') || is_filtered_module_prefix(path)
+}
+
+fn ensure_readable_module_path(path: &str) -> Result<()> {
+    if is_filtered_module_prefix(path) {
+        anyhow::bail!("refusing to read pseudo-filesystem path {path}");
+    }
+
+    let meta = fs::metadata(path)?;
+    if !meta.file_type().is_file() {
+        anyhow::bail!("refusing to read non-regular file {path}");
+    }
+
+    Ok(())
+}
+
 fn is_same_executable_as_current(pid: u32) -> bool {
     // Strongest signal: dev+ino equality on /proc/*/exe
     let self_meta = fs::metadata("/proc/self/exe");
@@ -579,5 +602,25 @@ mod tests {
         let module_entries = mgr.module_cache.get("/tmp/a.so").unwrap();
         assert_eq!(module_entries.len(), 1);
         assert_eq!(module_entries[0].pid, 7);
+    }
+
+    #[test]
+    fn skips_virtual_and_pseudo_filesystem_mappings() {
+        assert!(should_skip_mapped_module_path("[heap]"));
+        assert!(should_skip_mapped_module_path("/dev/dri/renderD128"));
+        assert!(should_skip_mapped_module_path("/sys/kernel/tracing"));
+        assert!(should_skip_mapped_module_path("/proc/123/maps"));
+        assert!(should_skip_mapped_module_path(
+            "/dev/dri/renderD128 (deleted)"
+        ));
+        assert!(!should_skip_mapped_module_path("/usr/lib/libc.so.6"));
+    }
+
+    #[test]
+    fn rejects_non_regular_module_paths_before_read() {
+        let err = ensure_readable_module_path("/dev/null").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("refusing to read pseudo-filesystem path /dev/null"));
     }
 }
