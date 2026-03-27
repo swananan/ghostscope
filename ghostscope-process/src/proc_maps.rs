@@ -40,7 +40,10 @@ pub struct ModuleIdentity {
 impl ModuleIdentity {
     pub fn from_path(path: &Path) -> Self {
         let path_str = path.to_string_lossy();
-        let normalized_path = normalize_mapped_module_path(&path_str).to_string();
+        // Fallback path matching against /proc/<pid>/maps must normalize "/./";
+        // otherwise equivalent paths can miss the same mapped module when
+        // metadata is unavailable.
+        let normalized_path = normalize_mapped_module_path(&path_str).replace("/./", "/");
         let (dev_major, dev_minor, inode) = fs::metadata(path)
             .map(|meta| {
                 let dev = meta.dev() as libc::dev_t;
@@ -180,7 +183,7 @@ mod tests {
 
     #[test]
     fn module_identity_matches_by_path_when_metadata_is_missing() {
-        let missing = PathBuf::from("/tmp/ghostscope-missing-lib.so");
+        let missing = PathBuf::from("/tmp/./ghostscope-missing-lib.so");
         let identity = ModuleIdentity::from_path(&missing);
         let entry = parse_maps_line(
             "7f1234500000-7f1234510000 r-xp 00000000 00:00 0 /tmp/ghostscope-missing-lib.so (deleted)",
