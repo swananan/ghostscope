@@ -126,18 +126,30 @@ impl<'dwarf> AccessPlanner<'dwarf> {
         }
     }
 
-    /// If DIE is a declaration, try to find a full definition across units by name+tag
+    /// If DIE is an explicit declaration, try to find a full definition across units.
+    ///
+    /// This must stay narrower than "childless aggregate". `die.has_children()`
+    /// only answers whether this DIE has inline member DIEs; it does not say
+    /// whether the DIE is a forward declaration. Empty definitions are valid
+    /// aggregates and legitimately have no children, so rebinding every
+    /// childless `struct Foo` by name can silently hop to an unrelated `Foo`
+    /// from another CU or namespace.
+    ///
+    /// The child flag still matters for member scanning after we have the final
+    /// DIE, but it must not be used as the trigger for declaration completion.
     fn maybe_complete_aggregate(
         &self,
         unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
         die: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
     ) -> crate::core::Result<(Option<gimli::DebugInfoOffset>, gimli::UnitOffset)> {
-        // Check declaration flag or childless struct
         let mut is_decl = false;
         if let Some(attr) = die.attr(gimli::DW_AT_declaration) {
             is_decl = matches!(attr.value(), gimli::AttributeValue::Flag(true));
         }
-        let has_children = die.has_children();
+
+        if !is_decl {
+            return Ok((None, die.offset()));
+        }
 
         let name_opt = if let Some(attr) = die.attr(gimli::DW_AT_name) {
             self.dwarf
@@ -148,7 +160,7 @@ impl<'dwarf> AccessPlanner<'dwarf> {
             None
         };
 
-        if (is_decl || !has_children) && name_opt.is_some() {
+        if name_opt.is_some() {
             let name = name_opt.unwrap();
             let tag = die.tag();
             if let Some(tix) = &self.type_index {
@@ -437,4 +449,364 @@ impl<'dwarf> AccessPlanner<'dwarf> {
     }
 
     // compute_add_offset removed (unused)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{IndexEntry, IndexFlags};
+    use crate::data::{LightweightIndex, TypeNameIndex};
+    use gimli::constants;
+    use gimli::write::{
+        AttributeValue as WriteAttributeValue, Dwarf as WriteDwarf, EndianVec, LineProgram,
+        Sections, Unit,
+    };
+    use gimli::{DebugInfoOffset, EndianArcSlice, Format};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    type PlannerRegressionFixture = (
+        gimli::Dwarf<EndianArcSlice<LittleEndian>>,
+        gimli::Unit<EndianArcSlice<LittleEndian>>,
+        gimli::UnitOffset,
+        DebugInfoOffset,
+        gimli::UnitOffset,
+        Arc<TypeNameIndex>,
+    );
+
+    fn build_declaration_completion_fixture() -> PlannerRegressionFixture {
+        let encoding = gimli::Encoding {
+            format: Format::Dwarf32,
+            version: 4,
+            address_size: 8,
+        };
+
+        let mut dwarf = WriteDwarf::new();
+        let decl_unit_id = dwarf.units.add(Unit::new(encoding, LineProgram::none()));
+        let def_unit_id = dwarf.units.add(Unit::new(encoding, LineProgram::none()));
+
+        {
+            let unit = dwarf.units.get_mut(decl_unit_id);
+            let root = unit.root();
+
+            let struct_id = unit.add(root, constants::DW_TAG_structure_type);
+            let struct_entry = unit.get_mut(struct_id);
+            struct_entry.set(
+                constants::DW_AT_name,
+                WriteAttributeValue::String(b"Foo".to_vec()),
+            );
+            struct_entry.set(
+                constants::DW_AT_declaration,
+                WriteAttributeValue::Flag(true),
+            );
+
+            let sibling_id = unit.add(root, constants::DW_TAG_subprogram);
+            let sibling = unit.get_mut(sibling_id);
+            sibling.set(
+                constants::DW_AT_name,
+                WriteAttributeValue::String(b"later_sibling".to_vec()),
+            );
+        }
+
+        {
+            let unit = dwarf.units.get_mut(def_unit_id);
+            let root = unit.root();
+
+            let int_id = unit.add(root, constants::DW_TAG_base_type);
+            let int_entry = unit.get_mut(int_id);
+            int_entry.set(
+                constants::DW_AT_name,
+                WriteAttributeValue::String(b"int".to_vec()),
+            );
+            int_entry.set(constants::DW_AT_byte_size, WriteAttributeValue::Data1(4));
+            int_entry.set(
+                constants::DW_AT_encoding,
+                WriteAttributeValue::Encoding(constants::DW_ATE_signed),
+            );
+
+            let struct_id = unit.add(root, constants::DW_TAG_structure_type);
+            let struct_entry = unit.get_mut(struct_id);
+            struct_entry.set(
+                constants::DW_AT_name,
+                WriteAttributeValue::String(b"Foo".to_vec()),
+            );
+            struct_entry.set(constants::DW_AT_byte_size, WriteAttributeValue::Data1(4));
+
+            let member_id = unit.add(struct_id, constants::DW_TAG_member);
+            let member = unit.get_mut(member_id);
+            member.set(
+                constants::DW_AT_name,
+                WriteAttributeValue::String(b"x".to_vec()),
+            );
+            member.set(constants::DW_AT_type, WriteAttributeValue::UnitRef(int_id));
+            member.set(
+                constants::DW_AT_data_member_location,
+                WriteAttributeValue::Data1(0),
+            );
+        }
+
+        let mut sections = Sections::new(EndianVec::new(LittleEndian));
+        dwarf.write(&mut sections).unwrap();
+
+        let dwarf_sections: gimli::DwarfSections<Vec<u8>> = gimli::DwarfSections::load(|id| {
+            Ok::<_, gimli::Error>(
+                sections
+                    .get(id)
+                    .map(|section| section.slice().to_vec())
+                    .unwrap_or_default(),
+            )
+        })
+        .unwrap();
+        let read_dwarf = dwarf_sections.borrow(|section| {
+            EndianArcSlice::new(Arc::<[u8]>::from(section.as_slice()), LittleEndian)
+        });
+
+        let mut units = read_dwarf.units();
+        let decl_header = units.next().unwrap().unwrap();
+        let def_header = units.next().unwrap().unwrap();
+        let def_cu_off = def_header.debug_info_offset().unwrap();
+
+        let decl_unit = read_dwarf.unit(decl_header).unwrap();
+        let def_unit = read_dwarf.unit(def_header).unwrap();
+        let decl_struct_off = find_struct_offset(&read_dwarf, &decl_unit, "Foo", true, false);
+        let def_struct_off = find_struct_offset(&read_dwarf, &def_unit, "Foo", false, true);
+
+        let mut types = HashMap::new();
+        types.insert(
+            "Foo".to_string(),
+            vec![IndexEntry {
+                name: Arc::from("Foo"),
+                die_offset: def_struct_off,
+                unit_offset: def_cu_off,
+                tag: constants::DW_TAG_structure_type,
+                flags: IndexFlags::default(),
+                language: None,
+                address_ranges: Vec::new(),
+                entry_pc: None,
+            }],
+        );
+        let type_index = Arc::new(TypeNameIndex::build_from_lightweight(
+            &LightweightIndex::from_builder_data(HashMap::new(), HashMap::new(), types),
+        ));
+
+        (
+            read_dwarf,
+            decl_unit,
+            decl_struct_off,
+            def_cu_off,
+            def_struct_off,
+            type_index,
+        )
+    }
+
+    fn build_empty_definition_fixture() -> PlannerRegressionFixture {
+        let encoding = gimli::Encoding {
+            format: Format::Dwarf32,
+            version: 4,
+            address_size: 8,
+        };
+
+        let mut dwarf = WriteDwarf::new();
+        let empty_unit_id = dwarf.units.add(Unit::new(encoding, LineProgram::none()));
+        let full_unit_id = dwarf.units.add(Unit::new(encoding, LineProgram::none()));
+
+        {
+            let unit = dwarf.units.get_mut(empty_unit_id);
+            let root = unit.root();
+
+            let struct_id = unit.add(root, constants::DW_TAG_structure_type);
+            let struct_entry = unit.get_mut(struct_id);
+            struct_entry.set(
+                constants::DW_AT_name,
+                WriteAttributeValue::String(b"Foo".to_vec()),
+            );
+            // This is a real empty definition, not a forward declaration.
+            struct_entry.set(constants::DW_AT_byte_size, WriteAttributeValue::Data1(1));
+        }
+
+        {
+            let unit = dwarf.units.get_mut(full_unit_id);
+            let root = unit.root();
+
+            let int_id = unit.add(root, constants::DW_TAG_base_type);
+            let int_entry = unit.get_mut(int_id);
+            int_entry.set(
+                constants::DW_AT_name,
+                WriteAttributeValue::String(b"int".to_vec()),
+            );
+            int_entry.set(constants::DW_AT_byte_size, WriteAttributeValue::Data1(4));
+            int_entry.set(
+                constants::DW_AT_encoding,
+                WriteAttributeValue::Encoding(constants::DW_ATE_signed),
+            );
+
+            let struct_id = unit.add(root, constants::DW_TAG_structure_type);
+            let struct_entry = unit.get_mut(struct_id);
+            struct_entry.set(
+                constants::DW_AT_name,
+                WriteAttributeValue::String(b"Foo".to_vec()),
+            );
+            struct_entry.set(constants::DW_AT_byte_size, WriteAttributeValue::Data1(4));
+
+            let member_id = unit.add(struct_id, constants::DW_TAG_member);
+            let member = unit.get_mut(member_id);
+            member.set(
+                constants::DW_AT_name,
+                WriteAttributeValue::String(b"x".to_vec()),
+            );
+            member.set(constants::DW_AT_type, WriteAttributeValue::UnitRef(int_id));
+            member.set(
+                constants::DW_AT_data_member_location,
+                WriteAttributeValue::Data1(0),
+            );
+        }
+
+        let mut sections = Sections::new(EndianVec::new(LittleEndian));
+        dwarf.write(&mut sections).unwrap();
+
+        let dwarf_sections: gimli::DwarfSections<Vec<u8>> = gimli::DwarfSections::load(|id| {
+            Ok::<_, gimli::Error>(
+                sections
+                    .get(id)
+                    .map(|section| section.slice().to_vec())
+                    .unwrap_or_default(),
+            )
+        })
+        .unwrap();
+        let read_dwarf = dwarf_sections.borrow(|section| {
+            EndianArcSlice::new(Arc::<[u8]>::from(section.as_slice()), LittleEndian)
+        });
+
+        let mut units = read_dwarf.units();
+        let empty_header = units.next().unwrap().unwrap();
+        let full_header = units.next().unwrap().unwrap();
+        let full_cu_off = full_header.debug_info_offset().unwrap();
+
+        let empty_unit = read_dwarf.unit(empty_header).unwrap();
+        let full_unit = read_dwarf.unit(full_header).unwrap();
+        let empty_struct_off = find_struct_offset(&read_dwarf, &empty_unit, "Foo", false, false);
+        let full_struct_off = find_struct_offset(&read_dwarf, &full_unit, "Foo", false, true);
+
+        let mut types = HashMap::new();
+        types.insert(
+            "Foo".to_string(),
+            vec![IndexEntry {
+                name: Arc::from("Foo"),
+                die_offset: full_struct_off,
+                unit_offset: full_cu_off,
+                tag: constants::DW_TAG_structure_type,
+                flags: IndexFlags::default(),
+                language: None,
+                address_ranges: Vec::new(),
+                entry_pc: None,
+            }],
+        );
+        let type_index = Arc::new(TypeNameIndex::build_from_lightweight(
+            &LightweightIndex::from_builder_data(HashMap::new(), HashMap::new(), types),
+        ));
+
+        (
+            read_dwarf,
+            empty_unit,
+            empty_struct_off,
+            full_cu_off,
+            full_struct_off,
+            type_index,
+        )
+    }
+
+    fn find_struct_offset(
+        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
+        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
+        expected_name: &str,
+        expected_is_declaration: bool,
+        expected_has_children: bool,
+    ) -> gimli::UnitOffset {
+        let mut entries = unit.entries();
+        while let Some(entry) = entries.next_dfs().unwrap() {
+            if entry.tag() != constants::DW_TAG_structure_type {
+                continue;
+            }
+            let Some(attr) = entry.attr(constants::DW_AT_name) else {
+                continue;
+            };
+            let Ok(name) = dwarf.attr_string(unit, attr.value()) else {
+                continue;
+            };
+            let Ok(name) = name.to_string_lossy() else {
+                continue;
+            };
+            let is_declaration = matches!(
+                entry.attr(constants::DW_AT_declaration),
+                Some(attr) if matches!(attr.value(), gimli::AttributeValue::Flag(true))
+            );
+            if name == expected_name
+                && is_declaration == expected_is_declaration
+                && entry.has_children() == expected_has_children
+            {
+                return entry.offset();
+            }
+        }
+        panic!(
+            "missing struct {expected_name} with declaration={expected_is_declaration} \
+             and has_children={expected_has_children}"
+        );
+    }
+
+    fn legacy_has_children_via_next_dfs(
+        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
+        die: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
+    ) -> bool {
+        let mut entries = unit.entries_at_offset(die.offset()).unwrap();
+        let _ = entries.next_entry().unwrap();
+        entries.next_dfs().unwrap().is_some()
+    }
+
+    #[test]
+    fn maybe_complete_aggregate_uses_declaration_flag_despite_later_siblings() {
+        let (dwarf, decl_unit, decl_struct_off, def_cu_off, def_struct_off, type_index) =
+            build_declaration_completion_fixture();
+        let decl_struct_die = decl_unit.entry(decl_struct_off).unwrap();
+        let mut legacy_cursor = decl_unit.entries_at_offset(decl_struct_off).unwrap();
+        assert!(legacy_cursor.next_entry().unwrap());
+        let next_after_decl = legacy_cursor.next_dfs().unwrap().unwrap();
+
+        assert!(!decl_struct_die.has_children());
+        assert_eq!(next_after_decl.depth(), 0);
+        assert_eq!(next_after_decl.tag(), constants::DW_TAG_subprogram);
+        assert!(legacy_has_children_via_next_dfs(
+            &decl_unit,
+            &decl_struct_die
+        ));
+
+        let planner = AccessPlanner::new_with_index(&dwarf, type_index, false);
+        let (resolved_cu, resolved_die) = planner
+            .maybe_complete_aggregate(&decl_unit, &decl_struct_die)
+            .unwrap();
+
+        assert_eq!(resolved_cu, Some(def_cu_off));
+        assert_eq!(resolved_die, def_struct_off);
+    }
+
+    #[test]
+    fn maybe_complete_aggregate_does_not_rebind_empty_definitions() {
+        let (dwarf, empty_unit, empty_struct_off, full_cu_off, full_struct_off, type_index) =
+            build_empty_definition_fixture();
+        let empty_struct_die = empty_unit.entry(empty_struct_off).unwrap();
+
+        assert!(!empty_struct_die.has_children());
+        assert!(empty_struct_die
+            .attr(constants::DW_AT_declaration)
+            .is_none());
+
+        let planner = AccessPlanner::new_with_index(&dwarf, type_index, false);
+        let (resolved_cu, resolved_die) = planner
+            .maybe_complete_aggregate(&empty_unit, &empty_struct_die)
+            .unwrap();
+
+        assert_eq!(resolved_cu, None);
+        assert_eq!(resolved_die, empty_struct_off);
+        assert_ne!(resolved_die, full_struct_off);
+        assert_ne!(resolved_cu, Some(full_cu_off));
+    }
 }
