@@ -254,7 +254,10 @@ impl<'a> DwarfParser<'a> {
                         entry.offset(),
                         unit_offset
                     );
-                    let is_static_symbol = self.is_static_symbol(entry).unwrap_or(false);
+                    let var_addr = self.extract_variable_address(entry, unit)?;
+                    let is_static_symbol = self
+                        .is_static_variable_symbol(entry, var_addr)
+                        .unwrap_or(false);
                     let in_function_scope = tag_stack.iter().any(|t| {
                         *t == gimli::constants::DW_TAG_subprogram
                             || *t == gimli::constants::DW_TAG_inlined_subroutine
@@ -271,7 +274,8 @@ impl<'a> DwarfParser<'a> {
                     } else if in_function_scope {
                         // Rust (and some C compilers) sometimes nest file-scoped statics under the
                         // function that first references them, even though DW_AT_location uses
-                        // DW_OP_addr. When DW_AT_external is false we treat them as true globals.
+                        // DW_OP_addr. Treat only absolute-address-backed statics as true globals;
+                        // stack/register locals must stay out of the global index.
                         tracing::trace!(
                             "Treating static variable at {:?} as global despite function scope (stack={:?})",
                             entry.offset(),
@@ -333,7 +337,6 @@ impl<'a> DwarfParser<'a> {
                         is_static: is_static_symbol,
                         ..Default::default()
                     };
-                    let var_addr = self.extract_variable_address(entry, unit)?;
                     let var_ranges = var_addr.map(|a| vec![(a, a)]).unwrap_or_default();
 
                     for (name, is_linkage_alias) in collected_names {
@@ -604,6 +607,26 @@ impl<'a> DwarfParser<'a> {
             return Ok(!is_external);
         }
         Ok(true)
+    }
+
+    // DW_AT_external only answers "is this visible outside the CU?".
+    // That is enough to identify extern globals, but not enough to separate
+    // file-scope statics from function locals: both are commonly non-external.
+    // For variables nested under a function, keep them in the global index only
+    // when DWARF gives us an absolute storage address (DW_OP_addr / Addr).
+    fn is_static_variable_symbol(
+        &self,
+        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
+        absolute_address: Option<u64>,
+    ) -> Result<bool> {
+        if let Some(is_external) = Self::bool_attr(entry, gimli::constants::DW_AT_external)? {
+            return Ok(!is_external);
+        }
+
+        // DW_AT_external is often omitted on local stack/register variables. Only keep
+        // function-scoped variables in the global index when DWARF gives them a true
+        // absolute storage address.
+        Ok(absolute_address.is_some())
     }
 
     fn is_declaration(

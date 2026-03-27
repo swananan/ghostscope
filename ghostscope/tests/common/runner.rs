@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! Shared asynchronous runner for invoking the `ghostscope` CLI from tests.
 //!
 //! Features:
