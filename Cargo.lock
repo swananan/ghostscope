@@ -816,6 +816,7 @@ dependencies = [
  "bytes",
  "libc",
  "log",
+ "memmap2",
  "object",
  "tracing",
 ]

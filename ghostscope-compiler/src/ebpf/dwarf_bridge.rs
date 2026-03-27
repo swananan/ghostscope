@@ -8,14 +8,14 @@ use ghostscope_dwarf::{
     ComputeStep, DirectValueResult, EvaluationResult, LocationResult, MemoryAccessSize, TypeInfo,
     VariableWithEvaluation,
 };
-use ghostscope_process::cookie;
+use ghostscope_process::module_probe;
 use inkwell::values::{BasicValueEnum, IntValue, PointerValue};
 use tracing::{debug, warn};
 
 impl<'ctx> EbpfContext<'ctx> {
     /// Compute a stable cookie for a module when per-PID offsets are unavailable (via coordinator).
     fn fallback_cookie_from_module_path(&self, module_path: &str) -> u64 {
-        cookie::from_path(module_path)
+        module_probe::cookie_for_path(module_path)
     }
 
     /// Compute section code for an address within a module (text=0, rodata=1, data=2, bss=3).

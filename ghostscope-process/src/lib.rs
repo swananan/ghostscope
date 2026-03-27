@@ -1,4 +1,4 @@
-pub mod cookie;
+pub mod module_probe;
 pub mod offsets;
 pub mod pinned_bpf_maps;
 pub mod proc_maps;
