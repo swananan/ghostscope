@@ -135,5 +135,5 @@ pub fn setup_panic_hook() {
 
 /// Perform cleanup of pinned maps when the process exits.
 pub extern "C" fn cleanup_pinned_maps_on_exit() {
-    let _ = ghostscope_process::maps::cleanup_pinned_proc_offsets();
+    let _ = ghostscope_process::pinned_bpf_maps::cleanup_pinned_proc_offsets();
 }

@@ -46,7 +46,7 @@ mod uprobe;
 use uprobe::UprobeAttachmentParams;
 
 // Use shared map types from ghostscope-process
-use ghostscope_process::maps::{proc_offsets_pin_dir, proc_offsets_pin_path};
+use ghostscope_process::pinned_bpf_maps::{proc_offsets_pin_dir, proc_offsets_pin_path};
 
 /// Event output map type wrapper
 enum EventMap {

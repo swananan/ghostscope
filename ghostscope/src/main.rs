@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
 
     // Pre-clean any stale per-process pinned offsets map from a previous crashed session.
     // This prevents PID reuse collisions leaving an old map affecting the new instance.
-    let _ = ghostscope_process::maps::cleanup_pinned_proc_offsets();
+    let _ = ghostscope_process::pinned_bpf_maps::cleanup_pinned_proc_offsets();
 
     // Parse command line arguments
     let parsed_args = config::Args::parse_args();

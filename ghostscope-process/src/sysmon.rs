@@ -1,6 +1,6 @@
 use crate::{
-    maps,
     offsets::{PidOffsetsEntry, ProcessManager},
+    pinned_bpf_maps,
     proc_maps::{parse_maps_line, ModuleIdentity},
 };
 use std::collections::HashMap;
@@ -165,8 +165,9 @@ impl ProcessSysmon {
     /// and stream events into this channel. For now, we ensure the pinned offsets map exists
     /// and keep a placeholder loop that can be extended to consume a real source.
     pub fn start(&mut self) {
-        let _ = maps::ensure_pinned_proc_offsets_exists(self.cfg.proc_offsets_max_entries);
-        let _ = maps::ensure_pinned_allowed_pids_exists(16_384);
+        let _ =
+            pinned_bpf_maps::ensure_pinned_proc_offsets_exists(self.cfg.proc_offsets_max_entries);
+        let _ = pinned_bpf_maps::ensure_pinned_allowed_pids_exists(16_384);
 
         let tx = self.tx.clone();
         let mgr = Arc::clone(&self.mgr);
@@ -303,7 +304,7 @@ impl ProcessSysmon {
                     }
                 }
                 // Cleanup: purge keys for this PID in pinned map and remove from allowlist
-                match crate::maps::purge_offsets_for_pid(proc_pid) {
+                match crate::pinned_bpf_maps::purge_offsets_for_pid(proc_pid) {
                     Ok(n) => info!(
                         "Sysmon: observed exit for event pid {} (proc pid {}) (purged {} entries)",
                         ev.tgid, proc_pid, n
@@ -316,9 +317,9 @@ impl ProcessSysmon {
                     ),
                 }
                 if proc_pid != ev.tgid {
-                    let _ = crate::maps::purge_offsets_for_pid(ev.tgid);
+                    let _ = crate::pinned_bpf_maps::purge_offsets_for_pid(ev.tgid);
                 }
-                let _ = crate::maps::remove_allowed_pid(ev.tgid);
+                let _ = crate::pinned_bpf_maps::remove_allowed_pid(ev.tgid);
             }
         }
         Ok(())
@@ -362,7 +363,7 @@ fn run_sysmon_loop(
         tracing::info!("Sysmon verifier logs: DEBUG (release/info)");
     }
     // Reuse pinned maps by name under our per-process dir
-    loader.map_pin_path(crate::maps::proc_offsets_pin_dir());
+    loader.map_pin_path(crate::pinned_bpf_maps::proc_offsets_pin_dir());
     let mut bpf = loader.load(obj)?;
 
     // Configure optional exec comm filter when targeting executables (-t binary).
@@ -434,7 +435,7 @@ fn run_sysmon_loop(
                 );
                 let entries = guard.cached_offsets_for_module(tpath.to_string_lossy().as_ref());
                 if !entries.is_empty() {
-                    use crate::maps::{insert_offsets_for_pid, ProcModuleOffsetsValue};
+                    use crate::pinned_bpf_maps::{insert_offsets_for_pid, ProcModuleOffsetsValue};
                     use std::collections::HashMap;
                     let mut by_pid: HashMap<u32, Vec<(u64, ProcModuleOffsetsValue)>> =
                         HashMap::new();
@@ -452,7 +453,7 @@ fn run_sysmon_loop(
                         // Add event PID (kernel namespace) to allowlist so subsequent
                         // fork/exit events are filtered in-kernel.
                         let event_pid = resolve_event_pid(pid);
-                        let _ = crate::maps::insert_allowed_pid(event_pid);
+                        let _ = crate::pinned_bpf_maps::insert_allowed_pid(event_pid);
                     }
                     tracing::info!(
                         "Sysmon: initial inserted {} offset entries for module {}",
@@ -700,7 +701,7 @@ fn prefill_offsets_for_pid(
     event_pid: u32,
     target: Option<&Path>,
 ) -> anyhow::Result<bool> {
-    use crate::maps::{insert_offsets_for_pid, ProcModuleOffsetsValue};
+    use crate::pinned_bpf_maps::{insert_offsets_for_pid, ProcModuleOffsetsValue};
 
     let proc_pid = resolve_procfs_pid(event_pid);
     let mut inserted_any = false;
@@ -742,7 +743,7 @@ fn prefill_offsets_for_pid(
                                     "Sysmon: module refresh inserted {} offset entries for proc pid {} (event pid {})",
                                     inserted, pid, event_pid
                                 );
-                                let _ = crate::maps::insert_allowed_pid(resolve_event_pid(pid));
+                                let _ = crate::pinned_bpf_maps::insert_allowed_pid(resolve_event_pid(pid));
                                 inserted_any = true;
                             }
                             Ok(_) => {}
@@ -816,7 +817,7 @@ fn prefill_offsets_for_pid(
                             event_pid,
                             proc_pid
                         );
-                        let _ = crate::maps::insert_allowed_pid(event_pid);
+                        let _ = crate::pinned_bpf_maps::insert_allowed_pid(event_pid);
                         inserted_any = true;
                     }
                 }
@@ -845,7 +846,7 @@ fn refresh_target_module_offsets(
     target: Option<&Path>,
     last_refresh: &mut Instant,
 ) {
-    use crate::maps::{insert_offsets_for_pid, ProcModuleOffsetsValue};
+    use crate::pinned_bpf_maps::{insert_offsets_for_pid, ProcModuleOffsetsValue};
 
     let Some(target_path) = target else {
         return;
@@ -884,7 +885,7 @@ fn refresh_target_module_offsets(
             Ok(inserted) => {
                 if inserted > 0 {
                     total += inserted;
-                    let _ = crate::maps::insert_allowed_pid(resolve_event_pid(pid));
+                    let _ = crate::pinned_bpf_maps::insert_allowed_pid(resolve_event_pid(pid));
                 }
             }
             Err(e) => tracing::debug!(

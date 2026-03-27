@@ -57,7 +57,7 @@ fn apply_cached_offsets_for_session_pid(
             coordinator.cached_offsets_pairs_for_pid(proc_pid)
         };
         if let Some(items) = items {
-            use ghostscope_process::maps::ProcModuleOffsetsValue;
+            use ghostscope_process::pinned_bpf_maps::ProcModuleOffsetsValue;
             let adapted: Vec<(u64, ProcModuleOffsetsValue)> = items
                 .iter()
                 .map(|(cookie, off)| {
@@ -70,9 +70,9 @@ fn apply_cached_offsets_for_session_pid(
 
             let target_pids = offsets_map_target_pids(session, compile_options);
             for target_pid in target_pids {
-                if let Err(e) =
-                    ghostscope_process::maps::insert_offsets_for_pid(target_pid, &adapted)
-                {
+                if let Err(e) = ghostscope_process::pinned_bpf_maps::insert_offsets_for_pid(
+                    target_pid, &adapted,
+                ) {
                     warn!(
                         "Failed to write cached offsets to pinned map for PID {} (proc PID {}): {}",
                         target_pid, proc_pid, e
@@ -109,8 +109,10 @@ async fn create_and_attach_loader(
         .as_ref()
         .map(|c| c.ebpf_config.proc_module_offsets_max_entries as u32)
         .unwrap_or(4096);
-    let pin_path = ghostscope_process::maps::proc_offsets_pin_path();
-    if let Err(e) = ghostscope_process::maps::ensure_pinned_proc_offsets_exists(max_entries) {
+    let pin_path = ghostscope_process::pinned_bpf_maps::proc_offsets_pin_path();
+    if let Err(e) =
+        ghostscope_process::pinned_bpf_maps::ensure_pinned_proc_offsets_exists(max_entries)
+    {
         error!(
             "Failed to ensure pinned proc_module_offsets map exists at {} ({} entries): {:#}",
             pin_path.display(),
@@ -163,7 +165,7 @@ async fn create_and_attach_loader(
         );
         // Apply cached offsets for this module to the loader's map
         if !entries.is_empty() {
-            use ghostscope_process::maps::ProcModuleOffsetsValue;
+            use ghostscope_process::pinned_bpf_maps::ProcModuleOffsetsValue;
             // Group by pid for efficient batch insert
             use std::collections::HashMap;
             let mut by_pid: HashMap<u32, Vec<(u64, ProcModuleOffsetsValue)>> = HashMap::new();
@@ -175,7 +177,9 @@ async fn create_and_attach_loader(
             }
             let mut total = 0usize;
             for (pid, items) in by_pid {
-                if let Err(e) = ghostscope_process::maps::insert_offsets_for_pid(pid, &items) {
+                if let Err(e) =
+                    ghostscope_process::pinned_bpf_maps::insert_offsets_for_pid(pid, &items)
+                {
                     tracing::warn!(
                         "Failed to write offsets to pinned map for PID {}: {}",
                         pid,
