@@ -1,6 +1,7 @@
 use crate::{
     maps,
     offsets::{PidOffsetsEntry, ProcessManager},
+    proc_maps::{parse_maps_line, ModuleIdentity},
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -1068,55 +1069,19 @@ fn truncate_basename_to_comm(path: &Path) -> Vec<u8> {
 
 fn pid_maps_target_module(pid: u32, target: &Path) -> bool {
     use std::fs;
-    use std::os::unix::fs::MetadataExt;
 
     let maps_path = format!("/proc/{pid}/maps");
     let Ok(content) = fs::read_to_string(&maps_path) else {
         return false;
     };
 
-    let (t_dev, t_ino) = fs::metadata(target)
-        .map(|m| (Some(m.dev()), Some(m.ino())))
-        .unwrap_or((None, None));
-    let t_norm = target.to_string_lossy().replace("/./", "/");
+    let target = ModuleIdentity::from_path(target);
 
     for line in content.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 6 {
+        let Some(entry) = parse_maps_line(line) else {
             continue;
-        }
-        let path = parts[5];
-        if path.starts_with('[') {
-            continue;
-        }
-        let path_trim = if let Some(idx) = path.find(" (deleted)") {
-            &path[..idx]
-        } else {
-            path
         };
-
-        let matched = if let (Some(dev), Some(ino)) = (t_dev, t_ino) {
-            if let Some((maj_s, min_s)) = parts[3].split_once(':') {
-                if let (Ok(maj), Ok(min), Ok(inode)) = (
-                    u64::from_str_radix(maj_s, 16),
-                    u64::from_str_radix(min_s, 16),
-                    parts[4].parse::<u64>(),
-                ) {
-                    let d = dev as libc::dev_t;
-                    let t_maj = libc::major(d) as u64;
-                    let t_min = libc::minor(d) as u64;
-                    maj == t_maj && min == t_min && inode == ino
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        } else {
-            path_trim == t_norm
-        };
-
-        if matched {
+        if target.matches(&entry) {
             return true;
         }
     }

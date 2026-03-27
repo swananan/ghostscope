@@ -1,8 +1,13 @@
+use crate::proc_maps::{
+    ensure_readable_module_path, normalize_mapped_module_path, parse_maps_line,
+    should_skip_mapped_module_path, ModuleIdentity,
+};
 use anyhow::Result;
 use object::{Object, ObjectSection, ObjectSegment};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 // no extra imports
 
 /// Per-module section offsets (runtime bias) computed from /proc/PID/maps
@@ -86,96 +91,32 @@ impl ProcessManager {
             }
         }
 
-        // 2) Shared libraries/modules: scan /proc/<pid>/maps and match dev:inode when metadata available
-        // Convert target st_dev to major/minor for comparing with maps 'dev' field
-        let (t_maj, t_min) = if let Some(dev) = t_dev {
-            let d = dev as libc::dev_t;
-            let maj = libc::major(d) as u64;
-            let min = libc::minor(d) as u64;
-            (Some(maj), Some(min))
-        } else {
-            (None, None)
-        };
-        if let (Some(tmaj), Some(tmin), Some(tino)) = (t_maj, t_min, t_ino) {
-            if let Ok(dir) = fs::read_dir("/proc") {
-                for ent in dir.flatten() {
-                    let fname = ent.file_name();
-                    if let Ok(pid) = fname.to_string_lossy().parse::<u32>() {
-                        if is_same_executable_as_current(pid) {
-                            continue; // skip our own processes even if they mmap the target for reading
-                        }
-                        let maps_path = format!("/proc/{pid}/maps");
-                        if let Ok(content) = fs::read_to_string(&maps_path) {
-                            let mut hit = false;
-                            for line in content.lines() {
-                                let parts: Vec<&str> = line.split_whitespace().collect();
-                                if parts.len() < 6 {
-                                    continue;
-                                }
-                                // Require execute permission on the mapping to avoid read-only mmaps
-                                // perms format example: r-xp, r--p, rw-p
-                                let perms = parts[1];
-                                if !perms.contains('x') {
-                                    continue;
-                                }
-                                // parts[3] = dev (maj:min), hex; parts[4] = inode (dec)
-                                let dev_str = parts[3];
-                                let inode_str = parts[4];
-                                if let Some((maj_s, min_s)) = dev_str.split_once(':') {
-                                    if let (Ok(maj), Ok(min), Ok(ino)) = (
-                                        u64::from_str_radix(maj_s, 16),
-                                        u64::from_str_radix(min_s, 16),
-                                        inode_str.parse::<u64>(),
-                                    ) {
-                                        if maj == tmaj && min == tmin && ino == tino {
-                                            hit = true;
-                                            break; // early stop per PID
-                                        }
-                                    }
-                                }
-                            }
-                            if hit {
-                                pids.insert(pid);
-                            }
-                        }
+        // 2) Shared libraries/modules: scan /proc/<pid>/maps for executable matches.
+        let target = ModuleIdentity::from_path(Path::new(module_path));
+        if let Ok(dir) = fs::read_dir("/proc") {
+            for ent in dir.flatten() {
+                let fname = ent.file_name();
+                if let Ok(pid) = fname.to_string_lossy().parse::<u32>() {
+                    if is_same_executable_as_current(pid) {
+                        continue; // skip our own processes even if they mmap the target for reading
                     }
-                }
-            }
-        } else {
-            // 3) Fallback: when metadata is unavailable (file removed/replaced),
-            // scan /proc/<pid>/maps and match pathname string (trim " (deleted)")
-            if let Ok(dir) = fs::read_dir("/proc") {
-                for ent in dir.flatten() {
-                    let fname = ent.file_name();
-                    if let Ok(pid) = fname.to_string_lossy().parse::<u32>() {
-                        if is_same_executable_as_current(pid) {
-                            continue;
+                    let maps_path = format!("/proc/{pid}/maps");
+                    if let Ok(content) = fs::read_to_string(&maps_path) {
+                        let mut hit = false;
+                        for line in content.lines() {
+                            let Some(entry) = parse_maps_line(line) else {
+                                continue;
+                            };
+                            if !entry.executable() {
+                                continue;
+                            }
+                            if target.matches(&entry) {
+                                hit = true;
+                                break; // early stop per PID
+                            }
                         }
-                        let maps_path = format!("/proc/{pid}/maps");
-                        if let Ok(content) = fs::read_to_string(&maps_path) {
-                            let mut hit = false;
-                            for line in content.lines() {
-                                let parts: Vec<&str> = line.split_whitespace().collect();
-                                if parts.len() < 6 {
-                                    continue;
-                                }
-                                let perms = parts[1];
-                                if !perms.contains('x') {
-                                    continue;
-                                }
-                                let path = parts[5];
-                                if path.starts_with('[') {
-                                    continue;
-                                }
-                                let path_trim = normalize_mapped_module_path(path);
-                                if path_trim == module_path {
-                                    hit = true;
-                                    break; // early stop per PID
-                                }
-                            }
-                            if hit {
-                                pids.insert(pid);
-                            }
+                        if hit {
+                            pids.insert(pid);
                         }
                     }
                 }
@@ -233,11 +174,12 @@ impl ProcessManager {
         let content = fs::read_to_string(&maps_path)?;
         let mut modules: BTreeSet<String> = BTreeSet::new();
         for line in content.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 6 {
+            let Some(entry) = parse_maps_line(line) else {
                 continue;
-            }
-            let path = parts[5];
+            };
+            let Some(path) = entry.path() else {
+                continue;
+            };
             if should_skip_mapped_module_path(path) {
                 continue;
             }
@@ -282,56 +224,18 @@ impl ProcessManager {
         let mut candidates: Vec<(u64, u64)> = Vec::new();
         let mut min_start: Option<u64> = None;
         let mut max_end: Option<u64> = None;
-
-        // Prefer dev:inode matching; fallback to normalized path compare
-        let (t_dev, t_ino) = fs::metadata(module_path)
-            .map(|m| (Some(m.dev()), Some(m.ino())))
-            .unwrap_or((None, None));
-        let (tmaj, tmin) = if let Some(dev) = t_dev {
-            let d = dev as libc::dev_t;
-            (Some(libc::major(d) as u64), Some(libc::minor(d) as u64))
-        } else {
-            (None, None)
-        };
-        let norm_target = module_path.replace("/./", "/");
+        let target = ModuleIdentity::from_path(Path::new(module_path));
 
         for line in maps.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 6 {
+            let Some(entry) = parse_maps_line(line) else {
+                continue;
+            };
+            if !target.matches(&entry) {
                 continue;
             }
-            if parts[5].starts_with('[') {
-                continue;
-            }
-            let mut matched = false;
-            if let (Some(maj), Some(min), Some(ino)) = (tmaj, tmin, t_ino) {
-                if let Some((maj_s, min_s)) = parts[3].split_once(':') {
-                    if let (Ok(dm), Ok(dn), Ok(inode)) = (
-                        u64::from_str_radix(maj_s, 16),
-                        u64::from_str_radix(min_s, 16),
-                        parts[4].parse::<u64>(),
-                    ) {
-                        matched = dm == maj && dn == min && inode == ino;
-                    }
-                }
-            } else {
-                let p = parts[5];
-                let path_trim = normalize_mapped_module_path(p);
-                matched = path_trim == norm_target;
-            }
-            if !matched {
-                continue;
-            }
-            let addrs: Vec<&str> = parts[0].split('-').collect();
-            if addrs.len() != 2 {
-                continue;
-            }
-            let start = u64::from_str_radix(addrs[0], 16).unwrap_or(0);
-            let end = u64::from_str_radix(addrs[1], 16).unwrap_or(start);
-            min_start = Some(min_start.map_or(start, |v| v.min(start)));
-            max_end = Some(max_end.map_or(end, |v| v.max(end)));
-            let file_off = u64::from_str_radix(parts[2], 16).unwrap_or(0);
-            candidates.push((file_off, start));
+            min_start = Some(min_start.map_or(entry.start, |v| v.min(entry.start)));
+            max_end = Some(max_end.map_or(entry.end, |v| v.max(entry.end)));
+            candidates.push((entry.offset, entry.start));
         }
         let data = fs::read(module_path)?;
         let obj = object::File::parse(&data[..])?;
@@ -494,39 +398,6 @@ impl ProcessManager {
     }
 }
 
-fn normalize_mapped_module_path(path: &str) -> &str {
-    if let Some(idx) = path.find(" (deleted)") {
-        &path[..idx]
-    } else {
-        path
-    }
-}
-
-fn is_filtered_module_prefix(path: &str) -> bool {
-    matches!(path, "/dev" | "/proc" | "/sys")
-        || path.starts_with("/dev/")
-        || path.starts_with("/proc/")
-        || path.starts_with("/sys/")
-}
-
-fn should_skip_mapped_module_path(path: &str) -> bool {
-    let path = normalize_mapped_module_path(path);
-    path.starts_with('[') || is_filtered_module_prefix(path)
-}
-
-fn ensure_readable_module_path(path: &str) -> Result<()> {
-    if is_filtered_module_prefix(path) {
-        anyhow::bail!("refusing to read pseudo-filesystem path {path}");
-    }
-
-    let meta = fs::metadata(path)?;
-    if !meta.file_type().is_file() {
-        anyhow::bail!("refusing to read non-regular file {path}");
-    }
-
-    Ok(())
-}
-
 fn is_same_executable_as_current(pid: u32) -> bool {
     // Strongest signal: dev+ino equality on /proc/*/exe
     let self_meta = fs::metadata("/proc/self/exe");
@@ -602,25 +473,5 @@ mod tests {
         let module_entries = mgr.module_cache.get("/tmp/a.so").unwrap();
         assert_eq!(module_entries.len(), 1);
         assert_eq!(module_entries[0].pid, 7);
-    }
-
-    #[test]
-    fn skips_virtual_and_pseudo_filesystem_mappings() {
-        assert!(should_skip_mapped_module_path("[heap]"));
-        assert!(should_skip_mapped_module_path("/dev/dri/renderD128"));
-        assert!(should_skip_mapped_module_path("/sys/kernel/tracing"));
-        assert!(should_skip_mapped_module_path("/proc/123/maps"));
-        assert!(should_skip_mapped_module_path(
-            "/dev/dri/renderD128 (deleted)"
-        ));
-        assert!(!should_skip_mapped_module_path("/usr/lib/libc.so.6"));
-    }
-
-    #[test]
-    fn rejects_non_regular_module_paths_before_read() {
-        let err = ensure_readable_module_path("/dev/null").unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("refusing to read pseudo-filesystem path /dev/null"));
     }
 }
