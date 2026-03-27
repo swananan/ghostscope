@@ -22,6 +22,8 @@ lazy_static! {
     static ref COMPILE_COMPLEX_DEBUG_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
     static ref COMPILE_COMPLEX_OPT_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
     static ref COMPILE_COMPLEX_NOPIE_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
+    static ref COMPILE_LATE_GLOBALS_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
+    static ref COMPILE_INLINE_CALLSITE_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
 }
 
 #[allow(dead_code)]
@@ -91,6 +93,14 @@ pub fn init() {
                 .status()
                 .is_ok();
 
+            // late_globals_program
+            let late_globals_dir = base.join("late_globals_program");
+            let _ = Command::new("make")
+                .arg("clean")
+                .current_dir(late_globals_dir)
+                .status()
+                .is_ok();
+
             // cpp_complex_program
             let cpp_complex_dir = base.join("cpp_complex_program");
             let _ = Command::new("make")
@@ -104,6 +114,14 @@ pub fn init() {
             let _ = Command::new("cargo")
                 .arg("clean")
                 .current_dir(rust_global_dir)
+                .status()
+                .is_ok();
+
+            // inline_callsite_program
+            let inline_callsite_dir = base.join("inline_callsite_program");
+            let _ = Command::new("make")
+                .arg("clean")
+                .current_dir(inline_callsite_dir)
                 .status()
                 .is_ok();
         }
@@ -357,6 +375,11 @@ impl TestFixtures {
             self.base_path
                 .join("globals_program")
                 .join("globals_program")
+        } else if name == "late_globals_program" {
+            ensure_late_globals_program_compiled()?;
+            self.base_path
+                .join("late_globals_program")
+                .join("late_globals_program")
         } else if name == "rust_global_program" {
             ensure_rust_global_program_compiled()?;
             self.base_path
@@ -364,6 +387,11 @@ impl TestFixtures {
                 .join("target")
                 .join("debug")
                 .join("rust_global_program")
+        } else if name == "inline_callsite_program" {
+            ensure_inline_callsite_program_compiled()?;
+            self.base_path
+                .join("inline_callsite_program")
+                .join("inline_callsite_program")
         } else if name == "cpp_complex_program" {
             ensure_cpp_complex_program_compiled()?;
             self.base_path
@@ -445,7 +473,9 @@ pub mod targets;
 pub mod termination;
 
 static COMPILE_GLOBALS: Once = Once::new();
+static COMPILE_LATE_GLOBALS: Once = Once::new();
 static COMPILE_RUST_GLOBAL: Once = Once::new();
+static COMPILE_INLINE_CALLSITE: Once = Once::new();
 static COMPILE_CPP_COMPLEX: Once = Once::new();
 
 fn ensure_globals_program_compiled() -> anyhow::Result<()> {
@@ -481,6 +511,39 @@ fn ensure_globals_program_compiled() -> anyhow::Result<()> {
     result
 }
 
+fn ensure_late_globals_program_compiled() -> anyhow::Result<()> {
+    COMPILE_LATE_GLOBALS.call_once(|| {
+        let compile_result = (|| -> anyhow::Result<()> {
+            let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/late_globals_program");
+            println!("Compiling late_globals_program (Debug) in {base:?}");
+            let _ = Command::new("make")
+                .arg("clean")
+                .current_dir(base.clone())
+                .status()
+                .is_ok();
+            let out = Command::new("make").arg("all").current_dir(base).output()?;
+            if out.status.success() {
+                println!("✓ Successfully compiled late_globals_program");
+                Ok(())
+            } else {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                Err(anyhow::anyhow!(
+                    "Failed to compile late_globals_program: {}",
+                    stderr
+                ))
+            }
+        })();
+        *COMPILE_LATE_GLOBALS_RESULT.lock().unwrap() = Some(compile_result);
+    });
+
+    match COMPILE_LATE_GLOBALS_RESULT.lock().unwrap().as_ref() {
+        Some(Ok(())) => Ok(()),
+        Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
+        None => panic!("Compilation result should be set after call_once"),
+    }
+}
+
 fn ensure_rust_global_program_compiled() -> anyhow::Result<()> {
     let mut result = Ok(());
     COMPILE_RUST_GLOBAL.call_once(|| {
@@ -512,6 +575,39 @@ fn ensure_rust_global_program_compiled() -> anyhow::Result<()> {
         }
     });
     result
+}
+
+fn ensure_inline_callsite_program_compiled() -> anyhow::Result<()> {
+    COMPILE_INLINE_CALLSITE.call_once(|| {
+        let compile_result = (|| -> anyhow::Result<()> {
+            let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/inline_callsite_program");
+            println!("Compiling inline_callsite_program (Optimized O2) in {base:?}");
+            let _ = Command::new("make")
+                .arg("clean")
+                .current_dir(base.clone())
+                .status()
+                .is_ok();
+            let out = Command::new("make").arg("all").current_dir(base).output()?;
+            if out.status.success() {
+                println!("✓ Successfully compiled inline_callsite_program");
+                Ok(())
+            } else {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                Err(anyhow::anyhow!(
+                    "Failed to compile inline_callsite_program: {}",
+                    stderr
+                ))
+            }
+        })();
+        *COMPILE_INLINE_CALLSITE_RESULT.lock().unwrap() = Some(compile_result);
+    });
+
+    match COMPILE_INLINE_CALLSITE_RESULT.lock().unwrap().as_ref() {
+        Some(Ok(())) => Ok(()),
+        Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
+        None => panic!("Compilation result should be set after call_once"),
+    }
 }
 
 fn ensure_cpp_complex_program_compiled() -> anyhow::Result<()> {

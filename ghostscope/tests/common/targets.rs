@@ -12,7 +12,10 @@ use tokio::sync::Mutex;
 const SAMPLE_PROGRAM_BUILD_DIR: &str = "/workspace/ghostscope/tests/fixtures/sample_program";
 const COMPLEX_TYPES_BUILD_DIR: &str = "/workspace/ghostscope/tests/fixtures/complex_types_program";
 const GLOBALS_BUILD_DIR: &str = "/workspace/ghostscope/tests/fixtures/globals_program";
+const LATE_GLOBALS_BUILD_DIR: &str = "/workspace/ghostscope/tests/fixtures/late_globals_program";
 const RUST_GLOBAL_BUILD_DIR: &str = "/workspace/ghostscope/tests/fixtures/rust_global_program";
+const INLINE_CALLSITE_BUILD_DIR: &str =
+    "/workspace/ghostscope/tests/fixtures/inline_callsite_program";
 const CPP_COMPLEX_BUILD_DIR: &str = "/workspace/ghostscope/tests/fixtures/cpp_complex_program";
 
 #[derive(Debug, Clone)]
@@ -325,8 +328,14 @@ fn maybe_prepare_container_fixture_binary(
         | "ghostscope/tests/fixtures/globals_program/libgvars.so" => {
             Some(format!("cd {GLOBALS_BUILD_DIR} && make -B all"))
         }
+        "ghostscope/tests/fixtures/late_globals_program/late_globals_program" => {
+            Some(format!("cd {LATE_GLOBALS_BUILD_DIR} && make -B all"))
+        }
         "ghostscope/tests/fixtures/rust_global_program/target/debug/rust_global_program" => {
             Some(format!("cd {RUST_GLOBAL_BUILD_DIR} && cargo build"))
+        }
+        "ghostscope/tests/fixtures/inline_callsite_program/inline_callsite_program" => {
+            Some(format!("cd {INLINE_CALLSITE_BUILD_DIR} && make -B all"))
         }
         "ghostscope/tests/fixtures/cpp_complex_program/cpp_complex_program" => {
             Some(format!("cd {CPP_COMPLEX_BUILD_DIR} && make -B"))

@@ -57,6 +57,8 @@ test_*
 !scripts/e2e/runner/install_codex_skill.sh
 # Keep other C files in test fixtures but exclude random C files in root
 /*.c
+ghostscope/tests/fixtures/inline_callsite_program/inline_callsite_program
+ghostscope/tests/fixtures/late_globals_program/late_globals_program
 CLA*
 IMPL*
 DWARF*
