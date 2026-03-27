@@ -365,7 +365,7 @@ fn run_sysmon_loop(
         tracing::info!("Sysmon verifier logs: DEBUG (release/info)");
     }
     // Reuse pinned maps by name under our per-process dir
-    loader.map_pin_path(crate::pinned_bpf_maps::proc_offsets_pin_dir());
+    loader.map_pin_path(crate::pinned_bpf_maps::proc_offsets_pin_dir()?);
     let mut bpf = loader.load(obj)?;
 
     // Configure optional exec comm filter when targeting executables (-t binary).
