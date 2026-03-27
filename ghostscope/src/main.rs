@@ -41,10 +41,6 @@ async fn main() -> Result<()> {
     // Setup panic hook before doing anything else
     crate::util::setup_panic_hook();
 
-    // Pre-clean any stale per-process pinned offsets map from a previous crashed session.
-    // This prevents PID reuse collisions leaving an old map affecting the new instance.
-    let _ = ghostscope_process::pinned_bpf_maps::cleanup_pinned_proc_offsets();
-
     // Parse command line arguments
     let parsed_args = config::Args::parse_args();
 
@@ -95,6 +91,12 @@ async fn main() -> Result<()> {
 
     // Ensure we have the privileges needed for eBPF interaction
     crate::util::ensure_privileges();
+
+    match ghostscope_process::pinned_bpf_maps::cleanup_stale_pinned_maps_root() {
+        Ok(0) => {}
+        Ok(removed) => info!("Removed {removed} stale pinned map directories from bpffs"),
+        Err(err) => warn!("Failed to clean stale pinned map directories from bpffs: {err}"),
+    }
 
     // Step 1 (PID/-t mode): detect runtime environment first (container/host/unknown).
     if merged_config.pid.is_some() || merged_config.target_path.is_some() {

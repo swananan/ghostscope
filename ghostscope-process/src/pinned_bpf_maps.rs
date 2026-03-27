@@ -9,19 +9,50 @@ use std::os::fd::{AsFd, AsRawFd};
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
+const BPFFS_ROOT: &str = "/sys/fs/bpf/ghostscope";
+const PROC_STAT_STARTTIME_INDEX: usize = 19;
+
+fn process_starttime(pid: u32) -> io::Result<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let (_, rest) = stat
+        .rsplit_once(") ")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed /proc stat"))?;
+    let raw = rest
+        .split_whitespace()
+        .nth(PROC_STAT_STARTTIME_INDEX)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing starttime field"))?;
+    raw.parse::<u64>()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+fn current_process_dir_name() -> anyhow::Result<String> {
+    let pid = std::process::id();
+    let starttime = process_starttime(pid)?;
+    Ok(format!("{pid}-{starttime}"))
+}
+
+fn parse_pin_dir_name(name: &str) -> Option<(u32, u64)> {
+    let (pid, starttime) = name.split_once('-')?;
+    let pid = pid.parse::<u32>().ok()?;
+    let starttime = starttime.parse::<u64>().ok()?;
+    Some((pid, starttime))
+}
+
 /// Compute the bpffs pin path for the proc_module_offsets map for current process
 /// Using per-process directory avoids conflicts across multiple GhostScope instances
-pub fn proc_offsets_pin_path() -> PathBuf {
-    let pid = std::process::id();
-    PathBuf::from(format!("/sys/fs/bpf/ghostscope/{pid}/proc_module_offsets"))
+pub fn proc_offsets_pin_path() -> anyhow::Result<PathBuf> {
+    Ok(PathBuf::from(format!(
+        "{BPFFS_ROOT}/{}/proc_module_offsets",
+        current_process_dir_name()?
+    )))
 }
 
 /// Pin directory containing the per-process offsets map
-pub fn proc_offsets_pin_dir() -> PathBuf {
-    proc_offsets_pin_path()
+pub fn proc_offsets_pin_dir() -> anyhow::Result<PathBuf> {
+    proc_offsets_pin_path()?
         .parent()
         .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("/sys/fs/bpf/ghostscope"))
+        .ok_or_else(|| anyhow::anyhow!("bpffs root has no parent for proc offsets pin path"))
 }
 
 /// Map name as embedded in BPF object
@@ -73,7 +104,7 @@ fn ensure_pin_dir(path: &Path) -> std::io::Result<()> {
 /// Ensure the pinned global proc_module_offsets map exists at the standard path.
 /// If not present, create and pin it with the specified capacity.
 pub fn ensure_pinned_proc_offsets_exists(max_entries: u32) -> anyhow::Result<()> {
-    let pin_path = proc_offsets_pin_path();
+    let pin_path = proc_offsets_pin_path()?;
     // Ensure parent dir exists
     ensure_pin_dir(&pin_path)?;
 
@@ -224,14 +255,16 @@ fn bpf_map_get_next_key(
 }
 
 /// Compute the bpffs pin path for the allowed_pids map for current process
-pub fn allowed_pids_pin_path() -> PathBuf {
-    let pid = std::process::id();
-    PathBuf::from(format!("/sys/fs/bpf/ghostscope/{pid}/allowed_pids"))
+pub fn allowed_pids_pin_path() -> anyhow::Result<PathBuf> {
+    Ok(PathBuf::from(format!(
+        "{BPFFS_ROOT}/{}/allowed_pids",
+        current_process_dir_name()?
+    )))
 }
 
 /// Ensure the pinned allowed_pids map exists under the per-process directory.
 pub fn ensure_pinned_allowed_pids_exists(max_entries: u32) -> anyhow::Result<()> {
-    let pin_path = allowed_pids_pin_path();
+    let pin_path = allowed_pids_pin_path()?;
     ensure_pin_dir(&pin_path)?;
 
     if pin_path.exists() {
@@ -294,7 +327,7 @@ pub fn ensure_pinned_allowed_pids_exists(max_entries: u32) -> anyhow::Result<()>
 
 /// Insert a PID into the allowed_pids pinned map.
 pub fn insert_allowed_pid(pid: u32) -> anyhow::Result<()> {
-    let map_data = MapData::from_pin(allowed_pids_pin_path())?;
+    let map_data = MapData::from_pin(allowed_pids_pin_path()?)?;
     let fd = map_data.fd().as_fd().as_raw_fd();
     let key = pid;
     let val: u8 = 1;
@@ -309,7 +342,7 @@ pub fn insert_allowed_pid(pid: u32) -> anyhow::Result<()> {
 
 /// Remove a PID from the allowed_pids pinned map.
 pub fn remove_allowed_pid(pid: u32) -> anyhow::Result<()> {
-    let map_data = MapData::from_pin(allowed_pids_pin_path())?;
+    let map_data = MapData::from_pin(allowed_pids_pin_path()?)?;
     let fd = map_data.fd().as_fd().as_raw_fd();
     bpf_map_delete_elem(fd, &pid as *const _ as *const _)
         .map_err(|e| anyhow::anyhow!("allowed_pids delete failed for {}: {}", pid, e))
@@ -340,7 +373,7 @@ fn bpf_map_delete_elem(fd: i32, key: *const c::c_void) -> io::Result<()> {
 
 /// Purge all entries for a given pid in the pinned proc_module_offsets map.
 pub fn purge_offsets_for_pid(pid: u32) -> anyhow::Result<usize> {
-    let map_data = MapData::from_pin(proc_offsets_pin_path())?;
+    let map_data = MapData::from_pin(proc_offsets_pin_path()?)?;
     let fd = map_data.fd().as_fd().as_raw_fd();
     let mut deleted = 0usize;
 
@@ -389,7 +422,7 @@ pub fn insert_offsets_for_pid(
     pid: u32,
     items: &[(u64, ProcModuleOffsetsValue)],
 ) -> anyhow::Result<usize> {
-    let map_data = MapData::from_pin(proc_offsets_pin_path())?;
+    let map_data = MapData::from_pin(proc_offsets_pin_path()?)?;
     let fd = map_data.fd().as_fd().as_raw_fd();
     let mut inserted = 0usize;
     for (cookie, off) in items {
@@ -421,20 +454,209 @@ pub fn insert_offsets_for_pid(
     Ok(inserted)
 }
 
-/// Remove the pinned proc_module_offsets map and its per-process directory (best effort).
-/// Safe to call multiple times; missing paths are ignored.
-pub fn cleanup_pinned_proc_offsets() -> anyhow::Result<()> {
-    let path = proc_offsets_pin_path();
-    if path.exists() {
-        let _ = std::fs::remove_file(&path);
-    }
-    if let Some(dir) = path.parent() {
-        if let Ok(mut rd) = std::fs::read_dir(dir) {
-            if rd.next().is_none() {
-                let _ = std::fs::remove_dir(dir);
-            }
+fn cleanup_pinned_maps_in_dir(dir: &Path) -> anyhow::Result<()> {
+    for file_name in [PROC_OFFSETS_MAP_NAME, ALLOWED_PIDS_MAP_NAME] {
+        let path = dir.join(file_name);
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
         }
     }
+
+    if let Ok(mut rd) = std::fs::read_dir(dir) {
+        if rd.next().is_none() {
+            let _ = std::fs::remove_dir(dir);
+        }
+    }
+
     Ok(())
+}
+
+fn cleanup_stale_pinned_maps_under<F>(
+    root: &Path,
+    current_pid: u32,
+    current_starttime: u64,
+    is_pid_live: F,
+) -> anyhow::Result<usize>
+where
+    F: Fn(u32) -> bool,
+{
+    let mut removed_dirs = 0usize;
+
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(err.into()),
+    };
+
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some((pid, dir_starttime)) = parse_pin_dir_name(&name) else {
+            continue;
+        };
+
+        let live = if pid == current_pid {
+            dir_starttime == current_starttime
+        } else if !is_pid_live(pid) {
+            false
+        } else {
+            match process_starttime(pid) {
+                Ok(live_starttime) => live_starttime == dir_starttime,
+                Err(_) => true,
+            }
+        };
+
+        if live {
+            continue;
+        }
+
+        cleanup_pinned_maps_in_dir(&entry.path())?;
+        removed_dirs += 1;
+    }
+
+    Ok(removed_dirs)
+}
+
+fn is_pid_live(pid: u32) -> bool {
+    Path::new("/proc").join(pid.to_string()).exists()
+}
+
+/// Remove the current process's pinned maps and its per-process directory (best effort).
+/// Safe to call multiple times; missing paths are ignored.
+pub fn cleanup_current_pinned_maps() -> anyhow::Result<()> {
+    cleanup_pinned_maps_in_dir(&proc_offsets_pin_dir()?)
+}
+
+/// Remove stale per-process pinned map directories whose PID no longer exists.
+pub fn cleanup_stale_pinned_maps_root() -> anyhow::Result<usize> {
+    let current_pid = std::process::id();
+    let current_starttime = process_starttime(current_pid)?;
+    cleanup_stale_pinned_maps_under(
+        Path::new(BPFFS_ROOT),
+        current_pid,
+        current_starttime,
+        is_pid_live,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        cleanup_pinned_maps_in_dir, cleanup_stale_pinned_maps_under, parse_pin_dir_name,
+        ALLOWED_PIDS_MAP_NAME, PROC_OFFSETS_MAP_NAME,
+    };
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn cleanup_removes_known_pinned_maps_and_empty_dir() {
+        let temp = tempdir().unwrap();
+        let dir = temp.path().join("1234");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(PROC_OFFSETS_MAP_NAME), b"offsets").unwrap();
+        fs::write(dir.join(ALLOWED_PIDS_MAP_NAME), b"allow").unwrap();
+
+        cleanup_pinned_maps_in_dir(&dir).unwrap();
+
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn cleanup_preserves_dir_when_unknown_files_remain() {
+        let temp = tempdir().unwrap();
+        let dir = temp.path().join("1234");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(PROC_OFFSETS_MAP_NAME), b"offsets").unwrap();
+        fs::write(dir.join(ALLOWED_PIDS_MAP_NAME), b"allow").unwrap();
+        let extra = dir.join("keep-me");
+        fs::write(&extra, b"extra").unwrap();
+
+        cleanup_pinned_maps_in_dir(&dir).unwrap();
+
+        assert!(dir.exists());
+        assert!(extra.exists());
+        assert!(!dir.join(PROC_OFFSETS_MAP_NAME).exists());
+        assert!(!dir.join(ALLOWED_PIDS_MAP_NAME).exists());
+    }
+
+    #[test]
+    fn stale_cleanup_removes_only_dead_pid_dirs() {
+        let temp = tempdir().unwrap();
+        let stale_dir = temp.path().join("111-10");
+        let live_dir = temp.path().join("222-20");
+        let current_dir = temp.path().join("333-30");
+        let non_pid_dir = temp.path().join("not-a-pid");
+
+        for dir in [&stale_dir, &live_dir, &current_dir, &non_pid_dir] {
+            fs::create_dir_all(dir).unwrap();
+            fs::write(dir.join(PROC_OFFSETS_MAP_NAME), b"offsets").unwrap();
+            fs::write(dir.join(ALLOWED_PIDS_MAP_NAME), b"allow").unwrap();
+        }
+
+        let removed =
+            cleanup_stale_pinned_maps_under(temp.path(), 333, 30, |pid| matches!(pid, 222 | 333))
+                .unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(!stale_dir.exists());
+        assert!(live_dir.exists());
+        assert!(current_dir.exists());
+        assert!(non_pid_dir.exists());
+    }
+
+    #[test]
+    fn stale_cleanup_removes_mismatched_starttime_for_reused_pid() {
+        let temp = tempdir().unwrap();
+        let stale_current_pid_dir = temp.path().join("333-10");
+        let current_pid_dir = temp.path().join("333-30");
+
+        for dir in [&stale_current_pid_dir, &current_pid_dir] {
+            fs::create_dir_all(dir).unwrap();
+            fs::write(dir.join(PROC_OFFSETS_MAP_NAME), b"offsets").unwrap();
+            fs::write(dir.join(ALLOWED_PIDS_MAP_NAME), b"allow").unwrap();
+        }
+
+        let removed =
+            cleanup_stale_pinned_maps_under(temp.path(), 333, 30, |pid| pid == 333).unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(!stale_current_pid_dir.exists());
+        assert!(current_pid_dir.exists());
+    }
+
+    #[test]
+    fn parse_pin_dir_name_requires_pid_starttime_format() {
+        assert_eq!(parse_pin_dir_name("1234"), None);
+        assert_eq!(parse_pin_dir_name("1234-5678"), Some((1234, 5678)));
+        assert_eq!(parse_pin_dir_name("bad"), None);
+        assert_eq!(parse_pin_dir_name("1234-bad"), None);
+    }
+
+    #[test]
+    fn stale_cleanup_ignores_legacy_numeric_dirs() {
+        let temp = tempdir().unwrap();
+        let legacy_dir = temp.path().join("444");
+        let current_dir = temp.path().join("333-30");
+
+        for dir in [&legacy_dir, &current_dir] {
+            fs::create_dir_all(dir).unwrap();
+            fs::write(dir.join(PROC_OFFSETS_MAP_NAME), b"offsets").unwrap();
+            fs::write(dir.join(ALLOWED_PIDS_MAP_NAME), b"allow").unwrap();
+        }
+
+        let removed =
+            cleanup_stale_pinned_maps_under(temp.path(), 333, 30, |pid| matches!(pid, 333 | 444))
+                .unwrap();
+
+        assert_eq!(removed, 0);
+        assert!(legacy_dir.exists());
+        assert!(current_dir.exists());
+    }
 }
 // Note: map open/write helpers will be added once we standardize on aya APIs across crates.

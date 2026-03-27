@@ -818,6 +818,7 @@ dependencies = [
  "log",
  "memmap2",
  "object",
+ "tempfile",
  "tracing",
 ]
 
