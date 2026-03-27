@@ -145,7 +145,8 @@ impl GhostScopeLoader {
         );
 
         // Enforce: proc_module_offsets must be provided as a pinned global map by the process layer
-        let pin_path = proc_offsets_pin_path();
+        let pin_path = proc_offsets_pin_path()
+            .map_err(|e| LoaderError::Generic(format!("Failed to resolve pinned map path: {e}")))?;
         if !pin_path.exists() {
             return Err(LoaderError::Generic(format!(
                 "Pinned map '{}' not found. Please call ghostscope-process to create it first.",
@@ -167,7 +168,9 @@ impl GhostScopeLoader {
         // Configure Aya loader to reuse pinned maps by name under our per-process pin directory.
         // This makes @proc_module_offsets in the eBPF object bind to the already pinned map
         // created by ghostscope-process instead of creating a new private map.
-        let pin_dir = proc_offsets_pin_dir();
+        let pin_dir = proc_offsets_pin_dir().map_err(|e| {
+            LoaderError::Generic(format!("Failed to resolve pinned map directory: {e}"))
+        })?;
         if pin_dir.exists() {
             loader.map_pin_path(&pin_dir);
             tracing::info!(

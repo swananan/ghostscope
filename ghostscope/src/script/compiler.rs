@@ -109,7 +109,8 @@ async fn create_and_attach_loader(
         .as_ref()
         .map(|c| c.ebpf_config.proc_module_offsets_max_entries as u32)
         .unwrap_or(4096);
-    let pin_path = ghostscope_process::pinned_bpf_maps::proc_offsets_pin_path();
+    let pin_path = ghostscope_process::pinned_bpf_maps::proc_offsets_pin_path()
+        .context("Failed to resolve pinned proc_module_offsets map path")?;
     if let Err(e) =
         ghostscope_process::pinned_bpf_maps::ensure_pinned_proc_offsets_exists(max_entries)
     {

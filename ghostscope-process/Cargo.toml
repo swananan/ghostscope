@@ -27,6 +27,9 @@ memmap2 = "0.9"
 [build-dependencies]
 aya-build = { workspace = true, optional = true }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [features]
 default = ["sysmon-ebpf"]
 sysmon-ebpf = ["aya-build"]
