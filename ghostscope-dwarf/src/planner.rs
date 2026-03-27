@@ -137,11 +137,7 @@ impl<'dwarf> AccessPlanner<'dwarf> {
         if let Some(attr) = die.attr(gimli::DW_AT_declaration) {
             is_decl = matches!(attr.value(), gimli::AttributeValue::Flag(true));
         }
-        let has_children = {
-            let mut entries = unit.entries_at_offset(die.offset())?;
-            let _ = entries.next_entry()?; // self
-            (entries.next_dfs()?).is_some()
-        };
+        let has_children = die.has_children();
 
         let name_opt = if let Some(attr) = die.attr(gimli::DW_AT_name) {
             self.dwarf
