@@ -1,4 +1,4 @@
-//! Tracing module - manages trace instances and their lifecycle
+//! Trace module - manages trace instances and their lifecycle
 
 pub mod instance;
 pub mod manager;

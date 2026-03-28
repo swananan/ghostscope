@@ -5,13 +5,12 @@ mod logging;
 mod pid;
 mod script;
 mod source_path;
-mod tracing;
+mod trace;
 mod tui;
 mod util;
 
 use anyhow::Result;
-// Use external tracing crate (not the local tracing module)
-use ::tracing::{info, warn};
+use tracing::{info, warn};
 
 fn pid_ns_context_needed(
     mapping: &config::ResolvedPidInfo,
