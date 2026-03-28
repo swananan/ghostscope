@@ -6,11 +6,56 @@ use aya_obj::{
 use libc as c;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 const BPFFS_ROOT: &str = "/sys/fs/bpf/ghostscope";
+const INITIAL_PID_NAMESPACE_INO: u64 = 4026531836;
 const PROC_STAT_STARTTIME_INDEX: usize = 19;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CurrentProcessIdentity {
+    host_pid: u32,
+    host_pid_reliable: bool,
+    starttime: u64,
+    initial_pid_namespace: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BpffsPruneMode {
+    Stale,
+    Instance(String),
+    All,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BpffsPruneOptions {
+    pub mode: BpffsPruneMode,
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BpffsPruneStatus {
+    RemoveDir,
+    CleanKnownPins,
+    SkipLive,
+    Ignore,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BpffsPruneEntry {
+    pub directory: String,
+    pub status: BpffsPruneStatus,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BpffsPruneReport {
+    pub root: PathBuf,
+    pub dry_run: bool,
+    pub entries: Vec<BpffsPruneEntry>,
+}
 
 fn process_starttime(pid: u32) -> io::Result<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
@@ -25,10 +70,95 @@ fn process_starttime(pid: u32) -> io::Result<u64> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+fn parse_status_chain(status: &str, key: &str) -> Option<Vec<u32>> {
+    status.lines().find_map(|line| {
+        let rest = line.strip_prefix(key)?.trim();
+        let values: Vec<u32> = rest
+            .split_whitespace()
+            .filter_map(|value| value.parse::<u32>().ok())
+            .collect();
+        if values.is_empty() {
+            None
+        } else {
+            Some(values)
+        }
+    })
+}
+
+fn read_nspid_chain(pid: u32) -> Option<Vec<u32>> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    parse_status_chain(&status, "NSpid:")
+}
+
+fn host_pid_for_visible_pid(pid: u32) -> u32 {
+    read_nspid_chain(pid)
+        .and_then(|chain| chain.first().copied())
+        .unwrap_or(pid)
+}
+
+fn host_pid_mapping_from_chain(
+    chain: Option<&[u32]>,
+    allow_single_value_nspid: bool,
+) -> Option<u32> {
+    match chain {
+        Some([]) => None,
+        Some([only]) if allow_single_value_nspid => Some(*only),
+        Some([_only]) => None,
+        Some(values) => values.first().copied(),
+        None if allow_single_value_nspid => None,
+        None => None,
+    }
+}
+
+fn read_pid_namespace_inode(pid: u32) -> Option<u64> {
+    std::fs::metadata(format!("/proc/{pid}/ns/pid"))
+        .ok()
+        .map(|metadata| metadata.ino())
+}
+
+fn resolve_visible_pid_for_host_pid(host_pid: u32, allow_single_value_nspid: bool) -> Option<u32> {
+    let direct = Path::new("/proc").join(host_pid.to_string());
+    if direct.exists() {
+        let chain = read_nspid_chain(host_pid);
+        if host_pid_mapping_from_chain(chain.as_deref(), allow_single_value_nspid) == Some(host_pid)
+        {
+            return Some(host_pid);
+        }
+    }
+
+    let entries = std::fs::read_dir("/proc").ok()?;
+    for entry in entries.flatten() {
+        let Ok(visible_pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let chain = read_nspid_chain(visible_pid);
+        if host_pid_mapping_from_chain(chain.as_deref(), allow_single_value_nspid) == Some(host_pid)
+        {
+            return Some(visible_pid);
+        }
+    }
+
+    None
+}
+
+fn current_process_identity() -> anyhow::Result<CurrentProcessIdentity> {
+    let visible_pid = std::process::id();
+    let initial_pid_namespace =
+        read_pid_namespace_inode(visible_pid) == Some(INITIAL_PID_NAMESPACE_INO);
+    let nspid_chain = read_nspid_chain(visible_pid);
+    let host_pid_reliable =
+        initial_pid_namespace || nspid_chain.as_ref().is_some_and(|chain| chain.len() > 1);
+    Ok(CurrentProcessIdentity {
+        host_pid: host_pid_for_visible_pid(visible_pid),
+        host_pid_reliable,
+        starttime: process_starttime(visible_pid)?,
+        initial_pid_namespace,
+    })
+}
+
 fn current_process_dir_name() -> anyhow::Result<String> {
-    let pid = std::process::id();
-    let starttime = process_starttime(pid)?;
-    Ok(format!("{pid}-{starttime}"))
+    let identity = current_process_identity()?;
+    Ok(format!("{}-{}", identity.host_pid, identity.starttime))
 }
 
 fn parse_pin_dir_name(name: &str) -> Option<(u32, u64)> {
@@ -454,37 +584,122 @@ pub fn insert_offsets_for_pid(
     Ok(inserted)
 }
 
-fn cleanup_pinned_maps_in_dir(dir: &Path) -> anyhow::Result<()> {
-    for file_name in [PROC_OFFSETS_MAP_NAME, ALLOWED_PIDS_MAP_NAME] {
-        let path = dir.join(file_name);
-        if path.exists() {
-            let _ = std::fs::remove_file(&path);
-        }
-    }
-
-    if let Ok(mut rd) = std::fs::read_dir(dir) {
-        if rd.next().is_none() {
-            let _ = std::fs::remove_dir(dir);
-        }
-    }
-
-    Ok(())
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirCleanupOutcome {
+    RemovedDir,
 }
 
-fn cleanup_stale_pinned_maps_under<F>(
-    root: &Path,
-    current_pid: u32,
-    current_starttime: u64,
-    is_pid_live: F,
-) -> anyhow::Result<usize>
+fn cleanup_outcome_without_mutation(dir: &Path) -> anyhow::Result<DirCleanupOutcome> {
+    if let Err(err) = std::fs::metadata(dir) {
+        if err.kind() != io::ErrorKind::NotFound {
+            return Err(err.into());
+        }
+    }
+    Ok(DirCleanupOutcome::RemovedDir)
+}
+
+fn cleanup_pinned_maps_in_dir(dir: &Path) -> anyhow::Result<DirCleanupOutcome> {
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => Ok(DirCleanupOutcome::RemovedDir),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(DirCleanupOutcome::RemovedDir),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn stale_reason_for_dir<R, S>(
+    host_pid: u32,
+    dir_starttime: u64,
+    current: CurrentProcessIdentity,
+    resolve_visible_pid: &R,
+    read_starttime: &S,
+) -> Option<&'static str>
 where
-    F: Fn(u32) -> bool,
+    R: Fn(u32) -> Option<u32>,
+    S: Fn(u32) -> io::Result<u64>,
 {
-    let mut removed_dirs = 0usize;
+    if current.host_pid_reliable && host_pid == current.host_pid {
+        return (dir_starttime != current.starttime).then_some("starttime_mismatch");
+    }
+
+    let Some(visible_pid) = resolve_visible_pid(host_pid) else {
+        return current.initial_pid_namespace.then_some("pid_not_running");
+    };
+
+    match read_starttime(visible_pid) {
+        Ok(live_starttime) if live_starttime != dir_starttime => Some("starttime_mismatch"),
+        Ok(_) => None,
+        Err(_) => current.initial_pid_namespace.then_some("pid_not_running"),
+    }
+}
+
+fn prune_entry_for_cleanup(
+    directory: String,
+    reason: &str,
+    outcome: DirCleanupOutcome,
+) -> BpffsPruneEntry {
+    BpffsPruneEntry {
+        directory,
+        status: match outcome {
+            DirCleanupOutcome::RemovedDir => BpffsPruneStatus::RemoveDir,
+        },
+        reason: reason.to_string(),
+    }
+}
+
+fn prune_pinned_maps_under<R, S>(
+    root: &Path,
+    current: CurrentProcessIdentity,
+    options: &BpffsPruneOptions,
+    resolve_visible_pid: R,
+    read_starttime: S,
+) -> anyhow::Result<BpffsPruneReport>
+where
+    R: Fn(u32) -> Option<u32>,
+    S: Fn(u32) -> io::Result<u64>,
+{
+    if let BpffsPruneMode::Instance(instance) = &options.mode {
+        let path = root.join(instance);
+        if !path.exists() {
+            return Err(anyhow::anyhow!(
+                "bpffs pin directory not found: {}",
+                path.display()
+            ));
+        }
+        if !path.is_dir() {
+            return Err(anyhow::anyhow!(
+                "bpffs pin path is not a directory: {}",
+                path.display()
+            ));
+        }
+
+        let outcome = if options.dry_run {
+            cleanup_outcome_without_mutation(&path)?
+        } else {
+            cleanup_pinned_maps_in_dir(&path)?
+        };
+
+        return Ok(BpffsPruneReport {
+            root: root.to_path_buf(),
+            dry_run: options.dry_run,
+            entries: vec![prune_entry_for_cleanup(
+                instance.clone(),
+                "explicit_instance",
+                outcome,
+            )],
+        });
+    }
+
+    let mut entries_out = Vec::new();
 
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Ok(BpffsPruneReport {
+                root: root.to_path_buf(),
+                dry_run: options.dry_run,
+                entries: entries_out,
+            });
+        }
         Err(err) => return Err(err.into()),
     };
 
@@ -497,51 +712,107 @@ where
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        let Some((pid, dir_starttime)) = parse_pin_dir_name(&name) else {
+        let Some((host_pid, dir_starttime)) = parse_pin_dir_name(&name) else {
+            entries_out.push(BpffsPruneEntry {
+                directory: name,
+                status: BpffsPruneStatus::Ignore,
+                reason: "non_matching_name".to_string(),
+            });
             continue;
         };
 
-        let live = if pid == current_pid {
-            dir_starttime == current_starttime
-        } else if !is_pid_live(pid) {
-            false
+        let removal_reason = match &options.mode {
+            BpffsPruneMode::Stale => stale_reason_for_dir(
+                host_pid,
+                dir_starttime,
+                current,
+                &resolve_visible_pid,
+                &read_starttime,
+            ),
+            BpffsPruneMode::All => Some("force_all"),
+            BpffsPruneMode::Instance(_) => unreachable!(),
+        };
+
+        let Some(reason) = removal_reason else {
+            entries_out.push(BpffsPruneEntry {
+                directory: name,
+                status: BpffsPruneStatus::SkipLive,
+                reason: "live_instance".to_string(),
+            });
+            continue;
+        };
+
+        let outcome = if options.dry_run {
+            cleanup_outcome_without_mutation(&entry.path())?
         } else {
-            match process_starttime(pid) {
-                Ok(live_starttime) => live_starttime == dir_starttime,
-                Err(_) => true,
-            }
+            cleanup_pinned_maps_in_dir(&entry.path())?
         };
-
-        if live {
-            continue;
-        }
-
-        cleanup_pinned_maps_in_dir(&entry.path())?;
-        removed_dirs += 1;
+        entries_out.push(prune_entry_for_cleanup(name, reason, outcome));
     }
 
-    Ok(removed_dirs)
+    entries_out.sort_by(|left, right| left.directory.cmp(&right.directory));
+
+    Ok(BpffsPruneReport {
+        root: root.to_path_buf(),
+        dry_run: options.dry_run,
+        entries: entries_out,
+    })
 }
 
-fn is_pid_live(pid: u32) -> bool {
-    Path::new("/proc").join(pid.to_string()).exists()
+fn cleanup_stale_pinned_maps_under<R, S>(
+    root: &Path,
+    current: CurrentProcessIdentity,
+    resolve_visible_pid: R,
+    read_starttime: S,
+) -> anyhow::Result<usize>
+where
+    R: Fn(u32) -> Option<u32>,
+    S: Fn(u32) -> io::Result<u64>,
+{
+    let report = prune_pinned_maps_under(
+        root,
+        current,
+        &BpffsPruneOptions {
+            mode: BpffsPruneMode::Stale,
+            dry_run: false,
+        },
+        resolve_visible_pid,
+        read_starttime,
+    )?;
+
+    Ok(report
+        .entries
+        .iter()
+        .filter(|entry| entry.status == BpffsPruneStatus::RemoveDir)
+        .count())
 }
 
 /// Remove the current process's pinned maps and its per-process directory (best effort).
 /// Safe to call multiple times; missing paths are ignored.
 pub fn cleanup_current_pinned_maps() -> anyhow::Result<()> {
-    cleanup_pinned_maps_in_dir(&proc_offsets_pin_dir()?)
+    let _ = cleanup_pinned_maps_in_dir(&proc_offsets_pin_dir()?);
+    Ok(())
 }
 
 /// Remove stale per-process pinned map directories whose PID no longer exists.
 pub fn cleanup_stale_pinned_maps_root() -> anyhow::Result<usize> {
-    let current_pid = std::process::id();
-    let current_starttime = process_starttime(current_pid)?;
+    let current = current_process_identity()?;
     cleanup_stale_pinned_maps_under(
         Path::new(BPFFS_ROOT),
-        current_pid,
-        current_starttime,
-        is_pid_live,
+        current,
+        |host_pid| resolve_visible_pid_for_host_pid(host_pid, current.initial_pid_namespace),
+        process_starttime,
+    )
+}
+
+pub fn prune_pinned_maps_root(options: &BpffsPruneOptions) -> anyhow::Result<BpffsPruneReport> {
+    let current = current_process_identity()?;
+    prune_pinned_maps_under(
+        Path::new(BPFFS_ROOT),
+        current,
+        options,
+        |host_pid| resolve_visible_pid_for_host_pid(host_pid, current.initial_pid_namespace),
+        process_starttime,
     )
 }
 
@@ -549,10 +820,37 @@ pub fn cleanup_stale_pinned_maps_root() -> anyhow::Result<usize> {
 mod tests {
     use super::{
         cleanup_pinned_maps_in_dir, cleanup_stale_pinned_maps_under, parse_pin_dir_name,
-        ALLOWED_PIDS_MAP_NAME, PROC_OFFSETS_MAP_NAME,
+        process_starttime, prune_pinned_maps_under, BpffsPruneMode, BpffsPruneOptions,
+        BpffsPruneStatus, CurrentProcessIdentity, ALLOWED_PIDS_MAP_NAME, PROC_OFFSETS_MAP_NAME,
     };
-    use std::fs;
+    use std::{fs, io};
     use tempfile::tempdir;
+
+    fn host_test_identity(host_pid: u32, starttime: u64) -> CurrentProcessIdentity {
+        CurrentProcessIdentity {
+            host_pid,
+            host_pid_reliable: true,
+            starttime,
+            initial_pid_namespace: true,
+        }
+    }
+
+    fn private_ns_test_identity(host_pid: u32, starttime: u64) -> CurrentProcessIdentity {
+        CurrentProcessIdentity {
+            host_pid,
+            host_pid_reliable: false,
+            starttime,
+            initial_pid_namespace: false,
+        }
+    }
+
+    fn simulated_starttime(pid: u32) -> io::Result<u64> {
+        match pid {
+            222 => Ok(20),
+            333 => Ok(30),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "missing pid")),
+        }
+    }
 
     #[test]
     fn cleanup_removes_known_pinned_maps_and_empty_dir() {
@@ -568,7 +866,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_preserves_dir_when_unknown_files_remain() {
+    fn cleanup_removes_dir_even_when_unknown_files_remain() {
         let temp = tempdir().unwrap();
         let dir = temp.path().join("1234");
         fs::create_dir_all(&dir).unwrap();
@@ -579,10 +877,8 @@ mod tests {
 
         cleanup_pinned_maps_in_dir(&dir).unwrap();
 
-        assert!(dir.exists());
-        assert!(extra.exists());
-        assert!(!dir.join(PROC_OFFSETS_MAP_NAME).exists());
-        assert!(!dir.join(ALLOWED_PIDS_MAP_NAME).exists());
+        assert!(!dir.exists());
+        assert!(!extra.exists());
     }
 
     #[test]
@@ -599,9 +895,13 @@ mod tests {
             fs::write(dir.join(ALLOWED_PIDS_MAP_NAME), b"allow").unwrap();
         }
 
-        let removed =
-            cleanup_stale_pinned_maps_under(temp.path(), 333, 30, |pid| matches!(pid, 222 | 333))
-                .unwrap();
+        let removed = cleanup_stale_pinned_maps_under(
+            temp.path(),
+            host_test_identity(333, 30),
+            |host_pid| matches!(host_pid, 222 | 333).then_some(host_pid),
+            simulated_starttime,
+        )
+        .unwrap();
 
         assert_eq!(removed, 1);
         assert!(!stale_dir.exists());
@@ -622,8 +922,13 @@ mod tests {
             fs::write(dir.join(ALLOWED_PIDS_MAP_NAME), b"allow").unwrap();
         }
 
-        let removed =
-            cleanup_stale_pinned_maps_under(temp.path(), 333, 30, |pid| pid == 333).unwrap();
+        let removed = cleanup_stale_pinned_maps_under(
+            temp.path(),
+            host_test_identity(333, 30),
+            |host_pid| (host_pid == 333).then_some(host_pid),
+            simulated_starttime,
+        )
+        .unwrap();
 
         assert_eq!(removed, 1);
         assert!(!stale_current_pid_dir.exists());
@@ -650,13 +955,213 @@ mod tests {
             fs::write(dir.join(ALLOWED_PIDS_MAP_NAME), b"allow").unwrap();
         }
 
-        let removed =
-            cleanup_stale_pinned_maps_under(temp.path(), 333, 30, |pid| matches!(pid, 333 | 444))
-                .unwrap();
+        let removed = cleanup_stale_pinned_maps_under(
+            temp.path(),
+            host_test_identity(333, 30),
+            |host_pid| matches!(host_pid, 333 | 444).then_some(host_pid),
+            simulated_starttime,
+        )
+        .unwrap();
 
         assert_eq!(removed, 0);
         assert!(legacy_dir.exists());
         assert!(current_dir.exists());
+    }
+
+    #[test]
+    fn dry_run_prune_reports_stale_and_keeps_dirs_intact() {
+        let temp = tempdir().unwrap();
+        let stale_dir = temp.path().join("111-10");
+        let live_dir = temp.path().join("222-20");
+        let legacy_dir = temp.path().join("legacy");
+
+        for dir in [&stale_dir, &live_dir, &legacy_dir] {
+            fs::create_dir_all(dir).unwrap();
+            fs::write(dir.join(PROC_OFFSETS_MAP_NAME), b"offsets").unwrap();
+            fs::write(dir.join(ALLOWED_PIDS_MAP_NAME), b"allow").unwrap();
+        }
+
+        let report = prune_pinned_maps_under(
+            temp.path(),
+            host_test_identity(333, 30),
+            &BpffsPruneOptions {
+                mode: BpffsPruneMode::Stale,
+                dry_run: true,
+            },
+            |host_pid| (host_pid == 222).then_some(host_pid),
+            simulated_starttime,
+        )
+        .unwrap();
+
+        assert!(stale_dir.exists());
+        assert!(live_dir.exists());
+        assert!(legacy_dir.exists());
+        assert!(report.entries.iter().any(|entry| {
+            entry.directory == "111-10"
+                && entry.status == BpffsPruneStatus::RemoveDir
+                && entry.reason == "pid_not_running"
+        }));
+        assert!(report.entries.iter().any(|entry| {
+            entry.directory == "222-20"
+                && entry.status == BpffsPruneStatus::SkipLive
+                && entry.reason == "live_instance"
+        }));
+        assert!(report.entries.iter().any(|entry| {
+            entry.directory == "legacy"
+                && entry.status == BpffsPruneStatus::Ignore
+                && entry.reason == "non_matching_name"
+        }));
+    }
+
+    #[test]
+    fn instance_prune_removes_selected_dir_even_when_live() {
+        let temp = tempdir().unwrap();
+        let live_dir = temp.path().join("222-20");
+        fs::create_dir_all(&live_dir).unwrap();
+        fs::write(live_dir.join(PROC_OFFSETS_MAP_NAME), b"offsets").unwrap();
+        fs::write(live_dir.join(ALLOWED_PIDS_MAP_NAME), b"allow").unwrap();
+
+        let report = prune_pinned_maps_under(
+            temp.path(),
+            host_test_identity(333, 30),
+            &BpffsPruneOptions {
+                mode: BpffsPruneMode::Instance("222-20".to_string()),
+                dry_run: false,
+            },
+            |_host_pid| Some(222),
+            simulated_starttime,
+        )
+        .unwrap();
+
+        assert!(!live_dir.exists());
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].directory, "222-20");
+        assert_eq!(report.entries[0].status, BpffsPruneStatus::RemoveDir);
+        assert_eq!(report.entries[0].reason, "explicit_instance");
+    }
+
+    #[test]
+    fn force_all_prune_skips_legacy_dirs_but_removes_pid_starttime_dirs() {
+        let temp = tempdir().unwrap();
+        let live_dir = temp.path().join("222-20");
+        let legacy_dir = temp.path().join("222");
+
+        for dir in [&live_dir, &legacy_dir] {
+            fs::create_dir_all(dir).unwrap();
+            fs::write(dir.join(PROC_OFFSETS_MAP_NAME), b"offsets").unwrap();
+            fs::write(dir.join(ALLOWED_PIDS_MAP_NAME), b"allow").unwrap();
+        }
+
+        let report = prune_pinned_maps_under(
+            temp.path(),
+            host_test_identity(333, 30),
+            &BpffsPruneOptions {
+                mode: BpffsPruneMode::All,
+                dry_run: false,
+            },
+            |_host_pid| Some(222),
+            simulated_starttime,
+        )
+        .unwrap();
+
+        assert!(!live_dir.exists());
+        assert!(legacy_dir.exists());
+        assert!(report.entries.iter().any(|entry| {
+            entry.directory == "222-20"
+                && entry.status == BpffsPruneStatus::RemoveDir
+                && entry.reason == "force_all"
+        }));
+        assert!(report.entries.iter().any(|entry| {
+            entry.directory == "222"
+                && entry.status == BpffsPruneStatus::Ignore
+                && entry.reason == "non_matching_name"
+        }));
+    }
+
+    #[test]
+    fn stale_prune_skips_unresolvable_host_pid_in_private_namespace() {
+        let temp = tempdir().unwrap();
+        let foreign_live_dir = temp.path().join("999-10");
+        fs::create_dir_all(&foreign_live_dir).unwrap();
+        fs::write(foreign_live_dir.join(PROC_OFFSETS_MAP_NAME), b"offsets").unwrap();
+        fs::write(foreign_live_dir.join(ALLOWED_PIDS_MAP_NAME), b"allow").unwrap();
+
+        let report = prune_pinned_maps_under(
+            temp.path(),
+            private_ns_test_identity(333, 30),
+            &BpffsPruneOptions {
+                mode: BpffsPruneMode::Stale,
+                dry_run: false,
+            },
+            |_host_pid| None,
+            simulated_starttime,
+        )
+        .unwrap();
+
+        assert!(foreign_live_dir.exists());
+        assert!(report.entries.iter().any(|entry| {
+            entry.directory == "999-10"
+                && entry.status == BpffsPruneStatus::SkipLive
+                && entry.reason == "live_instance"
+        }));
+    }
+
+    #[test]
+    fn stale_prune_skips_same_numeric_pid_when_current_host_pid_is_not_reliable() {
+        let temp = tempdir().unwrap();
+        let foreign_live_dir = temp.path().join("333-10");
+        fs::create_dir_all(&foreign_live_dir).unwrap();
+        fs::write(foreign_live_dir.join(PROC_OFFSETS_MAP_NAME), b"offsets").unwrap();
+        fs::write(foreign_live_dir.join(ALLOWED_PIDS_MAP_NAME), b"allow").unwrap();
+
+        let report = prune_pinned_maps_under(
+            temp.path(),
+            private_ns_test_identity(333, 30),
+            &BpffsPruneOptions {
+                mode: BpffsPruneMode::Stale,
+                dry_run: false,
+            },
+            |_host_pid| None,
+            simulated_starttime,
+        )
+        .unwrap();
+
+        assert!(foreign_live_dir.exists());
+        assert!(report.entries.iter().any(|entry| {
+            entry.directory == "333-10"
+                && entry.status == BpffsPruneStatus::SkipLive
+                && entry.reason == "live_instance"
+        }));
+    }
+
+    #[test]
+    fn stale_prune_keeps_live_dir_when_host_pid_maps_to_visible_pid() {
+        let temp = tempdir().unwrap();
+        let visible_pid = std::process::id();
+        let visible_starttime = process_starttime(visible_pid).unwrap();
+        let live_dir = temp.path().join(format!("999-{visible_starttime}"));
+        fs::create_dir_all(&live_dir).unwrap();
+        fs::write(live_dir.join(PROC_OFFSETS_MAP_NAME), b"offsets").unwrap();
+        fs::write(live_dir.join(ALLOWED_PIDS_MAP_NAME), b"allow").unwrap();
+
+        let report = prune_pinned_maps_under(
+            temp.path(),
+            private_ns_test_identity(333, 30),
+            &BpffsPruneOptions {
+                mode: BpffsPruneMode::Stale,
+                dry_run: false,
+            },
+            |host_pid| (host_pid == 999).then_some(visible_pid),
+            process_starttime,
+        )
+        .unwrap();
+
+        assert!(live_dir.exists());
+        assert!(report.entries.iter().any(|entry| {
+            entry.directory == format!("999-{visible_starttime}")
+                && entry.status == BpffsPruneStatus::SkipLive
+                && entry.reason == "live_instance"
+        }));
     }
 }
 // Note: map open/write helpers will be added once we standardize on aya APIs across crates.

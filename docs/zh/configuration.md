@@ -150,6 +150,41 @@ ghostscope --force-perf-event-array
 ghostscope --enable-sysmon-shared-lib
 ```
 
+### BPFFS 维护
+
+GhostScope 使用 bpffs，是因为有一部分运行时状态需要在用户态的 process 层、loader 以及 eBPF 程序之间共享。实际里像 `proc_module_offsets` 和 `allowed_pids` 这样的 map，会先 pin 到 bpffs，这样后续阶段就能按路径重新打开并复用同一个内核 map，而不是重复创建。GhostScope 又把这些 pin 放在按实例隔离的 `pid-starttime` 目录下，用来避免多个实例并发运行时互相冲突。
+
+GhostScope 会把每个实例的 pinned map 放在 `/sys/fs/bpf/ghostscope/<pid-starttime>/` 下。
+
+- 正常 tracing 启动时**不会**扫描并全局清理 `/sys/fs/bpf/ghostscope`。
+- 正常退出时会自动清理当前实例目录。
+- 如果看到残留目录，通常意味着进程发生了崩溃、`SIGKILL` 等异常退出。
+- 全局清理通过显式的 `bpffs prune` 子命令执行。
+
+```bash
+# 只删除 stale 的 pid-starttime 目录
+ghostscope bpffs prune
+
+# 仅预览，不实际删除
+ghostscope bpffs prune --dry-run
+
+# 删除一个明确的实例目录
+ghostscope bpffs prune --instance 1234-567890
+
+# 删除所有 pid-starttime 目录，包括活实例
+ghostscope bpffs prune --all --force
+
+# 输出机器可读的结果
+ghostscope bpffs prune --dry-run --json
+```
+
+行为说明：
+
+- 默认 `prune` 只删除 stale 的 `pid-starttime` 目录。
+- `--instance` 只处理一个明确的 `pid-starttime` 目录。
+- `--all --force` 会删除所有 `pid-starttime` 目录，包括活实例。
+- legacy 的纯数字目录会被忽略。
+
 ### 完整命令参考
 
 | 选项 | 简写 | 说明 | 默认值 |
@@ -179,6 +214,13 @@ ghostscope --enable-sysmon-shared-lib
 | `--force-perf-event-array` | | 强制 PerfEventArray（测试） | 关 |
 | `--enable-sysmon-shared-lib` | | -t 目标为共享库时，支持全局变量探测 | 关 |
 | `--args <PROGRAM> [ARGS...]` | | 启动程序并传递参数 | 无 |
+
+子命令：
+
+| 子命令 | 说明 |
+|--------|------|
+| `bpffs prune` | 显式检查或清理按实例分隔的 bpffs pin 目录 |
+
 
 ## 配置文件
 

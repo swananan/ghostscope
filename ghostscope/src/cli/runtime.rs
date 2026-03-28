@@ -4,6 +4,25 @@ use anyhow::Result;
 use std::io::{self, Write};
 use tracing::{debug, error, info, warn};
 
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> io::Result<&'static str> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+
+    tokio::select! {
+        _ = sigint.recv() => Ok("SIGINT"),
+        _ = sigterm.recv() => Ok("SIGTERM"),
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> io::Result<&'static str> {
+    tokio::signal::ctrl_c().await?;
+    Ok("Ctrl+C")
+}
+
 /// Run GhostScope in command line mode with merged configuration
 pub async fn run_command_line_runtime_with_config(config: MergedConfig) -> Result<()> {
     info!("Starting GhostScope in command line mode");
@@ -137,6 +156,8 @@ async fn run_cli_with_session(
     );
 
     let mut event_count = 0;
+    let shutdown_signal = wait_for_shutdown_signal();
+    tokio::pin!(shutdown_signal);
     loop {
         tokio::select! {
             result = session.trace_manager.wait_for_all_events_async() => {
@@ -170,8 +191,11 @@ async fn run_cli_with_session(
                 }
             }
 
-            _ = tokio::signal::ctrl_c() => {
-                info!("Received Ctrl+C, shutting down...");
+            signal = &mut shutdown_signal => {
+                match signal {
+                    Ok(signal_name) => info!("Received {signal_name}, shutting down..."),
+                    Err(err) => warn!("Failed to listen for shutdown signal: {err}"),
+                }
                 break;
             }
         }

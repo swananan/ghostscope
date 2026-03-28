@@ -149,6 +149,41 @@ ghostscope --force-perf-event-array
 ghostscope --enable-sysmon-shared-lib
 ```
 
+### BPFFS Maintenance
+
+GhostScope uses bpffs because some runtime state must be shared across the userspace process layer, the loader, and the eBPF programs themselves. In practice, maps such as `proc_module_offsets` and `allowed_pids` are pinned into bpffs so later stages can reopen and reuse the same kernel maps by path instead of recreating them. GhostScope places these pins under a per-instance `pid-starttime` directory to avoid collisions between concurrent runs.
+
+GhostScope stores per-instance pinned maps under `/sys/fs/bpf/ghostscope/<pid-starttime>/`.
+
+- Normal tracing runs do **not** sweep `/sys/fs/bpf/ghostscope` globally on startup.
+- On normal exit, GhostScope removes the current instance directory automatically.
+- Residual directories usually indicate abnormal termination, such as a crash or `SIGKILL`.
+- Global cleanup is an explicit maintenance action via the `bpffs prune` subcommand.
+
+```bash
+# Remove stale pid-starttime directories only
+ghostscope bpffs prune
+
+# Preview without deleting anything
+ghostscope bpffs prune --dry-run
+
+# Remove one specific instance directory
+ghostscope bpffs prune --instance 1234-567890
+
+# Remove all pid-starttime directories, including live instances
+ghostscope bpffs prune --all --force
+
+# Emit machine-readable output
+ghostscope bpffs prune --dry-run --json
+```
+
+Behavior:
+
+- Default `prune` removes only stale `pid-starttime` directories.
+- `--instance` targets one explicit `pid-starttime` directory.
+- `--all --force` removes all `pid-starttime` directories, including live ones.
+- Legacy numeric directories are ignored.
+
 ### Complete Command Reference
 
 | Option | Short | Description | Default |
@@ -178,6 +213,13 @@ ghostscope --enable-sysmon-shared-lib
 | `--force-perf-event-array` | | Force PerfEventArray (testing) | Off |
 | `--enable-sysmon-shared-lib` | | Start sysmon for -t shared library, so global variables can be traced | Off |
 | `--args <PROGRAM> [ARGS...]` | | Launch program with args | None |
+
+Subcommands:
+
+| Subcommand | Description |
+|-----------|-------------|
+| `bpffs prune` | Explicitly inspect or remove per-instance bpffs pin directories |
+
 
 ## Configuration File
 

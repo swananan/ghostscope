@@ -5,12 +5,13 @@
 //! timeout/read/drain behavior, and common flags). Prefer using it instead
 //! of re-implementing process management in each test file.
 
+use anyhow::Context;
 use lazy_static::lazy_static;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Once;
-
 use std::sync::Mutex;
+use std::sync::Once;
+use std::time::{Duration, Instant};
 
 static INIT: Once = Once::new();
 static COMPILE: Once = Once::new();
@@ -23,6 +24,80 @@ lazy_static! {
     static ref COMPILE_COMPLEX_DEBUG_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
     static ref COMPILE_COMPLEX_OPT_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
     static ref COMPILE_COMPLEX_NOPIE_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
+}
+
+#[allow(dead_code)]
+pub(crate) fn host_pid_is_running(pid: u32) -> bool {
+    PathBuf::from(format!("/proc/{pid}")).is_dir()
+}
+
+#[allow(dead_code)]
+#[cfg(unix)]
+fn send_sigterm(pid: u32, label: &str) -> anyhow::Result<()> {
+    let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    if rc == 0 {
+        return Ok(());
+    }
+
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+
+    Err(err).with_context(|| format!("failed to send SIGTERM to {label} pid {pid}"))
+}
+
+#[allow(dead_code)]
+#[cfg(not(unix))]
+fn send_sigterm(pid: u32, label: &str) -> anyhow::Result<()> {
+    let _ = (pid, label);
+    anyhow::bail!("SIGTERM helpers are only supported on Unix test platforms");
+}
+
+#[allow(dead_code)]
+pub(crate) fn terminate_std_child_gracefully(
+    child: &mut std::process::Child,
+    label: &str,
+    wait_timeout: Duration,
+) -> anyhow::Result<Option<std::process::ExitStatus>> {
+    if let Some(status) = child.try_wait()? {
+        return Ok(Some(status));
+    }
+
+    let pid = child.id();
+    send_sigterm(pid, label)?;
+
+    let deadline = Instant::now() + wait_timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) async fn terminate_tokio_child_gracefully(
+    child: &mut tokio::process::Child,
+    label: &str,
+    wait_timeout: Duration,
+) -> anyhow::Result<Option<std::process::ExitStatus>> {
+    if let Some(status) = child.try_wait()? {
+        return Ok(Some(status));
+    }
+
+    let pid = child
+        .id()
+        .context("child process does not have an OS pid for SIGTERM")?;
+    send_sigterm(pid, label)?;
+
+    match tokio::time::timeout(wait_timeout, child.wait()).await {
+        Ok(result) => result.map(Some).map_err(Into::into),
+        Err(_) => Ok(None),
+    }
 }
 
 /// Initialize logging for tests (call once per test)
@@ -53,6 +128,8 @@ pub fn init() {
             .with_target("/")
             .force_perf_event_array(false)
             .enable_sysmon_shared_lib(false);
+
+        let _use_pid_check: fn(u32) -> bool = host_pid_is_running;
     });
 
     // Register an atexit cleanup to remove built fixtures after all tests

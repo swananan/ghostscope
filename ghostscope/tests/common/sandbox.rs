@@ -131,6 +131,12 @@ pub enum BackgroundProcess {
     Detached { pid: u32 },
 }
 
+pub struct GhostscopeRunnerCommand {
+    pub program: OsString,
+    pub args: Vec<OsString>,
+    pub bootstrap_pid_from_stdout: bool,
+}
+
 impl BackgroundProcess {
     pub fn pid(&self) -> u32 {
         match self {
@@ -694,6 +700,50 @@ impl SandboxHandle {
             }
         }
     }
+
+    pub fn ghostscope_runner_command(
+        &self,
+        extra_args: &[OsString],
+    ) -> Result<GhostscopeRunnerCommand> {
+        match &*self.inner {
+            SandboxInner::Host => {
+                let (program, args) = self.ghostscope_command()?;
+                let mut full_args = args;
+                full_args.extend(extra_args.iter().cloned());
+                Ok(GhostscopeRunnerCommand {
+                    program,
+                    args: full_args,
+                    bootstrap_pid_from_stdout: false,
+                })
+            }
+            SandboxInner::Docker(inner) => {
+                self.ensure_ghostscope_built()?;
+                let bin = shell_quote(CONTAINER_GHOSTSCOPE_BIN);
+                let quoted_args = extra_args
+                    .iter()
+                    .map(|arg| shell_quote(&arg.to_string_lossy()))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let exec_line = if quoted_args.is_empty() {
+                    format!("printf '__GHOSTSCOPE_PID__ %s\\n' \"$$\"; exec {bin}")
+                } else {
+                    format!("printf '__GHOSTSCOPE_PID__ %s\\n' \"$$\"; exec {bin} {quoted_args}")
+                };
+
+                Ok(GhostscopeRunnerCommand {
+                    program: OsString::from("docker"),
+                    args: vec![
+                        OsString::from("exec"),
+                        OsString::from(&inner.container_name),
+                        OsString::from("bash"),
+                        OsString::from("-lc"),
+                        OsString::from(exec_line),
+                    ],
+                    bootstrap_pid_from_stdout: true,
+                })
+            }
+        }
+    }
 }
 
 impl DefaultSandboxState {
@@ -1063,6 +1113,10 @@ fn unix_timestamp_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r#"'"'"'"#))
 }
 
 fn unix_timestamp_nanos() -> u128 {

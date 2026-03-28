@@ -163,12 +163,22 @@ impl TargetHandle {
         match &self.inner.process_handle {
             TargetProcessHandle::Host(child) => {
                 if let Some(mut child) = child.lock().await.take() {
-                    tokio::task::spawn_blocking(move || {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                    let pid = child.id();
+                    tokio::task::spawn_blocking(move || -> Result<()> {
+                        match super::terminate_std_child_gracefully(
+                            &mut child,
+                            "host target",
+                            Duration::from_secs(2),
+                        )? {
+                            Some(_) => Ok(()),
+                            None => anyhow::bail!(
+                                "timed out waiting for host target pid {} to exit after SIGTERM",
+                                pid
+                            ),
+                        }
                     })
                     .await
-                    .context("host target reaping task panicked")?;
+                    .context("host target reaping task panicked")??;
                 }
             }
             TargetProcessHandle::Detached => {

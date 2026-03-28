@@ -6,13 +6,13 @@
 //! - Configurable timeout (overall cap) and optional PerfEventArray backend
 //! - Consistent flags: disable artifact saving by default; logging opt-in
 //! - Robust output collection: incremental read during run, drain after exit
-//! - Pragmatic success rule: if process was killed on timeout but produced
+//! - Pragmatic success rule: if process was terminated on timeout but produced
 //!   any output, treat exit code -1 as success (0) to keep tests stable
 
 use super::sandbox::SandboxHandle;
 use super::targets::ensure_target_binary_ready_for_default_sandbox;
 use super::targets::TargetHandle;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use ghostscope_process::is_shared_object;
 use std::env;
 use std::ffi::OsString;
@@ -25,6 +25,7 @@ use tokio::time::{timeout, Duration};
 const ENV_GHOSTSCOPE_LOG_LEVEL: &str = "E2E_GHOSTSCOPE_LOG_LEVEL";
 const ENV_GHOSTSCOPE_ENABLE_LOGGING: &str = "E2E_GHOSTSCOPE_ENABLE_LOGGING";
 const ENV_GHOSTSCOPE_LOG_CONSOLE: &str = "E2E_GHOSTSCOPE_LOG_CONSOLE";
+const GHOSTSCOPE_PID_BOOTSTRAP_PREFIX: &str = "__GHOSTSCOPE_PID__ ";
 
 pub struct GhostscopeRunner {
     script_content: String,
@@ -205,11 +206,10 @@ impl GhostscopeRunner {
             args.push(OsString::from("--log-console"));
         }
 
-        let (program, mut prefix_args) = sandbox.ghostscope_command()?;
-        prefix_args.extend(args);
+        let launch = sandbox.ghostscope_runner_command(&args)?;
 
-        let mut cmd = Command::new(&program);
-        cmd.args(&prefix_args);
+        let mut cmd = Command::new(&launch.program);
+        cmd.args(&launch.args);
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
@@ -222,6 +222,39 @@ impl GhostscopeRunner {
 
         let mut stdout_content = String::new();
         let mut stderr_content = String::new();
+        let mut managed_ghostscope_pid = None;
+
+        if launch.bootstrap_pid_from_stdout {
+            let mut bootstrap_line = String::new();
+            let read = timeout(
+                Duration::from_secs(2),
+                stdout_reader.read_line(&mut bootstrap_line),
+            )
+            .await
+            .context("timed out waiting for container GhostScope pid bootstrap")??;
+            anyhow::ensure!(
+                read > 0,
+                "container GhostScope exited before emitting pid bootstrap line"
+            );
+            let pid_text = bootstrap_line
+                .trim_end()
+                .strip_prefix(GHOSTSCOPE_PID_BOOTSTRAP_PREFIX)
+                .with_context(|| {
+                    format!(
+                        "invalid GhostScope pid bootstrap line from {}: {}",
+                        sandbox.label(),
+                        bootstrap_line.trim_end()
+                    )
+                })?;
+            managed_ghostscope_pid = Some(pid_text.parse::<u32>().with_context(|| {
+                format!(
+                    "invalid GhostScope pid bootstrap value from {}: {}",
+                    sandbox.label(),
+                    pid_text
+                )
+            })?);
+        }
+
         // Incremental read with periodic polls, bounded by overall timeout
         let read_task = async {
             let mut stdout_line = String::new();
@@ -259,16 +292,44 @@ impl GhostscopeRunner {
             }
         };
 
-        let _ = timeout(Duration::from_secs(self.timeout_secs), read_task).await;
+        let timed_out = timeout(Duration::from_secs(self.timeout_secs), read_task)
+            .await
+            .is_err();
 
-        // Determine exit code; kill on timeout
+        // Determine exit code; terminate gracefully on timeout
         let mut exit_code = match child.try_wait() {
             Ok(Some(status)) => status.code().unwrap_or(-1),
             _ => {
-                let _ = child.kill().await.is_ok(); // best-effort
-                match timeout(Duration::from_secs(2), child.wait()).await {
-                    Ok(Ok(status)) => status.code().unwrap_or(-1),
-                    _ => -1,
+                if timed_out {
+                    if let Some(pid) = managed_ghostscope_pid {
+                        sandbox.terminate_pid(pid).with_context(|| {
+                            format!(
+                                "failed to terminate timed-out GhostScope pid {} in {}",
+                                pid,
+                                sandbox.label()
+                            )
+                        })?;
+                        match timeout(Duration::from_secs(2), child.wait()).await {
+                            Ok(Ok(status)) => status.code().unwrap_or(-1),
+                            _ => -1,
+                        }
+                    } else {
+                        match super::terminate_tokio_child_gracefully(
+                            &mut child,
+                            "ghostscope runner child",
+                            Duration::from_secs(2),
+                        )
+                        .await?
+                        {
+                            Some(status) => status.code().unwrap_or(-1),
+                            None => -1,
+                        }
+                    }
+                } else {
+                    match timeout(Duration::from_secs(2), child.wait()).await {
+                        Ok(Ok(status)) => status.code().unwrap_or(-1),
+                        _ => -1,
+                    }
                 }
             }
         };
@@ -297,7 +358,7 @@ impl GhostscopeRunner {
             }
         }
 
-        // If the process was force-killed and produced some output, consider it success.
+        // If the process was terminated by signal after producing output, consider it success.
         if exit_code == -1 && (!stdout_content.is_empty() || !stderr_content.is_empty()) {
             exit_code = 0;
         }
