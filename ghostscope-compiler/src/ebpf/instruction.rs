@@ -10,6 +10,11 @@ use inkwell::values::PointerValue;
 use inkwell::AddressSpace;
 use tracing::info;
 
+#[cfg(test)]
+const fn split_pid_tgid(pid_tgid: u64) -> (u32, u32) {
+    ((pid_tgid >> 32) as u32, pid_tgid as u32)
+}
+
 impl<'ctx> EbpfContext<'ctx> {
     /// Reserve `size` bytes in the per-CPU accumulation buffer and return a pointer to the
     /// beginning of the reserved region. On overflow, resets the event offset and returns
@@ -268,20 +273,23 @@ impl<'ctx> EbpfContext<'ctx> {
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store timestamp: {e}")))?;
 
         // pid and tid at offset 16 and 20
+        // bpf_get_current_pid_tgid() returns:
+        // - high 32 bits: TGID (process ID / getpid() view)
+        // - low 32 bits: PID (thread ID / gettid() view)
         let pid_tgid_result = self.get_current_pid_tgid()?;
         let i32_type = self.context.i32_type();
+        let shift_32 = self.context.i64_type().const_int(32, false);
+        let pid_64 = self
+            .builder
+            .build_right_shift(pid_tgid_result, shift_32, false, "pid_64")
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to shift pid: {e}")))?;
         let pid = self
             .builder
-            .build_int_truncate(pid_tgid_result, i32_type, "pid")
+            .build_int_truncate(pid_64, i32_type, "pid")
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to truncate pid: {e}")))?;
-        let shift_32 = self.context.i64_type().const_int(32, false);
-        let tid_64 = self
-            .builder
-            .build_right_shift(pid_tgid_result, shift_32, false, "tid_64")
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to shift tid: {e}")))?;
         let tid = self
             .builder
-            .build_int_truncate(tid_64, i32_type, "tid")
+            .build_int_truncate(pid_tgid_result, i32_type, "tid")
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to truncate tid: {e}")))?;
 
         // Store pid at offset 16
@@ -573,5 +581,20 @@ impl<'ctx> EbpfContext<'ctx> {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_pid_tgid;
+
+    #[test]
+    fn split_pid_tgid_uses_tgid_for_pid_and_pid_for_tid() {
+        let raw = (0x1122_3344_u64 << 32) | 0x5566_7788;
+
+        let (pid, tid) = split_pid_tgid(raw);
+
+        assert_eq!(pid, 0x1122_3344);
+        assert_eq!(tid, 0x5566_7788);
     }
 }
