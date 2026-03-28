@@ -3,9 +3,9 @@ mod config;
 mod core;
 mod logging;
 mod pid;
-mod runtime;
 mod script;
 mod tracing;
+mod tui;
 mod util;
 
 use anyhow::Result;
@@ -365,7 +365,7 @@ async fn main() -> Result<()> {
 
     // Route to appropriate runtime mode
     if merged_config.tui_mode {
-        runtime::run_tui_coordinator_with_config(merged_config).await
+        tui::run_tui_coordinator_with_config(merged_config).await
     } else {
         cli::run_command_line_runtime_with_config(merged_config).await
     }

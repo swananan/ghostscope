@@ -1,6 +1,6 @@
 use crate::config::{MergedConfig, ParsedArgs};
 use crate::core::GhostSession;
-use crate::runtime::{dwarf_loader, info_handlers, source_handlers, trace_handlers};
+use crate::tui::{dwarf_loader, info_handlers, source_handlers, trace_handlers};
 use anyhow::Result;
 use ghostscope_protocol::ParsedTraceEvent;
 use ghostscope_ui::{EventRegistry, RuntimeChannels, RuntimeCommand, RuntimeStatus};

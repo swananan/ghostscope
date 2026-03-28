@@ -1,3 +1,5 @@
+//! CLI script-mode runtime orchestration.
+
 use crate::config::MergedConfig;
 use crate::core::GhostSession;
 use anyhow::Result;
