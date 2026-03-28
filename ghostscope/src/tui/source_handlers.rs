@@ -1,4 +1,5 @@
 use crate::core::GhostSession;
+use crate::source_path::apply_substitutions_to_directory;
 use ghostscope_ui::{events::*, RuntimeChannels, RuntimeStatus};
 use std::collections::HashSet;
 use tracing::info;
@@ -210,8 +211,6 @@ pub async fn handle_request_source_code(
 
 /// Get grouped source files information by module for UI
 fn get_grouped_source_files_info(session: &GhostSession) -> anyhow::Result<Vec<SourceFileGroup>> {
-    use crate::tui::source_path_resolver::apply_substitutions_to_directory;
-
     let mut groups = Vec::new();
 
     if let Some(ref process_analyzer) = session.process_analyzer {

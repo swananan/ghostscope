@@ -4,6 +4,7 @@ mod core;
 mod logging;
 mod pid;
 mod script;
+mod source_path;
 mod tracing;
 mod tui;
 mod util;
