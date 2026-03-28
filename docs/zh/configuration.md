@@ -60,6 +60,16 @@ ghostscope --script 'trace("main:entry") { print "Started"; }'
 # 从文件运行脚本
 ghostscope --script-file trace.gs
 
+# 选择脚本模式的 stdout 渲染方式
+ghostscope --script-output pretty   # 默认：时间戳 + TraceID/PID/TID 头信息
+ghostscope --script-output plain    # 只输出 payload 行
+ghostscope --script-output quiet    # 完全静默，不输出事件
+
+# 控制 pretty 模式的时间戳格式
+ghostscope --script-timestamp local # 默认
+ghostscope --script-timestamp boot
+ghostscope --script-timestamp none
+
 # 以 TUI 模式启动（未提供脚本时的默认模式）
 ghostscope --tui
 ```
@@ -193,6 +203,8 @@ ghostscope bpffs prune --dry-run --json
 | `--target <PATH>` | `-t` | 目标可执行文件或库 | 无 |
 | `--script <SCRIPT>` | `-s` | 要执行的内联脚本 | 无 |
 | `--script-file <PATH>` | | 要执行的脚本文件 | 无 |
+| `--script-output <MODE>` | | 脚本 stdout 模式：pretty, plain, quiet | pretty |
+| `--script-timestamp <FORMAT>` | | pretty 输出时间戳：local, boot, none | local |
 | `--debug-file <PATH>` | `-d` | 调试信息文件路径 | 自动检测 |
 | `--tui` | | 以 TUI 模式启动 | 自动 |
 | `--log` | | 启用文件日志 | Script: 关, TUI: 开 |
@@ -249,6 +261,16 @@ enable_console_logging = false
 
 # 日志级别：error, warn, info, debug, trace
 log_level = "warn"
+
+[script]
+# 非 TUI 脚本模式的 stdout 渲染
+# pretty: 时间戳 + TraceID/PID/TID 头信息 + 缩进 payload
+# plain: 只输出 payload 行
+# quiet: 不输出事件 stdout
+output = "pretty"
+
+# pretty 模式的时间戳格式：local, boot, none
+timestamp = "local"
 
 [dwarf]
 # DWARF 调试信息搜索路径（用于 .gnu_debuglink 文件）

@@ -59,6 +59,16 @@ ghostscope --script 'trace("main:entry") { print "Started"; }'
 # Run script from file
 ghostscope --script-file trace.gs
 
+# Choose script-mode stdout rendering
+ghostscope --script-output pretty   # default: timestamp + TraceID/PID/TID header
+ghostscope --script-output plain    # payload lines only
+ghostscope --script-output quiet    # suppress event stdout
+
+# Control timestamp style for pretty output
+ghostscope --script-timestamp local # default
+ghostscope --script-timestamp boot
+ghostscope --script-timestamp none
+
 # Start in TUI mode (default if no script provided)
 ghostscope --tui
 ```
@@ -192,6 +202,8 @@ Behavior:
 | `--target <PATH>` | `-t` | Target executable or library | None |
 | `--script <SCRIPT>` | `-s` | Inline script to execute | None |
 | `--script-file <PATH>` | | Script file to execute | None |
+| `--script-output <MODE>` | | Script stdout mode: pretty, plain, quiet | pretty |
+| `--script-timestamp <FORMAT>` | | Pretty output timestamp: local, boot, none | local |
 | `--debug-file <PATH>` | `-d` | Debug info file path | Auto-detect |
 | `--tui` | | Start in TUI mode | Auto |
 | `--log` | | Enable file logging | Script: off, TUI: on |
@@ -248,6 +260,16 @@ enable_console_logging = false
 
 # Log level: error, warn, info, debug, trace
 log_level = "warn"
+
+[script]
+# Stdout rendering for non-TUI script mode
+# pretty: timestamp + TraceID/PID/TID header + indented payload
+# plain: payload lines only
+# quiet: suppress event stdout
+output = "pretty"
+
+# Timestamp format for pretty script output: local, boot, none
+timestamp = "local"
 
 [dwarf]
 # Debug information search paths for .gnu_debuglink files

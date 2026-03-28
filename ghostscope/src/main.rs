@@ -344,6 +344,8 @@ async fn main() -> Result<()> {
         script_file: merged_config.script_file.clone(),
         pid: merged_config.pid,
         tui_mode: merged_config.tui_mode,
+        script_output: Some(merged_config.script_output_mode),
+        script_timestamp: Some(merged_config.script_timestamp_format),
         should_save_llvm_ir: merged_config.should_save_llvm_ir,
         should_save_ebpf: merged_config.should_save_ebpf,
         should_save_ast: merged_config.should_save_ast,

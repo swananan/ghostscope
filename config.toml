@@ -32,6 +32,23 @@ enable_logging = true
 # Default: "warn"
 log_level = "warn"
 
+[script]
+# Stdout rendering mode for non-TUI script execution
+# Options: "pretty", "plain", "quiet"
+# - pretty: TUI-like header with timestamp/PID/TID plus indented payload lines
+# - plain: only print script payload lines
+# - quiet: suppress event output on stdout
+# Default: "pretty"
+output = "pretty"
+
+# Timestamp format used by pretty script output
+# Options: "local", "boot", "none"
+# - local: wall-clock time derived from the eBPF monotonic timestamp
+# - boot: monotonic offset like boot+12.345s
+# - none: omit timestamp prefix
+# Default: "local"
+timestamp = "local"
+
 [dwarf]
 # DWARF debug information search paths for .gnu_debuglink files
 #
