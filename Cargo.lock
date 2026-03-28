@@ -711,6 +711,7 @@ name = "ghostscope"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "crossterm",
  "dirs",
