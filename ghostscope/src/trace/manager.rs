@@ -1,5 +1,5 @@
-use crate::tracing::instance::{TraceInstance, TraceInstanceArgs};
-use crate::tracing::snapshot::{TraceSnapshot, TraceSummary};
+use crate::trace::instance::{TraceInstance, TraceInstanceArgs};
+use crate::trace::snapshot::{TraceSnapshot, TraceSummary};
 use anyhow::Result;
 use futures::future::{select_all, BoxFuture};
 use futures::FutureExt;

@@ -418,7 +418,7 @@ pub async fn compile_and_load_script_for_tui(
 
                     // Register trace with its own loader
                     let _registered_trace_id = session.trace_manager.add_trace_with_id(
-                        crate::tracing::manager::AddTraceParams {
+                        crate::trace::manager::AddTraceParams {
                             trace_id: config.assigned_trace_id,
                             target: target_display.clone(),
                             script_content: script.to_string(),
@@ -671,7 +671,7 @@ pub async fn compile_and_load_script_for_cli(
 
                 // Register trace with its own loader (CLI mode)
                 let _registered_trace_id = session.trace_manager.add_trace_with_id(
-                    crate::tracing::manager::AddTraceParams {
+                    crate::trace::manager::AddTraceParams {
                         trace_id: config.assigned_trace_id,
                         target: target_display.clone(),
                         script_content: script.to_string(),
