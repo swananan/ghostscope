@@ -6,7 +6,7 @@ This document explains how GhostScope behaves in container environments, which s
 
 PID namespaces are the core source of complexity in container environments, so this section focuses on that first.
 
-This document assumes a local CLI workflow: GhostScope runs in the same environment where you actually invoke `ghostscope -p`. Deploying GhostScope itself as a containerized product is not the current primary supported mode; scenarios where GhostScope runs inside a container are included here mainly to explain PID-namespace semantics and boundaries.
+This document assumes a local CLI workflow: GhostScope runs in the same environment where you actually invoke `ghostscope -p`. The deployment-scope discussion for running GhostScope itself inside a container is collected later in Topic 4.
 
 ### The Most Important Rule
 
@@ -49,10 +49,10 @@ For clarity, this document uses the following names:
   The PID visible in GhostScope's current userspace `/proc` view, and the PID that can be used to read `/proc/<pid>/maps`.
 - `host_pid`
   The PID of the same target process in the host / initial PID namespace. Traditional `bpf_get_current_pid_tgid()` uses this PID view as well.
-- Script variable `$host_pid`
-  Always represents the current event's process ID in the host / initial PID namespace view.
-- Script variable `$input_pid`
-  Always represents the original `ghostscope -p <PID>` input, meaning the PID visible in the environment where `ghostscope -p` was invoked. It is only available in `-p` mode.
+- `container_pid`
+  The PID of the same target process in the innermost / target PID namespace view that GhostScope can resolve, usually the tail of `NSpid` when that mapping is explicit. In host-only or shared-PID cases it often collapses to the same numeric value as `host_pid`, so it is not always a distinct extra PID.
+- `pid_filter`
+  This term is only relevant in `-p` mode. After the user enters `ghostscope -p <PID>`, GhostScope resolves the internal PID views it needs and then installs an eBPF-side filter that keeps runtime events associated with that original `input_pid`. The purpose of `pid_filter` is to make sure GhostScope still filters the process the user intended, even when container PID namespaces mean the userspace-visible PID and the kernel-side PID view are not expressed the same way. In simpler cases this behaves like host-view TGID filtering; in namespace-aware cases it behaves more like "the target PID in a specific PID namespace".
 - `event_pid`
   The PID carried by runtime kernel events. GhostScope has a process-lifecycle monitoring pipeline that listens for `exec`, `fork`, and `exit` events, and this is the PID that pipeline sees first. In the current implementation, `event_pid` is populated from `bpf_get_current_pid_tgid() >> 32`, so it reflects the TGID in the host / initial PID namespace view. When the event comes from a particular target process, it will usually align with that process's `host_pid`, but it cannot directly replace `proc_pid` for accessing the current `/proc` view or for cleaning caches keyed by `proc_pid`.
 
@@ -75,12 +75,6 @@ So this document distinguishes between:
 ### Scenario Matrix
 
 The main scenarios can be described using two axes: where GhostScope runs, and where the target process runs.
-
-In particular:
-
-- From a product-semantic and implementation-analysis perspective, scenarios 1-3 are the primary paths that need to be explained clearly first, especially "GhostScope on the host, target inside a container".
-- From the perspective of current container e2e coverage, the existing smoke tests are closer to scenarios 4 and 5.
-- Scenarios 4-6 are also useful for explaining PID-namespace concepts and boundaries, but they do not mean containerized GhostScope deployment is already a first-class supported mode.
 
 #### Scenario 1: GhostScope on the Host, Target Also on the Host
 
@@ -134,7 +128,7 @@ What changes here is mostly the answer to "does GhostScope itself look container
 
 Here, the user runs GhostScope inside the container, so the input is the container-visible PID.
 
-This scenario is mainly included to explain concepts and future boundaries. It is not the most important deployment mode to guarantee first.
+This scenario is included because it explains what changes once GhostScope and the target share the same private PID namespace.
 
 - `input_pid` usually equals the container-visible `proc_pid`.
 - `host_pid` may differ.
@@ -157,6 +151,33 @@ Potential problems include:
 - If helpers are unavailable, fallback behavior may be unsafe.
 
 In these cases, GhostScope should fail clearly and early rather than guessing mappings.
+
+### Scenario-to-PID Reference Table
+
+The prose above explains the semantics. The table below turns those same cases into a quick lookup for `-p` mode.
+
+Here, "scenario" always means the relationship between two sides:
+
+- where GhostScope itself is running
+- where the observed target process is running
+
+| Scenario | `input_pid` | `proc_pid` | `host_pid` | `container_pid` | `pid_filter` | `event_pid` | Support |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1. Host -> host | Host-visible PID entered on the host | Usually the same as `input_pid` | Usually the same as `input_pid` and `proc_pid` | Usually the same as `host_pid`, because no nested PID namespace is involved | `bpf_get_current_pid_tgid() >> 32 == host_pid` | `bpf_get_current_pid_tgid() >> 32`, usually the same as `host_pid` | Supported |
+| 2. Host -> `--pid=host` container | Host-visible PID entered on the host | Usually the same as `input_pid` | Usually the same as `input_pid` and `proc_pid` | Usually the same as `host_pid`, because the container shares the host PID namespace | `bpf_get_current_pid_tgid() >> 32 == host_pid` | `bpf_get_current_pid_tgid() >> 32`, usually the same as `host_pid` | Supported |
+| 3. Host -> private PID-namespace container | Host-visible PID entered on the host | Usually the same as `input_pid` in the host `/proc` view | Usually the same as `input_pid` and `proc_pid` | Target PID inside the inner namespace; may differ from `host_pid` | `bpf_get_current_pid_tgid() >> 32 == host_pid` | `bpf_get_current_pid_tgid() >> 32`, usually the same as `host_pid` | Supported |
+| 4. `--pid=host` container -> host / shared-PID target | PID entered inside the container shell, which is already host-visible | Usually the same as `input_pid` | Usually the same as `input_pid` and `proc_pid` | Usually the same as `host_pid` | Helper supported: `bpf_get_ns_current_pid_tgid(...).tgid == proc_pid`; helper unsupported: `bpf_get_current_pid_tgid() >> 32 == host_pid` | `bpf_get_current_pid_tgid() >> 32`, usually the same as `host_pid` | Supported |
+| 5. Private PID-namespace container -> same private PID namespace | Container-visible PID entered inside that container | Usually the same as `input_pid` in the current container `/proc` view | Usually different from `input_pid` and `proc_pid`; corresponds to the first value in `NSpid` | Usually the same as `input_pid` and `proc_pid` when GhostScope and the target share that namespace | Helper supported: `bpf_get_ns_current_pid_tgid(...).tgid == proc_pid`; helper unsupported: if `NSpid` exposes an explicit host mapping, `bpf_get_current_pid_tgid() >> 32 == host_pid`, otherwise fail fast | `bpf_get_current_pid_tgid() >> 32`, usually aligned with `host_pid` rather than `input_pid` | Conditionally supported |
+| 6. Private PID-namespace container -> target outside that PID namespace | Often not satisfiable because the target is not visible in the current `/proc` view | Often unavailable from the current `/proc` view | Often not stably resolvable from the current view; if it exists, it belongs to a PID view outside the current `/proc` namespace | Unreliable or not visible from the current namespace | No stable comparison is installed; GhostScope should fail fast | No stable `event_pid` to `proc_pid` mapping can be assumed | Unsupported |
+
+Notes:
+
+- `pid_filter` only exists in `-p` mode. Its job is to keep eBPF-side runtime events associated with the original `ghostscope -p <PID>` input.
+- `container_pid` here means "the tail of `NSpid` when GhostScope can resolve one". It is often not a distinct extra value in host-only or shared-PID cases.
+- When the table says `bpf_get_current_pid_tgid() >> 32 == host_pid`, GhostScope is comparing the current event's host-view TGID against the resolved target `host_pid`.
+- When the table says `bpf_get_ns_current_pid_tgid(...).tgid == proc_pid`, GhostScope is comparing the current event's TGID in the target PID namespace against the resolved target `proc_pid`.
+- `event_pid` always comes from `bpf_get_current_pid_tgid() >> 32`, so it stays aligned with host-view TGID semantics even when `pid_filter` uses namespace-aware matching.
+- Values marked "usually" or "may differ" still depend on the actual `/proc` view, `NSpid`, and helper availability at runtime.
 
 ### Current `-p` Decision Flow
 
@@ -286,7 +307,9 @@ Depends on:
 
 Result:
 
-- If the helper is available, GhostScope prefers namespace-aware filtering.
+- In the current implementation, GhostScope effectively chooses between two filter forms: a host-view TGID filter and a namespace-aware TGID filter.
+- If the helper is available and GhostScope concludes that namespace-aware filtering is actually needed for this `-p` run, it uses the namespace-aware form.
+- If namespace-aware filtering is not considered necessary for the current case, GhostScope may still keep using host-view PID filtering even when the helper is available.
 - If the helper is unavailable, GhostScope considers falling back to host-view PID filtering.
 - If the target is still in the initial PID namespace, for example in a `--pid=host` case, then host-view PID filtering is still safe even without the helper.
 - GhostScope only fails fast when the environment looks container-like, the helper is unavailable, `NSpid` does not provide an explicit mapping, and the target is not in the initial PID namespace.
@@ -412,61 +435,43 @@ Current container e2e mainly covers smoke scenarios where GhostScope and the tar
 
 ## Topic 3: WSL
 
-### Why WSL Is a Separate Topic
+GhostScope does not currently support WSL as a runtime target.
 
-WSL is not a container, but for GhostScope it exposes a similar class of problems:
+The problem is that WSL's PID semantics do not line up with GhostScope's assumptions:
 
-- whether the current `/proc` view can reliably see the target PID
-- whether the necessary kernel helpers are available
-- whether eBPF and PID semantics match a normal Linux host closely enough
+- `bpf_get_current_pid_tgid()` may report a PID/TGID that does not match the PID visible inside the WSL distro.
+- `bpf_get_ns_current_pid_tgid()` is also not a general fix for this on WSL.
+- In current WSL + Docker container-topology validation, GhostScope teardown also hit kernel perf cleanup hangs after timeout, with stacks including `perf_event_detach_bpf_prog`, `perf_event_free_bpf_prog`, and `__fput`.
 
-So WSL deserves its own topic in the docs instead of being mixed into container semantics entirely.
-
-### The `-p` Input Rule Does Not Change in WSL
-
-Even in WSL, the input rule is still:
-
-- enter the PID visible where you run `ghostscope -p`
-
-This means:
-
-- if you run GhostScope in a WSL shell, enter the PID shown by `ps` / `pgrep` in that WSL environment
-- do not manually convert the PID into a Windows-side process ID
-- do not think of WSL as a case where "host PID must always be entered"
-
-### How to Think About Reliability in WSL Today
-
-The current implementation does not define a special PID model just for WSL. Reliability in WSL still mainly depends on the same factors that matter for `-p` in general:
-
-- whether the target PID is visible in the current `/proc`
-- whether `NSpid` provides sufficiently explicit mapping information
-- whether `bpf_get_ns_current_pid_tgid` is available
-- whether the current kernel / eBPF capabilities satisfy GhostScope's runtime requirements
-
-So WSL should be understood as a platform that needs explicit validation, not as an environment that is automatically equivalent to a standard Linux host.
-
-### Current Conclusion for WSL
-
-The user-facing rule stays simple:
-
-- `-p` still means the PID visible in the current environment
-
-The implementation-level conclusion is more conservative:
-
-- WSL still falls into the class of environments with soft limitations and should be validated against actual capabilities
-- if `/proc` visibility, helper support, or eBPF support does not satisfy the required assumptions, GhostScope should fail clearly instead of guessing PID mappings
+So this is currently a platform limitation, not a normal container-mapping case that GhostScope can reliably work around.
 
 Relevant background:
 
 - [WSL issue #12408](https://github.com/microsoft/WSL/issues/12408)
 - [WSL issue #12115](https://github.com/microsoft/WSL/issues/12115)
 
+## Topic 4: Deployment Scope When GhostScope Itself Runs in a Container
+
+GhostScope does not currently plan to support "run GhostScope in a container and observe arbitrary processes on the machine" as a deployment mode.
+
+The main reason is observability scope:
+
+- If GhostScope itself runs inside a container, it may simply be unable to see processes that live outside that container's PID namespace.
+- The main exception is when GhostScope runs in a `--pid=host` container, because that container shares the host PID namespace.
+
+So today's container support should be understood more narrowly:
+
+- GhostScope can run on the host and observe target processes that happen to run inside containers on that host. This is the primary container story.
+- GhostScope can run inside a container and observe processes in that same container PID namespace, or in descendant / nested PID namespaces that are still visible from there.
+- GhostScope can run inside a `--pid=host` container and observe host-visible processes because the PID view is shared with the host.
+
 ## Current Implementation Limitations Summary
 
 The following limitations used to be scattered in `limitations.md`. They are now collected here:
 
 - In `-p` mode, GhostScope currently decides in this order: runtime environment detection -> `NSpid` parsing -> helper probe -> filter strategy selection.
-- If the kernel supports `bpf_get_ns_current_pid_tgid` (helper id 120), GhostScope prefers namespace-aware PID filtering to avoid mismatches between container PID and host PID.
+- The current implementation does not switch to namespace-aware PID filtering solely because helper `bpf_get_ns_current_pid_tgid` (id 120) is available.
+- Instead, in `-p` mode GhostScope currently chooses between host-view TGID filtering and namespace-aware TGID filtering based on runtime-environment classification, resolved PID mapping, and helper availability together.
 - If the helper is unavailable, GhostScope falls back to host PID mapping derived from `NSpid`, but only when that mapping is explicit enough to be trusted.
 - `-p` must refer to a PID visible in the current PID namespace. If the PID is not visible in the current `/proc`, GhostScope fails immediately rather than guessing across namespaces.
 - The current implementation is intentionally stricter in one more case: in a container-like environment, if the helper is unavailable and `NSpid` cannot provide an explicit host mapping, GhostScope fails instead of guessing, unless the target remains in the initial PID namespace.
