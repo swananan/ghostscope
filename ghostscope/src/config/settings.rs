@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
 
-use crate::config::LayoutMode;
+use crate::config::{LayoutMode, ScriptOutputMode, ScriptTimestampFormat};
 
 /// Panel type enumeration for configuration
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize, Default)]
@@ -63,6 +63,8 @@ pub struct Config {
     #[serde(default)]
     pub general: GeneralConfig,
     #[serde(default)]
+    pub script: ScriptConfig,
+    #[serde(default)]
     pub dwarf: DwarfConfig,
     #[serde(default)]
     pub files: FilesConfig,
@@ -96,6 +98,16 @@ pub struct GeneralConfig {
     /// Priority: 1. Command line args, 2. RUST_LOG env var, 3. Config file (default: warn)
     #[serde(default)]
     pub log_level: LogLevel,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ScriptConfig {
+    /// Stdout rendering mode for non-TUI script execution
+    #[serde(default)]
+    pub output: ScriptOutputMode,
+    /// Timestamp format used when script output mode is `pretty`
+    #[serde(default)]
+    pub timestamp: ScriptTimestampFormat,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -343,6 +355,15 @@ impl Default for GeneralConfig {
             enable_logging: default_enable_logging(),
             enable_console_logging: default_enable_console_logging(),
             log_level: LogLevel::default(),
+        }
+    }
+}
+
+impl Default for ScriptConfig {
+    fn default() -> Self {
+        Self {
+            output: ScriptOutputMode::Pretty,
+            timestamp: ScriptTimestampFormat::Local,
         }
     }
 }

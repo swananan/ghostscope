@@ -78,6 +78,8 @@ pub async fn run_tui_coordinator_with_config(config: MergedConfig) -> Result<()>
         script_file: config.script_file,
         pid: config.pid,
         tui_mode: config.tui_mode,
+        script_output: Some(config.script_output_mode),
+        script_timestamp: Some(config.script_timestamp_format),
         should_save_llvm_ir: config.should_save_llvm_ir,
         should_save_ebpf: config.should_save_ebpf,
         should_save_ast: config.should_save_ast,

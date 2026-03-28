@@ -157,7 +157,6 @@ async fn run_cli_with_session(
     crate::util::emit_ready_marker(config.emit_ready_marker.as_deref())
         .map_err(|e| anyhow::anyhow!("failed to emit ready marker: {}", e))?;
 
-    let mut event_count = 0;
     let shutdown_signal = wait_for_shutdown_signal();
     tokio::pin!(shutdown_signal);
     loop {
@@ -166,14 +165,17 @@ async fn run_cli_with_session(
                 match result {
                     Ok(events) => {
                         for event in events {
-                            event_count += 1;
+                            let rendered_lines = crate::cli::script_output::render_script_event_lines(
+                                &event,
+                                crate::cli::script_output::ScriptOutputOptions {
+                                    mode: config.script_output_mode,
+                                    timestamp: config.script_timestamp_format,
+                                },
+                            );
 
-                            // Generate formatted output for better display
-                            let formatted_output = event.to_formatted_output();
-                            if !formatted_output.is_empty() {
-                                println!("[Event #{event_count}] Output:");
-                                for line in formatted_output {
-                                    println!("  {line}");
+                            if !rendered_lines.is_empty() {
+                                for line in rendered_lines {
+                                    println!("{line}");
                                 }
                                 // When stdout is piped (as in tests), Rust switches to block buffering.
                                 // Flush explicitly so short event bursts appear before the process exits.
@@ -182,8 +184,7 @@ async fn run_cli_with_session(
                                 }
                             }
 
-                            // Also show raw debug info if needed (can be removed later)
-                            debug!("[Event #{}] Raw: {:?}", event_count, event);
+                            debug!("Raw trace event: {:?}", event);
                         }
                     }
                     Err(e) => {

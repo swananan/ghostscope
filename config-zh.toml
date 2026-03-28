@@ -32,6 +32,23 @@ enable_logging = true
 # 默认值："warn"
 log_level = "warn"
 
+[script]
+# 非 TUI 脚本模式的标准输出渲染方式
+# 可选值："pretty", "plain", "quiet"
+# - pretty: 类似 TUI 的头信息，包含时间戳/PID/TID，并保留缩进后的 payload
+# - plain: 只输出脚本 payload 行
+# - quiet: 完全不在 stdout 打印事件输出
+# 默认值："pretty"
+output = "pretty"
+
+# pretty 模式下使用的时间戳格式
+# 可选值："local", "boot", "none"
+# - local: 基于 eBPF 单调时间戳推导出的本地墙钟时间
+# - boot: 类似 boot+12.345s 的单调偏移
+# - none: 不显示时间戳前缀
+# 默认值："local"
+timestamp = "local"
+
 [dwarf]
 # DWARF 调试信息搜索路径（用于 .gnu_debuglink 文件）
 #

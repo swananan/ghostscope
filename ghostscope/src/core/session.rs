@@ -355,6 +355,8 @@ mod tests {
             script: None,
             script_file: None,
             tui_mode: false,
+            script_output: None,
+            script_timestamp: None,
             should_save_llvm_ir: false,
             should_save_ebpf: false,
             should_save_ast: false,

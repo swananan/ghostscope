@@ -1,6 +1,7 @@
 //! CLI module - handles command line interface and non-TUI mode runtime
 
 pub mod runtime;
+pub mod script_output;
 
 use crate::config::BpffsPruneArgs;
 use anyhow::Result;

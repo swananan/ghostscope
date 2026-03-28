@@ -11,6 +11,28 @@ pub enum LayoutMode {
     Vertical,
 }
 
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize, Default,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum ScriptOutputMode {
+    #[default]
+    Pretty,
+    Plain,
+    Quiet,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize, Default,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum ScriptTimestampFormat {
+    #[default]
+    Local,
+    Boot,
+    None,
+}
+
 #[derive(Debug, Clone)]
 pub enum ParsedCommand {
     Trace(Box<ParsedArgs>),
@@ -178,6 +200,14 @@ pub struct Args {
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub tui: bool,
 
+    /// Script-mode stdout formatting: pretty, plain, or quiet
+    #[arg(long, value_name = "MODE", value_enum)]
+    pub script_output: Option<ScriptOutputMode>,
+
+    /// Timestamp style used by pretty script output: local, boot, or none
+    #[arg(long, value_name = "FORMAT", value_enum)]
+    pub script_timestamp: Option<ScriptTimestampFormat>,
+
     /// Save LLVM IR files for each trace pattern (debug: true, release: false)
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub save_llvm_ir: bool,
@@ -251,6 +281,8 @@ pub struct ParsedArgs {
     pub script_file: Option<PathBuf>,
     pub pid: Option<u32>,
     pub tui_mode: bool,
+    pub script_output: Option<ScriptOutputMode>,
+    pub script_timestamp: Option<ScriptTimestampFormat>,
     pub should_save_llvm_ir: bool,
     pub should_save_ebpf: bool,
     pub should_save_ast: bool,
@@ -401,6 +433,8 @@ impl Args {
             script_file: parsed.script_file,
             pid: parsed.pid,
             tui_mode,
+            script_output: parsed.script_output,
+            script_timestamp: parsed.script_timestamp,
             should_save_llvm_ir,
             should_save_ebpf,
             should_save_ast,
@@ -651,7 +685,9 @@ fn is_pid_running(pid: u32) -> bool {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{Args, BpffsCommand, BpffsPruneArgs, ParsedCommand};
+    use super::{
+        Args, BpffsCommand, BpffsPruneArgs, ParsedCommand, ScriptOutputMode, ScriptTimestampFormat,
+    };
 
     #[test]
     fn parses_bpffs_prune_subcommand() {
@@ -725,5 +761,28 @@ mod tests {
 
         let err = args.validate().unwrap_err().to_string();
         assert!(err.contains("pid-starttime"));
+    }
+
+    #[test]
+    fn parses_script_output_flags() {
+        let parsed = Args::parse_args_from(vec![
+            "ghostscope".to_string(),
+            "--pid".to_string(),
+            "1234".to_string(),
+            "--script-file".to_string(),
+            "trace.gs".to_string(),
+            "--script-output".to_string(),
+            "plain".to_string(),
+            "--script-timestamp".to_string(),
+            "boot".to_string(),
+        ]);
+
+        match parsed {
+            ParsedCommand::Trace(args) => {
+                assert_eq!(args.script_output, Some(ScriptOutputMode::Plain));
+                assert_eq!(args.script_timestamp, Some(ScriptTimestampFormat::Boot));
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
     }
 }
