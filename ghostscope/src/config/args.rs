@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::{Parser, ValueEnum};
+use clap::{Args as ClapArgs, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 use tracing::{info, warn};
 
@@ -9,6 +9,88 @@ pub enum LayoutMode {
     Horizontal,
     /// Vertical layout: panels arranged top to bottom (4:3:3 ratio)
     Vertical,
+}
+
+#[derive(Debug, Clone)]
+pub enum ParsedCommand {
+    Trace(ParsedArgs),
+    Bpffs(BpffsCommand),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BpffsCommand {
+    Prune(BpffsPruneArgs),
+}
+
+#[derive(ClapArgs, Debug, Clone, PartialEq, Eq)]
+pub struct BpffsPruneArgs {
+    /// Show what would be removed without deleting anything
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub dry_run: bool,
+
+    /// Remove one specific pid-starttime pin directory
+    #[arg(long, value_name = "PID-STARTTIME")]
+    pub instance: Option<String>,
+
+    /// Remove all pid-starttime pin directories, including live instances
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub all: bool,
+
+    /// Confirm destructive operation for --all
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub force: bool,
+
+    /// Emit machine-readable JSON output
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub json: bool,
+}
+
+impl BpffsPruneArgs {
+    pub fn validate(&self) -> Result<()> {
+        if self.all && self.instance.is_some() {
+            return Err(anyhow::anyhow!(
+                "--all and --instance cannot be used together"
+            ));
+        }
+
+        if self.all && !self.force && !self.dry_run {
+            return Err(anyhow::anyhow!(
+                "--all requires --force because it removes live pid-starttime directories"
+            ));
+        }
+
+        if self.force && !self.all {
+            return Err(anyhow::anyhow!("--force is only valid together with --all"));
+        }
+
+        if let Some(instance) = &self.instance {
+            if parse_pid_starttime(instance).is_none() {
+                return Err(anyhow::anyhow!(
+                    "--instance must use pid-starttime format, for example 1234-567890"
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Subcommand, Debug)]
+enum BpffsTopLevelCommand {
+    /// Manage GhostScope bpffs pin directories
+    Bpffs(BpffsArgs),
+}
+
+#[derive(ClapArgs, Debug)]
+struct BpffsArgs {
+    #[command(subcommand)]
+    command: BpffsSubcommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum BpffsSubcommand {
+    /// Prune stale or explicitly selected GhostScope bpffs pin directories
+    Prune(BpffsPruneArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -175,112 +257,153 @@ pub struct ParsedArgs {
     pub no_source_panel: bool,
 }
 
+fn parse_pid_starttime(value: &str) -> Option<(u32, u64)> {
+    let (pid, starttime) = value.split_once('-')?;
+    let pid = pid.parse::<u32>().ok()?;
+    let starttime = starttime.parse::<u64>().ok()?;
+    Some((pid, starttime))
+}
+
 impl Args {
     /// Parse command line arguments with special handling for --args
-    pub fn parse_args() -> ParsedArgs {
+    pub fn parse_args() -> ParsedCommand {
         let args: Vec<String> = std::env::args().collect();
+        Self::parse_args_from(args)
+    }
 
+    fn parse_args_from(args: Vec<String>) -> ParsedCommand {
+        let bpffs_prune_invocation = Self::is_bpffs_prune_invocation(&args);
+
+        if let Some(args_pos) = args.iter().position(|arg| arg == "--args") {
+            // `--args` belongs to trace mode; bpffs maintenance commands do not use it.
+            if bpffs_prune_invocation {
+                return Self::try_parse_dispatch(&args).unwrap_or_else(|e| e.exit());
+            }
+            return ParsedCommand::Trace(Self::parse_trace_args_with_split(args, args_pos));
+        }
+
+        if bpffs_prune_invocation {
+            return Self::try_parse_dispatch(&args).unwrap_or_else(|e| e.exit());
+        }
+
+        match Self::try_parse_dispatch(&args) {
+            Ok(command) => command,
+            Err(_err) if matches!(args.get(1).map(String::as_str), Some("bpffs")) => {
+                ParsedCommand::Trace(Self::parse_trace_args(args))
+            }
+            Err(err) => err.exit(),
+        }
+    }
+
+    fn is_bpffs_prune_invocation(args: &[String]) -> bool {
+        matches!(
+            (
+                args.get(1).map(String::as_str),
+                args.get(2).map(String::as_str)
+            ),
+            (Some("bpffs"), Some("prune"))
+        )
+    }
+
+    fn parse_trace_args(args: Vec<String>) -> ParsedArgs {
         // Look for --args flag
         if let Some(args_pos) = args.iter().position(|arg| arg == "--args") {
-            // Everything after --args is for the target binary
-            let (before_args, after_args) = args.split_at(args_pos);
-
-            // Parse options before --args
-            let mut modified_args = before_args.to_vec();
-            modified_args.push("--args".to_string()); // Keep the flag for clap
-
-            let parsed = Args::try_parse_from(&modified_args).unwrap_or_else(|e| e.exit());
-
-            // Extract binary and its arguments from after --args
-            let after_args = &after_args[1..]; // Skip the --args flag itself
-            let (binary_path, binary_args) = if !after_args.is_empty() {
-                (Some(after_args[0].clone()), after_args[1..].to_vec())
-            } else {
-                (None, Vec::new())
-            };
-
-            let should_save_llvm_ir = Self::should_save_llvm_ir(&parsed);
-            let should_save_ebpf = Self::should_save_ebpf(&parsed);
-            let should_save_ast = Self::should_save_ast(&parsed);
-            let tui_mode = Self::determine_tui_mode(&parsed);
-            let target_path = Self::resolve_target_path(&parsed);
-            let (
-                enable_logging,
-                enable_console_logging,
-                log_level,
-                has_explicit_log_flag,
-                has_explicit_console_log_flag,
-            ) = Self::determine_logging_config(&parsed);
-
-            ParsedArgs {
-                binary_path,
-                target_path,
-                binary_args,
-                log_file: parsed.log_file,
-                enable_logging,
-                enable_console_logging,
-                log_level,
-                has_explicit_log_flag,
-                has_explicit_console_log_flag,
-                config: parsed.config,
-                debug_file: parsed.debug_file,
-                script: parsed.script,
-                script_file: parsed.script_file,
-                pid: parsed.pid,
-                tui_mode,
-                should_save_llvm_ir,
-                should_save_ebpf,
-                should_save_ast,
-                layout_mode: parsed.layout,
-                force_perf_event_array: parsed.force_perf_event_array,
-                enable_sysmon_for_shared_lib: parsed.enable_sysmon_shared_lib,
-                allow_loose_debug_match: parsed.allow_loose_debug_match,
-                source_panel: parsed.source_panel,
-                no_source_panel: parsed.no_source_panel,
-            }
+            Self::parse_trace_args_with_split(args, args_pos)
         } else {
             // Normal parsing without --args
-            let parsed = Args::parse();
+            let parsed = Args::try_parse_from(&args).unwrap_or_else(|e| e.exit());
+            let binary_path = parsed.binary.clone();
+            Self::parsed_trace_args_from_clap(parsed, binary_path, Vec::new())
+        }
+    }
 
-            let should_save_llvm_ir = Self::should_save_llvm_ir(&parsed);
-            let should_save_ebpf = Self::should_save_ebpf(&parsed);
-            let should_save_ast = Self::should_save_ast(&parsed);
-            let tui_mode = Self::determine_tui_mode(&parsed);
-            let target_path = Self::resolve_target_path(&parsed);
-            let (
-                enable_logging,
-                enable_console_logging,
-                log_level,
-                has_explicit_log_flag,
-                has_explicit_console_log_flag,
-            ) = Self::determine_logging_config(&parsed);
+    fn parse_trace_args_with_split(args: Vec<String>, args_pos: usize) -> ParsedArgs {
+        // Everything after --args is for the target binary
+        let (before_args, after_args) = args.split_at(args_pos);
 
-            ParsedArgs {
-                binary_path: parsed.binary,
-                target_path,
-                binary_args: Vec::new(),
-                log_file: parsed.log_file,
-                enable_logging,
-                enable_console_logging,
-                log_level,
-                has_explicit_log_flag,
-                has_explicit_console_log_flag,
-                config: parsed.config,
-                debug_file: parsed.debug_file,
-                script: parsed.script,
-                script_file: parsed.script_file,
-                pid: parsed.pid,
-                tui_mode,
-                should_save_llvm_ir,
-                should_save_ebpf,
-                should_save_ast,
-                layout_mode: parsed.layout,
-                force_perf_event_array: parsed.force_perf_event_array,
-                enable_sysmon_for_shared_lib: parsed.enable_sysmon_shared_lib,
-                allow_loose_debug_match: parsed.allow_loose_debug_match,
-                source_panel: parsed.source_panel,
-                no_source_panel: parsed.no_source_panel,
-            }
+        // Parse options before --args
+        let mut modified_args = before_args.to_vec();
+        modified_args.push("--args".to_string()); // Keep the flag for clap
+
+        let parsed = Args::try_parse_from(&modified_args).unwrap_or_else(|e| e.exit());
+
+        // Extract binary and its arguments from after --args
+        let after_args = &after_args[1..]; // Skip the --args flag itself
+        let (binary_path, binary_args) = if !after_args.is_empty() {
+            (Some(after_args[0].clone()), after_args[1..].to_vec())
+        } else {
+            (None, Vec::new())
+        };
+
+        Self::parsed_trace_args_from_clap(parsed, binary_path, binary_args)
+    }
+
+    fn command_with_bpffs() -> clap::Command {
+        BpffsTopLevelCommand::augment_subcommands(Args::command())
+    }
+
+    fn try_parse_dispatch(args: &[String]) -> std::result::Result<ParsedCommand, clap::Error> {
+        let matches = Self::command_with_bpffs().try_get_matches_from(args.iter().cloned())?;
+
+        if let Some(("bpffs", sub_matches)) = matches.subcommand() {
+            let bpffs = BpffsArgs::from_arg_matches(sub_matches)?;
+            return Ok(ParsedCommand::Bpffs(match bpffs.command {
+                BpffsSubcommand::Prune(prune) => BpffsCommand::Prune(prune),
+            }));
+        }
+
+        let parsed = Args::from_arg_matches(&matches)?;
+        let binary_path = parsed.binary.clone();
+        Ok(ParsedCommand::Trace(Self::parsed_trace_args_from_clap(
+            parsed,
+            binary_path,
+            Vec::new(),
+        )))
+    }
+
+    fn parsed_trace_args_from_clap(
+        parsed: Args,
+        binary_path: Option<String>,
+        binary_args: Vec<String>,
+    ) -> ParsedArgs {
+        let should_save_llvm_ir = Self::should_save_llvm_ir(&parsed);
+        let should_save_ebpf = Self::should_save_ebpf(&parsed);
+        let should_save_ast = Self::should_save_ast(&parsed);
+        let tui_mode = Self::determine_tui_mode(&parsed);
+        let target_path = Self::resolve_target_path(&parsed);
+        let (
+            enable_logging,
+            enable_console_logging,
+            log_level,
+            has_explicit_log_flag,
+            has_explicit_console_log_flag,
+        ) = Self::determine_logging_config(&parsed);
+
+        ParsedArgs {
+            binary_path,
+            target_path,
+            binary_args,
+            log_file: parsed.log_file,
+            enable_logging,
+            enable_console_logging,
+            log_level,
+            has_explicit_log_flag,
+            has_explicit_console_log_flag,
+            config: parsed.config,
+            debug_file: parsed.debug_file,
+            script: parsed.script,
+            script_file: parsed.script_file,
+            pid: parsed.pid,
+            tui_mode,
+            should_save_llvm_ir,
+            should_save_ebpf,
+            should_save_ast,
+            layout_mode: parsed.layout,
+            force_perf_event_array: parsed.force_perf_event_array,
+            enable_sysmon_for_shared_lib: parsed.enable_sysmon_shared_lib,
+            allow_loose_debug_match: parsed.allow_loose_debug_match,
+            source_panel: parsed.source_panel,
+            no_source_panel: parsed.no_source_panel,
         }
     }
 
@@ -516,4 +639,85 @@ fn is_pid_running(pid: u32) -> bool {
     // On Linux, check if /proc/PID exists and is a directory
     let proc_path = format!("/proc/{pid}");
     Path::new(&proc_path).is_dir()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::{Args, BpffsCommand, BpffsPruneArgs, ParsedCommand};
+
+    #[test]
+    fn parses_bpffs_prune_subcommand() {
+        let parsed = Args::parse_args_from(vec![
+            "ghostscope".to_string(),
+            "bpffs".to_string(),
+            "prune".to_string(),
+            "--dry-run".to_string(),
+            "--json".to_string(),
+        ]);
+
+        match parsed {
+            ParsedCommand::Bpffs(BpffsCommand::Prune(args)) => {
+                assert!(args.dry_run);
+                assert!(args.json);
+                assert_eq!(args.instance, None);
+                assert!(!args.all);
+                assert!(!args.force);
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keeps_positional_binary_named_bpffs_in_trace_mode() {
+        let parsed = Args::parse_args_from(vec![
+            "ghostscope".to_string(),
+            "bpffs".to_string(),
+            "--script-file".to_string(),
+            "trace.gs".to_string(),
+        ]);
+
+        match parsed {
+            ParsedCommand::Trace(args) => {
+                assert_eq!(args.binary_path.as_deref(), Some("bpffs"));
+                assert_eq!(args.script_file, Some(PathBuf::from("trace.gs")));
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn root_help_lists_bpffs_subcommand() {
+        let help = Args::command_with_bpffs().render_long_help().to_string();
+        assert!(help.contains("bpffs"));
+    }
+
+    #[test]
+    fn bpffs_prune_requires_force_with_all() {
+        let args = BpffsPruneArgs {
+            dry_run: false,
+            instance: None,
+            all: true,
+            force: false,
+            json: false,
+        };
+
+        let err = args.validate().unwrap_err().to_string();
+        assert!(err.contains("--all requires --force"));
+    }
+
+    #[test]
+    fn bpffs_prune_rejects_bad_instance_format() {
+        let args = BpffsPruneArgs {
+            dry_run: false,
+            instance: Some("1234".to_string()),
+            all: false,
+            force: false,
+            json: false,
+        };
+
+        let err = args.validate().unwrap_err().to_string();
+        assert!(err.contains("pid-starttime"));
+    }
 }

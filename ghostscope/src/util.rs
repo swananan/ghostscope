@@ -2,6 +2,7 @@ use crate::core::session::GhostSession;
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, LeaveAlternateScreen};
 use std::io::{self, Write};
+use tracing::warn;
 
 /// Derive a short binary path hint for compiler options and logging.
 /// Priority:
@@ -133,7 +134,22 @@ pub fn setup_panic_hook() {
     }));
 }
 
-/// Perform cleanup of pinned maps when the process exits.
-pub extern "C" fn cleanup_pinned_maps_on_exit() {
-    let _ = ghostscope_process::pinned_bpf_maps::cleanup_current_pinned_maps();
+/// Best-effort cleanup guard for the current process's pinned bpffs directory.
+///
+/// This runs on normal returns and panic unwinds. It does not run for `SIGKILL`,
+/// `process::exit`, or aborting panics.
+pub struct PinnedMapsCleanupGuard;
+
+impl PinnedMapsCleanupGuard {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Drop for PinnedMapsCleanupGuard {
+    fn drop(&mut self) {
+        if let Err(err) = ghostscope_process::pinned_bpf_maps::cleanup_current_pinned_maps() {
+            warn!("Failed to clean current bpffs pin directory during shutdown: {err}");
+        }
+    }
 }

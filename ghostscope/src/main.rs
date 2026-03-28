@@ -11,7 +11,6 @@ mod util;
 use anyhow::Result;
 // Use external tracing crate (not the local tracing module)
 use ::tracing::{info, warn};
-use libc as c;
 
 fn pid_ns_context_needed(
     mapping: &config::ResolvedPidInfo,
@@ -41,8 +40,13 @@ async fn main() -> Result<()> {
     // Setup panic hook before doing anything else
     crate::util::setup_panic_hook();
 
-    // Parse command line arguments
-    let parsed_args = config::Args::parse_args();
+    // Parse command line arguments and route explicit maintenance commands
+    let parsed_args = match config::Args::parse_args() {
+        config::ParsedCommand::Trace(parsed_args) => parsed_args,
+        config::ParsedCommand::Bpffs(config::BpffsCommand::Prune(prune_args)) => {
+            return cli::run_bpffs_prune(&prune_args);
+        }
+    };
 
     // Load and merge configuration
     let config_path = parsed_args.config.clone();
@@ -73,11 +77,6 @@ async fn main() -> Result<()> {
         return Err(anyhow::anyhow!("Failed to initialize logging: {}", e));
     }
 
-    // Register atexit cleanup for pinned maps (per-process path)
-    unsafe {
-        c::atexit(crate::util::cleanup_pinned_maps_on_exit);
-    }
-
     // Log which configuration file was loaded (after logging is initialized)
     if let Some(config_path) = &merged_config.config_file_path {
         info!("Configuration loaded from: {}", config_path.display());
@@ -91,12 +90,6 @@ async fn main() -> Result<()> {
 
     // Ensure we have the privileges needed for eBPF interaction
     crate::util::ensure_privileges();
-
-    match ghostscope_process::pinned_bpf_maps::cleanup_stale_pinned_maps_root() {
-        Ok(0) => {}
-        Ok(removed) => info!("Removed {removed} stale pinned map directories from bpffs"),
-        Err(err) => warn!("Failed to clean stale pinned map directories from bpffs: {err}"),
-    }
 
     // Step 1 (PID/-t mode): detect runtime environment first (container/host/unknown).
     if merged_config.pid.is_some() || merged_config.target_path.is_some() {
@@ -363,6 +356,9 @@ async fn main() -> Result<()> {
         no_source_panel: false,
     };
     temp_args.validate()?;
+
+    // Best-effort cleanup for this process's bpffs pins on graceful shutdown and panic unwind.
+    let _pinned_maps_cleanup = crate::util::PinnedMapsCleanupGuard::new();
 
     // Route to appropriate runtime mode
     if merged_config.tui_mode {

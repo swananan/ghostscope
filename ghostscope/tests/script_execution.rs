@@ -91,11 +91,7 @@ async fn get_global_test_pid_with_opt(opt_level: OptimizationLevel) -> anyhow::R
     {
         let read_guard = manager.read().await;
         if let Some(process) = read_guard.get(&opt_level) {
-            let status = std::process::Command::new("kill")
-                .arg("-0")
-                .arg(process.host_pid().to_string())
-                .status();
-            if status.is_ok_and(|s| s.success()) {
+            if common::host_pid_is_running(process.host_pid()) {
                 return process.visible_pid();
             }
         }
@@ -106,11 +102,7 @@ async fn get_global_test_pid_with_opt(opt_level: OptimizationLevel) -> anyhow::R
 
     // Double-check under write lock in case another task started it
     if let Some(process) = write_guard.get(&opt_level) {
-        let status = std::process::Command::new("kill")
-            .arg("-0")
-            .arg(process.host_pid().to_string())
-            .status();
-        if status.is_ok_and(|s| s.success()) {
+        if common::host_pid_is_running(process.host_pid()) {
             return process.visible_pid();
         }
     }
