@@ -198,6 +198,18 @@ If you get permission errors when running GhostScope:
    ls /sys/fs/bpf
    ```
 
+4. Check if `bpffs` is mounted before running GhostScope:
+   ```bash
+   mount | grep bpf
+   ```
+   You should see `/sys/fs/bpf` mounted as filesystem type `bpf`.
+   If `/sys/fs/bpf` exists but nothing is mounted there, GhostScope will fail when it tries to pin BPF maps.
+   Some systems, including WSL2 and minimal/container environments, do not mount `bpffs` by default.
+   In that case, run:
+   ```bash
+   sudo mount -t bpf bpf /sys/fs/bpf
+   ```
+
 ## Next Steps
 
 - Read the [Quick Tutorial](tutorial.md) to learn basic usage
