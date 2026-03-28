@@ -1,12 +1,12 @@
 #![allow(dead_code)]
 
 use super::sandbox::{BackgroundProcess, SandboxHandle};
+use super::termination::{terminate_std_child_gracefully, GRACEFUL_TERMINATION_TIMEOUT};
 use super::{ensure_test_program_compiled_with_opt, OptimizationLevel};
 use anyhow::{Context, Result};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::Mutex;
 
 const SAMPLE_PROGRAM_BUILD_DIR: &str = "/workspace/ghostscope/tests/fixtures/sample_program";
@@ -165,10 +165,10 @@ impl TargetHandle {
                 if let Some(mut child) = child.lock().await.take() {
                     let pid = child.id();
                     tokio::task::spawn_blocking(move || -> Result<()> {
-                        match super::terminate_std_child_gracefully(
+                        match terminate_std_child_gracefully(
                             &mut child,
                             "host target",
-                            Duration::from_secs(2),
+                            GRACEFUL_TERMINATION_TIMEOUT,
                         )? {
                             Some(_) => Ok(()),
                             None => anyhow::bail!(
@@ -191,7 +191,6 @@ impl TargetHandle {
                             self.sandbox().label()
                         )
                     })?;
-                tokio::time::sleep(Duration::from_millis(300)).await;
             }
         }
         Ok(())
@@ -226,7 +225,7 @@ async fn spawn_binary_target(
             )
         })?;
     let sandbox_pid = process.pid();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     let status = sandbox
         .read_status(sandbox_pid)

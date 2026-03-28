@@ -12,6 +12,7 @@
 use super::sandbox::SandboxHandle;
 use super::targets::ensure_target_binary_ready_for_default_sandbox;
 use super::targets::TargetHandle;
+use super::termination::{terminate_tokio_child_gracefully, GRACEFUL_TERMINATION_TIMEOUT};
 use anyhow::{Context, Result};
 use ghostscope_process::is_shared_object;
 use std::env;
@@ -309,15 +310,15 @@ impl GhostscopeRunner {
                                 sandbox.label()
                             )
                         })?;
-                        match timeout(Duration::from_secs(2), child.wait()).await {
+                        match timeout(GRACEFUL_TERMINATION_TIMEOUT, child.wait()).await {
                             Ok(Ok(status)) => status.code().unwrap_or(-1),
                             _ => -1,
                         }
                     } else {
-                        match super::terminate_tokio_child_gracefully(
+                        match terminate_tokio_child_gracefully(
                             &mut child,
                             "ghostscope runner child",
-                            Duration::from_secs(2),
+                            GRACEFUL_TERMINATION_TIMEOUT,
                         )
                         .await?
                         {
