@@ -68,6 +68,7 @@ pub async fn run_tui_coordinator_with_config(config: MergedConfig) -> Result<()>
         target_path: config.target_path,
         binary_args: config.binary_args,
         log_file: Some(config.log_file),
+        emit_ready_marker: config.emit_ready_marker,
         enable_logging: config.enable_logging,
         enable_console_logging: config.enable_console_logging,
         log_level: config.log_level,

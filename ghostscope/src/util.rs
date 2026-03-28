@@ -87,6 +87,16 @@ pub fn ensure_privileges() {
     );
     std::process::exit(1);
 }
+
+pub fn emit_ready_marker(marker: Option<&str>) -> io::Result<()> {
+    let Some(marker) = marker else {
+        return Ok(());
+    };
+
+    println!("{marker}");
+    io::stdout().flush()
+}
+
 /// Install a panic hook that restores terminal state and prints friendly diagnostics.
 pub fn setup_panic_hook() {
     let original_hook = std::panic::take_hook();

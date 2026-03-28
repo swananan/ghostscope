@@ -154,6 +154,8 @@ async fn run_cli_with_session(
         "Starting event monitoring for {} active traces",
         session.trace_manager.active_trace_count()
     );
+    crate::util::emit_ready_marker(config.emit_ready_marker.as_deref())
+        .map_err(|e| anyhow::anyhow!("failed to emit ready marker: {}", e))?;
 
     let mut event_count = 0;
     let shutdown_signal = wait_for_shutdown_signal();

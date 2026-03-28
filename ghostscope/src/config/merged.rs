@@ -29,6 +29,7 @@ pub struct MergedConfig {
     /// `/proc/<proc_pid>/maps`.
     pub proc_offsets_pid_ns: Option<ghostscope_compiler::PidNamespaceSpec>,
     pub log_file: PathBuf,
+    pub emit_ready_marker: Option<String>,
     pub enable_logging: bool,
     pub enable_console_logging: bool,
     pub log_level: crate::config::settings::LogLevel,
@@ -184,6 +185,7 @@ impl MergedConfig {
             special_pid_ns: None,
             proc_offsets_pid_ns: None,
             log_file,
+            emit_ready_marker: args.emit_ready_marker,
             enable_logging,
             enable_console_logging,
             log_level,

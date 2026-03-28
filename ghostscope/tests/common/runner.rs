@@ -17,6 +17,7 @@ use anyhow::{Context, Result};
 use ghostscope_process::is_shared_object;
 use std::env;
 use std::ffi::OsString;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use tempfile::{Builder, NamedTempFile};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -27,6 +28,8 @@ const ENV_GHOSTSCOPE_LOG_LEVEL: &str = "E2E_GHOSTSCOPE_LOG_LEVEL";
 const ENV_GHOSTSCOPE_ENABLE_LOGGING: &str = "E2E_GHOSTSCOPE_ENABLE_LOGGING";
 const ENV_GHOSTSCOPE_LOG_CONSOLE: &str = "E2E_GHOSTSCOPE_LOG_CONSOLE";
 const GHOSTSCOPE_PID_BOOTSTRAP_PREFIX: &str = "__GHOSTSCOPE_PID__ ";
+#[allow(dead_code)]
+const GHOSTSCOPE_READY_MARKER: &str = "__GHOSTSCOPE_READY__";
 
 pub struct GhostscopeRunner {
     script_content: String,
@@ -127,6 +130,32 @@ impl GhostscopeRunner {
     }
 
     pub async fn run(self) -> Result<(i32, String, String)> {
+        let (exit_code, stdout, stderr, ()) = self.run_internal(None, || async { Ok(()) }).await?;
+        Ok((exit_code, stdout, stderr))
+    }
+
+    #[allow(dead_code)]
+    pub async fn run_after_ready<OnReady, Fut, T>(
+        self,
+        on_ready: OnReady,
+    ) -> Result<(i32, String, String, T)>
+    where
+        OnReady: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        self.run_internal(Some(GHOSTSCOPE_READY_MARKER.to_string()), on_ready)
+            .await
+    }
+
+    async fn run_internal<OnReady, Fut, T>(
+        self,
+        ready_marker: Option<String>,
+        on_ready: OnReady,
+    ) -> Result<(i32, String, String, T)>
+    where
+        OnReady: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
         let logging = self.resolve_logging_config();
         let sandbox = match self.sandbox {
             Some(sandbox) => sandbox,
@@ -195,6 +224,11 @@ impl GhostscopeRunner {
             args.push(OsString::from("--force-perf-event-array"));
         }
 
+        if let Some(marker) = ready_marker.as_ref() {
+            args.push(OsString::from("--emit-ready-marker"));
+            args.push(OsString::from(marker));
+        }
+
         // Opt-in sysmon for -t shared library tests
         if self.enable_sysmon_shared_lib {
             args.push(OsString::from("--enable-sysmon-shared-lib"));
@@ -224,6 +258,16 @@ impl GhostscopeRunner {
         let mut stdout_content = String::new();
         let mut stderr_content = String::new();
         let mut managed_ghostscope_pid = None;
+        let mut ready_callback = Some(on_ready);
+        let mut ready_result: Option<T> = None;
+        let mut ready_fired = ready_marker.is_none();
+
+        if ready_fired {
+            let callback = ready_callback
+                .take()
+                .expect("ready callback missing for immediate execution");
+            ready_result = Some(callback().await?);
+        }
 
         if launch.bootstrap_pid_from_stdout {
             let mut bootstrap_line = String::new();
@@ -271,6 +315,17 @@ impl GhostscopeRunner {
                 {
                     if n > 0 {
                         stdout_content.push_str(&stdout_line);
+                        if !ready_fired
+                            && ready_marker
+                                .as_deref()
+                                .is_some_and(|marker| stdout_line.trim_end() == marker)
+                        {
+                            let callback = ready_callback.take().with_context(|| {
+                                "ready callback missing when matching stdout ready marker"
+                            })?;
+                            ready_result = Some(callback().await?);
+                            ready_fired = true;
+                        }
                     }
                 }
                 // stderr
@@ -283,6 +338,17 @@ impl GhostscopeRunner {
                 {
                     if n > 0 {
                         stderr_content.push_str(&stderr_line);
+                        if !ready_fired
+                            && ready_marker
+                                .as_deref()
+                                .is_some_and(|marker| stderr_line.trim_end() == marker)
+                        {
+                            let callback = ready_callback.take().with_context(|| {
+                                "ready callback missing when matching stderr ready marker"
+                            })?;
+                            ready_result = Some(callback().await?);
+                            ready_fired = true;
+                        }
                     }
                 }
                 // quit early if the process exited
@@ -291,11 +357,16 @@ impl GhostscopeRunner {
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
+            Ok::<(), anyhow::Error>(())
         };
 
-        let timed_out = timeout(Duration::from_secs(self.timeout_secs), read_task)
-            .await
-            .is_err();
+        let timed_out = match timeout(Duration::from_secs(self.timeout_secs), read_task).await {
+            Ok(result) => {
+                result?;
+                false
+            }
+            Err(_) => true,
+        };
 
         // Determine exit code; terminate gracefully on timeout
         let mut exit_code = match child.try_wait() {
@@ -364,7 +435,21 @@ impl GhostscopeRunner {
             exit_code = 0;
         }
 
-        Ok((exit_code, stdout_content, stderr_content))
+        if !ready_fired {
+            anyhow::bail!(
+                "GhostScope exited before reaching ready state '{}'. stderr={} stdout={}",
+                ready_marker.as_deref().unwrap_or("<none>"),
+                stderr_content,
+                stdout_content
+            );
+        }
+
+        Ok((
+            exit_code,
+            stdout_content,
+            stderr_content,
+            ready_result.expect("ready callback result missing after ready state"),
+        ))
     }
 
     fn resolve_logging_config(&self) -> EffectiveLoggingConfig {
