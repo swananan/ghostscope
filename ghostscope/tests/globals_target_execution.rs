@@ -52,32 +52,44 @@ fn prepare_late_start_launcher(
     common::targets::ensure_target_binary_ready_for_default_sandbox(binary_path)
 }
 
-// Late-start helper: run GhostScope first, then start the target process after a delay
+fn ghostscope_log_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("failed to resolve workspace root for ghostscope.log"))?
+        .join("ghostscope.log"))
+}
+
+// Late-start helper: run GhostScope first, wait until the CLI reports it has
+// finished compile/load/attach, then start the target process.
+async fn run_ghostscope_then_start_target_after_ready(
+    runner: common::runner::GhostscopeRunner,
+    launcher_exe: &Path,
+) -> anyhow::Result<(i32, String, String, common::targets::TargetHandle, u32)> {
+    let (exit_code, stdout, stderr, (target, pid)) = runner
+        .run_after_ready(|| async {
+            let target = spawn_globals_program(launcher_exe).await?;
+            let pid = visible_pid_for_target(&target)?;
+            Ok((target, pid))
+        })
+        .await?;
+
+    Ok((exit_code, stdout, stderr, target, pid))
+}
+
 async fn run_ghostscope_then_start_exe(
     script_content: &str,
     timeout_secs: u64,
     target_path: &std::path::Path,
     launcher_exe: &std::path::Path,
-    launch_delay_ms: u64,
 ) -> anyhow::Result<(i32, String, String, common::targets::TargetHandle, u32)> {
-    // Spawn GhostScope in the background
-    let runner = common::runner::GhostscopeRunner::new()
-        .with_script(script_content)
-        .with_target(target_path)
-        .timeout_secs(timeout_secs);
-    let gs_task = tokio::spawn(async move { runner.run().await });
-
-    // Start target process after a small delay
-    tokio::time::sleep(Duration::from_millis(launch_delay_ms)).await;
-    let target = spawn_globals_program(launcher_exe).await?;
-    let pid = visible_pid_for_target(&target)?;
-
-    // Wait for GhostScope to finish (timeout-based)
-    let (exit_code, stdout, stderr) = gs_task
-        .await
-        .map_err(|e| anyhow::anyhow!("GhostScope task join error: {e}"))??;
-
-    Ok((exit_code, stdout, stderr, target, pid))
+    run_ghostscope_then_start_target_after_ready(
+        common::runner::GhostscopeRunner::new()
+            .with_script(script_content)
+            .with_target(target_path)
+            .timeout_secs(timeout_secs),
+        launcher_exe,
+    )
+    .await
 }
 
 // ---------------------------------
@@ -264,7 +276,6 @@ trace globals_program.c:32 {
         3,            // allow some time for sysmon -> prefill -> events
         &binary_path, // -t target
         &binary_path, // launcher (the same executable)
-        500,          // start target 0.5s after GhostScope
     )
     .await?;
 
@@ -314,6 +325,7 @@ async fn test_t_mode_library_late_start_globals_prints() -> anyhow::Result<()> {
     init();
 
     // -t points to libgvars.so; GhostScope first, then we run the executable which loads the lib
+    // only after GhostScope reports its late-start hooks are ready.
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
     let _target_sandbox_guard = prepare_late_start_launcher(&binary_path)?;
     let bin_dir = binary_path.parent().unwrap().to_path_buf();
@@ -324,30 +336,15 @@ trace lib_tick {
 }
 "#;
 
-    // Spawn GhostScope with saving + trace logs enabled
-    let gs_task = {
-        let target = lib_path.clone();
-        let sc = script.to_string();
-        tokio::spawn(async move {
-            common::runner::GhostscopeRunner::new()
-                .with_script(&sc)
-                .with_target(&target)
-                .timeout_secs(12)
-                .enable_sysmon_shared_lib(true)
-                .run()
-                .await
-        })
-    };
-
-    // Start the target process after a short delay
-    tokio::time::sleep(Duration::from_millis(700)).await;
-    let target = spawn_globals_program(&binary_path).await?;
-    let pid = visible_pid_for_target(&target)?;
-
-    // Wait for GhostScope to finish
-    let (exit_code, stdout, stderr) = gs_task
-        .await
-        .map_err(|e| anyhow::anyhow!("GhostScope task join error: {e}"))??;
+    let (exit_code, stdout, stderr, target, pid) = run_ghostscope_then_start_target_after_ready(
+        common::runner::GhostscopeRunner::new()
+            .with_script(script)
+            .with_target(&lib_path)
+            .timeout_secs(12)
+            .enable_sysmon_shared_lib(true),
+        &binary_path,
+    )
+    .await?;
     target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
@@ -375,14 +372,14 @@ trace lib_tick {
             "Late-start: LIB_STATE.counter should +2 per tick. STDOUT: {stdout}"
         );
     } else {
-        let log_dump = tokio::fs::read_to_string("ghostscope.log")
+        let log_dump = tokio::fs::read_to_string(ghostscope_log_path()?)
             .await
             .unwrap_or_else(|_| "<ghostscope.log unavailable>".to_string());
         let msg =
             format!("Late-start: No events for our PID {pid}. STDOUT: {stdout}. LOG: {log_dump}");
         assert!(!uniq.is_empty(), "{}", msg);
     }
-    let _ = tokio::fs::remove_file("ghostscope.log").await;
+    let _ = tokio::fs::remove_file(ghostscope_log_path()?).await;
     Ok(())
 }
 
@@ -401,7 +398,7 @@ trace globals_program.c:26 {
 "#;
 
     let (exit_code, stdout, stderr, target, pid) =
-        run_ghostscope_then_start_exe(script, 3, &binary_path, &binary_path, 500).await?;
+        run_ghostscope_then_start_exe(script, 3, &binary_path, &binary_path).await?;
 
     target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
@@ -456,27 +453,16 @@ trace lib_tick {
 }
 "#;
 
-    let gs_task = {
-        let target = lib_path.clone();
-        let sc = script.to_string();
-        tokio::spawn(async move {
-            common::runner::GhostscopeRunner::new()
-                .with_script(&sc)
-                .with_target(&target)
-                .timeout_secs(8)
-                .enable_sysmon_shared_lib(false)
-                .run()
-                .await
-        })
-    };
+    let (exit_code, stdout, stderr, target, pid) = run_ghostscope_then_start_target_after_ready(
+        common::runner::GhostscopeRunner::new()
+            .with_script(script)
+            .with_target(&lib_path)
+            .timeout_secs(8)
+            .enable_sysmon_shared_lib(false),
+        &binary_path,
+    )
+    .await?;
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let target = spawn_globals_program(&binary_path).await?;
-    let pid = visible_pid_for_target(&target)?;
-
-    let (exit_code, stdout, stderr) = gs_task
-        .await
-        .map_err(|e| anyhow::anyhow!("GhostScope task join error: {e}"))??;
     target.terminate().await?;
 
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
@@ -555,6 +541,8 @@ trace lib_tick {
         !target_stdout.contains("read_user failed"),
         "Should not surface raw read_user errors for PID {pid}. STDOUT: {stdout}"
     );
+
+    let _ = tokio::fs::remove_file(ghostscope_log_path()?).await;
 
     Ok(())
 }

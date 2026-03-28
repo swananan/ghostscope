@@ -42,7 +42,7 @@ async fn main() -> Result<()> {
 
     // Parse command line arguments and route explicit maintenance commands
     let parsed_args = match config::Args::parse_args() {
-        config::ParsedCommand::Trace(parsed_args) => parsed_args,
+        config::ParsedCommand::Trace(parsed_args) => *parsed_args,
         config::ParsedCommand::Bpffs(config::BpffsCommand::Prune(prune_args)) => {
             return cli::run_bpffs_prune(&prune_args);
         }
@@ -334,6 +334,7 @@ async fn main() -> Result<()> {
         target_path: merged_config.target_path.clone(),
         binary_args: merged_config.binary_args.clone(),
         log_file: Some(merged_config.log_file.clone()),
+        emit_ready_marker: merged_config.emit_ready_marker.clone(),
         enable_logging: merged_config.enable_logging,
         enable_console_logging: merged_config.enable_console_logging,
         log_level: merged_config.log_level,

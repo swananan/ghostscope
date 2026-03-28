@@ -344,6 +344,7 @@ mod tests {
             binary_args: vec![],
             pid: None,
             log_file: None,
+            emit_ready_marker: None,
             enable_logging: false,
             enable_console_logging: false,
             has_explicit_log_flag: false,

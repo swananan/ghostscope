@@ -13,7 +13,7 @@ pub enum LayoutMode {
 
 #[derive(Debug, Clone)]
 pub enum ParsedCommand {
-    Trace(ParsedArgs),
+    Trace(Box<ParsedArgs>),
     Bpffs(BpffsCommand),
 }
 
@@ -120,6 +120,10 @@ pub struct Args {
     /// Log file path (default: ./ghostscope.log)
     #[arg(long, value_name = "PATH")]
     pub log_file: Option<PathBuf>,
+
+    /// Emit a readiness marker to stdout after script compilation and uprobe attachment.
+    #[arg(long, value_name = "TEXT", hide = true)]
+    pub emit_ready_marker: Option<String>,
 
     /// Enable logging to file (overrides config file)
     #[arg(long, action = clap::ArgAction::SetTrue)]
@@ -235,6 +239,7 @@ pub struct ParsedArgs {
     pub target_path: Option<String>,
     pub binary_args: Vec<String>,
     pub log_file: Option<PathBuf>,
+    pub emit_ready_marker: Option<String>,
     pub enable_logging: bool,
     pub enable_console_logging: bool,
     pub log_level: crate::config::settings::LogLevel,
@@ -279,7 +284,9 @@ impl Args {
             if bpffs_prune_invocation {
                 return Self::try_parse_dispatch(&args).unwrap_or_else(|e| e.exit());
             }
-            return ParsedCommand::Trace(Self::parse_trace_args_with_split(args, args_pos));
+            return ParsedCommand::Trace(Box::new(Self::parse_trace_args_with_split(
+                args, args_pos,
+            )));
         }
 
         if bpffs_prune_invocation {
@@ -289,7 +296,7 @@ impl Args {
         match Self::try_parse_dispatch(&args) {
             Ok(command) => command,
             Err(_err) if matches!(args.get(1).map(String::as_str), Some("bpffs")) => {
-                ParsedCommand::Trace(Self::parse_trace_args(args))
+                ParsedCommand::Trace(Box::new(Self::parse_trace_args(args)))
             }
             Err(err) => err.exit(),
         }
@@ -354,10 +361,8 @@ impl Args {
 
         let parsed = Args::from_arg_matches(&matches)?;
         let binary_path = parsed.binary.clone();
-        Ok(ParsedCommand::Trace(Self::parsed_trace_args_from_clap(
-            parsed,
-            binary_path,
-            Vec::new(),
+        Ok(ParsedCommand::Trace(Box::new(
+            Self::parsed_trace_args_from_clap(parsed, binary_path, Vec::new()),
         )))
     }
 
@@ -384,6 +389,7 @@ impl Args {
             target_path,
             binary_args,
             log_file: parsed.log_file,
+            emit_ready_marker: parsed.emit_ready_marker,
             enable_logging,
             enable_console_logging,
             log_level,
