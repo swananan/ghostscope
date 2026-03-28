@@ -1,5 +1,6 @@
 use crate::config::{ScriptOutputMode, ScriptTimestampFormat};
 use ghostscope_protocol::ParsedTraceEvent;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScriptOutputOptions {
@@ -7,45 +8,140 @@ pub struct ScriptOutputOptions {
     pub timestamp: ScriptTimestampFormat,
 }
 
-pub fn render_script_event_lines(
-    event: &ParsedTraceEvent,
-    options: ScriptOutputOptions,
-) -> Vec<String> {
-    let formatted_output = event.to_formatted_output();
-    if formatted_output.is_empty() {
-        return Vec::new();
+#[derive(Debug)]
+pub struct ScriptOutputRenderer {
+    mode: ScriptOutputMode,
+    pretty_timestamp: Option<PrettyTimestampFormatter>,
+}
+
+impl ScriptOutputRenderer {
+    pub fn new(options: ScriptOutputOptions) -> Self {
+        let pretty_timestamp = match options.mode {
+            ScriptOutputMode::Pretty => Some(PrettyTimestampFormatter::new(options.timestamp)),
+            ScriptOutputMode::Plain | ScriptOutputMode::Quiet => None,
+        };
+
+        Self {
+            mode: options.mode,
+            pretty_timestamp,
+        }
     }
 
-    match options.mode {
-        ScriptOutputMode::Quiet => Vec::new(),
-        ScriptOutputMode::Plain => formatted_output,
-        ScriptOutputMode::Pretty => {
-            let mut lines = Vec::with_capacity(formatted_output.len() + 1);
-            lines.push(render_pretty_header(event, options.timestamp));
-            lines.extend(formatted_output.into_iter().map(|line| format!("  {line}")));
-            lines
+    pub fn render_event_lines(&mut self, event: &ParsedTraceEvent) -> Vec<String> {
+        match self.mode {
+            ScriptOutputMode::Quiet => Vec::new(),
+            ScriptOutputMode::Plain => {
+                let formatted_output = event.to_formatted_output();
+                if formatted_output.is_empty() {
+                    Vec::new()
+                } else {
+                    formatted_output
+                }
+            }
+            ScriptOutputMode::Pretty => {
+                let formatted_output = event.to_formatted_output();
+                if formatted_output.is_empty() {
+                    return Vec::new();
+                }
+
+                let mut lines = Vec::with_capacity(formatted_output.len() + 1);
+                lines.push(self.render_pretty_header(event));
+                lines.extend(formatted_output.into_iter().map(|line| format!("  {line}")));
+                lines
+            }
+        }
+    }
+
+    fn render_pretty_header(&mut self, event: &ParsedTraceEvent) -> String {
+        let metadata = format!(
+            "TraceID:{} PID:{} TID:{}",
+            event.trace_id, event.pid, event.tid
+        );
+
+        match self
+            .pretty_timestamp
+            .as_mut()
+            .expect("pretty timestamp formatter must exist for pretty mode")
+            .format(event.timestamp)
+        {
+            Some(timestamp) => format!("[{timestamp}] {metadata}"),
+            None => metadata,
         }
     }
 }
 
-fn render_pretty_header(event: &ParsedTraceEvent, timestamp: ScriptTimestampFormat) -> String {
-    let metadata = format!(
-        "TraceID:{} PID:{} TID:{}",
-        event.trace_id, event.pid, event.tid
-    );
+#[derive(Debug)]
+enum PrettyTimestampFormatter {
+    Local(LocalTimestampFormatter),
+    Boot,
+    None,
+}
 
-    match timestamp {
-        ScriptTimestampFormat::Local => format!(
-            "[{}] {metadata}",
-            ghostscope_ui::utils::format_timestamp_ns(event.timestamp)
-        ),
-        ScriptTimestampFormat::Boot => {
-            format!(
-                "[{}] {metadata}",
-                format_boot_offset_timestamp(event.timestamp)
-            )
+impl PrettyTimestampFormatter {
+    fn new(timestamp: ScriptTimestampFormat) -> Self {
+        match timestamp {
+            ScriptTimestampFormat::Local => Self::Local(LocalTimestampFormatter::new()),
+            ScriptTimestampFormat::Boot => Self::Boot,
+            ScriptTimestampFormat::None => Self::None,
         }
-        ScriptTimestampFormat::None => metadata,
+    }
+
+    fn format(&mut self, ns_timestamp: u64) -> Option<String> {
+        match self {
+            Self::Local(formatter) => Some(formatter.format(ns_timestamp)),
+            Self::Boot => Some(format_boot_offset_timestamp(ns_timestamp)),
+            Self::None => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LocalTimestampFormatter {
+    boot_time_unix_ns: Option<u64>,
+    cached_second: Option<u64>,
+    cached_prefix: String,
+}
+
+impl LocalTimestampFormatter {
+    fn new() -> Self {
+        Self::with_boot_time_unix_ns(current_boot_time_unix_ns())
+    }
+
+    fn with_boot_time_unix_ns(boot_time_unix_ns: Option<u64>) -> Self {
+        Self {
+            boot_time_unix_ns,
+            cached_second: None,
+            cached_prefix: String::new(),
+        }
+    }
+
+    fn format(&mut self, ns_timestamp: u64) -> String {
+        let Some(actual_time_ns) = self.actual_time_unix_ns(ns_timestamp) else {
+            return format_boot_offset_timestamp(ns_timestamp);
+        };
+
+        let actual_time_secs = actual_time_ns / 1_000_000_000;
+        let actual_time_nanos = (actual_time_ns % 1_000_000_000) as u32;
+        let Some(prefix) = self.local_prefix_for_second(actual_time_secs) else {
+            return format_boot_offset_timestamp(ns_timestamp);
+        };
+
+        format!("{prefix}.{:03}", actual_time_nanos / 1_000_000)
+    }
+
+    fn actual_time_unix_ns(&self, ns_timestamp: u64) -> Option<u64> {
+        self.boot_time_unix_ns?.checked_add(ns_timestamp)
+    }
+
+    fn local_prefix_for_second(&mut self, unix_seconds: u64) -> Option<&str> {
+        if self.cached_second != Some(unix_seconds) {
+            let utc_datetime = chrono::DateTime::from_timestamp(unix_seconds as i64, 0)?;
+            let local_datetime: chrono::DateTime<chrono::Local> = utc_datetime.into();
+            self.cached_second = Some(unix_seconds);
+            self.cached_prefix = local_datetime.format("%Y-%m-%d %H:%M:%S").to_string();
+        }
+
+        Some(self.cached_prefix.as_str())
     }
 }
 
@@ -56,9 +152,25 @@ fn format_boot_offset_timestamp(ns_timestamp: u64) -> String {
     format!("boot+{seconds}.{ms_remainder:03}s")
 }
 
+fn current_boot_time_unix_ns() -> Option<u64> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
+    let now_unix_ns = u64::try_from(now.as_nanos()).ok()?;
+    let uptime_ns = get_system_uptime_ns()?;
+    now_unix_ns.checked_sub(uptime_ns)
+}
+
+fn get_system_uptime_ns() -> Option<u64> {
+    std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|content| {
+            let uptime_secs: f64 = content.split_whitespace().next()?.parse().ok()?;
+            Some((uptime_secs * 1_000_000_000.0) as u64)
+        })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{render_script_event_lines, ScriptOutputOptions};
+    use super::{LocalTimestampFormatter, ScriptOutputOptions, ScriptOutputRenderer};
     use crate::config::{ScriptOutputMode, ScriptTimestampFormat};
     use ghostscope_protocol::{ParsedInstruction, ParsedTraceEvent};
 
@@ -83,9 +195,14 @@ mod tests {
         }
     }
 
+    fn render_with_renderer(event: &ParsedTraceEvent, options: ScriptOutputOptions) -> Vec<String> {
+        let mut renderer = ScriptOutputRenderer::new(options);
+        renderer.render_event_lines(event)
+    }
+
     #[test]
     fn pretty_output_includes_boot_timestamp_and_metadata() {
-        let lines = render_script_event_lines(
+        let lines = render_with_renderer(
             &sample_event(),
             ScriptOutputOptions {
                 mode: ScriptOutputMode::Pretty,
@@ -105,7 +222,7 @@ mod tests {
 
     #[test]
     fn plain_output_keeps_only_script_payload_lines() {
-        let lines = render_script_event_lines(
+        let lines = render_with_renderer(
             &sample_event(),
             ScriptOutputOptions {
                 mode: ScriptOutputMode::Plain,
@@ -118,7 +235,7 @@ mod tests {
 
     #[test]
     fn quiet_output_suppresses_stdout_lines() {
-        let lines = render_script_event_lines(
+        let lines = render_with_renderer(
             &sample_event(),
             ScriptOutputOptions {
                 mode: ScriptOutputMode::Quiet,
@@ -131,7 +248,7 @@ mod tests {
 
     #[test]
     fn pretty_output_can_omit_timestamp() {
-        let lines = render_script_event_lines(
+        let lines = render_with_renderer(
             &sample_event(),
             ScriptOutputOptions {
                 mode: ScriptOutputMode::Pretty,
@@ -140,5 +257,29 @@ mod tests {
         );
 
         assert_eq!(lines[0], "TraceID:7 PID:4321 TID:4322");
+    }
+
+    #[test]
+    fn renderer_quiet_mode_short_circuits_without_lines() {
+        let mut renderer = ScriptOutputRenderer::new(ScriptOutputOptions {
+            mode: ScriptOutputMode::Quiet,
+            timestamp: ScriptTimestampFormat::Local,
+        });
+
+        assert!(renderer.render_event_lines(&sample_event()).is_empty());
+    }
+
+    #[test]
+    fn local_timestamp_formatter_reuses_same_second_prefix() {
+        let mut formatter =
+            LocalTimestampFormatter::with_boot_time_unix_ns(Some(1_700_000_000_000_000_000));
+
+        let first = formatter.format(1_234_111_000);
+        let second = formatter.format(1_789_222_000);
+
+        assert_eq!(&first[..19], &second[..19]);
+        assert_ne!(first, second);
+        assert!(formatter.cached_second.is_some());
+        assert!(!formatter.cached_prefix.is_empty());
     }
 }

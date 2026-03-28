@@ -158,6 +158,12 @@ async fn run_cli_with_session(
     );
     crate::util::emit_ready_marker(config.emit_ready_marker.as_deref())
         .map_err(|e| anyhow::anyhow!("failed to emit ready marker: {}", e))?;
+    let mut output_renderer = crate::cli::script_output::ScriptOutputRenderer::new(
+        crate::cli::script_output::ScriptOutputOptions {
+            mode: config.script_output_mode,
+            timestamp: config.script_timestamp_format,
+        },
+    );
 
     let shutdown_signal = wait_for_shutdown_signal();
     tokio::pin!(shutdown_signal);
@@ -167,13 +173,7 @@ async fn run_cli_with_session(
                 match result {
                     Ok(events) => {
                         for event in events {
-                            let rendered_lines = crate::cli::script_output::render_script_event_lines(
-                                &event,
-                                crate::cli::script_output::ScriptOutputOptions {
-                                    mode: config.script_output_mode,
-                                    timestamp: config.script_timestamp_format,
-                                },
-                            );
+                            let rendered_lines = output_renderer.render_event_lines(&event);
 
                             if !rendered_lines.is_empty() {
                                 for line in rendered_lines {
