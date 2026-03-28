@@ -10,6 +10,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
+const BPFFS_MOUNT_POINT: &str = "/sys/fs/bpf";
 const BPFFS_ROOT: &str = "/sys/fs/bpf/ghostscope";
 const INITIAL_PID_NAMESPACE_INO: u64 = 4026531836;
 const PROC_STAT_STARTTIME_INDEX: usize = 19;
@@ -189,6 +190,52 @@ pub fn proc_offsets_pin_dir() -> anyhow::Result<PathBuf> {
 pub const PROC_OFFSETS_MAP_NAME: &str = "proc_module_offsets";
 pub const ALLOWED_PIDS_MAP_NAME: &str = "allowed_pids";
 
+fn bpffs_is_mounted() -> bool {
+    let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    mountinfo.lines().any(|line| {
+        let Some((left, right)) = line.split_once(" - ") else {
+            return false;
+        };
+        let mount_point = left.split_whitespace().nth(4);
+        let fs_type = right.split_whitespace().next();
+        mount_point == Some(BPFFS_MOUNT_POINT) && fs_type == Some("bpf")
+    })
+}
+
+fn bpffs_mount_hint_for_state(
+    pin_path: &Path,
+    bpffs_mount_point_exists: bool,
+    bpffs_mounted: bool,
+) -> Option<String> {
+    if !pin_path.starts_with(BPFFS_ROOT) {
+        return None;
+    }
+
+    if bpffs_mounted {
+        return None;
+    }
+
+    if !bpffs_mount_point_exists {
+        return Some(format!(
+            "GhostScope requires bpffs mounted at {BPFFS_MOUNT_POINT} to pin BPF maps under {BPFFS_ROOT}. That mount point does not exist. Try: `sudo mkdir -p {BPFFS_MOUNT_POINT} && sudo mount -t bpf bpf {BPFFS_MOUNT_POINT}`."
+        ));
+    }
+
+    Some(format!(
+        "GhostScope requires bpffs mounted at {BPFFS_MOUNT_POINT} to pin BPF maps under {BPFFS_ROOT}. Some systems, including WSL2 and minimal/container environments, do not mount it by default. Try: `sudo mount -t bpf bpf {BPFFS_MOUNT_POINT}` and verify with `mount | grep bpf`."
+    ))
+}
+
+pub fn bpffs_mount_hint_for_pin_path(pin_path: &Path) -> Option<String> {
+    bpffs_mount_hint_for_state(
+        pin_path,
+        Path::new(BPFFS_MOUNT_POINT).exists(),
+        bpffs_is_mounted(),
+    )
+}
+
 /// Key for proc_module_offsets map: { pid:u32, pad:u32, cookie_lo:u32, cookie_hi:u32 }
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -236,7 +283,18 @@ fn ensure_pin_dir(path: &Path) -> std::io::Result<()> {
 pub fn ensure_pinned_proc_offsets_exists(max_entries: u32) -> anyhow::Result<()> {
     let pin_path = proc_offsets_pin_path()?;
     // Ensure parent dir exists
-    ensure_pin_dir(&pin_path)?;
+    ensure_pin_dir(&pin_path).map_err(|e| {
+        let hint = bpffs_mount_hint_for_pin_path(&pin_path)
+            .map(|hint| format!(" {hint}"))
+            .unwrap_or_default();
+        anyhow::anyhow!(
+            "Failed to create pin directory for {} at {}: {}.{}",
+            PROC_OFFSETS_MAP_NAME,
+            pin_path.display(),
+            e,
+            hint
+        )
+    })?;
 
     // If pinned file already exists, try to reuse it directly (idempotent)
     if pin_path.exists() {
@@ -296,12 +354,18 @@ pub fn ensure_pinned_proc_offsets_exists(max_entries: u32) -> anyhow::Result<()>
                 Err(_) => {
                     // Best-effort cleanup and propagate error
                     let _ = std::fs::remove_file(&pin_path);
+                    let hint = bpffs_mount_hint_for_pin_path(&pin_path)
+                        .map(|hint| format!(" {hint}"))
+                        .unwrap_or_default();
                     Err(anyhow::anyhow!(
                         "Failed to pin {} at {}: {}",
                         PROC_OFFSETS_MAP_NAME,
                         pin_path.display(),
                         e
-                    ))
+                    )
+                    .context(format!(
+                        "Unable to persist {PROC_OFFSETS_MAP_NAME} in bpffs.{hint}"
+                    )))
                 }
             }
         }
@@ -395,7 +459,18 @@ pub fn allowed_pids_pin_path() -> anyhow::Result<PathBuf> {
 /// Ensure the pinned allowed_pids map exists under the per-process directory.
 pub fn ensure_pinned_allowed_pids_exists(max_entries: u32) -> anyhow::Result<()> {
     let pin_path = allowed_pids_pin_path()?;
-    ensure_pin_dir(&pin_path)?;
+    ensure_pin_dir(&pin_path).map_err(|e| {
+        let hint = bpffs_mount_hint_for_pin_path(&pin_path)
+            .map(|hint| format!(" {hint}"))
+            .unwrap_or_default();
+        anyhow::anyhow!(
+            "Failed to create pin directory for {} at {}: {}.{}",
+            ALLOWED_PIDS_MAP_NAME,
+            pin_path.display(),
+            e,
+            hint
+        )
+    })?;
 
     if pin_path.exists() {
         if MapData::from_pin(&pin_path).is_ok() {
@@ -444,12 +519,18 @@ pub fn ensure_pinned_allowed_pids_exists(max_entries: u32) -> anyhow::Result<()>
             }
             Err(_) => {
                 let _ = std::fs::remove_file(&pin_path);
+                let hint = bpffs_mount_hint_for_pin_path(&pin_path)
+                    .map(|hint| format!(" {hint}"))
+                    .unwrap_or_default();
                 Err(anyhow::anyhow!(
                     "Failed to pin {} at {}: {}",
                     ALLOWED_PIDS_MAP_NAME,
                     pin_path.display(),
                     e
-                ))
+                )
+                .context(format!(
+                    "Unable to persist {ALLOWED_PIDS_MAP_NAME} in bpffs.{hint}"
+                )))
             }
         },
     }
@@ -1165,3 +1246,31 @@ mod tests {
     }
 }
 // Note: map open/write helpers will be added once we standardize on aya APIs across crates.
+
+#[cfg(test)]
+mod bpffs_hint_tests {
+    use super::bpffs_mount_hint_for_state;
+    use std::path::Path;
+
+    #[test]
+    fn bpffs_hint_mentions_mount_for_unmounted_sys_fs_bpf() {
+        let hint =
+            bpffs_mount_hint_for_state(Path::new("/sys/fs/bpf/ghostscope/1/test"), true, false)
+                .expect("expected mount hint");
+        assert!(hint.contains("mount -t bpf bpf /sys/fs/bpf"));
+        assert!(hint.contains("WSL2"));
+    }
+
+    #[test]
+    fn bpffs_hint_omits_message_when_bpffs_is_mounted() {
+        let hint =
+            bpffs_mount_hint_for_state(Path::new("/sys/fs/bpf/ghostscope/1/test"), true, true);
+        assert!(hint.is_none());
+    }
+
+    #[test]
+    fn bpffs_hint_ignores_non_bpffs_paths() {
+        let hint = bpffs_mount_hint_for_state(Path::new("/tmp/ghostscope/test"), true, false);
+        assert!(hint.is_none());
+    }
+}

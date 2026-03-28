@@ -198,6 +198,18 @@ RUST_LOG=debug sudo ghostscope -p $(pidof your_program)
    ls /sys/fs/bpf
    ```
 
+4. 运行 GhostScope 前，检查 `bpffs` 是否已经挂载：
+   ```bash
+   mount | grep bpf
+   ```
+   你应该能看到 `/sys/fs/bpf` 以 `bpf` 文件系统类型挂载。
+   如果 `/sys/fs/bpf` 目录存在，但那里没有实际挂载 `bpffs`，GhostScope 在 pin BPF map 时会失败。
+   有些系统默认不会自动挂载 `bpffs`，WSL2、精简发行版或容器环境里更常见。
+   这种情况下可以执行：
+   ```bash
+   sudo mount -t bpf bpf /sys/fs/bpf
+   ```
+
 ## 下一步
 
 - 阅读[快速教程](tutorial.md)学习基本用法

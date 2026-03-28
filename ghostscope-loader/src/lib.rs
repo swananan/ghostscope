@@ -46,7 +46,9 @@ mod uprobe;
 use uprobe::UprobeAttachmentParams;
 
 // Use shared map types from ghostscope-process
-use ghostscope_process::pinned_bpf_maps::{proc_offsets_pin_dir, proc_offsets_pin_path};
+use ghostscope_process::pinned_bpf_maps::{
+    bpffs_mount_hint_for_pin_path, proc_offsets_pin_dir, proc_offsets_pin_path,
+};
 
 /// Event output map type wrapper
 enum EventMap {
@@ -148,9 +150,13 @@ impl GhostScopeLoader {
         let pin_path = proc_offsets_pin_path()
             .map_err(|e| LoaderError::Generic(format!("Failed to resolve pinned map path: {e}")))?;
         if !pin_path.exists() {
+            let hint = bpffs_mount_hint_for_pin_path(&pin_path)
+                .map(|hint| format!(" {hint}"))
+                .unwrap_or_default();
             return Err(LoaderError::Generic(format!(
-                "Pinned map '{}' not found. Please call ghostscope-process to create it first.",
-                pin_path.display()
+                "Pinned map '{}' not found. Please call ghostscope-process to create it first.{}",
+                pin_path.display(),
+                hint
             )));
         }
 
