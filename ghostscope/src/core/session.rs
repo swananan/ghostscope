@@ -1,6 +1,6 @@
 use crate::config::{MergedConfig, ParsedArgs, ResolvedPidInfo};
+use crate::source_path::SourcePathResolver;
 use crate::tracing::TraceManager;
-use crate::tui::source_path_resolver::SourcePathResolver;
 use anyhow::Result;
 use ghostscope_dwarf::{DwarfAnalyzer, ModuleStats};
 use ghostscope_process::{ProcessManager, ProcessSysmon, SysmonConfig};
