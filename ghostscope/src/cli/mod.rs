@@ -1,7 +1,7 @@
 //! CLI module - handles command line interface and non-TUI mode runtime
 
-pub mod runtime;
 pub mod script_output;
+pub mod script_runtime;
 
 use crate::config::BpffsPruneArgs;
 use anyhow::Result;
@@ -188,4 +188,4 @@ fn print_human_report(args: &BpffsPruneArgs, report: &BpffsPruneReport) {
 }
 
 // Re-export main functions for convenience
-pub use runtime::run_command_line_runtime_with_config;
+pub use script_runtime::run_command_line_runtime_with_config;

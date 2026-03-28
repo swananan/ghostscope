@@ -1,4 +1,4 @@
-//! Runtime module - handles TUI coordination and command processing
+//! TUI module - handles TUI coordination and command processing
 
 pub mod coordinator;
 pub mod dwarf_loader;

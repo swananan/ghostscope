@@ -104,7 +104,7 @@ pub async fn handle_info_source(
     session: &Option<GhostSession>,
     runtime_channels: &mut RuntimeChannels,
 ) {
-    crate::runtime::source_handlers::handle_request_source_code(session, runtime_channels).await;
+    crate::tui::source_handlers::handle_request_source_code(session, runtime_channels).await;
 }
 
 /// Handle InfoFile command
