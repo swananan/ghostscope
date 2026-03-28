@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use super::termination::{terminate_pid_gracefully, GRACEFUL_TERMINATION_TIMEOUT};
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -664,19 +665,47 @@ impl SandboxHandle {
     }
 
     pub fn terminate_pid(&self, pid: u32) -> Result<()> {
-        match &*self.inner {
-            SandboxInner::Host => {
-                terminate_pid_with_shell("host", pid, &format!("kill -TERM {pid}"))?
-            }
-            SandboxInner::Docker(inner) => {
-                terminate_pid_with_shell(
+        let label = self.label().to_owned();
+        terminate_pid_gracefully(
+            pid,
+            &label,
+            GRACEFUL_TERMINATION_TIMEOUT,
+            |pid| match &*self.inner {
+                SandboxInner::Host => {
+                    terminate_pid_with_shell("host", pid, &format!("kill -TERM {pid}"))
+                }
+                SandboxInner::Docker(inner) => terminate_pid_with_shell(
                     &inner.container_name,
                     pid,
                     &format!("docker exec {} kill -TERM {}", inner.container_name, pid),
-                )?;
+                ),
+            },
+            |pid| self.pid_is_running(pid),
+        )
+    }
+
+    fn pid_is_running(&self, pid: u32) -> Result<bool> {
+        match &*self.inner {
+            SandboxInner::Host => Ok(PathBuf::from(format!("/proc/{pid}")).is_dir()),
+            SandboxInner::Docker(inner) => {
+                let output = Command::new("docker")
+                    .args([
+                        "exec",
+                        &inner.container_name,
+                        "test",
+                        "-r",
+                        &format!("/proc/{pid}/status"),
+                    ])
+                    .output()
+                    .with_context(|| {
+                        format!(
+                            "failed to probe pid {} in docker sandbox {}",
+                            pid, inner.container_name
+                        )
+                    })?;
+                Ok(output.status.success())
             }
         }
-        Ok(())
     }
 
     pub fn repo_path_for_fixture_binary(&self, relative_binary: &Path) -> Result<PathBuf> {
