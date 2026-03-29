@@ -41,8 +41,7 @@ curl -sS -X POST http://127.0.0.1:8788/runs \
     "test_case": "test_correct_pid_filtering",
     "topology": {
       "ghostscope": "host",
-      "target": "docker-private",
-      "share": false
+      "target": "docker-private"
     }
   }'
 ```
@@ -61,8 +60,7 @@ curl -sS -X POST http://127.0.0.1:8788/runs \
     },
     "topology": {
       "ghostscope": "host",
-      "target": "docker-private",
-      "share": false
+      "target": "docker-private"
     }
   }'
 ```
@@ -94,8 +92,7 @@ curl -sS -X POST http://127.0.0.1:8788/runs \
     "repo": "/mnt/500g/code/ghostscope",
     "topology": {
       "ghostscope": "host",
-      "target": "docker-private",
-      "share": false
+      "target": "docker-private"
     }
   }'
 curl -sS -X POST http://127.0.0.1:8788/runs \
@@ -105,8 +102,7 @@ curl -sS -X POST http://127.0.0.1:8788/runs \
     "repo": "/mnt/500g/code/ghostscope",
     "topology": {
       "ghostscope": "docker-private",
-      "target": "docker-private",
-      "share": true
+      "target": "docker-private"
     }
   }'
 for test_case in test_invalid_pid_handling test_correct_pid_filtering test_pid_specificity_with_multiple_processes; do
@@ -118,8 +114,7 @@ for test_case in test_invalid_pid_handling test_correct_pid_filtering test_pid_s
       \"test_case\": \"$test_case\",
       \"topology\": {
         \"ghostscope\": \"docker-host\",
-        \"target\": \"docker-host\",
-        \"share\": true
+        \"target\": \"docker-host\"
       }
     }"
 done
@@ -135,8 +130,7 @@ curl -sS -X POST http://127.0.0.1:8788/runs \
     "repo": "/mnt/500g/code/ghostscope",
     "topology": {
       "ghostscope": "host",
-      "target": "docker-private",
-      "share": false
+      "target": "docker-private"
     }
   }'
 
@@ -147,8 +141,7 @@ curl -sS -X POST http://127.0.0.1:8788/runs \
     "repo": "/mnt/500g/code/ghostscope",
     "topology": {
       "ghostscope": "docker-private",
-      "target": "docker-private",
-      "share": true
+      "target": "docker-private"
     }
   }'
 ```
@@ -166,8 +159,7 @@ for test_case in test_invalid_pid_handling test_correct_pid_filtering test_pid_s
       \"test_case\": \"$test_case\",
       \"topology\": {
         \"ghostscope\": \"docker-host\",
-        \"target\": \"docker-host\",
-        \"share\": true
+        \"target\": \"docker-host\"
       }
     }"
 done
@@ -184,14 +176,12 @@ sudo env \
 sudo env \
   E2E_GHOSTSCOPE_SANDBOX=docker-private \
   E2E_TARGET_SANDBOX=docker-private \
-  E2E_SHARE_SANDBOX=1 \
   cargo test --all-features -- --nocapture
 
 for test_case in test_invalid_pid_handling test_correct_pid_filtering test_pid_specificity_with_multiple_processes; do
   sudo env \
     E2E_GHOSTSCOPE_SANDBOX=docker-host \
     E2E_TARGET_SANDBOX=docker-host \
-    E2E_SHARE_SANDBOX=1 \
     cargo test --all-features --test script_execution "$test_case" -- --nocapture
 done
 ```
@@ -223,8 +213,7 @@ curl -sS -X POST http://127.0.0.1:8788/runs \
     "test_case": "test_correct_pid_filtering",
     "topology": {
       "ghostscope": "host",
-      "target": "docker-private",
-      "share": false
+      "target": "docker-private"
     }
   }'
 ```
