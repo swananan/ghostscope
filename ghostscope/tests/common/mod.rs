@@ -24,6 +24,10 @@ lazy_static! {
     static ref COMPILE_COMPLEX_NOPIE_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
     static ref COMPILE_LATE_GLOBALS_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
     static ref COMPILE_INLINE_CALLSITE_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
+    static ref COMPILE_STATIC_SCOPE_DEFAULT_RESULT: Mutex<Option<anyhow::Result<()>>> =
+        Mutex::new(None);
+    static ref COMPILE_STATIC_SCOPE_CLANG_DWARF5_RESULT: Mutex<Option<anyhow::Result<()>>> =
+        Mutex::new(None);
 }
 
 #[allow(dead_code)]
@@ -46,6 +50,8 @@ pub fn init() {
             TestFixtures::get_test_binary_complex_nopie;
         let _use_method_ptr2: fn(&TestFixtures, &str) -> anyhow::Result<PathBuf> =
             TestFixtures::get_test_binary;
+        let _use_method_ptr3: fn(&TestFixtures, &str, FixtureCompiler) -> anyhow::Result<PathBuf> =
+            TestFixtures::get_test_binary_with_compiler;
 
         // Reference all OptimizationLevel variants so clippy does not flag
         // them as dead code in bins that don't use some levels.
@@ -53,6 +59,8 @@ pub fn init() {
         let _ = OptimizationLevel::O2;
         let _ = OptimizationLevel::O3;
         let _ = OptimizationLevel::Stripped;
+        let _ = FixtureCompiler::Default;
+        let _ = FixtureCompiler::ClangDwarf5;
 
         // Exercise runner builder methods so they are referenced in all bins.
         let _ = runner::GhostscopeRunner::new()
@@ -61,6 +69,9 @@ pub fn init() {
             .enable_sysmon_shared_lib(false);
 
         let _use_pid_check: fn(u32) -> bool = host_pid_is_running;
+        let _use_compiler_check: fn(FixtureCompiler) -> bool = fixture_compiler_available;
+        let _use_static_scope_compile: fn(FixtureCompiler) -> anyhow::Result<()> =
+            ensure_static_scope_program_compiled;
     });
 
     // Register an atexit cleanup to remove built fixtures after all tests
@@ -124,6 +135,14 @@ pub fn init() {
                 .current_dir(inline_callsite_dir)
                 .status()
                 .is_ok();
+
+            // static_scope_program
+            let static_scope_dir = base.join("static_scope_program");
+            let _ = Command::new("make")
+                .arg("clean")
+                .current_dir(static_scope_dir)
+                .status()
+                .is_ok();
         }
         libc::atexit(cleanup_fixtures);
     });
@@ -140,6 +159,54 @@ pub enum OptimizationLevel {
     O2,       // -O2
     O3,       // -O3
     Stripped, // -O0 with separate debug file (.gnu_debuglink)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FixtureCompiler {
+    Default,
+    ClangDwarf5,
+}
+
+impl FixtureCompiler {
+    fn binary_name(&self, base: &str) -> String {
+        match self {
+            FixtureCompiler::Default => base.to_string(),
+            FixtureCompiler::ClangDwarf5 => format!("{base}_clang_dwarf5"),
+        }
+    }
+
+    fn object_name(&self, base: &str) -> String {
+        format!("{}.o", self.binary_name(base))
+    }
+
+    fn description(&self) -> &'static str {
+        match self {
+            FixtureCompiler::Default => "default toolchain",
+            FixtureCompiler::ClangDwarf5 => "clang -gdwarf-5",
+        }
+    }
+
+    fn apply_to_c_make(&self, cmd: &mut Command, base: &str) {
+        cmd.arg("all")
+            .arg(format!("BINARY={}", self.binary_name(base)))
+            .arg(format!("OBJ={}", self.object_name(base)));
+
+        if matches!(self, FixtureCompiler::ClangDwarf5) {
+            cmd.arg("CC=clang")
+                .arg("CFLAGS=-Wall -Wextra -gdwarf-5 -O0");
+        }
+    }
+}
+
+pub fn fixture_compiler_available(compiler: FixtureCompiler) -> bool {
+    match compiler {
+        FixtureCompiler::Default => true,
+        FixtureCompiler::ClangDwarf5 => Command::new("clang")
+            .arg("--version")
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false),
+    }
 }
 
 impl OptimizationLevel {
@@ -341,7 +408,46 @@ impl TestFixtures {
     }
 
     pub fn get_test_binary(&self, name: &str) -> anyhow::Result<PathBuf> {
+        if name == "static_scope_program" {
+            // This fixture is compiled in-place and also supports alternate compilers,
+            // so route the default lookup through the compiler-aware path instead of the
+            // legacy tests/fixtures/binaries/<name>/<name> fallback.
+            return self.get_test_binary_with_compiler(name, FixtureCompiler::Default);
+        }
+
         self.get_test_binary_with_opt(name, OptimizationLevel::Debug)
+    }
+
+    pub fn get_test_binary_with_compiler(
+        &self,
+        name: &str,
+        compiler: FixtureCompiler,
+    ) -> anyhow::Result<PathBuf> {
+        if name == "static_scope_program" {
+            ensure_static_scope_program_compiled(compiler)?;
+            let binary_path = self
+                .base_path
+                .join("static_scope_program")
+                .join(compiler.binary_name("static_scope_program"));
+            if !binary_path.exists() {
+                anyhow::bail!(
+                    "Test binary not found: {} ({})",
+                    binary_path.display(),
+                    compiler.description()
+                );
+            }
+            return Ok(binary_path);
+        }
+
+        if !matches!(compiler, FixtureCompiler::Default) {
+            anyhow::bail!(
+                "Compiler override {} is not wired for fixture '{}'",
+                compiler.description(),
+                name
+            );
+        }
+
+        self.get_test_binary(name)
     }
 
     pub fn get_test_binary_with_opt(
@@ -477,6 +583,8 @@ static COMPILE_LATE_GLOBALS: Once = Once::new();
 static COMPILE_RUST_GLOBAL: Once = Once::new();
 static COMPILE_INLINE_CALLSITE: Once = Once::new();
 static COMPILE_CPP_COMPLEX: Once = Once::new();
+static COMPILE_STATIC_SCOPE_DEFAULT: Once = Once::new();
+static COMPILE_STATIC_SCOPE_CLANG_DWARF5: Once = Once::new();
 
 fn ensure_globals_program_compiled() -> anyhow::Result<()> {
     let mut result = Ok(());
@@ -642,4 +750,62 @@ fn ensure_cpp_complex_program_compiled() -> anyhow::Result<()> {
         }
     });
     result
+}
+
+fn ensure_static_scope_program_compiled(compiler: FixtureCompiler) -> anyhow::Result<()> {
+    let (once, slot): (&Once, &Mutex<Option<anyhow::Result<()>>>) = match compiler {
+        FixtureCompiler::Default => (
+            &COMPILE_STATIC_SCOPE_DEFAULT,
+            &*COMPILE_STATIC_SCOPE_DEFAULT_RESULT,
+        ),
+        FixtureCompiler::ClangDwarf5 => (
+            &COMPILE_STATIC_SCOPE_CLANG_DWARF5,
+            &*COMPILE_STATIC_SCOPE_CLANG_DWARF5_RESULT,
+        ),
+    };
+
+    once.call_once(|| {
+        let compile_result = compile_static_scope_program(compiler);
+        *slot.lock().unwrap() = Some(compile_result);
+    });
+
+    match slot.lock().unwrap().as_ref() {
+        Some(Ok(())) => Ok(()),
+        Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
+        None => panic!("Compilation result should be set after call_once"),
+    }
+}
+
+fn compile_static_scope_program(compiler: FixtureCompiler) -> anyhow::Result<()> {
+    let base =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/static_scope_program");
+    println!(
+        "Compiling static_scope_program {} in {base:?}",
+        compiler.description()
+    );
+
+    let mut cmd = Command::new("make");
+    compiler.apply_to_c_make(&mut cmd, "static_scope_program");
+    let output = cmd.current_dir(base).output().map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to run make for static_scope_program {}: {}",
+            compiler.description(),
+            e
+        )
+    })?;
+
+    if output.status.success() {
+        println!(
+            "✓ Successfully compiled static_scope_program {}",
+            compiler.description()
+        );
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(anyhow::anyhow!(
+            "Failed to compile static_scope_program {}: {}",
+            compiler.description(),
+            stderr
+        ))
+    }
 }
