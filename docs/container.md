@@ -136,7 +136,20 @@ This scenario is included because it explains what changes once GhostScope and t
 
 From the user's perspective, the rule is still the same: enter the PID visible where you run the command. But GhostScope's internal implementation is much more complex here than in host-side scenarios.
 
-#### Scenario 6: GhostScope in One Private PID-Namespace Container, Target Outside That PID Namespace
+#### Scenario 6: GhostScope in a Private PID-Namespace Container, Target in a Descendant / Nested Private PID Namespace
+
+This is the "outer container -> child container" case that sits between scenarios 5 and 7.
+
+The important difference from scenario 5 is that GhostScope and the target do not share the exact same PID namespace, but the target is still visible from GhostScope's current `/proc` view because the target lives in a descendant namespace.
+
+- The user still runs GhostScope in the outer container, so `input_pid` is the PID visible from that outer container.
+- `proc_pid` is still usually the same as that outer-container-visible PID.
+- The target may also have a different innermost PID in the child container, so `container_pid` can differ from both `input_pid` and `proc_pid`.
+- If GhostScope uses namespace-aware PID filtering here, the comparison target is no longer "the current `/proc` PID view"; it needs the target PID in the target's own innermost namespace.
+
+This scenario is already part of the intended container scope described later in Topic 4, but the current implementation does not yet model it as a separately validated path. So it should be treated as a missing support gap rather than as a proven-supported variation of scenario 5.
+
+#### Scenario 7: GhostScope in One Private PID-Namespace Container, Target Outside That PID Namespace
 
 This is one of the most ambiguous and failure-prone cases.
 
@@ -168,7 +181,8 @@ Here, "scenario" always means the relationship between two sides:
 | 3. Host -> private PID-namespace container | Host-visible PID entered on the host | Usually the same as `input_pid` in the host `/proc` view | Usually the same as `input_pid` and `proc_pid` | Target PID inside the inner namespace; may differ from `host_pid` | `bpf_get_current_pid_tgid() >> 32 == host_pid` | `bpf_get_current_pid_tgid() >> 32`, usually the same as `host_pid` | Supported |
 | 4. `--pid=host` container -> host / shared-PID target | PID entered inside the container shell, which is already host-visible | Usually the same as `input_pid` | Usually the same as `input_pid` and `proc_pid` | Usually the same as `host_pid` | Helper supported: `bpf_get_ns_current_pid_tgid(...).tgid == proc_pid`; helper unsupported: `bpf_get_current_pid_tgid() >> 32 == host_pid` | `bpf_get_current_pid_tgid() >> 32`, usually the same as `host_pid` | Supported |
 | 5. Private PID-namespace container -> same private PID namespace | Container-visible PID entered inside that container | Usually the same as `input_pid` in the current container `/proc` view | Usually different from `input_pid` and `proc_pid`; corresponds to the first value in `NSpid` | Usually the same as `input_pid` and `proc_pid` when GhostScope and the target share that namespace | Helper supported: `bpf_get_ns_current_pid_tgid(...).tgid == proc_pid`; helper unsupported: if `NSpid` exposes an explicit host mapping, `bpf_get_current_pid_tgid() >> 32 == host_pid`, otherwise fail fast | `bpf_get_current_pid_tgid() >> 32`, usually aligned with `host_pid` rather than `input_pid` | Conditionally supported |
-| 6. Private PID-namespace container -> target outside that PID namespace | Often not satisfiable because the target is not visible in the current `/proc` view | Often unavailable from the current `/proc` view | Often not stably resolvable from the current view; if it exists, it belongs to a PID view outside the current `/proc` namespace | Unreliable or not visible from the current namespace | No stable comparison is installed; GhostScope should fail fast | No stable `event_pid` to `proc_pid` mapping can be assumed | Unsupported |
+| 6. Private PID-namespace container -> descendant / nested private PID namespace | PID entered inside the current container shell, meaning the PID visible from the current container's `/proc` view, not the child container-local PID | Usually the same as `input_pid` in the current container `/proc` view | Usually different from `input_pid` and `proc_pid`; corresponds to the first value in `NSpid` | Usually different from `input_pid` and `proc_pid`; corresponds to the tail of `NSpid`, often the child container-local PID | Semantically this needs `bpf_get_ns_current_pid_tgid(...).tgid == container_pid`; host-view fallback is only defensible when `NSpid` exposes an explicit host mapping. The current implementation does not yet model this case separately | `bpf_get_current_pid_tgid() >> 32`, usually aligned with `host_pid` | Not yet supported |
+| 7. Private PID-namespace container -> target outside that PID namespace | Often not satisfiable because the target is not visible in the current `/proc` view | Often unavailable from the current `/proc` view | Often not stably resolvable from the current view; if it exists, it belongs to a PID view outside the current `/proc` namespace | Unreliable or not visible from the current namespace | No stable comparison is installed; GhostScope should fail fast | No stable `event_pid` to `proc_pid` mapping can be assumed | Unsupported |
 
 Notes:
 
@@ -198,7 +212,7 @@ Result:
 - If `/proc` does not contain that PID at all, GhostScope fails immediately.
 - This means the input does not satisfy the `-p` contract. GhostScope does not try to guess some other PID across namespaces.
 
-This removes obviously invalid inputs early, including scenario-6-like cases where the target is simply not visible in the current `/proc` view.
+This removes obviously invalid inputs early, including scenario-7-like cases where the target is simply not visible in the current `/proc` view.
 
 #### 2. Check Whether GhostScope Itself Looks Like It Runs in a Container
 
@@ -431,7 +445,7 @@ That is why:
 - but it cannot directly replace `proc_pid`
 - and `-t` cannot simply reuse the same PID semantics as `-p` in container-heavy environments
 
-Current container e2e mainly covers smoke scenarios where GhostScope and the target process run in the same container PID view. It does not yet truly cover the `-t` lifecycle-maintenance problem where GhostScope runs on the host and the target runs inside a private PID-namespace container.
+Current container e2e mainly covers smoke scenarios where GhostScope and the target process run in the same container PID view. It does not yet truly cover the `-t` lifecycle-maintenance problem where GhostScope runs on the host and the target runs inside a private PID-namespace container, and it does not yet build the "outer container -> descendant / nested PID namespace target" topology as a first-class e2e case.
 
 ## Topic 3: WSL
 
@@ -462,7 +476,8 @@ The main reason is observability scope:
 So today's container support should be understood more narrowly:
 
 - GhostScope can run on the host and observe target processes that happen to run inside containers on that host. This is the primary container story.
-- GhostScope can run inside a container and observe processes in that same container PID namespace, or in descendant / nested PID namespaces that are still visible from there.
+- GhostScope can run inside a container and observe processes in that same container PID namespace.
+- Descendant / nested PID namespaces that remain visible from that container are still within the intended scope, but the dedicated "outer container -> child container target" case is not yet fully modeled in the current implementation or e2e matrix.
 - GhostScope can run inside a `--pid=host` container and observe host-visible processes because the PID view is shared with the host.
 
 ## Current Implementation Limitations Summary
@@ -475,7 +490,8 @@ The following limitations used to be scattered in `limitations.md`. They are now
 - If the helper is unavailable, GhostScope falls back to host PID mapping derived from `NSpid`, but only when that mapping is explicit enough to be trusted.
 - `-p` must refer to a PID visible in the current PID namespace. If the PID is not visible in the current `/proc`, GhostScope fails immediately rather than guessing across namespaces.
 - The current implementation is intentionally stricter in one more case: in a container-like environment, if the helper is unavailable and `NSpid` cannot provide an explicit host mapping, GhostScope fails instead of guessing, unless the target remains in the initial PID namespace.
-- Scenario 6 (GhostScope in one private PID namespace, target outside that namespace) is not currently supported. `-p` should fail rather than attempting to guess a cross-namespace PID mapping.
+- Scenario 6 (GhostScope in a private PID namespace container, target in a descendant / nested private PID namespace) is within the intended scope, but the current implementation does not yet model it as a separately validated path. In particular, namespace-aware PID filtering would need to distinguish the current `/proc` PID view from the target's innermost `container_pid`.
+- Scenario 7 (GhostScope in one private PID namespace, target outside that namespace) is not currently supported. `-p` should fail rather than attempting to guess a cross-namespace PID mapping.
 - In container PID-namespace environments, if the helper is unavailable, `$pid/$tid` in scripts may reflect host-namespace values rather than the PID visible inside the container.
 - `-t` depends on sysmon to maintain runtime process lifecycle state. sysmon's `event_pid` comes from `bpf_get_current_pid_tgid() >> 32` and aligns with host-view PID semantics. In cross-PID-namespace cases, alignment between `event_pid` and `proc_pid` is not currently reliable, so `-t` has a structural limitation in those scenarios.
 
