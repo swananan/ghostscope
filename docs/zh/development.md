@@ -184,9 +184,6 @@ curl -sS -X POST http://127.0.0.1:8788/runs \
   控制 Rust e2e 里 GhostScope 自己运行在哪个环境。默认：`host`。
 - `E2E_TARGET_SANDBOX=host|docker-private|docker-host`
   控制 Rust e2e 里被追踪目标进程运行在哪个环境。默认：`host`。
-- `E2E_SHARE_SANDBOX=1|0`
-  当 GhostScope 和目标使用同一种 sandbox 类型时，是否复用同一个 sandbox。
-  默认：`0`。只有两边使用相同的非 host sandbox 时，这个变量才有意义。
 - `E2E_GHOSTSCOPE_LOG_LEVEL=error|warn|info|debug|trace`
   为直接执行的 `cargo test` 打开 GhostScope 日志并设置日志级别。
   设置该变量后，测试 helper 会自动启用 GhostScope 的文件日志和控制台日志。
@@ -213,8 +210,7 @@ curl -sS -X POST http://127.0.0.1:8788/runs \
     },
     "topology": {
       "ghostscope": "host",
-      "target": "docker-private",
-      "share": false
+      "target": "docker-private"
     }
   }'
 ```
@@ -240,7 +236,6 @@ sudo env \
 sudo env \
   E2E_GHOSTSCOPE_SANDBOX=docker-private \
   E2E_TARGET_SANDBOX=docker-private \
-  E2E_SHARE_SANDBOX=1 \
   cargo test --all-features -- --nocapture
 ```
 
@@ -252,7 +247,6 @@ for test_case in test_invalid_pid_handling test_correct_pid_filtering test_pid_s
   sudo env \
     E2E_GHOSTSCOPE_SANDBOX=docker-host \
     E2E_TARGET_SANDBOX=docker-host \
-    E2E_SHARE_SANDBOX=1 \
     cargo test --all-features --test script_execution "$test_case" -- --nocapture
 done
 ```
@@ -260,6 +254,7 @@ done
 说明：
 
 - Rust 测试 harness 仍运行在宿主机上，GhostScope 和目标进程会按指定拓扑进入对应容器 sandbox。
+- 当 GhostScope 和目标使用同一种 sandbox 类型时，topology-aware e2e helper 会自动复用同一个 sandbox 实例。
 - `host -> docker-private` 和 `docker-private -> same docker-private` 是当前在 CI 中跑全量 e2e 的容器场景。
 - `docker-host -> same docker-host` 仍保留为 smoke，因为它更接近默认的 host PID 视角。
 - `docker-private` 这一组通常需要 `sudo`，因为宿主机上的测试 harness 需要检查该 sandbox 的 PID namespace。

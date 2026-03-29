@@ -34,7 +34,6 @@ Common env vars:
 - `logging.level` (`error|warn|info|debug|trace`, optional)
 - `topology.ghostscope` (`host|docker-private|docker-host`, optional)
 - `topology.target` (`host|docker-private|docker-host`, optional)
-- `topology.share` (`true|false`, optional; defaults to `false`)
 
 Example:
 
@@ -74,8 +73,7 @@ curl -sS -X POST http://127.0.0.1:8788/runs \
     "repo": "/mnt/500g/code/ghostscope",
     "topology": {
       "ghostscope": "host",
-      "target": "docker-private",
-      "share": false
+      "target": "docker-private"
     }
   }'
 
@@ -86,8 +84,7 @@ curl -sS -X POST http://127.0.0.1:8788/runs \
     "repo": "/mnt/500g/code/ghostscope",
     "topology": {
       "ghostscope": "docker-private",
-      "target": "docker-private",
-      "share": true
+      "target": "docker-private"
     }
   }'
 
@@ -100,8 +97,7 @@ for test_case in test_invalid_pid_handling test_correct_pid_filtering test_pid_s
       \"test_case\": \"$test_case\",
       \"topology\": {
         \"ghostscope\": \"docker-host\",
-        \"target\": \"docker-host\",
-        \"share\": true
+        \"target\": \"docker-host\"
       }
     }"
 done
@@ -114,7 +110,6 @@ for test_case in test_invalid_pid_handling test_correct_pid_filtering test_pid_s
   sudo env \
     E2E_GHOSTSCOPE_SANDBOX=docker-private \
     E2E_TARGET_SANDBOX=docker-private \
-    E2E_SHARE_SANDBOX=1 \
     cargo test --all-features --test script_execution "$test_case" -- --nocapture
 done
 
@@ -122,7 +117,6 @@ for test_case in test_invalid_pid_handling test_correct_pid_filtering test_pid_s
   sudo env \
     E2E_GHOSTSCOPE_SANDBOX=docker-host \
     E2E_TARGET_SANDBOX=docker-host \
-    E2E_SHARE_SANDBOX=1 \
     cargo test --all-features --test script_execution "$test_case" -- --nocapture
 done
 ```

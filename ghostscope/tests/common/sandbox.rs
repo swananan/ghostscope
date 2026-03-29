@@ -25,15 +25,14 @@ static STALE_DOCKER_SANDBOX_SWEEP: OnceLock<Result<(), String>> = OnceLock::new(
 struct DefaultSandboxState {
     ghostscope: DefaultSandboxSelection,
     target: DefaultSandboxSelection,
-    share: bool,
     handles: Mutex<CachedDefaultSandboxes>,
 }
 
 #[derive(Debug, Default)]
 struct CachedDefaultSandboxes {
-    ghostscope: Option<Weak<SandboxInner>>,
-    target: Option<Weak<SandboxInner>>,
-    shared: Option<Weak<SandboxInner>>,
+    host: Option<Weak<SandboxInner>>,
+    docker_private: Option<Weak<SandboxInner>>,
+    docker_host: Option<Weak<SandboxInner>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -781,10 +780,7 @@ impl DefaultSandboxState {
             .handles
             .lock()
             .map_err(|_| anyhow::anyhow!("default sandbox cache mutex was poisoned"))?;
-        if self.share {
-            return get_or_create_cached_sandbox(&mut handles.shared, self.ghostscope);
-        }
-        get_or_create_cached_sandbox(&mut handles.ghostscope, self.ghostscope)
+        get_or_create_cached_sandbox(handles.slot_for_selection(self.ghostscope), self.ghostscope)
     }
 
     fn target_handle(&self) -> Result<SandboxHandle> {
@@ -792,10 +788,20 @@ impl DefaultSandboxState {
             .handles
             .lock()
             .map_err(|_| anyhow::anyhow!("default sandbox cache mutex was poisoned"))?;
-        if self.share {
-            return get_or_create_cached_sandbox(&mut handles.shared, self.target);
+        get_or_create_cached_sandbox(handles.slot_for_selection(self.target), self.target)
+    }
+}
+
+impl CachedDefaultSandboxes {
+    fn slot_for_selection(
+        &mut self,
+        selection: DefaultSandboxSelection,
+    ) -> &mut Option<Weak<SandboxInner>> {
+        match selection {
+            DefaultSandboxSelection::Host => &mut self.host,
+            DefaultSandboxSelection::DockerPrivate => &mut self.docker_private,
+            DefaultSandboxSelection::DockerHost => &mut self.docker_host,
         }
-        get_or_create_cached_sandbox(&mut handles.target, self.target)
     }
 }
 
@@ -827,34 +833,12 @@ fn resolve_default_sandbox_state() -> Result<DefaultSandboxState> {
         DefaultSandboxSelection::from_env("E2E_GHOSTSCOPE_SANDBOX", DefaultSandboxSelection::Host)?;
     let target =
         DefaultSandboxSelection::from_env("E2E_TARGET_SANDBOX", DefaultSandboxSelection::Host)?;
-    let share = bool_env("E2E_SHARE_SANDBOX")?.unwrap_or(false);
-
-    if share {
-        anyhow::ensure!(
-            ghostscope == target,
-            "E2E_SHARE_SANDBOX=1 requires GhostScope and target to use the same sandbox kind"
-        );
-    }
 
     Ok(DefaultSandboxState {
         ghostscope,
         target,
-        share,
         handles: Mutex::new(CachedDefaultSandboxes::default()),
     })
-}
-
-fn bool_env(name: &str) -> Result<Option<bool>> {
-    match std::env::var(name) {
-        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => Ok(Some(true)),
-            "0" | "false" | "no" | "off" => Ok(Some(false)),
-            _ => anyhow::bail!("invalid boolean value for {name}: {value}"),
-        },
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(err) => Err(anyhow::Error::new(err))
-            .with_context(|| format!("failed to read environment variable {name}")),
-    }
 }
 
 fn resolve_default_image() -> String {

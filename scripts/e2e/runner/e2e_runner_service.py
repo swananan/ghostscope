@@ -18,8 +18,7 @@ POST /runs body (JSON, optional):
   },
   "topology": {
     "ghostscope": "host",
-    "target": "docker-private",
-    "share": false
+    "target": "docker-private"
   }
 }
 
@@ -86,7 +85,6 @@ class Job:
     ghostscope_log_level: Optional[str]
     ghostscope_sandbox: str
     target_sandbox: str
-    share_sandbox: bool
     status: str = "queued"
     created_at: str = field(default_factory=now_iso)
     started_at: Optional[str] = None
@@ -191,7 +189,6 @@ class JobStore:
         requested_ghostscope_log_level: Optional[str],
         requested_ghostscope_sandbox: Optional[str],
         requested_target_sandbox: Optional[str],
-        requested_share_sandbox: Optional[bool],
     ) -> Job:
         repo = self._resolve_repo(requested_repo)
         test_case = normalize_test_case(requested_test_case)
@@ -202,12 +199,6 @@ class JobStore:
         target_sandbox = normalize_sandbox_selection(
             "target_sandbox", requested_target_sandbox
         ) or "host"
-        share_sandbox = requested_share_sandbox or False
-        if share_sandbox:
-            if ghostscope_sandbox != target_sandbox:
-                raise ValueError(
-                    "share_sandbox=true requires ghostscope_sandbox and target_sandbox to match"
-                )
 
         job = Job(
             id=uuid.uuid4().hex[:12],
@@ -218,7 +209,6 @@ class JobStore:
             ghostscope_log_level=ghostscope_log_level,
             ghostscope_sandbox=ghostscope_sandbox,
             target_sandbox=target_sandbox,
-            share_sandbox=share_sandbox,
         )
         with self._lock:
             self._jobs[job.id] = job
@@ -273,11 +263,9 @@ class JobStore:
             "ghostscope_log_level": job.ghostscope_log_level,
             "ghostscope_sandbox": job.ghostscope_sandbox,
             "target_sandbox": job.target_sandbox,
-            "share_sandbox": job.share_sandbox,
             "topology": {
                 "ghostscope": job.ghostscope_sandbox,
                 "target": job.target_sandbox,
-                "share": job.share_sandbox,
             },
             "steps": len(job.steps),
             "log_lines": len(job.logs),
@@ -321,7 +309,6 @@ class JobStore:
             env["CARGO_HOME"] = self.cargo_home
         env["E2E_GHOSTSCOPE_SANDBOX"] = job.ghostscope_sandbox
         env["E2E_TARGET_SANDBOX"] = job.target_sandbox
-        env["E2E_SHARE_SANDBOX"] = "1" if job.share_sandbox else "0"
         if job.ghostscope_log_level:
             env["E2E_GHOSTSCOPE_LOG_LEVEL"] = job.ghostscope_log_level
         else:
@@ -365,8 +352,7 @@ class JobStore:
                     f"id={job.id} repo={job.repo} test_case={job.test_case or '<all>'} "
                     f"requested_sudo={job.requested_sudo} "
                     f"log_level={job.ghostscope_log_level or '<default>'} "
-                    f"topology={job.ghostscope_sandbox}->{job.target_sandbox} "
-                    f"share={job.share_sandbox}"
+                    f"topology={job.ghostscope_sandbox}->{job.target_sandbox}"
                 ),
             )
 
@@ -573,19 +559,6 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
-        requested_share_sandbox = body.get(
-            "share_sandbox",
-            topology.get("share") if topology else None,
-        )
-        if requested_share_sandbox is not None and not isinstance(
-            requested_share_sandbox, bool
-        ):
-            self._write_json(
-                HTTPStatus.BAD_REQUEST,
-                {"error": "share_sandbox must be true/false"},
-            )
-            return
-
         try:
             job = self.store.create_job(
                 requested_sudo=requested_sudo,
@@ -594,7 +567,6 @@ class Handler(BaseHTTPRequestHandler):
                 requested_ghostscope_log_level=requested_ghostscope_log_level,
                 requested_ghostscope_sandbox=requested_ghostscope_sandbox,
                 requested_target_sandbox=requested_target_sandbox,
-                requested_share_sandbox=requested_share_sandbox,
             )
         except ValueError as exc:
             self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
@@ -612,11 +584,9 @@ class Handler(BaseHTTPRequestHandler):
                 "ghostscope_log_level": job.ghostscope_log_level,
                 "ghostscope_sandbox": job.ghostscope_sandbox,
                 "target_sandbox": job.target_sandbox,
-                "share_sandbox": job.share_sandbox,
                 "topology": {
                     "ghostscope": job.ghostscope_sandbox,
                     "target": job.target_sandbox,
-                    "share": job.share_sandbox,
                 },
             },
         )

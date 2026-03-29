@@ -183,9 +183,6 @@ Test-framework environment variables:
   Controls where GhostScope itself runs in Rust e2e tests. Default: `host`.
 - `E2E_TARGET_SANDBOX=host|docker-private|docker-host`
   Controls where the traced target process runs in Rust e2e tests. Default: `host`.
-- `E2E_SHARE_SANDBOX=1|0`
-  When GhostScope and target use the same sandbox type, reuse a single sandbox for both.
-  Default: `0`. This only makes sense when both sides use the same non-host sandbox.
 - `E2E_GHOSTSCOPE_LOG_LEVEL=error|warn|info|debug|trace`
   Enables GhostScope logging for direct `cargo test` runs and sets the log level.
   The test helper automatically turns on GhostScope file+console logging when this is set.
@@ -212,8 +209,7 @@ curl -sS -X POST http://127.0.0.1:8788/runs \
     },
     "topology": {
       "ghostscope": "host",
-      "target": "docker-private",
-      "share": false
+      "target": "docker-private"
     }
   }'
 ```
@@ -239,7 +235,6 @@ sudo env \
 sudo env \
   E2E_GHOSTSCOPE_SANDBOX=docker-private \
   E2E_TARGET_SANDBOX=docker-private \
-  E2E_SHARE_SANDBOX=1 \
   cargo test --all-features -- --nocapture
 ```
 
@@ -251,7 +246,6 @@ for test_case in test_invalid_pid_handling test_correct_pid_filtering test_pid_s
   sudo env \
     E2E_GHOSTSCOPE_SANDBOX=docker-host \
     E2E_TARGET_SANDBOX=docker-host \
-    E2E_SHARE_SANDBOX=1 \
     cargo test --all-features --test script_execution "$test_case" -- --nocapture
 done
 ```
@@ -259,6 +253,7 @@ done
 Notes:
 
 - These commands keep the Rust test harness on the host and move GhostScope plus the traced target into the requested container sandbox topology.
+- When GhostScope and target use the same sandbox kind, the topology-aware e2e helper automatically reuses the same sandbox instance.
 - `host -> docker-private` and `docker-private -> same docker-private` are the container scenarios that run the full e2e suite in CI.
 - `docker-host -> same docker-host` remains a smoke run because it is close to the default host PID view.
 - Running the `docker-private` variant usually requires `sudo` because the host-side test harness must inspect the sandbox PID namespace.
