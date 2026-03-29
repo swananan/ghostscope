@@ -30,6 +30,92 @@ lazy_static! {
         Mutex::new(None);
 }
 
+#[derive(Debug, Clone, Copy)]
+enum CleanupCommand {
+    Make,
+    Cargo,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RegisteredFixtureKind {
+    Sample,
+    ComplexTypes,
+    Globals,
+    LateGlobals,
+    RustGlobal,
+    InlineCallsite,
+    CppComplex,
+    StaticScope,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RegisteredFixture {
+    name: &'static str,
+    directory: &'static str,
+    cleanup: CleanupCommand,
+    kind: RegisteredFixtureKind,
+}
+
+// TODO: Replace this string-keyed registry with a strongly typed FixtureId enum
+// and move the per-fixture behavior behind impl methods. This table is an
+// intermediate step to remove scattered name-based special cases.
+const REGISTERED_FIXTURES: &[RegisteredFixture] = &[
+    RegisteredFixture {
+        name: "sample_program",
+        directory: "sample_program",
+        cleanup: CleanupCommand::Make,
+        kind: RegisteredFixtureKind::Sample,
+    },
+    RegisteredFixture {
+        name: "complex_types_program",
+        directory: "complex_types_program",
+        cleanup: CleanupCommand::Make,
+        kind: RegisteredFixtureKind::ComplexTypes,
+    },
+    RegisteredFixture {
+        name: "globals_program",
+        directory: "globals_program",
+        cleanup: CleanupCommand::Make,
+        kind: RegisteredFixtureKind::Globals,
+    },
+    RegisteredFixture {
+        name: "late_globals_program",
+        directory: "late_globals_program",
+        cleanup: CleanupCommand::Make,
+        kind: RegisteredFixtureKind::LateGlobals,
+    },
+    RegisteredFixture {
+        name: "rust_global_program",
+        directory: "rust_global_program",
+        cleanup: CleanupCommand::Cargo,
+        kind: RegisteredFixtureKind::RustGlobal,
+    },
+    RegisteredFixture {
+        name: "inline_callsite_program",
+        directory: "inline_callsite_program",
+        cleanup: CleanupCommand::Make,
+        kind: RegisteredFixtureKind::InlineCallsite,
+    },
+    RegisteredFixture {
+        name: "cpp_complex_program",
+        directory: "cpp_complex_program",
+        cleanup: CleanupCommand::Make,
+        kind: RegisteredFixtureKind::CppComplex,
+    },
+    RegisteredFixture {
+        name: "static_scope_program",
+        directory: "static_scope_program",
+        cleanup: CleanupCommand::Make,
+        kind: RegisteredFixtureKind::StaticScope,
+    },
+];
+
+fn registered_fixture(name: &str) -> Option<&'static RegisteredFixture> {
+    REGISTERED_FIXTURES
+        .iter()
+        .find(|fixture| fixture.name == name)
+}
+
 #[allow(dead_code)]
 pub(crate) fn host_pid_is_running(pid: u32) -> bool {
     PathBuf::from(format!("/proc/{pid}")).is_dir()
@@ -79,70 +165,9 @@ pub fn init() {
         extern "C" fn cleanup_fixtures() {
             // Best-effort cleanup; ignore errors
             let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-
-            // sample_program
-            let sample_dir = base.join("sample_program");
-            let _ = Command::new("make")
-                .arg("clean")
-                .current_dir(sample_dir)
-                .status()
-                .is_ok();
-
-            // complex_types_program (also remove Non-PIE target)
-            let complex_dir = base.join("complex_types_program");
-            let _ = Command::new("make")
-                .arg("clean")
-                .current_dir(complex_dir)
-                .status()
-                .is_ok();
-
-            // globals_program
-            let globals_dir = base.join("globals_program");
-            let _ = Command::new("make")
-                .arg("clean")
-                .current_dir(globals_dir)
-                .status()
-                .is_ok();
-
-            // late_globals_program
-            let late_globals_dir = base.join("late_globals_program");
-            let _ = Command::new("make")
-                .arg("clean")
-                .current_dir(late_globals_dir)
-                .status()
-                .is_ok();
-
-            // cpp_complex_program
-            let cpp_complex_dir = base.join("cpp_complex_program");
-            let _ = Command::new("make")
-                .arg("clean")
-                .current_dir(cpp_complex_dir)
-                .status()
-                .is_ok();
-
-            // rust_global_program
-            let rust_global_dir = base.join("rust_global_program");
-            let _ = Command::new("cargo")
-                .arg("clean")
-                .current_dir(rust_global_dir)
-                .status()
-                .is_ok();
-
-            // inline_callsite_program
-            let inline_callsite_dir = base.join("inline_callsite_program");
-            let _ = Command::new("make")
-                .arg("clean")
-                .current_dir(inline_callsite_dir)
-                .status()
-                .is_ok();
-
-            // static_scope_program
-            let static_scope_dir = base.join("static_scope_program");
-            let _ = Command::new("make")
-                .arg("clean")
-                .current_dir(static_scope_dir)
-                .status()
-                .is_ok();
+            for fixture in REGISTERED_FIXTURES {
+                fixture.cleanup(&base);
+            }
         }
         libc::atexit(cleanup_fixtures);
     });
@@ -194,6 +219,105 @@ impl FixtureCompiler {
         if matches!(self, FixtureCompiler::ClangDwarf5) {
             cmd.arg("CC=clang")
                 .arg("CFLAGS=-Wall -Wextra -gdwarf-5 -O0");
+        }
+    }
+}
+
+impl RegisteredFixture {
+    fn dir(&self, fixtures_base: &std::path::Path) -> PathBuf {
+        fixtures_base.join(self.directory)
+    }
+
+    fn cleanup(&self, fixtures_base: &std::path::Path) {
+        let dir = self.dir(fixtures_base);
+        let mut cmd = match self.cleanup {
+            CleanupCommand::Make => {
+                let mut cmd = Command::new("make");
+                cmd.arg("clean");
+                cmd
+            }
+            CleanupCommand::Cargo => {
+                let mut cmd = Command::new("cargo");
+                cmd.arg("clean");
+                cmd
+            }
+        };
+        let _ = cmd.current_dir(dir).status().is_ok();
+    }
+
+    fn binary_path_with_opt(
+        &self,
+        fixtures_base: &std::path::Path,
+        opt_level: OptimizationLevel,
+    ) -> anyhow::Result<PathBuf> {
+        let dir = self.dir(fixtures_base);
+        match self.kind {
+            RegisteredFixtureKind::Sample => {
+                ensure_test_program_compiled_with_opt(opt_level)?;
+                Ok(dir.join(opt_level.as_binary_name()))
+            }
+            RegisteredFixtureKind::ComplexTypes => {
+                ensure_complex_program_compiled_with_opt(opt_level)?;
+                let bin_name = match opt_level {
+                    OptimizationLevel::Debug => "complex_types_program",
+                    OptimizationLevel::O1 => "complex_types_program_o1",
+                    OptimizationLevel::O2 => "complex_types_program_o2",
+                    OptimizationLevel::O3 => "complex_types_program_o3",
+                    OptimizationLevel::Stripped => {
+                        anyhow::bail!(
+                            "Stripped optimization level not supported for complex_types_program"
+                        )
+                    }
+                };
+                Ok(dir.join(bin_name))
+            }
+            RegisteredFixtureKind::Globals => {
+                ensure_globals_program_compiled()?;
+                Ok(dir.join("globals_program"))
+            }
+            RegisteredFixtureKind::LateGlobals => {
+                ensure_late_globals_program_compiled()?;
+                Ok(dir.join("late_globals_program"))
+            }
+            RegisteredFixtureKind::RustGlobal => {
+                ensure_rust_global_program_compiled()?;
+                Ok(dir.join("target").join("debug").join("rust_global_program"))
+            }
+            RegisteredFixtureKind::InlineCallsite => {
+                ensure_inline_callsite_program_compiled()?;
+                Ok(dir.join("inline_callsite_program"))
+            }
+            RegisteredFixtureKind::CppComplex => {
+                ensure_cpp_complex_program_compiled()?;
+                Ok(dir.join("cpp_complex_program"))
+            }
+            RegisteredFixtureKind::StaticScope => {
+                ensure_static_scope_program_compiled(FixtureCompiler::Default)?;
+                Ok(dir.join(FixtureCompiler::Default.binary_name(self.name)))
+            }
+        }
+    }
+
+    fn binary_path_with_compiler(
+        &self,
+        fixtures_base: &std::path::Path,
+        compiler: FixtureCompiler,
+    ) -> anyhow::Result<PathBuf> {
+        match self.kind {
+            RegisteredFixtureKind::StaticScope => {
+                ensure_static_scope_program_compiled(compiler)?;
+                Ok(self
+                    .dir(fixtures_base)
+                    .join(compiler.binary_name(self.name)))
+            }
+            _ if matches!(compiler, FixtureCompiler::Default) => {
+                self.binary_path_with_opt(fixtures_base, OptimizationLevel::Debug)
+            }
+            _ => anyhow::bail!(
+                "Compiler override {} is not wired for fixture '{}'",
+                compiler.description(),
+                self.name
+            ),
         }
     }
 }
@@ -408,13 +532,6 @@ impl TestFixtures {
     }
 
     pub fn get_test_binary(&self, name: &str) -> anyhow::Result<PathBuf> {
-        if name == "static_scope_program" {
-            // This fixture is compiled in-place and also supports alternate compilers,
-            // so route the default lookup through the compiler-aware path instead of the
-            // legacy tests/fixtures/binaries/<name>/<name> fallback.
-            return self.get_test_binary_with_compiler(name, FixtureCompiler::Default);
-        }
-
         self.get_test_binary_with_opt(name, OptimizationLevel::Debug)
     }
 
@@ -423,31 +540,27 @@ impl TestFixtures {
         name: &str,
         compiler: FixtureCompiler,
     ) -> anyhow::Result<PathBuf> {
-        if name == "static_scope_program" {
-            ensure_static_scope_program_compiled(compiler)?;
-            let binary_path = self
-                .base_path
-                .join("static_scope_program")
-                .join(compiler.binary_name("static_scope_program"));
-            if !binary_path.exists() {
-                anyhow::bail!(
-                    "Test binary not found: {} ({})",
-                    binary_path.display(),
-                    compiler.description()
-                );
-            }
-            return Ok(binary_path);
-        }
-
-        if !matches!(compiler, FixtureCompiler::Default) {
+        let binary_path = if let Some(fixture) = registered_fixture(name) {
+            fixture.binary_path_with_compiler(&self.base_path, compiler)?
+        } else if matches!(compiler, FixtureCompiler::Default) {
+            self.base_path.join("binaries").join(name).join(name)
+        } else {
             anyhow::bail!(
                 "Compiler override {} is not wired for fixture '{}'",
                 compiler.description(),
                 name
             );
+        };
+
+        if !binary_path.exists() {
+            anyhow::bail!(
+                "Test binary not found: {} ({})",
+                binary_path.display(),
+                compiler.description()
+            );
         }
 
-        self.get_test_binary(name)
+        Ok(binary_path)
     }
 
     pub fn get_test_binary_with_opt(
@@ -455,54 +568,8 @@ impl TestFixtures {
         name: &str,
         opt_level: OptimizationLevel,
     ) -> anyhow::Result<PathBuf> {
-        let binary_path = if name == "sample_program" {
-            // Ensure compilation happens before getting binary path
-            ensure_test_program_compiled_with_opt(opt_level)?;
-            self.base_path
-                .join("sample_program")
-                .join(opt_level.as_binary_name())
-        } else if name == "complex_types_program" {
-            ensure_complex_program_compiled_with_opt(opt_level)?;
-            let bin_name = match opt_level {
-                OptimizationLevel::Debug => "complex_types_program",
-                OptimizationLevel::O1 => "complex_types_program_o1",
-                OptimizationLevel::O2 => "complex_types_program_o2",
-                OptimizationLevel::O3 => "complex_types_program_o3",
-                OptimizationLevel::Stripped => {
-                    anyhow::bail!(
-                        "Stripped optimization level not supported for complex_types_program"
-                    )
-                }
-            };
-            self.base_path.join("complex_types_program").join(bin_name)
-        } else if name == "globals_program" {
-            // Only debug build for globals fixture
-            ensure_globals_program_compiled()?;
-            self.base_path
-                .join("globals_program")
-                .join("globals_program")
-        } else if name == "late_globals_program" {
-            ensure_late_globals_program_compiled()?;
-            self.base_path
-                .join("late_globals_program")
-                .join("late_globals_program")
-        } else if name == "rust_global_program" {
-            ensure_rust_global_program_compiled()?;
-            self.base_path
-                .join("rust_global_program")
-                .join("target")
-                .join("debug")
-                .join("rust_global_program")
-        } else if name == "inline_callsite_program" {
-            ensure_inline_callsite_program_compiled()?;
-            self.base_path
-                .join("inline_callsite_program")
-                .join("inline_callsite_program")
-        } else if name == "cpp_complex_program" {
-            ensure_cpp_complex_program_compiled()?;
-            self.base_path
-                .join("cpp_complex_program")
-                .join("cpp_complex_program")
+        let binary_path = if let Some(fixture) = registered_fixture(name) {
+            fixture.binary_path_with_opt(&self.base_path, opt_level)?
         } else {
             // Fallback to old binaries directory (debug only)
             self.base_path.join("binaries").join(name).join(name)
