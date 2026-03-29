@@ -667,11 +667,13 @@ impl<'a> DwarfParser<'a> {
     ///
     ///   - DW_AT_location = Addr(...)
     ///   - Exprloc([DW_OP_addr ...])
+    ///   - Exprloc([DW_OP_addrx ...]) resolved through `.debug_addr`
     ///   - Exprloc([DW_OP_constu ...]) in the legacy constant-as-address form
     ///
     /// We must reject value expressions like:
     ///
     ///   - DW_OP_addr ...; DW_OP_stack_value
+    ///   - DW_OP_addrx ...; DW_OP_stack_value
     ///
     /// because those describe the variable's value, not a place where the
     /// variable itself lives. Optimized locals that hold constant addresses are
@@ -685,9 +687,9 @@ impl<'a> DwarfParser<'a> {
             match attr.value() {
                 gimli::AttributeValue::Addr(a) => return Ok(Some(a)),
                 gimli::AttributeValue::Exprloc(expr) => {
-                    return Ok(Self::extract_absolute_storage_address_from_expr(
+                    return Ok(self.extract_absolute_storage_address_from_expr(
+                        unit,
                         gimli::Expression(expr.0),
-                        unit.encoding(),
                     ));
                 }
                 gimli::AttributeValue::LocationListsRef(offs) => {
@@ -696,9 +698,9 @@ impl<'a> DwarfParser<'a> {
                         .locations(unit, gimli::LocationListsOffset(offs.0))
                     {
                         while let Ok(Some(loc)) = locations.next() {
-                            if let Some(address) = Self::extract_absolute_storage_address_from_expr(
+                            if let Some(address) = self.extract_absolute_storage_address_from_expr(
+                                unit,
                                 gimli::Expression(loc.data.0),
-                                unit.encoding(),
                             ) {
                                 return Ok(Some(address));
                             }
@@ -710,9 +712,9 @@ impl<'a> DwarfParser<'a> {
                         self.dwarf.locations(unit, gimli::LocationListsOffset(off))
                     {
                         while let Ok(Some(loc)) = locations.next() {
-                            if let Some(address) = Self::extract_absolute_storage_address_from_expr(
+                            if let Some(address) = self.extract_absolute_storage_address_from_expr(
+                                unit,
                                 gimli::Expression(loc.data.0),
-                                unit.encoding(),
                             ) {
                                 return Ok(Some(address));
                             }
@@ -726,16 +728,21 @@ impl<'a> DwarfParser<'a> {
     }
 
     fn extract_absolute_storage_address_from_expr(
+        &self,
+        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
         mut expr: gimli::Expression<EndianArcSlice<LittleEndian>>,
-        encoding: gimli::Encoding,
     ) -> Option<u64> {
         let mut operations = Vec::new();
-        while let Ok(op) = gimli::Operation::parse(&mut expr.0, encoding) {
+        while let Ok(op) = gimli::Operation::parse(&mut expr.0, unit.encoding()) {
             operations.push(op);
         }
 
         match operations.as_slice() {
             [gimli::Operation::Address { address }] => Some(*address),
+            // clang/LLVM commonly encodes function-scoped statics in DWARF5 as a
+            // single `DW_OP_addrx` op. This is still a true storage location, just
+            // indirected through `.debug_addr`.
+            [gimli::Operation::AddressIndex { index }] => self.dwarf.address(unit, *index).ok(),
             [gimli::Operation::UnsignedConstant { value }] => Some(*value),
             // Anything more complex may be a computed value or a composite
             // location. In particular, `DW_OP_stack_value` means the expression
