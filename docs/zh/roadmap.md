@@ -7,8 +7,13 @@ GhostScope 仍处在快速演进阶段，以下里程碑按照“优先修补基
 - 在验证 eBPF 验证器限制后，逐步引入表达式/动态下标，确保性能与安全达标。
 
 ## 容器追踪增强
-- 容器（Docker/WSL 等）环境下的 `-p <pid>` 模式仍存在软限制，详见[限制列表](limitations.md#9-容器-wsl-场景下--pid-pid-模式的软限制)。
+- 容器（Docker/WSL 等）环境下的 `-p <pid>` 模式仍存在软限制，详见[限制列表](limitations.md#10-容器-wsl-场景下--pid-pid-模式的软限制)。
 - 待核心能力稳定后，会评估如何改进在这些隔离场景中的兼容性。
+
+## Uprobe 增强
+- 支持 sleepable uprobe（`uprobe.s` / `uretprobe.s`），在合适场景下使用可睡眠 helper，尤其提升用户态内存读取的可靠性。
+- 支持 multi-attach uprobe（`uprobe.multi` / `uretprobe.multi`），让脚本展开出大量探针点时仍能保持更好的扩展性。
+- 对暂时只能走普通 `uprobe` 的内核或 libbpf/Aya 路径保留兼容性回退。
 
 ## 栈回溯（Stack Unwinding）
 - 在每个追踪点捕获完整调用栈，基于 `.eh_frame`/`.eh_frame_hdr` 信息做好解析。

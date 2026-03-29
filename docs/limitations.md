@@ -8,15 +8,10 @@ The underlying eBPF mechanism requires elevated privileges to access kernel trac
 ### 2. Do Not Use with GDB Simultaneously
 Both uprobe and GDB modify target process instructions (inserting breakpoints). Using them together may lead to conflicts and unpredictable behavior.
 
-### 3. eBPF bpf_probe_read_user Limitations
-eBPF helper functions do not support handling page faults, which may cause failures when reading virtual addresses in the target process. This is a design limitation of eBPF.
-
-**Reference**: https://lists.iovisor.org/g/iovisor-dev/topic/accessing_user_memory_and/21386221
-
-### 4. Read-Only Access, Cannot Modify Program Behavior
+### 3. Read-Only Access, Cannot Modify Program Behavior
 Although eBPF technically supports modifying process behavior to some extent, GhostScope is designed as a read-only tool and cannot modify program state, variable values, or control flow. This ensures safety in production environments.
 
-### 5. Platform Support
+### 4. Platform Support
 Currently only supports **Linux** operating system due to its core dependency on **eBPF** and **uprobe**.
 
 ## Soft Limitations
@@ -29,22 +24,32 @@ For interpreted languages (Lua, Python, Ruby, etc.), only the interpreter itself
 ### 2. Architecture Support
 Currently only supports **x86_64 (AMD64)** architecture. Other platforms (such as ARM64) are technically feasible but require time for adaptation and testing.
 
-### 3. Performance Impact
+### 3. User-Memory Reads via `bpf_probe_read_user`
+In traditional non-sleepable probe paths, helpers such as `bpf_probe_read_user` cannot resolve user-space page faults, so reads from a target virtual address may still fail if the page is not resident or otherwise faults on access.
+
+This is no longer an absolute eBPF limitation. Linux now supports sleepable uprobes (`uprobe.s` / `uretprobe.s`), and sleepable programs can use helpers such as `bpf_copy_from_user_task()` for fault-capable user-memory reads. GhostScope currently emits regular `uprobe` programs, so this remains a practical limitation today, but it is better described as a soft implementation limitation rather than a fundamental design limit of eBPF.
+
+**References**:
+- https://lists.iovisor.org/g/iovisor-dev/topic/accessing_user_memory_and/21386221
+- https://docs.kernel.org/bpf/libbpf/program_types.html
+- https://man7.org/linux/man-pages/man7/bpf-helpers.7.html
+
+### 4. Performance Impact
 Based on uprobe implementation, each probe trigger incurs a context switch overhead plus eBPF program execution time. If probes are set on hot paths, they may significantly impact the monitored process performance. Use with caution.
 
-### 4. Event Loss (Backpressure)
+### 5. Event Loss (Backpressure)
 Uses ring buffer to pass events between eBPF programs and userspace. If event generation rate exceeds userspace consumption capacity, the kernel will drop events, leading to trace data loss. GhostScope's error reporting is not yet comprehensive (will learn from bpftrace's approach in the future); avoid setting too many probes on high-frequency paths.
 
-### 5. DWARF Support Coverage
+### 6. DWARF Support Coverage
 Primarily tested and validated with DWARF 5 format. Theoretically supports DWARF 2-5, but other versions may have compatibility issues. Some DWARF expression instructions are not yet supported for conversion to eBPF (purely due to implementation not being completed yet) and will provide clear error messages when encountered.
 
-### 6. Highly Optimized Code Support
+### 7. Highly Optimized Code Support
 Compiler optimizations (-O2, -O3) can cause variables to be optimized away or generate complex DWARF expressions. GhostScope will attempt to parse them, including inline function support, but some variables may be inaccessible (shown as OptimizedOut) because the compiler optimized them away.
 
-### 7. Dynamically Loaded Libraries (dlopen)
+### 8. Dynamically Loaded Libraries (dlopen)
 GhostScope scans `/proc/PID/maps` at startup to obtain loaded dynamic library information. As long as GhostScope is started after `dlopen`, tracing works normally. Future plans include dynamically monitoring process `dlopen` behavior for better user experience.
 
-### 8. Global Variables in `-t` Mode
+### 9. Global Variables in `-t` Mode
 
 - **Executable targets**: When `-t` points to an executable (`-t /path/to/app`), GhostScope treats that binary as the primary module and globals are supported by default.
 - **Shared-library targets (existing processes)**: If GhostScope starts after the library has already been mapped (e.g., tracing a running process that loaded `libfoo.so` earlier), globals work without extra steps.
@@ -52,7 +57,7 @@ GhostScope scans `/proc/PID/maps` at startup to obtain loaded dynamic library in
 
 > **Note**: The current sysmon pipeline still assumes the library is mapped when the exec event is handled; if a loader pulls it in much later, offsets are not retried yet.
 
-### 9. `-p <pid>` Mode inside Containers or WSL
+### 10. `-p <pid>` Mode inside Containers or WSL
 
 - For the full explanation of container scenarios, PID namespace terminology, the scenario matrix, and current implementation limits, see [Container Environments](container.md).
 - This page keeps only the short summary: whether `-p` is reliable in container/WSL scenarios depends on GhostScope's current PID view, whether the target PID is visible in the current `/proc`, whether `NSpid` provides a reliable mapping, and whether the `bpf_get_ns_current_pid_tgid` helper is available.
