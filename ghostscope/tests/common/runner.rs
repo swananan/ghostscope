@@ -29,9 +29,11 @@ use tokio::time::{timeout, Duration};
 const ENV_GHOSTSCOPE_LOG_LEVEL: &str = "E2E_GHOSTSCOPE_LOG_LEVEL";
 const ENV_GHOSTSCOPE_ENABLE_LOGGING: &str = "E2E_GHOSTSCOPE_ENABLE_LOGGING";
 const ENV_GHOSTSCOPE_LOG_CONSOLE: &str = "E2E_GHOSTSCOPE_LOG_CONSOLE";
+const ENV_E2E_TARGET_MODE: &str = "E2E_TARGET_MODE";
 const GHOSTSCOPE_PID_BOOTSTRAP_PREFIX: &str = "__GHOSTSCOPE_PID__ ";
 #[allow(dead_code)]
 const GHOSTSCOPE_READY_MARKER: &str = "__GHOSTSCOPE_READY__";
+const CHILD_CONTAINER_TIMEOUT_SLACK_SECS: u64 = 3;
 
 pub struct GhostscopeRunner {
     script_content: String,
@@ -132,7 +134,14 @@ impl GhostscopeRunner {
     }
 
     pub async fn run(self) -> Result<(i32, String, String)> {
-        let (exit_code, stdout, stderr, ()) = self.run_internal(None, || async { Ok(()) }).await?;
+        let (exit_code, stdout, stderr, ()) = self
+            .run_internal(
+                Some(GHOSTSCOPE_READY_MARKER.to_string()),
+                None::<fn() -> std::future::Ready<Result<()>>>,
+                false,
+                Some(()),
+            )
+            .await?;
         Ok((exit_code, stdout, stderr))
     }
 
@@ -145,26 +154,34 @@ impl GhostscopeRunner {
         OnReady: FnOnce() -> Fut,
         Fut: Future<Output = Result<T>>,
     {
-        self.run_internal(Some(GHOSTSCOPE_READY_MARKER.to_string()), on_ready)
-            .await
+        self.run_internal(
+            Some(GHOSTSCOPE_READY_MARKER.to_string()),
+            Some(on_ready),
+            true,
+            None,
+        )
+        .await
     }
 
     async fn run_internal<OnReady, Fut, T>(
         self,
         ready_marker: Option<String>,
-        on_ready: OnReady,
+        on_ready: Option<OnReady>,
+        require_ready_marker: bool,
+        default_ready_result: Option<T>,
     ) -> Result<(i32, String, String, T)>
     where
         OnReady: FnOnce() -> Fut,
         Fut: Future<Output = Result<T>>,
     {
         let logging = self.resolve_logging_config();
+        let monitor_timeout_secs = self.effective_timeout_secs();
+        let setup_timeout_secs = self.setup_timeout_secs();
         let sandbox = match self.sandbox {
             Some(sandbox) => sandbox,
             None => SandboxHandle::default_ghostscope()?,
         };
 
-        // Validate attach mode
         let by_pid = self.pid.is_some();
         let by_attached_target = self.attach_target.is_some();
         let by_target = self.target.is_some();
@@ -174,17 +191,6 @@ impl GhostscopeRunner {
         );
 
         let _target_sandbox_guard = if let Some(ref target) = self.target {
-            // In late-start -t tests, GhostScope may compile the script before the target
-            // process is launched. Pre-build the target artifact in the sandbox where the
-            // program will later execute so any Build-ID based cookie matches what sysmon
-            // will see from /proc/<pid>/maps after the process starts. Keep a strong
-            // reference to that default sandbox for the duration of this run so the later
-            // target spawn reuses the same sandbox instance and artifact cache.
-            //
-            // Restrict this to executable targets. Late-start shared-library tests
-            // intentionally exercise the "no shared-lib sysmon" path, and eagerly
-            // preparing the library sandbox would add enough startup delay to make the
-            // target process appear before GhostScope actually compiles/attaches.
             if !is_shared_object(target) {
                 Some(ensure_target_binary_ready_for_default_sandbox(target)?)
             } else {
@@ -194,13 +200,11 @@ impl GhostscopeRunner {
             None
         };
 
-        // Write script to a temp file
         let mut script_file = create_script_file()?;
         use std::io::Write as _;
         script_file.write_all(self.script_content.as_bytes())?;
         let script_path = sandbox.path_in_sandbox(script_file.path())?;
 
-        // Build command + args
         let mut args: Vec<OsString> = Vec::new();
         if let Some(pid) = self.pid {
             args.push(OsString::from("-p"));
@@ -221,21 +225,16 @@ impl GhostscopeRunner {
             args.push(OsString::from("--log-level"));
             args.push(OsString::from(level.clone()));
         }
-
         if self.force_perf_event_array {
             args.push(OsString::from("--force-perf-event-array"));
         }
-
         if let Some(marker) = ready_marker.as_ref() {
             args.push(OsString::from("--emit-ready-marker"));
             args.push(OsString::from(marker));
         }
-
-        // Opt-in sysmon for -t shared library tests
         if self.enable_sysmon_shared_lib {
             args.push(OsString::from("--enable-sysmon-shared-lib"));
         }
-
         if logging.enable_logging {
             args.push(OsString::from("--log"));
         }
@@ -244,14 +243,12 @@ impl GhostscopeRunner {
         }
 
         let launch = sandbox.ghostscope_runner_command(&args)?;
-
         let mut cmd = Command::new(&launch.program);
         cmd.args(&launch.args);
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
         let mut child = cmd.spawn()?;
-
         let stdout_handle = child.stdout.take().unwrap();
         let stderr_handle = child.stderr.take().unwrap();
         let mut stdout_reader = BufReader::new(stdout_handle);
@@ -260,15 +257,14 @@ impl GhostscopeRunner {
         let mut stdout_content = String::new();
         let mut stderr_content = String::new();
         let mut managed_ghostscope_pid = None;
-        let mut ready_callback = Some(on_ready);
-        let mut ready_result: Option<T> = None;
+        let mut ready_callback = on_ready;
+        let mut ready_result = default_ready_result;
         let mut ready_fired = ready_marker.is_none();
 
-        if ready_fired {
-            let callback = ready_callback
-                .take()
-                .expect("ready callback missing for immediate execution");
-            ready_result = Some(callback().await?);
+        if ready_fired && ready_result.is_none() {
+            if let Some(callback) = ready_callback.take() {
+                ready_result = Some(callback().await?);
+            }
         }
 
         if launch.bootstrap_pid_from_stdout {
@@ -302,75 +298,134 @@ impl GhostscopeRunner {
             })?);
         }
 
-        // Incremental read with periodic polls, bounded by overall timeout
-        let read_task = async {
-            let mut stdout_line = String::new();
-            let mut stderr_line = String::new();
-            loop {
-                // stdout
-                stdout_line.clear();
-                if let Ok(Ok(n)) = timeout(
-                    Duration::from_millis(50),
-                    stdout_reader.read_line(&mut stdout_line),
-                )
-                .await
-                {
-                    if n > 0 {
-                        stdout_content.push_str(&stdout_line);
-                        if !ready_fired
-                            && ready_marker
+        if !ready_fired {
+            let pre_ready_task = async {
+                let mut stdout_line = String::new();
+                let mut stderr_line = String::new();
+                loop {
+                    stdout_line.clear();
+                    if let Ok(Ok(n)) = timeout(
+                        Duration::from_millis(50),
+                        stdout_reader.read_line(&mut stdout_line),
+                    )
+                    .await
+                    {
+                        if n > 0 {
+                            stdout_content.push_str(&stdout_line);
+                            if ready_marker
                                 .as_deref()
                                 .is_some_and(|marker| stdout_line.trim_end() == marker)
-                        {
-                            let callback = ready_callback.take().with_context(|| {
-                                "ready callback missing when matching stdout ready marker"
-                            })?;
-                            ready_result = Some(callback().await?);
-                            ready_fired = true;
+                            {
+                                if let Some(callback) = ready_callback.take() {
+                                    ready_result = Some(callback().await?);
+                                }
+                                ready_fired = true;
+                                break;
+                            }
                         }
                     }
-                }
-                // stderr
-                stderr_line.clear();
-                if let Ok(Ok(n)) = timeout(
-                    Duration::from_millis(50),
-                    stderr_reader.read_line(&mut stderr_line),
-                )
-                .await
-                {
-                    if n > 0 {
-                        stderr_content.push_str(&stderr_line);
-                        if !ready_fired
-                            && ready_marker
+
+                    stderr_line.clear();
+                    if let Ok(Ok(n)) = timeout(
+                        Duration::from_millis(50),
+                        stderr_reader.read_line(&mut stderr_line),
+                    )
+                    .await
+                    {
+                        if n > 0 {
+                            stderr_content.push_str(&stderr_line);
+                            if ready_marker
                                 .as_deref()
                                 .is_some_and(|marker| stderr_line.trim_end() == marker)
-                        {
-                            let callback = ready_callback.take().with_context(|| {
-                                "ready callback missing when matching stderr ready marker"
-                            })?;
-                            ready_result = Some(callback().await?);
-                            ready_fired = true;
+                            {
+                                if let Some(callback) = ready_callback.take() {
+                                    ready_result = Some(callback().await?);
+                                }
+                                ready_fired = true;
+                                break;
+                            }
                         }
                     }
+
+                    if let Ok(Some(_status)) = child.try_wait() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
-                // quit early if the process exited
-                if let Ok(Some(_status)) = child.try_wait() {
-                    break;
+                Ok::<(), anyhow::Error>(())
+            };
+
+            match timeout(Duration::from_secs(setup_timeout_secs), pre_ready_task).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    if let Some(pid) = managed_ghostscope_pid {
+                        sandbox.terminate_pid(pid).with_context(|| {
+                            format!(
+                                "failed to terminate startup-stalled GhostScope pid {} in {}",
+                                pid,
+                                sandbox.label()
+                            )
+                        })?;
+                    } else {
+                        let _ = terminate_tokio_child_gracefully(
+                            &mut child,
+                            "ghostscope runner child",
+                            GRACEFUL_TERMINATION_TIMEOUT,
+                        )
+                        .await?;
+                    }
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            Ok::<(), anyhow::Error>(())
+        }
+
+        let timed_out = if ready_fired {
+            let read_task = async {
+                let mut stdout_line = String::new();
+                let mut stderr_line = String::new();
+                loop {
+                    stdout_line.clear();
+                    if let Ok(Ok(n)) = timeout(
+                        Duration::from_millis(50),
+                        stdout_reader.read_line(&mut stdout_line),
+                    )
+                    .await
+                    {
+                        if n > 0 {
+                            stdout_content.push_str(&stdout_line);
+                        }
+                    }
+
+                    stderr_line.clear();
+                    if let Ok(Ok(n)) = timeout(
+                        Duration::from_millis(50),
+                        stderr_reader.read_line(&mut stderr_line),
+                    )
+                    .await
+                    {
+                        if n > 0 {
+                            stderr_content.push_str(&stderr_line);
+                        }
+                    }
+
+                    if let Ok(Some(_status)) = child.try_wait() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Ok::<(), anyhow::Error>(())
+            };
+
+            match timeout(Duration::from_secs(monitor_timeout_secs), read_task).await {
+                Ok(result) => {
+                    result?;
+                    false
+                }
+                Err(_) => true,
+            }
+        } else {
+            false
         };
 
-        let timed_out = match timeout(Duration::from_secs(self.timeout_secs), read_task).await {
-            Ok(result) => {
-                result?;
-                false
-            }
-            Err(_) => true,
-        };
-
-        // Determine exit code; terminate gracefully on timeout
         let mut exit_code = match child.try_wait() {
             Ok(Some(status)) => status.code().unwrap_or(-1),
             _ => {
@@ -408,7 +463,6 @@ impl GhostscopeRunner {
             }
         };
 
-        // Drain any remaining output to capture full diagnostics/banners
         {
             let mut line = String::new();
             loop {
@@ -432,12 +486,11 @@ impl GhostscopeRunner {
             }
         }
 
-        // If the process was terminated by signal after producing output, consider it success.
         if exit_code == -1 && (!stdout_content.is_empty() || !stderr_content.is_empty()) {
             exit_code = 0;
         }
 
-        if !ready_fired {
+        if !ready_fired && require_ready_marker {
             anyhow::bail!(
                 "GhostScope exited before reaching ready state '{}'. stderr={} stdout={}",
                 ready_marker.as_deref().unwrap_or("<none>"),
@@ -450,7 +503,7 @@ impl GhostscopeRunner {
             exit_code,
             stdout_content,
             stderr_content,
-            ready_result.expect("ready callback result missing after ready state"),
+            ready_result.expect("ready result missing after runner completion"),
         ))
     }
 
@@ -482,6 +535,21 @@ impl GhostscopeRunner {
             enable_logging,
             enable_console_logging,
         }
+    }
+
+    fn effective_timeout_secs(&self) -> u64 {
+        self.timeout_secs
+    }
+
+    fn setup_timeout_secs(&self) -> u64 {
+        let mut timeout_secs = self.timeout_secs.max(15);
+        if env::var(ENV_E2E_TARGET_MODE)
+            .ok()
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("child-container"))
+        {
+            timeout_secs = timeout_secs.saturating_add(CHILD_CONTAINER_TIMEOUT_SLACK_SECS);
+        }
+        timeout_secs
     }
 }
 

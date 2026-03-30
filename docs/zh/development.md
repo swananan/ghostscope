@@ -264,8 +264,8 @@ done
 
 - Rust 测试 harness 仍运行在宿主机上，GhostScope 和目标进程会按指定拓扑进入对应容器 sandbox。
 - 当 GhostScope 和目标使用同一种 sandbox 类型时，topology-aware e2e helper 会自动复用同一个 sandbox 实例。
-- `host -> docker-private`、`docker-private -> same docker-private` 和 `docker-private -> child-container` 是当前在 CI 中跑全量 e2e 的容器场景。
-- `docker-private -> child-container` 通过 `E2E_TARGET_MODE=child-container` 启用，表示目标进程运行在外层 private sandbox 里再启动的子容器中。
+- `host -> docker-private` 和 `docker-private -> same docker-private` 是当前在 CI 中跑全量 e2e 的容器场景。
+- `docker-private -> child-container` 通过 `E2E_TARGET_MODE=child-container` 启用，表示目标进程运行在外层 private sandbox 里再启动的子容器中。它目前仍有专门验证覆盖，但 full-CI 矩阵入口暂时关闭，等待 nested PID aliasing 支持补齐。
 - `docker-host -> same docker-host` 仍保留为 smoke，因为它更接近默认的 host PID 视角。
 - `docker-private` 这一组通常需要 `sudo`，因为宿主机上的测试 harness 需要检查该 sandbox 的 PID namespace。
 - topology-aware e2e 默认使用专门给容器 e2e 发布的 Ubuntu 24.04 runtime 镜像的固定 digest：`ghcr.io/swananan/ghostscope-e2e-runtime@sha256:d5df1b977c38f7a51bbf28b878f2246705a05b83ac6df7cb6be8f8a4de4105f4`。

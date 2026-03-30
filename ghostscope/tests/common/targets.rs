@@ -167,6 +167,12 @@ pub(crate) fn ensure_target_binary_ready_for_default_sandbox(
 ) -> Result<SandboxHandle> {
     let sandbox = SandboxHandle::default_target()?;
     let _ = ensure_binary_ready(&sandbox, binary_path)?;
+    if matches!(
+        default_target_launch_mode()?,
+        TargetLaunchMode::ChildContainer
+    ) {
+        sandbox.ensure_child_container_runtime_ready()?;
+    }
     Ok(sandbox)
 }
 

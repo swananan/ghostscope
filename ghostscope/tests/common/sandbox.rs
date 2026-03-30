@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,6 +17,7 @@ const DEFAULT_REMOTE_IMAGE: &str = "ghcr.io/swananan/ghostscope-e2e-runtime@sha2
 const DEFAULT_CHILD_CONTAINER_IMAGE: &str = "ubuntu:24.04";
 const CONTAINER_REPO_ROOT: &str = "/workspace";
 const CONTAINER_TARGET_DIR: &str = "/tmp/ghostscope-target";
+const STAGED_TOOL_DIR: &str = ".ghostscope-test-bin";
 const INNER_DOCKER_HOST: &str = "unix:///tmp/ghostscope-dind.sock";
 const INNER_DOCKER_SOCK: &str = "/tmp/ghostscope-dind.sock";
 const INNER_DOCKER_PIDFILE: &str = "/tmp/ghostscope-dind.pid";
@@ -468,7 +470,13 @@ impl SandboxHandle {
             "ghostscope test binary does not exist on host: {}",
             host_bin.display()
         );
-        self.path_in_sandbox(&host_bin)
+        match self.path_in_sandbox(&host_bin) {
+            Ok(path) => Ok(path),
+            Err(_) => {
+                let staged = stage_host_binary_under_repo(&host_bin, "ghostscope")?;
+                self.path_in_sandbox(&staged)
+            }
+        }
     }
 
     pub fn ensure_fixture_command_built_once(&self, key: &str, script: &str) -> Result<()> {
@@ -698,12 +706,26 @@ impl SandboxHandle {
         Ok(())
     }
 
+    pub fn ensure_child_container_runtime_ready(&self) -> Result<()> {
+        self.ensure_dind_ready()?;
+
+        let SandboxInner::Docker(inner) = &*self.inner else {
+            anyhow::bail!("child-container targets require a docker sandbox");
+        };
+
+        let child_image = std::env::var("E2E_CHILD_CONTAINER_IMAGE")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_CHILD_CONTAINER_IMAGE.to_string());
+        self.ensure_child_image_ready(inner, &child_image)
+    }
+
     pub fn spawn_background_binary_in_child_container(
         &self,
         binary_path: &Path,
         working_dir: Option<&Path>,
     ) -> Result<BackgroundProcess> {
-        self.ensure_dind_ready()?;
+        self.ensure_child_container_runtime_ready()?;
 
         let SandboxInner::Docker(inner) = &*self.inner else {
             anyhow::bail!("child-container targets require a docker sandbox");
@@ -719,7 +741,6 @@ impl SandboxHandle {
             .ok()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_CHILD_CONTAINER_IMAGE.to_string());
-        self.ensure_child_image_ready(inner, &child_image)?;
         let working_dir = working_dir
             .map(Path::to_path_buf)
             .or_else(|| binary_path.parent().map(Path::to_path_buf))
@@ -1483,6 +1504,53 @@ fn resolve_host_ghostscope_bin() -> PathBuf {
         }
     }
     PathBuf::from("../target/debug/ghostscope")
+}
+
+fn stage_host_binary_under_repo(host_bin: &Path, name: &str) -> Result<PathBuf> {
+    let repo_root = workspace_root()?;
+    let staged_dir = repo_root.join(STAGED_TOOL_DIR);
+    fs::create_dir_all(&staged_dir).with_context(|| {
+        format!(
+            "failed to create staged tool directory {}",
+            staged_dir.display()
+        )
+    })?;
+
+    let staged = staged_dir.join(name);
+    if host_bin == staged {
+        return Ok(staged);
+    }
+
+    let needs_copy = match (fs::metadata(host_bin), fs::metadata(&staged)) {
+        (Ok(src), Ok(dst)) => {
+            let src_mtime = src.modified().ok();
+            let dst_mtime = dst.modified().ok();
+            src.len() != dst.len() || src_mtime != dst_mtime
+        }
+        (Ok(_), Err(_)) => true,
+        (Err(err), _) => {
+            return Err(anyhow::Error::new(err))
+                .with_context(|| format!("failed to stat host binary {}", host_bin.display()));
+        }
+    };
+
+    if needs_copy {
+        fs::copy(host_bin, &staged).with_context(|| {
+            format!(
+                "failed to stage host binary {} under repo root at {}",
+                host_bin.display(),
+                staged.display()
+            )
+        })?;
+        let mut perms = fs::metadata(&staged)
+            .with_context(|| format!("failed to stat staged binary {}", staged.display()))?
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&staged, perms)
+            .with_context(|| format!("failed to chmod staged binary {}", staged.display()))?;
+    }
+
+    Ok(staged)
 }
 
 fn terminate_pid_with_shell(label: &str, pid: u32, command: &str) -> Result<()> {
