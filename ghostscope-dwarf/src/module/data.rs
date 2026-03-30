@@ -1874,9 +1874,14 @@ impl ModuleData {
     ///   do not scan for is_stmt here to preserve entry-like behavior and keep
     ///   entry-view locations available.
     /// - Non-inline (DW_TAG_subprogram):
-    ///   For each range, return the first executable address after the prologue
-    ///   (prologue-skip). If any formal parameter uses DW_OP_entry_value, prefer
-    ///   the true entry (range start) to preserve entry context.
+    ///   For each selected executable range, return the first executable address
+    ///   after the prologue (prologue-skip). If any formal parameter uses
+    ///   DW_OP_entry_value, prefer the true entry (range start) to preserve
+    ///   entry context. When DW_AT_ranges contains partitioned hot/cold code,
+    ///   prefer the range containing DW_AT_entry_pc; otherwise preserve the
+    ///   first DWARF-emitted range because compilers typically list the entry/
+    ///   hot partition first even when a later address sort would put `.cold`
+    ///   code ahead of it.
     ///
     /// Determinism
     /// - A sorted copy of the DIE's ranges (ascending by start) is used for all
@@ -1924,9 +1929,7 @@ impl ModuleData {
         } else {
             // If function parameters use DW_OP_entry_value, prefer the true entry (no prologue skip)
             let prefer_entry = self.function_uses_entry_value(entry).unwrap_or(false);
-            // Work on a sorted copy of ranges for deterministic behavior
-            let mut nranges = entry.address_ranges.clone();
-            nranges.sort_unstable_by_key(|(s, _)| *s);
+            let nranges = Self::selected_non_inline_ranges(entry);
             for (start, _end) in &nranges {
                 let addr = if prefer_entry {
                     *start
@@ -1949,6 +1952,25 @@ impl ModuleData {
             }
         }
         out
+    }
+
+    fn selected_non_inline_ranges(entry: &crate::core::IndexEntry) -> Vec<(u64, u64)> {
+        let ranges = entry.address_ranges.clone();
+        if ranges.len() <= 1 {
+            return ranges;
+        }
+
+        if let Some(entry_pc) = entry.entry_pc {
+            if let Some(range) = ranges
+                .iter()
+                .copied()
+                .find(|(start, end)| *start <= entry_pc && entry_pc < *end)
+            {
+                return vec![range];
+            }
+        }
+
+        vec![ranges[0]]
     }
 
     /// Check if this subprogram uses DW_OP_entry_value in any formal parameter location
@@ -2497,5 +2519,67 @@ impl ModuleData {
 
         // find_global_variables_by_name already classifies section using obj
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ModuleData;
+    use crate::core::{IndexEntry, IndexFlags};
+    use gimli::constants;
+    use std::sync::Arc;
+
+    fn subprogram_entry(ranges: &[(u64, u64)], entry_pc: Option<u64>) -> IndexEntry {
+        IndexEntry {
+            name: Arc::from("CGPsend"),
+            die_offset: gimli::UnitOffset(0),
+            unit_offset: gimli::DebugInfoOffset(0),
+            tag: constants::DW_TAG_subprogram,
+            flags: IndexFlags::default(),
+            language: None,
+            address_ranges: ranges.to_vec(),
+            entry_pc,
+        }
+    }
+
+    #[test]
+    fn selected_non_inline_ranges_keeps_hot_partition_first_when_cold_has_lower_address() {
+        let entry = subprogram_entry(&[(0x8e97c0, 0x8e9be0), (0x76e78e, 0x76e798)], None);
+
+        assert_eq!(
+            ModuleData::selected_non_inline_ranges(&entry),
+            vec![(0x8e97c0, 0x8e9be0)],
+        );
+    }
+
+    #[test]
+    fn selected_non_inline_ranges_keeps_single_contiguous_range() {
+        let entry = subprogram_entry(&[(0x8ea060, 0x8eb07b)], None);
+
+        assert_eq!(
+            ModuleData::selected_non_inline_ranges(&entry),
+            vec![(0x8ea060, 0x8eb07b)],
+        );
+    }
+
+    #[test]
+    fn selected_non_inline_ranges_prefers_range_containing_entry_pc() {
+        let entry = subprogram_entry(&[(0x100, 0x180), (0x200, 0x220)], Some(0x208));
+
+        assert_eq!(
+            ModuleData::selected_non_inline_ranges(&entry),
+            vec![(0x200, 0x220)],
+        );
+    }
+
+    #[test]
+    fn selected_non_inline_ranges_without_entry_pc_keeps_first_range_even_if_later_range_is_larger()
+    {
+        let entry = subprogram_entry(&[(0x100, 0x110), (0x200, 0x260)], None);
+
+        assert_eq!(
+            ModuleData::selected_non_inline_ranges(&entry),
+            vec![(0x100, 0x110)],
+        );
     }
 }

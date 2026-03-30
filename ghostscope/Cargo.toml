@@ -43,3 +43,4 @@ lazy_static = { workspace = true }
 scopeguard = { workspace = true }
 serial_test = { workspace = true }
 regex = "1"
+object = { workspace = true }
