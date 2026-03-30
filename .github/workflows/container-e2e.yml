@@ -24,9 +24,15 @@ jobs:
           - name: host-to-private
             ghostscope_sandbox: host
             target_sandbox: docker-private
+            target_mode: same
           - name: private-same-sandbox
             ghostscope_sandbox: docker-private
             target_sandbox: docker-private
+            target_mode: same
+          - name: private-to-child-container
+            ghostscope_sandbox: docker-private
+            target_sandbox: docker-private
+            target_mode: child-container
 
     steps:
       - uses: actions/checkout@v4
@@ -72,12 +78,14 @@ jobs:
           E2E_CONTAINER_IMAGE: ghcr.io/swananan/ghostscope-build:ubuntu20.04-llvm18.1.8
           E2E_GHOSTSCOPE_SANDBOX: ${{ matrix.ghostscope_sandbox }}
           E2E_TARGET_SANDBOX: ${{ matrix.target_sandbox }}
+          E2E_TARGET_MODE: ${{ matrix.target_mode }}
         run: |
           sudo -E env \
             E2E_CONTAINER_IMAGE="$E2E_CONTAINER_IMAGE" \
             E2E_GHOSTSCOPE_SANDBOX="$E2E_GHOSTSCOPE_SANDBOX" \
             E2E_TARGET_SANDBOX="$E2E_TARGET_SANDBOX" \
-            "$(which cargo)" test --all-features -- --nocapture
+            E2E_TARGET_MODE="$E2E_TARGET_MODE" \
+            "$(which cargo)" test -p ghostscope --tests --all-features -- --nocapture
 
   container-e2e-smoke:
     name: Container E2E Smoke (${{ matrix.name }})
@@ -92,6 +100,7 @@ jobs:
           - name: host-pid-same-sandbox
             ghostscope_sandbox: docker-host
             target_sandbox: docker-host
+            target_mode: same
 
     steps:
       - uses: actions/checkout@v4
@@ -137,6 +146,7 @@ jobs:
           E2E_CONTAINER_IMAGE: ghcr.io/swananan/ghostscope-build:ubuntu20.04-llvm18.1.8
           E2E_GHOSTSCOPE_SANDBOX: ${{ matrix.ghostscope_sandbox }}
           E2E_TARGET_SANDBOX: ${{ matrix.target_sandbox }}
+          E2E_TARGET_MODE: ${{ matrix.target_mode }}
         run: |
           for test_case in \
             test_invalid_pid_handling \
@@ -147,5 +157,6 @@ jobs:
               E2E_CONTAINER_IMAGE="$E2E_CONTAINER_IMAGE" \
               E2E_GHOSTSCOPE_SANDBOX="$E2E_GHOSTSCOPE_SANDBOX" \
               E2E_TARGET_SANDBOX="$E2E_TARGET_SANDBOX" \
-              "$(which cargo)" test --all-features --test script_execution "$test_case" -- --nocapture
+              E2E_TARGET_MODE="$E2E_TARGET_MODE" \
+              "$(which cargo)" test -p ghostscope --all-features --test script_execution "$test_case" -- --nocapture
           done

@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     ninja-build \
     python3 \
+    libffi-dev \
     libzstd-dev zlib1g-dev libxml2-dev \
     && rm -rf /var/lib/apt/lists/*
 

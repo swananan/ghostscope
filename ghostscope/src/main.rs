@@ -187,15 +187,16 @@ async fn main() -> Result<()> {
             if let (Some(pid_ns_dev), Some(pid_ns_inode)) =
                 (mapping.pid_ns_dev, mapping.pid_ns_inode)
             {
+                let target_pid = mapping.container_pid.unwrap_or(mapping.process_pid);
                 merged_config.pid_filter_spec =
                     Some(ghostscope_compiler::PidFilterSpec::NamespaceTgid {
-                        target_pid: mapping.process_pid,
+                        target_pid,
                         pid_ns_dev,
                         pid_ns_inode,
                     });
                 info!(
                     "PID filter strategy selected: ns-helper (target_pid={} ns_dev={} ns_inode={})",
-                    mapping.process_pid, pid_ns_dev, pid_ns_inode
+                    target_pid, pid_ns_dev, pid_ns_inode
                 );
             } else {
                 merged_config.pid_filter_spec =

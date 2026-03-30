@@ -13,9 +13,16 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_REMOTE_IMAGE: &str = "ghcr.io/swananan/ghostscope-build:ubuntu20.04-llvm18.1.8";
+const DEFAULT_CHILD_CONTAINER_IMAGE: &str = "ubuntu:20.04";
 const CONTAINER_REPO_ROOT: &str = "/workspace";
 const CONTAINER_TARGET_DIR: &str = "/tmp/ghostscope-target";
 const CONTAINER_GHOSTSCOPE_BIN: &str = "/tmp/ghostscope-target/debug/ghostscope";
+const INNER_DOCKER_HOST: &str = "unix:///tmp/ghostscope-dind.sock";
+const INNER_DOCKER_SOCK: &str = "/tmp/ghostscope-dind.sock";
+const INNER_DOCKER_PIDFILE: &str = "/tmp/ghostscope-dind.pid";
+const INNER_DOCKER_LOG: &str = "/tmp/ghostscope-dind.log";
+const INNER_DOCKER_DATA_ROOT: &str = "/var/lib/ghostscope-dind";
+const INNER_DOCKER_EXEC_ROOT: &str = "/var/run/ghostscope-dind";
 
 static NEXT_SANDBOX_ID: AtomicU64 = AtomicU64::new(1);
 static DEFAULT_SANDBOX_STATE: OnceLock<Result<DefaultSandboxState, String>> = OnceLock::new();
@@ -129,6 +136,7 @@ pub struct SandboxHandle {
 pub enum BackgroundProcess {
     Host { pid: u32, child: Child },
     Detached { pid: u32 },
+    ChildContainer { pid: u32, container_name: String },
 }
 
 pub struct GhostscopeRunnerCommand {
@@ -140,12 +148,15 @@ pub struct GhostscopeRunnerCommand {
 impl BackgroundProcess {
     pub fn pid(&self) -> u32 {
         match self {
-            Self::Host { pid, .. } | Self::Detached { pid } => *pid,
+            Self::Host { pid, .. } | Self::Detached { pid } | Self::ChildContainer { pid, .. } => {
+                *pid
+            }
         }
     }
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 enum SandboxInner {
     Host,
     Docker(DockerSandboxInner),
@@ -162,6 +173,8 @@ struct DockerSandboxInner {
     repo_root: PathBuf,
     build_ready: Mutex<bool>,
     prepared_fixture_commands: Mutex<HashSet<String>>,
+    dind_ready: Mutex<bool>,
+    loaded_child_images: Mutex<HashSet<String>>,
 }
 
 impl Drop for DockerSandboxInner {
@@ -265,7 +278,7 @@ impl SandboxHandle {
         args.push("-v".into());
         args.push("ghostscope-e2e-cargo-git:/root/.cargo/git".into());
         args.push("-v".into());
-        args.push(format!("ghostscope-e2e-target:{CONTAINER_TARGET_DIR}").into());
+        args.push(CONTAINER_TARGET_DIR.into());
 
         args.push(spec.image.clone().into());
         args.push("bash".into());
@@ -298,6 +311,8 @@ impl SandboxHandle {
                 repo_root,
                 build_ready: Mutex::new(false),
                 prepared_fixture_commands: Mutex::new(HashSet::new()),
+                dind_ready: Mutex::new(false),
+                loaded_child_images: Mutex::new(HashSet::new()),
             })),
         };
 
@@ -433,19 +448,23 @@ impl SandboxHandle {
                     let Ok(host_pid) = name.to_string_lossy().parse::<u32>() else {
                         continue;
                     };
-                    let Ok(ns_inode) = read_pid_ns_inode(host_pid) else {
-                        continue;
-                    };
-                    if ns_inode != pid_ns_inode {
-                        continue;
-                    }
                     let Ok(status) = fs::read_to_string(format!("/proc/{host_pid}/status")) else {
                         continue;
                     };
                     let Some(chain) = parse_nspid_chain(&status) else {
                         continue;
                     };
-                    if chain.last() == Some(&sandbox_pid) {
+                    let same_namespace_pid = read_pid_ns_inode(host_pid)
+                        .ok()
+                        .filter(|ns_inode| *ns_inode == pid_ns_inode)
+                        .is_some()
+                        && chain.last() == Some(&sandbox_pid);
+                    if same_namespace_pid {
+                        return Ok(host_pid);
+                    }
+                    if process_descends_from(host_pid, inner.init_host_pid)
+                        && chain.iter().skip(1).any(|pid| *pid == sandbox_pid)
+                    {
                         return Ok(host_pid);
                     }
                 }
@@ -470,7 +489,17 @@ impl SandboxHandle {
                     return Ok(());
                 }
                 let script = format!(
-                    "cd {CONTAINER_REPO_ROOT} && cargo build --all-features --target-dir {CONTAINER_TARGET_DIR} -p ghostscope && cargo build --all-features --target-dir {CONTAINER_TARGET_DIR} -p dwarf-tool"
+                    "set -euo pipefail\n\
+                     if [ ! -e /usr/lib/x86_64-linux-gnu/libffi.so ]; then\n\
+                       export DEBIAN_FRONTEND=noninteractive\n\
+                       apt-get update >/tmp/ghostscope-build-apt.log 2>&1\n\
+                       apt-get install -y libffi-dev >>/tmp/ghostscope-build-apt.log 2>&1\n\
+                     fi\n\
+                     mkdir -p {CONTAINER_TARGET_DIR}\n\
+                     find {CONTAINER_TARGET_DIR} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} +\n\
+                     cd {CONTAINER_REPO_ROOT}\n\
+                     cargo build --all-features --target-dir {CONTAINER_TARGET_DIR} -p ghostscope\n\
+                     cargo build --all-features --target-dir {CONTAINER_TARGET_DIR} -p dwarf-tool"
                 );
                 let output = self.run_shell(&script).with_context(|| {
                     format!(
@@ -478,11 +507,21 @@ impl SandboxHandle {
                         inner.container_name
                     )
                 })?;
+                let apt_log_tail = if output.status.success() {
+                    String::new()
+                } else {
+                    self.run_shell("tail -n 80 /tmp/ghostscope-build-apt.log 2>/dev/null || true")
+                        .ok()
+                        .and_then(|apt_output| String::from_utf8(apt_output.stdout).ok())
+                        .unwrap_or_default()
+                };
                 anyhow::ensure!(
                     output.status.success(),
-                    "failed to build ghostscope inside docker sandbox {}: {}",
+                    "failed to build ghostscope inside docker sandbox {}: stdout={} stderr={} apt_log_tail={}",
                     inner.container_name,
-                    String::from_utf8_lossy(&output.stderr)
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                    apt_log_tail.trim()
                 );
                 *ready = true;
                 Ok(())
@@ -518,6 +557,88 @@ impl SandboxHandle {
         }
     }
 
+    pub fn ensure_dind_ready(&self) -> Result<()> {
+        match &*self.inner {
+            SandboxInner::Host => {
+                anyhow::bail!("child-container targets require a docker sandbox, not the host")
+            }
+            SandboxInner::Docker(inner) => {
+                anyhow::ensure!(
+                    matches!(inner.pid_mode, DockerPidMode::Private),
+                    "child-container targets require a private docker sandbox"
+                );
+
+                let mut ready = inner.dind_ready.lock().unwrap();
+                if *ready {
+                    let output = self.run_shell(&format!(
+                        "docker -H {} info >/dev/null 2>&1",
+                        shell_quote(INNER_DOCKER_HOST)
+                    ))?;
+                    if output.status.success() {
+                        return Ok(());
+                    }
+                    *ready = false;
+                }
+
+                let script = format!(
+                    "set -eu\n\
+                     if ! command -v docker >/dev/null 2>&1; then\n\
+                       echo 'docker CLI is missing from sandbox image {image}' >&2\n\
+                       exit 1\n\
+                     fi\n\
+                     if ! command -v dockerd >/dev/null 2>&1; then\n\
+                       echo 'dockerd is missing from sandbox image {image}' >&2\n\
+                       exit 1\n\
+                     fi\n\
+                     if docker -H {host} info >/dev/null 2>&1; then\n\
+                       exit 0\n\
+                     fi\n\
+                     rm -f {sock} {pidfile}\n\
+                     mkdir -p {data_root} {exec_root}\n\
+                     nohup dockerd \\\n\
+                       --host={host} \\\n\
+                       --pidfile={pidfile} \\\n\
+                       --data-root={data_root} \\\n\
+                       --exec-root={exec_root} \\\n\
+                       --storage-driver=vfs \\\n\
+                       --iptables=false \\\n\
+                       >{log} 2>&1 &\n\
+                     for _ in $(seq 1 60); do\n\
+                       if docker -H {host} info >/dev/null 2>&1; then\n\
+                         exit 0\n\
+                       fi\n\
+                       sleep 1\n\
+                     done\n\
+                     echo 'failed to start nested dockerd' >&2\n\
+                     tail -n 80 {log} >&2 || true\n\
+                     exit 1",
+                    host = shell_quote(INNER_DOCKER_HOST),
+                    image = shell_quote(&inner.image),
+                    sock = shell_quote(INNER_DOCKER_SOCK),
+                    pidfile = shell_quote(INNER_DOCKER_PIDFILE),
+                    data_root = shell_quote(INNER_DOCKER_DATA_ROOT),
+                    exec_root = shell_quote(INNER_DOCKER_EXEC_ROOT),
+                    log = shell_quote(INNER_DOCKER_LOG),
+                );
+                let output = self.run_shell(&script).with_context(|| {
+                    format!(
+                        "failed to prepare nested docker daemon inside sandbox {}",
+                        inner.container_name
+                    )
+                })?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "failed to prepare nested docker daemon inside sandbox {}: stdout={} stderr={}",
+                    inner.container_name,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                *ready = true;
+                Ok(())
+            }
+        }
+    }
+
     pub fn run_shell(&self, script: &str) -> Result<Output> {
         match &*self.inner {
             SandboxInner::Host => Command::new("bash")
@@ -534,6 +655,237 @@ impl SandboxHandle {
                     )
                 }),
         }
+    }
+
+    fn ensure_child_image_ready(
+        &self,
+        inner: &DockerSandboxInner,
+        child_image: &str,
+    ) -> Result<()> {
+        let inspect_script = format!(
+            "docker -H {host} image inspect {image} >/dev/null 2>&1",
+            host = shell_quote(INNER_DOCKER_HOST),
+            image = shell_quote(child_image),
+        );
+
+        let mut loaded_images = inner.loaded_child_images.lock().unwrap();
+        if loaded_images.contains(child_image) {
+            let output = self.run_shell(&inspect_script)?;
+            if output.status.success() {
+                return Ok(());
+            }
+            loaded_images.remove(child_image);
+        }
+
+        let output = self.run_shell(&inspect_script)?;
+        if output.status.success() {
+            loaded_images.insert(child_image.to_string());
+            return Ok(());
+        }
+
+        let host_has_image = Command::new("docker")
+            .args(["image", "inspect", child_image])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .with_context(|| format!("failed to inspect host image {child_image}"))?
+            .success();
+
+        if host_has_image {
+            let load_script = format!(
+                "set -euo pipefail\n\
+                 docker image save {image} | docker exec -i {container} docker -H {host} load",
+                image = shell_quote(child_image),
+                container = shell_quote(&inner.container_name),
+                host = shell_quote(INNER_DOCKER_HOST),
+            );
+            let output = Command::new("bash")
+                .args(["-lc", &load_script])
+                .output()
+                .with_context(|| {
+                    format!(
+                        "failed to load child image {} into nested docker daemon for sandbox {}",
+                        child_image, inner.container_name
+                    )
+                })?;
+            anyhow::ensure!(
+                output.status.success(),
+                "failed to load child image {} into nested docker daemon for sandbox {}: stdout={} stderr={}",
+                child_image,
+                inner.container_name,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        } else {
+            let pull_script = format!(
+                "set -eu\n\
+                 for _ in $(seq 1 5); do\n\
+                   if docker -H {host} pull {image}; then\n\
+                     exit 0\n\
+                   fi\n\
+                   sleep 2\n\
+                 done\n\
+                 exit 1",
+                host = shell_quote(INNER_DOCKER_HOST),
+                image = shell_quote(child_image),
+            );
+            let output = self.run_shell(&pull_script).with_context(|| {
+                format!(
+                    "failed to pull child image {} inside sandbox {}",
+                    child_image, inner.container_name
+                )
+            })?;
+            anyhow::ensure!(
+                output.status.success(),
+                "failed to pull child image {} inside sandbox {}: stdout={} stderr={}",
+                child_image,
+                inner.container_name,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let verify = self.run_shell(&inspect_script)?;
+        anyhow::ensure!(
+            verify.status.success(),
+            "child image {} is still unavailable inside nested docker daemon for sandbox {}",
+            child_image,
+            inner.container_name
+        );
+        loaded_images.insert(child_image.to_string());
+        Ok(())
+    }
+
+    pub fn spawn_background_binary_in_child_container(
+        &self,
+        binary_path: &Path,
+        working_dir: Option<&Path>,
+    ) -> Result<BackgroundProcess> {
+        self.ensure_dind_ready()?;
+
+        let SandboxInner::Docker(inner) = &*self.inner else {
+            anyhow::bail!("child-container targets require a docker sandbox");
+        };
+
+        let container_name = format!(
+            "ghostscope-child-{}-{}-{}",
+            inner.id,
+            std::process::id(),
+            unix_timestamp_nanos()
+        );
+        let child_image = std::env::var("E2E_CHILD_CONTAINER_IMAGE")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_CHILD_CONTAINER_IMAGE.to_string());
+        self.ensure_child_image_ready(inner, &child_image)?;
+        let working_dir = working_dir
+            .map(Path::to_path_buf)
+            .or_else(|| binary_path.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| PathBuf::from(CONTAINER_REPO_ROOT));
+        let entrypoint = format!(
+            "exec {} >/dev/null 2>/tmp/ghostscope-child-target.err",
+            shell_quote(&binary_path.display().to_string())
+        );
+        let script = format!(
+            "docker -H {host} run -d --name {name} \
+               --label {label} \
+               -v {workspace_mount} \
+               -v {repo_mount} \
+               -v {target_mount} \
+               -w {workdir} \
+               {image} \
+               bash -lc {entrypoint}",
+            host = shell_quote(INNER_DOCKER_HOST),
+            name = shell_quote(&container_name),
+            label = shell_quote("ghostscope.test-child-container=1"),
+            workspace_mount = shell_quote(&format!("{CONTAINER_REPO_ROOT}:{CONTAINER_REPO_ROOT}")),
+            repo_mount = shell_quote(&format!(
+                "{}:{}",
+                inner.repo_root.display(),
+                inner.repo_root.display()
+            )),
+            target_mount = shell_quote(&format!("{CONTAINER_TARGET_DIR}:{CONTAINER_TARGET_DIR}")),
+            workdir = shell_quote(&working_dir.display().to_string()),
+            image = shell_quote(&child_image),
+            entrypoint = shell_quote(&entrypoint),
+        );
+        let output = self.run_shell(&script).with_context(|| {
+            format!(
+                "failed to start child-container target {} in sandbox {}",
+                binary_path.display(),
+                inner.container_name
+            )
+        })?;
+        anyhow::ensure!(
+            output.status.success(),
+            "failed to start child-container target {} in sandbox {}: {}",
+            binary_path.display(),
+            inner.container_name,
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let inspect_script = format!(
+            "docker -H {host} inspect -f '{{{{.State.Running}}}}|{{{{.State.Pid}}}}|{{{{.State.ExitCode}}}}' {name}",
+            host = shell_quote(INNER_DOCKER_HOST),
+            name = shell_quote(&container_name),
+        );
+        let logs_script = format!(
+            "docker -H {host} logs {name} 2>&1 || true",
+            host = shell_quote(INNER_DOCKER_HOST),
+            name = shell_quote(&container_name),
+        );
+
+        for _ in 0..30 {
+            let inspect = self.run_shell(&inspect_script).with_context(|| {
+                format!(
+                    "failed to inspect child-container target {} in sandbox {}",
+                    container_name, inner.container_name
+                )
+            })?;
+            if inspect.status.success() {
+                let inspect_text = String::from_utf8(inspect.stdout)
+                    .context("child-container inspect output was not valid UTF-8")?;
+                let parts: Vec<&str> = inspect_text.trim().split('|').collect();
+                if parts.len() == 3 {
+                    let running = parts[0].trim().eq_ignore_ascii_case("true");
+                    let pid = parts[1].trim().parse::<u32>().unwrap_or(0);
+                    if running && pid > 0 {
+                        return Ok(BackgroundProcess::ChildContainer {
+                            pid,
+                            container_name,
+                        });
+                    }
+
+                    if !running {
+                        let exit_code = parts[2].trim();
+                        let logs = self
+                            .run_shell(&logs_script)
+                            .ok()
+                            .and_then(|output| String::from_utf8(output.stdout).ok())
+                            .unwrap_or_default();
+                        let _ = self.remove_child_container(&container_name);
+                        let trimmed_logs = logs.trim();
+                        anyhow::bail!(
+                            "child-container target {} exited before it could be observed (exit_code={}): {}",
+                            binary_path.display(),
+                            exit_code,
+                            if trimmed_logs.is_empty() {
+                                "<no logs available>"
+                            } else {
+                                trimmed_logs
+                            }
+                        );
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        anyhow::bail!(
+            "timed out waiting for child-container target {} to become visible (container={})",
+            binary_path.display(),
+            container_name
+        )
     }
 
     pub fn spawn_background_binary(
@@ -658,6 +1010,41 @@ impl SandboxHandle {
                     inner.container_name,
                     pid_file,
                     err_file
+                )
+            }
+        }
+    }
+
+    pub fn remove_child_container(&self, container_name: &str) -> Result<()> {
+        match &*self.inner {
+            SandboxInner::Host => {
+                anyhow::bail!("cannot remove a child container from the host sandbox")
+            }
+            SandboxInner::Docker(inner) => {
+                anyhow::ensure!(
+                    matches!(inner.pid_mode, DockerPidMode::Private),
+                    "child-container cleanup requires a private docker sandbox"
+                );
+                self.ensure_dind_ready()?;
+                let output = self.run_shell(&format!(
+                    "docker -H {host} rm -f {name}",
+                    host = shell_quote(INNER_DOCKER_HOST),
+                    name = shell_quote(container_name),
+                ))?;
+                if output.status.success() {
+                    return Ok(());
+                }
+
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if is_missing_docker_container_error(&stderr) {
+                    return Ok(());
+                }
+
+                anyhow::bail!(
+                    "failed to remove child container {} from sandbox {}: {}",
+                    container_name,
+                    inner.container_name,
+                    stderr
                 )
             }
         }
@@ -1062,6 +1449,36 @@ fn parse_nspid_chain(status: &str) -> Option<Vec<u32>> {
     } else {
         Some(chain)
     }
+}
+
+fn parse_ppid(status: &str) -> Option<u32> {
+    let line = status.lines().find(|line| line.starts_with("PPid:"))?;
+    line.strip_prefix("PPid:")?.trim().parse::<u32>().ok()
+}
+
+fn process_descends_from(mut pid: u32, ancestor_pid: u32) -> bool {
+    if pid == ancestor_pid {
+        return true;
+    }
+
+    let mut visited = HashSet::new();
+    while pid > 1 && visited.insert(pid) {
+        let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) else {
+            return false;
+        };
+        let Some(ppid) = parse_ppid(&status) else {
+            return false;
+        };
+        if ppid == ancestor_pid {
+            return true;
+        }
+        if ppid == 0 || ppid == pid {
+            return false;
+        }
+        pid = ppid;
+    }
+
+    false
 }
 
 fn resolve_host_ghostscope_bin() -> PathBuf {

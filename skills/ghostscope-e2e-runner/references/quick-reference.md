@@ -102,7 +102,8 @@ curl -sS -X POST http://127.0.0.1:8788/runs \
     "repo": "/mnt/500g/code/ghostscope",
     "topology": {
       "ghostscope": "docker-private",
-      "target": "docker-private"
+      "target": "docker-private",
+      "target_mode": "child-container"
     }
   }'
 for test_case in test_invalid_pid_handling test_correct_pid_filtering test_pid_specificity_with_multiple_processes; do
@@ -171,18 +172,18 @@ Fallback local CI-style commands:
 sudo env \
   E2E_GHOSTSCOPE_SANDBOX=host \
   E2E_TARGET_SANDBOX=docker-private \
-  cargo test --all-features -- --nocapture
+  cargo test -p ghostscope --tests --all-features -- --nocapture
 
 sudo env \
   E2E_GHOSTSCOPE_SANDBOX=docker-private \
   E2E_TARGET_SANDBOX=docker-private \
-  cargo test --all-features -- --nocapture
+  cargo test -p ghostscope --tests --all-features -- --nocapture
 
 for test_case in test_invalid_pid_handling test_correct_pid_filtering test_pid_specificity_with_multiple_processes; do
   sudo env \
     E2E_GHOSTSCOPE_SANDBOX=docker-host \
     E2E_TARGET_SANDBOX=docker-host \
-    cargo test --all-features --test script_execution "$test_case" -- --nocapture
+    cargo test -p ghostscope --all-features --test script_execution "$test_case" -- --nocapture
 done
 ```
 
