@@ -12,11 +12,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const DEFAULT_REMOTE_IMAGE: &str = "ghcr.io/swananan/ghostscope-build:ubuntu20.04-llvm18.1.8";
-const DEFAULT_CHILD_CONTAINER_IMAGE: &str = "ubuntu:20.04";
+const DEFAULT_REMOTE_IMAGE: &str = "ghcr.io/swananan/ghostscope-e2e-runtime@sha256:d5df1b977c38f7a51bbf28b878f2246705a05b83ac6df7cb6be8f8a4de4105f4";
+const DEFAULT_CHILD_CONTAINER_IMAGE: &str = "ubuntu:24.04";
 const CONTAINER_REPO_ROOT: &str = "/workspace";
 const CONTAINER_TARGET_DIR: &str = "/tmp/ghostscope-target";
-const CONTAINER_GHOSTSCOPE_BIN: &str = "/tmp/ghostscope-target/debug/ghostscope";
 const INNER_DOCKER_HOST: &str = "unix:///tmp/ghostscope-dind.sock";
 const INNER_DOCKER_SOCK: &str = "/tmp/ghostscope-dind.sock";
 const INNER_DOCKER_PIDFILE: &str = "/tmp/ghostscope-dind.pid";
@@ -171,7 +170,6 @@ struct DockerSandboxInner {
     init_host_pid: u32,
     pid_ns_inode: Option<u64>,
     repo_root: PathBuf,
-    build_ready: Mutex<bool>,
     prepared_fixture_commands: Mutex<HashSet<String>>,
     dind_ready: Mutex<bool>,
     loaded_child_images: Mutex<HashSet<String>>,
@@ -248,12 +246,6 @@ impl SandboxHandle {
             format!("{}:{}", repo_root.display(), repo_root.display()).into(),
             "-w".into(),
             CONTAINER_REPO_ROOT.into(),
-            "-e".into(),
-            "LLVM_SYS_181_PREFIX=/opt/llvm-18".into(),
-            "-e".into(),
-            "LLVM_CONFIG_PATH=/opt/llvm-18/bin/llvm-config".into(),
-            "-e".into(),
-            "RUSTFLAGS=-C link-arg=-Wl,--as-needed".into(),
         ];
 
         if let Some(pid_mode) = spec.pid_mode.as_docker_arg() {
@@ -269,16 +261,6 @@ impl SandboxHandle {
             args.push("-v".into());
             args.push("/sys/kernel/debug:/sys/kernel/debug".into());
         }
-
-        // Reuse the same cache layout as the container e2e script.
-        args.push("-v".into());
-        args.push("ghostscope-e2e-rustup:/root/.rustup".into());
-        args.push("-v".into());
-        args.push("ghostscope-e2e-cargo-registry:/root/.cargo/registry".into());
-        args.push("-v".into());
-        args.push("ghostscope-e2e-cargo-git:/root/.cargo/git".into());
-        args.push("-v".into());
-        args.push(CONTAINER_TARGET_DIR.into());
 
         args.push(spec.image.clone().into());
         args.push("bash".into());
@@ -309,7 +291,6 @@ impl SandboxHandle {
                 init_host_pid,
                 pid_ns_inode,
                 repo_root,
-                build_ready: Mutex::new(false),
                 prepared_fixture_commands: Mutex::new(HashSet::new()),
                 dind_ready: Mutex::new(false),
                 loaded_child_images: Mutex::new(HashSet::new()),
@@ -480,53 +461,14 @@ impl SandboxHandle {
         }
     }
 
-    pub fn ensure_ghostscope_built(&self) -> Result<()> {
-        match &*self.inner {
-            SandboxInner::Host => Ok(()),
-            SandboxInner::Docker(inner) => {
-                let mut ready = inner.build_ready.lock().unwrap();
-                if *ready {
-                    return Ok(());
-                }
-                let script = format!(
-                    "set -euo pipefail\n\
-                     if [ ! -e /usr/lib/x86_64-linux-gnu/libffi.so ]; then\n\
-                       export DEBIAN_FRONTEND=noninteractive\n\
-                       apt-get update >/tmp/ghostscope-build-apt.log 2>&1\n\
-                       apt-get install -y libffi-dev >>/tmp/ghostscope-build-apt.log 2>&1\n\
-                     fi\n\
-                     mkdir -p {CONTAINER_TARGET_DIR}\n\
-                     find {CONTAINER_TARGET_DIR} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} +\n\
-                     cd {CONTAINER_REPO_ROOT}\n\
-                     cargo build --all-features --target-dir {CONTAINER_TARGET_DIR} -p ghostscope\n\
-                     cargo build --all-features --target-dir {CONTAINER_TARGET_DIR} -p dwarf-tool"
-                );
-                let output = self.run_shell(&script).with_context(|| {
-                    format!(
-                        "failed to build ghostscope inside docker sandbox {}",
-                        inner.container_name
-                    )
-                })?;
-                let apt_log_tail = if output.status.success() {
-                    String::new()
-                } else {
-                    self.run_shell("tail -n 80 /tmp/ghostscope-build-apt.log 2>/dev/null || true")
-                        .ok()
-                        .and_then(|apt_output| String::from_utf8(apt_output.stdout).ok())
-                        .unwrap_or_default()
-                };
-                anyhow::ensure!(
-                    output.status.success(),
-                    "failed to build ghostscope inside docker sandbox {}: stdout={} stderr={} apt_log_tail={}",
-                    inner.container_name,
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr),
-                    apt_log_tail.trim()
-                );
-                *ready = true;
-                Ok(())
-            }
-        }
+    fn resolve_ghostscope_bin_for_sandbox(&self) -> Result<PathBuf> {
+        let host_bin = resolve_host_ghostscope_bin();
+        anyhow::ensure!(
+            host_bin.exists(),
+            "ghostscope test binary does not exist on host: {}",
+            host_bin.display()
+        );
+        self.path_in_sandbox(&host_bin)
     }
 
     pub fn ensure_fixture_command_built_once(&self, key: &str, script: &str) -> Result<()> {
@@ -1103,13 +1045,23 @@ impl SandboxHandle {
         match &*self.inner {
             SandboxInner::Host => Ok((resolve_host_ghostscope_bin().into_os_string(), Vec::new())),
             SandboxInner::Docker(inner) => {
-                self.ensure_ghostscope_built()?;
+                let bin = self.resolve_ghostscope_bin_for_sandbox()?;
+                let output = self.run_shell(&format!(
+                    "test -x {}",
+                    shell_quote(&bin.display().to_string())
+                ))?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "ghostscope host binary {} is not executable inside docker sandbox {}",
+                    bin.display(),
+                    inner.container_name
+                );
                 Ok((
                     OsString::from("docker"),
                     vec![
                         OsString::from("exec"),
                         OsString::from(&inner.container_name),
-                        OsString::from(CONTAINER_GHOSTSCOPE_BIN),
+                        bin.into_os_string(),
                     ],
                 ))
             }
@@ -1132,8 +1084,18 @@ impl SandboxHandle {
                 })
             }
             SandboxInner::Docker(inner) => {
-                self.ensure_ghostscope_built()?;
-                let bin = shell_quote(CONTAINER_GHOSTSCOPE_BIN);
+                let bin_path = self.resolve_ghostscope_bin_for_sandbox()?;
+                let output = self.run_shell(&format!(
+                    "test -x {}",
+                    shell_quote(&bin_path.display().to_string())
+                ))?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "ghostscope host binary {} is not executable inside docker sandbox {}",
+                    bin_path.display(),
+                    inner.container_name
+                );
+                let bin = shell_quote(&bin_path.display().to_string());
                 let quoted_args = extra_args
                     .iter()
                     .map(|arg| shell_quote(&arg.to_string_lossy()))
