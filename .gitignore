@@ -39,6 +39,7 @@ output.*
 ghostscope.log
 ghostscope_*
 .ghostscope_*
+.ghostscope-test-bin/
 log
 
 # Test programs and binaries (not part of Rust project)

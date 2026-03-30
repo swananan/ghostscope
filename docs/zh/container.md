@@ -444,7 +444,7 @@ GhostScope 同时依赖两类信息源：
 - 但不能直接替代 `proc_pid`
 - `-t` 模式在容器场景下，不能简单套用 `-p` 的那套 PID 语义
 
-当前容器 e2e 还没有真正覆盖“GhostScope 在 host、目标在 private PID namespace 容器里”的 `-t` 生命周期维护问题；但它现在已经同时包含了一个专门的 `-p` 验证路径，以及一个全量容器 e2e 的 CI 拓扑入口，用来覆盖“外层容器 -> 更内层 / 子层 PID namespace 目标”这个拓扑。
+当前容器 e2e 还没有真正覆盖“GhostScope 在 host、目标在 private PID namespace 容器里”的 `-t` 生命周期维护问题；“外层容器 -> 更内层 / 子层 PID namespace 目标”这个拓扑目前有专门的 `-p` 验证路径，但在 nested PID aliasing 完成之前，还没有重新放回 full container-e2e CI 矩阵。
 
 ## 话题三：WSL
 
@@ -476,7 +476,7 @@ GhostScope 目前没有计划支持“自身运行在容器里，然后观察机
 
 - GhostScope 运行在宿主机上，观察同一台宿主机上容器内部的被观测进程。这是当前最主要的容器场景。
 - GhostScope 运行在容器里，观察本容器 PID namespace 内的进程。
-- 从当前容器仍可见的更内层 / 子层 PID namespace，仍然属于预期范围，而且 `-p` 现在已经既有“外层容器 -> 子容器目标”的专门验证路径，也进入了全量容器 e2e CI 拓扑；但 `-t` 的生命周期维护仍然是另一条限制链路。
+- 从当前容器仍可见的更内层 / 子层 PID namespace，仍然属于预期范围，而且 `-p` 现在已经有“外层容器 -> 子容器目标”的专门验证路径；把它重新放回 full container-e2e CI 矩阵，要等 nested PID aliasing 做完。`-t` 的生命周期维护仍然是另一条限制链路。
 - GhostScope 运行在 `--pid=host` 容器里，利用与宿主机共享的 PID 视角去观察宿主机可见进程。
 
 ## 当前实现限制摘要
@@ -490,7 +490,7 @@ GhostScope 目前没有计划支持“自身运行在容器里，然后观察机
 - 若 helper 不可用，则回退到 `NSpid` 推导出来的 host PID 映射，但只有在映射足够明确时才安全。
 - `-p` 必须是当前 PID namespace 可见的进程号。如果当前 `/proc` 中看不到该 PID，GhostScope 会直接报错，不会跨 namespace 猜测映射。
 - 当前实现里还有一层额外严格策略：在“容器倾向环境 + helper 不可用 + `NSpid` 不能给出明确 host 映射”时，GhostScope 会直接报错，不做猜测。
-- 场景 6（GhostScope 在 private PID namespace 容器里、目标位于当前容器可见的更内层 / 子层 private PID namespace）现在已经既作为 `-p` 的单独验证路径存在，也进入了全量容器 e2e CI 矩阵。尤其在 namespace-aware PID 过滤下，需要显式区分“当前 `/proc` 视角 PID”和目标最内层 `container_pid`；如果这一映射不能被安全建立，GhostScope 仍会直接失败而不是猜测。
+- 场景 6（GhostScope 在 private PID namespace 容器里、目标位于当前容器可见的更内层 / 子层 private PID namespace）现在已经作为 `-p` 的单独验证路径存在；要把它重新放回 full container-e2e CI 矩阵，需要先完成 nested PID aliasing。尤其在 namespace-aware PID 过滤下，需要显式区分“当前 `/proc` 视角 PID”和目标最内层 `container_pid`；如果这一映射不能被安全建立，GhostScope 仍会直接失败而不是猜测。
 - 场景 7（GhostScope 在一个 private PID namespace 容器里、目标不在这个 PID namespace 里）当前不支持；`-p` 模式应直接失败，而不是尝试跨 namespace 猜测 PID 映射。
 - 在容器 PID namespace 环境下，如果 helper 不可用，脚本里的 `$pid/$tid` 可能表现为宿主机 namespace 的值，而不是容器内看到的 PID。
 - `-t` 模式依赖 `sysmon` 维护运行时进程生命周期；而 `sysmon` 的 `event_pid` 来自 `bpf_get_current_pid_tgid() >> 32`，对齐的是 host 视角 PID。跨 PID namespace 场景下，`event_pid` 与 `proc_pid` 的对齐目前并不可靠，因此 `-t` 的生命周期维护链路在这类场景下存在结构性限制。

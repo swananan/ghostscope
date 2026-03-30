@@ -29,10 +29,9 @@ jobs:
             ghostscope_sandbox: docker-private
             target_sandbox: docker-private
             target_mode: same
-          - name: private-to-child-container
-            ghostscope_sandbox: docker-private
-            target_sandbox: docker-private
-            target_mode: child-container
+          # TODO(container-nested-full): re-enable private-to-child-container in the
+          # full matrix after nested PID aliasing is implemented for proc offsets
+          # and `$pid`/event PID alignment.
 
     steps:
       - uses: actions/checkout@v4
