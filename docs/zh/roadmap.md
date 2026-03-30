@@ -7,8 +7,17 @@ GhostScope 仍处在快速演进阶段，以下里程碑按照“优先修补基
 - 在验证 eBPF 验证器限制后，逐步引入表达式/动态下标，确保性能与安全达标。
 
 ## 容器追踪增强
-- 容器（Docker/WSL 等）环境下的 `-p <pid>` 模式仍存在软限制，详见[限制列表](limitations.md#10-容器-wsl-场景下--pid-pid-模式的软限制)。
-- 待核心能力稳定后，会评估如何改进在这些隔离场景中的兼容性。
+- `-p` 模式下，大部分容器 PID 追踪场景已经到位。
+- 当前已验证覆盖的场景包括：
+  - 宿主机 -> private PID namespace 容器
+  - private PID namespace 容器 -> 同一个 private PID namespace
+  - private PID namespace 容器 -> 嵌套子容器
+  - `--pid=host` 容器 -> 同一 host PID 视角（smoke）
+- 剩余里程碑已经收窄为：
+  - 补强跨 PID namespace 的 `-t` 生命周期维护，尤其是 host -> private container 这类场景
+  - 继续收敛 helper 可用性与 PID 映射仍属软限制的边界情况
+  - WSL 目前仍不在支持范围内
+- 详见[容器支持与限制](container.md)和[限制列表](limitations.md#10-容器-wsl-场景下--pid-pid-模式的软限制)。
 
 ## Uprobe 增强
 - 支持 sleepable uprobe（`uprobe.s` / `uretprobe.s`），在合适场景下使用可睡眠 helper，尤其提升用户态内存读取的可靠性。

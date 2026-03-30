@@ -7,8 +7,17 @@ GhostScope is still evolving quickly. The milestones below are ordered from “s
 - Once verifier limits are well understood, roll out expression-based/dynamic indices in staged fashion.
 
 ## Container tracing enhancements
-- PID-based tracing inside containerized environments (Docker/WSL) still faces soft limitations; see [Limitations](limitations.md#10-container--wsl-limitations-for--p-pid-mode).
-- Once foundational work settles, we’ll revisit improving compatibility in these isolated setups.
+- Most PID-based container tracing scenarios for `-p` are now in place.
+- Current validated coverage includes:
+  - host -> private PID-namespace container
+  - private PID-namespace container -> same private PID namespace
+  - private PID-namespace container -> nested child container
+  - `--pid=host` container -> same host-PID view (smoke)
+- The remaining milestone work is narrower:
+  - improve `-t` lifecycle maintenance across PID-namespace boundaries, especially host -> private container cases
+  - keep tightening edge cases where helper availability and PID mapping are still soft constraints
+  - WSL remains outside the supported runtime scope today
+- See [Container support and limits](container.md) and [Limitations](limitations.md#10-container--wsl-limitations-for--p-pid-mode).
 
 ## Uprobe enhancements
 - Add support for sleepable uprobes (`uprobe.s` / `uretprobe.s`) so GhostScope can use sleepable helpers where appropriate, especially for more reliable user-memory reads.

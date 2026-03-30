@@ -263,11 +263,12 @@ Notes:
 
 - These commands keep the Rust test harness on the host and move GhostScope plus the traced target into the requested container sandbox topology.
 - When GhostScope and target use the same sandbox kind, the topology-aware e2e helper automatically reuses the same sandbox instance.
-- `host -> docker-private` and `docker-private -> same docker-private` are the container scenarios that run the full e2e suite in CI.
+- `host -> docker-private`, `docker-private -> same docker-private`, and `docker-private -> child-container` are the container scenarios that run the full e2e suite in CI.
 - `docker-private -> child-container` uses `E2E_TARGET_MODE=child-container` and launches the target in a nested Docker child container inside the outer private sandbox.
 - `docker-host -> same docker-host` remains a smoke run because it is close to the default host PID view.
 - Running the `docker-private` variant usually requires `sudo` because the host-side test harness must inspect the sandbox PID namespace.
 - By default the topology-aware e2e framework uses a pinned digest of the dedicated Ubuntu 24.04 runtime image published for container e2e: `ghcr.io/swananan/ghostscope-e2e-runtime@sha256:d5df1b977c38f7a51bbf28b878f2246705a05b83ac6df7cb6be8f8a4de4105f4`.
+- Container e2e uses the dedicated runtime image above; release/containerized builds continue to use the separate `ghostscope-build` base image published from `docker/base-build/Dockerfile`.
 - Override the Docker image with `E2E_CONTAINER_IMAGE`. Use this when you explicitly want to test a local image or a pinned digest of the runtime image.
 
 ### Testing DWARF Parsing with dwarf-tool
