@@ -184,6 +184,9 @@ curl -sS -X POST http://127.0.0.1:8788/runs \
   控制 Rust e2e 里 GhostScope 自己运行在哪个环境。默认：`host`。
 - `E2E_TARGET_SANDBOX=host|docker-private|docker-host`
   控制 Rust e2e 里被追踪目标进程运行在哪个环境。默认：`host`。
+- `E2E_TARGET_MODE=same|child-container`
+  进一步描述目标进程在所选 target sandbox 里的启动方式。默认：`same`。
+  目前 `child-container` 专指“在外层 `docker-private` sandbox 里再起一个子容器来运行目标进程”。
 - `E2E_GHOSTSCOPE_LOG_LEVEL=error|warn|info|debug|trace`
   为直接执行的 `cargo test` 打开 GhostScope 日志并设置日志级别。
   设置该变量后，测试 helper 会自动启用 GhostScope 的文件日志和控制台日志。
@@ -237,6 +240,12 @@ sudo env \
   E2E_GHOSTSCOPE_SANDBOX=docker-private \
   E2E_TARGET_SANDBOX=docker-private \
   cargo test --all-features -- --nocapture
+
+sudo env \
+  E2E_GHOSTSCOPE_SANDBOX=docker-private \
+  E2E_TARGET_SANDBOX=docker-private \
+  E2E_TARGET_MODE=child-container \
+  cargo test --all-features -- --nocapture
 ```
 
 `docker-host` 同 sandbox 的场景继续保留聚焦 `-p` 的 smoke 用例：
@@ -256,6 +265,7 @@ done
 - Rust 测试 harness 仍运行在宿主机上，GhostScope 和目标进程会按指定拓扑进入对应容器 sandbox。
 - 当 GhostScope 和目标使用同一种 sandbox 类型时，topology-aware e2e helper 会自动复用同一个 sandbox 实例。
 - `host -> docker-private` 和 `docker-private -> same docker-private` 是当前在 CI 中跑全量 e2e 的容器场景。
+- `docker-private -> child-container` 通过 `E2E_TARGET_MODE=child-container` 启用，表示目标进程运行在外层 private sandbox 里再启动的子容器中。
 - `docker-host -> same docker-host` 仍保留为 smoke，因为它更接近默认的 host PID 视角。
 - `docker-private` 这一组通常需要 `sudo`，因为宿主机上的测试 harness 需要检查该 sandbox 的 PID namespace。
 - topology-aware e2e 默认使用和 CI 一致的 Ubuntu 20.04 发布镜像：`ghcr.io/swananan/ghostscope-build:ubuntu20.04-llvm18.1.8`。

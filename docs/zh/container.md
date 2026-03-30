@@ -147,7 +147,7 @@ GhostScope 同时依赖两类信息源：
 - 目标进程在子容器里通常还会有一套更内层 PID，因此 `container_pid` 可能同时不同于 `input_pid` 和 `proc_pid`。
 - 如果这里要做 namespace-aware PID 过滤，那么比较对象就不能再直接拿“当前 `/proc` 视角里的 PID”，而是要拿目标在其最内层命名空间里的 PID。
 
-这个场景已经属于后面“话题四”里定义的预期容器范围，但当前实现还没有把它作为一个单独验证过的支持路径来建模。因此这里更适合把它看成“明确存在的支持缺口”，而不是“场景 5 的一个已验证变体”。
+这个场景现在已经成为一个单独验证过的 `-p` 路径：GhostScope 仍然接受外层容器 `/proc` 视角里可见的 PID，但 namespace-aware 过滤需要拿目标最内层的 `container_pid` 来比较。如果 helper 路径不可用、且 `NSpid` 也不能给出可信的 host 映射，GhostScope 仍然应该 fail fast，而不是猜测。
 
 #### 场景 7：GhostScope 在一个 private PID namespace 容器里，被追踪进程不在这个 PID namespace 里
 
@@ -181,7 +181,7 @@ GhostScope 同时依赖两类信息源：
 | 3. 宿主机 -> private PID namespace 容器 | 在宿主机输入、宿主机里可见的 PID | 在宿主机 `/proc` 视角下，通常等于 `input_pid` | 通常等于 `input_pid`，也等于 `proc_pid` | 目标在更内层 PID namespace 里的 PID，可能和 `host_pid` 不同 | `bpf_get_current_pid_tgid() >> 32 == host_pid` | `bpf_get_current_pid_tgid() >> 32`，通常等于 `host_pid` | 支持 |
 | 4. `--pid=host` 容器 -> 宿主机 / 共享 PID 目标 | 在该容器 shell 中输入、但本质上已经是 host 可见的 PID | 通常等于 `input_pid` | 通常等于 `input_pid`，也等于 `proc_pid` | 通常等于 `host_pid` | helper 可用：`bpf_get_ns_current_pid_tgid(...).tgid == proc_pid`；helper 不可用：`bpf_get_current_pid_tgid() >> 32 == host_pid` | `bpf_get_current_pid_tgid() >> 32`，通常等于 `host_pid` | 支持 |
 | 5. private PID namespace 容器 -> 同一个 private PID namespace | 在该容器内输入、容器里可见的 PID | 在当前容器 `/proc` 视角下，通常等于 `input_pid` | 通常不同于 `input_pid` 和 `proc_pid`；对应 `NSpid` 第一项 | 当 GhostScope 与目标共享同一个 PID namespace 时，通常等于 `input_pid`，也等于 `proc_pid` | helper 可用：`bpf_get_ns_current_pid_tgid(...).tgid == proc_pid`；helper 不可用：只有在 `NSpid` 给出明确 host 映射时才回退到 `bpf_get_current_pid_tgid() >> 32 == host_pid`，否则直接 fail fast | `bpf_get_current_pid_tgid() >> 32`，通常更接近 `host_pid`，而不是 `input_pid` | 条件支持 |
-| 6. private PID namespace 容器 -> 当前容器可见的更内层 / 子层 private PID namespace | 在当前容器 shell 中输入、且是当前容器 `/proc` 视角可见的 PID，不是子容器里看到的局部 PID | 在当前容器 `/proc` 视角下，通常等于 `input_pid` | 通常不同于 `input_pid` 和 `proc_pid`；对应 `NSpid` 第一项 | 通常不同于 `input_pid` 和 `proc_pid`；对应 `NSpid` 链条尾部，往往就是子容器内看到的 PID | 从语义上讲，这里需要 `bpf_get_ns_current_pid_tgid(...).tgid == container_pid`；只有当 `NSpid` 给出明确 host 映射时，host 视角 fallback 才勉强成立。当前实现尚未把这一场景单独建模 | `bpf_get_current_pid_tgid() >> 32`，通常仍对齐 `host_pid` | 尚未支持 |
+| 6. private PID namespace 容器 -> 当前容器可见的更内层 / 子层 private PID namespace | 在当前容器 shell 中输入、且是当前容器 `/proc` 视角可见的 PID，不是子容器里看到的局部 PID | 在当前容器 `/proc` 视角下，通常等于 `input_pid` | 通常不同于 `input_pid` 和 `proc_pid`；对应 `NSpid` 第一项 | 通常不同于 `input_pid` 和 `proc_pid`；对应 `NSpid` 链条尾部，往往就是子容器内看到的 PID | helper 可用：`bpf_get_ns_current_pid_tgid(...).tgid == container_pid`；helper 不可用：只有在 `NSpid` 给出明确 host 映射时才回退到 `bpf_get_current_pid_tgid() >> 32 == host_pid`，否则直接 fail fast | `bpf_get_current_pid_tgid() >> 32`，通常仍对齐 `host_pid` | 条件支持 |
 | 7. private PID namespace 容器 -> 目标不在这个 PID namespace 里 | 往往根本无法满足，因为目标在当前 `/proc` 视角下不可见 | 当前 `/proc` 往往拿不到 | 从当前视角通常也无法稳定解析；即使存在，也属于当前 `/proc` 视角之外的 PID | 当前 namespace 下不可靠，甚至不可见 | 不会安装稳定的比较条件；GhostScope 应直接 fail fast | 不能假定存在稳定的 `event_pid` -> `proc_pid` 对应关系 | 不支持 |
 
 说明：
@@ -444,7 +444,7 @@ GhostScope 同时依赖两类信息源：
 - 但不能直接替代 `proc_pid`
 - `-t` 模式在容器场景下，不能简单套用 `-p` 的那套 PID 语义
 
-当前容器 e2e 主要覆盖的是 GhostScope 与目标进程运行在同一容器 PID 视角里的 smoke 场景；它还没有真正覆盖“GhostScope 在 host、目标在 private PID namespace 容器里”的 `-t` 生命周期维护问题，也还没有把“外层容器 -> 更内层 / 子层 PID namespace 目标”建成一个一等 e2e 拓扑。
+当前容器 e2e 还没有真正覆盖“GhostScope 在 host、目标在 private PID namespace 容器里”的 `-t` 生命周期维护问题；但它现在已经包含了一个专门的 `-p` 验证路径，用来覆盖“外层容器 -> 更内层 / 子层 PID namespace 目标”这个拓扑。
 
 ## 话题三：WSL
 
@@ -476,7 +476,7 @@ GhostScope 目前没有计划支持“自身运行在容器里，然后观察机
 
 - GhostScope 运行在宿主机上，观察同一台宿主机上容器内部的被观测进程。这是当前最主要的容器场景。
 - GhostScope 运行在容器里，观察本容器 PID namespace 内的进程。
-- 从当前容器仍可见的更内层 / 子层 PID namespace，仍然属于预期范围；但“外层容器 -> 子容器目标”这个专门场景，当前实现和 e2e 矩阵都还没有完整建模。
+- 从当前容器仍可见的更内层 / 子层 PID namespace，仍然属于预期范围，而且 `-p` 现在已经有“外层容器 -> 子容器目标”的专门验证路径；但 `-t` 的生命周期维护仍然是另一条限制链路。
 - GhostScope 运行在 `--pid=host` 容器里，利用与宿主机共享的 PID 视角去观察宿主机可见进程。
 
 ## 当前实现限制摘要
@@ -490,7 +490,7 @@ GhostScope 目前没有计划支持“自身运行在容器里，然后观察机
 - 若 helper 不可用，则回退到 `NSpid` 推导出来的 host PID 映射，但只有在映射足够明确时才安全。
 - `-p` 必须是当前 PID namespace 可见的进程号。如果当前 `/proc` 中看不到该 PID，GhostScope 会直接报错，不会跨 namespace 猜测映射。
 - 当前实现里还有一层额外严格策略：在“容器倾向环境 + helper 不可用 + `NSpid` 不能给出明确 host 映射”时，GhostScope 会直接报错，不做猜测。
-- 场景 6（GhostScope 在 private PID namespace 容器里、目标位于当前容器可见的更内层 / 子层 private PID namespace）属于预期范围，但当前实现还没有把它作为单独验证过的路径来建模。尤其在 namespace-aware PID 过滤下，需要显式区分“当前 `/proc` 视角 PID”和目标最内层 `container_pid`。
+- 场景 6（GhostScope 在 private PID namespace 容器里、目标位于当前容器可见的更内层 / 子层 private PID namespace）现在已经作为 `-p` 的单独验证路径存在。尤其在 namespace-aware PID 过滤下，需要显式区分“当前 `/proc` 视角 PID”和目标最内层 `container_pid`；如果这一映射不能被安全建立，GhostScope 仍会直接失败而不是猜测。
 - 场景 7（GhostScope 在一个 private PID namespace 容器里、目标不在这个 PID namespace 里）当前不支持；`-p` 模式应直接失败，而不是尝试跨 namespace 猜测 PID 映射。
 - 在容器 PID namespace 环境下，如果 helper 不可用，脚本里的 `$pid/$tid` 可能表现为宿主机 namespace 的值，而不是容器内看到的 PID。
 - `-t` 模式依赖 `sysmon` 维护运行时进程生命周期；而 `sysmon` 的 `event_pid` 来自 `bpf_get_current_pid_tgid() >> 32`，对齐的是 host 视角 PID。跨 PID namespace 场景下，`event_pid` 与 `proc_pid` 的对齐目前并不可靠，因此 `-t` 的生命周期维护链路在这类场景下存在结构性限制。

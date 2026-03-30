@@ -53,10 +53,11 @@ fn target_diagnostics(target: &TargetHandle) -> String {
         .unwrap_or_else(|err| format!("<failed to read sandbox exe: {err}>"));
 
     format!(
-        "sandbox={} sandbox_pid={} host_pid={} nspid_chain={:?} host_exe={} sandbox_exe={} host_maps={}",
+        "sandbox={} sandbox_pid={} host_pid={} container_pid={:?} nspid_chain={:?} host_exe={} sandbox_exe={} host_maps={}",
         target.sandbox().label(),
         target.sandbox_pid(),
         target.host_pid(),
+        target.container_pid(),
         target.nspid_chain(),
         host_exe,
         sandbox_exe,
@@ -174,6 +175,50 @@ async fn test_attach_from_private_container_to_host_target_fails_when_pid_invisi
     assert!(
         message.contains("not visible"),
         "expected not-visible error when private container tries to observe host target: {message}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_attach_from_private_container_to_child_container_target() -> anyhow::Result<()> {
+    init();
+    if skip_if_docker_unavailable() {
+        return Ok(());
+    }
+
+    let Some(private_box) = docker_sandbox_or_skip(DockerSpec::private())? else {
+        return Ok(());
+    };
+    let target = TargetLauncher::sample_program()
+        .in_child_container_of(&private_box)
+        .spawn()
+        .await?;
+
+    assert_ne!(
+        target.container_pid(),
+        Some(target.sandbox_pid()),
+        "child-container target should expose a distinct innermost pid"
+    );
+
+    let result = GhostscopeRunner::new()
+        .in_sandbox(&private_box)
+        .with_script(pid_filter_script())
+        .attach_to(&target)
+        .timeout_secs(5)
+        .run()
+        .await;
+    let diagnostics = target_diagnostics(&target);
+    target.terminate().await?;
+
+    let (exit_code, stdout, stderr) = result?;
+    assert_eq!(
+        exit_code, 0,
+        "stderr={stderr} stdout={stdout} diagnostics={diagnostics}"
+    );
+    assert!(
+        stdout.contains("FILTERED:"),
+        "expected trace output for private container -> child container attach. stdout={stdout} stderr={stderr} diagnostics={diagnostics}"
     );
     Ok(())
 }

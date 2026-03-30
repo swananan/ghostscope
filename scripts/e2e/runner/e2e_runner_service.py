@@ -18,7 +18,8 @@ POST /runs body (JSON, optional):
   },
   "topology": {
     "ghostscope": "host",
-    "target": "docker-private"
+    "target": "docker-private",
+    "target_mode": "same"
   }
 }
 
@@ -59,7 +60,21 @@ VALID_SANDBOX_ALIASES = {
     "docker-host-pid": "docker-host",
     "container-host": "docker-host",
 }
+VALID_TARGET_MODE_ALIASES = {
+    "same": "same",
+    "direct": "same",
+    "same-sandbox": "same",
+    "child-container": "child-container",
+    "child": "child-container",
+    "nested": "child-container",
+    "descendant": "child-container",
+}
 VALID_LOG_LEVELS = {"error", "warn", "info", "debug", "trace"}
+E2E_TEST_PACKAGE = "ghostscope"
+
+
+def ghostscope_e2e_cargo_args(*extra: str) -> List[str]:
+    return ["test", "-p", E2E_TEST_PACKAGE, "--tests", "--all-features", *extra]
 
 
 def now_iso() -> str:
@@ -85,6 +100,7 @@ class Job:
     ghostscope_log_level: Optional[str]
     ghostscope_sandbox: str
     target_sandbox: str
+    target_mode: str
     status: str = "queued"
     created_at: str = field(default_factory=now_iso)
     started_at: Optional[str] = None
@@ -149,6 +165,20 @@ def normalize_log_level(value: Optional[str]) -> Optional[str]:
     return candidate
 
 
+def normalize_target_mode(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+
+    candidate = value.strip().lower()
+    if not candidate:
+        return None
+
+    normalized = VALID_TARGET_MODE_ALIASES.get(candidate)
+    if normalized is None:
+        raise ValueError("target_mode must be one of: same, child-container")
+    return normalized
+
+
 class JobStore:
     def __init__(
         self,
@@ -189,6 +219,7 @@ class JobStore:
         requested_ghostscope_log_level: Optional[str],
         requested_ghostscope_sandbox: Optional[str],
         requested_target_sandbox: Optional[str],
+        requested_target_mode: Optional[str],
     ) -> Job:
         repo = self._resolve_repo(requested_repo)
         test_case = normalize_test_case(requested_test_case)
@@ -199,6 +230,17 @@ class JobStore:
         target_sandbox = normalize_sandbox_selection(
             "target_sandbox", requested_target_sandbox
         ) or "host"
+        target_mode = normalize_target_mode(requested_target_mode) or "same"
+        if (
+            target_mode == "child-container"
+            and (
+                ghostscope_sandbox != "docker-private"
+                or target_sandbox != "docker-private"
+            )
+        ):
+            raise ValueError(
+                "topology.target_mode=child-container requires ghostscope=docker-private and target=docker-private"
+            )
 
         job = Job(
             id=uuid.uuid4().hex[:12],
@@ -209,6 +251,7 @@ class JobStore:
             ghostscope_log_level=ghostscope_log_level,
             ghostscope_sandbox=ghostscope_sandbox,
             target_sandbox=target_sandbox,
+            target_mode=target_mode,
         )
         with self._lock:
             self._jobs[job.id] = job
@@ -263,16 +306,18 @@ class JobStore:
             "ghostscope_log_level": job.ghostscope_log_level,
             "ghostscope_sandbox": job.ghostscope_sandbox,
             "target_sandbox": job.target_sandbox,
+            "target_mode": job.target_mode,
             "topology": {
                 "ghostscope": job.ghostscope_sandbox,
                 "target": job.target_sandbox,
+                "target_mode": job.target_mode,
             },
             "steps": len(job.steps),
             "log_lines": len(job.logs),
         }
 
     def _resolve_test_command(self, use_sudo: bool, test_case: Optional[str]) -> List[str]:
-        cargo_args = ["test", "--all-features"]
+        cargo_args = ghostscope_e2e_cargo_args()
         if test_case:
             cargo_args.append(test_case)
 
@@ -285,7 +330,7 @@ class JobStore:
     def _step_commands(self, requested_sudo: Optional[bool], test_case: Optional[str]) -> List[StepResult]:
         use_sudo = self.default_sudo if requested_sudo is None else requested_sudo
 
-        build_cmd = ["cargo", "test", "--no-run", "--all-features"]
+        build_cmd = ["cargo", *ghostscope_e2e_cargo_args("--no-run")]
         if test_case:
             build_cmd.append(test_case)
 
@@ -305,10 +350,19 @@ class JobStore:
 
         env = os.environ.copy()
         env["LLVM_SYS_181_PREFIX"] = self.llvm_prefix
+        llvm_config = Path(self.llvm_prefix) / "bin" / "llvm-config"
+        if llvm_config.exists():
+            env["LLVM_CONFIG_PATH"] = str(llvm_config)
+        else:
+            env.pop("LLVM_CONFIG_PATH", None)
         if self.cargo_home:
             env["CARGO_HOME"] = self.cargo_home
         env["E2E_GHOSTSCOPE_SANDBOX"] = job.ghostscope_sandbox
         env["E2E_TARGET_SANDBOX"] = job.target_sandbox
+        if job.target_mode != "same":
+            env["E2E_TARGET_MODE"] = job.target_mode
+        else:
+            env.pop("E2E_TARGET_MODE", None)
         if job.ghostscope_log_level:
             env["E2E_GHOSTSCOPE_LOG_LEVEL"] = job.ghostscope_log_level
         else:
@@ -352,7 +406,8 @@ class JobStore:
                     f"id={job.id} repo={job.repo} test_case={job.test_case or '<all>'} "
                     f"requested_sudo={job.requested_sudo} "
                     f"log_level={job.ghostscope_log_level or '<default>'} "
-                    f"topology={job.ghostscope_sandbox}->{job.target_sandbox}"
+                    f"topology={job.ghostscope_sandbox}->{job.target_sandbox} "
+                    f"target_mode={job.target_mode}"
                 ),
             )
 
@@ -559,6 +614,19 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
+        requested_target_mode = body.get(
+            "target_mode",
+            topology.get("target_mode") if topology else None,
+        )
+        if requested_target_mode is not None and not isinstance(
+            requested_target_mode, str
+        ):
+            self._write_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "target_mode must be a string"},
+            )
+            return
+
         try:
             job = self.store.create_job(
                 requested_sudo=requested_sudo,
@@ -567,6 +635,7 @@ class Handler(BaseHTTPRequestHandler):
                 requested_ghostscope_log_level=requested_ghostscope_log_level,
                 requested_ghostscope_sandbox=requested_ghostscope_sandbox,
                 requested_target_sandbox=requested_target_sandbox,
+                requested_target_mode=requested_target_mode,
             )
         except ValueError as exc:
             self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
@@ -584,9 +653,11 @@ class Handler(BaseHTTPRequestHandler):
                 "ghostscope_log_level": job.ghostscope_log_level,
                 "ghostscope_sandbox": job.ghostscope_sandbox,
                 "target_sandbox": job.target_sandbox,
+                "target_mode": job.target_mode,
                 "topology": {
                     "ghostscope": job.ghostscope_sandbox,
                     "target": job.target_sandbox,
+                    "target_mode": job.target_mode,
                 },
             },
         )
