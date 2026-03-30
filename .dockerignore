@@ -27,3 +27,4 @@ docs/
 
 # Test files
 test_*
+.ghostscope-test-script-*.gs

@@ -103,8 +103,8 @@ docker run --rm -v $(pwd):/workspace -w /workspace \
 docker run -it --rm -v $(pwd):/workspace -w /workspace \
     ghostscope-builder:ubuntu20.04 bash
 
-# Rebuild Docker image (only needed if Dockerfile changes)
-docker build -t ghostscope-builder:ubuntu20.04 .
+# Rebuild Docker image (only needed if `docker/base-build/Dockerfile` changes)
+docker build -t ghostscope-builder:ubuntu20.04 -f docker/base-build/Dockerfile .
 ```
 
 **Note**: Debug builds are used by default during development for faster iteration and better debugging experience.
