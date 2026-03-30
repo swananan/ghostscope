@@ -445,7 +445,7 @@ That is why:
 - but it cannot directly replace `proc_pid`
 - and `-t` cannot simply reuse the same PID semantics as `-p` in container-heavy environments
 
-Current container e2e still does not truly cover the `-t` lifecycle-maintenance problem where GhostScope runs on the host and the target runs inside a private PID-namespace container. But it now does include a dedicated `-p` validation path for the "outer container -> descendant / nested PID namespace target" topology.
+Current container e2e still does not truly cover the `-t` lifecycle-maintenance problem where GhostScope runs on the host and the target runs inside a private PID-namespace container. But it now includes both a dedicated `-p` validation path and a full container-e2e CI topology entry for the "outer container -> descendant / nested PID namespace target" case.
 
 ## Topic 3: WSL
 
@@ -477,7 +477,7 @@ So today's container support should be understood more narrowly:
 
 - GhostScope can run on the host and observe target processes that happen to run inside containers on that host. This is the primary container story.
 - GhostScope can run inside a container and observe processes in that same container PID namespace.
-- Descendant / nested PID namespaces that remain visible from that container are still within the intended scope, and `-p` now has a dedicated "outer container -> child container target" validation path. `-t` lifecycle maintenance is still a separate limitation.
+- Descendant / nested PID namespaces that remain visible from that container are still within the intended scope, and `-p` now has both a dedicated "outer container -> child container target" validation path and a full container-e2e CI topology. `-t` lifecycle maintenance is still a separate limitation.
 - GhostScope can run inside a `--pid=host` container and observe host-visible processes because the PID view is shared with the host.
 
 ## Current Implementation Limitations Summary
@@ -490,7 +490,7 @@ The following limitations used to be scattered in `limitations.md`. They are now
 - If the helper is unavailable, GhostScope falls back to host PID mapping derived from `NSpid`, but only when that mapping is explicit enough to be trusted.
 - `-p` must refer to a PID visible in the current PID namespace. If the PID is not visible in the current `/proc`, GhostScope fails immediately rather than guessing across namespaces.
 - The current implementation is intentionally stricter in one more case: in a container-like environment, if the helper is unavailable and `NSpid` cannot provide an explicit host mapping, GhostScope fails instead of guessing, unless the target remains in the initial PID namespace.
-- Scenario 6 (GhostScope in a private PID namespace container, target in a descendant / nested private PID namespace) is now separately validated for `-p`. In particular, namespace-aware PID filtering must distinguish the current `/proc` PID view from the target's innermost `container_pid`; when that mapping cannot be established safely, GhostScope still fails fast.
+- Scenario 6 (GhostScope in a private PID namespace container, target in a descendant / nested private PID namespace) is now separately validated for `-p`, and it is also part of the full container-e2e CI matrix. In particular, namespace-aware PID filtering must distinguish the current `/proc` PID view from the target's innermost `container_pid`; when that mapping cannot be established safely, GhostScope still fails fast.
 - Scenario 7 (GhostScope in one private PID namespace, target outside that namespace) is not currently supported. `-p` should fail rather than attempting to guess a cross-namespace PID mapping.
 - In container PID-namespace environments, if the helper is unavailable, `$pid/$tid` in scripts may reflect host-namespace values rather than the PID visible inside the container.
 - `-t` depends on sysmon to maintain runtime process lifecycle state. sysmon's `event_pid` comes from `bpf_get_current_pid_tgid() >> 32` and aligns with host-view PID semantics. In cross-PID-namespace cases, alignment between `event_pid` and `proc_pid` is not currently reliable, so `-t` has a structural limitation in those scenarios.
