@@ -1,4 +1,4 @@
-name: Build Base Image
+name: Build E2E Runtime Image
 
 on:
   workflow_dispatch:
@@ -30,16 +30,16 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/swananan/ghostscope-build
+          images: ghcr.io/swananan/ghostscope-e2e-runtime
           tags: |
-            type=raw,value=ubuntu20.04-llvm18.1.8
+            type=raw,value=ubuntu24.04-llvm18
             type=sha
 
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: docker/base-build/Dockerfile
+          file: docker/e2e-runtime/Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

@@ -103,8 +103,8 @@ docker run --rm -v $(pwd):/workspace -w /workspace \
 docker run -it --rm -v $(pwd):/workspace -w /workspace \
     ghostscope-builder:ubuntu20.04 bash
 
-# 重新构建 Docker 镜像（仅在 Dockerfile 修改后需要）
-docker build -t ghostscope-builder:ubuntu20.04 .
+# 重新构建 Docker 镜像（仅在 `docker/base-build/Dockerfile` 修改后需要）
+docker build -t ghostscope-builder:ubuntu20.04 -f docker/base-build/Dockerfile .
 ```
 
 **注意**：开发过程中默认使用 debug 构建，以获得更快的迭代速度和更好的调试体验。
