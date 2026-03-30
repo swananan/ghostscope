@@ -268,8 +268,8 @@ done
 - `docker-private -> child-container` 通过 `E2E_TARGET_MODE=child-container` 启用，表示目标进程运行在外层 private sandbox 里再启动的子容器中。
 - `docker-host -> same docker-host` 仍保留为 smoke，因为它更接近默认的 host PID 视角。
 - `docker-private` 这一组通常需要 `sudo`，因为宿主机上的测试 harness 需要检查该 sandbox 的 PID namespace。
-- topology-aware e2e 默认使用和 CI 一致的 Ubuntu 20.04 发布镜像：`ghcr.io/swananan/ghostscope-build:ubuntu20.04-llvm18.1.8`。
-- 可通过 `E2E_CONTAINER_IMAGE` 覆盖容器镜像；只有在你明确想测试本地镜像时，才建议改成 `ghostscope-builder:ubuntu20.04`。
+- topology-aware e2e 默认使用专门给容器 e2e 发布的 Ubuntu 24.04 runtime 镜像的固定 digest：`ghcr.io/swananan/ghostscope-e2e-runtime@sha256:d5df1b977c38f7a51bbf28b878f2246705a05b83ac6df7cb6be8f8a4de4105f4`。
+- 可通过 `E2E_CONTAINER_IMAGE` 覆盖容器镜像；只有在你明确想测试本地镜像或某个固定 digest 时，才建议手动改这个变量。
 
 ### 使用 dwarf-tool 测试 DWARF 解析
 

@@ -10,14 +10,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-const SAMPLE_PROGRAM_BUILD_DIR: &str = "/workspace/ghostscope/tests/fixtures/sample_program";
-const COMPLEX_TYPES_BUILD_DIR: &str = "/workspace/ghostscope/tests/fixtures/complex_types_program";
-const GLOBALS_BUILD_DIR: &str = "/workspace/ghostscope/tests/fixtures/globals_program";
-const LATE_GLOBALS_BUILD_DIR: &str = "/workspace/ghostscope/tests/fixtures/late_globals_program";
-const RUST_GLOBAL_BUILD_DIR: &str = "/workspace/ghostscope/tests/fixtures/rust_global_program";
-const INLINE_CALLSITE_BUILD_DIR: &str =
-    "/workspace/ghostscope/tests/fixtures/inline_callsite_program";
-const CPP_COMPLEX_BUILD_DIR: &str = "/workspace/ghostscope/tests/fixtures/cpp_complex_program";
 const ENV_E2E_TARGET_MODE: &str = "E2E_TARGET_MODE";
 
 #[derive(Debug, Clone)]
@@ -360,16 +352,7 @@ fn ensure_sample_program_ready(
     sandbox: &SandboxHandle,
     opt_level: OptimizationLevel,
 ) -> Result<PathBuf> {
-    if sandbox.is_host_backend() {
-        ensure_test_program_compiled_with_opt(opt_level)?;
-    } else {
-        let build_key = format!("sample_program:{}", opt_level.as_make_target());
-        let build_script = format!(
-            "cd {SAMPLE_PROGRAM_BUILD_DIR} && make -B {}",
-            opt_level.as_make_target()
-        );
-        sandbox.ensure_fixture_command_built_once(&build_key, &build_script)?;
-    }
+    ensure_test_program_compiled_with_opt(opt_level)?;
 
     sandbox.repo_path_for_fixture_binary(Path::new(&format!(
         "ghostscope/tests/fixtures/sample_program/{}",
@@ -377,88 +360,13 @@ fn ensure_sample_program_ready(
     )))
 }
 
-fn ensure_binary_ready(sandbox: &SandboxHandle, binary_path: &Path) -> Result<PathBuf> {
-    if sandbox.is_host_backend() {
-        return Ok(binary_path.to_path_buf());
-    }
-
-    maybe_prepare_container_fixture_binary(sandbox, binary_path)?;
+fn ensure_binary_ready(_sandbox: &SandboxHandle, binary_path: &Path) -> Result<PathBuf> {
+    anyhow::ensure!(
+        binary_path.exists(),
+        "target binary {} does not exist on host; build the fixture before launching a container-backed target",
+        binary_path.display()
+    );
     Ok(binary_path.to_path_buf())
-}
-
-fn maybe_prepare_container_fixture_binary(
-    sandbox: &SandboxHandle,
-    binary_path: &Path,
-) -> Result<()> {
-    let repo_root = repo_root()?;
-    let Ok(relative) = binary_path.strip_prefix(&repo_root) else {
-        return Ok(());
-    };
-
-    let command = match relative.to_string_lossy().as_ref() {
-        "ghostscope/tests/fixtures/sample_program/sample_program" => Some(format!(
-            "cd {SAMPLE_PROGRAM_BUILD_DIR} && make -B sample_program"
-        )),
-        "ghostscope/tests/fixtures/sample_program/sample_program_o1" => Some(format!(
-            "cd {SAMPLE_PROGRAM_BUILD_DIR} && make -B sample_program_o1"
-        )),
-        "ghostscope/tests/fixtures/sample_program/sample_program_o2" => Some(format!(
-            "cd {SAMPLE_PROGRAM_BUILD_DIR} && make -B sample_program_o2"
-        )),
-        "ghostscope/tests/fixtures/sample_program/sample_program_o3" => Some(format!(
-            "cd {SAMPLE_PROGRAM_BUILD_DIR} && make -B sample_program_o3"
-        )),
-        "ghostscope/tests/fixtures/sample_program/sample_program_stripped" => Some(format!(
-            "cd {SAMPLE_PROGRAM_BUILD_DIR} && make -B sample_program_stripped"
-        )),
-        "ghostscope/tests/fixtures/complex_types_program/complex_types_program" => Some(format!(
-            "cd {COMPLEX_TYPES_BUILD_DIR} && make -B complex_types_program"
-        )),
-        "ghostscope/tests/fixtures/complex_types_program/complex_types_program_o1" => Some(
-            format!("cd {COMPLEX_TYPES_BUILD_DIR} && make -B complex_types_program_o1"),
-        ),
-        "ghostscope/tests/fixtures/complex_types_program/complex_types_program_o2" => Some(
-            format!("cd {COMPLEX_TYPES_BUILD_DIR} && make -B complex_types_program_o2"),
-        ),
-        "ghostscope/tests/fixtures/complex_types_program/complex_types_program_o3" => Some(
-            format!("cd {COMPLEX_TYPES_BUILD_DIR} && make -B complex_types_program_o3"),
-        ),
-        "ghostscope/tests/fixtures/complex_types_program/complex_types_program_nopie" => Some(
-            format!("cd {COMPLEX_TYPES_BUILD_DIR} && make -B complex_types_program_nopie"),
-        ),
-        "ghostscope/tests/fixtures/globals_program/globals_program"
-        | "ghostscope/tests/fixtures/globals_program/libgvars.so" => {
-            Some(format!("cd {GLOBALS_BUILD_DIR} && make -B all"))
-        }
-        "ghostscope/tests/fixtures/late_globals_program/late_globals_program" => {
-            Some(format!("cd {LATE_GLOBALS_BUILD_DIR} && make -B all"))
-        }
-        "ghostscope/tests/fixtures/rust_global_program/target/debug/rust_global_program" => {
-            Some(format!("cd {RUST_GLOBAL_BUILD_DIR} && cargo build"))
-        }
-        "ghostscope/tests/fixtures/inline_callsite_program/inline_callsite_program" => {
-            Some(format!("cd {INLINE_CALLSITE_BUILD_DIR} && make -B all"))
-        }
-        "ghostscope/tests/fixtures/cpp_complex_program/cpp_complex_program" => {
-            Some(format!("cd {CPP_COMPLEX_BUILD_DIR} && make -B"))
-        }
-        _ => None,
-    };
-
-    let Some(command) = command else {
-        return Ok(());
-    };
-
-    let build_key = format!("fixture-cmd:{command}");
-    sandbox.ensure_fixture_command_built_once(&build_key, &command)?;
-    Ok(())
-}
-
-fn repo_root() -> Result<PathBuf> {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .map(Path::to_path_buf)
-        .context("failed to resolve workspace root from CARGO_MANIFEST_DIR")
 }
 
 fn parse_nspid_chain(status: &str) -> Option<Vec<u32>> {
