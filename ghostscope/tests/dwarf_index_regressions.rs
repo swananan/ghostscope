@@ -1,8 +1,29 @@
 mod common;
 
 use common::{fixture_compiler_available, init, FixtureCompiler, FIXTURES};
+use object::{Object, ObjectSymbol};
 use std::collections::HashSet;
 use std::path::PathBuf;
+
+fn find_symbol_address(binary_path: &std::path::Path, symbol_name: &str) -> anyhow::Result<u64> {
+    let bytes = std::fs::read(binary_path)
+        .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", binary_path.display(), e))?;
+    let file = object::File::parse(&*bytes)
+        .map_err(|e| anyhow::anyhow!("Failed to parse {}: {}", binary_path.display(), e))?;
+
+    file.symbols()
+        .find_map(|symbol| match symbol.name() {
+            Ok(name) if name == symbol_name => Some(symbol.address()),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Symbol '{}' not found in {}",
+                symbol_name,
+                binary_path.display()
+            )
+        })
+}
 
 #[tokio::test]
 async fn test_late_globals_are_indexed_as_globals() -> anyhow::Result<()> {
@@ -152,4 +173,58 @@ async fn test_static_scope_fixture_indexes_statics_with_clang_dwarf5() -> anyhow
         "clang -gdwarf-5 static_scope_program",
     )
     .await
+}
+
+#[tokio::test]
+async fn test_partitioned_ranges_fixture_exposes_cold_symbol_before_hot_entry() -> anyhow::Result<()>
+{
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("partitioned_ranges_program")?;
+    let hot_addr = find_symbol_address(&binary_path, "partitioned_target")?;
+    let cold_addr = find_symbol_address(&binary_path, "partitioned_target.cold")?;
+
+    assert_ne!(
+        hot_addr, cold_addr,
+        "partitioned_ranges_program should expose distinct hot/cold symbols"
+    );
+    assert!(
+        cold_addr < hot_addr,
+        "Expected cold partition to sort before the real entry. hot=0x{hot_addr:x} cold=0x{cold_addr:x}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_partitioned_ranges_lookup_prefers_hot_entry_over_cold_partition() -> anyhow::Result<()>
+{
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("partitioned_ranges_program")?;
+    let hot_addr = find_symbol_address(&binary_path, "partitioned_target")?;
+    let cold_addr = find_symbol_address(&binary_path, "partitioned_target.cold")?;
+
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
+    let addrs = analyzer.lookup_function_addresses("partitioned_target");
+
+    assert_eq!(
+        addrs.len(),
+        1,
+        "Expected a single resolved address for partitioned_target. Results: {addrs:?}"
+    );
+    assert_eq!(
+        addrs[0].module_path, binary_path,
+        "Resolved module should point at the partitioned fixture"
+    );
+    assert_eq!(
+        addrs[0].address, hot_addr,
+        "lookup_function_addresses should resolve to the entry/hot range"
+    );
+    assert_ne!(
+        addrs[0].address, cold_addr,
+        "lookup_function_addresses must not resolve to the .cold partition"
+    );
+
+    Ok(())
 }
