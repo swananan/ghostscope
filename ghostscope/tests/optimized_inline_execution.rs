@@ -6,7 +6,9 @@ use std::path::Path;
 use std::time::Duration;
 
 // Keep this on the first executable line inside add3's inline body.
-const INLINE_TRACE_LINE: u32 = 39;
+const INLINE_TRACE_LINE: u32 = 43;
+// Keep this on the nested executable line inside consume_state's inline body.
+const INLINE_STATE_TRACE_LINE: u32 = 71;
 
 fn should_skip_for_ebpf_env(exit_code: i32, stderr: &str) -> bool {
     exit_code != 0
@@ -147,6 +149,107 @@ async fn test_optimized_inline_parameters_do_not_degrade_to_expr_errors() -> any
     assert!(
         !stdout.contains("<optimized_out>"),
         "Inline parameters should not degrade to optimized-out placeholders. STDOUT: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_optimized_inline_struct_member_access_resolves_inline_parameter_names(
+) -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("inline_callsite_program")?;
+    let mut analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to load DWARF for inline_callsite_program: {}", e))?;
+    let addrs = analyzer
+        .lookup_addresses_by_source_line("inline_callsite_program.c", INLINE_STATE_TRACE_LINE);
+    anyhow::ensure!(
+        !addrs.is_empty(),
+        "No DWARF addresses found for inline_callsite_program.c:{INLINE_STATE_TRACE_LINE}"
+    );
+    for module_address in &addrs {
+        let planned = analyzer
+            .plan_chain_access(module_address, "state", &["total_bytes".to_string()])
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "exec-path plan_chain_access failed for 0x{:x}: {}",
+                    module_address.address,
+                    e
+                )
+            })?;
+        anyhow::ensure!(
+            planned.is_some(),
+            "exec-path plan_chain_access returned None for 0x{:x}",
+            module_address.address
+        );
+    }
+
+    let target = spawn_inline_callsite_program(&binary_path).await?;
+    // The analyzer runs in the host test process, so it must inspect the host PID.
+    // `visible_pid_from(observer)` is only correct for processes that actually run
+    // inside the observer sandbox, such as GhostScope itself.
+    let mut pid_analyzer = ghostscope_dwarf::DwarfAnalyzer::from_pid(target.host_pid()).await?;
+    let pid_addrs = pid_analyzer
+        .lookup_addresses_by_source_line("inline_callsite_program.c", INLINE_STATE_TRACE_LINE);
+    anyhow::ensure!(
+        !pid_addrs.is_empty(),
+        "No PID-backed DWARF addresses found for inline_callsite_program.c:{INLINE_STATE_TRACE_LINE}"
+    );
+    for module_address in &pid_addrs {
+        let planned = pid_analyzer
+            .plan_chain_access(module_address, "state", &["total_bytes".to_string()])
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "pid-backed plan_chain_access failed for 0x{:x}: {}",
+                    module_address.address,
+                    e
+                )
+            })?;
+        anyhow::ensure!(
+            planned.is_some(),
+            "pid-backed plan_chain_access returned None for 0x{:x}",
+            module_address.address
+        );
+    }
+    let script = format!(
+        "trace inline_callsite_program.c:{INLINE_STATE_TRACE_LINE} {{\n    print \"STATE:{{}}:{{}}\", state.total_bytes, state.stream_id;\n}}\n"
+    );
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(&script, 4, &target).await?;
+    target.terminate().await?;
+
+    if should_skip_for_ebpf_env(exit_code, &stderr) {
+        return Ok(());
+    }
+
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(
+        !stdout.contains("ExprError"),
+        "Inline member access should not emit ExprError. STDOUT: {stdout}"
+    );
+    assert!(
+        !stdout.contains("<optimized_out>"),
+        "Inline member access should not degrade to optimized-out placeholders. STDOUT: {stdout}"
+    );
+
+    let re = Regex::new(r"STATE:([0-9-]+):([0-9-]+)")?;
+    let mut seen = 0;
+    for caps in re.captures_iter(&stdout) {
+        let total_bytes: i64 = caps[1].parse()?;
+        let stream_id: i64 = caps[2].parse()?;
+        assert_eq!(
+            total_bytes,
+            (stream_id - 7) * 10,
+            "Expected state.total_bytes == (state.stream_id - 7) * 10. STDOUT: {stdout}"
+        );
+        seen += 1;
+    }
+
+    assert!(
+        seen >= 2,
+        "Expected multiple inline struct member events. STDOUT: {stdout}"
     );
 
     Ok(())

@@ -1,6 +1,6 @@
 CC = gcc
 BASE_CFLAGS = -Wall -Wextra -g
-CFLAGS = $(BASE_CFLAGS) -O2
+CFLAGS = $(BASE_CFLAGS) -O3
 
 all: inline_callsite_program
 

@@ -40,6 +40,10 @@ use std::{
 
 // Clippy: factor complex HashMap<String, Vec<usize>> type into an alias
 type NameIndex = HashMap<String, Vec<usize>>;
+type DwarfUnit = gimli::Unit<gimli::EndianArcSlice<LittleEndian>>;
+type DwarfEntry = gimli::DebuggingInformationEntry<gimli::EndianArcSlice<LittleEndian>>;
+type ResolvedOriginEntry = (gimli::DebugInfoOffset, DwarfUnit, DwarfEntry);
+type ResolvedUnitEntry = (DwarfUnit, DwarfEntry);
 
 /// Complete DWARF data for a single module
 #[derive(Debug)]
@@ -808,12 +812,13 @@ impl ModuleData {
                             if let Ok(unit) = dwarf_ref.unit(header) {
                                 if let Ok(entry) = unit.entry(vr.die_offset) {
                                     let planner = crate::planner::AccessPlanner::new(dwarf_ref);
-                                    if let Ok(Some(tdie)) =
+                                    if let Ok(Some(type_loc)) =
                                         planner.resolve_type_ref_with_origins_public(&entry, &unit)
                                     {
-                                        if let Some(ty) =
-                                            self.detailed_shallow_type(vr.cu_offset, tdie)
-                                        {
+                                        if let Some(ty) = self.detailed_shallow_type(
+                                            type_loc.cu_off,
+                                            type_loc.die_off,
+                                        ) {
                                             var_out.type_name = ty.type_name();
                                             var_out.dwarf_type = Some(ty);
                                         }
@@ -879,6 +884,91 @@ impl ModuleData {
         base_var: &str,
         chain: &[String],
     ) -> Result<Option<crate::data::VariableWithEvaluation>> {
+        fn resolve_var_name_with_origins(
+            dwarf: &gimli::Dwarf<gimli::EndianArcSlice<LittleEndian>>,
+            unit: &gimli::Unit<gimli::EndianArcSlice<LittleEndian>>,
+            entry: &gimli::DebuggingInformationEntry<gimli::EndianArcSlice<LittleEndian>>,
+        ) -> gimli::read::Result<Option<String>> {
+            fn resolve_debug_info_ref(
+                dwarf: &gimli::Dwarf<gimli::EndianArcSlice<LittleEndian>>,
+                debug_info_off: gimli::DebugInfoOffset,
+            ) -> gimli::read::Result<Option<ResolvedUnitEntry>> {
+                let mut units = dwarf.units();
+                while let Some(header) = units.next()? {
+                    if let Some(unit_off) = debug_info_off.to_unit_offset(&header) {
+                        let target_unit = dwarf.unit(header)?;
+                        let target_entry = target_unit.entry(unit_off)?;
+                        return Ok(Some((target_unit, target_entry)));
+                    }
+                }
+                Ok(None)
+            }
+
+            fn resolve_origin_entry(
+                dwarf: &gimli::Dwarf<gimli::EndianArcSlice<LittleEndian>>,
+                unit: &gimli::Unit<gimli::EndianArcSlice<LittleEndian>>,
+                value: gimli::AttributeValue<gimli::EndianArcSlice<LittleEndian>>,
+            ) -> gimli::read::Result<Option<ResolvedOriginEntry>> {
+                let debug_info_off = match value {
+                    gimli::AttributeValue::UnitRef(off) => off.to_debug_info_offset(&unit.header),
+                    gimli::AttributeValue::DebugInfoRef(off) => Some(off),
+                    _ => None,
+                };
+                let Some(debug_info_off) = debug_info_off else {
+                    return Ok(None);
+                };
+
+                let Some((origin_unit, origin_entry)) =
+                    resolve_debug_info_ref(dwarf, debug_info_off)?
+                else {
+                    return Ok(None);
+                };
+                Ok(Some((debug_info_off, origin_unit, origin_entry)))
+            }
+
+            fn inner(
+                dwarf: &gimli::Dwarf<gimli::EndianArcSlice<LittleEndian>>,
+                unit: &gimli::Unit<gimli::EndianArcSlice<LittleEndian>>,
+                entry: &gimli::DebuggingInformationEntry<gimli::EndianArcSlice<LittleEndian>>,
+                visited: &mut std::collections::HashSet<gimli::DebugInfoOffset>,
+            ) -> gimli::read::Result<Option<String>> {
+                if let Some(attr) = entry.attr(gimli::DW_AT_name) {
+                    if let Ok(s) = dwarf.attr_string(unit, attr.value()) {
+                        if let Ok(name) = s.to_string_lossy() {
+                            return Ok(Some(name.into_owned()));
+                        }
+                    }
+                }
+
+                for origin_attr in [
+                    gimli::constants::DW_AT_abstract_origin,
+                    gimli::constants::DW_AT_specification,
+                ] {
+                    if let Some(value) = entry.attr_value(origin_attr) {
+                        if let Some((origin_abs, origin_unit, origin_entry)) =
+                            resolve_origin_entry(dwarf, unit, value)?
+                        {
+                            if visited.insert(origin_abs) {
+                                if let Some(name) =
+                                    inner(dwarf, &origin_unit, &origin_entry, visited)?
+                                {
+                                    return Ok(Some(name));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Ok(None)
+            }
+
+            let mut visited = std::collections::HashSet::new();
+            if let Some(entry_abs) = entry.offset().to_debug_info_offset(&unit.header) {
+                visited.insert(entry_abs);
+            }
+            inner(dwarf, unit, entry, &mut visited)
+        }
+
         let t0 = Instant::now();
         let mut built_funcs: usize = 0;
         let mut build_ms: u128 = 0;
@@ -945,89 +1035,80 @@ impl ModuleData {
             let mut cand_names: Vec<String> = Vec::new();
             for v in &candidates {
                 let e = unit.entry(v.die_offset)?;
-                if let Some(attr) = e.attr(gimli::DW_AT_name) {
-                    if let Ok(s) = dwarf.attr_string(&unit, attr.value()) {
-                        if let Ok(s_str) = s.to_string_lossy() {
-                            cand_names.push(s_str.into_owned());
-                        }
-                    }
+                if let Some(name) = resolve_var_name_with_origins(dwarf, &unit, &e)? {
+                    cand_names.push(name);
                 }
             }
             tracing::info!("DWARF:plan_chain candidates_names={:?}", cand_names);
 
             for v in candidates {
                 let e = unit.entry(v.die_offset)?;
-                if let Some(attr) = e.attr(gimli::DW_AT_name) {
-                    if let Ok(s) = dwarf.attr_string(&unit, attr.value()) {
-                        if let Ok(n) = s.to_string_lossy() {
-                            if n == base_var || n.starts_with(&format!("{base_var}@")) {
-                                // Chain empty: short-circuit to base variable (avoid heavy type resolution)
-                                if chain.is_empty() {
-                                    let one = vec![(func.cu_offset, v.die_offset)];
-                                    let t1 = Instant::now();
-                                    let vars =
-                                        self.resolver.resolve_variables_by_offsets_at_address(
-                                            address,
-                                            &one,
-                                            Some(&get_cfa_closure),
-                                        )?;
-                                    let mut var_opt = vars.into_iter().next();
-                                    let mut type_ms = 0u128;
-                                    if let Some(ref mut var0) = var_opt {
-                                        if var0.dwarf_type.is_none() {
-                                            // Resolve base variable type strictly via DWARF type DIE
-                                            let dwarf = self.resolver.dwarf_ref();
-                                            let header = dwarf.unit_header(func.cu_offset)?;
-                                            let unit = dwarf.unit(header)?;
-                                            let e = unit.entry(v.die_offset)?;
-                                            let planner = crate::planner::AccessPlanner::new(dwarf);
-                                            if let Some(type_die_off) = planner
-                                                .resolve_type_ref_with_origins_public(&e, &unit)?
-                                            {
-                                                let tstart = Instant::now();
-                                                if let Some(ty) = self.detailed_shallow_type(
-                                                    func.cu_offset,
-                                                    type_die_off,
-                                                ) {
-                                                    type_ms = tstart.elapsed().as_millis();
-                                                    var0.type_name = ty.type_name();
-                                                    var0.dwarf_type = Some(ty);
-                                                }
-                                            }
+                if let Some(n) = resolve_var_name_with_origins(dwarf, &unit, &e)? {
+                    if n == base_var || n.starts_with(&format!("{base_var}@")) {
+                        // Chain empty: short-circuit to base variable (avoid heavy type resolution)
+                        if chain.is_empty() {
+                            let one = vec![(func.cu_offset, v.die_offset)];
+                            let t1 = Instant::now();
+                            let vars = self.resolver.resolve_variables_by_offsets_at_address(
+                                address,
+                                &one,
+                                Some(&get_cfa_closure),
+                            )?;
+                            let mut var_opt = vars.into_iter().next();
+                            let mut type_ms = 0u128;
+                            if let Some(ref mut var0) = var_opt {
+                                if var0.dwarf_type.is_none() {
+                                    // Resolve base variable type strictly via DWARF type DIE
+                                    let dwarf = self.resolver.dwarf_ref();
+                                    let header = dwarf.unit_header(func.cu_offset)?;
+                                    let unit = dwarf.unit(header)?;
+                                    let e = unit.entry(v.die_offset)?;
+                                    let planner = crate::planner::AccessPlanner::new(dwarf);
+                                    if let Some(type_loc) =
+                                        planner.resolve_type_ref_with_origins_public(&e, &unit)?
+                                    {
+                                        let tstart = Instant::now();
+                                        if let Some(ty) = self.detailed_shallow_type(
+                                            type_loc.cu_off,
+                                            type_loc.die_off,
+                                        ) {
+                                            type_ms = tstart.elapsed().as_millis();
+                                            var0.type_name = ty.type_name();
+                                            var0.dwarf_type = Some(ty);
                                         }
                                     }
-                                    tracing::info!(
-                                        "DWARF:plan_chain var_match='{}' resolve_base_ms={} type_ms={} total_ms={}",
-                                        n,
-                                        t1.elapsed().as_millis(),
-                                        type_ms,
-                                        t0.elapsed().as_millis()
-                                    );
-                                    return Ok(var_opt);
                                 }
-
-                                // Non-empty chain: plan from the base variable
-                                let t1 = Instant::now();
-                                let res = self.resolver.plan_chain_access_from_var(
-                                    address,
-                                    func.cu_offset,
-                                    func.die_offset,
-                                    v.die_offset,
-                                    crate::data::on_demand_resolver::ChainSpec {
-                                        base: base_var,
-                                        fields: chain,
-                                    },
-                                    Some(&get_cfa_closure),
-                                )?;
-                                tracing::info!(
-                                    "DWARF:plan_chain var_match='{}' plan_ms={} total_ms={}",
-                                    n,
-                                    t1.elapsed().as_millis(),
-                                    t0.elapsed().as_millis()
-                                );
-                                return Ok(res);
                             }
+                            tracing::info!(
+                                "DWARF:plan_chain var_match='{}' resolve_base_ms={} type_ms={} total_ms={}",
+                                n,
+                                t1.elapsed().as_millis(),
+                                type_ms,
+                                t0.elapsed().as_millis()
+                            );
+                            return Ok(var_opt);
                         }
+
+                        // Non-empty chain: plan from the base variable
+                        let t1 = Instant::now();
+                        let res = self.resolver.plan_chain_access_from_var(
+                            address,
+                            func.cu_offset,
+                            func.die_offset,
+                            v.die_offset,
+                            crate::data::on_demand_resolver::ChainSpec {
+                                base: base_var,
+                                fields: chain,
+                            },
+                            Some(&get_cfa_closure),
+                        )?;
+                        tracing::info!(
+                            "DWARF:plan_chain var_match='{}' plan_ms={} total_ms={}",
+                            n,
+                            t1.elapsed().as_millis(),
+                            t0.elapsed().as_millis()
+                        );
+                        return Ok(res);
                     }
                 }
             }
@@ -2331,7 +2412,7 @@ impl ModuleData {
         let entry = unit.entry(die_off).ok()?;
         let planner = crate::planner::AccessPlanner::new(dwarf);
         match planner.resolve_type_ref_with_origins_public(&entry, &unit) {
-            Ok(Some(type_die_off)) => self.detailed_shallow_type(cu_off, type_die_off),
+            Ok(Some(type_loc)) => self.detailed_shallow_type(type_loc.cu_off, type_loc.die_off),
             _ => None,
         }
     }

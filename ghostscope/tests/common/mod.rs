@@ -771,7 +771,7 @@ fn ensure_inline_callsite_program_compiled() -> anyhow::Result<()> {
         let compile_result = (|| -> anyhow::Result<()> {
             let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/fixtures/inline_callsite_program");
-            println!("Compiling inline_callsite_program (Optimized O2) in {base:?}");
+            println!("Compiling inline_callsite_program (Optimized O3) in {base:?}");
             let _ = Command::new("make")
                 .arg("clean")
                 .current_dir(base.clone())

@@ -6,6 +6,9 @@ use gimli::Reader;
 use gimli::{EndianArcSlice, LittleEndian};
 
 // PlanAction removed (unused)
+type DwarfUnit = gimli::Unit<EndianArcSlice<LittleEndian>>;
+type DwarfEntry = gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>;
+type ResolvedOriginEntry = (gimli::DebugInfoOffset, DwarfUnit, DwarfEntry);
 
 /// Utilities for DIE-level chain access planning
 pub struct AccessPlanner<'dwarf> {
@@ -55,27 +58,88 @@ impl<'dwarf> AccessPlanner<'dwarf> {
         &self,
         entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
         unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
-    ) -> crate::core::Result<Option<gimli::UnitOffset>> {
-        // Local recursive helper mimicking DetailedParser::resolve_attr_with_origins
-        fn resolve_attr_with_origins(
+    ) -> crate::core::Result<Option<TypeLoc>> {
+        fn resolve_debug_info_ref(
+            dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
+            debug_info_off: gimli::DebugInfoOffset,
+        ) -> crate::core::Result<Option<(gimli::Unit<EndianArcSlice<LittleEndian>>, TypeLoc)>>
+        {
+            let mut units = dwarf.units();
+            while let Some(header) = units.next()? {
+                if let Some(die_off) = debug_info_off.to_unit_offset(&header) {
+                    let target_unit = dwarf.unit(header)?;
+                    let cu_off = target_unit
+                        .header
+                        .debug_info_offset()
+                        .ok_or_else(|| anyhow::anyhow!("unit missing debug_info offset"))?;
+                    return Ok(Some((target_unit, TypeLoc { cu_off, die_off })));
+                }
+            }
+            Ok(None)
+        }
+
+        fn type_loc_from_attr_value(
+            dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
+            unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
+            value: gimli::AttributeValue<EndianArcSlice<LittleEndian>>,
+        ) -> crate::core::Result<Option<TypeLoc>> {
+            let cu_off = unit
+                .header
+                .debug_info_offset()
+                .ok_or_else(|| anyhow::anyhow!("unit missing debug_info offset"))?;
+            match value {
+                gimli::AttributeValue::UnitRef(die_off) => Ok(Some(TypeLoc { cu_off, die_off })),
+                gimli::AttributeValue::DebugInfoRef(debug_info_off) => {
+                    Ok(resolve_debug_info_ref(dwarf, debug_info_off)?.map(|(_, loc)| loc))
+                }
+                _ => Ok(None),
+            }
+        }
+
+        fn resolve_origin_entry(
+            dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
+            unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
+            value: gimli::AttributeValue<EndianArcSlice<LittleEndian>>,
+        ) -> crate::core::Result<Option<ResolvedOriginEntry>> {
+            let debug_info_off = match value {
+                gimli::AttributeValue::UnitRef(off) => off.to_debug_info_offset(&unit.header),
+                gimli::AttributeValue::DebugInfoRef(off) => Some(off),
+                _ => None,
+            };
+            let Some(debug_info_off) = debug_info_off else {
+                return Ok(None);
+            };
+
+            let Some((origin_unit, origin_loc)) = resolve_debug_info_ref(dwarf, debug_info_off)?
+            else {
+                return Ok(None);
+            };
+            let origin_entry = origin_unit.entry(origin_loc.die_off)?;
+            Ok(Some((debug_info_off, origin_unit, origin_entry)))
+        }
+
+        fn inner(
+            dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
             entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
             unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
-            attr: gimli::DwAt,
-            visited: &mut std::collections::HashSet<gimli::UnitOffset>,
-        ) -> crate::core::Result<Option<gimli::AttributeValue<EndianArcSlice<LittleEndian>>>>
-        {
-            if let Some(value) = entry.attr_value(attr) {
-                return Ok(Some(value));
+            visited: &mut std::collections::HashSet<gimli::DebugInfoOffset>,
+        ) -> crate::core::Result<Option<TypeLoc>> {
+            if let Some(value) = entry.attr_value(gimli::constants::DW_AT_type) {
+                return type_loc_from_attr_value(dwarf, unit, value);
             }
+
             for origin_attr in [
                 gimli::constants::DW_AT_abstract_origin,
                 gimli::constants::DW_AT_specification,
             ] {
-                if let Some(gimli::AttributeValue::UnitRef(off)) = entry.attr_value(origin_attr) {
-                    if visited.insert(off) {
-                        let origin = unit.entry(off)?;
-                        if let Some(v) = resolve_attr_with_origins(&origin, unit, attr, visited)? {
-                            return Ok(Some(v));
+                if let Some(value) = entry.attr_value(origin_attr) {
+                    if let Some((origin_abs, origin_unit, origin_entry)) =
+                        resolve_origin_entry(dwarf, unit, value)?
+                    {
+                        if visited.insert(origin_abs) {
+                            if let Some(v) = inner(dwarf, &origin_entry, &origin_unit, visited)? {
+                                return Ok(Some(v));
+                            }
                         }
                     }
                 }
@@ -84,13 +148,10 @@ impl<'dwarf> AccessPlanner<'dwarf> {
         }
 
         let mut visited = std::collections::HashSet::new();
-        Ok(
-            resolve_attr_with_origins(entry, unit, gimli::constants::DW_AT_type, &mut visited)?
-                .and_then(|v| match v {
-                    gimli::AttributeValue::UnitRef(u) => Some(u),
-                    _ => None,
-                }),
-        )
+        if let Some(entry_abs) = entry.offset().to_debug_info_offset(&unit.header) {
+            visited.insert(entry_abs);
+        }
+        inner(self.dwarf, entry, unit, &mut visited)
     }
 
     /// Public wrapper for resolving DW_AT_type via origins/specification chain
@@ -98,31 +159,29 @@ impl<'dwarf> AccessPlanner<'dwarf> {
         &self,
         entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
         unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
-    ) -> crate::core::Result<Option<gimli::UnitOffset>> {
+    ) -> crate::core::Result<Option<TypeLoc>> {
         self.resolve_type_ref_with_origins(entry, unit)
     }
 
     /// Follow typedef/qualified chain to the underlying type DIE
-    fn strip_typedef_qualified(
-        &self,
-        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
-        mut die_off: gimli::UnitOffset,
-    ) -> crate::core::Result<gimli::UnitOffset> {
+    fn strip_typedef_qualified(&self, mut type_loc: TypeLoc) -> crate::core::Result<TypeLoc> {
         loop {
-            let die = unit.entry(die_off)?;
+            let header = self.dwarf.unit_header(type_loc.cu_off)?;
+            let unit = self.dwarf.unit(header)?;
+            let die = unit.entry(type_loc.die_off)?;
             match die.tag() {
                 gimli::DW_TAG_typedef
                 | gimli::DW_TAG_const_type
                 | gimli::DW_TAG_volatile_type
                 | gimli::DW_TAG_restrict_type => {
-                    if let Some(u) = self.resolve_type_ref_with_origins(&die, unit)? {
-                        die_off = u;
+                    if let Some(next) = self.resolve_type_ref_with_origins(&die, &unit)? {
+                        type_loc = next;
                         continue;
                     }
                 }
                 _ => {}
             }
-            return Ok(die_off);
+            return Ok(type_loc);
         }
     }
 
@@ -209,37 +268,34 @@ impl<'dwarf> AccessPlanner<'dwarf> {
     pub fn plan_chain_from_known(
         &self,
         mut current_cu_off: gimli::DebugInfoOffset,
-        mut type_die_off: gimli::UnitOffset,
+        type_die_off: gimli::UnitOffset,
         mut current_eval: EvaluationResult,
         chain: &[String],
     ) -> Result<(EvaluationResult, TypeLoc, Option<MemberParentCtx>)> {
+        let mut current_type = TypeLoc {
+            cu_off: current_cu_off,
+            die_off: type_die_off,
+        };
         let mut idx = 0usize;
         let mut last_parent_ctx: Option<MemberParentCtx> = None;
         while idx < chain.len() {
             let field = &chain[idx];
-            // Reacquire current unit on each step
-            let header_now = self.dwarf.unit_header(current_cu_off)?;
-            let unit_now = self.dwarf.unit(header_now)?;
+            current_type = self.strip_typedef_qualified(current_type)?;
+            current_cu_off = current_type.cu_off;
 
-            // Strip typedef/qualified
-            type_die_off = self.strip_typedef_qualified(&unit_now, type_die_off)?;
-            let type_die = unit_now.entry(type_die_off)?;
+            // Reacquire current unit on each step
+            let header_now = self.dwarf.unit_header(current_type.cu_off)?;
+            let unit_now = self.dwarf.unit(header_now)?;
+            let type_die = unit_now.entry(current_type.die_off)?;
 
             match type_die.tag() {
                 gimli::DW_TAG_pointer_type => {
                     // Dereference then continue without consuming field
                     current_eval = Self::compute_pointer_deref(current_eval);
-                    if let Some(u) = self.resolve_type_ref_with_origins(&type_die, &unit_now)? {
-                        type_die_off = u;
+                    if let Some(next) = self.resolve_type_ref_with_origins(&type_die, &unit_now)? {
+                        current_type = next;
                     } else {
-                        return Ok((
-                            current_eval,
-                            TypeLoc {
-                                cu_off: current_cu_off,
-                                die_off: type_die_off,
-                            },
-                            last_parent_ctx,
-                        ));
+                        return Ok((current_eval, current_type, last_parent_ctx));
                     }
                     continue;
                 }
@@ -257,7 +313,6 @@ impl<'dwarf> AccessPlanner<'dwarf> {
                     // Scan members for the field
                     let mut entries = unit_now2.entries_at_offset(def_die.offset())?;
                     let _ = entries.next_entry()?; // self
-                    let mut next_type: Option<gimli::UnitOffset> = None;
                     let mut found_member = false;
                     while let Some(e) = entries.next_dfs()? {
                         if e.tag() == gimli::DW_TAG_member {
@@ -341,15 +396,15 @@ impl<'dwarf> AccessPlanner<'dwarf> {
                                                 };
                                             }
                                             // type
-                                            if let Some(a) = e.attr(gimli::DW_AT_type) {
-                                                if let gimli::AttributeValue::UnitRef(u) = a.value()
-                                                {
-                                                    next_type = Some(u);
-                                                }
-                                            }
-                                            type_die_off = next_type.unwrap_or(type_die_off);
+                                            let next_type =
+                                                self.resolve_type_ref_with_origins(e, &unit_now2)?;
+                                            let parent_cu_off = current_cu_off;
+                                            current_type = next_type.unwrap_or(TypeLoc {
+                                                cu_off: current_cu_off,
+                                                die_off: current_type.die_off,
+                                            });
                                             last_parent_ctx = Some(MemberParentCtx {
-                                                parent_cu_off: current_cu_off,
+                                                parent_cu_off,
                                                 parent_die_off: def_off,
                                                 member_name: field.clone(),
                                             });
@@ -387,31 +442,16 @@ impl<'dwarf> AccessPlanner<'dwarf> {
                 }
                 _ => {
                     // Can't descend further
-                    return Ok((
-                        current_eval,
-                        TypeLoc {
-                            cu_off: current_cu_off,
-                            die_off: type_die_off,
-                        },
-                        last_parent_ctx,
-                    ));
+                    return Ok((current_eval, current_type, last_parent_ctx));
                 }
             }
         }
 
-        Ok((
-            current_eval,
-            TypeLoc {
-                cu_off: current_cu_off,
-                die_off: type_die_off,
-            },
-            last_parent_ctx,
-        ))
+        Ok((current_eval, current_type, last_parent_ctx))
     }
 
     fn compute_pointer_deref(base: EvaluationResult) -> EvaluationResult {
-        use crate::core::ComputeStep;
-        use crate::core::LocationResult;
+        use crate::core::{ComputeStep, DirectValueResult, LocationResult};
         match base {
             EvaluationResult::MemoryLocation(LocationResult::RegisterAddress {
                 register,
@@ -442,6 +482,26 @@ impl<'dwarf> AccessPlanner<'dwarf> {
                 steps.push(ComputeStep::Dereference {
                     size: crate::core::MemoryAccessSize::U64,
                 });
+                EvaluationResult::MemoryLocation(LocationResult::ComputedLocation { steps })
+            }
+            EvaluationResult::DirectValue(DirectValueResult::RegisterValue(register)) => {
+                EvaluationResult::MemoryLocation(LocationResult::RegisterAddress {
+                    register,
+                    offset: None,
+                    size: None,
+                })
+            }
+            EvaluationResult::DirectValue(DirectValueResult::Constant(value)) => {
+                EvaluationResult::MemoryLocation(LocationResult::Address(value as u64))
+            }
+            EvaluationResult::DirectValue(DirectValueResult::ImplicitValue(bytes)) => {
+                let mut value = 0u64;
+                for (idx, byte) in bytes.iter().take(8).enumerate() {
+                    value |= (*byte as u64) << (idx * 8);
+                }
+                EvaluationResult::MemoryLocation(LocationResult::Address(value))
+            }
+            EvaluationResult::DirectValue(DirectValueResult::ComputedValue { steps, .. }) => {
                 EvaluationResult::MemoryLocation(LocationResult::ComputedLocation { steps })
             }
             other => other,
@@ -808,5 +868,18 @@ mod tests {
         assert_eq!(resolved_die, empty_struct_off);
         assert_ne!(resolved_die, full_struct_off);
         assert_ne!(resolved_cu, Some(full_cu_off));
+    }
+
+    #[test]
+    fn pointer_deref_handles_direct_register_values() {
+        let eval = EvaluationResult::DirectValue(crate::core::DirectValueResult::RegisterValue(12));
+        assert_eq!(
+            AccessPlanner::compute_pointer_deref(eval),
+            EvaluationResult::MemoryLocation(crate::core::LocationResult::RegisterAddress {
+                register: 12,
+                offset: None,
+                size: None,
+            })
+        );
     }
 }

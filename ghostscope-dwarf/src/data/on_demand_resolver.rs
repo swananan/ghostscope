@@ -100,7 +100,7 @@ impl OnDemandResolver {
 
         if !chain.fields.is_empty() {
             let t1 = std::time::Instant::now();
-            let type_die_off = planner
+            let type_loc = planner
                 .resolve_type_ref_with_origins_public(&var_entry, &unit)?
                 .ok_or_else(|| anyhow::anyhow!("variable has no DW_AT_type"))?;
             tracing::info!(
@@ -110,8 +110,8 @@ impl OnDemandResolver {
 
             let t2 = std::time::Instant::now();
             let (fe, ftl, pctx) = planner.plan_chain_from_known(
-                cu_offset,
-                type_die_off,
+                type_loc.cu_off,
+                type_loc.die_off,
                 current_eval,
                 chain.fields,
             )?;
