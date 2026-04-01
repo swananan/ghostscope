@@ -30,10 +30,14 @@ const ENV_GHOSTSCOPE_LOG_LEVEL: &str = "E2E_GHOSTSCOPE_LOG_LEVEL";
 const ENV_GHOSTSCOPE_ENABLE_LOGGING: &str = "E2E_GHOSTSCOPE_ENABLE_LOGGING";
 const ENV_GHOSTSCOPE_LOG_CONSOLE: &str = "E2E_GHOSTSCOPE_LOG_CONSOLE";
 const ENV_E2E_TARGET_MODE: &str = "E2E_TARGET_MODE";
+const ENV_E2E_GHOSTSCOPE_SANDBOX: &str = "E2E_GHOSTSCOPE_SANDBOX";
+const ENV_E2E_TARGET_SANDBOX: &str = "E2E_TARGET_SANDBOX";
 const GHOSTSCOPE_PID_BOOTSTRAP_PREFIX: &str = "__GHOSTSCOPE_PID__ ";
 #[allow(dead_code)]
 const GHOSTSCOPE_READY_MARKER: &str = "__GHOSTSCOPE_READY__";
-const CHILD_CONTAINER_TIMEOUT_SLACK_SECS: u64 = 3;
+const CHILD_CONTAINER_TIMEOUT_SLACK_SECS: u64 = 45;
+const CHILD_CONTAINER_POST_READY_CALLBACK_SLACK_SECS: u64 = 45;
+const CONTAINER_TOPOLOGY_SETUP_SLACK_SECS: u64 = 10;
 
 pub struct GhostscopeRunner {
     script_content: String,
@@ -175,8 +179,10 @@ impl GhostscopeRunner {
         Fut: Future<Output = Result<T>>,
     {
         let logging = self.resolve_logging_config();
+        let runner_debug = logging.level.is_some();
         let monitor_timeout_secs = self.effective_timeout_secs();
         let setup_timeout_secs = self.setup_timeout_secs();
+        let post_ready_callback_timeout_secs = self.post_ready_callback_timeout_secs();
         let sandbox = match self.sandbox {
             Some(sandbox) => sandbox,
             None => SandboxHandle::default_ghostscope()?,
@@ -316,8 +322,11 @@ impl GhostscopeRunner {
                                 .as_deref()
                                 .is_some_and(|marker| stdout_line.trim_end() == marker)
                             {
-                                if let Some(callback) = ready_callback.take() {
-                                    ready_result = Some(callback().await?);
+                                if runner_debug {
+                                    eprintln!(
+                                        "[ghostscope-test-runner] observed ready marker on stdout from {}",
+                                        sandbox.label()
+                                    );
                                 }
                                 ready_fired = true;
                                 break;
@@ -338,8 +347,11 @@ impl GhostscopeRunner {
                                 .as_deref()
                                 .is_some_and(|marker| stderr_line.trim_end() == marker)
                             {
-                                if let Some(callback) = ready_callback.take() {
-                                    ready_result = Some(callback().await?);
+                                if runner_debug {
+                                    eprintln!(
+                                        "[ghostscope-test-runner] observed ready marker on stderr from {}",
+                                        sandbox.label()
+                                    );
                                 }
                                 ready_fired = true;
                                 break;
@@ -358,6 +370,13 @@ impl GhostscopeRunner {
             match timeout(Duration::from_secs(setup_timeout_secs), pre_ready_task).await {
                 Ok(result) => result?,
                 Err(_) => {
+                    if runner_debug {
+                        eprintln!(
+                            "[ghostscope-test-runner] timed out waiting for ready marker from {} after {}s",
+                            sandbox.label(),
+                            setup_timeout_secs
+                        );
+                    }
                     if let Some(pid) = managed_ghostscope_pid {
                         sandbox.terminate_pid(pid).with_context(|| {
                             format!(
@@ -373,6 +392,64 @@ impl GhostscopeRunner {
                             GRACEFUL_TERMINATION_TIMEOUT,
                         )
                         .await?;
+                    }
+                }
+            }
+        }
+
+        if ready_fired && ready_result.is_none() {
+            if let Some(callback) = ready_callback.take() {
+                if runner_debug {
+                    eprintln!(
+                        "[ghostscope-test-runner] starting post-ready callback for {} with {}s timeout",
+                        sandbox.label(),
+                        post_ready_callback_timeout_secs
+                    );
+                }
+                match timeout(
+                    Duration::from_secs(post_ready_callback_timeout_secs),
+                    callback(),
+                )
+                .await
+                {
+                    Ok(result) => {
+                        if runner_debug {
+                            eprintln!(
+                                "[ghostscope-test-runner] completed post-ready callback for {}",
+                                sandbox.label()
+                            );
+                        }
+                        ready_result = Some(result?);
+                    }
+                    Err(_) => {
+                        if runner_debug {
+                            eprintln!(
+                                "[ghostscope-test-runner] timed out waiting for post-ready callback for {} after {}s",
+                                sandbox.label(),
+                                post_ready_callback_timeout_secs
+                            );
+                        }
+                        if let Some(pid) = managed_ghostscope_pid {
+                            sandbox.terminate_pid(pid).with_context(|| {
+                                format!(
+                                    "failed to terminate GhostScope pid {} after post-ready callback timeout in {}",
+                                    pid,
+                                    sandbox.label()
+                                )
+                            })?;
+                        } else {
+                            let _ = terminate_tokio_child_gracefully(
+                                &mut child,
+                                "ghostscope runner child",
+                                GRACEFUL_TERMINATION_TIMEOUT,
+                            )
+                            .await?;
+                        }
+                        anyhow::bail!(
+                            "timed out waiting for post-ready callback after ready marker '{}' in {}",
+                            ready_marker.as_deref().unwrap_or("<none>"),
+                            sandbox.label()
+                        );
                     }
                 }
             }
@@ -543,11 +620,30 @@ impl GhostscopeRunner {
 
     fn setup_timeout_secs(&self) -> u64 {
         let mut timeout_secs = self.timeout_secs.max(15);
+        let docker_topology = [ENV_E2E_GHOSTSCOPE_SANDBOX, ENV_E2E_TARGET_SANDBOX]
+            .into_iter()
+            .filter_map(|key| env::var(key).ok())
+            .any(|value| value.trim_start().starts_with("docker-"));
+        if docker_topology {
+            timeout_secs = timeout_secs.saturating_add(CONTAINER_TOPOLOGY_SETUP_SLACK_SECS);
+        }
         if env::var(ENV_E2E_TARGET_MODE)
             .ok()
             .is_some_and(|value| value.trim().eq_ignore_ascii_case("child-container"))
         {
             timeout_secs = timeout_secs.saturating_add(CHILD_CONTAINER_TIMEOUT_SLACK_SECS);
+        }
+        timeout_secs
+    }
+
+    fn post_ready_callback_timeout_secs(&self) -> u64 {
+        let mut timeout_secs = self.setup_timeout_secs();
+        if env::var(ENV_E2E_TARGET_MODE)
+            .ok()
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("child-container"))
+        {
+            timeout_secs =
+                timeout_secs.saturating_add(CHILD_CONTAINER_POST_READY_CALLBACK_SLACK_SECS);
         }
         timeout_secs
     }

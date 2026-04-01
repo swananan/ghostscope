@@ -177,6 +177,7 @@ curl -sS -X POST http://127.0.0.1:8788/runs \
 - `repo`：覆盖仓库根目录
 - `test_case`：指定单个 cargo test filter
 - `sudo`：控制 service 是否用 `sudo` 执行该次运行
+- runner service 会为每个提交的 job 自动设置 `E2E_SANDBOX_SESSION=runner-<job-id>`，并在 job 结束后尽力清理该 session 对应的 Docker sandbox。
 
 测试框架级环境变量：
 
@@ -187,6 +188,8 @@ curl -sS -X POST http://127.0.0.1:8788/runs \
 - `E2E_TARGET_MODE=same|child-container`
   进一步描述目标进程在所选 target sandbox 里的启动方式。默认：`same`。
   目前 `child-container` 专指“在外层 `docker-private` sandbox 里再起一个子容器来运行目标进程”。
+- `E2E_CHILD_CONTAINER_IMAGE=<image-ref>`
+  覆盖 nested `child-container` 目标使用的镜像。默认会继承 `E2E_CONTAINER_IMAGE`，也就是外层 sandbox 和子容器默认共用同一张 runtime 镜像，除非你显式指定不同镜像。
 - `E2E_GHOSTSCOPE_LOG_LEVEL=error|warn|info|debug|trace`
   为直接执行的 `cargo test` 打开 GhostScope 日志并设置日志级别。
   设置该变量后，测试 helper 会自动启用 GhostScope 的文件日志和控制台日志。
@@ -271,6 +274,10 @@ done
 - topology-aware e2e 默认使用专门给容器 e2e 发布的 Ubuntu 24.04 runtime 镜像的固定 digest：`ghcr.io/swananan/ghostscope-e2e-runtime@sha256:d5df1b977c38f7a51bbf28b878f2246705a05b83ac6df7cb6be8f8a4de4105f4`。
 - 容器 e2e 使用上面的 runtime 镜像；release / 容器化构建则继续使用从 `docker/base-build/Dockerfile` 发布出来的独立 `ghostscope-build` 基础镜像。
 - 可通过 `E2E_CONTAINER_IMAGE` 覆盖容器镜像；只有在你明确想测试本地镜像或某个固定 digest 时，才建议手动改这个变量。
+- nested `child-container` 默认会继承 `E2E_CONTAINER_IMAGE`。只有在你明确想让子容器使用不同镜像时，才需要额外设置 `E2E_CHILD_CONTAINER_IMAGE`。
+- 如果你想让容器类测试在不同 Rust test binary 或多次本地命令之间复用同一个外层 sandbox，可显式设置 `E2E_SANDBOX_SESSION`。跑完后可用 `docker ps -aq --filter "label=ghostscope.session=$E2E_SANDBOX_SESSION" | xargs -r docker rm -f` 清理残留容器。
+- `scripts/e2e/container/` 下的辅助脚本默认沿用 cargo test 的正常输出捕获；只有在你明确传 `--nocapture` 时，才会额外追加 `-- --nocapture`。
+- `E2E_CARGO_NOCAPTURE=1` 仍然保留为兼容性兜底，但本地调试时更推荐直接用脚本参数。
 
 ### 使用 dwarf-tool 测试 DWARF 解析
 

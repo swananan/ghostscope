@@ -176,6 +176,7 @@ Optional variables:
 - Submit `repo` to override the repository root.
 - Submit `test_case` to run a single cargo-test filter.
 - Submit `sudo` to control whether the service executes the run with `sudo`.
+- The runner service automatically sets `E2E_SANDBOX_SESSION=runner-<job-id>` for each submitted job and performs best-effort cleanup of session-scoped Docker sandboxes after the job finishes.
 
 Test-framework environment variables:
 
@@ -186,6 +187,8 @@ Test-framework environment variables:
 - `E2E_TARGET_MODE=same|child-container`
   Refines how the target is launched inside the selected target sandbox. Default: `same`.
   `child-container` currently means "launch the target in a nested child container inside the outer `docker-private` sandbox".
+- `E2E_CHILD_CONTAINER_IMAGE=<image-ref>`
+  Overrides the image used for nested `child-container` targets. By default it inherits `E2E_CONTAINER_IMAGE`, so the outer sandbox and nested child container use the same runtime image unless you explicitly split them.
 - `E2E_GHOSTSCOPE_LOG_LEVEL=error|warn|info|debug|trace`
   Enables GhostScope logging for direct `cargo test` runs and sets the log level.
   The test helper automatically turns on GhostScope file+console logging when this is set.
@@ -270,6 +273,10 @@ Notes:
 - By default the topology-aware e2e framework uses a pinned digest of the dedicated Ubuntu 24.04 runtime image published for container e2e: `ghcr.io/swananan/ghostscope-e2e-runtime@sha256:d5df1b977c38f7a51bbf28b878f2246705a05b83ac6df7cb6be8f8a4de4105f4`.
 - Container e2e uses the dedicated runtime image above; release/containerized builds continue to use the separate `ghostscope-build` base image published from `docker/base-build/Dockerfile`.
 - Override the Docker image with `E2E_CONTAINER_IMAGE`. Use this when you explicitly want to test a local image or a pinned digest of the runtime image.
+- Nested `child-container` targets inherit `E2E_CONTAINER_IMAGE` by default. Override `E2E_CHILD_CONTAINER_IMAGE` only when you intentionally want a different child image.
+- Set `E2E_SANDBOX_SESSION` when you want container-backed tests to reuse the same outer sandbox across separate Rust test binaries or repeated local commands. Remove leftovers with `docker ps -aq --filter "label=ghostscope.session=$E2E_SANDBOX_SESSION" | xargs -r docker rm -f`.
+- The helper scripts under `scripts/e2e/container/` default to normal cargo test output capture. Pass `--nocapture` when you explicitly want them to append `-- --nocapture`.
+- `E2E_CARGO_NOCAPTURE=1` remains supported as a compatibility fallback, but the script flag is the preferred local workflow.
 
 ### Testing DWARF Parsing with dwarf-tool
 

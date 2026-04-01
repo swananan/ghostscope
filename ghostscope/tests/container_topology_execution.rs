@@ -181,6 +181,61 @@ async fn test_attach_from_private_container_to_host_target_fails_when_pid_invisi
 
 #[tokio::test]
 #[serial]
+async fn test_child_container_runtime_reuses_single_nested_container() -> anyhow::Result<()> {
+    init();
+    if skip_if_docker_unavailable() {
+        return Ok(());
+    }
+
+    let Some(private_box) = docker_sandbox_or_skip(DockerSpec::private())? else {
+        return Ok(());
+    };
+
+    let target_one = TargetLauncher::sample_program()
+        .in_child_container_of(&private_box)
+        .spawn()
+        .await?;
+    let runtime_names_after_first = private_box
+        .list_inner_docker_container_names_by_label("ghostscope.test-child-runtime=1")?;
+    let child_target_names_after_first = private_box
+        .list_inner_docker_container_names_by_label("ghostscope.test-child-container=1")?;
+    assert_eq!(
+        runtime_names_after_first.len(),
+        1,
+        "expected exactly one reusable child runtime container after first launch"
+    );
+    assert!(
+        child_target_names_after_first.is_empty(),
+        "expected child-container launch to avoid per-target docker run containers, found {child_target_names_after_first:?}"
+    );
+    let runtime_name = runtime_names_after_first[0].clone();
+    target_one.terminate().await?;
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let target_two = TargetLauncher::sample_program()
+        .in_child_container_of(&private_box)
+        .spawn()
+        .await?;
+    let runtime_names_after_second = private_box
+        .list_inner_docker_container_names_by_label("ghostscope.test-child-runtime=1")?;
+    let child_target_names_after_second = private_box
+        .list_inner_docker_container_names_by_label("ghostscope.test-child-container=1")?;
+    assert_eq!(
+        runtime_names_after_second,
+        vec![runtime_name],
+        "expected nested target launches to reuse the same child runtime container"
+    );
+    assert!(
+        child_target_names_after_second.is_empty(),
+        "expected nested target launches to avoid extra child docker containers, found {child_target_names_after_second:?}"
+    );
+    target_two.terminate().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
 async fn test_attach_from_private_container_to_child_container_target() -> anyhow::Result<()> {
     init();
     if skip_if_docker_unavailable() {
