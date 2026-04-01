@@ -68,16 +68,16 @@ pub fn initialize_logging_with_config(
                 .with_ansi(false);
 
             if enable_console_logging {
-                // Console logging enabled: dual output to file and stdout with level filter
-                let stdout_layer = tracing_subscriber::fmt::layer()
+                // Console logging enabled: dual output to file and stderr with level filter
+                let stderr_layer = tracing_subscriber::fmt::layer()
                     .event_format(event_format.clone())
-                    .with_writer(std::io::stdout)
+                    .with_writer(std::io::stderr)
                     .with_ansi(true);
 
                 let init_res = tracing_subscriber::registry()
                     .with(env_filter)
                     .with(file_layer)
-                    .with(stdout_layer)
+                    .with(stderr_layer)
                     .try_init();
                 let _ = init_res;
             } else {
@@ -90,14 +90,14 @@ pub fn initialize_logging_with_config(
             }
         }
         Err(_) => {
-            // Fallback to stdout only if file creation fails and console logging is enabled
+            // Fallback to stderr only if file creation fails and console logging is enabled
             if enable_console_logging {
-                let stdout_layer = tracing_subscriber::fmt::layer()
+                let stderr_layer = tracing_subscriber::fmt::layer()
                     .event_format(event_format)
-                    .with_writer(std::io::stdout);
+                    .with_writer(std::io::stderr);
                 let init_res = tracing_subscriber::registry()
                     .with(env_filter)
-                    .with(stdout_layer)
+                    .with(stderr_layer)
                     .try_init();
                 let _ = init_res;
             } else {

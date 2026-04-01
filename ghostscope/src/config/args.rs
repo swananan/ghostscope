@@ -155,11 +155,11 @@ pub struct Args {
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub no_log: bool,
 
-    /// Enable console/stdout logging in addition to file logging (overrides config file)
+    /// Enable console/stderr logging in addition to file logging (overrides config file)
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub log_console: bool,
 
-    /// Disable console/stdout logging, file logging only (overrides config file)
+    /// Disable console/stderr logging, file logging only (overrides config file)
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub no_log_console: bool,
 

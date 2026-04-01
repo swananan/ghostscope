@@ -91,7 +91,7 @@ pub struct GeneralConfig {
     /// Enable/disable file logging (overridden by --log/--no-log)
     #[serde(default = "default_enable_logging")]
     pub enable_logging: bool,
-    /// Enable/disable console logging (overridden by --log-console/--no-log-console)
+    /// Enable/disable console stderr logging (overridden by --log-console/--no-log-console)
     #[serde(default = "default_enable_console_logging")]
     pub enable_console_logging: bool,
     /// Log level filter
