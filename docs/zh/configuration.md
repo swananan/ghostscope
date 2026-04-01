@@ -106,10 +106,10 @@ ghostscope --log
 # 禁用所有日志
 ghostscope --no-log
 
-# 除文件外还启用控制台输出
+# 除文件外还启用控制台 stderr 日志
 ghostscope --log-console
 
-# 禁用控制台输出
+# 禁用控制台 stderr 日志
 ghostscope --no-log-console
 
 # 设置日志级别
@@ -209,8 +209,8 @@ ghostscope bpffs prune --dry-run --json
 | `--tui` | | 以 TUI 模式启动 | 自动 |
 | `--log` | | 启用文件日志 | Script: 关, TUI: 开 |
 | `--no-log` | | 禁用所有日志 | - |
-| `--log-console` | | 启用控制台日志 | 关 |
-| `--no-log-console` | | 禁用控制台日志 | - |
+| `--log-console` | | 启用控制台 stderr 日志 | 关 |
+| `--no-log-console` | | 禁用控制台 stderr 日志 | - |
 | `--log-level <LEVEL>` | | 设置日志级别 | warn |
 | `--log-file <PATH>` | | 日志文件路径 | ./ghostscope.log |
 | `--save-llvm-ir` | | 保存 LLVM IR 文件 | Debug: 开, Release: 关 |
@@ -256,7 +256,7 @@ default_tui_mode = true
 # 启用/禁用文件日志
 enable_logging = false
 
-# 启用/禁用控制台日志
+# 启用/禁用控制台 stderr 日志
 enable_console_logging = false
 
 # 日志级别：error, warn, info, debug, trace

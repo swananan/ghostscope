@@ -105,10 +105,10 @@ ghostscope --log
 # Disable all logging
 ghostscope --no-log
 
-# Enable console output in addition to file
+# Enable console logging on stderr in addition to file output
 ghostscope --log-console
 
-# Disable console output
+# Disable console stderr logging
 ghostscope --no-log-console
 
 # Set log level
@@ -208,8 +208,8 @@ Behavior:
 | `--tui` | | Start in TUI mode | Auto |
 | `--log` | | Enable file logging | Script: off, TUI: on |
 | `--no-log` | | Disable all logging | - |
-| `--log-console` | | Enable console logging | Off |
-| `--no-log-console` | | Disable console logging | - |
+| `--log-console` | | Enable console stderr logging | Off |
+| `--no-log-console` | | Disable console stderr logging | - |
 | `--log-level <LEVEL>` | | Set log level | warn |
 | `--log-file <PATH>` | | Log file path | ./ghostscope.log |
 | `--save-llvm-ir` | | Save LLVM IR files | Debug: on, Release: off |
@@ -255,7 +255,7 @@ default_tui_mode = true
 # Enable/disable file logging
 enable_logging = false
 
-# Enable/disable console logging
+# Enable/disable console stderr logging
 enable_console_logging = false
 
 # Log level: error, warn, info, debug, trace
