@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use crate::config::{
-    Config, LayoutMode, ParsedArgs, ResolvedPidInfo, RuntimeEnvironmentInfo, ScriptOutputMode,
-    ScriptTimestampFormat,
+    CliColorMode, Config, LayoutMode, ParsedArgs, ResolvedPidInfo, RuntimeEnvironmentInfo,
+    ScriptOutputMode, ScriptTimestampFormat,
 };
 
 /// Final merged configuration that combines command line arguments and config file settings
@@ -41,6 +41,7 @@ pub struct MergedConfig {
     pub script_file: Option<PathBuf>,
     pub script_output_mode: ScriptOutputMode,
     pub script_timestamp_format: ScriptTimestampFormat,
+    pub script_color_mode: CliColorMode,
     pub tui_mode: bool,
 
     // File saving options
@@ -199,6 +200,7 @@ impl MergedConfig {
             script_file: args.script_file,
             script_output_mode: args.script_output.unwrap_or(config.script.output),
             script_timestamp_format: args.script_timestamp.unwrap_or(config.script.timestamp),
+            script_color_mode: config.script.color,
             tui_mode,
             should_save_llvm_ir,
             should_save_ebpf,

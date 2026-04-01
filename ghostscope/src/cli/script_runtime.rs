@@ -38,8 +38,13 @@ pub async fn run_command_line_runtime_with_config(config: MergedConfig) -> Resul
     // Step 2: Initialize debug session and DWARF information processing
     info!("Initializing debug session and DWARF information processing...");
 
+    let console_stderr_logging_active =
+        is_console_stderr_logging_active(config.enable_logging, config.enable_console_logging);
     let reporter = Arc::new(Mutex::new(
-        crate::cli::loading_reporter::CliLoadingReporter::new(config.enable_console_logging),
+        crate::cli::loading_reporter::CliLoadingReporter::new(
+            console_stderr_logging_active,
+            config.script_color_mode,
+        ),
     ));
     let reporter_task = spawn_loading_reporter(Arc::clone(&reporter));
     let progress_callback = {
@@ -110,6 +115,7 @@ async fn run_cli_with_session(
     config: &MergedConfig,
 ) -> Result<()> {
     let show_cli_status = should_print_cli_status(config);
+    let stderr_colors = crate::cli::color::CliColors::for_stderr(config.script_color_mode);
 
     // Step 3: Display session information
     info!("Debug session created");
@@ -202,7 +208,10 @@ async fn run_cli_with_session(
 
     // Step 7: Compile and load script with graceful error handling
     if show_cli_status {
-        eprintln!("Compiling script...");
+        eprintln!(
+            "{}",
+            stderr_colors.yellow(stderr_colors.bold("Compiling script..."))
+        );
     }
     if let Err(e) = crate::script::compile_and_load_script_for_cli(
         &script_content,
@@ -225,14 +234,19 @@ async fn run_cli_with_session(
         .map_err(|e| anyhow::anyhow!("failed to emit ready marker: {}", e))?;
     if show_cli_status {
         eprintln!(
-            "Attached {} trace(s). Waiting for events...",
-            session.trace_manager.active_trace_count()
+            "{} {}",
+            stderr_colors.green("Attached"),
+            stderr_colors.bold(format!(
+                "{} trace(s). Waiting for events...",
+                session.trace_manager.active_trace_count()
+            ))
         );
     }
     let mut output_renderer = crate::cli::script_output::ScriptOutputRenderer::new(
         crate::cli::script_output::ScriptOutputOptions {
             mode: config.script_output_mode,
             timestamp: config.script_timestamp_format,
+            color_enabled: should_use_script_stdout_color(config),
         },
     );
 
@@ -281,7 +295,16 @@ async fn run_cli_with_session(
 }
 
 fn should_print_cli_status(config: &MergedConfig) -> bool {
-    !config.enable_console_logging && io::stderr().is_terminal()
+    !is_console_stderr_logging_active(config.enable_logging, config.enable_console_logging)
+        && io::stderr().is_terminal()
+}
+
+fn is_console_stderr_logging_active(enable_logging: bool, enable_console_logging: bool) -> bool {
+    enable_logging && enable_console_logging
+}
+
+fn should_use_script_stdout_color(config: &MergedConfig) -> bool {
+    crate::cli::color::CliColors::for_stdout(config.script_color_mode).enabled()
 }
 
 /// Get script content from merged configuration or provide default
@@ -312,5 +335,18 @@ fn get_script_content_from_config(config: &MergedConfig) -> Result<String> {
             "#
             .to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_console_stderr_logging_active;
+
+    #[test]
+    fn console_stderr_logging_requires_logging_to_be_enabled() {
+        assert!(!is_console_stderr_logging_active(false, false));
+        assert!(!is_console_stderr_logging_active(false, true));
+        assert!(!is_console_stderr_logging_active(true, false));
+        assert!(is_console_stderr_logging_active(true, true));
     }
 }

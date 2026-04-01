@@ -19,4 +19,4 @@ pub use args::{
 };
 pub use merged::MergedConfig;
 pub use runtime_env::{detect_runtime_environment, RuntimeEnvironmentInfo};
-pub use settings::{Config, LogLevel, PanelType};
+pub use settings::{CliColorMode, Config, LogLevel, PanelType};

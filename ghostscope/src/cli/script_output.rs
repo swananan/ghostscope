@@ -6,11 +6,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct ScriptOutputOptions {
     pub mode: ScriptOutputMode,
     pub timestamp: ScriptTimestampFormat,
+    pub color_enabled: bool,
 }
 
 #[derive(Debug)]
 pub struct ScriptOutputRenderer {
     mode: ScriptOutputMode,
+    colors: crate::cli::color::CliColors,
     pretty_timestamp: Option<PrettyTimestampFormatter>,
 }
 
@@ -23,6 +25,7 @@ impl ScriptOutputRenderer {
 
         Self {
             mode: options.mode,
+            colors: crate::cli::color::CliColors::new(options.color_enabled),
             pretty_timestamp,
         }
     }
@@ -54,8 +57,13 @@ impl ScriptOutputRenderer {
 
     fn render_pretty_header(&mut self, event: &ParsedTraceEvent) -> String {
         let metadata = format!(
-            "TraceID:{} PID:{} TID:{}",
-            event.trace_id, event.pid, event.tid
+            "{}:{} {}:{} {}:{}",
+            self.colors.cyan("TraceID"),
+            event.trace_id,
+            self.colors.cyan("PID"),
+            event.pid,
+            self.colors.cyan("TID"),
+            event.tid
         );
 
         match self
@@ -64,7 +72,7 @@ impl ScriptOutputRenderer {
             .expect("pretty timestamp formatter must exist for pretty mode")
             .format(event.timestamp)
         {
-            Some(timestamp) => format!("[{timestamp}] {metadata}"),
+            Some(timestamp) => format!("{} {metadata}", self.colors.dim(format!("[{timestamp}]"))),
             None => metadata,
         }
     }
@@ -207,6 +215,7 @@ mod tests {
             ScriptOutputOptions {
                 mode: ScriptOutputMode::Pretty,
                 timestamp: ScriptTimestampFormat::Boot,
+                color_enabled: false,
             },
         );
 
@@ -227,6 +236,7 @@ mod tests {
             ScriptOutputOptions {
                 mode: ScriptOutputMode::Plain,
                 timestamp: ScriptTimestampFormat::Local,
+                color_enabled: false,
             },
         );
 
@@ -240,6 +250,7 @@ mod tests {
             ScriptOutputOptions {
                 mode: ScriptOutputMode::Quiet,
                 timestamp: ScriptTimestampFormat::Boot,
+                color_enabled: false,
             },
         );
 
@@ -253,6 +264,7 @@ mod tests {
             ScriptOutputOptions {
                 mode: ScriptOutputMode::Pretty,
                 timestamp: ScriptTimestampFormat::None,
+                color_enabled: false,
             },
         );
 
@@ -264,6 +276,7 @@ mod tests {
         let mut renderer = ScriptOutputRenderer::new(ScriptOutputOptions {
             mode: ScriptOutputMode::Quiet,
             timestamp: ScriptTimestampFormat::Local,
+            color_enabled: false,
         });
 
         assert!(renderer.render_event_lines(&sample_event()).is_empty());
@@ -281,5 +294,19 @@ mod tests {
         assert_ne!(first, second);
         assert!(formatter.cached_second.is_some());
         assert!(!formatter.cached_prefix.is_empty());
+    }
+
+    #[test]
+    fn pretty_output_can_colorize_header() {
+        let lines = render_with_renderer(
+            &sample_event(),
+            ScriptOutputOptions {
+                mode: ScriptOutputMode::Pretty,
+                timestamp: ScriptTimestampFormat::Boot,
+                color_enabled: true,
+            },
+        );
+
+        assert!(lines[0].contains("\u{1b}["));
     }
 }
