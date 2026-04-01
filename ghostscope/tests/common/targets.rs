@@ -29,7 +29,7 @@ struct TargetHandleInner {
 enum TargetProcessHandle {
     Host(Mutex<Option<std::process::Child>>),
     Detached,
-    ChildContainer { container_name: String },
+    ChildContainer,
 }
 
 impl fmt::Debug for TargetHandleInner {
@@ -50,10 +50,7 @@ impl fmt::Debug for TargetProcessHandle {
         match self {
             Self::Host(_) => f.write_str("Host"),
             Self::Detached => f.write_str("Detached"),
-            Self::ChildContainer { container_name } => f
-                .debug_struct("ChildContainer")
-                .field("container_name", container_name)
-                .finish(),
+            Self::ChildContainer => f.write_str("ChildContainer"),
         }
     }
 }
@@ -249,13 +246,13 @@ impl TargetHandle {
                         )
                     })?;
             }
-            TargetProcessHandle::ChildContainer { container_name } => {
+            TargetProcessHandle::ChildContainer => {
                 self.sandbox()
-                    .remove_child_container(container_name)
+                    .terminate_pid(self.sandbox_pid())
                     .with_context(|| {
                         format!(
-                            "failed to remove child container {} in sandbox {}",
-                            container_name,
+                            "failed to terminate child-container target pid {} in sandbox {}",
+                            self.sandbox_pid(),
                             self.sandbox().label()
                         )
                     })?;
@@ -336,9 +333,7 @@ async fn spawn_binary_target(
                     TargetProcessHandle::Host(Mutex::new(Some(child)))
                 }
                 BackgroundProcess::Detached { .. } => TargetProcessHandle::Detached,
-                BackgroundProcess::ChildContainer { container_name, .. } => {
-                    TargetProcessHandle::ChildContainer { container_name }
-                }
+                BackgroundProcess::ChildContainer { .. } => TargetProcessHandle::ChildContainer,
             },
         }),
     })

@@ -14,10 +14,10 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_REMOTE_IMAGE: &str = "ghcr.io/swananan/ghostscope-e2e-runtime@sha256:d5df1b977c38f7a51bbf28b878f2246705a05b83ac6df7cb6be8f8a4de4105f4";
-const DEFAULT_CHILD_CONTAINER_IMAGE: &str = "ubuntu:24.04";
 const CONTAINER_REPO_ROOT: &str = "/workspace";
 const CONTAINER_TARGET_DIR: &str = "/tmp/ghostscope-target";
 const STAGED_TOOL_DIR: &str = ".ghostscope-test-bin";
+const ENV_E2E_SANDBOX_SESSION: &str = "E2E_SANDBOX_SESSION";
 const INNER_DOCKER_HOST: &str = "unix:///tmp/ghostscope-dind.sock";
 const INNER_DOCKER_SOCK: &str = "/tmp/ghostscope-dind.sock";
 const INNER_DOCKER_PIDFILE: &str = "/tmp/ghostscope-dind.pid";
@@ -137,7 +137,7 @@ pub struct SandboxHandle {
 pub enum BackgroundProcess {
     Host { pid: u32, child: Child },
     Detached { pid: u32 },
-    ChildContainer { pid: u32, container_name: String },
+    ChildContainer { pid: u32 },
 }
 
 pub struct GhostscopeRunnerCommand {
@@ -149,9 +149,7 @@ pub struct GhostscopeRunnerCommand {
 impl BackgroundProcess {
     pub fn pid(&self) -> u32 {
         match self {
-            Self::Host { pid, .. } | Self::Detached { pid } | Self::ChildContainer { pid, .. } => {
-                *pid
-            }
+            Self::Host { pid, .. } | Self::Detached { pid } | Self::ChildContainer { pid } => *pid,
         }
     }
 }
@@ -167,6 +165,7 @@ enum SandboxInner {
 struct DockerSandboxInner {
     id: u64,
     container_name: String,
+    session: Option<String>,
     image: String,
     pid_mode: DockerPidMode,
     init_host_pid: u32,
@@ -175,11 +174,29 @@ struct DockerSandboxInner {
     prepared_fixture_commands: Mutex<HashSet<String>>,
     dind_ready: Mutex<bool>,
     loaded_child_images: Mutex<HashSet<String>>,
+    child_runtime: Mutex<Option<ChildRuntimeState>>,
+}
+
+#[derive(Debug, Clone)]
+struct ChildRuntimeState {
+    container_name: String,
+    image: String,
+    init_host_pid: u32,
+    pid_ns_inode: u64,
+}
+
+#[derive(Debug)]
+struct InnerDockerContainerState {
+    running: bool,
+    pid: u32,
+    image: String,
 }
 
 impl Drop for DockerSandboxInner {
     fn drop(&mut self) {
-        let _ = remove_docker_sandbox(&self.container_name);
+        if self.session.is_none() {
+            let _ = remove_docker_sandbox(&self.container_name);
+        }
     }
 }
 
@@ -216,13 +233,123 @@ impl SandboxHandle {
         ensure_stale_docker_sandboxes_swept()?;
 
         let repo_root = workspace_root()?;
+        if let Some(session) = current_sandbox_session() {
+            return Self::docker_with_session(spec, repo_root, session);
+        }
+
         let id = NEXT_SANDBOX_ID.fetch_add(1, Ordering::Relaxed);
         let container_name = format!(
             "ghostscope-test-{id}-{}-{}",
             std::process::id(),
             unix_timestamp_nanos()
         );
+        Self::create_docker_sandbox(spec, repo_root, container_name, None)
+    }
 
+    pub fn label(&self) -> String {
+        match &*self.inner {
+            SandboxInner::Host => "host".to_string(),
+            SandboxInner::Docker(inner) => {
+                format!(
+                    "docker(pid_mode={:?}, image={})",
+                    inner.pid_mode, inner.image
+                )
+            }
+        }
+    }
+
+    pub fn is_host_pid_view(&self) -> bool {
+        match &*self.inner {
+            SandboxInner::Host => true,
+            SandboxInner::Docker(inner) => inner.pid_mode.is_host_pid_view(),
+        }
+    }
+
+    pub fn is_host_backend(&self) -> bool {
+        matches!(&*self.inner, SandboxInner::Host)
+    }
+
+    pub fn same_sandbox(&self, other: &Self) -> bool {
+        match (&*self.inner, &*other.inner) {
+            (SandboxInner::Host, SandboxInner::Host) => true,
+            (SandboxInner::Docker(a), SandboxInner::Docker(b)) => {
+                a.container_name == b.container_name
+            }
+            _ => false,
+        }
+    }
+
+    fn docker_with_session(spec: DockerSpec, repo_root: PathBuf, session: String) -> Result<Self> {
+        let container_name = session_scoped_container_name(&session, &spec, &repo_root);
+        if let Some(handle) = Self::attach_existing_docker_sandbox(
+            &spec,
+            repo_root.clone(),
+            &container_name,
+            &session,
+        )? {
+            return Ok(handle);
+        }
+
+        match Self::create_docker_sandbox(
+            spec.clone(),
+            repo_root.clone(),
+            container_name.clone(),
+            Some(session.clone()),
+        ) {
+            Ok(handle) => Ok(handle),
+            Err(create_err) => {
+                if let Some(handle) = Self::attach_existing_docker_sandbox(
+                    &spec,
+                    repo_root,
+                    &container_name,
+                    &session,
+                )? {
+                    return Ok(handle);
+                }
+                Err(create_err)
+            }
+        }
+    }
+
+    fn attach_existing_docker_sandbox(
+        spec: &DockerSpec,
+        repo_root: PathBuf,
+        container_name: &str,
+        session: &str,
+    ) -> Result<Option<Self>> {
+        let Some(state) = inspect_docker_container_state(container_name)? else {
+            return Ok(None);
+        };
+        if !state.running || state.image != spec.image {
+            let _ = remove_docker_sandbox(container_name);
+            return Ok(None);
+        }
+
+        let health = Command::new("docker")
+            .args(["exec", container_name, "bash", "-lc", "true"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .with_context(|| format!("failed to probe docker sandbox {container_name}"))?;
+        if !health.success() {
+            let _ = remove_docker_sandbox(container_name);
+            return Ok(None);
+        }
+
+        Ok(Some(Self::build_docker_sandbox_handle(
+            spec.clone(),
+            repo_root,
+            container_name.to_string(),
+            Some(session.to_string()),
+        )?))
+    }
+
+    fn create_docker_sandbox(
+        spec: DockerSpec,
+        repo_root: PathBuf,
+        container_name: String,
+        session: Option<String>,
+    ) -> Result<Self> {
         let mut args: Vec<OsString> = vec![
             "run".into(),
             "-d".into(),
@@ -242,13 +369,19 @@ impl SandboxHandle {
                     .context("failed to determine current process starttime for sandbox labels")?
             )
             .into(),
-            "-v".into(),
-            format!("{}:{CONTAINER_REPO_ROOT}", repo_root.display()).into(),
-            "-v".into(),
-            format!("{}:{}", repo_root.display(), repo_root.display()).into(),
-            "-w".into(),
-            CONTAINER_REPO_ROOT.into(),
         ];
+
+        if let Some(session) = session.as_ref() {
+            args.push("--label".into());
+            args.push(format!("ghostscope.session={session}").into());
+        }
+
+        args.push("-v".into());
+        args.push(format!("{}:{CONTAINER_REPO_ROOT}", repo_root.display()).into());
+        args.push("-v".into());
+        args.push(format!("{}:{}", repo_root.display(), repo_root.display()).into());
+        args.push("-w".into());
+        args.push(CONTAINER_REPO_ROOT.into());
 
         if let Some(pid_mode) = spec.pid_mode.as_docker_arg() {
             args.push("--pid".into());
@@ -278,6 +411,17 @@ impl SandboxHandle {
             "failed to start docker sandbox: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+
+        Self::build_docker_sandbox_handle(spec, repo_root, container_name, session)
+    }
+
+    fn build_docker_sandbox_handle(
+        spec: DockerSpec,
+        repo_root: PathBuf,
+        container_name: String,
+        session: Option<String>,
+    ) -> Result<Self> {
+        let id = NEXT_SANDBOX_ID.fetch_add(1, Ordering::Relaxed);
         let init_host_pid = resolve_container_init_host_pid(&container_name)?;
         let pid_ns_inode = match spec.pid_mode {
             DockerPidMode::Private => Some(read_pid_ns_inode(init_host_pid)?),
@@ -288,6 +432,7 @@ impl SandboxHandle {
             inner: Arc::new(SandboxInner::Docker(DockerSandboxInner {
                 id,
                 container_name,
+                session,
                 image: spec.image,
                 pid_mode: spec.pid_mode,
                 init_host_pid,
@@ -296,43 +441,13 @@ impl SandboxHandle {
                 prepared_fixture_commands: Mutex::new(HashSet::new()),
                 dind_ready: Mutex::new(false),
                 loaded_child_images: Mutex::new(HashSet::new()),
+                child_runtime: Mutex::new(None),
             })),
         };
 
         sandbox.run_shell("mount -t bpf bpf /sys/fs/bpf 2>/dev/null || true")?;
         sandbox.run_shell("mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null || true")?;
         Ok(sandbox)
-    }
-
-    pub fn label(&self) -> String {
-        match &*self.inner {
-            SandboxInner::Host => "host".to_string(),
-            SandboxInner::Docker(inner) => {
-                format!(
-                    "docker(pid_mode={:?}, image={})",
-                    inner.pid_mode, inner.image
-                )
-            }
-        }
-    }
-
-    pub fn is_host_pid_view(&self) -> bool {
-        match &*self.inner {
-            SandboxInner::Host => true,
-            SandboxInner::Docker(inner) => inner.pid_mode.is_host_pid_view(),
-        }
-    }
-
-    pub fn is_host_backend(&self) -> bool {
-        matches!(&*self.inner, SandboxInner::Host)
-    }
-
-    pub fn same_sandbox(&self, other: &Self) -> bool {
-        match (&*self.inner, &*other.inner) {
-            (SandboxInner::Host, SandboxInner::Host) => true,
-            (SandboxInner::Docker(a), SandboxInner::Docker(b)) => a.id == b.id,
-            _ => false,
-        }
     }
 
     pub fn path_in_sandbox(&self, host_path: &Path) -> Result<PathBuf> {
@@ -611,25 +726,26 @@ impl SandboxHandle {
         &self,
         inner: &DockerSandboxInner,
         child_image: &str,
+        inner_child_image: &str,
     ) -> Result<()> {
         let inspect_script = format!(
             "docker -H {host} image inspect {image} >/dev/null 2>&1",
             host = shell_quote(INNER_DOCKER_HOST),
-            image = shell_quote(child_image),
+            image = shell_quote(inner_child_image),
         );
 
         let mut loaded_images = inner.loaded_child_images.lock().unwrap();
-        if loaded_images.contains(child_image) {
+        if loaded_images.contains(inner_child_image) {
             let output = self.run_shell(&inspect_script)?;
             if output.status.success() {
                 return Ok(());
             }
-            loaded_images.remove(child_image);
+            loaded_images.remove(inner_child_image);
         }
 
         let output = self.run_shell(&inspect_script)?;
         if output.status.success() {
-            loaded_images.insert(child_image.to_string());
+            loaded_images.insert(inner_child_image.to_string());
             return Ok(());
         }
 
@@ -642,13 +758,28 @@ impl SandboxHandle {
             .success();
 
         if host_has_image {
-            let load_script = format!(
-                "set -euo pipefail\n\
-                 docker image save {image} | docker exec -i {container} docker -H {host} load",
-                image = shell_quote(child_image),
-                container = shell_quote(&inner.container_name),
-                host = shell_quote(INNER_DOCKER_HOST),
-            );
+            let load_script = if child_image == inner_child_image {
+                format!(
+                    "set -euo pipefail\n\
+                     docker image save {image} | docker exec -i {container} docker -H {host} load",
+                    image = shell_quote(child_image),
+                    container = shell_quote(&inner.container_name),
+                    host = shell_quote(INNER_DOCKER_HOST),
+                )
+            } else {
+                format!(
+                    "set -euo pipefail\n\
+                     host_id=$(docker image inspect --format '{{{{.Id}}}}' {source})\n\
+                     cleanup() {{ docker image rm -f {alias} >/dev/null 2>&1 || true; }}\n\
+                     trap cleanup EXIT\n\
+                     docker image tag \"$host_id\" {alias}\n\
+                     docker image save {alias} | docker exec -i {container} docker -H {host} load",
+                    source = shell_quote(child_image),
+                    alias = shell_quote(inner_child_image),
+                    container = shell_quote(&inner.container_name),
+                    host = shell_quote(INNER_DOCKER_HOST),
+                )
+            };
             let output = Command::new("bash")
                 .args(["-lc", &load_script])
                 .output()
@@ -693,63 +824,183 @@ impl SandboxHandle {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
+            if child_image != inner_child_image {
+                let tag_script = format!(
+                    "set -eu\n\
+                     image_id=$(docker -H {host} image inspect --format '{{{{.Id}}}}' {source})\n\
+                     docker -H {host} image tag \"$image_id\" {alias}",
+                    host = shell_quote(INNER_DOCKER_HOST),
+                    source = shell_quote(child_image),
+                    alias = shell_quote(inner_child_image),
+                );
+                let tag_output = self.run_shell(&tag_script)?;
+                anyhow::ensure!(
+                    tag_output.status.success(),
+                    "failed to tag child image {} as {} inside nested docker daemon for sandbox {}: stdout={} stderr={}",
+                    child_image,
+                    inner_child_image,
+                    inner.container_name,
+                    String::from_utf8_lossy(&tag_output.stdout),
+                    String::from_utf8_lossy(&tag_output.stderr)
+                );
+            }
         }
 
         let verify = self.run_shell(&inspect_script)?;
         anyhow::ensure!(
             verify.status.success(),
-            "child image {} is still unavailable inside nested docker daemon for sandbox {}",
+            "child image {} (inner alias {}) is still unavailable inside nested docker daemon for sandbox {}",
             child_image,
+            inner_child_image,
             inner.container_name
         );
-        loaded_images.insert(child_image.to_string());
+        loaded_images.insert(inner_child_image.to_string());
         Ok(())
     }
 
-    pub fn ensure_child_container_runtime_ready(&self) -> Result<()> {
+    fn inspect_inner_docker_container(
+        &self,
+        container_name: &str,
+    ) -> Result<Option<InnerDockerContainerState>> {
+        let inspect_script = format!(
+            "docker -H {host} inspect -f '{{{{.State.Running}}}}|{{{{.State.Pid}}}}|{{{{.Config.Image}}}}' {name}",
+            host = shell_quote(INNER_DOCKER_HOST),
+            name = shell_quote(container_name),
+        );
+        let output = self.run_shell(&inspect_script)?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if is_missing_docker_container_error(&stderr) {
+                return Ok(None);
+            }
+            anyhow::bail!(
+                "failed to inspect nested docker container {} in sandbox {}: {}",
+                container_name,
+                self.label(),
+                stderr
+            );
+        }
+
+        let inspect_text = String::from_utf8(output.stdout)
+            .context("nested docker inspect output was not valid UTF-8")?;
+        let mut parts = inspect_text.trim().split('|');
+        let running = parts
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .eq_ignore_ascii_case("true");
+        let pid = parts
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .parse::<u32>()
+            .unwrap_or(0);
+        let image = parts.next().unwrap_or_default().trim().to_string();
+        Ok(Some(InnerDockerContainerState {
+            running,
+            pid,
+            image,
+        }))
+    }
+
+    fn remove_inner_docker_container(&self, container_name: &str) -> Result<()> {
+        let output = self.run_shell(&format!(
+            "docker -H {host} rm -f {name}",
+            host = shell_quote(INNER_DOCKER_HOST),
+            name = shell_quote(container_name),
+        ))?;
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if is_missing_docker_container_error(&stderr) {
+            return Ok(());
+        }
+
+        anyhow::bail!(
+            "failed to remove nested docker container {} in sandbox {}: {}",
+            container_name,
+            self.label(),
+            stderr
+        )
+    }
+
+    fn attach_existing_child_runtime(
+        &self,
+        container_name: &str,
+        image: &str,
+    ) -> Result<Option<ChildRuntimeState>> {
+        let Some(state) = self.inspect_inner_docker_container(container_name)? else {
+            return Ok(None);
+        };
+        if !state.running || state.pid == 0 || state.image != image {
+            let _ = self.remove_inner_docker_container(container_name);
+            return Ok(None);
+        }
+
+        let health_output = self.run_shell(&format!(
+            "docker -H {host} exec {name} bash -lc true",
+            host = shell_quote(INNER_DOCKER_HOST),
+            name = shell_quote(container_name),
+        ))?;
+        if !health_output.status.success() {
+            let _ = self.remove_inner_docker_container(container_name);
+            return Ok(None);
+        }
+
+        let Ok(init_host_pid) = self.resolve_host_pid_for_sandbox_pid(state.pid) else {
+            let _ = self.remove_inner_docker_container(container_name);
+            return Ok(None);
+        };
+        let Ok(pid_ns_inode) = read_pid_ns_inode(init_host_pid) else {
+            let _ = self.remove_inner_docker_container(container_name);
+            return Ok(None);
+        };
+
+        Ok(Some(ChildRuntimeState {
+            container_name: container_name.to_string(),
+            image: image.to_string(),
+            init_host_pid,
+            pid_ns_inode,
+        }))
+    }
+
+    fn ensure_child_runtime_state(&self) -> Result<ChildRuntimeState> {
         self.ensure_dind_ready()?;
 
         let SandboxInner::Docker(inner) = &*self.inner else {
             anyhow::bail!("child-container targets require a docker sandbox");
         };
 
-        let child_image = std::env::var("E2E_CHILD_CONTAINER_IMAGE")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_CHILD_CONTAINER_IMAGE.to_string());
-        self.ensure_child_image_ready(inner, &child_image)
-    }
+        let child_image = resolve_default_child_image();
+        let inner_child_image = resolve_inner_child_image_ref(&child_image);
+        self.ensure_child_image_ready(inner, &child_image, &inner_child_image)?;
+        let runtime_name = child_runtime_container_name(&inner.container_name, &inner_child_image);
 
-    pub fn spawn_background_binary_in_child_container(
-        &self,
-        binary_path: &Path,
-        working_dir: Option<&Path>,
-    ) -> Result<BackgroundProcess> {
-        self.ensure_child_container_runtime_ready()?;
+        let mut runtime = inner.child_runtime.lock().unwrap();
+        if let Some(state) = runtime.as_ref() {
+            if state.image == inner_child_image {
+                if let Some(attached) =
+                    self.attach_existing_child_runtime(&state.container_name, &state.image)?
+                {
+                    *runtime = Some(attached.clone());
+                    return Ok(attached);
+                }
+            } else {
+                let _ = self.remove_inner_docker_container(&state.container_name);
+            }
+            *runtime = None;
+        }
 
-        let SandboxInner::Docker(inner) = &*self.inner else {
-            anyhow::bail!("child-container targets require a docker sandbox");
-        };
+        if let Some(attached) =
+            self.attach_existing_child_runtime(&runtime_name, &inner_child_image)?
+        {
+            *runtime = Some(attached.clone());
+            return Ok(attached);
+        }
 
-        let container_name = format!(
-            "ghostscope-child-{}-{}-{}",
-            inner.id,
-            std::process::id(),
-            unix_timestamp_nanos()
-        );
-        let child_image = std::env::var("E2E_CHILD_CONTAINER_IMAGE")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_CHILD_CONTAINER_IMAGE.to_string());
-        let working_dir = working_dir
-            .map(Path::to_path_buf)
-            .or_else(|| binary_path.parent().map(Path::to_path_buf))
-            .unwrap_or_else(|| PathBuf::from(CONTAINER_REPO_ROOT));
-        let entrypoint = format!(
-            "exec {} >/dev/null 2>/tmp/ghostscope-child-target.err",
-            shell_quote(&binary_path.display().to_string())
-        );
-        let script = format!(
+        let create_script = format!(
             "docker -H {host} run -d --name {name} \
                --label {label} \
                -v {workspace_mount} \
@@ -759,8 +1010,8 @@ impl SandboxHandle {
                {image} \
                bash -lc {entrypoint}",
             host = shell_quote(INNER_DOCKER_HOST),
-            name = shell_quote(&container_name),
-            label = shell_quote("ghostscope.test-child-container=1"),
+            name = shell_quote(&runtime_name),
+            label = shell_quote("ghostscope.test-child-runtime=1"),
             workspace_mount = shell_quote(&format!("{CONTAINER_REPO_ROOT}:{CONTAINER_REPO_ROOT}")),
             repo_mount = shell_quote(&format!(
                 "{}:{}",
@@ -768,8 +1019,157 @@ impl SandboxHandle {
                 inner.repo_root.display()
             )),
             target_mount = shell_quote(&format!("{CONTAINER_TARGET_DIR}:{CONTAINER_TARGET_DIR}")),
+            workdir = shell_quote(CONTAINER_REPO_ROOT),
+            image = shell_quote(&inner_child_image),
+            entrypoint = shell_quote("trap : TERM INT; sleep infinity & wait"),
+        );
+        let output = self.run_shell(&create_script).with_context(|| {
+            format!(
+                "failed to create child runtime container {} in sandbox {}",
+                runtime_name, inner.container_name
+            )
+        })?;
+        if !output.status.success() {
+            if let Some(attached) =
+                self.attach_existing_child_runtime(&runtime_name, &inner_child_image)?
+            {
+                *runtime = Some(attached.clone());
+                return Ok(attached);
+            }
+            anyhow::bail!(
+                "failed to create child runtime container {} in sandbox {}: {}",
+                runtime_name,
+                inner.container_name,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let attached = self
+            .attach_existing_child_runtime(&runtime_name, &inner_child_image)?
+            .with_context(|| {
+                format!(
+                    "child runtime container {} did not become ready in sandbox {}",
+                    runtime_name, inner.container_name
+                )
+            })?;
+        *runtime = Some(attached.clone());
+        Ok(attached)
+    }
+
+    fn resolve_descendant_process_pids(
+        &self,
+        runtime: &ChildRuntimeState,
+        child_local_pid: u32,
+    ) -> Result<(u32, u32)> {
+        let SandboxInner::Docker(inner) = &*self.inner else {
+            anyhow::bail!("child-container targets require a docker sandbox");
+        };
+
+        let proc_dir = fs::read_dir("/proc")
+            .context("failed to read host /proc while resolving child-container target pid")?;
+        for entry in proc_dir.flatten() {
+            let name = entry.file_name();
+            let Ok(host_pid) = name.to_string_lossy().parse::<u32>() else {
+                continue;
+            };
+            if host_pid == runtime.init_host_pid {
+                continue;
+            }
+            let Ok(status) = fs::read_to_string(format!("/proc/{host_pid}/status")) else {
+                continue;
+            };
+            let Some(chain) = parse_nspid_chain(&status) else {
+                continue;
+            };
+            let Ok(pid_ns_inode) = read_pid_ns_inode(host_pid) else {
+                continue;
+            };
+            if pid_ns_inode != runtime.pid_ns_inode {
+                continue;
+            }
+            if chain.last() != Some(&child_local_pid) || chain.len() < 2 {
+                continue;
+            }
+            return Ok((chain[chain.len() - 2], host_pid));
+        }
+
+        anyhow::bail!(
+            "failed to resolve child-container target pid {} in sandbox {} via runtime host pid {}",
+            child_local_pid,
+            inner.container_name,
+            runtime.init_host_pid
+        )
+    }
+
+    pub fn ensure_child_container_runtime_ready(&self) -> Result<()> {
+        let _ = self.ensure_child_runtime_state()?;
+        Ok(())
+    }
+
+    pub fn list_inner_docker_container_names_by_label(&self, label: &str) -> Result<Vec<String>> {
+        self.ensure_dind_ready()?;
+
+        let SandboxInner::Docker(inner) = &*self.inner else {
+            anyhow::bail!("nested docker container listing requires a docker sandbox");
+        };
+
+        let output = self.run_shell(&format!(
+            "docker -H {host} ps -a --filter label={label} --format '{{{{.Names}}}}'",
+            host = shell_quote(INNER_DOCKER_HOST),
+            label = shell_quote(label),
+        ))?;
+        anyhow::ensure!(
+            output.status.success(),
+            "failed to list nested docker containers in sandbox {}: {}",
+            inner.container_name,
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let mut names: Vec<String> = String::from_utf8(output.stdout)
+            .context("nested docker ps output was not valid UTF-8")?
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
+        names.sort();
+        Ok(names)
+    }
+
+    pub fn spawn_background_binary_in_child_container(
+        &self,
+        binary_path: &Path,
+        working_dir: Option<&Path>,
+    ) -> Result<BackgroundProcess> {
+        let runtime = self.ensure_child_runtime_state()?;
+
+        let SandboxInner::Docker(inner) = &*self.inner else {
+            anyhow::bail!("child-container targets require a docker sandbox");
+        };
+
+        let pid_file = format!(
+            "/tmp/ghostscope-child-target-{}.pid",
+            unix_timestamp_nanos()
+        );
+        let err_file = format!(
+            "/tmp/ghostscope-child-target-{}.err",
+            unix_timestamp_nanos()
+        );
+        let working_dir = working_dir
+            .map(Path::to_path_buf)
+            .or_else(|| binary_path.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| PathBuf::from(CONTAINER_REPO_ROOT));
+        let entrypoint = format!(
+            "rm -f {pid_file} {err_file}; cd {workdir}; {binary} >/dev/null 2>{err_file} & child=$!; echo $child > {pid_file}; wait $child",
+            pid_file = shell_quote(&pid_file),
+            err_file = shell_quote(&err_file),
             workdir = shell_quote(&working_dir.display().to_string()),
-            image = shell_quote(&child_image),
+            binary = shell_quote(&binary_path.display().to_string()),
+        );
+        let script = format!(
+            "docker -H {host} exec -d {name} bash -lc {entrypoint}",
+            host = shell_quote(INNER_DOCKER_HOST),
+            name = shell_quote(&runtime.container_name),
             entrypoint = shell_quote(&entrypoint),
         );
         let output = self.run_shell(&script).with_context(|| {
@@ -787,67 +1187,83 @@ impl SandboxHandle {
             String::from_utf8_lossy(&output.stderr)
         );
 
-        let inspect_script = format!(
-            "docker -H {host} inspect -f '{{{{.State.Running}}}}|{{{{.State.Pid}}}}|{{{{.State.ExitCode}}}}' {name}",
+        let read_pid_script = format!(
+            "docker -H {host} exec {name} cat {pid_file}",
             host = shell_quote(INNER_DOCKER_HOST),
-            name = shell_quote(&container_name),
+            name = shell_quote(&runtime.container_name),
+            pid_file = shell_quote(&pid_file),
         );
-        let logs_script = format!(
-            "docker -H {host} logs {name} 2>&1 || true",
+        let read_err_script = format!(
+            "docker -H {host} exec {name} cat {err_file} 2>/dev/null || true",
             host = shell_quote(INNER_DOCKER_HOST),
-            name = shell_quote(&container_name),
+            name = shell_quote(&runtime.container_name),
+            err_file = shell_quote(&err_file),
+        );
+        let cleanup_script = format!(
+            "docker -H {host} exec {name} rm -f {pid_file} {err_file} >/dev/null 2>&1 || true",
+            host = shell_quote(INNER_DOCKER_HOST),
+            name = shell_quote(&runtime.container_name),
+            pid_file = shell_quote(&pid_file),
+            err_file = shell_quote(&err_file),
         );
 
         for _ in 0..30 {
-            let inspect = self.run_shell(&inspect_script).with_context(|| {
+            let pid_output = self.run_shell(&read_pid_script).with_context(|| {
                 format!(
-                    "failed to inspect child-container target {} in sandbox {}",
-                    container_name, inner.container_name
+                    "failed to inspect child-container target runtime {} in sandbox {}",
+                    runtime.container_name, inner.container_name
                 )
             })?;
-            if inspect.status.success() {
-                let inspect_text = String::from_utf8(inspect.stdout)
-                    .context("child-container inspect output was not valid UTF-8")?;
-                let parts: Vec<&str> = inspect_text.trim().split('|').collect();
-                if parts.len() == 3 {
-                    let running = parts[0].trim().eq_ignore_ascii_case("true");
-                    let pid = parts[1].trim().parse::<u32>().unwrap_or(0);
-                    if running && pid > 0 {
-                        return Ok(BackgroundProcess::ChildContainer {
-                            pid,
-                            container_name,
-                        });
-                    }
+            if pid_output.status.success() {
+                let pid_text = String::from_utf8(pid_output.stdout)
+                    .context("child-container pid output was not valid UTF-8")?;
+                let child_local_pid = pid_text
+                    .trim()
+                    .parse::<u32>()
+                    .with_context(|| format!("invalid child-container pid output: {pid_text}"))?;
+                if let Ok((sandbox_pid, _host_pid)) =
+                    self.resolve_descendant_process_pids(&runtime, child_local_pid)
+                {
+                    let _ = self.run_shell(&cleanup_script);
+                    return Ok(BackgroundProcess::ChildContainer { pid: sandbox_pid });
+                }
 
-                    if !running {
-                        let exit_code = parts[2].trim();
-                        let logs = self
-                            .run_shell(&logs_script)
-                            .ok()
-                            .and_then(|output| String::from_utf8(output.stdout).ok())
-                            .unwrap_or_default();
-                        let _ = self.remove_child_container(&container_name);
-                        let trimmed_logs = logs.trim();
-                        anyhow::bail!(
-                            "child-container target {} exited before it could be observed (exit_code={}): {}",
-                            binary_path.display(),
-                            exit_code,
-                            if trimmed_logs.is_empty() {
-                                "<no logs available>"
-                            } else {
-                                trimmed_logs
-                            }
-                        );
-                    }
+                let process_alive = self
+                    .run_shell(&format!(
+                        "docker -H {host} exec {name} test -r /proc/{pid}/status",
+                        host = shell_quote(INNER_DOCKER_HOST),
+                        name = shell_quote(&runtime.container_name),
+                        pid = child_local_pid,
+                    ))?
+                    .status
+                    .success();
+                if !process_alive {
+                    let logs = self
+                        .run_shell(&read_err_script)
+                        .ok()
+                        .and_then(|output| String::from_utf8(output.stdout).ok())
+                        .unwrap_or_default();
+                    let _ = self.run_shell(&cleanup_script);
+                    let trimmed_logs = logs.trim();
+                    anyhow::bail!(
+                        "child-container target {} exited before it could be observed: {}",
+                        binary_path.display(),
+                        if trimmed_logs.is_empty() {
+                            "<no logs available>"
+                        } else {
+                            trimmed_logs
+                        }
+                    );
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
 
+        let _ = self.run_shell(&cleanup_script);
         anyhow::bail!(
-            "timed out waiting for child-container target {} to become visible (container={})",
+            "timed out waiting for child-container target {} to become visible (runtime={})",
             binary_path.display(),
-            container_name
+            runtime.container_name
         )
     }
 
@@ -1222,6 +1638,85 @@ fn resolve_default_image() -> String {
     DEFAULT_REMOTE_IMAGE.to_string()
 }
 
+fn resolve_default_child_image() -> String {
+    if let Ok(image) = std::env::var("E2E_CHILD_CONTAINER_IMAGE") {
+        if !image.trim().is_empty() {
+            return image;
+        }
+    }
+    // Nested child containers default to the same runtime image as the outer
+    // sandbox so local runs and CI do not fall back to a fresh ubuntu pull.
+    resolve_default_image()
+}
+
+fn resolve_inner_child_image_ref(child_image: &str) -> String {
+    if let Some((_, digest)) = child_image.split_once("@sha256:") {
+        let short = &digest[..digest.len().min(16)];
+        return format!("ghostscope-e2e-child:{short}");
+    }
+    child_image.to_string()
+}
+
+fn current_sandbox_session() -> Option<String> {
+    std::env::var(ENV_E2E_SANDBOX_SESSION)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn session_scoped_container_name(session: &str, spec: &DockerSpec, repo_root: &Path) -> String {
+    let mode = match spec.pid_mode {
+        DockerPidMode::Private => "private",
+        DockerPidMode::Host => "host",
+    };
+    let session_part = sanitize_docker_name_component(session, 24);
+    let key = format!("{session}|{mode}|{}|{}", spec.image, repo_root.display());
+    let hash = stable_name_hash(&key);
+    format!("ghostscope-session-{session_part}-{mode}-{hash:016x}")
+}
+
+fn child_runtime_container_name(outer_container_name: &str, inner_child_image: &str) -> String {
+    let outer_part = sanitize_docker_name_component(outer_container_name, 24);
+    let hash = stable_name_hash(&format!("{outer_container_name}|{inner_child_image}"));
+    format!("ghostscope-child-runtime-{outer_part}-{hash:016x}")
+}
+
+fn sanitize_docker_name_component(value: &str, max_len: usize) -> String {
+    let mut out = String::with_capacity(max_len);
+    for ch in value.chars() {
+        let mapped = if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_lowercase()
+        } else {
+            '-'
+        };
+        if mapped == '-' && out.ends_with('-') {
+            continue;
+        }
+        out.push(mapped);
+        if out.len() >= max_len {
+            break;
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "default".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn stable_name_hash(input: &str) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in input.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
 fn remove_docker_sandbox(container_name: &str) -> std::io::Result<std::process::ExitStatus> {
     Command::new("docker")
         .args(["rm", "-f", container_name])
@@ -1244,10 +1739,14 @@ fn sweep_stale_docker_sandboxes() -> Result<()> {
     // they cannot rely on process-exit Drop for final cleanup. Instead, each
     // new test process garbage-collects stale docker sandboxes left behind by
     // dead owners before creating fresh ones.
+    let current_session = current_sandbox_session();
     for container_id in list_test_sandbox_container_ids()? {
         let Some(metadata) = inspect_test_sandbox_if_present(&container_id)? else {
             continue;
         };
+        if metadata.session == current_session {
+            continue;
+        }
         if metadata.belongs_to_live_owner() {
             continue;
         }
@@ -1294,6 +1793,7 @@ struct TestSandboxMetadata {
     name: String,
     owner_pid: Option<u32>,
     owner_starttime: Option<u64>,
+    session: Option<String>,
 }
 
 impl TestSandboxMetadata {
@@ -1306,6 +1806,12 @@ impl TestSandboxMetadata {
                 .is_some(),
         }
     }
+
+    fn is_session_scoped(&self) -> bool {
+        self.session
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    }
 }
 
 fn inspect_test_sandbox_if_present(container_id: &str) -> Result<Option<TestSandboxMetadata>> {
@@ -1313,7 +1819,7 @@ fn inspect_test_sandbox_if_present(container_id: &str) -> Result<Option<TestSand
         .args([
             "inspect",
             "-f",
-            "{{.Name}}|{{ index .Config.Labels \"ghostscope.owner-pid\" }}|{{ index .Config.Labels \"ghostscope.owner-starttime\" }}",
+            "{{.Name}}|{{ index .Config.Labels \"ghostscope.owner-pid\" }}|{{ index .Config.Labels \"ghostscope.owner-starttime\" }}|{{ index .Config.Labels \"ghostscope.session\" }}",
             container_id,
         ])
         .output()
@@ -1346,12 +1852,57 @@ fn inspect_test_sandbox_if_present(container_id: &str) -> Result<Option<TestSand
         .to_string();
     let owner_pid = parts.next().and_then(parse_optional_u32);
     let owner_starttime = parts.next().and_then(parse_optional_u64);
+    let session = parts
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "<no value>")
+        .map(ToOwned::to_owned);
 
     Ok(Some(TestSandboxMetadata {
         name,
         owner_pid,
         owner_starttime,
+        session,
     }))
+}
+
+#[derive(Debug)]
+struct DockerContainerState {
+    running: bool,
+    image: String,
+}
+
+fn inspect_docker_container_state(container_name: &str) -> Result<Option<DockerContainerState>> {
+    let output = Command::new("docker")
+        .args([
+            "inspect",
+            "-f",
+            "{{.State.Running}}|{{.Config.Image}}",
+            container_name,
+        ])
+        .output()
+        .with_context(|| format!("failed to inspect docker sandbox {container_name}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if is_missing_docker_container_error(&stderr) {
+            return Ok(None);
+        }
+        anyhow::bail!(
+            "failed to inspect docker sandbox {}: {}",
+            container_name,
+            stderr
+        );
+    }
+
+    let line =
+        String::from_utf8(output.stdout).context("docker inspect output was not valid UTF-8")?;
+    let mut parts = line.trim().split('|');
+    let running = parts
+        .next()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"));
+    let image = parts.next().unwrap_or_default().trim().to_string();
+
+    Ok(Some(DockerContainerState { running, image }))
 }
 
 fn is_missing_docker_container_error(stderr: &str) -> bool {

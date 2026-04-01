@@ -343,6 +343,69 @@ class JobStore:
             ),
         ]
 
+    def _session_name(self, job: Job) -> str:
+        return f"runner-{job.id}"
+
+    def _resolve_docker_command(self, use_sudo: bool, *args: str) -> List[str]:
+        if os.geteuid() == 0 or not use_sudo:
+            return ["docker", *args]
+        return ["sudo", "-E", "docker", *args]
+
+    def _cleanup_session_sandboxes(self, job: Job) -> None:
+        use_sudo = self.default_sudo if job.requested_sudo is None else job.requested_sudo
+        session = self._session_name(job)
+
+        list_cmd = self._resolve_docker_command(
+            use_sudo,
+            "ps",
+            "-aq",
+            "--filter",
+            f"label=ghostscope.session={session}",
+        )
+        result = subprocess.run(
+            list_cmd,
+            cwd=job.repo,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.strip() or "<no stderr>"
+            self._append_log(
+                job,
+                f"Cleanup: failed to list session sandboxes for {session}: {stderr}",
+            )
+            return
+
+        container_ids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        if not container_ids:
+            self._append_log(job, f"Cleanup: no session sandboxes found for {session}")
+            return
+
+        remove_cmd = self._resolve_docker_command(use_sudo, "rm", "-f", *container_ids)
+        result = subprocess.run(
+            remove_cmd,
+            cwd=job.repo,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.strip() or "<no stderr>"
+            self._append_log(
+                job,
+                (
+                    f"Cleanup: failed to remove {len(container_ids)} session sandbox(s) "
+                    f"for {session}: {stderr}"
+                ),
+            )
+            return
+
+        self._append_log(
+            job,
+            f"Cleanup: removed {len(container_ids)} session sandbox(s) for {session}",
+        )
+
     def _run_step(self, job: Job, step: StepResult) -> int:
         step.started_at = now_iso()
         self._append_log(job, f"cwd={job.repo}")
@@ -359,6 +422,7 @@ class JobStore:
             env["CARGO_HOME"] = self.cargo_home
         env["E2E_GHOSTSCOPE_SANDBOX"] = job.ghostscope_sandbox
         env["E2E_TARGET_SANDBOX"] = job.target_sandbox
+        env["E2E_SANDBOX_SESSION"] = self._session_name(job)
         if job.target_mode != "same":
             env["E2E_TARGET_MODE"] = job.target_mode
         else:
@@ -431,12 +495,16 @@ class JobStore:
                     error=str(exc),
                     finished_at=now_iso(),
                 )
-                continue
-
-            if failed_code is None:
-                self._set_status(job, status="succeeded", exit_code=0, finished_at=now_iso())
             else:
-                self._set_status(job, status="failed", exit_code=failed_code, finished_at=now_iso())
+                if failed_code is None:
+                    self._set_status(job, status="succeeded", exit_code=0, finished_at=now_iso())
+                else:
+                    self._set_status(job, status="failed", exit_code=failed_code, finished_at=now_iso())
+            finally:
+                try:
+                    self._cleanup_session_sandboxes(job)
+                except Exception as exc:  # noqa: BLE001
+                    self._append_log(job, f"Cleanup: unhandled exception: {exc}")
 
 
 class Handler(BaseHTTPRequestHandler):

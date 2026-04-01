@@ -36,6 +36,9 @@ Common env vars:
 - `topology.target` (`host|docker-private|docker-host`, optional)
 - `topology.target_mode` (`same|child-container`, optional)
 
+Each submitted job automatically uses `E2E_SANDBOX_SESSION=runner-<job-id>`.
+The service also performs best-effort cleanup of session-scoped Docker sandboxes after the job finishes.
+
 Example:
 
 ```bash
