@@ -236,6 +236,26 @@ impl DwarfAnalyzer {
         debug_search_paths: &[String],
         allow_loose_debug_match: bool,
     ) -> Result<Self> {
+        Self::from_exec_path_with_config_and_progress(
+            exec_path,
+            debug_search_paths,
+            allow_loose_debug_match,
+            |_event| {},
+        )
+        .await
+    }
+
+    /// Create DWARF analyzer from executable path with debug search paths and progress callback
+    pub async fn from_exec_path_with_config_and_progress<P, F>(
+        exec_path: P,
+        debug_search_paths: &[String],
+        allow_loose_debug_match: bool,
+        progress_callback: F,
+    ) -> Result<Self>
+    where
+        P: AsRef<std::path::Path>,
+        F: Fn(ModuleLoadingEvent) + Send + Sync + 'static,
+    {
         let exec_path = exec_path.as_ref().to_path_buf();
         tracing::info!(
             "Creating DWARF analyzer for executable: {}",
@@ -254,12 +274,37 @@ impl DwarfAnalyzer {
             loaded_address: None, // No process mapping in exec path mode
             size: 0,              // Will be determined from file size if needed
         };
+        let module_path = exec_path.to_string_lossy().to_string();
+
+        progress_callback(ModuleLoadingEvent::Discovered {
+            module_path: module_path.clone(),
+            current: 1,
+            total: 1,
+        });
+        progress_callback(ModuleLoadingEvent::LoadingStarted {
+            module_path: module_path.clone(),
+            current: 1,
+            total: 1,
+        });
 
         // Load the single module using parallel loading
+        let start_time = std::time::Instant::now();
         match ModuleData::load_parallel(module_mapping, debug_search_paths, allow_loose_debug_match)
             .await
         {
             Ok(module_data) => {
+                let (functions, variables, types) = module_data.get_lightweight_index().get_stats();
+                progress_callback(ModuleLoadingEvent::LoadingCompleted {
+                    module_path,
+                    stats: ModuleLoadingStats {
+                        functions,
+                        variables,
+                        types,
+                        load_time_ms: start_time.elapsed().as_millis() as u64,
+                    },
+                    current: 1,
+                    total: 1,
+                });
                 analyzer.modules.insert(exec_path.clone(), module_data);
                 tracing::info!(
                     "Created DWARF analyzer for executable {} with 1 module",
@@ -267,6 +312,12 @@ impl DwarfAnalyzer {
                 );
             }
             Err(e) => {
+                progress_callback(ModuleLoadingEvent::LoadingFailed {
+                    module_path,
+                    error: e.to_string(),
+                    current: 1,
+                    total: 1,
+                });
                 return Err(crate::DwarfError::ModuleLoadError(format!(
                     "Failed to load executable {}: {}",
                     exec_path.display(),

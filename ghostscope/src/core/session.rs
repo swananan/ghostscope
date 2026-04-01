@@ -227,10 +227,11 @@ impl GhostSession {
         } else if let Some(ref binary_path) = self.target_binary {
             info!("Loading binary from executable path: {}", binary_path);
             Some(
-                DwarfAnalyzer::from_exec_path_with_config(
+                DwarfAnalyzer::from_exec_path_with_config_and_progress(
                     binary_path,
                     &debug_search_paths,
                     allow_loose,
+                    progress_callback,
                 )
                 .await?,
             )
@@ -246,13 +247,6 @@ impl GhostSession {
     /// Load binary and perform DWARF analysis (backwards compatibility - now uses parallel)
     pub async fn load_binary(&mut self) -> Result<()> {
         self.load_binary_parallel().await
-    }
-
-    /// Create ghost session with merged config and load binary in one step
-    pub async fn new_with_binary_and_config(config: &MergedConfig) -> Result<Self> {
-        let mut session = Self::new_with_config(config);
-        session.load_binary().await?;
-        Ok(session)
     }
 
     /// Create ghost session and load binary in one step (now uses parallel loading)

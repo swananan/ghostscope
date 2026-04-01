@@ -69,6 +69,11 @@ ghostscope --script-timestamp local # default
 ghostscope --script-timestamp boot
 ghostscope --script-timestamp none
 
+# Output streams in script mode:
+# - trace events stay on stdout
+# - interactive progress/status messages (DWARF loading, script compile, attach summary) go to stderr
+# - these stderr status messages are shown only for interactive terminals and are not part of the event stream contract
+
 # Start in TUI mode (default if no script provided)
 ghostscope --tui
 ```
@@ -266,6 +271,7 @@ log_level = "warn"
 # pretty: timestamp + TraceID/PID/TID header + indented payload
 # plain: payload lines only
 # quiet: suppress event stdout
+# Interactive status/progress messages use stderr and are shown only on TTYs.
 output = "pretty"
 
 # Timestamp format for pretty script output: local, boot, none
