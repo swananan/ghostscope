@@ -3,7 +3,10 @@
 use crate::config::MergedConfig;
 use crate::core::GhostSession;
 use anyhow::Result;
-use std::io::{self, Write};
+use ghostscope_dwarf::ModuleLoadingEvent;
+use std::io::{self, IsTerminal, Write};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 #[cfg(unix)]
@@ -35,12 +38,69 @@ pub async fn run_command_line_runtime_with_config(config: MergedConfig) -> Resul
     // Step 2: Initialize debug session and DWARF information processing
     info!("Initializing debug session and DWARF information processing...");
 
-    let session = GhostSession::new_with_binary_and_config(&config)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to create debug session: {}", e))?;
+    let reporter = Arc::new(Mutex::new(
+        crate::cli::loading_reporter::CliLoadingReporter::new(config.enable_console_logging),
+    ));
+    let reporter_task = spawn_loading_reporter(Arc::clone(&reporter));
+    let progress_callback = {
+        let reporter = Arc::clone(&reporter);
+        move |event: ModuleLoadingEvent| {
+            if let Ok(mut reporter) = reporter.lock() {
+                reporter.handle_event(event);
+            }
+        }
+    };
+
+    let session_result =
+        GhostSession::new_with_config_and_progress(&config, progress_callback).await;
+    if let Some(task) = reporter_task {
+        task.abort();
+        let _ = task.await;
+    }
+
+    let session = match session_result {
+        Ok(session) => {
+            if let Ok(mut reporter) = reporter.lock() {
+                reporter.finish_success();
+            }
+            session
+        }
+        Err(e) => {
+            if let Ok(mut reporter) = reporter.lock() {
+                reporter.finish_failure(&e.to_string());
+            }
+            return Err(anyhow::anyhow!("Failed to create debug session: {}", e));
+        }
+    };
 
     // Continue with the rest of the CLI runtime logic, using config instead of parsed_args
     run_cli_with_session(session, script_content, &config).await
+}
+
+fn spawn_loading_reporter(
+    reporter: Arc<Mutex<crate::cli::loading_reporter::CliLoadingReporter>>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let enabled = reporter
+        .lock()
+        .map(|reporter| reporter.is_enabled())
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+
+    Some(tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(120));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            ticker.tick().await;
+            if let Ok(mut reporter) = reporter.lock() {
+                reporter.render_tick();
+            } else {
+                break;
+            }
+        }
+    }))
 }
 
 /// Run CLI session with existing GhostSession and configuration
@@ -49,6 +109,8 @@ async fn run_cli_with_session(
     script_content: String,
     config: &MergedConfig,
 ) -> Result<()> {
+    let show_cli_status = should_print_cli_status(config);
+
     // Step 3: Display session information
     info!("Debug session created");
     info!("Save LLVM IR files: {}", config.should_save_llvm_ir);
@@ -139,6 +201,9 @@ async fn run_cli_with_session(
     );
 
     // Step 7: Compile and load script with graceful error handling
+    if show_cli_status {
+        eprintln!("Compiling script...");
+    }
     if let Err(e) = crate::script::compile_and_load_script_for_cli(
         &script_content,
         &mut session,
@@ -158,6 +223,12 @@ async fn run_cli_with_session(
     );
     crate::util::emit_ready_marker(config.emit_ready_marker.as_deref())
         .map_err(|e| anyhow::anyhow!("failed to emit ready marker: {}", e))?;
+    if show_cli_status {
+        eprintln!(
+            "Attached {} trace(s). Waiting for events...",
+            session.trace_manager.active_trace_count()
+        );
+    }
     let mut output_renderer = crate::cli::script_output::ScriptOutputRenderer::new(
         crate::cli::script_output::ScriptOutputOptions {
             mode: config.script_output_mode,
@@ -207,6 +278,10 @@ async fn run_cli_with_session(
     }
 
     Ok(())
+}
+
+fn should_print_cli_status(config: &MergedConfig) -> bool {
+    !config.enable_console_logging && io::stderr().is_terminal()
 }
 
 /// Get script content from merged configuration or provide default

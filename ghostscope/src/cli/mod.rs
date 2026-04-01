@@ -1,5 +1,6 @@
 //! CLI module - handles command line interface and non-TUI mode runtime
 
+mod loading_reporter;
 pub mod script_output;
 pub mod script_runtime;
 

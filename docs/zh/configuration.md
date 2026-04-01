@@ -70,6 +70,11 @@ ghostscope --script-timestamp local # 默认
 ghostscope --script-timestamp boot
 ghostscope --script-timestamp none
 
+# 脚本模式的输出流约定：
+# - trace 事件始终走 stdout
+# - 交互式进度/状态提示（DWARF 加载、脚本编译、attach 摘要）走 stderr
+# - 这些 stderr 状态提示只在交互式终端显示，不属于事件输出契约
+
 # 以 TUI 模式启动（未提供脚本时的默认模式）
 ghostscope --tui
 ```
@@ -267,6 +272,7 @@ log_level = "warn"
 # pretty: 时间戳 + TraceID/PID/TID 头信息 + 缩进 payload
 # plain: 只输出 payload 行
 # quiet: 不输出事件 stdout
+# 交互式状态/进度提示走 stderr，且仅在 TTY 下显示。
 output = "pretty"
 
 # pretty 模式的时间戳格式：local, boot, none
