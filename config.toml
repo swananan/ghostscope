@@ -49,6 +49,14 @@ output = "pretty"
 # Default: "local"
 timestamp = "local"
 
+# ANSI color mode for CLI script output and interactive stderr status rendering
+# Options: "auto", "always", "never"
+# - auto: enable colors only when the corresponding stream is a TTY
+# - always: force ANSI colors even when redirected
+# - never: disable ANSI colors entirely
+# Default: "auto"
+color = "auto"
+
 [dwarf]
 # DWARF debug information search paths for .gnu_debuglink files
 #

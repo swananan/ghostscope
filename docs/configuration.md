@@ -73,6 +73,7 @@ ghostscope --script-timestamp none
 # - trace events stay on stdout
 # - interactive progress/status messages (DWARF loading, script compile, attach summary) go to stderr
 # - these stderr status messages are shown only for interactive terminals and are not part of the event stream contract
+# - ANSI colors for pretty stdout and interactive stderr status can be controlled with [script].color in config.toml
 
 # Start in TUI mode (default if no script provided)
 ghostscope --tui
@@ -276,6 +277,12 @@ output = "pretty"
 
 # Timestamp format for pretty script output: local, boot, none
 timestamp = "local"
+
+# ANSI color mode for pretty stdout and interactive stderr status:
+# - auto: enable colors only when the corresponding stream is a TTY
+# - always: force ANSI colors even when redirected
+# - never: disable ANSI colors entirely
+color = "auto"
 
 [dwarf]
 # Debug information search paths for .gnu_debuglink files

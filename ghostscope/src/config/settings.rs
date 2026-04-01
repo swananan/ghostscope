@@ -7,6 +7,25 @@ use tracing::{debug, info};
 
 use crate::config::{LayoutMode, ScriptOutputMode, ScriptTimestampFormat};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CliColorMode {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+impl CliColorMode {
+    pub fn use_ansi(self, stream_is_terminal: bool) -> bool {
+        match self {
+            Self::Auto => stream_is_terminal,
+            Self::Always => true,
+            Self::Never => false,
+        }
+    }
+}
+
 /// Panel type enumeration for configuration
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize, Default)]
 pub enum PanelType {
@@ -108,6 +127,9 @@ pub struct ScriptConfig {
     /// Timestamp format used when script output mode is `pretty`
     #[serde(default)]
     pub timestamp: ScriptTimestampFormat,
+    /// ANSI color mode for CLI script output/status rendering
+    #[serde(default)]
+    pub color: CliColorMode,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -364,6 +386,7 @@ impl Default for ScriptConfig {
         Self {
             output: ScriptOutputMode::Pretty,
             timestamp: ScriptTimestampFormat::Local,
+            color: CliColorMode::Auto,
         }
     }
 }

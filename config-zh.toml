@@ -49,6 +49,14 @@ output = "pretty"
 # 默认值："local"
 timestamp = "local"
 
+# CLI 脚本输出和交互式 stderr 状态渲染的 ANSI 色彩模式
+# 可选值："auto", "always", "never"
+# - auto: 仅在对应输出流是 TTY 时启用颜色
+# - always: 即使被重定向也强制输出 ANSI 颜色
+# - never: 完全禁用 ANSI 颜色
+# 默认值："auto"
+color = "auto"
+
 [dwarf]
 # DWARF 调试信息搜索路径（用于 .gnu_debuglink 文件）
 #

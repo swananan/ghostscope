@@ -74,6 +74,7 @@ ghostscope --script-timestamp none
 # - trace 事件始终走 stdout
 # - 交互式进度/状态提示（DWARF 加载、脚本编译、attach 摘要）走 stderr
 # - 这些 stderr 状态提示只在交互式终端显示，不属于事件输出契约
+# - pretty stdout 和交互式 stderr 状态的 ANSI 色彩可通过 config.toml 里的 [script].color 控制
 
 # 以 TUI 模式启动（未提供脚本时的默认模式）
 ghostscope --tui
@@ -277,6 +278,12 @@ output = "pretty"
 
 # pretty 模式的时间戳格式：local, boot, none
 timestamp = "local"
+
+# pretty stdout 和交互式 stderr 状态的 ANSI 色彩模式：
+# - auto: 仅在对应输出流是 TTY 时启用颜色
+# - always: 即使被重定向也强制输出 ANSI 颜色
+# - never: 完全禁用 ANSI 颜色
+color = "auto"
 
 [dwarf]
 # DWARF 调试信息搜索路径（用于 .gnu_debuglink 文件）

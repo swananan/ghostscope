@@ -10,6 +10,7 @@ const SPINNER_FRAMES: [char; 4] = ['|', '/', '-', '\\'];
 #[derive(Debug)]
 pub struct CliLoadingReporter {
     enabled: bool,
+    colors: crate::cli::color::CliColors,
     render_delay: Duration,
     progress: LoadingProgress,
     last_render_width: usize,
@@ -17,16 +18,25 @@ pub struct CliLoadingReporter {
 }
 
 impl CliLoadingReporter {
-    pub fn new(enable_console_logging: bool) -> Self {
+    pub fn new(
+        console_stderr_logging_active: bool,
+        color_mode: crate::config::CliColorMode,
+    ) -> Self {
         Self::new_with_enabled(
-            !enable_console_logging && io::stderr().is_terminal(),
+            !console_stderr_logging_active && io::stderr().is_terminal(),
+            crate::cli::color::CliColors::for_stderr(color_mode),
             DEFAULT_RENDER_DELAY,
         )
     }
 
-    fn new_with_enabled(enabled: bool, render_delay: Duration) -> Self {
+    fn new_with_enabled(
+        enabled: bool,
+        colors: crate::cli::color::CliColors,
+        render_delay: Duration,
+    ) -> Self {
         Self {
             enabled,
+            colors,
             render_delay,
             progress: LoadingProgress::new(),
             last_render_width: 0,
@@ -51,18 +61,18 @@ impl CliLoadingReporter {
             return;
         }
 
-        self.render_line(&self.progress.status_line());
+        self.render_line(&self.progress.status_line(&self.colors));
     }
 
     pub fn finish_success(&mut self) {
         if self.rendered_anything {
-            self.render_final_line(&self.progress.success_summary_line());
+            self.render_final_line(&self.progress.success_summary_line(&self.colors));
         }
     }
 
     pub fn finish_failure(&mut self, error: &str) {
         if self.rendered_anything {
-            self.render_final_line(&self.progress.failure_summary_line(error));
+            self.render_final_line(&self.progress.failure_summary_line(&self.colors, error));
         }
     }
 
@@ -152,7 +162,7 @@ impl LoadingProgress {
         }
     }
 
-    fn status_line(&self) -> String {
+    fn status_line(&self, colors: &crate::cli::color::CliColors) -> String {
         let elapsed = self.start_time.elapsed();
         let spinner = SPINNER_FRAMES[(elapsed.as_millis() as usize / 120) % SPINNER_FRAMES.len()];
         let processed = self.completed_modules + self.failed_modules;
@@ -163,36 +173,43 @@ impl LoadingProgress {
             .unwrap_or_else(|| "discovering modules".to_string());
 
         let mut line = format!(
-            "{spinner} Loading DWARF {} {processed}/{} | {} | {}",
-            progress_bar(self.progress_ratio()),
+            "{} {} {} {processed}/{} | {} | {}",
+            colors.cyan(spinner),
+            colors.bold("Loading DWARF"),
+            colors.blue(progress_bar(self.progress_ratio())),
             self.total_modules,
-            module_name,
-            format_duration(elapsed),
+            colors.yellow(module_name),
+            colors.dim(format_duration(elapsed)),
         );
 
         if self.failed_modules > 0 {
-            line.push_str(&format!(" | {} failed", self.failed_modules));
+            line.push_str(&format!(
+                " | {}",
+                colors.red(format!("{} failed", self.failed_modules))
+            ));
         }
 
         line
     }
 
-    fn success_summary_line(&self) -> String {
+    fn success_summary_line(&self, colors: &crate::cli::color::CliColors) -> String {
         format!(
-            "DWARF ready: {} module{}, {} functions, {} variables, {} types, {}",
+            "{} {} module{}, {} functions, {} variables, {} types, {}",
+            colors.green("DWARF ready:"),
             self.completed_modules,
             if self.completed_modules == 1 { "" } else { "s" },
             self.functions,
             self.variables,
             self.types,
-            format_duration(self.start_time.elapsed()),
+            colors.dim(format_duration(self.start_time.elapsed())),
         )
     }
 
-    fn failure_summary_line(&self, error: &str) -> String {
+    fn failure_summary_line(&self, colors: &crate::cli::color::CliColors, error: &str) -> String {
         format!(
-            "DWARF loading failed after {}: {}",
-            format_duration(self.start_time.elapsed()),
+            "{} {}: {}",
+            colors.red("DWARF loading failed after"),
+            colors.dim(format_duration(self.start_time.elapsed())),
             error
         )
     }
@@ -223,10 +240,15 @@ fn short_module_name(path: &str) -> String {
         .unwrap_or(path);
 
     const MAX_WIDTH: usize = 32;
-    if display.len() <= MAX_WIDTH {
+    let display_chars = display.chars().count();
+    if display_chars <= MAX_WIDTH {
         display.to_string()
     } else {
-        format!("...{}", &display[display.len() - (MAX_WIDTH - 3)..])
+        let suffix: String = display
+            .chars()
+            .skip(display_chars - (MAX_WIDTH - 3))
+            .collect();
+        format!("...{suffix}")
     }
 }
 
@@ -244,6 +266,7 @@ fn format_duration(duration: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::{progress_bar, short_module_name, CliLoadingReporter};
+    use crate::config::CliColorMode;
     use ghostscope_dwarf::{ModuleLoadingEvent, ModuleLoadingStats};
     use std::time::Duration;
 
@@ -260,8 +283,22 @@ mod tests {
     }
 
     #[test]
+    fn short_module_name_truncates_utf8_on_char_boundaries() {
+        let display = "模块名字模块名字模块名字模块名字模块名字模块名字模块名字模块名字模块名字.so";
+        let shortened = short_module_name(&format!("/tmp/{display}"));
+        let expected_suffix: String = display.chars().skip(display.chars().count() - 29).collect();
+
+        assert_eq!(shortened, format!("...{expected_suffix}"));
+        assert_eq!(shortened.chars().count(), 32);
+    }
+
+    #[test]
     fn reporter_accumulates_module_stats() {
-        let mut reporter = CliLoadingReporter::new_with_enabled(false, Duration::ZERO);
+        let mut reporter = CliLoadingReporter::new_with_enabled(
+            false,
+            crate::cli::color::CliColors::new(false),
+            Duration::ZERO,
+        );
         reporter.handle_event(ModuleLoadingEvent::Discovered {
             module_path: "/usr/bin/app".to_string(),
             current: 1,
@@ -284,12 +321,18 @@ mod tests {
             total: 2,
         });
 
-        let status = reporter.progress.status_line();
-        let summary = reporter.progress.success_summary_line();
+        let status = reporter.progress.status_line(&reporter.colors);
+        let summary = reporter.progress.success_summary_line(&reporter.colors);
 
         assert!(status.contains("1/2"));
         assert!(summary.contains("12 functions"));
         assert!(summary.contains("3 variables"));
         assert!(summary.contains("7 types"));
+    }
+
+    #[test]
+    fn reporter_accepts_color_mode() {
+        let reporter = CliLoadingReporter::new(false, CliColorMode::Never);
+        assert!(!reporter.colors.enabled());
     }
 }
