@@ -150,6 +150,18 @@ docker build -t ghostscope-builder:ubuntu20.04 -f docker/base-build/Dockerfile .
 sudo cargo test
 ```
 
+### DWARF 性能基线
+
+DWARF 解析性能基线的完整说明单独放在
+[`scripts/dwarf-perf/corpus/README.md`](../../scripts/dwarf-perf/corpus/README.md)。
+
+这里建议把它作为入口索引，具体细节都以该文档为准，包括：
+
+- 可复现的 DWARF perf corpus 构建方式
+- `fast parse` 基线的语义和执行命令
+- `source-line query` 基线的语义和执行命令
+- 生成产物目录和 `perf-results/` 结果目录
+
 ### Agent E2E Runner（Codex）
 
 该流程用于在 AI agent 环境中执行 e2e，目的是规避 agent 无法直接执行 `sudo cargo test` 的限制。

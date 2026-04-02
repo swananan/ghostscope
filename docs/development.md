@@ -149,6 +149,18 @@ After rebuilding, a regular workspace build will pick up the new objects automat
 sudo cargo test
 ```
 
+### DWARF Performance Baselines
+
+DWARF parser performance baselines are documented separately under
+[`scripts/dwarf-perf/corpus/README.md`](../scripts/dwarf-perf/corpus/README.md).
+
+Use that document for:
+
+- reproducible DWARF perf corpus builds
+- `fast parse` benchmark semantics and commands
+- `source-line query` benchmark semantics and commands
+- output locations for generated corpus artifacts and `perf-results/`
+
 ### Agent E2E Runner (Codex)
 
 This runner path is for running e2e from an AI agent environment, where the agent may not be able to execute `sudo cargo test` directly.
