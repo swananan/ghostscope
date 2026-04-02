@@ -1,0 +1,219 @@
+name: DWARF Perf Regression
+
+on:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'ghostscope-dwarf/**'
+      - 'bins/dwarf-tool/**'
+      - 'scripts/dwarf-perf/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/dwarf-perf-regression.yml'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  LLVM_SYS_181_PREFIX: /usr/lib/llvm-18
+
+jobs:
+  regression:
+    name: DWARF Perf Regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target-dwarf-perf
+      DWARF_PERF_RESULTS_DIR: ${{ runner.temp }}/dwarf-perf-results
+    steps:
+      - name: Checkout head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: head
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Detect benchmark mode
+        id: detect
+        working-directory: head
+        run: |
+          set -euo pipefail
+
+          base_supported=true
+          for required_path in \
+            scripts/dwarf-perf/build_corpus.sh \
+            scripts/dwarf-perf/run_baseline.sh \
+            scripts/dwarf-perf/corpus/README.md
+          do
+            if ! git cat-file -e "${BASE_SHA}:${required_path}" 2>/dev/null; then
+              base_supported=false
+            fi
+          done
+
+          changed_files=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+          printf '%s\n' "$changed_files" > "$RUNNER_TEMP/dwarf-perf-changed-files.txt"
+
+          benchmark_changed=false
+          if printf '%s\n' "$changed_files" | grep -Eq \
+            '^(scripts/dwarf-perf/corpus/|scripts/dwarf-perf/build_corpus\.sh$|scripts/dwarf-perf/build_corpus_in_container\.sh$|scripts/dwarf-perf/generate_parse_stress\.py$|scripts/dwarf-perf/builder_image_ref\.txt$|scripts/dwarf-perf/compare_baseline\.py$|\.github/workflows/dwarf-perf-regression\.yml$)'; then
+            benchmark_changed=true
+          fi
+
+          echo "base_supported=$base_supported" >> "$GITHUB_OUTPUT"
+          echo "benchmark_changed=$benchmark_changed" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout base
+        if: steps.detect.outputs.base_supported == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Install LLVM 18 and jq
+        run: |
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 18
+          sudo apt-get install -y llvm-18-dev libpolly-18-dev jq
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-dwarf-perf-cargo-registry-${{ hashFiles('head/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-dwarf-perf-cargo-registry-
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-dwarf-perf-cargo-index-${{ hashFiles('head/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-dwarf-perf-cargo-index-
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/cargo-target-dwarf-perf
+          key: ${{ runner.os }}-dwarf-perf-target-${{ hashFiles('head/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-dwarf-perf-target-
+
+      - name: Prepare result directories
+        run: mkdir -p "$DWARF_PERF_RESULTS_DIR"
+
+      - name: Run base baseline
+        if: steps.detect.outputs.base_supported == 'true'
+        working-directory: base
+        run: |
+          set -euo pipefail
+          ./scripts/dwarf-perf/build_corpus.sh
+          ./scripts/dwarf-perf/run_baseline.sh \
+            --skip-build \
+            --corpus-dir "$GITHUB_WORKSPACE/base/scripts/dwarf-perf/corpus/out" \
+            --results-dir "$DWARF_PERF_RESULTS_DIR" \
+            --result-name base \
+            --runs 10 \
+            --cargo-target-dir "$CARGO_TARGET_DIR"
+
+      - name: Run head baseline with base corpus
+        if: steps.detect.outputs.base_supported == 'true'
+        working-directory: head
+        run: |
+          set -euo pipefail
+          ./scripts/dwarf-perf/run_baseline.sh \
+            --skip-build \
+            --corpus-dir "$GITHUB_WORKSPACE/base/scripts/dwarf-perf/corpus/out" \
+            --results-dir "$DWARF_PERF_RESULTS_DIR" \
+            --result-name head \
+            --runs 10 \
+            --cargo-target-dir "$CARGO_TARGET_DIR"
+
+      - name: Run head-only baseline
+        if: steps.detect.outputs.base_supported != 'true'
+        working-directory: head
+        run: |
+          set -euo pipefail
+          ./scripts/dwarf-perf/build_corpus.sh
+          ./scripts/dwarf-perf/run_baseline.sh \
+            --skip-build \
+            --corpus-dir "$GITHUB_WORKSPACE/head/scripts/dwarf-perf/corpus/out" \
+            --results-dir "$DWARF_PERF_RESULTS_DIR" \
+            --result-name head \
+            --runs 10 \
+            --cargo-target-dir "$CARGO_TARGET_DIR"
+
+      - name: Compare baselines
+        if: steps.detect.outputs.base_supported == 'true'
+        id: compare
+        working-directory: head
+        env:
+          REPORT_ONLY: ${{ steps.detect.outputs.benchmark_changed }}
+        run: |
+          set +e
+
+          args=(
+            --base "$DWARF_PERF_RESULTS_DIR/base.json"
+            --head "$DWARF_PERF_RESULTS_DIR/head.json"
+            --base-label "base:${BASE_SHA::12}"
+            --head-label "head:${HEAD_SHA::12}"
+            --summary-file "$DWARF_PERF_RESULTS_DIR/summary.md"
+            --result-file "$DWARF_PERF_RESULTS_DIR/compare.json"
+          )
+
+          if [[ "$REPORT_ONLY" == "true" ]]; then
+            args+=(
+              --report-only
+              --report-only-reason "Benchmark inputs changed in this PR, so thresholds were not enforced."
+            )
+          fi
+
+          python3 scripts/dwarf-perf/compare_baseline.py "${args[@]}"
+          exit_code=$?
+          echo "exit_code=$exit_code" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Write bootstrap summary
+        if: steps.detect.outputs.base_supported != 'true'
+        run: |
+          cat > "$DWARF_PERF_RESULTS_DIR/summary.md" <<EOF
+          ## DWARF Perf Regression
+
+          - Mode: \`bootstrap\`
+          - Base: \`${BASE_SHA::12}\`
+          - Head: \`${HEAD_SHA::12}\`
+          - Note: The base revision does not contain the DWARF perf baseline tooling yet, so regression gating was skipped.
+
+          A head-only baseline was generated and uploaded as an artifact for inspection.
+          EOF
+
+      - name: Publish summary
+        if: always()
+        run: cat "$DWARF_PERF_RESULTS_DIR/summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload perf artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dwarf-perf-regression-${{ github.event.pull_request.number }}
+          path: |
+            ${{ runner.temp }}/dwarf-perf-results/*.json
+            ${{ runner.temp }}/dwarf-perf-results/*.md
+            ${{ runner.temp }}/dwarf-perf-changed-files.txt
+
+      - name: Enforce regression gate
+        if: ${{ steps.compare.outputs.exit_code && steps.compare.outputs.exit_code != '0' }}
+        run: |
+          echo "DWARF perf regression gate failed"
+          exit 1
