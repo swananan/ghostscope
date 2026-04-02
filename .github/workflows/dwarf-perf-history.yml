@@ -27,9 +27,9 @@ jobs:
     permissions:
       contents: write
     env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target-dwarf-perf
-      DWARF_PERF_RESULTS_DIR: ${{ runner.temp }}/dwarf-perf-results
-      DWARF_PERF_SITE_DIR: ${{ runner.temp }}/dwarf-perf-site
+      CARGO_TARGET_DIR: ${{ github.workspace }}/.target_tmp/dwarf-perf-history
+      DWARF_PERF_RESULTS_DIR: ${{ github.workspace }}/.tmp/dwarf-perf-results
+      DWARF_PERF_SITE_DIR: ${{ github.workspace }}/.tmp/dwarf-perf-site
       DWARF_PERF_HISTORY_BRANCH: dwarf-perf-history-data
     steps:
       - uses: actions/checkout@v4
@@ -70,7 +70,7 @@ jobs:
       - name: Cache cargo build
         uses: actions/cache@v4
         with:
-          path: ${{ runner.temp }}/cargo-target-dwarf-perf
+          path: ${{ github.workspace }}/.target_tmp/dwarf-perf-history
           key: ${{ runner.os }}-dwarf-perf-history-target-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-dwarf-perf-history-target-
@@ -139,7 +139,7 @@ jobs:
       - name: Upload GitHub Pages artifact
         uses: actions/upload-pages-artifact@v4
         with:
-          path: ${{ runner.temp }}/dwarf-perf-site
+          path: ${{ github.workspace }}/.tmp/dwarf-perf-site
 
       - name: Publish summary
         run: |
@@ -158,8 +158,8 @@ jobs:
         with:
           name: dwarf-perf-history-${{ github.run_id }}
           path: |
-            ${{ runner.temp }}/dwarf-perf-results/*.json
-            ${{ runner.temp }}/dwarf-perf-site/**
+            ${{ github.workspace }}/.tmp/dwarf-perf-results/*.json
+            ${{ github.workspace }}/.tmp/dwarf-perf-site/**
 
   deploy:
     name: Deploy DWARF Perf History
