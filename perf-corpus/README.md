@@ -57,9 +57,20 @@ This will:
 - run the query benchmark through `dwarf-tool benchmark-source-line`
 - write a JSON result under `perf-results/`
 
+The script prints three separate sections:
+
+- `Fast parse benchmark`
+- `Source-line query benchmark`
+- `Query result snapshot`
+
+`Fast parse benchmark` is the analyzer load path, which reflects the initial
+DWARF fast-parse and index-build cost.
+
 The source-line benchmark keeps one analyzer instance warm, repeats the same
 query multiple times, and records `first_run_ms`, `average_ms`, `p50_ms`,
-`p95_ms`, `min_ms`, and `max_ms`.
+`p95_ms`, `min_ms`, and `max_ms`. Its latency covers the full source-line
+query path: source-line lookup, matched address resolution, and variable
+collection for those addresses.
 
 ## Tuning
 

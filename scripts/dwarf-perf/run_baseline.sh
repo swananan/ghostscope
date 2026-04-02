@@ -128,9 +128,6 @@ PARSE_AVG_MS=$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Average load time:/ {gsub("
 PARSE_MIN_MS=$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Min:/ {gsub("ms","",$2); print $2}')
 PARSE_MAX_MS=$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Max:/ {gsub("ms","",$2); print $2}')
 QUERY_JSON=$(printf '%s\n' "$QUERY_OUTPUT" | sed -n '/^{/,$p')
-QUERY_TOTAL_VARS=$(printf '%s\n' "$QUERY_JSON" | jq '.total_variables')
-QUERY_ADDRESS_COUNT=$(printf '%s\n' "$QUERY_JSON" | jq '.address_count')
-QUERY_FIRST_ADDRESS=$(printf '%s\n' "$QUERY_JSON" | jq -r '.first_address // empty')
 QUERY_LOADING_MS=$(printf '%s\n' "$QUERY_JSON" | jq '.loading_time_ms')
 QUERY_FIRST_RUN_MS=$(printf '%s\n' "$QUERY_JSON" | jq '.benchmark.first_run_ms')
 QUERY_AVG_MS=$(printf '%s\n' "$QUERY_JSON" | jq '.benchmark.average_ms')
@@ -138,6 +135,9 @@ QUERY_P50_MS=$(printf '%s\n' "$QUERY_JSON" | jq '.benchmark.p50_ms')
 QUERY_P95_MS=$(printf '%s\n' "$QUERY_JSON" | jq '.benchmark.p95_ms')
 QUERY_MIN_MS=$(printf '%s\n' "$QUERY_JSON" | jq '.benchmark.min_ms')
 QUERY_MAX_MS=$(printf '%s\n' "$QUERY_JSON" | jq '.benchmark.max_ms')
+QUERY_TOTAL_VARS=$(printf '%s\n' "$QUERY_JSON" | jq '.total_variables')
+QUERY_ADDRESS_COUNT=$(printf '%s\n' "$QUERY_JSON" | jq '.address_count')
+QUERY_FIRST_ADDRESS=$(printf '%s\n' "$QUERY_JSON" | jq -r '.first_address // empty')
 
 jq -n \
     --arg generated_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
@@ -164,22 +164,25 @@ jq -n \
     --argjson query_total_variables "$QUERY_TOTAL_VARS" \
     --argjson query_address_count "$QUERY_ADDRESS_COUNT" \
     --slurpfile manifest_json "$MANIFEST_PATH" \
-    --argjson query_result "$QUERY_JSON" \
     '{
-        schema_version: 1,
+        schema_version: 2,
         generated_at: $generated_at,
         repo_root: $repo_root,
         corpus_dir: $corpus_dir,
         manifest_path: $manifest,
         result_path: $results_path,
         parse_benchmark: {
+            description: "Fast parse benchmark: analyzer load plus initial DWARF fast-parse/index build.",
             binary: $parse_binary,
             runs: $runs,
-            average_ms: $parse_avg_ms,
-            min_ms: $parse_min_ms,
-            max_ms: $parse_max_ms
+            metrics_ms: {
+                average: $parse_avg_ms,
+                min: $parse_min_ms,
+                max: $parse_max_ms
+            }
         },
         query_benchmark: {
+            description: "End-to-end source-line query benchmark: source-line lookup, address resolution, and variable collection for all matched addresses.",
             binary: $query_binary,
             source: {
                 path: $query_source,
@@ -187,36 +190,54 @@ jq -n \
             },
             loading_time_ms: $query_loading_ms,
             runs: $runs,
+            metrics_ms: {
+                first_run: $query_first_run_ms,
+                average: $query_avg_ms,
+                p50: $query_p50_ms,
+                p95: $query_p95_ms,
+                min: $query_min_ms,
+                max: $query_max_ms
+            }
+        },
+        query_result: {
+            description: "Snapshot of the matched query result for the benchmarked source line.",
+            source: {
+                path: $query_source,
+                line: ($query_line | tonumber)
+            },
             first_address: $query_first_address,
             address_count: $query_address_count,
-            total_variables: $query_total_variables,
-            first_run_ms: $query_first_run_ms,
-            average_ms: $query_avg_ms,
-            p50_ms: $query_p50_ms,
-            p95_ms: $query_p95_ms,
-            min_ms: $query_min_ms,
-            max_ms: $query_max_ms,
-            result: $query_result
+            total_variables: $query_total_variables
         },
         corpus_manifest: $manifest_json[0]
     }' >"$RESULT_PATH"
 
-echo "$PARSE_OUTPUT"
+echo "Fast parse benchmark:"
+echo "  meaning: analyzer load + initial DWARF fast-parse/index build"
+echo "  binary: $PARSE_BINARY"
+echo "  runs: $RUNS"
+echo "  average: ${PARSE_AVG_MS}ms"
+echo "  min: ${PARSE_MIN_MS}ms"
+echo "  max: ${PARSE_MAX_MS}ms"
 echo
-echo "Query benchmark:"
+echo "Source-line query benchmark:"
+echo "  meaning: source-line lookup + address resolution + variable collection for matched addresses"
 echo "  source: ${QUERY_SOURCE_ABS}:${QUERY_LINE}"
+echo "  binary: $QUERY_BINARY"
 echo "  loading time: ${QUERY_LOADING_MS}ms"
 echo "  runs: $RUNS"
-echo "  addresses: $QUERY_ADDRESS_COUNT"
-echo "  total variables: $QUERY_TOTAL_VARS"
-if [[ -n "$QUERY_FIRST_ADDRESS" ]]; then
-    echo "  first address: $QUERY_FIRST_ADDRESS"
-fi
 echo "  first run: ${QUERY_FIRST_RUN_MS}ms"
 echo "  average: ${QUERY_AVG_MS}ms"
 echo "  p50: ${QUERY_P50_MS}ms"
 echo "  p95: ${QUERY_P95_MS}ms"
 echo "  min: ${QUERY_MIN_MS}ms"
 echo "  max: ${QUERY_MAX_MS}ms"
+echo
+echo "Query result snapshot:"
+echo "  addresses: $QUERY_ADDRESS_COUNT"
+echo "  total variables: $QUERY_TOTAL_VARS"
+if [[ -n "$QUERY_FIRST_ADDRESS" ]]; then
+    echo "  first address: $QUERY_FIRST_ADDRESS"
+fi
 echo
 echo "Result JSON: $RESULT_PATH"
