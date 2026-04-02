@@ -3,7 +3,21 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
-IMAGE_REF=${DWARF_PERF_BUILDER_IMAGE:-ghostscope-dwarf-perf-builder:dev}
+DEFAULT_IMAGE_REF_FILE="$SCRIPT_DIR/builder_image_ref.txt"
+
+if [[ -n "${DWARF_PERF_BUILDER_IMAGE:-}" ]]; then
+    IMAGE_REF=$DWARF_PERF_BUILDER_IMAGE
+elif [[ -f "$DEFAULT_IMAGE_REF_FILE" ]]; then
+    IMAGE_REF=$(<"$DEFAULT_IMAGE_REF_FILE")
+else
+    echo "builder image ref is not configured; set DWARF_PERF_BUILDER_IMAGE or add $DEFAULT_IMAGE_REF_FILE" >&2
+    exit 1
+fi
+
+if [[ -z "$IMAGE_REF" ]]; then
+    echo "builder image ref is empty" >&2
+    exit 1
+fi
 
 if [[ $# -gt 1 ]]; then
     echo "usage: $0 [output-dir]" >&2

@@ -18,7 +18,20 @@ The corpus is intentionally separate from `ghostscope/tests/fixtures`:
 
 ## Build Flow
 
-Use the dedicated builder image created by the DWARF perf image workflow:
+By default the build uses the image pinned in
+`scripts/dwarf-perf/builder_image_ref.txt`, produced by the DWARF perf image workflow:
+
+```bash
+./scripts/dwarf-perf/build_corpus.sh
+```
+
+Current locked image:
+
+```text
+ghcr.io/swananan/ghostscope-dwarf-perf-builder@sha256:ed99b20a96a4fb2abc4845ca55e7e3780e97752d3281da441b8aa335b56b9ecb
+```
+
+To override the pinned image temporarily:
 
 ```bash
 DWARF_PERF_BUILDER_IMAGE=ghcr.io/swananan/ghostscope-dwarf-perf-builder:ubuntu24.04-llvm18-rust1.88 \
