@@ -6,7 +6,10 @@
 //! - Support for parallel construction with index shards
 //! - Fast binary search for symbol lookup
 
-use crate::core::{demangle_by_lang, demangled_leaf, IndexEntry};
+use crate::{
+    core::{demangle_by_lang, demangled_leaf, IndexEntry},
+    semantics::range_contains_pc,
+};
 use gimli::{DebugInfoOffset, EndianArcSlice, LittleEndian};
 use std::collections::{BTreeMap, HashMap};
 use tracing::debug;
@@ -290,11 +293,7 @@ impl LightweightIndex {
                         }
                     }
                     for (start, end) in &entry.address_ranges {
-                        let contains = if start == end {
-                            address == *start
-                        } else {
-                            address >= *start && address < *end
-                        };
+                        let contains = range_contains_pc(*start, *end, address);
                         if contains {
                             return Some(entry);
                         }
@@ -314,11 +313,7 @@ impl LightweightIndex {
                 }
             }
             for (start, end) in &entry.address_ranges {
-                let contains = if start == end {
-                    address == *start
-                } else {
-                    address >= *start && address < *end
-                };
+                let contains = range_contains_pc(*start, *end, address);
                 if contains {
                     return Some(entry);
                 }
@@ -354,11 +349,7 @@ impl LightweightIndex {
 
             // Check all ranges for this entry
             for (start, end) in &entry.address_ranges {
-                let contains = if start == end {
-                    address == *start
-                } else {
-                    address >= *start && address < *end
-                };
+                let contains = range_contains_pc(*start, *end, address);
 
                 if contains {
                     tracing::debug!(

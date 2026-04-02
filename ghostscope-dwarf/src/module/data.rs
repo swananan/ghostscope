@@ -29,6 +29,7 @@ use crate::{
         CfiIndex, LightweightIndex, LineMappingTable, OnDemandResolver, ScopedFileIndexManager,
     },
     parser::{CompilationUnit, ExpressionEvaluator, SourceFile},
+    semantics::{resolve_attr_with_unit_origins, resolve_name_with_origins},
 };
 use gimli::{LittleEndian, Reader};
 use object::{Object, ObjectSection, ObjectSegment};
@@ -40,10 +41,6 @@ use std::{
 
 // Clippy: factor complex HashMap<String, Vec<usize>> type into an alias
 type NameIndex = HashMap<String, Vec<usize>>;
-type DwarfUnit = gimli::Unit<gimli::EndianArcSlice<LittleEndian>>;
-type DwarfEntry = gimli::DebuggingInformationEntry<gimli::EndianArcSlice<LittleEndian>>;
-type ResolvedOriginEntry = (gimli::DebugInfoOffset, DwarfUnit, DwarfEntry);
-type ResolvedUnitEntry = (DwarfUnit, DwarfEntry);
 
 /// Complete DWARF data for a single module
 #[derive(Debug)]
@@ -884,91 +881,6 @@ impl ModuleData {
         base_var: &str,
         chain: &[String],
     ) -> Result<Option<crate::data::VariableWithEvaluation>> {
-        fn resolve_var_name_with_origins(
-            dwarf: &gimli::Dwarf<gimli::EndianArcSlice<LittleEndian>>,
-            unit: &gimli::Unit<gimli::EndianArcSlice<LittleEndian>>,
-            entry: &gimli::DebuggingInformationEntry<gimli::EndianArcSlice<LittleEndian>>,
-        ) -> gimli::read::Result<Option<String>> {
-            fn resolve_debug_info_ref(
-                dwarf: &gimli::Dwarf<gimli::EndianArcSlice<LittleEndian>>,
-                debug_info_off: gimli::DebugInfoOffset,
-            ) -> gimli::read::Result<Option<ResolvedUnitEntry>> {
-                let mut units = dwarf.units();
-                while let Some(header) = units.next()? {
-                    if let Some(unit_off) = debug_info_off.to_unit_offset(&header) {
-                        let target_unit = dwarf.unit(header)?;
-                        let target_entry = target_unit.entry(unit_off)?;
-                        return Ok(Some((target_unit, target_entry)));
-                    }
-                }
-                Ok(None)
-            }
-
-            fn resolve_origin_entry(
-                dwarf: &gimli::Dwarf<gimli::EndianArcSlice<LittleEndian>>,
-                unit: &gimli::Unit<gimli::EndianArcSlice<LittleEndian>>,
-                value: gimli::AttributeValue<gimli::EndianArcSlice<LittleEndian>>,
-            ) -> gimli::read::Result<Option<ResolvedOriginEntry>> {
-                let debug_info_off = match value {
-                    gimli::AttributeValue::UnitRef(off) => off.to_debug_info_offset(&unit.header),
-                    gimli::AttributeValue::DebugInfoRef(off) => Some(off),
-                    _ => None,
-                };
-                let Some(debug_info_off) = debug_info_off else {
-                    return Ok(None);
-                };
-
-                let Some((origin_unit, origin_entry)) =
-                    resolve_debug_info_ref(dwarf, debug_info_off)?
-                else {
-                    return Ok(None);
-                };
-                Ok(Some((debug_info_off, origin_unit, origin_entry)))
-            }
-
-            fn inner(
-                dwarf: &gimli::Dwarf<gimli::EndianArcSlice<LittleEndian>>,
-                unit: &gimli::Unit<gimli::EndianArcSlice<LittleEndian>>,
-                entry: &gimli::DebuggingInformationEntry<gimli::EndianArcSlice<LittleEndian>>,
-                visited: &mut std::collections::HashSet<gimli::DebugInfoOffset>,
-            ) -> gimli::read::Result<Option<String>> {
-                if let Some(attr) = entry.attr(gimli::DW_AT_name) {
-                    if let Ok(s) = dwarf.attr_string(unit, attr.value()) {
-                        if let Ok(name) = s.to_string_lossy() {
-                            return Ok(Some(name.into_owned()));
-                        }
-                    }
-                }
-
-                for origin_attr in [
-                    gimli::constants::DW_AT_abstract_origin,
-                    gimli::constants::DW_AT_specification,
-                ] {
-                    if let Some(value) = entry.attr_value(origin_attr) {
-                        if let Some((origin_abs, origin_unit, origin_entry)) =
-                            resolve_origin_entry(dwarf, unit, value)?
-                        {
-                            if visited.insert(origin_abs) {
-                                if let Some(name) =
-                                    inner(dwarf, &origin_unit, &origin_entry, visited)?
-                                {
-                                    return Ok(Some(name));
-                                }
-                            }
-                        }
-                    }
-                }
-
-                Ok(None)
-            }
-
-            let mut visited = std::collections::HashSet::new();
-            if let Some(entry_abs) = entry.offset().to_debug_info_offset(&unit.header) {
-                visited.insert(entry_abs);
-            }
-            inner(dwarf, unit, entry, &mut visited)
-        }
-
         let t0 = Instant::now();
         let mut built_funcs: usize = 0;
         let mut build_ms: u128 = 0;
@@ -1035,7 +947,7 @@ impl ModuleData {
             let mut cand_names: Vec<String> = Vec::new();
             for v in &candidates {
                 let e = unit.entry(v.die_offset)?;
-                if let Some(name) = resolve_var_name_with_origins(dwarf, &unit, &e)? {
+                if let Some(name) = resolve_name_with_origins(dwarf, &unit, &e)? {
                     cand_names.push(name);
                 }
             }
@@ -1043,7 +955,7 @@ impl ModuleData {
 
             for v in candidates {
                 let e = unit.entry(v.die_offset)?;
-                if let Some(n) = resolve_var_name_with_origins(dwarf, &unit, &e)? {
+                if let Some(n) = resolve_name_with_origins(dwarf, &unit, &e)? {
                     if n == base_var || n.starts_with(&format!("{base_var}@")) {
                         // Chain empty: short-circuit to base variable (avoid heavy type resolution)
                         if chain.is_empty() {
@@ -1703,44 +1615,6 @@ impl ModuleData {
         func: &crate::data::FunctionBlocks,
         pc: u64,
     ) -> Option<crate::core::CfaResult> {
-        // Helper: resolve an attribute up abstract_origin/specification
-        fn resolve_attr_with_origins(
-            entry: &gimli::DebuggingInformationEntry<gimli::EndianArcSlice<LittleEndian>>,
-            unit: &gimli::Unit<gimli::EndianArcSlice<LittleEndian>>,
-            attr: gimli::DwAt,
-        ) -> gimli::read::Result<Option<gimli::AttributeValue<gimli::EndianArcSlice<LittleEndian>>>>
-        {
-            let mut visited = std::collections::HashSet::new();
-            fn inner(
-                entry: &gimli::DebuggingInformationEntry<gimli::EndianArcSlice<LittleEndian>>,
-                unit: &gimli::Unit<gimli::EndianArcSlice<LittleEndian>>,
-                attr: gimli::DwAt,
-                visited: &mut std::collections::HashSet<gimli::UnitOffset>,
-            ) -> gimli::read::Result<
-                Option<gimli::AttributeValue<gimli::EndianArcSlice<LittleEndian>>>,
-            > {
-                if let Some(value) = entry.attr_value(attr) {
-                    return Ok(Some(value));
-                }
-                for origin_attr in [
-                    gimli::constants::DW_AT_abstract_origin,
-                    gimli::constants::DW_AT_specification,
-                ] {
-                    if let Some(gimli::AttributeValue::UnitRef(off)) = entry.attr_value(origin_attr)
-                    {
-                        if visited.insert(off) {
-                            let origin = unit.entry(off)?;
-                            if let Some(v) = inner(&origin, unit, attr, visited)? {
-                                return Ok(Some(v));
-                            }
-                        }
-                    }
-                }
-                Ok(None)
-            }
-            inner(entry, unit, attr, &mut visited)
-        }
-
         let dwarf = self.resolver.dwarf_ref();
         let header = dwarf.unit_header(func.cu_offset).ok()?;
         let unit = dwarf.unit(header).ok()?;
@@ -1757,9 +1631,11 @@ impl ModuleData {
 
         for off in candidates {
             if let Ok(entry) = unit.entry(off) {
-                if let Ok(Some(val)) =
-                    resolve_attr_with_origins(&entry, &unit, gimli::constants::DW_AT_frame_base)
-                {
+                if let Ok(Some(val)) = resolve_attr_with_unit_origins(
+                    &entry,
+                    &unit,
+                    gimli::constants::DW_AT_frame_base,
+                ) {
                     // Evaluate to EvaluationResult using existing evaluator paths
                     let eval_res = match val {
                         gimli::AttributeValue::Exprloc(expr) => {
@@ -2070,44 +1946,6 @@ impl ModuleData {
             return Ok(false);
         }
 
-        // Helper: resolve attr with origins/specification
-        fn resolve_attr_with_origins(
-            entry: &gimli::DebuggingInformationEntry<gimli::EndianArcSlice<LittleEndian>>,
-            unit: &gimli::Unit<gimli::EndianArcSlice<LittleEndian>>,
-            attr: gimli::DwAt,
-        ) -> gimli::read::Result<Option<gimli::AttributeValue<gimli::EndianArcSlice<LittleEndian>>>>
-        {
-            let mut visited = std::collections::HashSet::new();
-            fn inner(
-                entry: &gimli::DebuggingInformationEntry<gimli::EndianArcSlice<LittleEndian>>,
-                unit: &gimli::Unit<gimli::EndianArcSlice<LittleEndian>>,
-                attr: gimli::DwAt,
-                visited: &mut std::collections::HashSet<gimli::UnitOffset>,
-            ) -> gimli::read::Result<
-                Option<gimli::AttributeValue<gimli::EndianArcSlice<LittleEndian>>>,
-            > {
-                if let Some(v) = entry.attr_value(attr) {
-                    return Ok(Some(v));
-                }
-                for origin_attr in [
-                    gimli::constants::DW_AT_abstract_origin,
-                    gimli::constants::DW_AT_specification,
-                ] {
-                    if let Some(gimli::AttributeValue::UnitRef(off)) = entry.attr_value(origin_attr)
-                    {
-                        if visited.insert(off) {
-                            let origin = unit.entry(off)?;
-                            if let Some(v2) = inner(&origin, unit, attr, visited)? {
-                                return Ok(Some(v2));
-                            }
-                        }
-                    }
-                }
-                Ok(None)
-            }
-            inner(entry, unit, attr, &mut visited)
-        }
-
         if let Ok(mut tree) = unit.entries_tree(Some(entry.offset())) {
             if let Ok(root) = tree.root() {
                 let mut children = root.children();
@@ -2115,7 +1953,11 @@ impl ModuleData {
                     let e = child.entry();
                     if e.tag() == gimli::constants::DW_TAG_formal_parameter {
                         if let Ok(Some(gimli::AttributeValue::Exprloc(expr))) =
-                            resolve_attr_with_origins(e, &unit, gimli::constants::DW_AT_location)
+                            resolve_attr_with_unit_origins(
+                                e,
+                                &unit,
+                                gimli::constants::DW_AT_location,
+                            )
                         {
                             // Parse ops and look for EntryValue
                             let mut expression = gimli::Expression(expr.0);

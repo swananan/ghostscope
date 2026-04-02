@@ -8,6 +8,10 @@
 use crate::{
     core::{EvaluationResult, Result},
     parser::ExpressionEvaluator,
+    semantics::{
+        eval_member_offset_expr, resolve_name_with_origins,
+        resolve_type_ref_in_same_unit_with_origins,
+    },
     TypeInfo,
 };
 use gimli::{EndianArcSlice, LittleEndian, Reader};
@@ -90,7 +94,8 @@ impl DetailedParser {
                     if alias_name.is_none() {
                         alias_name = entry_name.clone();
                     }
-                    if let Some(gimli::AttributeValue::UnitRef(off)) = entry.attr_value(DW_AT_TYPE)
+                    if let Some(off) =
+                        resolve_type_ref_in_same_unit_with_origins(dwarf, &entry, unit).ok()?
                     {
                         type_offset = off;
                         continue;
@@ -105,7 +110,8 @@ impl DetailedParser {
                     });
                 }
                 DW_TAG_CONST_TYPE | DW_TAG_VOLATILE_TYPE | DW_TAG_RESTRICT_TYPE => {
-                    if let Some(gimli::AttributeValue::UnitRef(off)) = entry.attr_value(DW_AT_TYPE)
+                    if let Some(off) =
+                        resolve_type_ref_in_same_unit_with_origins(dwarf, &entry, unit).ok()?
                     {
                         type_offset = off;
                         continue;
@@ -130,8 +136,8 @@ impl DetailedParser {
                     }
                     // Very shallow pointee name resolution: unwrap typedef/qualifiers only, without recursion
                     let mut pointee_name: Option<String> = None;
-                    if let Some(gimli::AttributeValue::UnitRef(mut toff)) =
-                        entry.attr_value(DW_AT_TYPE)
+                    if let Some(mut toff) =
+                        resolve_type_ref_in_same_unit_with_origins(dwarf, &entry, unit).ok()?
                     {
                         // Unwrap up to a small bound to avoid deep recursion/stack blowups on real-world code
                         for _ in 0..8 {
@@ -151,8 +157,11 @@ impl DetailedParser {
                                                 }
                                             }
                                         }
-                                        if let Some(gimli::AttributeValue::UnitRef(next)) =
-                                            tentry.attr_value(DW_AT_TYPE)
+                                        if let Some(next) =
+                                            resolve_type_ref_in_same_unit_with_origins(
+                                                dwarf, &tentry, unit,
+                                            )
+                                            .ok()?
                                         {
                                             toff = next;
                                             continue;
@@ -306,9 +315,7 @@ impl DetailedParser {
                                             gimli::AttributeValue::Udata(v) => m_offset = v,
                                             gimli::AttributeValue::Exprloc(expr) => {
                                                 // Try to eval simple DW_OP_constu / plus_uconst
-                                                if let Some(v) =
-                                                    Self::eval_member_offset_expr_local(&expr)
-                                                {
+                                                if let Some(v) = eval_member_offset_expr(&expr) {
                                                     m_offset = v;
                                                 }
                                             }
@@ -713,28 +720,6 @@ impl DetailedParser {
         }
     }
 
-    /// Local simple evaluator for DW_AT_data_member_location exprloc when it's a constant offset.
-    fn eval_member_offset_expr_local(
-        expr: &gimli::Expression<EndianArcSlice<LittleEndian>>,
-    ) -> Option<u64> {
-        let temp = expr.0.to_slice().ok();
-        let bytes = temp.as_deref().unwrap_or(&[]);
-        if bytes.is_empty() {
-            return None;
-        }
-        let mut rdr = gimli::EndianSlice::new(bytes, LittleEndian);
-        if let Ok(op) = rdr.read_u8() {
-            match op {
-                0x10 => rdr.read_uleb128().ok(),                   // DW_OP_constu
-                0x11 => rdr.read_sleb128().ok().map(|v| v as u64), // DW_OP_consts
-                0x23 => rdr.read_uleb128().ok(),                   // DW_OP_plus_uconst
-                _ => None,
-            }
-        } else {
-            None
-        }
-    }
-
     // Full variable collection and traversal helpers removed in shallow-only mode
 
     // parse_variable_entry wrapper removed; use parse_variable_entry_with_mode
@@ -791,7 +776,7 @@ impl DetailedParser {
         visited: &mut HashSet<gimli::UnitOffset>,
     ) -> Result<String> {
         // Follow DW_AT_type if present
-        let Some(type_off) = Self::resolve_type_ref(entry, unit)? else {
+        let Some(type_off) = Self::resolve_type_ref(entry, unit, dwarf)? else {
             // As a fallback, try to use the entry's own name if any
             let mut name_visited = HashSet::new();
             if let Some(n) = Self::resolve_name_with_origins(entry, unit, dwarf, &mut name_visited)?
@@ -868,82 +853,21 @@ impl DetailedParser {
         0
     }
 
-    fn resolve_attr_with_origins(
-        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
-        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
-        attr: gimli::DwAt,
-        visited: &mut HashSet<gimli::UnitOffset>,
-    ) -> Result<Option<gimli::AttributeValue<EndianArcSlice<LittleEndian>>>> {
-        if let Some(value) = entry.attr_value(attr) {
-            return Ok(Some(value));
-        }
-
-        for origin_attr in [
-            gimli::constants::DW_AT_abstract_origin,
-            gimli::constants::DW_AT_specification,
-        ] {
-            if let Some(gimli::AttributeValue::UnitRef(offset)) = entry.attr_value(origin_attr) {
-                if visited.insert(offset) {
-                    let origin_entry = unit.entry(offset)?;
-                    if let Some(value) =
-                        Self::resolve_attr_with_origins(&origin_entry, unit, attr, visited)?
-                    {
-                        return Ok(Some(value));
-                    }
-                }
-            }
-        }
-
-        Ok(None)
-    }
-
     fn resolve_name_with_origins(
         entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
         unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
         dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
-        visited: &mut HashSet<gimli::UnitOffset>,
+        _visited: &mut HashSet<gimli::UnitOffset>,
     ) -> Result<Option<String>> {
-        if let Some(attr) =
-            Self::resolve_attr_with_origins(entry, unit, gimli::constants::DW_AT_name, visited)?
-        {
-            return Self::attr_to_string(attr, unit, dwarf);
-        }
-        Ok(None)
+        Ok(resolve_name_with_origins(dwarf, unit, entry)?)
     }
 
     fn resolve_type_ref(
         entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
         unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
-    ) -> Result<Option<gimli::UnitOffset>> {
-        let mut visited = HashSet::new();
-        Ok(Self::resolve_attr_with_origins(
-            entry,
-            unit,
-            gimli::constants::DW_AT_type,
-            &mut visited,
-        )?
-        .and_then(|value| match value {
-            gimli::AttributeValue::UnitRef(offset) => Some(offset),
-            _ => None,
-        }))
-    }
-
-    fn attr_to_string(
-        attr: gimli::AttributeValue<EndianArcSlice<LittleEndian>>,
-        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
         dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
-    ) -> Result<Option<String>> {
-        if let Ok(attr_string) = dwarf.attr_string(unit, attr.clone()) {
-            if let Ok(s_str) = attr_string.to_string_lossy() {
-                return Ok(Some(s_str.into_owned()));
-            }
-        }
-
-        if let gimli::AttributeValue::String(s) = attr {
-            return Ok(s.to_string().ok().map(|cow| cow.into_owned()));
-        }
-
-        Ok(None)
+    ) -> Result<Option<gimli::UnitOffset>> {
+        resolve_type_ref_in_same_unit_with_origins(dwarf, entry, unit)
     }
 
     // resolve_flag_with_origins and entry_pc_matches removed with variable traversal helpers

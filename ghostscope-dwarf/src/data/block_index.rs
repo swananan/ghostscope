@@ -5,7 +5,10 @@
 //! - Associates variables and parameters with the block scopes
 //! - Provides fast lookup of in-scope variables at a given PC
 
-use crate::parser::RangeExtractor;
+use crate::{
+    parser::RangeExtractor,
+    semantics::{ranges_contain_pc, resolve_origin_entry},
+};
 use gimli::{EndianArcSlice, LittleEndian};
 use std::collections::BTreeMap;
 
@@ -49,16 +52,7 @@ impl BlockNode {
                 return true;
             }
         }
-        for (lo, hi) in &self.ranges {
-            if if lo == hi {
-                pc == *lo
-            } else {
-                pc >= *lo && pc < *hi
-            } {
-                return true;
-            }
-        }
-        false
+        ranges_contain_pc(&self.ranges, pc)
     }
 }
 
@@ -91,16 +85,7 @@ impl FunctionBlocks {
 
     #[inline]
     fn function_contains_pc(&self, pc: u64) -> bool {
-        for (lo, hi) in &self.ranges {
-            if if lo == hi {
-                pc == *lo
-            } else {
-                pc >= *lo && pc < *hi
-            } {
-                return true;
-            }
-        }
-        false
+        ranges_contain_pc(&self.ranges, pc)
     }
 
     /// Return node indices from root to the innermost block containing PC
@@ -330,8 +315,12 @@ impl<'a> BlockIndexBuilder<'a> {
                         }
                         if !has_inline_params {
                             if let Some(attr) = e.attr(gimli::constants::DW_AT_abstract_origin) {
-                                if let gimli::AttributeValue::UnitRef(origin_off) = attr.value() {
-                                    if let Ok(mut iter) = unit.entries_at_offset(origin_off) {
+                                if let Ok(Some((_origin_abs, origin_unit, origin_entry))) =
+                                    resolve_origin_entry(self.dwarf, unit, attr.value())
+                                {
+                                    if let Ok(mut iter) =
+                                        origin_unit.entries_at_offset(origin_entry.offset())
+                                    {
                                         // Skip the origin DIE itself
                                         let _ = iter.next_entry();
                                         while let Ok(Some(ce)) = iter.next_dfs() {
@@ -345,7 +334,9 @@ impl<'a> BlockIndexBuilder<'a> {
                                             if ce.tag() == gimli::constants::DW_TAG_formal_parameter
                                             {
                                                 let v = VarRef {
-                                                    cu_offset: match unit.header.debug_info_offset()
+                                                    cu_offset: match origin_unit
+                                                        .header
+                                                        .debug_info_offset()
                                                     {
                                                         Some(off) => off,
                                                         _ => continue,

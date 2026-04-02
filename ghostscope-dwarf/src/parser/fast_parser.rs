@@ -1,5 +1,6 @@
 //! Unified DWARF parser - true single-pass parsing
 
+use super::fast_paths::resolve_name_in_unit_fast;
 use crate::{
     core::{
         demangle::{demangle_by_lang, demangled_leaf},
@@ -422,55 +423,7 @@ impl<'a> DwarfParser<'a> {
         unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
         entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
     ) -> Result<Option<String>> {
-        // Prefer local DW_AT_name
-        if let Some(attr) = entry.attr(gimli::constants::DW_AT_name) {
-            if let Ok(name) = dwarf.attr_string(unit, attr.value()) {
-                if let Ok(s_str) = name.to_string_lossy() {
-                    return Ok(Some(s_str.into_owned()));
-                }
-            }
-        }
-
-        // Fall back to DW_AT_specification / DW_AT_abstract_origin to resolve name
-        // Common for globals defined in .c and declared in headers: definition DIE refers to declaration DIE for the name
-        if let Some(attr) = entry.attr(gimli::constants::DW_AT_specification) {
-            if let Some(n) = Self::resolve_name_via_ref(dwarf, unit, attr.value())? {
-                return Ok(Some(n));
-            }
-        }
-        if let Some(attr) = entry.attr(gimli::constants::DW_AT_abstract_origin) {
-            if let Some(n) = Self::resolve_name_via_ref(dwarf, unit, attr.value())? {
-                return Ok(Some(n));
-            }
-        }
-
-        Ok(None)
-    }
-
-    fn resolve_name_via_ref(
-        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
-        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
-        value: gimli::AttributeValue<EndianArcSlice<LittleEndian>>,
-    ) -> Result<Option<String>> {
-        match value {
-            gimli::AttributeValue::UnitRef(uoff) => {
-                if let Ok(spec_entry) = unit.entry(uoff) {
-                    if let Some(attr) = spec_entry.attr(gimli::constants::DW_AT_name) {
-                        if let Ok(name) = dwarf.attr_string(unit, attr.value()) {
-                            if let Ok(s_str) = name.to_string_lossy() {
-                                return Ok(Some(s_str.into_owned()));
-                            }
-                        }
-                    }
-                }
-            }
-            gimli::AttributeValue::DebugInfoRef(_dioff) => {
-                // Cross-unit specification is rare for our use cases; skip to keep fast path simple
-                // and avoid heavy cross-CU resolution here.
-            }
-            _ => {}
-        }
-        Ok(None)
+        Ok(resolve_name_in_unit_fast(dwarf, unit, entry)?)
     }
 
     fn extract_linkage_name(
