@@ -44,6 +44,19 @@ The build writes artifacts under `perf-corpus/out/`:
 - `parse-stress/parse_stress`
 - `manifest.json`
 
+End-to-end baseline runner:
+
+```bash
+./scripts/dwarf-perf/run_baseline.sh
+```
+
+This will:
+
+- build the corpus unless `--skip-build` is passed
+- run the parse benchmark through `dwarf-tool benchmark`
+- run the query benchmark through `dwarf-tool source-line`
+- write a JSON result under `perf-results/`
+
 ## Tuning
 
 The generated parse corpus is deterministic and can be scaled without editing sources:
