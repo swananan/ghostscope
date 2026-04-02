@@ -38,7 +38,7 @@ DWARF_PERF_BUILDER_IMAGE=ghcr.io/swananan/ghostscope-dwarf-perf-builder:ubuntu24
   ./scripts/dwarf-perf/build_corpus.sh
 ```
 
-The build writes artifacts under `perf-corpus/out/`:
+The build writes artifacts under `scripts/dwarf-perf/corpus/out/`:
 
 - `query-hotspot/query_hotspot`
 - `parse-stress/parse_stress`
@@ -64,7 +64,8 @@ The script prints three separate sections:
 - `Query result snapshot`
 
 `Fast parse benchmark` is the analyzer load path, which reflects the initial
-DWARF fast-parse and index-build cost.
+DWARF fast-parse and index-build cost. It reports `average_ms`, `p50_ms`,
+`p95_ms`, `min_ms`, and `max_ms`.
 
 The source-line benchmark keeps one analyzer instance warm, repeats the same
 query multiple times, and records `first_run_ms`, `average_ms`, `p50_ms`,

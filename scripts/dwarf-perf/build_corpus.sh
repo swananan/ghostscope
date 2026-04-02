@@ -24,7 +24,7 @@ if [[ $# -gt 1 ]]; then
     exit 1
 fi
 
-OUT_DIR=${1:-"perf-corpus/out"}
+OUT_DIR=${1:-"scripts/dwarf-perf/corpus/out"}
 if [[ "$OUT_DIR" != /* ]]; then
     OUT_DIR="$REPO_ROOT/$OUT_DIR"
 fi
@@ -71,3 +71,4 @@ echo "Host artifacts:"
 echo "  $OUT_DIR/query-hotspot/query_hotspot"
 echo "  $OUT_DIR/parse-stress/parse_stress"
 echo "  $OUT_DIR/manifest.json"
+echo

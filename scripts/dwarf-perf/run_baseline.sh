@@ -6,7 +6,7 @@ REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 
 BUILD_CORPUS=1
 RUNS=10
-CORPUS_DIR="$REPO_ROOT/perf-corpus/out"
+CORPUS_DIR="$REPO_ROOT/scripts/dwarf-perf/corpus/out"
 RESULTS_DIR="$REPO_ROOT/perf-results"
 RESULT_NAME=""
 CARGO_TARGET_DIR_VALUE="$REPO_ROOT/.target_tmp/dwarf-perf"
@@ -17,7 +17,7 @@ usage: run_baseline.sh [options]
 
 Options:
   --skip-build           reuse an existing corpus directory
-  --corpus-dir PATH      corpus output directory (default: perf-corpus/out)
+  --corpus-dir PATH      corpus output directory (default: scripts/dwarf-perf/corpus/out)
   --results-dir PATH     result directory (default: perf-results)
   --result-name NAME     result file stem (default: timestamp-based)
   --runs N               benchmark runs for parse and query baselines (default: 10)
@@ -125,6 +125,8 @@ QUERY_OUTPUT=$(CARGO_TARGET_DIR="$CARGO_TARGET_DIR_VALUE" \
     --json)
 
 PARSE_AVG_MS=$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Average load time:/ {gsub("ms","",$4); print $4}')
+PARSE_P50_MS=$(printf '%s\n' "$PARSE_OUTPUT" | awk '/P50:/ {gsub("ms","",$2); print $2}')
+PARSE_P95_MS=$(printf '%s\n' "$PARSE_OUTPUT" | awk '/P95:/ {gsub("ms","",$2); print $2}')
 PARSE_MIN_MS=$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Min:/ {gsub("ms","",$2); print $2}')
 PARSE_MAX_MS=$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Max:/ {gsub("ms","",$2); print $2}')
 QUERY_JSON=$(printf '%s\n' "$QUERY_OUTPUT" | sed -n '/^{/,$p')
@@ -152,6 +154,8 @@ jq -n \
     --arg query_first_address "$QUERY_FIRST_ADDRESS" \
     --argjson runs "$RUNS" \
     --argjson parse_avg_ms "$PARSE_AVG_MS" \
+    --argjson parse_p50_ms "$PARSE_P50_MS" \
+    --argjson parse_p95_ms "$PARSE_P95_MS" \
     --argjson parse_min_ms "$PARSE_MIN_MS" \
     --argjson parse_max_ms "$PARSE_MAX_MS" \
     --argjson query_loading_ms "$QUERY_LOADING_MS" \
@@ -177,6 +181,8 @@ jq -n \
             runs: $runs,
             metrics_ms: {
                 average: $parse_avg_ms,
+                p50: $parse_p50_ms,
+                p95: $parse_p95_ms,
                 min: $parse_min_ms,
                 max: $parse_max_ms
             }
@@ -217,6 +223,8 @@ echo "  meaning: analyzer load + initial DWARF fast-parse/index build"
 echo "  binary: $PARSE_BINARY"
 echo "  runs: $RUNS"
 echo "  average: ${PARSE_AVG_MS}ms"
+echo "  p50: ${PARSE_P50_MS}ms"
+echo "  p95: ${PARSE_P95_MS}ms"
 echo "  min: ${PARSE_MIN_MS}ms"
 echo "  max: ${PARSE_MAX_MS}ms"
 echo

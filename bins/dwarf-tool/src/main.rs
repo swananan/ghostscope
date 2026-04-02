@@ -867,13 +867,14 @@ async fn run_benchmark(pid: Option<u32>, target_path: Option<&str>, runs: usize)
             load_times.push(start.elapsed());
         }
         println!();
-
-        let avg_time = load_times.iter().sum::<std::time::Duration>() / runs as u32;
+        let summary = summarize_durations(&load_times)?;
 
         println!("\nResults:");
-        println!("  Average load time: {}ms", avg_time.as_millis());
-        println!("  Min: {}ms", load_times.iter().min().unwrap().as_millis());
-        println!("  Max: {}ms", load_times.iter().max().unwrap().as_millis());
+        println!("  Average load time: {:.3}ms", summary.average_ms);
+        println!("  P50: {:.3}ms", summary.p50_ms);
+        println!("  P95: {:.3}ms", summary.p95_ms);
+        println!("  Min: {:.3}ms", summary.min_ms);
+        println!("  Max: {:.3}ms", summary.max_ms);
     } else if let Some(target) = target_path {
         println!("Benchmarking target file loading for {target} ({runs} runs)...\n");
 
@@ -888,13 +889,14 @@ async fn run_benchmark(pid: Option<u32>, target_path: Option<&str>, runs: usize)
             load_times.push(start.elapsed());
         }
         println!();
-
-        let avg_time = load_times.iter().sum::<std::time::Duration>() / runs as u32;
+        let summary = summarize_durations(&load_times)?;
 
         println!("\nResults:");
-        println!("  Average load time: {}ms", avg_time.as_millis());
-        println!("  Min: {}ms", load_times.iter().min().unwrap().as_millis());
-        println!("  Max: {}ms", load_times.iter().max().unwrap().as_millis());
+        println!("  Average load time: {:.3}ms", summary.average_ms);
+        println!("  P50: {:.3}ms", summary.p50_ms);
+        println!("  P95: {:.3}ms", summary.p95_ms);
+        println!("  Min: {:.3}ms", summary.min_ms);
+        println!("  Max: {:.3}ms", summary.max_ms);
     } else {
         return Err(anyhow::anyhow!(
             "Either PID or target path must be specified for benchmark"

@@ -67,5 +67,5 @@ nginx*
 
 # Python cache
 __pycache__/
-perf-corpus/out/
+scripts/dwarf-perf/corpus/out/
 perf-results/

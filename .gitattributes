@@ -8,4 +8,4 @@ ghostscope-process/ebpf/build_sysmon_bpf.sh linguist-vendored
 # Exclude DWARF perf corpus and helper scripts from language statistics
 scripts/dwarf-perf/*.py linguist-vendored
 scripts/dwarf-perf/*.sh linguist-vendored
-perf-corpus/** linguist-vendored
+scripts/dwarf-perf/corpus/** linguist-vendored
