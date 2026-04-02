@@ -66,3 +66,8 @@ docker run --rm \
     -w /workspace \
     "$IMAGE_REF" \
     bash /workspace/scripts/dwarf-perf/build_corpus_in_container.sh "$CONTAINER_OUT_DIR"
+
+echo "Host artifacts:"
+echo "  $OUT_DIR/query-hotspot/query_hotspot"
+echo "  $OUT_DIR/parse-stress/parse_stress"
+echo "  $OUT_DIR/manifest.json"
