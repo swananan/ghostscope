@@ -30,8 +30,8 @@ jobs:
             target_sandbox: docker-private
             target_mode: same
           # TODO(container-nested-full): re-enable private-to-child-container in the
-          # full matrix after nested PID aliasing is implemented for proc offsets
-          # and `$pid`/event PID alignment.
+          # full matrix after nested target-mode lifecycle support exists for the
+          # outer-container `/proc` pid view.
 
     steps:
       - uses: actions/checkout@v4

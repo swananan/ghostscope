@@ -2,15 +2,15 @@
 
 This document explains how GhostScope behaves in container environments, which scenarios matter, and what the current implementation limits are.
 
-## Topic 1: PID Namespaces and `-p` Mode
+## Topic 1: Container PID Semantics for `-p` and `-t`
 
-PID namespaces are the core source of complexity in container environments, so this section focuses on that first.
+PID namespaces are the core source of complexity in container environments, so this section explains them once and then distinguishes how `-p` and `-t` use those same PID views differently.
 
-This document assumes a local CLI workflow: GhostScope runs in the same environment where you actually invoke `ghostscope -p`. The deployment-scope discussion for running GhostScope itself inside a container is collected later in Topic 4.
+This document assumes a local CLI workflow: GhostScope runs in the same environment where you actually invoke GhostScope. The deployment-scope discussion for running GhostScope itself inside a container is collected later in Topic 3.
 
-### The Most Important Rule
+### The Most Important User Rule
 
-When using `ghostscope -p <PID>`, the rule is simple:
+For `ghostscope -p <PID>`, the rule is simple:
 
 Enter the PID as seen in the same environment where you run `ghostscope -p`, for example from `ps`, `top`, or `pgrep`.
 
@@ -20,6 +20,8 @@ In other words:
 - If you run `ghostscope -p` inside a container, enter the PID you see inside that container.
 
 Users should not manually convert between "host PID" and "container PID". GhostScope is responsible for translating the user input into the internal PID meanings it needs.
+
+For `-t`, there is no PID input from the user, but the same current environment still defines GhostScope's `/proc` view. That means the environment where GhostScope runs still determines which `proc_pid` is authoritative for `/proc/<pid>/maps`, `proc_module_offsets`, and runtime lifecycle cleanup.
 
 ### Why Containers Make This More Complicated
 
@@ -55,6 +57,22 @@ For clarity, this document uses the following names:
   This term is only relevant in `-p` mode. After the user enters `ghostscope -p <PID>`, GhostScope resolves the internal PID views it needs and then installs an eBPF-side filter that keeps runtime events associated with that original `input_pid`. The purpose of `pid_filter` is to make sure GhostScope still filters the process the user intended, even when container PID namespaces mean the userspace-visible PID and the kernel-side PID view are not expressed the same way. In simpler cases this behaves like host-view TGID filtering; in namespace-aware cases it behaves more like "the target PID in a specific PID namespace".
 - `event_pid`
   The PID carried by runtime kernel events. GhostScope has a process-lifecycle monitoring pipeline that listens for `exec`, `fork`, and `exit` events, and this is the PID that pipeline sees first. In the current implementation, `event_pid` is populated from `bpf_get_current_pid_tgid() >> 32`, so it reflects the TGID in the host / initial PID namespace view. When the event comes from a particular target process, it will usually align with that process's `host_pid`, but it cannot directly replace `proc_pid` for accessing the current `/proc` view or for cleaning caches keyed by `proc_pid`.
+- `proc_offsets_runtime_pid`
+  An implementation-only term for the PID value that the eBPF side obtains first when it is about to look up `proc_module_offsets`. This is not a new stable user-facing PID view. Depending on the path, it may line up with `host_pid`, `container_pid`, or a PID carried by runtime events. GhostScope may still need to normalize it before the map lookup can succeed.
+- `proc_offsets_lookup_pid`
+  An implementation-only term for the PID component that is finally used to look up `proc_module_offsets`. In the intended successful path, this should align with `proc_pid`, because `proc_module_offsets` is populated from `/proc/<proc_pid>/maps` in GhostScope's current userspace environment.
+
+For the current implementation, the `proc_module_offsets` path is easiest to understand as:
+
+```text
+proc_offsets_runtime_pid -> pid_aliases -> proc_offsets_lookup_pid (= usually proc_pid)
+```
+
+Here:
+
+- `pid_aliases` is an internal bridge map, not a general PID translation layer.
+- It exists only to help `proc_module_offsets` recover the `/proc`-side PID key that userspace used during prefill.
+- It does not redefine `event_pid`, and it does not replace the normal `pid_filter` semantics used for `-p`.
 
 From a product perspective, users only need to care about `input_pid`. The other PID values are internal views that GhostScope maintains for `/proc` access, eBPF filtering, and cleanup.
 
@@ -71,6 +89,17 @@ So this document distinguishes between:
 
 - user-facing scenario semantics
 - implementation-level technical differences caused by GhostScope's own runtime environment
+
+### How `-p` and `-t` Use the Same PID Terms Differently
+
+The scenario descriptions below are shared. The main difference is which parts of the PID model each mode actually depends on:
+
+- `-p`
+  Starts from a user-supplied `input_pid`, resolves the target's PID views, and installs a `pid_filter` so eBPF events keep matching the process the user meant.
+- `-t`
+  Does not have an `input_pid`. Instead, GhostScope relies on `sysmon` and runtime module-maintenance logic, so the hard problem becomes keeping host-view `event_pid` and current-`/proc` `proc_pid` aligned strongly enough for `/proc/<pid>/maps`, offset prefill, allowlists, and exit cleanup.
+
+That is why the same scenario can be fine for `-p` but still limited for `-t`.
 
 ### Scenario Matrix
 
@@ -165,32 +194,40 @@ Potential problems include:
 
 In these cases, GhostScope should fail clearly and early rather than guessing mappings.
 
-### Scenario-to-PID Reference Table
+### Scenario-to-PID and Support Reference Table
 
-The prose above explains the semantics. The table below turns those same cases into a quick lookup for `-p` mode.
+The prose above explains the shared semantics. The table below turns those same cases into a quick lookup for both `-p` and `-t`.
 
 Here, "scenario" always means the relationship between two sides:
 
 - where GhostScope itself is running
 - where the observed target process is running
 
-| Scenario | `input_pid` | `proc_pid` | `host_pid` | `container_pid` | `pid_filter` | `event_pid` | Support |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 1. Host -> host | Host-visible PID entered on the host | Usually the same as `input_pid` | Usually the same as `input_pid` and `proc_pid` | Usually the same as `host_pid`, because no nested PID namespace is involved | `bpf_get_current_pid_tgid() >> 32 == host_pid` | `bpf_get_current_pid_tgid() >> 32`, usually the same as `host_pid` | Supported |
-| 2. Host -> `--pid=host` container | Host-visible PID entered on the host | Usually the same as `input_pid` | Usually the same as `input_pid` and `proc_pid` | Usually the same as `host_pid`, because the container shares the host PID namespace | `bpf_get_current_pid_tgid() >> 32 == host_pid` | `bpf_get_current_pid_tgid() >> 32`, usually the same as `host_pid` | Supported |
-| 3. Host -> private PID-namespace container | Host-visible PID entered on the host | Usually the same as `input_pid` in the host `/proc` view | Usually the same as `input_pid` and `proc_pid` | Target PID inside the inner namespace; may differ from `host_pid` | `bpf_get_current_pid_tgid() >> 32 == host_pid` | `bpf_get_current_pid_tgid() >> 32`, usually the same as `host_pid` | Supported |
-| 4. `--pid=host` container -> host / shared-PID target | PID entered inside the container shell, which is already host-visible | Usually the same as `input_pid` | Usually the same as `input_pid` and `proc_pid` | Usually the same as `host_pid` | Helper supported: `bpf_get_ns_current_pid_tgid(...).tgid == proc_pid`; helper unsupported: `bpf_get_current_pid_tgid() >> 32 == host_pid` | `bpf_get_current_pid_tgid() >> 32`, usually the same as `host_pid` | Supported |
-| 5. Private PID-namespace container -> same private PID namespace | Container-visible PID entered inside that container | Usually the same as `input_pid` in the current container `/proc` view | Usually different from `input_pid` and `proc_pid`; corresponds to the first value in `NSpid` | Usually the same as `input_pid` and `proc_pid` when GhostScope and the target share that namespace | Helper supported: `bpf_get_ns_current_pid_tgid(...).tgid == proc_pid`; helper unsupported: if `NSpid` exposes an explicit host mapping, `bpf_get_current_pid_tgid() >> 32 == host_pid`, otherwise fail fast | `bpf_get_current_pid_tgid() >> 32`, usually aligned with `host_pid` rather than `input_pid` | Conditionally supported |
-| 6. Private PID-namespace container -> descendant / nested private PID namespace | PID entered inside the current container shell, meaning the PID visible from the current container's `/proc` view, not the child container-local PID | Usually the same as `input_pid` in the current container `/proc` view | Usually different from `input_pid` and `proc_pid`; corresponds to the first value in `NSpid` | Usually different from `input_pid` and `proc_pid`; corresponds to the tail of `NSpid`, often the child container-local PID | Helper supported: `bpf_get_ns_current_pid_tgid(...).tgid == container_pid`; helper unsupported: if `NSpid` exposes an explicit host mapping, `bpf_get_current_pid_tgid() >> 32 == host_pid`, otherwise fail fast | `bpf_get_current_pid_tgid() >> 32`, usually aligned with `host_pid` | Conditionally supported |
-| 7. Private PID-namespace container -> target outside that PID namespace | Often not satisfiable because the target is not visible in the current `/proc` view | Often unavailable from the current `/proc` view | Often not stably resolvable from the current view; if it exists, it belongs to a PID view outside the current `/proc` namespace | Unreliable or not visible from the current namespace | No stable comparison is installed; GhostScope should fail fast | No stable `event_pid` to `proc_pid` mapping can be assumed | Unsupported |
+| Scenario | `input_pid` | `proc_pid` | `host_pid` | `container_pid` | `pid_filter` | `event_pid` | `proc_offsets_runtime_pid` | `proc_module_offsets` lookup key | `-p` Support | `-t` Support |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1. Host -> host | Host-visible PID entered on the host | Usually the same as `input_pid` | Usually the same as `input_pid` and `proc_pid` | Usually the same as `host_pid`, because no nested PID namespace is involved | `bpf_get_current_pid_tgid() >> 32 == host_pid` | `bpf_get_current_pid_tgid() >> 32`, usually the same as `host_pid` | Usually the same as `host_pid` and `proc_pid`; aliasing is usually unnecessary | `proc_pid` in the host `/proc` view | Supported | Supported |
+| 2. Host -> `--pid=host` container | Host-visible PID entered on the host | Usually the same as `input_pid` | Usually the same as `input_pid` and `proc_pid` | Usually the same as `host_pid`, because the container shares the host PID namespace | `bpf_get_current_pid_tgid() >> 32 == host_pid` | `bpf_get_current_pid_tgid() >> 32`, usually the same as `host_pid` | Usually the same as `host_pid` and `proc_pid`; aliasing is usually unnecessary | `proc_pid` in the host `/proc` view | Supported | Supported |
+| 3. Host -> private PID-namespace container | Host-visible PID entered on the host | Usually the same as `input_pid` in the host `/proc` view | Usually the same as `input_pid` and `proc_pid` | Target PID inside the inner namespace; may differ from `host_pid` | `bpf_get_current_pid_tgid() >> 32 == host_pid` | `bpf_get_current_pid_tgid() >> 32`, usually the same as `host_pid` | Usually the same as `host_pid`; aliasing is usually unnecessary because `/proc` is already in the host view | `proc_pid` in the host `/proc` view | Supported | Supported |
+| 4. `--pid=host` container -> host / shared-PID target | PID entered inside the container shell, which is already host-visible | Usually the same as `input_pid` | Usually the same as `input_pid` and `proc_pid` | Usually the same as `host_pid` | Helper supported: `bpf_get_ns_current_pid_tgid(...).tgid == proc_pid`; helper unsupported: `bpf_get_current_pid_tgid() >> 32 == host_pid` | `bpf_get_current_pid_tgid() >> 32`, usually the same as `host_pid` | Helper supported: namespace-local TGID, which is still usually `proc_pid`; helper unsupported: host-view TGID | `proc_pid` in the current shared `/proc` view | Supported | Supported |
+| 5. Private PID-namespace container -> same private PID namespace | Container-visible PID entered inside that container | Usually the same as `input_pid` in the current container `/proc` view | Usually different from `input_pid` and `proc_pid`; corresponds to the first value in `NSpid` | Usually the same as `input_pid` and `proc_pid` when GhostScope and the target share that namespace | Helper supported: `bpf_get_ns_current_pid_tgid(...).tgid == proc_pid`; helper unsupported: if `NSpid` exposes an explicit host mapping, `bpf_get_current_pid_tgid() >> 32 == host_pid`, otherwise fail fast | `bpf_get_current_pid_tgid() >> 32`, usually aligned with `host_pid` rather than `input_pid` | Helper supported: usually the same as `proc_pid`; helper unsupported: often starts from `host_pid`, so aliasing may be needed | `proc_pid` in the current container `/proc` view | Conditionally supported | Conditionally supported |
+| 6. Private PID-namespace container -> descendant / nested private PID namespace | PID entered inside the current container shell, meaning the PID visible from the current container's `/proc` view, not the child container-local PID | Usually the same as `input_pid` in the current container `/proc` view | Usually different from `input_pid` and `proc_pid`; corresponds to the first value in `NSpid` | Usually different from `input_pid` and `proc_pid`; corresponds to the tail of `NSpid`, often the child container-local PID | Helper supported: `bpf_get_ns_current_pid_tgid(...).tgid == container_pid`; helper unsupported: if `NSpid` exposes an explicit host mapping, `bpf_get_current_pid_tgid() >> 32 == host_pid`, otherwise fail fast | `bpf_get_current_pid_tgid() >> 32`, usually aligned with `host_pid` | Helper supported: usually starts from `container_pid`; helper unsupported: usually starts from `host_pid`; either way it still has to normalize back to the outer-container `proc_pid` | `proc_pid` in the outer container `/proc` view, not the child-container-local `container_pid` | Conditionally supported | Unsupported |
+| 7. Private PID-namespace container -> target outside that PID namespace | Often not satisfiable because the target is not visible in the current `/proc` view | Often unavailable from the current `/proc` view | Often not stably resolvable from the current view; if it exists, it belongs to a PID view outside the current `/proc` namespace | Unreliable or not visible from the current namespace | No stable comparison is installed; GhostScope should fail fast | No stable `event_pid` to `proc_pid` mapping can be assumed | No stable runtime-side PID can be normalized back to the current `/proc` view | Usually unavailable because the current `/proc` view cannot stably identify the target | Unsupported | Unsupported |
 
 Notes:
 
 - `pid_filter` only exists in `-p` mode. Its job is to keep eBPF-side runtime events associated with the original `ghostscope -p <PID>` input.
+- `-p` support in the table means the current implementation can reliably maintain the user-facing PID-input contract and eBPF-side PID filtering for that scenario.
+- `-t` support in the table means the current implementation can reliably maintain target-path lifecycle state for that scenario, including the relationship between `event_pid`, `proc_pid`, and `proc_module_offsets`.
 - `container_pid` here means "the tail of `NSpid` when GhostScope can resolve one". It is often not a distinct extra value in host-only or shared-PID cases.
 - When the table says `bpf_get_current_pid_tgid() >> 32 == host_pid`, GhostScope is comparing the current event's host-view TGID against the resolved target `host_pid`.
 - When the table says `bpf_get_ns_current_pid_tgid(...).tgid == proc_pid`, GhostScope is comparing the current event's TGID in the target PID namespace against the resolved target `proc_pid`.
 - `event_pid` always comes from `bpf_get_current_pid_tgid() >> 32`, so it stays aligned with host-view TGID semantics even when `pid_filter` uses namespace-aware matching.
+- `proc_offsets_runtime_pid` is the PID value that the eBPF side sees first for `proc_module_offsets` lookup, before any `pid_aliases` normalization. It may line up with `host_pid`, `proc_pid`, or `container_pid`, depending on helper usage and namespace layout.
+- `proc_module_offsets` is populated from `/proc/<pid>/maps` in GhostScope's current userspace environment, so its lookup key follows `proc_offsets_lookup_pid`, which in the intended successful path should be the same as `proc_pid`, not `event_pid`, and in nested-container cases not necessarily the innermost `container_pid`.
+- That map is used for runtime module rebasing, including global-variable and shared-library address resolution that depends on the current `/proc/<pid>/maps` layout.
+- `pid_aliases` is the bridge from `proc_offsets_runtime_pid` to `proc_offsets_lookup_pid`. It is not a general replacement for `event_pid`, `host_pid`, or `pid_filter`.
+- `Conditionally supported` means the current implementation can work, but correctness still depends on helper availability, explicit enough `NSpid` data, and stable runtime alignment between the kernel-event side and the current `/proc` view.
+- Scenario 6 is the key place where `-p` and `-t` now diverge: `-p` has a dedicated nested validation path, while nested child-container `-t` remains intentionally unsupported and skipped in e2e.
 - Values marked "usually" or "may differ" still depend on the actual `/proc` view, `NSpid`, and helper availability at runtime.
 
 ### Current `-p` Decision Flow
@@ -376,9 +413,9 @@ What actually determines whether the mapping is reliable is:
 - whether the helper is available
 - whether `NSpid` provides enough explicit mapping information
 
-## Topic 2: `-t` Mode and sysmon
+### `-t` Mode and sysmon
 
-### What sysmon Is
+#### What sysmon Is
 
 `sysmon` is GhostScope's runtime pipeline for tracking process lifecycle state.
 
@@ -390,7 +427,7 @@ It mainly listens for:
 
 In the current implementation, `-p` mode does not start this pipeline. `sysmon` mainly serves `-t` mode, especially when GhostScope needs to keep module offsets, allowlists, and exit cleanup up to date after the target starts.
 
-### Which PID View sysmon Depends On
+#### Which PID View sysmon Depends On
 
 sysmon's kernel events come from tracepoints. The `event_pid` in those events is not read from the current `/proc` view. It is populated from `bpf_get_current_pid_tgid() >> 32`.
 
@@ -411,7 +448,7 @@ So in `-t` mode, sysmon actually depends on two PID languages at the same time:
 - `event_pid` on the kernel-event side
 - `proc_pid` on the current `/proc` side
 
-### Why `-t` Becomes Problematic in Containers
+#### Why `-t` Becomes Problematic in Containers
 
 If GhostScope and the target stay in the same PID namespace, or if the current `/proc` view can reliably map `event_pid` back to the same `proc_pid`, then the pipeline can still work.
 
@@ -432,12 +469,13 @@ So the core `-t` problem in cross-PID-namespace cases is not "did GhostScope rec
 
 Once that mapping cannot be recovered, the sysmon lifecycle pipeline breaks.
 
-### Current Conclusion for `-t`
+#### Current Conclusion for `-t`
 
-Today, `-t` can be understood in two broad categories:
+Today, `-t` is better understood in three broad categories:
 
-- same-PID-namespace or mostly aligned PID-view cases, where sysmon is much more likely to work as intended
-- cross-PID-namespace cases, especially private PID-namespace cases, where sysmon is not currently reliable; the weakness is not event collection itself, but the alignment between `event_pid` and `proc_pid`
+- host-aligned cases, where `event_pid` and the current `/proc` view already line up well enough for lifecycle maintenance; these are the clearly supported `-t` paths
+- cases where GhostScope and the target still share enough PID-view information to recover the right `proc_pid`, but correctness depends on helper availability and runtime mapping quality; these are the conditionally supported `-t` paths
+- cross-PID-namespace cases without a stable shared mapping source between runtime `event_pid` and the `/proc`-side `proc_pid`; these are not currently reliable enough to treat as supported `-t` paths
 
 That is why:
 
@@ -445,9 +483,16 @@ That is why:
 - but it cannot directly replace `proc_pid`
 - and `-t` cannot simply reuse the same PID semantics as `-p` in container-heavy environments
 
-Current container e2e still does not truly cover the `-t` lifecycle-maintenance problem where GhostScope runs on the host and the target runs inside a private PID-namespace container. The "outer container -> descendant / nested PID namespace target" case does have a dedicated `-p` validation path, but it is not currently part of the full container-e2e CI matrix while nested PID aliasing remains incomplete.
+There is one nested case worth calling out explicitly:
 
-## Topic 3: WSL
+- In the "outer container -> child container" topology, `-t` is currently not treated as supported coverage.
+- The reason is structural: sysmon first learns a host-view `event_pid`, while `proc_module_offsets` remains keyed by the outer container's `/proc` view (`proc_pid`), because that map is populated from `/proc/<pid>/maps` in GhostScope's current userspace environment.
+- Earlier experiments tried to recover that mapping by learning PID aliases from emitted trace events, but that only works in narrow single-target situations and is not reliable enough to treat as general correctness.
+- Without a stable shared source of "runtime PID in nested target mode -> outer-container `/proc` PID", nested `-t` lifecycle maintenance is not trustworthy enough, especially once multiple candidate processes or shared libraries are involved.
+
+Current container e2e does exercise the supported host-to-container and same-container `-t` paths. The hardest remaining lifecycle-maintenance gap is the "outer container -> descendant / nested PID namespace target" case: it has a dedicated `-p` validation path, while nested child-container `-t` tests are now explicitly skipped with comments rather than relying on runtime alias-guessing heuristics. That topology therefore remains excluded from the full container-e2e CI matrix.
+
+## Topic 2: WSL
 
 GhostScope does not currently support WSL as a runtime target.
 
@@ -464,7 +509,7 @@ Relevant background:
 - [WSL issue #12408](https://github.com/microsoft/WSL/issues/12408)
 - [WSL issue #12115](https://github.com/microsoft/WSL/issues/12115)
 
-## Topic 4: Deployment Scope When GhostScope Itself Runs in a Container
+## Topic 3: Deployment Scope When GhostScope Itself Runs in a Container
 
 GhostScope does not currently plan to support "run GhostScope in a container and observe arbitrary processes on the machine" as a deployment mode.
 
@@ -477,12 +522,18 @@ So today's container support should be understood more narrowly:
 
 - GhostScope can run on the host and observe target processes that happen to run inside containers on that host. This is the primary container story.
 - GhostScope can run inside a container and observe processes in that same container PID namespace.
-- Descendant / nested PID namespaces that remain visible from that container are still within the intended scope, and `-p` now has a dedicated "outer container -> child container target" validation path. Re-enabling that topology in the full container-e2e CI matrix is deferred until nested PID aliasing is completed. `-t` lifecycle maintenance is still a separate limitation.
+- Descendant / nested PID namespaces that remain visible from that container are still within the intended scope, and `-p` now has a dedicated "outer container -> child container target" validation path. Re-enabling that topology in the full container-e2e CI matrix is deferred until nested target-mode lifecycle support exists for the outer-container `/proc` PID view. Nested `-t` lifecycle maintenance is still a separate limitation.
+- More specifically, nested child-container `-t` is not currently treated as supported coverage. `event_pid` is learned in host-view terms, while `proc_module_offsets` is still keyed by the outer container's `/proc` PID view, and the project no longer relies on post-hoc trace-event PID alias guessing to bridge that gap.
 - GhostScope can run inside a `--pid=host` container and observe host-visible processes because the PID view is shared with the host.
 
 ## Current Implementation Limitations Summary
 
-The following limitations used to be scattered in `limitations.md`. They are now collected here:
+### Shared Runtime Limits
+
+- `proc_module_offsets` is always populated from GhostScope's current userspace `/proc/<pid>/maps` view, so its stable lookup key follows `proc_pid`, not `event_pid`, and in nested cases not necessarily the innermost `container_pid`.
+- In container PID-namespace environments, if the namespace-aware helper is unavailable, `$pid/$tid` in scripts may reflect host-namespace values rather than the PID visible inside the container.
+
+### `-p`-Specific Limits
 
 - In `-p` mode, GhostScope currently decides in this order: runtime environment detection -> `NSpid` parsing -> helper probe -> filter strategy selection.
 - The current implementation does not switch to namespace-aware PID filtering solely because helper `bpf_get_ns_current_pid_tgid` (id 120) is available.
@@ -490,10 +541,13 @@ The following limitations used to be scattered in `limitations.md`. They are now
 - If the helper is unavailable, GhostScope falls back to host PID mapping derived from `NSpid`, but only when that mapping is explicit enough to be trusted.
 - `-p` must refer to a PID visible in the current PID namespace. If the PID is not visible in the current `/proc`, GhostScope fails immediately rather than guessing across namespaces.
 - The current implementation is intentionally stricter in one more case: in a container-like environment, if the helper is unavailable and `NSpid` cannot provide an explicit host mapping, GhostScope fails instead of guessing, unless the target remains in the initial PID namespace.
-- Scenario 6 (GhostScope in a private PID namespace container, target in a descendant / nested private PID namespace) is now separately validated for `-p`. Re-enabling it in the full container-e2e CI matrix is deferred until nested PID aliasing is completed. In particular, namespace-aware PID filtering must distinguish the current `/proc` PID view from the target's innermost `container_pid`; when that mapping cannot be established safely, GhostScope still fails fast.
-- Scenario 7 (GhostScope in one private PID namespace, target outside that namespace) is not currently supported. `-p` should fail rather than attempting to guess a cross-namespace PID mapping.
-- In container PID-namespace environments, if the helper is unavailable, `$pid/$tid` in scripts may reflect host-namespace values rather than the PID visible inside the container.
-- `-t` depends on sysmon to maintain runtime process lifecycle state. sysmon's `event_pid` comes from `bpf_get_current_pid_tgid() >> 32` and aligns with host-view PID semantics. In cross-PID-namespace cases, alignment between `event_pid` and `proc_pid` is not currently reliable, so `-t` has a structural limitation in those scenarios.
+- For scenario 6, namespace-aware PID filtering must distinguish the current `/proc` PID view from the target's innermost `container_pid`; when that mapping cannot be established safely, GhostScope still fails fast.
+
+### `-t`-Specific Limits
+
+- `-t` depends on sysmon to maintain runtime process lifecycle state. sysmon's `event_pid` comes from `bpf_get_current_pid_tgid() >> 32` and aligns with host-view PID semantics.
+- In cross-PID-namespace cases, `-t` must keep `event_pid`, `proc_pid`, and `proc_module_offsets` aligned strongly enough for `/proc` reads, offset insertion, and exit cleanup. That alignment is still the structural weak point.
+- Nested child-container `-t` tests are currently skipped in e2e. They need a stable mapping between host-view runtime/event PID and the outer container's `proc_pid`, because `proc_module_offsets` is still populated from the outer `/proc/<pid>/maps` view used for global-variable and shared-library rebasing.
 
 These limitations do not change the user contract defined earlier. They describe what the current implementation can support reliably, and where it will deliberately refuse to guess.
 

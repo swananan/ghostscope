@@ -59,7 +59,5 @@ GhostScope scans `/proc/PID/maps` at startup to obtain loaded dynamic library in
 
 ### 10. `-p <pid>` Mode inside Containers or WSL
 
-- For the full explanation of container scenarios, PID namespace terminology, the scenario matrix, and current implementation limits, see [Container Environments](container.md).
-- This page keeps only the short summary: whether `-p` is reliable in container/WSL scenarios depends on GhostScope's current PID view, whether the target PID is visible in the current `/proc`, whether `NSpid` provides a reliable mapping, and whether the `bpf_get_ns_current_pid_tgid` helper is available.
-- The user-facing input rule does not change: always enter the PID visible in the environment where you run `ghostscope -p`.
+- See [Container Environments](container.md) for the full explanation of container / WSL scenarios, PID namespace terminology, the scenario matrix, and current implementation limits.
 - See [PID namespaces manual](https://www.man7.org/linux/man-pages/man7/pid_namespaces.7.html), [WSL issue #12408](https://github.com/microsoft/WSL/issues/12408), and [WSL issue #12115](https://github.com/microsoft/WSL/issues/12115) for background.

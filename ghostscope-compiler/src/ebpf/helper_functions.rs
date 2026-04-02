@@ -16,6 +16,148 @@ use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, IntValue, PointerV
 use inkwell::AddressSpace;
 
 impl<'ctx> EbpfContext<'ctx> {
+    pub fn lookup_visible_pid_alias(
+        &mut self,
+        runtime_pid: IntValue<'ctx>,
+        name_prefix: &str,
+    ) -> Result<IntValue<'ctx>> {
+        let Some(map_global) = self.module.get_global("pid_aliases") else {
+            return Ok(runtime_pid);
+        };
+
+        let i32_type = self.context.i32_type();
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let map_ptr = map_global.as_pointer_value();
+        let map_ptr_cast = self
+            .builder
+            .build_bit_cast(map_ptr, ptr_type, &format!("{name_prefix}_map_ptr"))
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        let key_alloca = self.pm_key_alloca.ok_or_else(|| {
+            CodeGenError::LLVMError("pm_key not allocated in entry block".to_string())
+        })?;
+        let key_arr_ty = i32_type.array_type(4);
+        let zero = i32_type.const_zero();
+        let key_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    key_arr_ty,
+                    key_alloca,
+                    &[zero, zero],
+                    &format!("{name_prefix}_alias_key_ptr"),
+                )
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+        };
+        self.builder
+            .build_store(key_ptr, runtime_pid)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let key_arg = self
+            .builder
+            .build_bit_cast(key_ptr, ptr_type, &format!("{name_prefix}_alias_key_arg"))
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        let lookup_id = self
+            .context
+            .i64_type()
+            .const_int(BPF_FUNC_map_lookup_elem as u64, false);
+        let lookup_fn_type = ptr_type.fn_type(&[ptr_type.into(), ptr_type.into()], false);
+        let lookup_fn_ptr = self
+            .builder
+            .build_int_to_ptr(lookup_id, ptr_type, &format!("{name_prefix}_lookup_fn"))
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let lookup_args: Vec<BasicMetadataValueEnum> = vec![map_ptr_cast.into(), key_arg.into()];
+        let value_ptr_any = self
+            .builder
+            .build_indirect_call(
+                lookup_fn_type,
+                lookup_fn_ptr,
+                &lookup_args,
+                &format!("{name_prefix}_alias_lookup"),
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .ok_or_else(|| {
+                CodeGenError::LLVMError("pid_aliases lookup returned void".to_string())
+            })?;
+
+        let value_ptr = match value_ptr_any {
+            BasicValueEnum::PointerValue(p) => p,
+            _ => {
+                return Err(CodeGenError::LLVMError(
+                    "pid_aliases lookup did not return pointer".to_string(),
+                ));
+            }
+        };
+
+        let helper_fn = self
+            .builder
+            .get_insert_block()
+            .unwrap()
+            .get_parent()
+            .unwrap();
+        let alias_hit_block = self
+            .context
+            .append_basic_block(helper_fn, &format!("{name_prefix}_alias_hit"));
+        let alias_miss_block = self
+            .context
+            .append_basic_block(helper_fn, &format!("{name_prefix}_alias_miss"));
+        let alias_cont_block = self
+            .context
+            .append_basic_block(helper_fn, &format!("{name_prefix}_alias_cont"));
+
+        let i64_type = self.context.i64_type();
+        let value_ptr_int = self
+            .builder
+            .build_ptr_to_int(
+                value_ptr,
+                i64_type,
+                &format!("{name_prefix}_alias_value_ptr_int"),
+            )
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let is_hit = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::NE,
+                value_ptr_int,
+                i64_type.const_zero(),
+                &format!("{name_prefix}_alias_found"),
+            )
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        self.builder
+            .build_conditional_branch(is_hit, alias_hit_block, alias_miss_block)
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        self.builder.position_at_end(alias_hit_block);
+        let alias_value = self
+            .builder
+            .build_load(i32_type, value_ptr, &format!("{name_prefix}_alias_value"))
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_int_value();
+        self.builder
+            .build_unconditional_branch(alias_cont_block)
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let alias_hit_end = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(alias_miss_block);
+        self.builder
+            .build_unconditional_branch(alias_cont_block)
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let alias_miss_end = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(alias_cont_block);
+        let alias_phi = self
+            .builder
+            .build_phi(i32_type, &format!("{name_prefix}_alias_pid"))
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        alias_phi.add_incoming(&[
+            (&alias_value, alias_hit_end),
+            (&runtime_pid, alias_miss_end),
+        ]);
+
+        Ok(alias_phi.as_basic_value().into_int_value())
+    }
+
     /// Get or create a static i8 buffer global of a given size, returning its ArrayType and pointer
     pub fn get_or_create_i8_buffer(
         &mut self,
@@ -216,7 +358,7 @@ impl<'ctx> EbpfContext<'ctx> {
             .proc_offsets_pid_ns
             .map(|ns| (ns.pid_ns_dev, ns.pid_ns_inode));
 
-        let pid = if let Some((pid_ns_dev, pid_ns_inode)) = ns_spec {
+        let runtime_pid = if let Some((pid_ns_dev, pid_ns_inode)) = ns_spec {
             // Reuse key_alloca as temporary helper output buffer: [pid:u32, tgid:u32].
             self.builder
                 .build_store(key_alloca, key_arr_ty.const_zero())
@@ -279,6 +421,7 @@ impl<'ctx> EbpfContext<'ctx> {
         } else {
             host_tgid
         };
+        let pid = self.lookup_visible_pid_alias(runtime_pid, "offset_pid")?;
 
         // Store pid at key[0]
         self.builder

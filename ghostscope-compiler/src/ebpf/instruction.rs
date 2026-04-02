@@ -272,25 +272,9 @@ impl<'ctx> EbpfContext<'ctx> {
             .build_store(timestamp_u64_ptr, timestamp)
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store timestamp: {e}")))?;
 
-        // pid and tid at offset 16 and 20
-        // bpf_get_current_pid_tgid() returns:
-        // - high 32 bits: TGID (process ID / getpid() view)
-        // - low 32 bits: PID (thread ID / gettid() view)
-        let pid_tgid_result = self.get_current_pid_tgid()?;
-        let i32_type = self.context.i32_type();
-        let shift_32 = self.context.i64_type().const_int(32, false);
-        let pid_64 = self
-            .builder
-            .build_right_shift(pid_tgid_result, shift_32, false, "pid_64")
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to shift pid: {e}")))?;
-        let pid = self
-            .builder
-            .build_int_truncate(pid_64, i32_type, "pid")
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to truncate pid: {e}")))?;
-        let tid = self
-            .builder
-            .build_int_truncate(pid_tgid_result, i32_type, "tid")
-            .map_err(|e| CodeGenError::LLVMError(format!("Failed to truncate tid: {e}")))?;
+        // Keep transport metadata on host/event semantics. Namespace-aware
+        // `$pid`/`$tid` remain available through the special var path.
+        let (event_pid, event_tid) = self.get_host_pid_tid_values()?;
 
         // Store pid at offset 16
         let pid_ptr = unsafe {
@@ -315,7 +299,7 @@ impl<'ctx> EbpfContext<'ctx> {
             )
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast pid ptr: {e}")))?;
         self.builder
-            .build_store(pid_u32_ptr, pid)
+            .build_store(pid_u32_ptr, event_pid)
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store pid: {e}")))?;
 
         // Store tid at offset 20
@@ -341,7 +325,7 @@ impl<'ctx> EbpfContext<'ctx> {
             )
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast tid ptr: {e}")))?;
         self.builder
-            .build_store(tid_u32_ptr, tid)
+            .build_store(tid_u32_ptr, event_tid)
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store tid: {e}")))?;
 
         // Already wrote into the accumulation buffer; no copy needed

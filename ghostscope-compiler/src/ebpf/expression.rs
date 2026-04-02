@@ -13,7 +13,7 @@ use tracing::debug;
 // compare cap is provided via compile_options.compare_cap (config: ebpf.compare_cap)
 
 impl<'ctx> EbpfContext<'ctx> {
-    fn get_host_pid_tid_values(&mut self) -> Result<(IntValue<'ctx>, IntValue<'ctx>)> {
+    pub(crate) fn get_host_pid_tid_values(&mut self) -> Result<(IntValue<'ctx>, IntValue<'ctx>)> {
         let i32_type = self.context.i32_type();
         let i64_type = self.context.i64_type();
 
@@ -51,7 +51,9 @@ impl<'ctx> EbpfContext<'ctx> {
         Ok((host_pid_i32, host_tid_i32))
     }
 
-    fn get_special_pid_tid_values(&mut self) -> Result<(IntValue<'ctx>, IntValue<'ctx>)> {
+    pub(crate) fn get_special_pid_tid_values(
+        &mut self,
+    ) -> Result<(IntValue<'ctx>, IntValue<'ctx>)> {
         const BPF_FUNC_GET_NS_CURRENT_PID_TGID: u64 = 120;
         const BPF_PIDNS_INFO_SIZE: u64 = 8; // struct { u32 pid; u32 tgid; }
 

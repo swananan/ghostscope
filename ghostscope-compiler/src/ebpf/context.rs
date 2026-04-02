@@ -361,6 +361,17 @@ impl<'ctx> EbpfContext<'ctx> {
                 CodeGenError::LLVMError(format!(
                     "Failed to create proc_module_offsets map in test: {e}"
                 ))
+            })?;
+        self.map_manager
+            .create_pid_aliases_map(
+                &self.module,
+                &self.di_builder,
+                &self.compile_unit,
+                "pid_aliases",
+                self.compile_options.proc_module_offsets_max_entries,
+            )
+            .map_err(|e| {
+                CodeGenError::LLVMError(format!("Failed to create pid_aliases map in test: {e}"))
             })
     }
 
@@ -489,6 +500,18 @@ impl<'ctx> EbpfContext<'ctx> {
             )
             .map_err(|e| {
                 CodeGenError::LLVMError(format!("Failed to create proc_module_offsets map: {e}"))
+            })?;
+
+        self.map_manager
+            .create_pid_aliases_map(
+                &self.module,
+                &self.di_builder,
+                &self.compile_unit,
+                "pid_aliases",
+                self.compile_options.proc_module_offsets_max_entries,
+            )
+            .map_err(|e| {
+                CodeGenError::LLVMError(format!("Failed to create pid_aliases map: {e}"))
             })?;
 
         // Variables are now queried on-demand when accessed in expressions

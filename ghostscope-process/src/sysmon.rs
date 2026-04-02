@@ -169,6 +169,8 @@ impl ProcessSysmon {
     pub fn start(&mut self) {
         let _ =
             pinned_bpf_maps::ensure_pinned_proc_offsets_exists(self.cfg.proc_offsets_max_entries);
+        let _ =
+            pinned_bpf_maps::ensure_pinned_pid_aliases_exists(self.cfg.proc_offsets_max_entries);
         let _ = pinned_bpf_maps::ensure_pinned_allowed_pids_exists(16_384);
 
         let tx = self.tx.clone();
@@ -322,6 +324,7 @@ impl ProcessSysmon {
                     let _ = crate::pinned_bpf_maps::purge_offsets_for_pid(ev.tgid);
                 }
                 let _ = crate::pinned_bpf_maps::remove_allowed_pid(ev.tgid);
+                let _ = crate::pinned_bpf_maps::remove_pid_alias(ev.tgid);
             }
         }
         Ok(())
@@ -706,6 +709,16 @@ fn prefill_offsets_for_pid(
     use crate::pinned_bpf_maps::{insert_offsets_for_pid, ProcModuleOffsetsValue};
 
     let proc_pid = resolve_procfs_pid(event_pid);
+    if proc_pid != event_pid {
+        if let Err(e) = crate::pinned_bpf_maps::insert_pid_alias(event_pid, proc_pid) {
+            tracing::debug!(
+                "Sysmon: failed to insert PID alias event pid {} -> proc pid {}: {}",
+                event_pid,
+                proc_pid,
+                e
+            );
+        }
+    }
     let mut inserted_any = false;
     if let Ok(mut guard) = mgr.lock() {
         let prefilled = match guard.ensure_prefill_pid(proc_pid) {

@@ -61,7 +61,5 @@ GhostScope 启动时会扫描进程的 `/proc/PID/maps` 获取已加载的动态
 
 ### 10. 容器 / WSL 场景下 `-p <pid>` 模式的软限制
 
-- 容器场景、PID namespace 术语、场景矩阵，以及当前实现限制的完整说明，见 [容器环境](container.md)。
-- 本页只保留摘要：容器/WSL 场景下，`-p` 模式是否可靠，取决于 GhostScope 当前 PID 视角、目标 PID 在当前 `/proc` 中是否可见、`NSpid` 是否能提供可靠映射，以及 `bpf_get_ns_current_pid_tgid` helper 是否可用。
-- 用户层面的输入规则不变：始终填写你执行 `ghostscope -p` 时那个环境里可见的 PID。
+- 容器 / WSL 场景、PID namespace 术语、场景矩阵，以及当前实现限制的完整说明，见 [容器环境](container.md)。
 - 参考 [PID namespaces 手册](https://www.man7.org/linux/man-pages/man7/pid_namespaces.7.html)、[WSL issue #12408](https://github.com/microsoft/WSL/issues/12408) 和 [WSL issue #12115](https://github.com/microsoft/WSL/issues/12115)。

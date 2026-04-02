@@ -13,40 +13,65 @@ fn map_compile_error_message(e: &ghostscope_compiler::CompileError) -> String {
     }
 }
 
-fn offsets_map_target_pids(
+fn pid_alias_runtime_pid(
     session: &GhostSession,
     compile_options: &ghostscope_compiler::CompileOptions,
-) -> Vec<u32> {
-    let mut pids = Vec::new();
+) -> Option<u32> {
+    let resolved_target_ns = session
+        .pid_mapping()
+        .and_then(|mapping| Some((mapping.pid_ns_dev?, mapping.pid_ns_inode?)));
+    let proc_offsets_ns = compile_options
+        .proc_offsets_pid_ns
+        .map(|ns| (ns.pid_ns_dev, ns.pid_ns_inode));
+
+    // When proc offsets are configured against the resolved target namespace, the
+    // eBPF-side runtime key is the namespace-local TGID rather than the host-visible
+    // PID used for `/proc` prefill.
+    if let (Some(mapping), Some(target_ns)) = (session.pid_mapping(), resolved_target_ns) {
+        if proc_offsets_ns == Some(target_ns) && mapping.container_pid.is_some() {
+            return mapping.container_pid;
+        }
+    }
+
     match compile_options.pid_filter_spec {
         Some(ghostscope_compiler::PidFilterSpec::NamespaceTgid { target_pid, .. }) => {
-            pids.push(target_pid);
+            Some(target_pid)
         }
-        Some(ghostscope_compiler::PidFilterSpec::HostTgid { target_pid }) => {
-            pids.push(target_pid);
-        }
-        None => {
-            if let Some(pid) = session.pid_for_filter() {
-                pids.push(pid);
-            }
+        Some(ghostscope_compiler::PidFilterSpec::HostTgid { target_pid }) => Some(target_pid),
+        None => session.pid_for_filter(),
+    }
+}
+
+fn pid_alias_pair(
+    session: &GhostSession,
+    compile_options: &ghostscope_compiler::CompileOptions,
+) -> Option<(u32, u32)> {
+    let visible_pid = session.pid_for_proc()?;
+    let runtime_pid = pid_alias_runtime_pid(session, compile_options)?;
+    (runtime_pid != visible_pid).then_some((runtime_pid, visible_pid))
+}
+
+fn apply_pid_alias_for_session(
+    session: &GhostSession,
+    compile_options: &ghostscope_compiler::CompileOptions,
+) {
+    if let Some((runtime_pid, visible_pid)) = pid_alias_pair(session, compile_options) {
+        match ghostscope_process::pinned_bpf_maps::insert_pid_alias(runtime_pid, visible_pid) {
+            Ok(()) => info!(
+                "✓ Applied PID alias runtime_pid={} -> visible_pid={}",
+                runtime_pid, visible_pid
+            ),
+            Err(e) => warn!(
+                "Failed to write PID alias runtime_pid={} -> visible_pid={}: {}",
+                runtime_pid, visible_pid, e
+            ),
         }
     }
-    if let Some(proc_pid) = session.pid_for_proc() {
-        if !pids.contains(&proc_pid) {
-            pids.push(proc_pid);
-        }
-    }
-    if let Some(filter_pid) = session.pid_for_filter() {
-        if !pids.contains(&filter_pid) {
-            pids.push(filter_pid);
-        }
-    }
-    pids
 }
 
 fn apply_cached_offsets_for_session_pid(
     session: &GhostSession,
-    compile_options: &ghostscope_compiler::CompileOptions,
+    _compile_options: &ghostscope_compiler::CompileOptions,
 ) {
     if let Some(proc_pid) = session.pid_for_proc() {
         let items = {
@@ -68,23 +93,19 @@ fn apply_cached_offsets_for_session_pid(
                 })
                 .collect();
 
-            let target_pids = offsets_map_target_pids(session, compile_options);
-            for target_pid in target_pids {
-                if let Err(e) = ghostscope_process::pinned_bpf_maps::insert_offsets_for_pid(
-                    target_pid, &adapted,
-                ) {
-                    warn!(
-                        "Failed to write cached offsets to pinned map for PID {} (proc PID {}): {}",
-                        target_pid, proc_pid, e
-                    );
-                } else {
-                    info!(
-                        "✓ Applied {} cached offsets to pinned map for PID {} (proc PID {})",
-                        adapted.len(),
-                        target_pid,
-                        proc_pid
-                    );
-                }
+            if let Err(e) =
+                ghostscope_process::pinned_bpf_maps::insert_offsets_for_pid(proc_pid, &adapted)
+            {
+                warn!(
+                    "Failed to write cached offsets to pinned map for PID {}: {}",
+                    proc_pid, e
+                );
+            } else {
+                info!(
+                    "✓ Applied {} cached offsets to pinned map for PID {}",
+                    adapted.len(),
+                    proc_pid
+                );
             }
         }
     }
@@ -95,6 +116,7 @@ async fn create_and_attach_loader(
     config: &ghostscope_compiler::UProbeConfig,
     attach_pid: Option<u32>,
     session: &mut crate::core::GhostSession,
+    compile_options: &ghostscope_compiler::CompileOptions,
 ) -> Result<GhostScopeLoader> {
     // Create a new loader for this uprobe configuration
     info!(
@@ -123,6 +145,22 @@ async fn create_and_attach_loader(
         return Err(e.context(format!(
             "Unable to prepare pinned proc_module_offsets map at {}",
             pin_path.display()
+        )));
+    }
+    let alias_pin_path = ghostscope_process::pinned_bpf_maps::pid_aliases_pin_path()
+        .context("Failed to resolve pinned pid_aliases map path")?;
+    if let Err(e) =
+        ghostscope_process::pinned_bpf_maps::ensure_pinned_pid_aliases_exists(max_entries)
+    {
+        error!(
+            "Failed to ensure pinned pid_aliases map exists at {} ({} entries): {:#}",
+            alias_pin_path.display(),
+            max_entries,
+            e
+        );
+        return Err(e.context(format!(
+            "Unable to prepare pinned pid_aliases map at {}",
+            alias_pin_path.display()
         )));
     }
 
@@ -198,6 +236,8 @@ async fn create_and_attach_loader(
             );
         }
     }
+
+    apply_pid_alias_for_session(session, compile_options);
 
     if let Some(uprobe_offset) = config.uprobe_offset {
         if let Some(ref function_name) = config.function_name {
@@ -406,7 +446,14 @@ pub async fn compile_and_load_script_for_tui(
                 .unwrap_or_else(|| format!("{addr_disp:#x}"));
 
             // Create individual loader for this config
-            match create_and_attach_loader(config, session.pid_for_attach(), session).await {
+            match create_and_attach_loader(
+                config,
+                session.pid_for_attach(),
+                session,
+                compile_options,
+            )
+            .await
+            {
                 Ok(loader) => {
                     // Apply cached offsets for PID-mode lookups (if available).
                     apply_cached_offsets_for_session_pid(session, compile_options);
@@ -659,7 +706,9 @@ pub async fn compile_and_load_script_for_cli(
             .unwrap_or_else(|| format!("{addr_disp:#x}"));
 
         // Create individual loader for this config
-        match create_and_attach_loader(config, session.pid_for_attach(), session).await {
+        match create_and_attach_loader(config, session.pid_for_attach(), session, compile_options)
+            .await
+        {
             Ok(loader) => {
                 // Apply cached offsets for PID-mode lookups (if available).
                 apply_cached_offsets_for_session_pid(session, compile_options);

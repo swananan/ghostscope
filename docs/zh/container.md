@@ -3,14 +3,14 @@
 本文专门说明 GhostScope 在容器环境下的使用语义、主要场景和当前限制。
 
 
-## 话题一：PID namespace 与 `-p` 模式
-PID namespace 问题是容器环境里最核心、也最容易让人困惑的一部分，因此本节会重点展开这一点。
+## 话题一：容器场景下 `-p` 与 `-t` 的 PID 语义
+PID namespace 问题是容器环境里最核心、也最容易让人困惑的一部分，因此本节统一解释这套 PID 语义，再分别说明 `-p` 和 `-t` 如何使用同一批 PID 视角。
 
-本文默认讨论的是本地 CLI 场景：你在哪里实际执行 `ghostscope -p`，GhostScope 就在哪里运行。GhostScope 自身运行在容器里的部署边界，会在后面的“话题四”里集中说明。
+本文默认讨论的是本地 CLI 场景：你在哪里实际执行 GhostScope，GhostScope 就在哪里运行。GhostScope 自身运行在容器里的部署边界，会在后面的“话题三”里集中说明。
 
 ### 一条最重要的使用规则
 
-使用 `ghostscope -p <PID>` 时，规则很简单：
+对 `ghostscope -p <PID>` 来说，规则很简单：
 
 你是在哪个环境里执行这条命令，就填写那个环境里 `ps` / `top` / `pgrep` 看到的 PID。
 
@@ -20,6 +20,8 @@ PID namespace 问题是容器环境里最核心、也最容易让人困惑的一
 - 如果你在容器里执行 `ghostscope -p`，就输入该容器里看到的 PID。
 
 用户不需要手工区分 “host PID” 和 “container PID”，也不需要自己换算。GhostScope 的职责是根据当前环境把用户输入转换成内部需要的 PID 语义。
+
+对 `-t` 来说，用户不会直接输入 PID，但 GhostScope 当前运行的环境仍然决定了它所看到的 `/proc` 视角。因此，当前环境仍然会决定哪个 `proc_pid` 才是 `/proc/<pid>/maps`、`proc_module_offsets` 和运行时生命周期清理所依赖的权威 PID。
 
 ### 为什么容器场景会变复杂
 
@@ -55,6 +57,22 @@ GhostScope 同时依赖两类信息源：
   这个概念只在 `-p` 模式下成立。用户输入 `ghostscope -p <PID>` 之后，GhostScope 会先解析内部需要的几种 PID 视角，再在 eBPF 侧安装一层过滤条件，把运行时事件稳定地关联回这个原始 `input_pid`。它的目的，是即使在容器这类 PID namespace 场景下，userspace 里看到的 PID 和内核侧实际使用的 PID 语义不完全一样，GhostScope 仍然能过滤出用户真正想关注的那个进程。简单场景下，它更接近 host 视角 TGID 过滤；namespace-aware 场景下，则更接近“指定 PID namespace 里的 target PID”这组条件。
 - `event_pid`
   运行时内核事件里携带的 PID。GhostScope 有一条进程生命周期监控链路，会监听进程的 exec / fork / exit 事件；这条链路首先拿到的就是这类 PID。当前实现里，`event_pid` 是通过 `bpf_get_current_pid_tgid() >> 32` 填出来的，因此对应的是 host / 初始 PID namespace 视角下的 TGID；当事件来自某个目标进程时，它通常会与该进程的 `host_pid` 对齐，而不能直接替代 `proc_pid` 去访问当前 `/proc` 或清理以 `proc_pid` 为 key 的缓存。
+- `proc_offsets_runtime_pid`
+  这是一个只在实现层面使用的术语，表示 eBPF 在准备查询 `proc_module_offsets` 时，最先拿到的那套 PID 值。它不是一个新的稳定用户语义 PID。根据不同路径，它可能更接近 `host_pid`、`container_pid`，也可能更接近运行时事件里先看到的那套 PID；在真正完成 map 查询之前，GhostScope 还可能需要先把它归一化。
+- `proc_offsets_lookup_pid`
+  这也是一个只在实现层面使用的术语，表示最终真正拿来查询 `proc_module_offsets` 的那一段 PID key。按当前设计，成功路径里它应该对齐到 `proc_pid`，因为 `proc_module_offsets` 本来就是按 GhostScope 当前 userspace 环境里的 `/proc/<proc_pid>/maps` 填出来的。
+
+对当前实现来说，`proc_module_offsets` 这条链路最容易理解成：
+
+```text
+proc_offsets_runtime_pid -> pid_aliases -> proc_offsets_lookup_pid (= 通常就是 proc_pid)
+```
+
+这里需要强调：
+
+- `pid_aliases` 只是内部桥接 map，不是一个通用 PID 翻译层。
+- 它的职责只是帮助 `proc_module_offsets` 找回 userspace 预填充时那套 `/proc` 视角 PID key。
+- 它不会重新定义 `event_pid`，也不会替代 `-p` 下原本的 `pid_filter` 语义。
 
 从产品语义上，用户只需要关心 `input_pid`。其余 PID 是 GhostScope 内部为了做 `/proc` 访问、eBPF 过滤和退出清理而维护的不同视角。
 
@@ -71,6 +89,17 @@ GhostScope 同时依赖两类信息源：
 
 - 用户视角下的场景语义
 - 当前实现里 GhostScope 所在运行环境带来的技术差异
+
+### `-p` 与 `-t` 如何分别使用这些 PID 概念
+
+下面的场景描述本身是共用的。两种模式的主要区别，在于它们真正依赖哪一部分 PID 语义：
+
+- `-p`
+  从用户输入的 `input_pid` 出发，解析目标进程的几套 PID 视角，再通过 `pid_filter` 把 eBPF 事件稳定绑定回用户真正想追踪的那个进程。
+- `-t`
+  没有 `input_pid`。它主要依赖 `sysmon` 和运行时模块生命周期维护，所以困难点变成：要不要、以及能不能把 host 视角的 `event_pid` 和当前 `/proc` 视角下的 `proc_pid` 持续对齐到足够可靠，以支撑 `/proc/<pid>/maps`、offset 预填充、allowlist 和退出清理。
+
+这也是为什么：同一个容器场景，`-p` 可能是支持的，而 `-t` 仍然可能存在结构性限制。
 
 ### 场景矩阵
 
@@ -167,30 +196,38 @@ GhostScope 同时依赖两类信息源：
 
 ### 场景对照表
 
-上面的段落是在讲语义，下面这张表则把同一批场景压成 `-p` 模式下的速查表。
+上面的段落是在讲共用语义，下面这张表则把同一批场景同时压成 `-p` 和 `-t` 两种模式下的速查表。
 
 这里的“场景”固定指两边的关系：
 
 - GhostScope 自己运行在什么环境里
 - 被观测进程运行在什么环境里
 
-| 场景 | `input_pid` | `proc_pid` | `host_pid` | `container_pid` | `pid_filter` | `event_pid` | 支持情况 |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 1. 宿主机 -> 宿主机 | 在宿主机输入、宿主机里可见的 PID | 通常等于 `input_pid` | 通常等于 `input_pid`，也等于 `proc_pid` | 通常等于 `host_pid`，因为没有额外的 PID namespace 分层 | `bpf_get_current_pid_tgid() >> 32 == host_pid` | `bpf_get_current_pid_tgid() >> 32`，通常等于 `host_pid` | 支持 |
-| 2. 宿主机 -> `--pid=host` 容器 | 在宿主机输入、宿主机里可见的 PID | 通常等于 `input_pid` | 通常等于 `input_pid`，也等于 `proc_pid` | 通常等于 `host_pid`，因为容器与宿主机共享同一套 PID namespace | `bpf_get_current_pid_tgid() >> 32 == host_pid` | `bpf_get_current_pid_tgid() >> 32`，通常等于 `host_pid` | 支持 |
-| 3. 宿主机 -> private PID namespace 容器 | 在宿主机输入、宿主机里可见的 PID | 在宿主机 `/proc` 视角下，通常等于 `input_pid` | 通常等于 `input_pid`，也等于 `proc_pid` | 目标在更内层 PID namespace 里的 PID，可能和 `host_pid` 不同 | `bpf_get_current_pid_tgid() >> 32 == host_pid` | `bpf_get_current_pid_tgid() >> 32`，通常等于 `host_pid` | 支持 |
-| 4. `--pid=host` 容器 -> 宿主机 / 共享 PID 目标 | 在该容器 shell 中输入、但本质上已经是 host 可见的 PID | 通常等于 `input_pid` | 通常等于 `input_pid`，也等于 `proc_pid` | 通常等于 `host_pid` | helper 可用：`bpf_get_ns_current_pid_tgid(...).tgid == proc_pid`；helper 不可用：`bpf_get_current_pid_tgid() >> 32 == host_pid` | `bpf_get_current_pid_tgid() >> 32`，通常等于 `host_pid` | 支持 |
-| 5. private PID namespace 容器 -> 同一个 private PID namespace | 在该容器内输入、容器里可见的 PID | 在当前容器 `/proc` 视角下，通常等于 `input_pid` | 通常不同于 `input_pid` 和 `proc_pid`；对应 `NSpid` 第一项 | 当 GhostScope 与目标共享同一个 PID namespace 时，通常等于 `input_pid`，也等于 `proc_pid` | helper 可用：`bpf_get_ns_current_pid_tgid(...).tgid == proc_pid`；helper 不可用：只有在 `NSpid` 给出明确 host 映射时才回退到 `bpf_get_current_pid_tgid() >> 32 == host_pid`，否则直接 fail fast | `bpf_get_current_pid_tgid() >> 32`，通常更接近 `host_pid`，而不是 `input_pid` | 条件支持 |
-| 6. private PID namespace 容器 -> 当前容器可见的更内层 / 子层 private PID namespace | 在当前容器 shell 中输入、且是当前容器 `/proc` 视角可见的 PID，不是子容器里看到的局部 PID | 在当前容器 `/proc` 视角下，通常等于 `input_pid` | 通常不同于 `input_pid` 和 `proc_pid`；对应 `NSpid` 第一项 | 通常不同于 `input_pid` 和 `proc_pid`；对应 `NSpid` 链条尾部，往往就是子容器内看到的 PID | helper 可用：`bpf_get_ns_current_pid_tgid(...).tgid == container_pid`；helper 不可用：只有在 `NSpid` 给出明确 host 映射时才回退到 `bpf_get_current_pid_tgid() >> 32 == host_pid`，否则直接 fail fast | `bpf_get_current_pid_tgid() >> 32`，通常仍对齐 `host_pid` | 条件支持 |
-| 7. private PID namespace 容器 -> 目标不在这个 PID namespace 里 | 往往根本无法满足，因为目标在当前 `/proc` 视角下不可见 | 当前 `/proc` 往往拿不到 | 从当前视角通常也无法稳定解析；即使存在，也属于当前 `/proc` 视角之外的 PID | 当前 namespace 下不可靠，甚至不可见 | 不会安装稳定的比较条件；GhostScope 应直接 fail fast | 不能假定存在稳定的 `event_pid` -> `proc_pid` 对应关系 | 不支持 |
+| 场景 | `input_pid` | `proc_pid` | `host_pid` | `container_pid` | `pid_filter` | `event_pid` | `proc_offsets_runtime_pid` | `proc_module_offsets` lookup key | `-p` 支持 | `-t` 支持 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1. 宿主机 -> 宿主机 | 在宿主机输入、宿主机里可见的 PID | 通常等于 `input_pid` | 通常等于 `input_pid`，也等于 `proc_pid` | 通常等于 `host_pid`，因为没有额外的 PID namespace 分层 | `bpf_get_current_pid_tgid() >> 32 == host_pid` | `bpf_get_current_pid_tgid() >> 32`，通常等于 `host_pid` | 通常等于 `host_pid`，也等于 `proc_pid`；一般不需要 alias | host `/proc` 视角下的 `proc_pid` | 支持 | 支持 |
+| 2. 宿主机 -> `--pid=host` 容器 | 在宿主机输入、宿主机里可见的 PID | 通常等于 `input_pid` | 通常等于 `input_pid`，也等于 `proc_pid` | 通常等于 `host_pid`，因为容器与宿主机共享同一套 PID namespace | `bpf_get_current_pid_tgid() >> 32 == host_pid` | `bpf_get_current_pid_tgid() >> 32`，通常等于 `host_pid` | 通常等于 `host_pid`，也等于 `proc_pid`；一般不需要 alias | host `/proc` 视角下的 `proc_pid` | 支持 | 支持 |
+| 3. 宿主机 -> private PID namespace 容器 | 在宿主机输入、宿主机里可见的 PID | 在宿主机 `/proc` 视角下，通常等于 `input_pid` | 通常等于 `input_pid`，也等于 `proc_pid` | 目标在更内层 PID namespace 里的 PID，可能和 `host_pid` 不同 | `bpf_get_current_pid_tgid() >> 32 == host_pid` | `bpf_get_current_pid_tgid() >> 32`，通常等于 `host_pid` | 通常等于 `host_pid`；因为 `/proc` 已经在 host 视角，通常不需要 alias | host `/proc` 视角下的 `proc_pid` | 支持 | 支持 |
+| 4. `--pid=host` 容器 -> 宿主机 / 共享 PID 目标 | 在该容器 shell 中输入、但本质上已经是 host 可见的 PID | 通常等于 `input_pid` | 通常等于 `input_pid`，也等于 `proc_pid` | 通常等于 `host_pid` | helper 可用：`bpf_get_ns_current_pid_tgid(...).tgid == proc_pid`；helper 不可用：`bpf_get_current_pid_tgid() >> 32 == host_pid` | `bpf_get_current_pid_tgid() >> 32`，通常等于 `host_pid` | helper 可用时是 namespace-local TGID，但通常仍等于 `proc_pid`；helper 不可用时是 host 视角 TGID | 当前共享 `/proc` 视角下的 `proc_pid` | 支持 | 支持 |
+| 5. private PID namespace 容器 -> 同一个 private PID namespace | 在该容器内输入、容器里可见的 PID | 在当前容器 `/proc` 视角下，通常等于 `input_pid` | 通常不同于 `input_pid` 和 `proc_pid`；对应 `NSpid` 第一项 | 当 GhostScope 与目标共享同一个 PID namespace 时，通常等于 `input_pid`，也等于 `proc_pid` | helper 可用：`bpf_get_ns_current_pid_tgid(...).tgid == proc_pid`；helper 不可用：只有在 `NSpid` 给出明确 host 映射时才回退到 `bpf_get_current_pid_tgid() >> 32 == host_pid`，否则直接 fail fast | `bpf_get_current_pid_tgid() >> 32`，通常更接近 `host_pid`，而不是 `input_pid` | helper 可用时通常等于 `proc_pid`；helper 不可用时往往先拿到 `host_pid`，所以可能需要 alias | 当前容器 `/proc` 视角下的 `proc_pid` | 条件支持 | 条件支持 |
+| 6. private PID namespace 容器 -> 当前容器可见的更内层 / 子层 private PID namespace | 在当前容器 shell 中输入、且是当前容器 `/proc` 视角可见的 PID，不是子容器里看到的局部 PID | 在当前容器 `/proc` 视角下，通常等于 `input_pid` | 通常不同于 `input_pid` 和 `proc_pid`；对应 `NSpid` 第一项 | 通常不同于 `input_pid` 和 `proc_pid`；对应 `NSpid` 链条尾部，往往就是子容器内看到的 PID | helper 可用：`bpf_get_ns_current_pid_tgid(...).tgid == container_pid`；helper 不可用：只有在 `NSpid` 给出明确 host 映射时才回退到 `bpf_get_current_pid_tgid() >> 32 == host_pid`，否则直接 fail fast | `bpf_get_current_pid_tgid() >> 32`，通常仍对齐 `host_pid` | helper 可用时通常先拿到 `container_pid`；helper 不可用时通常先拿到 `host_pid`；无论哪种，最终都还要归一回外层容器可见的 `proc_pid` | 外层容器 `/proc` 视角下的 `proc_pid`，不是子容器本地 `container_pid` | 条件支持 | 不支持 |
+| 7. private PID namespace 容器 -> 目标不在这个 PID namespace 里 | 往往根本无法满足，因为目标在当前 `/proc` 视角下不可见 | 当前 `/proc` 往往拿不到 | 从当前视角通常也无法稳定解析；即使存在，也属于当前 `/proc` 视角之外的 PID | 当前 namespace 下不可靠，甚至不可见 | 不会安装稳定的比较条件；GhostScope 应直接 fail fast | 不能假定存在稳定的 `event_pid` -> `proc_pid` 对应关系 | 没有稳定的 runtime 侧 PID 可以安全归一回当前 `/proc` 视角 | 通常不可用，因为当前 `/proc` 视角无法稳定定位目标 | 不支持 | 不支持 |
 
 说明：
 
 - `pid_filter` 只存在于 `-p` 模式里，它的职责是在 eBPF 侧把运行时事件稳定地关联回原始 `ghostscope -p <PID>` 输入。
+- 表里的 `-p` 支持，表示当前实现能否在该场景下可靠维持用户输入 PID 契约和 eBPF 侧 PID 过滤语义。
+- 表里的 `-t` 支持，表示当前实现能否在该场景下可靠维持 target-path 生命周期状态，包括 `event_pid`、`proc_pid` 和 `proc_module_offsets` 之间的关系。
 - 这里的 `container_pid` 指的是“GhostScope 当前能解析到的 `NSpid` 链条尾部值”。在宿主机或共享 PID namespace 场景里，它经常不会形成一个额外独立的 PID。
 - 当表里写 `bpf_get_current_pid_tgid() >> 32 == host_pid` 时，表示 GhostScope 正在把“当前命中事件的 host 视角 TGID”和解析出来的目标 `host_pid` 做比较。
 - 当表里写 `bpf_get_ns_current_pid_tgid(...).tgid == proc_pid` 时，表示 GhostScope 正在把“当前命中事件在目标 PID namespace 下的 TGID”和解析出来的目标 `proc_pid` 做比较。
 - `event_pid` 始终来自 `bpf_get_current_pid_tgid() >> 32`，因此它始终对齐 host 视角 TGID，即使 `pid_filter` 这一列使用了 namespace-aware 过滤。
+- `proc_offsets_runtime_pid` 表示 eBPF 在查询 `proc_module_offsets` 前、在 `pid_aliases` 归一化之前，最先拿到的那套 PID，它可能更接近 `host_pid`、`proc_pid`，也可能更接近 `container_pid`，取决于 helper 路径和 namespace 分层。
+- `proc_module_offsets` 是按 GhostScope 当前 userspace 环境里读到的 `/proc/<pid>/maps` 来填充的，所以它最终查询时使用的 `proc_offsets_lookup_pid` 应该回到 `proc_pid` 这一侧，而不是 `event_pid`；在 nested 容器场景里，它也不一定跟最内层的 `container_pid` 相同。
+- 这张 map 用来做运行时模块重定位，包括全局变量和共享库数据地址这类依赖当前 `/proc/<pid>/maps` 布局的解析。
+- `pid_aliases` 的作用，就是把 `proc_offsets_runtime_pid` 桥接回 `proc_offsets_lookup_pid`；它不是 `event_pid`、`host_pid` 或 `pid_filter` 的通用替代物。
+- 表里的“条件支持”，表示当前实现可以工作，但正确性仍然依赖 helper 是否可用、`NSpid` 是否足够明确，以及内核事件侧与当前 `/proc` 视角之间的运行时对齐是否稳定。
+- 场景 6 是 `-p` 与 `-t` 当前最明确分叉的地方：`-p` 已经有单独的 nested 验证路径，而 nested child-container 的 `-t` 仍然是故意不支持、并在 e2e 里显式跳过。
 - 表里写“通常”或“可能不同”的地方，仍然要以运行时实际拿到的 `/proc`、`NSpid` 和 helper 能力为准。
 
 ### 目前 `-p` 模式的判断顺序
@@ -375,9 +412,9 @@ GhostScope 同时依赖两类信息源：
 - helper 是否可用
 - `NSpid` 是否提供了足够明确的映射信息
 
-## 话题二：`-t` 模式与 sysmon
+### `-t` 模式与 sysmon
 
-### `sysmon` 是什么
+#### `sysmon` 是什么
 
 `sysmon` 是 GhostScope 在运行时维护进程生命周期信息的一条监控链路。
 
@@ -389,7 +426,7 @@ GhostScope 同时依赖两类信息源：
 
 当前实现里，`-p` 模式不启动这条链路；`sysmon` 主要服务于 `-t` 模式，尤其是需要在目标进程启动后持续维护模块 offsets、allowlist 和退出清理的时候。
 
-### `sysmon` 依赖什么 PID 视角
+#### `sysmon` 依赖什么 PID 视角
 
 `sysmon` 的内核事件来自 tracepoint，事件里的 `event_pid` 不是从当前 `/proc` 里读出来的，而是通过 `bpf_get_current_pid_tgid() >> 32` 填出来的。
 
@@ -410,7 +447,7 @@ GhostScope 同时依赖两类信息源：
 - 内核事件侧的 `event_pid`
 - 当前 `/proc` 侧的 `proc_pid`
 
-### `-t` 模式在容器里为什么会出问题
+#### `-t` 模式在容器里为什么会出问题
 
 如果 GhostScope 和目标进程处在同一个 PID namespace，或者至少当前 `/proc` 能稳定把 `event_pid` 对应回同一个 `proc_pid`，那么这条链路通常还能成立。
 
@@ -431,12 +468,13 @@ GhostScope 同时依赖两类信息源：
 
 一旦这个关系恢复不了，`sysmon` 的生命周期维护链路就会被打穿。
 
-### 当前对 `-t` 的结论
+#### 当前对 `-t` 的结论
 
-当前实现下，可以把 `-t` 模式分成两类理解：
+当前实现下，`-t` 更适合分成三类理解：
 
-- 同一 PID namespace 或 PID 视角基本一致的场景：`sysmon` 更容易按预期工作
-- 跨 PID namespace，尤其 private PID namespace 场景：`sysmon` 当前并不可靠，问题不在事件采集本身，而在 `event_pid` 和 `proc_pid` 的对齐
+- host 视角已经基本对齐的场景：`event_pid` 和当前 `/proc` 视角已经足够一致，生命周期维护链路相对明确，这些属于当前清晰支持的 `-t` 路径
+- GhostScope 与目标仍然共享足够 PID 语义、还能恢复出正确 `proc_pid` 的场景：这类路径可以工作，但正确性仍然依赖 helper 可用性和运行时映射质量，因此属于“条件支持”
+- 运行时 `event_pid` 与 `/proc` 侧 `proc_pid` 之间缺少稳定共享映射来源的跨 PID namespace 场景：这类路径当前还不够可靠，不能当成已支持的 `-t` 路径
 
 这也是为什么：
 
@@ -444,9 +482,16 @@ GhostScope 同时依赖两类信息源：
 - 但不能直接替代 `proc_pid`
 - `-t` 模式在容器场景下，不能简单套用 `-p` 的那套 PID 语义
 
-当前容器 e2e 还没有真正覆盖“GhostScope 在 host、目标在 private PID namespace 容器里”的 `-t` 生命周期维护问题；“外层容器 -> 更内层 / 子层 PID namespace 目标”这个拓扑目前有专门的 `-p` 验证路径，但在 nested PID aliasing 完成之前，还没有重新放回 full container-e2e CI 矩阵。
+这里还有一个需要单独点名的 nested 子场景：
 
-## 话题三：WSL
+- 在“外层容器 -> 子容器”拓扑下，`-t` 当前不作为已支持覆盖路径。
+- 原因是结构性的：`sysmon` 先学到的是 host 视角的 `event_pid`，而 `proc_module_offsets` 仍然按外层容器当前 userspace `/proc` 视角里的 `proc_pid` 做 key，因为这张 map 本来就是按 GhostScope 当前环境里的 `/proc/<pid>/maps` 填出来的。
+- 之前尝试过“从 trace event 反学 PID alias”去补这条映射，但它只在很窄的单目标场景里才可能成立，不能当成通用正确性机制。
+- 在没有一条稳定共享的“nested target-mode 运行时 PID -> 外层容器 `/proc` PID”来源之前，nested `-t` 的生命周期维护都不够可靠，尤其一旦出现多个候选进程或共享库，就更不能依赖这种猜测。
+
+当前容器 e2e 已经覆盖了当前被视为支持的 host-to-container 和 same-container `-t` 路径。剩下最难补齐的生命周期维护缺口，是“外层容器 -> 更内层 / 子层 PID namespace 目标”这个拓扑：它目前已经有专门的 `-p` 验证路径，而 nested child-container 的 `-t` 用例现在会带注释地显式跳过，不再依赖运行时 alias 猜测。这也是为什么这个拓扑仍然没有重新放回 full container-e2e CI 矩阵。
+
+## 话题二：WSL
 
 GhostScope 当前并不支持把 WSL 作为运行环境。
 
@@ -463,7 +508,7 @@ GhostScope 当前并不支持把 WSL 作为运行环境。
 - [WSL issue #12408](https://github.com/microsoft/WSL/issues/12408)
 - [WSL issue #12115](https://github.com/microsoft/WSL/issues/12115)
 
-## 话题四：GhostScope 自身运行在容器里时的部署边界
+## 话题三：GhostScope 自身运行在容器里时的部署边界
 
 GhostScope 目前没有计划支持“自身运行在容器里，然后观察机器上的任意进程”这类部署方式。
 
@@ -476,12 +521,18 @@ GhostScope 目前没有计划支持“自身运行在容器里，然后观察机
 
 - GhostScope 运行在宿主机上，观察同一台宿主机上容器内部的被观测进程。这是当前最主要的容器场景。
 - GhostScope 运行在容器里，观察本容器 PID namespace 内的进程。
-- 从当前容器仍可见的更内层 / 子层 PID namespace，仍然属于预期范围，而且 `-p` 现在已经有“外层容器 -> 子容器目标”的专门验证路径；把它重新放回 full container-e2e CI 矩阵，要等 nested PID aliasing 做完。`-t` 的生命周期维护仍然是另一条限制链路。
+- 从当前容器仍可见的更内层 / 子层 PID namespace，仍然属于预期范围，而且 `-p` 现在已经有“外层容器 -> 子容器目标”的专门验证路径；把它重新放回 full container-e2e CI 矩阵，要等“外层容器 `/proc` 视角下的 nested target-mode 生命周期支持”补齐。nested `-t` 的生命周期维护仍然是另一条限制链路。
+- 更准确地说，nested child-container 的 `-t` 当前都不作为已支持覆盖路径：`event_pid` 先按 host 视角出现，而 `proc_module_offsets` 仍按外层容器 `/proc` 的 PID 视角建 key；项目也不再依赖 trace event 之后再猜 alias 的方式来补这条映射。
 - GhostScope 运行在 `--pid=host` 容器里，利用与宿主机共享的 PID 视角去观察宿主机可见进程。
 
 ## 当前实现限制摘要
 
-下面这些限制此前散落在 `limitations.md` 中，现统一收口到本页：
+### 共享运行时限制
+
+- `proc_module_offsets` 始终是按 GhostScope 当前 userspace 环境里的 `/proc/<pid>/maps` 来填充的，因此它稳定使用的 lookup key 跟随 `proc_pid`，而不是 `event_pid`；在 nested 场景里，它也不一定跟最内层的 `container_pid` 相同。
+- 在容器 PID namespace 环境下，如果 namespace-aware helper 不可用，脚本里的 `$pid/$tid` 可能表现为宿主机 namespace 的值，而不是容器内看到的 PID。
+
+### `-p` 相关限制
 
 - GhostScope 在 `-p` 模式下目前按以下顺序决策：
   运行环境检测 -> `NSpid` 解析 -> helper 探测 -> 过滤策略选择。
@@ -489,11 +540,14 @@ GhostScope 目前没有计划支持“自身运行在容器里，然后观察机
 - 更准确地说，在 `-p` 模式下，GhostScope 目前会结合运行环境判断、解析出的 PID 映射，以及 helper 是否可用，在 host 视角 TGID 过滤和命名空间 TGID 过滤之间做选择。
 - 若 helper 不可用，则回退到 `NSpid` 推导出来的 host PID 映射，但只有在映射足够明确时才安全。
 - `-p` 必须是当前 PID namespace 可见的进程号。如果当前 `/proc` 中看不到该 PID，GhostScope 会直接报错，不会跨 namespace 猜测映射。
-- 当前实现里还有一层额外严格策略：在“容器倾向环境 + helper 不可用 + `NSpid` 不能给出明确 host 映射”时，GhostScope 会直接报错，不做猜测。
-- 场景 6（GhostScope 在 private PID namespace 容器里、目标位于当前容器可见的更内层 / 子层 private PID namespace）现在已经作为 `-p` 的单独验证路径存在；要把它重新放回 full container-e2e CI 矩阵，需要先完成 nested PID aliasing。尤其在 namespace-aware PID 过滤下，需要显式区分“当前 `/proc` 视角 PID”和目标最内层 `container_pid`；如果这一映射不能被安全建立，GhostScope 仍会直接失败而不是猜测。
-- 场景 7（GhostScope 在一个 private PID namespace 容器里、目标不在这个 PID namespace 里）当前不支持；`-p` 模式应直接失败，而不是尝试跨 namespace 猜测 PID 映射。
-- 在容器 PID namespace 环境下，如果 helper 不可用，脚本里的 `$pid/$tid` 可能表现为宿主机 namespace 的值，而不是容器内看到的 PID。
-- `-t` 模式依赖 `sysmon` 维护运行时进程生命周期；而 `sysmon` 的 `event_pid` 来自 `bpf_get_current_pid_tgid() >> 32`，对齐的是 host 视角 PID。跨 PID namespace 场景下，`event_pid` 与 `proc_pid` 的对齐目前并不可靠，因此 `-t` 的生命周期维护链路在这类场景下存在结构性限制。
+- 当前实现里还有一层额外严格策略：在“容器倾向环境 + helper 不可用 + `NSpid` 不能给出明确 host 映射”时，GhostScope 会直接报错，不做猜测，除非目标仍然处在初始 PID namespace。
+- 对场景 6 来说，namespace-aware PID 过滤必须显式区分“当前 `/proc` 视角 PID”和目标最内层 `container_pid`；如果这一映射不能被安全建立，GhostScope 仍会直接失败而不是猜测。
+
+### `-t` 相关限制
+
+- `-t` 模式依赖 `sysmon` 维护运行时进程生命周期；而 `sysmon` 的 `event_pid` 来自 `bpf_get_current_pid_tgid() >> 32`，对齐的是 host 视角 PID。
+- 在跨 PID namespace 场景里，`-t` 需要把 `event_pid`、`proc_pid` 和 `proc_module_offsets` 持续对齐到足够稳定，才能正确完成 `/proc` 读取、offset 写入和退出清理；这一点目前仍是结构性薄弱点。
+- 其中，nested child-container 的 `-t` 用例目前会在 e2e 里显式跳过。它们需要稳定维护“host 视角运行时 / event PID -> 外层容器 `proc_pid`”的映射，因为 `proc_module_offsets` 仍然是按外层 `/proc/<pid>/maps` 这套视角来做全局变量和共享库重定位的。
 
 这些限制并不改变本文前面定义的用户契约；它们描述的是 GhostScope 当前实现能可靠覆盖到哪里、在哪些边界条件下会主动拒绝继续执行。
 

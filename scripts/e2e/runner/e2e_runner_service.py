@@ -50,6 +50,8 @@ from urllib.parse import parse_qs, urlparse
 
 DEFAULT_REPO = "/mnt/500g/code/ghostscope"
 MAX_TEST_CASE_LEN = 256
+DOCKER_CLEANUP_LIST_TIMEOUT_SECS = 5
+DOCKER_CLEANUP_REMOVE_TIMEOUT_SECS = 20
 VALID_SANDBOX_ALIASES = {
     "host": "host",
     "docker-private": "docker-private",
@@ -362,13 +364,24 @@ class JobStore:
             "--filter",
             f"label=ghostscope.session={session}",
         )
-        result = subprocess.run(
-            list_cmd,
-            cwd=job.repo,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+        try:
+            result = subprocess.run(
+                list_cmd,
+                cwd=job.repo,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=DOCKER_CLEANUP_LIST_TIMEOUT_SECS,
+            )
+        except subprocess.TimeoutExpired:
+            self._append_log(
+                job,
+                (
+                    f"Cleanup: timed out listing session sandboxes for {session} "
+                    f"after {DOCKER_CLEANUP_LIST_TIMEOUT_SECS}s"
+                ),
+            )
+            return
         if result.returncode != 0:
             stderr = result.stderr.strip() or "<no stderr>"
             self._append_log(
@@ -383,13 +396,24 @@ class JobStore:
             return
 
         remove_cmd = self._resolve_docker_command(use_sudo, "rm", "-f", *container_ids)
-        result = subprocess.run(
-            remove_cmd,
-            cwd=job.repo,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+        try:
+            result = subprocess.run(
+                remove_cmd,
+                cwd=job.repo,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=DOCKER_CLEANUP_REMOVE_TIMEOUT_SECS,
+            )
+        except subprocess.TimeoutExpired:
+            self._append_log(
+                job,
+                (
+                    f"Cleanup: timed out removing {len(container_ids)} session sandbox(s) "
+                    f"for {session} after {DOCKER_CLEANUP_REMOVE_TIMEOUT_SECS}s"
+                ),
+            )
+            return
         if result.returncode != 0:
             stderr = result.stderr.strip() or "<no stderr>"
             self._append_log(
@@ -404,6 +428,24 @@ class JobStore:
         self._append_log(
             job,
             f"Cleanup: removed {len(container_ids)} session sandbox(s) for {session}",
+        )
+
+    def _start_cleanup_session_sandboxes(self, job: Job) -> None:
+        def cleanup_task() -> None:
+            try:
+                self._cleanup_session_sandboxes(job)
+            except Exception as exc:  # noqa: BLE001
+                self._append_log(job, f"Cleanup: unhandled exception: {exc}")
+
+        thread = threading.Thread(
+            target=cleanup_task,
+            name=f"cleanup-{job.id}",
+            daemon=True,
+        )
+        thread.start()
+        self._append_log(
+            job,
+            f"Cleanup: scheduled background session cleanup for {self._session_name(job)}",
         )
 
     def _run_step(self, job: Job, step: StepResult) -> int:
@@ -501,10 +543,7 @@ class JobStore:
                 else:
                     self._set_status(job, status="failed", exit_code=failed_code, finished_at=now_iso())
             finally:
-                try:
-                    self._cleanup_session_sandboxes(job)
-                except Exception as exc:  # noqa: BLE001
-                    self._append_log(job, f"Cleanup: unhandled exception: {exc}")
+                self._start_cleanup_session_sandboxes(job)
 
 
 class Handler(BaseHTTPRequestHandler):

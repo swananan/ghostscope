@@ -97,16 +97,14 @@ pub struct CompileOptions {
     pub special_pid_ns: Option<PidNamespaceSpec>,
     /// Optional PID namespace context used by `proc_module_offsets` lookups.
     ///
-    /// Important: this must follow GhostScope's current `/proc` view, not the
-    /// target process namespace used by `$pid`/`$tid`.
+    /// In `-p` mode this only switches to the target PID-namespace view when
+    /// GhostScope has an explicit namespace-local target PID that can be
+    /// aliased back to the `/proc` key used to populate
+    /// `proc_module_offsets`. Otherwise it stays on GhostScope's current
+    /// `/proc`-visible PID view.
     ///
-    /// In practice this means:
-    /// - host GhostScope => `None` / host TGID key
-    /// - container GhostScope => self PID namespace / namespace-local TGID key
-    ///
-    /// The offsets map is populated from `/proc/<proc_pid>/maps`, so its `pid`
-    /// key must always match the PID view GhostScope used for those `/proc`
-    /// reads.
+    /// In `-t` mode we continue to use GhostScope's own `/proc` view, because
+    /// offsets are discovered from `/proc/<pid>/maps` in that namespace.
     pub proc_offsets_pid_ns: Option<PidNamespaceSpec>,
     /// Optional original `-p` input PID for `$input_pid`.
     /// This is only available in `-p` mode.

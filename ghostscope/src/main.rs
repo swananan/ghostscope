@@ -24,6 +24,18 @@ fn pid_ns_context_needed(
     mapping.host_pid != mapping.process_pid || (in_container && helper_supported)
 }
 
+fn should_use_target_proc_offsets_pid_ns(
+    mapping: &config::ResolvedPidInfo,
+    pid_filter_spec: Option<&ghostscope_compiler::PidFilterSpec>,
+) -> bool {
+    match pid_filter_spec {
+        Some(ghostscope_compiler::PidFilterSpec::NamespaceTgid { target_pid, .. }) => {
+            mapping.container_pid == Some(*target_pid) || mapping.process_pid == *target_pid
+        }
+        _ => false,
+    }
+}
+
 fn should_fail_fast_pid_mode(
     mapping: &config::ResolvedPidInfo,
     in_container: bool,
@@ -280,28 +292,23 @@ async fn main() -> Result<()> {
 
     // Configure namespace context for proc_module_offsets lookups.
     //
-    // This intentionally follows GhostScope's own `/proc` view rather than the
-    // target namespace used by `$pid`/`$tid`. Offsets are computed from
-    // `/proc/<proc_pid>/maps`, so the lookup key must use the same PID view:
+    // In `-p` mode we switch proc_module_offsets lookups to the target
+    // namespace whenever PID filtering already uses NamespaceTgid semantics
+    // for that same target. When the helper returns a different namespace-local
+    // TGID than the `/proc` key GhostScope prefilled, pid_aliases bridges the
+    // two; when they are already the same PID (for example same-namespace
+    // container runs without NSpid), no alias is needed.
     //
-    // - host GhostScope => host TGID key
-    // - container GhostScope => self namespace TGID key
-    //
-    // Reusing the target namespace here breaks host -> private-container
-    // tracing, because userspace inserts offsets under host PIDs while eBPF
-    // would look them up under namespace-local PIDs.
-    if kernel_caps.supports_ns_current_pid_tgid_helper
-        && merged_config
-            .runtime_env
-            .as_ref()
-            .map(|env| env.is_container_likely())
-            .unwrap_or(false)
-    {
-        let self_pid = std::process::id();
-        match config::resolve_pid_info(self_pid) {
-            Ok(self_info) => {
+    // In `-t` mode there is no single target PID to anchor on, so container
+    // runs still follow GhostScope's own `/proc` view.
+    if kernel_caps.supports_ns_current_pid_tgid_helper {
+        if let Some(mapping) = merged_config.pid_mapping.as_ref() {
+            if should_use_target_proc_offsets_pid_ns(
+                mapping,
+                merged_config.pid_filter_spec.as_ref(),
+            ) {
                 if let (Some(pid_ns_dev), Some(pid_ns_inode)) =
-                    (self_info.pid_ns_dev, self_info.pid_ns_inode)
+                    (mapping.pid_ns_dev, mapping.pid_ns_inode)
                 {
                     merged_config.proc_offsets_pid_ns =
                         Some(ghostscope_compiler::PidNamespaceSpec {
@@ -309,21 +316,49 @@ async fn main() -> Result<()> {
                             pid_ns_inode,
                         });
                     info!(
-                        "proc_module_offsets PID namespace configured from self PID {}: ns_dev={} ns_inode={}",
-                        self_pid, pid_ns_dev, pid_ns_inode
-                    );
-                } else {
-                    warn!(
-                        "Could not derive self pid namespace dev/inode for proc_module_offsets (self pid={})",
-                        self_pid
+                        "proc_module_offsets PID namespace configured from target mapping: ns_dev={} ns_inode={}",
+                        pid_ns_dev, pid_ns_inode
                     );
                 }
-            }
-            Err(err) => {
-                warn!(
-                    "Failed to resolve self PID namespace for proc_module_offsets (self pid={}): {}",
-                    self_pid, err
+            } else if mapping.pid_ns_dev.is_some() && mapping.pid_ns_inode.is_some() {
+                info!(
+                    "proc_module_offsets remains on GhostScope /proc PID view because target-namespace filtering is not active for this session"
                 );
+            }
+        } else if merged_config
+            .runtime_env
+            .as_ref()
+            .map(|env| env.is_container_likely())
+            .unwrap_or(false)
+        {
+            let self_pid = std::process::id();
+            match config::resolve_pid_info(self_pid) {
+                Ok(self_info) => {
+                    if let (Some(pid_ns_dev), Some(pid_ns_inode)) =
+                        (self_info.pid_ns_dev, self_info.pid_ns_inode)
+                    {
+                        merged_config.proc_offsets_pid_ns =
+                            Some(ghostscope_compiler::PidNamespaceSpec {
+                                pid_ns_dev,
+                                pid_ns_inode,
+                            });
+                        info!(
+                            "proc_module_offsets PID namespace configured from self PID {}: ns_dev={} ns_inode={}",
+                            self_pid, pid_ns_dev, pid_ns_inode
+                        );
+                    } else {
+                        warn!(
+                            "Could not derive self pid namespace dev/inode for proc_module_offsets (self pid={})",
+                            self_pid
+                        );
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        "Failed to resolve self PID namespace for proc_module_offsets (self pid={}): {}",
+                        self_pid, err
+                    );
+                }
             }
         }
     }
@@ -374,7 +409,9 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{pid_ns_context_needed, should_fail_fast_pid_mode};
+    use super::{
+        pid_ns_context_needed, should_fail_fast_pid_mode, should_use_target_proc_offsets_pid_ns,
+    };
     use crate::config::ResolvedPidInfo;
     use crate::pid::PidResolveSource;
 
@@ -443,5 +480,55 @@ mod tests {
         let mut host_pid_ns = make_mapping(321, 321);
         host_pid_ns.pid_ns_inode = Some(crate::pid::INITIAL_PID_NAMESPACE_INO);
         assert!(!should_fail_fast_pid_mode(&host_pid_ns, true, false));
+    }
+
+    #[test]
+    fn proc_offsets_ns_uses_target_namespace_with_explicit_container_pid_alias() {
+        let mut mapping = make_mapping(321, 4321);
+        mapping.container_pid = Some(17);
+        assert!(should_use_target_proc_offsets_pid_ns(
+            &mapping,
+            Some(&ghostscope_compiler::PidFilterSpec::NamespaceTgid {
+                target_pid: 17,
+                pid_ns_dev: 1,
+                pid_ns_inode: 2,
+            }),
+        ));
+    }
+
+    #[test]
+    fn proc_offsets_ns_uses_target_namespace_when_target_pid_matches_proc_pid() {
+        let mapping = make_mapping(321, 4321);
+        assert!(should_use_target_proc_offsets_pid_ns(
+            &mapping,
+            Some(&ghostscope_compiler::PidFilterSpec::NamespaceTgid {
+                target_pid: 321,
+                pid_ns_dev: 1,
+                pid_ns_inode: 2,
+            }),
+        ));
+    }
+
+    #[test]
+    fn proc_offsets_ns_does_not_use_target_namespace_for_host_filter() {
+        let mut mapping = make_mapping(321, 4321);
+        mapping.container_pid = Some(17);
+        assert!(!should_use_target_proc_offsets_pid_ns(
+            &mapping,
+            Some(&ghostscope_compiler::PidFilterSpec::HostTgid { target_pid: 4321 }),
+        ));
+    }
+
+    #[test]
+    fn proc_offsets_ns_does_not_use_target_namespace_for_mismatched_namespace_pid() {
+        let mapping = make_mapping(321, 4321);
+        assert!(!should_use_target_proc_offsets_pid_ns(
+            &mapping,
+            Some(&ghostscope_compiler::PidFilterSpec::NamespaceTgid {
+                target_pid: 999,
+                pid_ns_dev: 1,
+                pid_ns_inode: 2,
+            }),
+        ));
     }
 }

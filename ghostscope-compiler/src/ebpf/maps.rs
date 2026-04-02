@@ -276,6 +276,26 @@ impl<'ctx> MapManager<'ctx> {
         )
     }
 
+    pub fn create_pid_aliases_map(
+        &mut self,
+        module: &Module<'ctx>,
+        di_builder: &DebugInfoBuilder<'ctx>,
+        compile_unit: &inkwell::debug_info::DICompileUnit<'ctx>,
+        name: &str,
+        max_entries: u64,
+    ) -> Result<()> {
+        self.create_map_definition(
+            module,
+            di_builder,
+            compile_unit,
+            name,
+            BpfMapType::Hash,
+            max_entries,
+            SizedType::integer(32),
+            SizedType::integer(32),
+        )
+    }
+
     pub fn create_event_loss_counter_map(
         &mut self,
         module: &Module<'ctx>,
@@ -435,8 +455,8 @@ impl<'ctx> MapManager<'ctx> {
                         max_entries_ptr.as_type(),
                     ),
                 ];
-                // For proc_module_offsets, include optional 'pinning' to signal Aya ByName pinning
-                if map_name == "proc_module_offsets" {
+                // For pinned maps, include optional 'pinning' to signal Aya ByName pinning.
+                if matches!(map_name, "proc_module_offsets" | "pid_aliases") {
                     // ByName is typically encoded as 1 in aya_obj::maps::PinningType
                     let pinning_ptr = mk_ptr_to_array("pinning", 1);
                     v.push(di_builder.create_member_type(
@@ -462,7 +482,7 @@ impl<'ctx> MapManager<'ctx> {
         let (total_size_bits, field_count) = match map_type {
             BpfMapType::Ringbuf => (128, 2), // 2 * 64 bits
             _ => {
-                if map_name == "proc_module_offsets" {
+                if matches!(map_name, "proc_module_offsets" | "pid_aliases") {
                     (320, 5) // include 'pinning'
                 } else {
                     (256, 4)

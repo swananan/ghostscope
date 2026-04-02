@@ -189,6 +189,7 @@ pub fn proc_offsets_pin_dir() -> anyhow::Result<PathBuf> {
 /// Map name as embedded in BPF object
 pub const PROC_OFFSETS_MAP_NAME: &str = "proc_module_offsets";
 pub const ALLOWED_PIDS_MAP_NAME: &str = "allowed_pids";
+pub const PID_ALIASES_MAP_NAME: &str = "pid_aliases";
 
 fn bpffs_is_mounted() -> bool {
     let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") else {
@@ -258,6 +259,14 @@ pub struct ProcModuleOffsetsValue {
 
 unsafe impl aya::Pod for ProcModuleKey {}
 unsafe impl aya::Pod for ProcModuleOffsetsValue {}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct PidAliasValue {
+    pub visible_pid: u32,
+}
+
+unsafe impl aya::Pod for PidAliasValue {}
 
 impl ProcModuleOffsetsValue {
     pub fn new(text: u64, rodata: u64, data: u64, bss: u64) -> Self {
@@ -456,6 +465,14 @@ pub fn allowed_pids_pin_path() -> anyhow::Result<PathBuf> {
     )))
 }
 
+/// Compute the bpffs pin path for the pid_aliases map for current process.
+pub fn pid_aliases_pin_path() -> anyhow::Result<PathBuf> {
+    Ok(PathBuf::from(format!(
+        "{BPFFS_ROOT}/{}/pid_aliases",
+        current_process_dir_name()?
+    )))
+}
+
 /// Ensure the pinned allowed_pids map exists under the per-process directory.
 pub fn ensure_pinned_allowed_pids_exists(max_entries: u32) -> anyhow::Result<()> {
     let pin_path = allowed_pids_pin_path()?;
@@ -536,6 +553,86 @@ pub fn ensure_pinned_allowed_pids_exists(max_entries: u32) -> anyhow::Result<()>
     }
 }
 
+/// Ensure the pinned pid_aliases map exists under the per-process directory.
+pub fn ensure_pinned_pid_aliases_exists(max_entries: u32) -> anyhow::Result<()> {
+    let pin_path = pid_aliases_pin_path()?;
+    ensure_pin_dir(&pin_path).map_err(|e| {
+        let hint = bpffs_mount_hint_for_pin_path(&pin_path)
+            .map(|hint| format!(" {hint}"))
+            .unwrap_or_default();
+        anyhow::anyhow!(
+            "Failed to create pin directory for {} at {}: {}.{}",
+            PID_ALIASES_MAP_NAME,
+            pin_path.display(),
+            e,
+            hint
+        )
+    })?;
+
+    if pin_path.exists() {
+        if MapData::from_pin(&pin_path).is_ok() {
+            info!("Reusing existing pinned map at {}", pin_path.display());
+            return Ok(());
+        } else {
+            let _ = std::fs::remove_file(&pin_path);
+        }
+    }
+
+    let obj_map = ObjMap::Legacy(LegacyMap {
+        section_index: 0,
+        section_kind: EbpfSectionKind::Maps,
+        symbol_index: None,
+        def: bpf_map_def {
+            map_type: BPF_MAP_TYPE_HASH as u32,
+            key_size: 4,
+            value_size: 4,
+            max_entries,
+            map_flags: 0,
+            id: 0,
+            pinning: aya_obj::maps::PinningType::None,
+        },
+        data: Vec::new(),
+    });
+
+    let map = MapData::create(obj_map, PID_ALIASES_MAP_NAME, None)?;
+    info!(
+        "Created {} map with capacity {} entries",
+        PID_ALIASES_MAP_NAME, max_entries
+    );
+
+    match map.pin(&pin_path) {
+        Ok(()) => {
+            info!("Pinned {} at {}", PID_ALIASES_MAP_NAME, pin_path.display());
+            Ok(())
+        }
+        Err(e) => match MapData::from_pin(&pin_path) {
+            Ok(_) => {
+                info!(
+                    "Pin path {} already exists; reusing existing map ({}).",
+                    pin_path.display(),
+                    e
+                );
+                Ok(())
+            }
+            Err(_) => {
+                let _ = std::fs::remove_file(&pin_path);
+                let hint = bpffs_mount_hint_for_pin_path(&pin_path)
+                    .map(|hint| format!(" {hint}"))
+                    .unwrap_or_default();
+                Err(anyhow::anyhow!(
+                    "Failed to pin {} at {}: {}",
+                    PID_ALIASES_MAP_NAME,
+                    pin_path.display(),
+                    e
+                )
+                .context(format!(
+                    "Unable to persist {PID_ALIASES_MAP_NAME} in bpffs.{hint}"
+                )))
+            }
+        },
+    }
+}
+
 /// Insert a PID into the allowed_pids pinned map.
 pub fn insert_allowed_pid(pid: u32) -> anyhow::Result<()> {
     let map_data = MapData::from_pin(allowed_pids_pin_path()?)?;
@@ -557,6 +654,41 @@ pub fn remove_allowed_pid(pid: u32) -> anyhow::Result<()> {
     let fd = map_data.fd().as_fd().as_raw_fd();
     bpf_map_delete_elem(fd, &pid as *const _ as *const _)
         .map_err(|e| anyhow::anyhow!("allowed_pids delete failed for {}: {}", pid, e))
+}
+
+/// Insert a runtime-pid -> visible-pid alias into the pinned pid_aliases map.
+pub fn insert_pid_alias(runtime_pid: u32, visible_pid: u32) -> anyhow::Result<()> {
+    let map_data = MapData::from_pin(pid_aliases_pin_path()?)?;
+    let fd = map_data.fd().as_fd().as_raw_fd();
+    let key = runtime_pid;
+    let val = PidAliasValue { visible_pid };
+    bpf_map_update_elem(
+        fd,
+        &key as *const _ as *const _,
+        &val as *const _ as *const _,
+        0,
+    )
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "pid_aliases update failed for runtime_pid={} visible_pid={}: {}",
+            runtime_pid,
+            visible_pid,
+            e
+        )
+    })
+}
+
+/// Remove a runtime-pid alias from the pinned pid_aliases map.
+pub fn remove_pid_alias(runtime_pid: u32) -> anyhow::Result<()> {
+    let map_data = MapData::from_pin(pid_aliases_pin_path()?)?;
+    let fd = map_data.fd().as_fd().as_raw_fd();
+    bpf_map_delete_elem(fd, &runtime_pid as *const _ as *const _).map_err(|e| {
+        anyhow::anyhow!(
+            "pid_aliases delete failed for runtime_pid={}: {}",
+            runtime_pid,
+            e
+        )
+    })
 }
 
 fn bpf_map_delete_elem(fd: i32, key: *const c::c_void) -> io::Result<()> {

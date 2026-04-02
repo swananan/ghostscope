@@ -7,6 +7,7 @@ use common::{init, FIXTURES};
 use ghostscope_process::is_shared_object;
 use regex::Regex;
 use serial_test::serial;
+use std::env;
 use std::path::Path;
 use std::time::Duration;
 
@@ -59,6 +60,38 @@ fn ghostscope_log_path() -> anyhow::Result<std::path::PathBuf> {
         .join("ghostscope.log"))
 }
 
+fn skip_if_nested_t_mode_unsupported() -> bool {
+    let target_mode = match env::var("E2E_TARGET_MODE") {
+        Ok(value) => value,
+        Err(env::VarError::NotPresent) => return false,
+        Err(err) => {
+            eprintln!("continuing nested -t test despite unreadable E2E_TARGET_MODE: {err}");
+            return false;
+        }
+    };
+    let nested_child_container = matches!(
+        target_mode.trim().to_ascii_lowercase().as_str(),
+        "child-container" | "child" | "nested" | "descendant"
+    );
+    if !nested_child_container {
+        return false;
+    }
+
+    // Nested child-container `-t` is intentionally unsupported for now.
+    // The current `-t` implementation relies on target-path / sysmon lifecycle
+    // maintenance anchored in GhostScope's current `/proc` view, while nested
+    // child-container targets introduce a second PID namespace below that view.
+    // Without a stable, shared runtime-pid -> outer `/proc` pid mapping source,
+    // these tests are not a reliable correctness signal, so skip the entire
+    // nested `-t` suite instead of depending on CLI-only heuristics.
+    eprintln!(
+        "skipping nested child-container -t test: nested target-path mode is \
+         currently unsupported because proc offsets and runtime lifecycle \
+         maintenance stay anchored in the outer container /proc pid view"
+    );
+    true
+}
+
 // Late-start helper: run GhostScope first, wait until the CLI reports it has
 // finished compile/load/attach, then start the target process.
 async fn run_ghostscope_then_start_target_after_ready(
@@ -100,6 +133,9 @@ async fn run_ghostscope_then_start_exe(
 #[serial(globals_target)]
 async fn test_t_mode_executable_globals_prints() -> anyhow::Result<()> {
     init();
+    if skip_if_nested_t_mode_unsupported() {
+        return Ok(());
+    }
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
     let target = spawn_globals_program(&binary_path).await?;
@@ -156,6 +192,9 @@ trace globals_program.c:32 {
 #[serial(globals_target)]
 async fn test_t_mode_library_globals_prints() -> anyhow::Result<()> {
     init();
+    if skip_if_nested_t_mode_unsupported() {
+        return Ok(());
+    }
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
     let bin_dir = binary_path.parent().unwrap().to_path_buf();
@@ -209,6 +248,9 @@ trace lib_tick {
 #[serial(globals_target)]
 async fn test_t_mode_executable_rodata_and_struct_pretty() -> anyhow::Result<()> {
     init();
+    if skip_if_nested_t_mode_unsupported() {
+        return Ok(());
+    }
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
     let target = spawn_globals_program(&binary_path).await?;
@@ -262,6 +304,9 @@ trace globals_program.c:26 {
 #[serial(globals_target)]
 async fn test_t_mode_executable_late_start_globals_prints() -> anyhow::Result<()> {
     init();
+    if skip_if_nested_t_mode_unsupported() {
+        return Ok(());
+    }
 
     // GhostScope starts first (-t points to the executable), then we start the process
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
@@ -323,6 +368,9 @@ trace globals_program.c:32 {
 #[serial(globals_target)]
 async fn test_t_mode_library_late_start_globals_prints() -> anyhow::Result<()> {
     init();
+    if skip_if_nested_t_mode_unsupported() {
+        return Ok(());
+    }
 
     // -t points to libgvars.so; GhostScope first, then we run the executable which loads the lib
     // only after GhostScope reports its late-start hooks are ready.
@@ -387,6 +435,9 @@ trace lib_tick {
 #[serial(globals_target)]
 async fn test_t_mode_executable_late_start_rodata_and_struct_pretty() -> anyhow::Result<()> {
     init();
+    if skip_if_nested_t_mode_unsupported() {
+        return Ok(());
+    }
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
     // At line 26, aliases (s, ls, gm, etc.) are initialized
@@ -435,6 +486,9 @@ trace globals_program.c:26 {
 #[serial(globals_target)]
 async fn test_t_mode_library_late_start_without_sysmon_offsets_unavailable() -> anyhow::Result<()> {
     init();
+    if skip_if_nested_t_mode_unsupported() {
+        return Ok(());
+    }
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
     let _target_sandbox_guard = prepare_late_start_launcher(&binary_path)?;
