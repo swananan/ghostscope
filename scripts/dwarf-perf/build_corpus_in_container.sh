@@ -61,7 +61,7 @@ mkdir -p "$QUERY_OUT_DIR" "$PARSE_OUT_DIR" "$PARSE_SRC_DIR" "$PARSE_OBJ_DIR"
 rm -rf "$PARSE_SRC_DIR" "$PARSE_OBJ_DIR"
 mkdir -p "$PARSE_SRC_DIR" "$PARSE_OBJ_DIR"
 
-QUERY_SRC="$REPO_ROOT/perf-corpus/src/query-hotspot/query_hotspot.c"
+QUERY_SRC="$REPO_ROOT/scripts/dwarf-perf/corpus/src/query-hotspot/query_hotspot.c"
 QUERY_BIN="$QUERY_OUT_DIR/query_hotspot"
 QUERY_MARKER_LINE=$(grep -n "DWARF_PERF_QUERY_HOTSPOT" "$QUERY_SRC" | cut -d: -f1)
 
@@ -139,7 +139,7 @@ jq -n \
     --arg compiler "$CC" \
     --arg query_path "query-hotspot/query_hotspot" \
     --arg query_sha "$query_sha" \
-    --arg query_source "perf-corpus/src/query-hotspot/query_hotspot.c" \
+    --arg query_source "scripts/dwarf-perf/corpus/src/query-hotspot/query_hotspot.c" \
     --arg query_function "dwarf_perf_query_hotspot" \
     --arg query_marker "DWARF_PERF_QUERY_HOTSPOT" \
     --arg parse_path "parse-stress/parse_stress" \
