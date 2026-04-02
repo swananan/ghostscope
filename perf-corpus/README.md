@@ -48,10 +48,29 @@ The build writes artifacts under `perf-corpus/out/`:
 
 The generated parse corpus is deterministic and can be scaled without editing sources:
 
+- `PARSE_STRESS_PRESET`
 - `PARSE_STRESS_UNITS`
 - `PARSE_STRESS_TYPES_PER_UNIT`
 - `PARSE_STRESS_FUNCTIONS_PER_UNIT`
 - `PARSE_STRESS_HISTORY_LEN`
+
+Preset defaults:
+
+- `medium`: `16` units, `12` types/unit, `32` helper functions/unit, `8` history entries
+- `large`: `48` units, `24` types/unit, `72` helper functions/unit, `16` history entries
+- `xlarge`: `96` units, `40` types/unit, `128` helper functions/unit, `24` history entries
+
+Current default:
+
+- `PARSE_STRESS_PRESET=large`
+
+The generator now emits:
+
+- a shared type header
+- a shared inline-helper header
+- one header and one source per unit
+- cross-unit type references and callback edges
+- a `generation_config.json` file consumed by the build manifest
 
 The compiler and DWARF flavor are also configurable:
 
@@ -60,7 +79,7 @@ The compiler and DWARF flavor are also configurable:
 - `DWARF_PERF_CFLAGS`
 - `DWARF_PERF_LDFLAGS`
 
-Current default:
+Compiler default:
 
 - `DWARF_PERF_CC=gcc`
 

@@ -16,6 +16,7 @@ WORK_DIR="$OUT_DIR/_build"
 PARSE_SRC_DIR="$WORK_DIR/parse-stress-src"
 PARSE_OBJ_DIR="$WORK_DIR/parse-stress-obj"
 MANIFEST_PATH="$OUT_DIR/manifest.json"
+PARSE_CONFIG_PATH="$PARSE_SRC_DIR/generation_config.json"
 
 CC=${DWARF_PERF_CC:-gcc}
 DWARF_VERSION=${DWARF_PERF_DWARF_VERSION:-5}
@@ -49,10 +50,7 @@ else
     EXTRA_LDFLAGS=()
 fi
 
-PARSE_STRESS_UNITS=${PARSE_STRESS_UNITS:-16}
-PARSE_STRESS_TYPES_PER_UNIT=${PARSE_STRESS_TYPES_PER_UNIT:-10}
-PARSE_STRESS_FUNCTIONS_PER_UNIT=${PARSE_STRESS_FUNCTIONS_PER_UNIT:-24}
-PARSE_STRESS_HISTORY_LEN=${PARSE_STRESS_HISTORY_LEN:-8}
+PARSE_STRESS_PRESET=${PARSE_STRESS_PRESET:-large}
 
 if ! command -v "$CC" >/dev/null 2>&1; then
     echo "compiler not found: $CC" >&2
@@ -77,12 +75,36 @@ QUERY_MARKER_LINE=$(grep -n "DWARF_PERF_QUERY_HOTSPOT" "$QUERY_SRC" | cut -d: -f
     "${COMMON_LDFLAGS[@]}" \
     "${EXTRA_LDFLAGS[@]}"
 
-python3 "$REPO_ROOT/scripts/dwarf-perf/generate_parse_stress.py" \
-    --output-dir "$PARSE_SRC_DIR" \
-    --units "$PARSE_STRESS_UNITS" \
-    --types-per-unit "$PARSE_STRESS_TYPES_PER_UNIT" \
-    --functions-per-unit "$PARSE_STRESS_FUNCTIONS_PER_UNIT" \
-    --history-len "$PARSE_STRESS_HISTORY_LEN"
+generator_args=(
+    --output-dir "$PARSE_SRC_DIR"
+    --preset "$PARSE_STRESS_PRESET"
+)
+
+if [[ -n "${PARSE_STRESS_UNITS:-}" ]]; then
+    generator_args+=(--units "$PARSE_STRESS_UNITS")
+fi
+
+if [[ -n "${PARSE_STRESS_TYPES_PER_UNIT:-}" ]]; then
+    generator_args+=(--types-per-unit "$PARSE_STRESS_TYPES_PER_UNIT")
+fi
+
+if [[ -n "${PARSE_STRESS_FUNCTIONS_PER_UNIT:-}" ]]; then
+    generator_args+=(--functions-per-unit "$PARSE_STRESS_FUNCTIONS_PER_UNIT")
+fi
+
+if [[ -n "${PARSE_STRESS_HISTORY_LEN:-}" ]]; then
+    generator_args+=(--history-len "$PARSE_STRESS_HISTORY_LEN")
+fi
+
+python3 "$REPO_ROOT/scripts/dwarf-perf/generate_parse_stress.py" "${generator_args[@]}"
+
+PARSE_STRESS_PRESET=$(jq -r '.preset' "$PARSE_CONFIG_PATH")
+PARSE_STRESS_UNITS=$(jq -r '.units' "$PARSE_CONFIG_PATH")
+PARSE_STRESS_TYPES_PER_UNIT=$(jq -r '.types_per_unit' "$PARSE_CONFIG_PATH")
+PARSE_STRESS_FUNCTIONS_PER_UNIT=$(jq -r '.functions_per_unit' "$PARSE_CONFIG_PATH")
+PARSE_STRESS_HISTORY_LEN=$(jq -r '.history_len' "$PARSE_CONFIG_PATH")
+PARSE_STRESS_GENERATED_C_FILES=$(jq -r '.generated_c_files' "$PARSE_CONFIG_PATH")
+PARSE_STRESS_GENERATED_HEADER_FILES=$(jq -r '.generated_header_files' "$PARSE_CONFIG_PATH")
 
 mapfile -t parse_sources < <(find "$PARSE_SRC_DIR" -name '*.c' -print | sort)
 parse_objects=()
@@ -123,6 +145,7 @@ jq -n \
     --arg parse_path "parse-stress/parse_stress" \
     --arg parse_sha "$parse_sha" \
     --arg parse_generator "scripts/dwarf-perf/generate_parse_stress.py" \
+    --arg parse_preset "$PARSE_STRESS_PRESET" \
     --argjson dwarf_version "$DWARF_VERSION" \
     --argjson query_line "$QUERY_MARKER_LINE" \
     --argjson query_size "$query_size" \
@@ -131,6 +154,8 @@ jq -n \
     --argjson parse_types_per_unit "$PARSE_STRESS_TYPES_PER_UNIT" \
     --argjson parse_functions_per_unit "$PARSE_STRESS_FUNCTIONS_PER_UNIT" \
     --argjson parse_history_len "$PARSE_STRESS_HISTORY_LEN" \
+    --argjson parse_generated_c_files "$PARSE_STRESS_GENERATED_C_FILES" \
+    --argjson parse_generated_header_files "$PARSE_STRESS_GENERATED_HEADER_FILES" \
     '{
         schema_version: 1,
         builder_image: $builder_image,
@@ -160,10 +185,13 @@ jq -n \
                 size_bytes: $parse_size,
                 generator: {
                     script: $parse_generator,
+                    preset: $parse_preset,
                     units: $parse_units,
                     types_per_unit: $parse_types_per_unit,
                     functions_per_unit: $parse_functions_per_unit,
-                    history_len: $parse_history_len
+                    history_len: $parse_history_len,
+                    generated_c_files: $parse_generated_c_files,
+                    generated_header_files: $parse_generated_header_files
                 }
             }
         ]

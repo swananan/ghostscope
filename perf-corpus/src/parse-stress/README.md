@@ -19,9 +19,21 @@ The generator lives at:
 
 - `scripts/dwarf-perf/generate_parse_stress.py`
 
-Default scale:
+The generator now emits:
 
-- `PARSE_STRESS_UNITS=16`
-- `PARSE_STRESS_TYPES_PER_UNIT=10`
-- `PARSE_STRESS_FUNCTIONS_PER_UNIT=24`
-- `PARSE_STRESS_HISTORY_LEN=8`
+- `parse_stress_shared.h`
+- `parse_stress_inline.h`
+- `main.c`
+- `unit_XX.h`
+- `unit_XX.c`
+- `generation_config.json`
+
+Preset scale:
+
+- `medium`: `16` units, `12` types/unit, `32` helper functions/unit, `8` history entries
+- `large`: `48` units, `24` types/unit, `72` helper functions/unit, `16` history entries
+- `xlarge`: `96` units, `40` types/unit, `128` helper functions/unit, `24` history entries
+
+Default preset:
+
+- `large`
