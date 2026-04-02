@@ -2,26 +2,18 @@
 //! requiring full TypeInfo expansion.
 
 use crate::core::{EvaluationResult, Result};
+pub(crate) use crate::semantics::TypeLoc;
+use crate::semantics::{
+    eval_member_offset_expr, resolve_type_ref_with_origins, strip_typedef_qualified,
+};
 use gimli::Reader;
 use gimli::{EndianArcSlice, LittleEndian};
-
-// PlanAction removed (unused)
-type DwarfUnit = gimli::Unit<EndianArcSlice<LittleEndian>>;
-type DwarfEntry = gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>;
-type ResolvedOriginEntry = (gimli::DebugInfoOffset, DwarfUnit, DwarfEntry);
 
 /// Utilities for DIE-level chain access planning
 pub struct AccessPlanner<'dwarf> {
     dwarf: &'dwarf gimli::Dwarf<EndianArcSlice<LittleEndian>>,
     type_index: Option<std::sync::Arc<crate::data::TypeNameIndex>>,
     strict_index: bool,
-}
-
-/// Location of a type within the DWARF (CU + DIE offset)
-#[derive(Debug, Clone, Copy)]
-pub struct TypeLoc {
-    pub cu_off: gimli::DebugInfoOffset,
-    pub die_off: gimli::UnitOffset,
 }
 
 /// Parent struct/class context for the final matched member.
@@ -53,136 +45,13 @@ impl<'dwarf> AccessPlanner<'dwarf> {
         }
     }
 
-    /// Resolve DW_AT_type reference with origins/specification following
-    fn resolve_type_ref_with_origins(
-        &self,
-        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
-        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
-    ) -> crate::core::Result<Option<TypeLoc>> {
-        fn resolve_debug_info_ref(
-            dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
-            debug_info_off: gimli::DebugInfoOffset,
-        ) -> crate::core::Result<Option<(gimli::Unit<EndianArcSlice<LittleEndian>>, TypeLoc)>>
-        {
-            let mut units = dwarf.units();
-            while let Some(header) = units.next()? {
-                if let Some(die_off) = debug_info_off.to_unit_offset(&header) {
-                    let target_unit = dwarf.unit(header)?;
-                    let cu_off = target_unit
-                        .header
-                        .debug_info_offset()
-                        .ok_or_else(|| anyhow::anyhow!("unit missing debug_info offset"))?;
-                    return Ok(Some((target_unit, TypeLoc { cu_off, die_off })));
-                }
-            }
-            Ok(None)
-        }
-
-        fn type_loc_from_attr_value(
-            dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
-            unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
-            value: gimli::AttributeValue<EndianArcSlice<LittleEndian>>,
-        ) -> crate::core::Result<Option<TypeLoc>> {
-            let cu_off = unit
-                .header
-                .debug_info_offset()
-                .ok_or_else(|| anyhow::anyhow!("unit missing debug_info offset"))?;
-            match value {
-                gimli::AttributeValue::UnitRef(die_off) => Ok(Some(TypeLoc { cu_off, die_off })),
-                gimli::AttributeValue::DebugInfoRef(debug_info_off) => {
-                    Ok(resolve_debug_info_ref(dwarf, debug_info_off)?.map(|(_, loc)| loc))
-                }
-                _ => Ok(None),
-            }
-        }
-
-        fn resolve_origin_entry(
-            dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
-            unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
-            value: gimli::AttributeValue<EndianArcSlice<LittleEndian>>,
-        ) -> crate::core::Result<Option<ResolvedOriginEntry>> {
-            let debug_info_off = match value {
-                gimli::AttributeValue::UnitRef(off) => off.to_debug_info_offset(&unit.header),
-                gimli::AttributeValue::DebugInfoRef(off) => Some(off),
-                _ => None,
-            };
-            let Some(debug_info_off) = debug_info_off else {
-                return Ok(None);
-            };
-
-            let Some((origin_unit, origin_loc)) = resolve_debug_info_ref(dwarf, debug_info_off)?
-            else {
-                return Ok(None);
-            };
-            let origin_entry = origin_unit.entry(origin_loc.die_off)?;
-            Ok(Some((debug_info_off, origin_unit, origin_entry)))
-        }
-
-        fn inner(
-            dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
-            entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
-            unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
-            visited: &mut std::collections::HashSet<gimli::DebugInfoOffset>,
-        ) -> crate::core::Result<Option<TypeLoc>> {
-            if let Some(value) = entry.attr_value(gimli::constants::DW_AT_type) {
-                return type_loc_from_attr_value(dwarf, unit, value);
-            }
-
-            for origin_attr in [
-                gimli::constants::DW_AT_abstract_origin,
-                gimli::constants::DW_AT_specification,
-            ] {
-                if let Some(value) = entry.attr_value(origin_attr) {
-                    if let Some((origin_abs, origin_unit, origin_entry)) =
-                        resolve_origin_entry(dwarf, unit, value)?
-                    {
-                        if visited.insert(origin_abs) {
-                            if let Some(v) = inner(dwarf, &origin_entry, &origin_unit, visited)? {
-                                return Ok(Some(v));
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(None)
-        }
-
-        let mut visited = std::collections::HashSet::new();
-        if let Some(entry_abs) = entry.offset().to_debug_info_offset(&unit.header) {
-            visited.insert(entry_abs);
-        }
-        inner(self.dwarf, entry, unit, &mut visited)
-    }
-
     /// Public wrapper for resolving DW_AT_type via origins/specification chain
     pub fn resolve_type_ref_with_origins_public(
         &self,
         entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
         unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
     ) -> crate::core::Result<Option<TypeLoc>> {
-        self.resolve_type_ref_with_origins(entry, unit)
-    }
-
-    /// Follow typedef/qualified chain to the underlying type DIE
-    fn strip_typedef_qualified(&self, mut type_loc: TypeLoc) -> crate::core::Result<TypeLoc> {
-        loop {
-            let header = self.dwarf.unit_header(type_loc.cu_off)?;
-            let unit = self.dwarf.unit(header)?;
-            let die = unit.entry(type_loc.die_off)?;
-            match die.tag() {
-                gimli::DW_TAG_typedef
-                | gimli::DW_TAG_const_type
-                | gimli::DW_TAG_volatile_type
-                | gimli::DW_TAG_restrict_type => {
-                    if let Some(next) = self.resolve_type_ref_with_origins(&die, &unit)? {
-                        type_loc = next;
-                        continue;
-                    }
-                }
-                _ => {}
-            }
-            return Ok(type_loc);
-        }
+        resolve_type_ref_with_origins(self.dwarf, entry, unit)
     }
 
     /// If DIE is an explicit declaration, try to find a full definition across units.
@@ -240,30 +109,6 @@ impl<'dwarf> AccessPlanner<'dwarf> {
         Ok((None, die.offset()))
     }
 
-    /// Evaluate DW_AT_data_member_location expression to constant offset if possible
-    fn eval_member_offset_expr(
-        &self,
-        expr: &gimli::Expression<EndianArcSlice<LittleEndian>>,
-    ) -> Option<u64> {
-        use gimli::Reader;
-        let bytes_cow = expr.0.to_slice().ok()?;
-        let bytes: &[u8] = &bytes_cow;
-        if bytes.is_empty() {
-            return None;
-        }
-        let mut rdr = gimli::EndianSlice::new(bytes, LittleEndian);
-        if let Ok(op) = rdr.read_u8() {
-            match op {
-                0x10 => rdr.read_uleb128().ok(),                   // DW_OP_constu
-                0x11 => rdr.read_sleb128().ok().map(|v| v as u64), // DW_OP_consts
-                0x23 => rdr.read_uleb128().ok(),                   // DW_OP_plus_uconst
-                _ => None,
-            }
-        } else {
-            None
-        }
-    }
-
     /// Start planning from a known variable (skip variable search)
     pub fn plan_chain_from_known(
         &self,
@@ -280,7 +125,7 @@ impl<'dwarf> AccessPlanner<'dwarf> {
         let mut last_parent_ctx: Option<MemberParentCtx> = None;
         while idx < chain.len() {
             let field = &chain[idx];
-            current_type = self.strip_typedef_qualified(current_type)?;
+            current_type = strip_typedef_qualified(self.dwarf, current_type)?;
             current_cu_off = current_type.cu_off;
 
             // Reacquire current unit on each step
@@ -292,7 +137,9 @@ impl<'dwarf> AccessPlanner<'dwarf> {
                 gimli::DW_TAG_pointer_type => {
                     // Dereference then continue without consuming field
                     current_eval = Self::compute_pointer_deref(current_eval);
-                    if let Some(next) = self.resolve_type_ref_with_origins(&type_die, &unit_now)? {
+                    if let Some(next) =
+                        resolve_type_ref_with_origins(self.dwarf, &type_die, &unit_now)?
+                    {
                         current_type = next;
                     } else {
                         return Ok((current_eval, current_type, last_parent_ctx));
@@ -330,7 +177,7 @@ impl<'dwarf> AccessPlanner<'dwarf> {
                                                         off = Some(v)
                                                     }
                                                     gimli::AttributeValue::Exprloc(expr) => {
-                                                        off = self.eval_member_offset_expr(&expr)
+                                                        off = eval_member_offset_expr(&expr)
                                                     }
                                                     _ => {}
                                                 }
@@ -396,8 +243,9 @@ impl<'dwarf> AccessPlanner<'dwarf> {
                                                 };
                                             }
                                             // type
-                                            let next_type =
-                                                self.resolve_type_ref_with_origins(e, &unit_now2)?;
+                                            let next_type = resolve_type_ref_with_origins(
+                                                self.dwarf, e, &unit_now2,
+                                            )?;
                                             let parent_cu_off = current_cu_off;
                                             current_type = next_type.unwrap_or(TypeLoc {
                                                 cu_off: current_cu_off,

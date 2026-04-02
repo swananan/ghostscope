@@ -5,10 +5,10 @@
 use crate::core::{
     ComputeStep, DirectValueResult, EvaluationResult, LocationResult, MemoryAccessSize, Result,
 };
+use crate::semantics::{range_contains_pc, resolve_attr_with_unit_origins};
 use gimli::{
     read::RawLocListEntry, EndianArcSlice, EndianSlice, Expression, LittleEndian, Operation, Reader,
 };
-use std::collections::HashSet;
 use tracing::{debug, trace, warn};
 
 /// DWARF expression evaluator
@@ -23,37 +23,9 @@ impl ExpressionEvaluator {
         address: u64,
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
     ) -> Result<EvaluationResult> {
-        // Helper: resolve an attribute up the abstract_origin/specification chain
-        fn resolve_attr_with_origins(
-            entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
-            unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
-            attr: gimli::DwAt,
-            visited: &mut HashSet<gimli::UnitOffset>,
-        ) -> gimli::read::Result<Option<gimli::AttributeValue<EndianArcSlice<LittleEndian>>>>
-        {
-            if let Some(value) = entry.attr_value(attr) {
-                return Ok(Some(value));
-            }
-            for origin_attr in [
-                gimli::constants::DW_AT_abstract_origin,
-                gimli::constants::DW_AT_specification,
-            ] {
-                if let Some(gimli::AttributeValue::UnitRef(off)) = entry.attr_value(origin_attr) {
-                    if visited.insert(off) {
-                        let origin = unit.entry(off)?;
-                        if let Some(v) = resolve_attr_with_origins(&origin, unit, attr, visited)? {
-                            return Ok(Some(v));
-                        }
-                    }
-                }
-            }
-            Ok(None)
-        }
-
         // Get DW_AT_location attribute (follow origins/specification for inlined/declared vars)
-        let mut visited: HashSet<gimli::UnitOffset> = HashSet::new();
         let location_attr =
-            resolve_attr_with_origins(entry, unit, gimli::constants::DW_AT_location, &mut visited)?;
+            resolve_attr_with_unit_origins(entry, unit, gimli::constants::DW_AT_location)?;
 
         match location_attr {
             Some(gimli::AttributeValue::Exprloc(expr)) => {
@@ -96,12 +68,10 @@ impl ExpressionEvaluator {
             }
             None => {
                 // Try DW_AT_const_value (follow origins) as a last resort
-                let mut v2: HashSet<gimli::UnitOffset> = HashSet::new();
-                if let Some(cv) = resolve_attr_with_origins(
+                if let Some(cv) = resolve_attr_with_unit_origins(
                     entry,
                     unit,
                     gimli::constants::DW_AT_const_value,
-                    &mut v2,
                 )? {
                     let res = match cv {
                         gimli::AttributeValue::Udata(u) => {
@@ -607,11 +577,7 @@ impl ExpressionEvaluator {
 
                     debug!("  Parsed expression: {:?}", location_expr);
 
-                    let contains_address = if start_pc == end_pc {
-                        address == start_pc
-                    } else {
-                        address >= start_pc && address < end_pc
-                    };
+                    let contains_address = range_contains_pc(start_pc, end_pc, address);
 
                     if contains_address && !matches!(location_expr, EvaluationResult::Optimized) {
                         return Ok(location_expr);
@@ -664,11 +630,7 @@ impl ExpressionEvaluator {
                             );
                             let start = begin;
                             let end = begin.wrapping_add(length);
-                            let contains = if length == 0 {
-                                address == start
-                            } else {
-                                address >= start && address < end
-                            };
+                            let contains = range_contains_pc(start, end, address);
 
                             debug!(
                                 "   StartLength contains={} (address=0x{:x})",
@@ -699,11 +661,7 @@ impl ExpressionEvaluator {
                                 "  Raw fallback StartEnd begin=0x{:x} end=0x{:x}",
                                 begin, end
                             );
-                            let contains = if begin == end {
-                                address == begin
-                            } else {
-                                address >= begin && address < end
-                            };
+                            let contains = range_contains_pc(begin, end, address);
 
                             debug!(
                                 "   StartEnd contains={} (address=0x{:x})",
@@ -737,11 +695,7 @@ impl ExpressionEvaluator {
                             );
                             let start = base_address.wrapping_add(begin);
                             let end_addr = base_address.wrapping_add(end);
-                            let contains = if start == end_addr {
-                                address == start
-                            } else {
-                                address >= start && address < end_addr
-                            };
+                            let contains = range_contains_pc(start, end_addr, address);
 
                             debug!(
                                 "   OffsetPair contains={} (address=0x{:x})",
@@ -778,11 +732,7 @@ impl ExpressionEvaluator {
                                     start, length
                                 );
                                 let end = start.wrapping_add(length);
-                                let contains = if length == 0 {
-                                    address == start
-                                } else {
-                                    address >= start && address < end
-                                };
+                                let contains = range_contains_pc(start, end, address);
 
                                 debug!(
                                     "   StartxLength contains={} (address=0x{:x})",
@@ -820,11 +770,7 @@ impl ExpressionEvaluator {
                                     "  Raw fallback StartxEndx begin=0x{:x} end=0x{:x}",
                                     start, end_addr
                                 );
-                                let contains = if start == end_addr {
-                                    address == start
-                                } else {
-                                    address >= start && address < end_addr
-                                };
+                                let contains = range_contains_pc(start, end_addr, address);
 
                                 debug!(
                                     "   StartxEndx contains={} (address=0x{:x})",

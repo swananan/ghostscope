@@ -13,6 +13,7 @@ pub(crate) mod loader;
 pub(crate) mod module;
 pub(crate) mod parser;
 pub(crate) mod planner;
+pub(crate) mod semantics;
 
 // Main entry point
 pub mod analyzer;
