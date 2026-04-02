@@ -1,0 +1,153 @@
+name: DWARF Perf History
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'ghostscope-dwarf/**'
+      - 'bins/dwarf-tool/**'
+      - 'scripts/dwarf-perf/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/dwarf-perf-history.yml'
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  LLVM_SYS_181_PREFIX: /usr/lib/llvm-18
+
+jobs:
+  publish:
+    name: Publish DWARF Perf History
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target-dwarf-perf
+      DWARF_PERF_RESULTS_DIR: ${{ runner.temp }}/dwarf-perf-results
+      DWARF_PERF_SITE_DIR: ${{ runner.temp }}/dwarf-perf-site
+      DWARF_PERF_SITE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install LLVM 18 and jq
+        run: |
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 18
+          sudo apt-get install -y llvm-18-dev libpolly-18-dev jq
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-dwarf-perf-history-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-dwarf-perf-history-cargo-registry-
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-dwarf-perf-history-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-dwarf-perf-history-cargo-index-
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/cargo-target-dwarf-perf
+          key: ${{ runner.os }}-dwarf-perf-history-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-dwarf-perf-history-target-
+
+      - name: Prepare result directories
+        run: mkdir -p "$DWARF_PERF_RESULTS_DIR"
+
+      - name: Run baseline
+        run: |
+          set -euo pipefail
+          ./scripts/dwarf-perf/build_corpus.sh
+          ./scripts/dwarf-perf/run_baseline.sh \
+            --skip-build \
+            --results-dir "$DWARF_PERF_RESULTS_DIR" \
+            --result-name main \
+            --runs 10 \
+            --cargo-target-dir "$CARGO_TARGET_DIR"
+
+      - name: Restore gh-pages worktree
+        env:
+          REPO_URL: https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --heads "$REPO_URL" gh-pages >/dev/null 2>&1; then
+            git clone --depth 1 --branch gh-pages "$REPO_URL" "$DWARF_PERF_SITE_DIR"
+          else
+            mkdir -p "$DWARF_PERF_SITE_DIR"
+            git init "$DWARF_PERF_SITE_DIR"
+            git -C "$DWARF_PERF_SITE_DIR" checkout -b gh-pages
+            git -C "$DWARF_PERF_SITE_DIR" remote add origin "$REPO_URL"
+          fi
+
+      - name: Publish history site
+        run: |
+          set -euo pipefail
+          python3 scripts/dwarf-perf/publish_history.py \
+            --baseline "$DWARF_PERF_RESULTS_DIR/main.json" \
+            --site-dir "$DWARF_PERF_SITE_DIR" \
+            --repo "$GITHUB_REPOSITORY" \
+            --sha "$GITHUB_SHA" \
+            --ref "$GITHUB_REF_NAME" \
+            --event "$GITHUB_EVENT_NAME" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-number "$GITHUB_RUN_NUMBER" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --site-url "$DWARF_PERF_SITE_URL"
+
+      - name: Commit and push gh-pages
+        run: |
+          set -euo pipefail
+          git -C "$DWARF_PERF_SITE_DIR" add .
+          if git -C "$DWARF_PERF_SITE_DIR" diff --cached --quiet; then
+            echo "No site changes to publish"
+            exit 0
+          fi
+
+          git -C "$DWARF_PERF_SITE_DIR" \
+            -c user.name='github-actions[bot]' \
+            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -m "chore: update dwarf perf history for ${GITHUB_SHA::12}"
+
+          git -C "$DWARF_PERF_SITE_DIR" push origin gh-pages
+
+      - name: Publish summary
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## DWARF Perf History
+
+          - Baseline JSON: \`${DWARF_PERF_RESULTS_DIR}/main.json\`
+          - History branch: \`gh-pages\`
+          - Expected site URL: ${DWARF_PERF_SITE_URL}
+          - Note: Configure repository Pages to publish from branch \`gh-pages\` (root) if it is not already enabled.
+          EOF
+
+      - name: Upload history artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dwarf-perf-history-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/dwarf-perf-results/*.json
+            ${{ runner.temp }}/dwarf-perf-site/**

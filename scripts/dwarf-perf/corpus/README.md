@@ -63,6 +63,10 @@ This will:
 `perf-results/` is also ignored by Git and is intended for local or CI
 benchmark result snapshots.
 
+For long-term main-branch history, see
+`.github/workflows/dwarf-perf-history.yml`. That workflow can publish the
+baseline history site to the repository `gh-pages` branch.
+
 The script prints three separate sections:
 
 - `Fast parse benchmark`
