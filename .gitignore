@@ -67,3 +67,4 @@ nginx*
 
 # Python cache
 __pycache__/
+perf-corpus/out/
