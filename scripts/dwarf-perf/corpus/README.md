@@ -64,8 +64,9 @@ This will:
 benchmark result snapshots.
 
 For long-term main-branch history, see
-`.github/workflows/dwarf-perf-history.yml`. That workflow can publish the
-baseline history site to the repository `gh-pages` branch.
+`.github/workflows/dwarf-perf-history.yml`. That workflow publishes the
+baseline history site through GitHub Pages custom workflow deployment and
+keeps the generated site state in the `dwarf-perf-history-data` branch.
 
 The script prints three separate sections:
 

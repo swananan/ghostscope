@@ -14,29 +14,32 @@ on:
     - cron: '17 3 * * *'
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   LLVM_SYS_181_PREFIX: /usr/lib/llvm-18
 
 jobs:
-  publish:
-    name: Publish DWARF Perf History
+  build:
+    name: Build DWARF Perf History
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    permissions:
+      contents: write
     env:
       CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target-dwarf-perf
       DWARF_PERF_RESULTS_DIR: ${{ runner.temp }}/dwarf-perf-results
       DWARF_PERF_SITE_DIR: ${{ runner.temp }}/dwarf-perf-site
-      DWARF_PERF_SITE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
+      DWARF_PERF_HISTORY_BRANCH: dwarf-perf-history-data
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 0
+
+      - name: Configure GitHub Pages
+        id: pages
+        uses: actions/configure-pages@v5
 
       - name: Install LLVM 18 and jq
         run: |
@@ -86,17 +89,17 @@ jobs:
             --runs 10 \
             --cargo-target-dir "$CARGO_TARGET_DIR"
 
-      - name: Restore gh-pages worktree
+      - name: Restore history state worktree
         env:
           REPO_URL: https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
         run: |
           set -euo pipefail
-          if git ls-remote --exit-code --heads "$REPO_URL" gh-pages >/dev/null 2>&1; then
-            git clone --depth 1 --branch gh-pages "$REPO_URL" "$DWARF_PERF_SITE_DIR"
+          if git ls-remote --exit-code --heads "$REPO_URL" "$DWARF_PERF_HISTORY_BRANCH" >/dev/null 2>&1; then
+            git clone --depth 1 --branch "$DWARF_PERF_HISTORY_BRANCH" "$REPO_URL" "$DWARF_PERF_SITE_DIR"
           else
             mkdir -p "$DWARF_PERF_SITE_DIR"
             git init "$DWARF_PERF_SITE_DIR"
-            git -C "$DWARF_PERF_SITE_DIR" checkout -b gh-pages
+            git -C "$DWARF_PERF_SITE_DIR" checkout -b "$DWARF_PERF_HISTORY_BRANCH"
             git -C "$DWARF_PERF_SITE_DIR" remote add origin "$REPO_URL"
           fi
 
@@ -113,24 +116,30 @@ jobs:
             --run-id "$GITHUB_RUN_ID" \
             --run-number "$GITHUB_RUN_NUMBER" \
             --run-attempt "$GITHUB_RUN_ATTEMPT" \
-            --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
-            --site-url "$DWARF_PERF_SITE_URL"
+            --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
 
-      - name: Commit and push gh-pages
+      - name: Commit and push history state
         run: |
           set -euo pipefail
           git -C "$DWARF_PERF_SITE_DIR" add .
           if git -C "$DWARF_PERF_SITE_DIR" diff --cached --quiet; then
-            echo "No site changes to publish"
-            exit 0
+            echo "No history changes to persist"
+          else
+            git -C "$DWARF_PERF_SITE_DIR" \
+              -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m "chore: update dwarf perf history for ${GITHUB_SHA::12}"
+
+            git -C "$DWARF_PERF_SITE_DIR" push origin "$DWARF_PERF_HISTORY_BRANCH"
           fi
 
-          git -C "$DWARF_PERF_SITE_DIR" \
-            -c user.name='github-actions[bot]' \
-            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
-            commit -m "chore: update dwarf perf history for ${GITHUB_SHA::12}"
+      - name: Remove git metadata from published site
+        run: rm -rf "$DWARF_PERF_SITE_DIR/.git"
 
-          git -C "$DWARF_PERF_SITE_DIR" push origin gh-pages
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: ${{ runner.temp }}/dwarf-perf-site
 
       - name: Publish summary
         run: |
@@ -138,9 +147,9 @@ jobs:
           ## DWARF Perf History
 
           - Baseline JSON: \`${DWARF_PERF_RESULTS_DIR}/main.json\`
-          - History branch: \`gh-pages\`
-          - Expected site URL: ${DWARF_PERF_SITE_URL}
-          - Note: Configure repository Pages to publish from branch \`gh-pages\` (root) if it is not already enabled.
+          - History state branch: \`${DWARF_PERF_HISTORY_BRANCH}\`
+          - Pages base path: ${{ steps.pages.outputs.base_path }}
+          - Pages deployment: configured through \`GitHub Actions\`
           EOF
 
       - name: Upload history artifacts
@@ -151,3 +160,18 @@ jobs:
           path: |
             ${{ runner.temp }}/dwarf-perf-results/*.json
             ${{ runner.temp }}/dwarf-perf-site/**
+
+  deploy:
+    name: Deploy DWARF Perf History
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
