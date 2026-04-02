@@ -44,6 +44,9 @@ The build writes artifacts under `scripts/dwarf-perf/corpus/out/`:
 - `parse-stress/parse_stress`
 - `manifest.json`
 
+These generated outputs are ignored by Git through the repository
+`/.gitignore`.
+
 End-to-end baseline runner:
 
 ```bash
@@ -56,6 +59,9 @@ This will:
 - run the parse benchmark through `dwarf-tool benchmark`
 - run the query benchmark through `dwarf-tool benchmark-source-line`
 - write a JSON result under `perf-results/`
+
+`perf-results/` is also ignored by Git and is intended for local or CI
+benchmark result snapshots.
 
 The script prints three separate sections:
 
