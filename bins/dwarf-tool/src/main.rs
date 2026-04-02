@@ -16,7 +16,7 @@ use tracing::warn;
 #[command(about = "DWARF debug information analysis tool with multiple analysis modes")]
 #[command(author = "swananan")]
 #[command(
-    after_help = "SUBCOMMANDS:\n  source-line (s)   Analyze variables at specific source file:line location\n  function (f)      Find function addresses and analyze variables at those addresses\n  module-addr (m)   Analyze variables at specific module:address location\n  modules (ls)      List all loaded modules\n  source-files (sf) List source files grouped by module\n  benchmark         Performance benchmarking"
+    after_help = "SUBCOMMANDS:\n  source-line (s)            Analyze variables at specific source file:line location\n  function (f)               Find function addresses and analyze variables at those addresses\n  module-addr (m)            Analyze variables at specific module:address location\n  modules (ls)               List all loaded modules\n  source-files (sf)          List source files grouped by module\n  benchmark                  Performance benchmarking\n  benchmark-source-line      Benchmark a source-line query with a warm analyzer"
 )]
 struct Cli {
     /// Process ID to analyze
@@ -140,6 +140,18 @@ enum Commands {
         #[arg(long, default_value = "3")]
         runs: usize,
     },
+    /// Benchmark a source-line query with one analyzer load and repeated lookups
+    #[command(name = "benchmark-source-line", alias = "bench-s")]
+    BenchmarkSourceLine {
+        /// Source location (file:line)
+        location: String,
+        /// Number of runs
+        #[arg(long, default_value = "10")]
+        runs: usize,
+        /// JSON output
+        #[arg(long)]
+        json: bool,
+    },
     /// Compute per-module section offsets (PID mode)
     #[command(name = "offsets", alias = "off")]
     Offsets {
@@ -174,6 +186,27 @@ struct AnalysisResult {
     addresses: Vec<AddressInfo>,
     total_variables: usize,
     loading_time_ms: u64,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct BenchmarkSummary {
+    runs: usize,
+    first_run_ms: f64,
+    average_ms: f64,
+    min_ms: f64,
+    p50_ms: f64,
+    p95_ms: f64,
+    max_ms: f64,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct SourceLineBenchmarkResult {
+    source_location: String,
+    loading_time_ms: u64,
+    address_count: usize,
+    total_variables: usize,
+    first_address: Option<String>,
+    benchmark: BenchmarkSummary,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -217,6 +250,7 @@ impl CommonOptions for Commands {
             Commands::ModuleAddr { verbose, .. } => *verbose,
             Commands::Globals { verbose, .. } => *verbose,
             Commands::GlobalsAll { verbose, .. } => *verbose,
+            Commands::BenchmarkSourceLine { .. } => false,
             Commands::Offsets { .. } => false,
             Commands::ListModules { .. } => false,
             Commands::SourceFiles { .. } => false,
@@ -231,6 +265,7 @@ impl CommonOptions for Commands {
             Commands::ModuleAddr { quiet, .. } => *quiet,
             Commands::Globals { quiet, .. } => *quiet,
             Commands::GlobalsAll { quiet, .. } => *quiet,
+            Commands::BenchmarkSourceLine { .. } => false,
             Commands::Offsets { .. } => false,
             Commands::ListModules { quiet, .. } => *quiet,
             Commands::SourceFiles { quiet, .. } => *quiet,
@@ -245,6 +280,7 @@ impl CommonOptions for Commands {
             Commands::ModuleAddr { json, .. } => *json,
             Commands::Globals { json, .. } => *json,
             Commands::GlobalsAll { json, .. } => *json,
+            Commands::BenchmarkSourceLine { json, .. } => *json,
             Commands::Offsets { json, .. } => *json,
             Commands::ListModules { json, .. } => *json,
             Commands::SourceFiles { json, .. } => *json,
@@ -348,9 +384,25 @@ async fn main() -> Result<()> {
     }
 
     // Handle benchmark separately (no need to load modules)
-    if let Commands::Benchmark { runs } = &cli.command {
-        // For benchmark, we need either PID or target
-        return run_benchmark(cli.pid, cli.target.as_deref(), *runs).await;
+    match &cli.command {
+        Commands::Benchmark { runs } => {
+            return run_benchmark(cli.pid, cli.target.as_deref(), *runs).await;
+        }
+        Commands::BenchmarkSourceLine {
+            location,
+            runs,
+            json,
+        } => {
+            return run_source_line_benchmark(
+                cli.pid,
+                cli.target.as_deref(),
+                location,
+                *runs,
+                *json,
+            )
+            .await;
+        }
+        _ => {}
     }
 
     // Load analyzer
@@ -381,6 +433,18 @@ fn init_logging(command: &Commands) {
     }
 }
 
+async fn load_analyzer(pid: Option<u32>, target_path: Option<&str>) -> Result<DwarfAnalyzer> {
+    if let Some(pid) = pid {
+        DwarfAnalyzer::from_pid_parallel(pid).await
+    } else if let Some(target_path) = target_path {
+        DwarfAnalyzer::from_exec_path(target_path).await
+    } else {
+        Err(anyhow::anyhow!(
+            "Either PID or target path must be specified"
+        ))
+    }
+}
+
 async fn load_analyzer_and_execute(cli: Cli) -> Result<std::time::Duration> {
     if !cli.command.quiet() {
         if cli.pid.is_some() {
@@ -391,17 +455,7 @@ async fn load_analyzer_and_execute(cli: Cli) -> Result<std::time::Duration> {
     }
 
     let start = Instant::now();
-    let mut analyzer = if let Some(pid) = cli.pid {
-        // PID mode: load from running process (always parallel)
-        DwarfAnalyzer::from_pid_parallel(pid).await?
-    } else if let Some(ref target_path) = cli.target {
-        // Target path mode: load from executable file
-        DwarfAnalyzer::from_exec_path(target_path).await?
-    } else {
-        return Err(anyhow::anyhow!(
-            "Either PID or target path must be specified"
-        ));
-    };
+    let mut analyzer = load_analyzer(cli.pid, cli.target.as_deref()).await?;
     let loading_time = start.elapsed();
 
     if !cli.command.quiet() && !cli.command.json() {
@@ -436,7 +490,8 @@ async fn load_analyzer_and_execute(cli: Cli) -> Result<std::time::Duration> {
         Commands::SourceFiles { .. } => {
             list_source_files(&analyzer, &cli.command)?;
         }
-        Commands::Benchmark { .. } => unreachable!(), // Handled earlier
+        Commands::BenchmarkSourceLine { .. } => unreachable!(), // Handled earlier
+        Commands::Benchmark { .. } => unreachable!(),           // Handled earlier
     }
 
     Ok(loading_time)
@@ -794,6 +849,10 @@ fn list_source_files(analyzer: &DwarfAnalyzer, options: &Commands) -> Result<()>
 }
 
 async fn run_benchmark(pid: Option<u32>, target_path: Option<&str>, runs: usize) -> Result<()> {
+    if runs == 0 {
+        return Err(anyhow::anyhow!("Benchmark runs must be greater than 0"));
+    }
+
     if let Some(pid) = pid {
         println!("Benchmarking module loading for PID {pid} ({runs} runs)...\n");
 
@@ -843,6 +902,133 @@ async fn run_benchmark(pid: Option<u32>, target_path: Option<&str>, runs: usize)
     }
 
     Ok(())
+}
+
+async fn run_source_line_benchmark(
+    pid: Option<u32>,
+    target_path: Option<&str>,
+    source: &str,
+    runs: usize,
+    json: bool,
+) -> Result<()> {
+    if runs == 0 {
+        return Err(anyhow::anyhow!("Benchmark runs must be greater than 0"));
+    }
+
+    if !json {
+        if let Some(pid) = pid {
+            println!("Benchmarking source-line query for PID {pid} at {source} ({runs} runs)...\n");
+        } else if let Some(target) = target_path {
+            println!("Benchmarking source-line query for {target} at {source} ({runs} runs)...\n");
+        }
+    }
+
+    let (file_path, line_number) = parse_source_line(source)?;
+
+    let load_start = Instant::now();
+    let mut analyzer = load_analyzer(pid, target_path).await?;
+    let loading_time = load_start.elapsed();
+
+    let mut query_times = Vec::with_capacity(runs);
+    let mut address_count = 0usize;
+    let mut total_variables = 0usize;
+    let mut first_address = None;
+
+    if !json {
+        println!("Loaded in {}ms", loading_time.as_millis());
+        print!("Querying: ");
+        std::io::Write::flush(&mut std::io::stdout()).unwrap();
+    }
+
+    for run_index in 0..runs {
+        if !json {
+            print!(".");
+            std::io::Write::flush(&mut std::io::stdout()).unwrap();
+        }
+
+        let start = Instant::now();
+        let addresses = analyzer.lookup_addresses_by_source_line(file_path, line_number);
+        let mut run_total_variables = 0usize;
+
+        for module_address in &addresses {
+            run_total_variables += analyzer.get_all_variables_at_address(module_address)?.len();
+        }
+
+        query_times.push(start.elapsed());
+
+        if run_index == 0 {
+            address_count = addresses.len();
+            total_variables = run_total_variables;
+            first_address = addresses
+                .first()
+                .map(|addr| format!("0x{:x}", addr.address));
+        }
+    }
+
+    if !json {
+        println!();
+    }
+
+    let result = SourceLineBenchmarkResult {
+        source_location: source.to_string(),
+        loading_time_ms: loading_time.as_millis() as u64,
+        address_count,
+        total_variables,
+        first_address,
+        benchmark: summarize_durations(&query_times)?,
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!("\nQuery summary:");
+        println!("  Addresses: {}", result.address_count);
+        println!("  Total variables: {}", result.total_variables);
+        if let Some(first_address) = &result.first_address {
+            println!("  First address: {first_address}");
+        }
+        println!("\nResults:");
+        println!("  First run: {:.3}ms", result.benchmark.first_run_ms);
+        println!("  Average query time: {:.3}ms", result.benchmark.average_ms);
+        println!("  P50: {:.3}ms", result.benchmark.p50_ms);
+        println!("  P95: {:.3}ms", result.benchmark.p95_ms);
+        println!("  Min: {:.3}ms", result.benchmark.min_ms);
+        println!("  Max: {:.3}ms", result.benchmark.max_ms);
+    }
+
+    Ok(())
+}
+
+fn summarize_durations(durations: &[std::time::Duration]) -> Result<BenchmarkSummary> {
+    if durations.is_empty() {
+        return Err(anyhow::anyhow!("Cannot summarize an empty benchmark run"));
+    }
+
+    let mut samples_ms: Vec<f64> = durations.iter().map(duration_to_ms).collect();
+    samples_ms.sort_by(f64::total_cmp);
+    let average_ms = samples_ms.iter().sum::<f64>() / samples_ms.len() as f64;
+
+    Ok(BenchmarkSummary {
+        runs: durations.len(),
+        first_run_ms: duration_to_ms(&durations[0]),
+        average_ms,
+        min_ms: *samples_ms.first().unwrap(),
+        p50_ms: percentile_nearest_rank(&samples_ms, 0.50),
+        p95_ms: percentile_nearest_rank(&samples_ms, 0.95),
+        max_ms: *samples_ms.last().unwrap(),
+    })
+}
+
+fn duration_to_ms(duration: &std::time::Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
+fn percentile_nearest_rank(sorted_samples_ms: &[f64], percentile: f64) -> f64 {
+    assert!(!sorted_samples_ms.is_empty());
+
+    let rank = (percentile.clamp(0.0, 1.0) * sorted_samples_ms.len() as f64).ceil() as usize;
+    let index = rank.saturating_sub(1).min(sorted_samples_ms.len() - 1);
+    sorted_samples_ms[index]
 }
 
 fn print_variables_with_style(
@@ -942,6 +1128,25 @@ fn parse_address(address_str: &str) -> Result<u64> {
         address_str.parse::<u64>()
     }
     .map_err(|_| anyhow::anyhow!("Invalid address format: {}", address_str))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_source_line, percentile_nearest_rank};
+
+    #[test]
+    fn parses_source_line_with_colons_in_path() {
+        let (file_path, line_number) = parse_source_line("/tmp/drive:c/main.c:42").unwrap();
+        assert_eq!(file_path, "/tmp/drive:c/main.c");
+        assert_eq!(line_number, 42);
+    }
+
+    #[test]
+    fn computes_percentiles_with_nearest_rank() {
+        let samples = [1.0, 2.0, 3.0, 4.0, 5.0];
+        assert_eq!(percentile_nearest_rank(&samples, 0.50), 3.0);
+        assert_eq!(percentile_nearest_rank(&samples, 0.95), 5.0);
+    }
 }
 
 #[derive(Debug, serde::Serialize)]

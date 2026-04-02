@@ -54,8 +54,12 @@ This will:
 
 - build the corpus unless `--skip-build` is passed
 - run the parse benchmark through `dwarf-tool benchmark`
-- run the query benchmark through `dwarf-tool source-line`
+- run the query benchmark through `dwarf-tool benchmark-source-line`
 - write a JSON result under `perf-results/`
+
+The source-line benchmark keeps one analyzer instance warm, repeats the same
+query multiple times, and records `first_run_ms`, `average_ms`, `p50_ms`,
+`p95_ms`, `min_ms`, and `max_ms`.
 
 ## Tuning
 

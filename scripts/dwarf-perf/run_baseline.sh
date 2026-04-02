@@ -20,7 +20,7 @@ Options:
   --corpus-dir PATH      corpus output directory (default: perf-corpus/out)
   --results-dir PATH     result directory (default: perf-results)
   --result-name NAME     result file stem (default: timestamp-based)
-  --runs N               benchmark runs for parse baseline (default: 10)
+  --runs N               benchmark runs for parse and query baselines (default: 10)
   --cargo-target-dir P   cargo target dir for dwarf-tool (default: .target_tmp/dwarf-perf)
   -h, --help             show this help
 EOF
@@ -120,7 +120,8 @@ PARSE_OUTPUT=$(CARGO_TARGET_DIR="$CARGO_TARGET_DIR_VALUE" \
 QUERY_OUTPUT=$(CARGO_TARGET_DIR="$CARGO_TARGET_DIR_VALUE" \
     cargo run -q -p dwarf-tool -- \
     -t "$QUERY_BINARY" \
-    source-line "${QUERY_SOURCE_ABS}:${QUERY_LINE}" \
+    benchmark-source-line "${QUERY_SOURCE_ABS}:${QUERY_LINE}" \
+    --runs "$RUNS" \
     --json)
 
 PARSE_AVG_MS=$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Average load time:/ {gsub("ms","",$4); print $4}')
@@ -128,8 +129,15 @@ PARSE_MIN_MS=$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Min:/ {gsub("ms","",$2); pr
 PARSE_MAX_MS=$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Max:/ {gsub("ms","",$2); print $2}')
 QUERY_JSON=$(printf '%s\n' "$QUERY_OUTPUT" | sed -n '/^{/,$p')
 QUERY_TOTAL_VARS=$(printf '%s\n' "$QUERY_JSON" | jq '.total_variables')
-QUERY_ADDRESS_COUNT=$(printf '%s\n' "$QUERY_JSON" | jq '.addresses | length')
-QUERY_FIRST_ADDRESS=$(printf '%s\n' "$QUERY_JSON" | jq -r '.addresses[0].address // empty')
+QUERY_ADDRESS_COUNT=$(printf '%s\n' "$QUERY_JSON" | jq '.address_count')
+QUERY_FIRST_ADDRESS=$(printf '%s\n' "$QUERY_JSON" | jq -r '.first_address // empty')
+QUERY_LOADING_MS=$(printf '%s\n' "$QUERY_JSON" | jq '.loading_time_ms')
+QUERY_FIRST_RUN_MS=$(printf '%s\n' "$QUERY_JSON" | jq '.benchmark.first_run_ms')
+QUERY_AVG_MS=$(printf '%s\n' "$QUERY_JSON" | jq '.benchmark.average_ms')
+QUERY_P50_MS=$(printf '%s\n' "$QUERY_JSON" | jq '.benchmark.p50_ms')
+QUERY_P95_MS=$(printf '%s\n' "$QUERY_JSON" | jq '.benchmark.p95_ms')
+QUERY_MIN_MS=$(printf '%s\n' "$QUERY_JSON" | jq '.benchmark.min_ms')
+QUERY_MAX_MS=$(printf '%s\n' "$QUERY_JSON" | jq '.benchmark.max_ms')
 
 jq -n \
     --arg generated_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
@@ -146,6 +154,13 @@ jq -n \
     --argjson parse_avg_ms "$PARSE_AVG_MS" \
     --argjson parse_min_ms "$PARSE_MIN_MS" \
     --argjson parse_max_ms "$PARSE_MAX_MS" \
+    --argjson query_loading_ms "$QUERY_LOADING_MS" \
+    --argjson query_first_run_ms "$QUERY_FIRST_RUN_MS" \
+    --argjson query_avg_ms "$QUERY_AVG_MS" \
+    --argjson query_p50_ms "$QUERY_P50_MS" \
+    --argjson query_p95_ms "$QUERY_P95_MS" \
+    --argjson query_min_ms "$QUERY_MIN_MS" \
+    --argjson query_max_ms "$QUERY_MAX_MS" \
     --argjson query_total_variables "$QUERY_TOTAL_VARS" \
     --argjson query_address_count "$QUERY_ADDRESS_COUNT" \
     --slurpfile manifest_json "$MANIFEST_PATH" \
@@ -170,9 +185,17 @@ jq -n \
                 path: $query_source,
                 line: ($query_line | tonumber)
             },
+            loading_time_ms: $query_loading_ms,
+            runs: $runs,
             first_address: $query_first_address,
             address_count: $query_address_count,
             total_variables: $query_total_variables,
+            first_run_ms: $query_first_run_ms,
+            average_ms: $query_avg_ms,
+            p50_ms: $query_p50_ms,
+            p95_ms: $query_p95_ms,
+            min_ms: $query_min_ms,
+            max_ms: $query_max_ms,
             result: $query_result
         },
         corpus_manifest: $manifest_json[0]
@@ -182,10 +205,18 @@ echo "$PARSE_OUTPUT"
 echo
 echo "Query benchmark:"
 echo "  source: ${QUERY_SOURCE_ABS}:${QUERY_LINE}"
+echo "  loading time: ${QUERY_LOADING_MS}ms"
+echo "  runs: $RUNS"
 echo "  addresses: $QUERY_ADDRESS_COUNT"
 echo "  total variables: $QUERY_TOTAL_VARS"
 if [[ -n "$QUERY_FIRST_ADDRESS" ]]; then
     echo "  first address: $QUERY_FIRST_ADDRESS"
 fi
+echo "  first run: ${QUERY_FIRST_RUN_MS}ms"
+echo "  average: ${QUERY_AVG_MS}ms"
+echo "  p50: ${QUERY_P50_MS}ms"
+echo "  p95: ${QUERY_P95_MS}ms"
+echo "  min: ${QUERY_MIN_MS}ms"
+echo "  max: ${QUERY_MAX_MS}ms"
 echo
 echo "Result JSON: $RESULT_PATH"
