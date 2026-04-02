@@ -27,8 +27,9 @@ jobs:
     env:
       BASE_SHA: ${{ github.event.pull_request.base.sha }}
       HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-      CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target-dwarf-perf
-      DWARF_PERF_RESULTS_DIR: ${{ runner.temp }}/dwarf-perf-results
+      CARGO_TARGET_DIR: ${{ github.workspace }}/.target_tmp/dwarf-perf-regression
+      DWARF_PERF_RESULTS_DIR: ${{ github.workspace }}/.tmp/dwarf-perf-results
+      DWARF_PERF_CHANGED_FILES: ${{ github.workspace }}/.tmp/dwarf-perf-changed-files.txt
     steps:
       - name: Checkout head
         uses: actions/checkout@v4
@@ -56,7 +57,8 @@ jobs:
           done
 
           changed_files=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
-          printf '%s\n' "$changed_files" > "$RUNNER_TEMP/dwarf-perf-changed-files.txt"
+          mkdir -p "$(dirname "$DWARF_PERF_CHANGED_FILES")"
+          printf '%s\n' "$changed_files" > "$DWARF_PERF_CHANGED_FILES"
 
           benchmark_changed=false
           if printf '%s\n' "$changed_files" | grep -Eq \
@@ -105,7 +107,7 @@ jobs:
       - name: Cache cargo build
         uses: actions/cache@v4
         with:
-          path: ${{ runner.temp }}/cargo-target-dwarf-perf
+          path: ${{ github.workspace }}/.target_tmp/dwarf-perf-regression
           key: ${{ runner.os }}-dwarf-perf-target-${{ hashFiles('head/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-dwarf-perf-target-
@@ -208,9 +210,9 @@ jobs:
         with:
           name: dwarf-perf-regression-${{ github.event.pull_request.number }}
           path: |
-            ${{ runner.temp }}/dwarf-perf-results/*.json
-            ${{ runner.temp }}/dwarf-perf-results/*.md
-            ${{ runner.temp }}/dwarf-perf-changed-files.txt
+            ${{ github.workspace }}/.tmp/dwarf-perf-results/*.json
+            ${{ github.workspace }}/.tmp/dwarf-perf-results/*.md
+            ${{ github.workspace }}/.tmp/dwarf-perf-changed-files.txt
 
       - name: Enforce regression gate
         if: ${{ steps.compare.outputs.exit_code && steps.compare.outputs.exit_code != '0' }}
