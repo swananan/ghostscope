@@ -1,3 +1,5 @@
+use crate::trace::instance::TracePidContext;
+
 /// Snapshot of a trace instance for serialization and transfer
 #[derive(Debug, Clone)]
 pub struct TraceSnapshot {
@@ -7,10 +9,7 @@ pub struct TraceSnapshot {
     pub script_content: String,
     pub binary_path: String,
     pub target_display: String,
-    /// Host PID used by eBPF attach/filter.
-    pub target_pid: Option<u32>,
-    /// Userspace-visible PID used for /proc reads and user-facing display.
-    pub target_proc_pid: Option<u32>,
+    pub pid_context: TracePidContext,
     pub is_enabled: bool,
     pub pc: u64,
     #[allow(dead_code)]

@@ -16,7 +16,7 @@ use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, IntValue, PointerV
 use inkwell::AddressSpace;
 
 impl<'ctx> EbpfContext<'ctx> {
-    pub fn lookup_visible_pid_alias(
+    pub fn lookup_proc_pid_alias(
         &mut self,
         runtime_pid: IntValue<'ctx>,
         name_prefix: &str,
@@ -356,7 +356,7 @@ impl<'ctx> EbpfContext<'ctx> {
         let ns_spec = self
             .compile_options
             .proc_offsets_pid_ns
-            .map(|ns| (ns.pid_ns_dev, ns.pid_ns_inode));
+            .and_then(|pid_ns| pid_ns.helper_dev_inode());
 
         let runtime_pid = if let Some((pid_ns_dev, pid_ns_inode)) = ns_spec {
             // Reuse key_alloca as temporary helper output buffer: [pid:u32, tgid:u32].
@@ -421,7 +421,7 @@ impl<'ctx> EbpfContext<'ctx> {
         } else {
             host_tgid
         };
-        let pid = self.lookup_visible_pid_alias(runtime_pid, "offset_pid")?;
+        let pid = self.lookup_proc_pid_alias(runtime_pid, "offset_pid")?;
 
         // Store pid at key[0]
         self.builder

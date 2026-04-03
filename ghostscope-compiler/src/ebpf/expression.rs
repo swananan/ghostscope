@@ -61,17 +61,14 @@ impl<'ctx> EbpfContext<'ctx> {
         let i64_type = self.context.i64_type();
         let (host_pid_i32, host_tid_i32) = self.get_host_pid_tid_values()?;
 
-        let ns_spec = if let Some(crate::PidFilterSpec::NamespaceTgid {
-            pid_ns_dev,
-            pid_ns_inode,
-            ..
-        }) = self.compile_options.pid_filter_spec
+        let ns_spec = if let Some(crate::PidFilterSpec::NamespaceTgid { pid_ns, .. }) =
+            self.compile_options.pid_filter_spec
         {
-            Some((pid_ns_dev, pid_ns_inode))
+            pid_ns.helper_dev_inode()
         } else {
             self.compile_options
                 .special_pid_ns
-                .map(|ns| (ns.pid_ns_dev, ns.pid_ns_inode))
+                .and_then(|pid_ns| pid_ns.helper_dev_inode())
         };
         let Some((pid_ns_dev, pid_ns_inode)) = ns_spec else {
             let host_pid = self
@@ -1777,7 +1774,7 @@ impl<'ctx> EbpfContext<'ctx> {
                 Ok(host_pid.into())
             }
             "input_pid" => {
-                let input_pid = self.compile_options.special_input_pid.ok_or_else(|| {
+                let input_pid = self.compile_options.input_pid.ok_or_else(|| {
                     CodeGenError::NotImplemented(
                         "Special variable '$input_pid' is only available in -p mode".to_string(),
                     )

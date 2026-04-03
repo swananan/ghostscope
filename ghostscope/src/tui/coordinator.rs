@@ -547,8 +547,8 @@ async fn handle_save_traces(
     }
 
     // Set PID if available
-    if let Some(pid) = session.pid() {
-        persistence.set_pid(pid);
+    if let Some(proc_pid) = session.proc_pid() {
+        persistence.set_pid(proc_pid);
     }
 
     // Collect trace information directly from trace manager snapshots (includes pc)

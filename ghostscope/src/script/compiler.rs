@@ -18,27 +18,27 @@ fn pid_alias_runtime_pid(
     compile_options: &ghostscope_compiler::CompileOptions,
 ) -> Option<u32> {
     let resolved_target_ns = session
-        .pid_mapping()
-        .and_then(|mapping| Some((mapping.pid_ns_dev?, mapping.pid_ns_inode?)));
+        .pid_views()
+        .and_then(|pid_views| Some((pid_views.pid_ns_dev()?, pid_views.pid_ns_inode()?)));
     let proc_offsets_ns = compile_options
         .proc_offsets_pid_ns
-        .map(|ns| (ns.pid_ns_dev, ns.pid_ns_inode));
+        .and_then(|pid_ns| pid_ns.helper_dev_inode());
 
     // When proc offsets are configured against the resolved target namespace, the
     // eBPF-side runtime key is the namespace-local TGID rather than the host-visible
     // PID used for `/proc` prefill.
-    if let (Some(mapping), Some(target_ns)) = (session.pid_mapping(), resolved_target_ns) {
-        if proc_offsets_ns == Some(target_ns) && mapping.container_pid.is_some() {
-            return mapping.container_pid;
+    if let (Some(pid_views), Some(target_ns)) = (session.pid_views(), resolved_target_ns) {
+        if proc_offsets_ns == Some(target_ns) && pid_views.container_pid.is_some() {
+            return pid_views.container_pid;
         }
     }
 
     match compile_options.pid_filter_spec {
-        Some(ghostscope_compiler::PidFilterSpec::NamespaceTgid { target_pid, .. }) => {
-            Some(target_pid)
+        Some(ghostscope_compiler::PidFilterSpec::NamespaceTgid { filter_pid, .. }) => {
+            Some(filter_pid)
         }
-        Some(ghostscope_compiler::PidFilterSpec::HostTgid { target_pid }) => Some(target_pid),
-        None => session.pid_for_filter(),
+        Some(ghostscope_compiler::PidFilterSpec::HostTgid { filter_pid }) => Some(filter_pid),
+        None => session.host_pid(),
     }
 }
 
@@ -46,24 +46,24 @@ fn pid_alias_pair(
     session: &GhostSession,
     compile_options: &ghostscope_compiler::CompileOptions,
 ) -> Option<(u32, u32)> {
-    let visible_pid = session.pid_for_proc()?;
+    let proc_pid = session.proc_pid()?;
     let runtime_pid = pid_alias_runtime_pid(session, compile_options)?;
-    (runtime_pid != visible_pid).then_some((runtime_pid, visible_pid))
+    (runtime_pid != proc_pid).then_some((runtime_pid, proc_pid))
 }
 
 fn apply_pid_alias_for_session(
     session: &GhostSession,
     compile_options: &ghostscope_compiler::CompileOptions,
 ) {
-    if let Some((runtime_pid, visible_pid)) = pid_alias_pair(session, compile_options) {
-        match ghostscope_process::pinned_bpf_maps::insert_pid_alias(runtime_pid, visible_pid) {
+    if let Some((runtime_pid, proc_pid)) = pid_alias_pair(session, compile_options) {
+        match ghostscope_process::pinned_bpf_maps::insert_pid_alias(runtime_pid, proc_pid) {
             Ok(()) => info!(
-                "✓ Applied PID alias runtime_pid={} -> visible_pid={}",
-                runtime_pid, visible_pid
+                "✓ Applied PID alias runtime_pid={} -> proc_pid={}",
+                runtime_pid, proc_pid
             ),
             Err(e) => warn!(
-                "Failed to write PID alias runtime_pid={} -> visible_pid={}: {}",
-                runtime_pid, visible_pid, e
+                "Failed to write PID alias runtime_pid={} -> proc_pid={}: {}",
+                runtime_pid, proc_pid, e
             ),
         }
     }
@@ -73,7 +73,7 @@ fn apply_cached_offsets_for_session_pid(
     session: &GhostSession,
     _compile_options: &ghostscope_compiler::CompileOptions,
 ) {
-    if let Some(proc_pid) = session.pid_for_proc() {
+    if let Some(proc_pid) = session.proc_pid() {
         let items = {
             let coordinator = session
                 .coordinator
@@ -283,7 +283,7 @@ pub async fn compile_and_load_script_for_tui(
     session: &mut GhostSession,
     compile_options: &ghostscope_compiler::CompileOptions,
 ) -> Result<ScriptCompilationDetails> {
-    let filter_pid = session.pid_for_filter();
+    let fallback_host_pid = session.host_pid();
 
     // Step 1: Validate process analyzer availability
     let process_analyzer = session
@@ -306,7 +306,7 @@ pub async fn compile_and_load_script_for_tui(
     let compilation_result = match ghostscope_compiler::compile_script(
         script,
         process_analyzer,
-        filter_pid,
+        fallback_host_pid,
         Some(starting_trace_id), // Use trace_manager's next available ID
         compile_options,
     ) {
@@ -399,7 +399,7 @@ pub async fn compile_and_load_script_for_tui(
     );
 
     // Ensure -p offsets are cached once per session
-    if let Some(proc_pid) = session.pid_for_proc() {
+    if let Some(proc_pid) = session.proc_pid() {
         let result = {
             let mut coordinator = session
                 .coordinator
@@ -446,13 +446,8 @@ pub async fn compile_and_load_script_for_tui(
                 .unwrap_or_else(|| format!("{addr_disp:#x}"));
 
             // Create individual loader for this config
-            match create_and_attach_loader(
-                config,
-                session.pid_for_attach(),
-                session,
-                compile_options,
-            )
-            .await
+            match create_and_attach_loader(config, session.attach_pid(), session, compile_options)
+                .await
             {
                 Ok(loader) => {
                     // Apply cached offsets for PID-mode lookups (if available).
@@ -472,12 +467,15 @@ pub async fn compile_and_load_script_for_tui(
                             pc: config.function_address.unwrap_or(0),
                             binary_path: config.binary_path.clone(),
                             target_display: target_display.clone(),
-                            target_pid: session.pid_for_filter(),
-                            target_proc_pid: session.pid_for_proc(),
+                            pid_context: crate::trace::instance::TracePidContext {
+                                attach_pid: session.attach_pid(),
+                                host_pid: session.host_pid(),
+                                proc_pid: session.proc_pid(),
+                            },
                             loader: Some(loader),
                             ebpf_function_name: format!(
                                 "gs_{}_{}_{}",
-                                session.pid_for_filter().unwrap_or(0),
+                                session.host_pid().unwrap_or(0),
                                 target_display,
                                 config.assigned_trace_id
                             ),
@@ -547,7 +545,7 @@ pub async fn compile_and_load_script_for_cli(
     session: &mut GhostSession,
     compile_options: &ghostscope_compiler::CompileOptions,
 ) -> Result<()> {
-    let filter_pid = session.pid_for_filter();
+    let fallback_host_pid = session.host_pid();
 
     info!("Starting unified script compilation with DWARF integration...");
 
@@ -564,7 +562,7 @@ pub async fn compile_and_load_script_for_cli(
     let compilation_result = match ghostscope_compiler::compile_script(
         script,
         process_analyzer,
-        filter_pid,
+        fallback_host_pid,
         Some(starting_trace_id), // Use trace_manager's next available ID
         compile_options,
     ) {
@@ -598,7 +596,7 @@ pub async fn compile_and_load_script_for_cli(
     }
 
     // Ensure -p offsets are cached once per session
-    if let Some(proc_pid) = session.pid_for_proc() {
+    if let Some(proc_pid) = session.proc_pid() {
         let result = {
             let mut coordinator = session
                 .coordinator
@@ -706,8 +704,7 @@ pub async fn compile_and_load_script_for_cli(
             .unwrap_or_else(|| format!("{addr_disp:#x}"));
 
         // Create individual loader for this config
-        match create_and_attach_loader(config, session.pid_for_attach(), session, compile_options)
-            .await
+        match create_and_attach_loader(config, session.attach_pid(), session, compile_options).await
         {
             Ok(loader) => {
                 // Apply cached offsets for PID-mode lookups (if available).
@@ -727,12 +724,15 @@ pub async fn compile_and_load_script_for_cli(
                         pc: config.function_address.unwrap_or(0),
                         binary_path: config.binary_path.clone(),
                         target_display: target_display.clone(),
-                        target_pid: session.pid_for_filter(),
-                        target_proc_pid: session.pid_for_proc(),
+                        pid_context: crate::trace::instance::TracePidContext {
+                            attach_pid: session.attach_pid(),
+                            host_pid: session.host_pid(),
+                            proc_pid: session.proc_pid(),
+                        },
                         loader: Some(loader),
                         ebpf_function_name: format!(
                             "gs_{}_{}_{}",
-                            session.pid_for_filter().unwrap_or(0),
+                            session.host_pid().unwrap_or(0),
                             target_display,
                             config.assigned_trace_id
                         ),

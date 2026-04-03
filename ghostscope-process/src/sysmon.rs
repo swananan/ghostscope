@@ -1,6 +1,7 @@
 use crate::{
     module_probe::cookie_for_path,
     offsets::{PidOffsetsEntry, ProcessManager},
+    pid::{resolve_event_pid_for_proc, resolve_proc_pid_for_event},
     pinned_bpf_maps,
     proc_maps::{visit_proc_maps, ModuleIdentity},
 };
@@ -238,7 +239,7 @@ impl ProcessSysmon {
         tracing::trace!("Sysmon event: kind={:?} event_pid={}", kind, ev.tgid);
         match kind {
             SysEventKind::Exec | SysEventKind::Fork => {
-                let proc_pid = resolve_procfs_pid(ev.tgid);
+                let proc_pid = resolve_proc_pid_for_event(ev.tgid);
                 if let Some(tpath) = target {
                     let path = tpath.as_path();
                     if crate::util::is_shared_object(path) {
@@ -297,7 +298,7 @@ impl ProcessSysmon {
                 }
             }
             SysEventKind::Exit => {
-                let proc_pid = resolve_procfs_pid(ev.tgid);
+                let proc_pid = resolve_proc_pid_for_event(ev.tgid);
                 if let Ok(mut guard) = pending.lock() {
                     guard.remove(ev.tgid);
                 }
@@ -457,7 +458,7 @@ fn run_sysmon_loop(
                         }
                         // Add event PID (kernel namespace) to allowlist so subsequent
                         // fork/exit events are filtered in-kernel.
-                        let event_pid = resolve_event_pid(pid);
+                        let event_pid = resolve_event_pid_for_proc(pid);
                         let _ = crate::pinned_bpf_maps::insert_allowed_pid(event_pid);
                     }
                     tracing::info!(
@@ -708,7 +709,7 @@ fn prefill_offsets_for_pid(
 ) -> anyhow::Result<bool> {
     use crate::pinned_bpf_maps::{insert_offsets_for_pid, ProcModuleOffsetsValue};
 
-    let proc_pid = resolve_procfs_pid(event_pid);
+    let proc_pid = resolve_proc_pid_for_event(event_pid);
     if proc_pid != event_pid {
         if let Err(e) = crate::pinned_bpf_maps::insert_pid_alias(event_pid, proc_pid) {
             tracing::debug!(
@@ -758,7 +759,9 @@ fn prefill_offsets_for_pid(
                                     "Sysmon: module refresh inserted {} offset entries for proc pid {} (event pid {})",
                                     inserted, pid, event_pid
                                 );
-                                let _ = crate::pinned_bpf_maps::insert_allowed_pid(resolve_event_pid(pid));
+                                let _ = crate::pinned_bpf_maps::insert_allowed_pid(
+                                    resolve_event_pid_for_proc(pid),
+                                );
                                 inserted_any = true;
                             }
                             Ok(_) => {}
@@ -900,7 +903,8 @@ fn refresh_target_module_offsets(
             Ok(inserted) => {
                 if inserted > 0 {
                     total += inserted;
-                    let _ = crate::pinned_bpf_maps::insert_allowed_pid(resolve_event_pid(pid));
+                    let _ =
+                        crate::pinned_bpf_maps::insert_allowed_pid(resolve_event_pid_for_proc(pid));
                 }
             }
             Err(e) => tracing::debug!(
@@ -934,7 +938,7 @@ fn poll_pending_offsets(mgr: &Arc<Mutex<ProcessManager>>, pending: &Arc<Mutex<Pe
     let mut to_remove: Vec<u32> = Vec::new();
 
     for (event_pid, target_path, attempts) in due {
-        let proc_pid = resolve_procfs_pid(event_pid);
+        let proc_pid = resolve_proc_pid_for_event(event_pid);
         if !pid_alive(proc_pid) {
             tracing::debug!(
                 "Sysmon: event pid {} (proc pid {}) exited while waiting for offsets; removing from retry queue",
@@ -1002,58 +1006,6 @@ fn poll_pending_offsets(mgr: &Arc<Mutex<ProcessManager>>, pending: &Arc<Mutex<Pe
             }
         }
     }
-}
-
-fn parse_status_chain(status: &str, key: &str) -> Option<Vec<u32>> {
-    status.lines().find_map(|line| {
-        let rest = line.strip_prefix(key)?.trim();
-        let values: Vec<u32> = rest
-            .split_whitespace()
-            .filter_map(|v| v.parse::<u32>().ok())
-            .collect();
-        if values.is_empty() {
-            None
-        } else {
-            Some(values)
-        }
-    })
-}
-
-fn read_nspid_chain(pid: u32) -> Option<Vec<u32>> {
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    parse_status_chain(&status, "NSpid:")
-}
-
-/// Resolve a kernel event PID (initial PID namespace) to the /proc-visible PID in
-/// the current namespace when possible.
-fn resolve_procfs_pid(event_pid: u32) -> u32 {
-    if std::path::Path::new(&format!("/proc/{event_pid}")).exists() {
-        return event_pid;
-    }
-
-    if let Ok(dir) = std::fs::read_dir("/proc") {
-        for ent in dir.flatten() {
-            let fname = ent.file_name();
-            let Ok(visible_pid) = fname.to_string_lossy().parse::<u32>() else {
-                continue;
-            };
-            let Some(chain) = read_nspid_chain(visible_pid) else {
-                continue;
-            };
-            if chain.first().copied() == Some(event_pid) {
-                return visible_pid;
-            }
-        }
-    }
-
-    event_pid
-}
-
-/// Resolve a /proc-visible PID back to the kernel event PID when possible.
-fn resolve_event_pid(proc_pid: u32) -> u32 {
-    read_nspid_chain(proc_pid)
-        .and_then(|chain| chain.first().copied())
-        .unwrap_or(proc_pid)
 }
 
 fn get_comm_from_proc(pid: u32) -> Option<String> {

@@ -1,3 +1,6 @@
+use crate::pid::{
+    host_pid_for_proc_pid, read_nspid_chain, read_pid_ns_inode, INITIAL_PID_NAMESPACE_INO,
+};
 use aya::maps::MapData;
 use aya_obj::maps::bpf_map_def;
 use aya_obj::{
@@ -6,13 +9,11 @@ use aya_obj::{
 use libc as c;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 const BPFFS_MOUNT_POINT: &str = "/sys/fs/bpf";
 const BPFFS_ROOT: &str = "/sys/fs/bpf/ghostscope";
-const INITIAL_PID_NAMESPACE_INO: u64 = 4026531836;
 const PROC_STAT_STARTTIME_INDEX: usize = 19;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,32 +72,6 @@ fn process_starttime(pid: u32) -> io::Result<u64> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-fn parse_status_chain(status: &str, key: &str) -> Option<Vec<u32>> {
-    status.lines().find_map(|line| {
-        let rest = line.strip_prefix(key)?.trim();
-        let values: Vec<u32> = rest
-            .split_whitespace()
-            .filter_map(|value| value.parse::<u32>().ok())
-            .collect();
-        if values.is_empty() {
-            None
-        } else {
-            Some(values)
-        }
-    })
-}
-
-fn read_nspid_chain(pid: u32) -> Option<Vec<u32>> {
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    parse_status_chain(&status, "NSpid:")
-}
-
-fn host_pid_for_visible_pid(pid: u32) -> u32 {
-    read_nspid_chain(pid)
-        .and_then(|chain| chain.first().copied())
-        .unwrap_or(pid)
-}
-
 fn host_pid_mapping_from_chain(
     chain: Option<&[u32]>,
     allow_single_value_nspid: bool,
@@ -111,13 +86,7 @@ fn host_pid_mapping_from_chain(
     }
 }
 
-fn read_pid_namespace_inode(pid: u32) -> Option<u64> {
-    std::fs::metadata(format!("/proc/{pid}/ns/pid"))
-        .ok()
-        .map(|metadata| metadata.ino())
-}
-
-fn resolve_visible_pid_for_host_pid(host_pid: u32, allow_single_value_nspid: bool) -> Option<u32> {
+fn resolve_proc_pid_for_host_pid(host_pid: u32, allow_single_value_nspid: bool) -> Option<u32> {
     let direct = Path::new("/proc").join(host_pid.to_string());
     if direct.exists() {
         let chain = read_nspid_chain(host_pid);
@@ -129,13 +98,13 @@ fn resolve_visible_pid_for_host_pid(host_pid: u32, allow_single_value_nspid: boo
 
     let entries = std::fs::read_dir("/proc").ok()?;
     for entry in entries.flatten() {
-        let Ok(visible_pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+        let Ok(proc_pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
             continue;
         };
-        let chain = read_nspid_chain(visible_pid);
+        let chain = read_nspid_chain(proc_pid);
         if host_pid_mapping_from_chain(chain.as_deref(), allow_single_value_nspid) == Some(host_pid)
         {
-            return Some(visible_pid);
+            return Some(proc_pid);
         }
     }
 
@@ -143,16 +112,15 @@ fn resolve_visible_pid_for_host_pid(host_pid: u32, allow_single_value_nspid: boo
 }
 
 fn current_process_identity() -> anyhow::Result<CurrentProcessIdentity> {
-    let visible_pid = std::process::id();
-    let initial_pid_namespace =
-        read_pid_namespace_inode(visible_pid) == Some(INITIAL_PID_NAMESPACE_INO);
-    let nspid_chain = read_nspid_chain(visible_pid);
+    let proc_pid = std::process::id();
+    let initial_pid_namespace = read_pid_ns_inode(proc_pid) == Some(INITIAL_PID_NAMESPACE_INO);
+    let nspid_chain = read_nspid_chain(proc_pid);
     let host_pid_reliable =
         initial_pid_namespace || nspid_chain.as_ref().is_some_and(|chain| chain.len() > 1);
     Ok(CurrentProcessIdentity {
-        host_pid: host_pid_for_visible_pid(visible_pid),
+        host_pid: host_pid_for_proc_pid(proc_pid),
         host_pid_reliable,
-        starttime: process_starttime(visible_pid)?,
+        starttime: process_starttime(proc_pid)?,
         initial_pid_namespace,
     })
 }
@@ -263,7 +231,7 @@ unsafe impl aya::Pod for ProcModuleOffsetsValue {}
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct PidAliasValue {
-    pub visible_pid: u32,
+    pub proc_pid: u32,
 }
 
 unsafe impl aya::Pod for PidAliasValue {}
@@ -656,12 +624,12 @@ pub fn remove_allowed_pid(pid: u32) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("allowed_pids delete failed for {}: {}", pid, e))
 }
 
-/// Insert a runtime-pid -> visible-pid alias into the pinned pid_aliases map.
-pub fn insert_pid_alias(runtime_pid: u32, visible_pid: u32) -> anyhow::Result<()> {
+/// Insert a runtime-pid -> proc-pid alias into the pinned pid_aliases map.
+pub fn insert_pid_alias(runtime_pid: u32, proc_pid: u32) -> anyhow::Result<()> {
     let map_data = MapData::from_pin(pid_aliases_pin_path()?)?;
     let fd = map_data.fd().as_fd().as_raw_fd();
     let key = runtime_pid;
-    let val = PidAliasValue { visible_pid };
+    let val = PidAliasValue { proc_pid };
     bpf_map_update_elem(
         fd,
         &key as *const _ as *const _,
@@ -670,9 +638,9 @@ pub fn insert_pid_alias(runtime_pid: u32, visible_pid: u32) -> anyhow::Result<()
     )
     .map_err(|e| {
         anyhow::anyhow!(
-            "pid_aliases update failed for runtime_pid={} visible_pid={}: {}",
+            "pid_aliases update failed for runtime_pid={} proc_pid={}: {}",
             runtime_pid,
-            visible_pid,
+            proc_pid,
             e
         )
     })
@@ -823,7 +791,7 @@ fn stale_reason_for_dir<R, S>(
     host_pid: u32,
     dir_starttime: u64,
     current: CurrentProcessIdentity,
-    resolve_visible_pid: &R,
+    resolve_proc_pid: &R,
     read_starttime: &S,
 ) -> Option<&'static str>
 where
@@ -834,11 +802,11 @@ where
         return (dir_starttime != current.starttime).then_some("starttime_mismatch");
     }
 
-    let Some(visible_pid) = resolve_visible_pid(host_pid) else {
+    let Some(proc_pid) = resolve_proc_pid(host_pid) else {
         return current.initial_pid_namespace.then_some("pid_not_running");
     };
 
-    match read_starttime(visible_pid) {
+    match read_starttime(proc_pid) {
         Ok(live_starttime) if live_starttime != dir_starttime => Some("starttime_mismatch"),
         Ok(_) => None,
         Err(_) => current.initial_pid_namespace.then_some("pid_not_running"),
@@ -863,7 +831,7 @@ fn prune_pinned_maps_under<R, S>(
     root: &Path,
     current: CurrentProcessIdentity,
     options: &BpffsPruneOptions,
-    resolve_visible_pid: R,
+    resolve_proc_pid: R,
     read_starttime: S,
 ) -> anyhow::Result<BpffsPruneReport>
 where
@@ -939,7 +907,7 @@ where
                 host_pid,
                 dir_starttime,
                 current,
-                &resolve_visible_pid,
+                &resolve_proc_pid,
                 &read_starttime,
             ),
             BpffsPruneMode::All => Some("force_all"),
@@ -975,7 +943,7 @@ where
 fn cleanup_stale_pinned_maps_under<R, S>(
     root: &Path,
     current: CurrentProcessIdentity,
-    resolve_visible_pid: R,
+    resolve_proc_pid: R,
     read_starttime: S,
 ) -> anyhow::Result<usize>
 where
@@ -989,7 +957,7 @@ where
             mode: BpffsPruneMode::Stale,
             dry_run: false,
         },
-        resolve_visible_pid,
+        resolve_proc_pid,
         read_starttime,
     )?;
 
@@ -1013,7 +981,7 @@ pub fn cleanup_stale_pinned_maps_root() -> anyhow::Result<usize> {
     cleanup_stale_pinned_maps_under(
         Path::new(BPFFS_ROOT),
         current,
-        |host_pid| resolve_visible_pid_for_host_pid(host_pid, current.initial_pid_namespace),
+        |host_pid| resolve_proc_pid_for_host_pid(host_pid, current.initial_pid_namespace),
         process_starttime,
     )
 }
@@ -1024,7 +992,7 @@ pub fn prune_pinned_maps_root(options: &BpffsPruneOptions) -> anyhow::Result<Bpf
         Path::new(BPFFS_ROOT),
         current,
         options,
-        |host_pid| resolve_visible_pid_for_host_pid(host_pid, current.initial_pid_namespace),
+        |host_pid| resolve_proc_pid_for_host_pid(host_pid, current.initial_pid_namespace),
         process_starttime,
     )
 }
@@ -1348,11 +1316,11 @@ mod tests {
     }
 
     #[test]
-    fn stale_prune_keeps_live_dir_when_host_pid_maps_to_visible_pid() {
+    fn stale_prune_keeps_live_dir_when_host_pid_maps_to_proc_pid() {
         let temp = tempdir().unwrap();
-        let visible_pid = std::process::id();
-        let visible_starttime = process_starttime(visible_pid).unwrap();
-        let live_dir = temp.path().join(format!("999-{visible_starttime}"));
+        let proc_pid = std::process::id();
+        let proc_starttime = process_starttime(proc_pid).unwrap();
+        let live_dir = temp.path().join(format!("999-{proc_starttime}"));
         fs::create_dir_all(&live_dir).unwrap();
         fs::write(live_dir.join(PROC_OFFSETS_MAP_NAME), b"offsets").unwrap();
         fs::write(live_dir.join(ALLOWED_PIDS_MAP_NAME), b"allow").unwrap();
@@ -1364,14 +1332,14 @@ mod tests {
                 mode: BpffsPruneMode::Stale,
                 dry_run: false,
             },
-            |host_pid| (host_pid == 999).then_some(visible_pid),
+            |host_pid| (host_pid == 999).then_some(proc_pid),
             process_starttime,
         )
         .unwrap();
 
         assert!(live_dir.exists());
         assert!(report.entries.iter().any(|entry| {
-            entry.directory == format!("999-{visible_starttime}")
+            entry.directory == format!("999-{proc_starttime}")
                 && entry.status == BpffsPruneStatus::SkipLive
                 && entry.reason == "live_instance"
         }));

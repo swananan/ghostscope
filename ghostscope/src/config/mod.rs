@@ -12,11 +12,11 @@ pub mod merged;
 pub mod runtime_env;
 pub mod settings;
 
-pub use crate::pid::{resolve_pid_info, ResolvedPidInfo};
 pub use args::{
     Args, BpffsCommand, BpffsPruneArgs, LayoutMode, ParsedArgs, ParsedCommand, ScriptOutputMode,
     ScriptTimestampFormat,
 };
+pub use ghostscope_process::{resolve_input_pid, PidViews};
 pub use merged::MergedConfig;
 pub use runtime_env::{detect_runtime_environment, RuntimeEnvironmentInfo};
 pub use settings::{CliColorMode, Config, LogLevel, PanelType};
