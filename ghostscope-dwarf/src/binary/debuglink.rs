@@ -3,10 +3,9 @@
 //! This module implements the standard GNU debuglink mechanism for locating
 //! debug information in separate files, following GDB's search strategy.
 
-use crate::core::Result;
+use crate::{binary::MappedFile, core::Result};
 use object::Object;
 use std::collections::HashSet;
-use std::fs::File;
 use std::path::{Path, PathBuf};
 
 /// Find separate debug file using .gnu_debuglink section
@@ -38,8 +37,8 @@ pub fn find_debug_file<P: AsRef<Path>>(
     let binary_path = binary_path.as_ref();
 
     // Read binary and check for .gnu_debuglink section
-    let binary_data = std::fs::read(binary_path)?;
-    let binary_obj = object::File::parse(&*binary_data)?;
+    let binary_data = MappedFile::open(binary_path)?;
+    let binary_obj = binary_data.parse_object()?;
 
     // Extract build ID from binary for later verification
     let binary_build_id = binary_obj.build_id().ok().flatten();
@@ -223,10 +222,10 @@ fn verify_debug_file(
     expected_crc: u32,
     binary_build_id: Option<&[u8]>,
 ) -> Result<bool> {
-    let file_data = std::fs::read(debug_file_path)?;
+    let file_data = MappedFile::open(debug_file_path)?;
 
     // 1. Verify CRC-32
-    let actual_crc = calculate_gnu_debuglink_crc(&file_data);
+    let actual_crc = calculate_gnu_debuglink_crc(file_data.as_bytes());
 
     if actual_crc != expected_crc {
         tracing::error!(
@@ -244,7 +243,7 @@ fn verify_debug_file(
     );
 
     // 2. Verify build ID if present
-    let debug_obj = object::File::parse(&*file_data)?;
+    let debug_obj = file_data.parse_object()?;
     let debug_build_id = debug_obj.build_id().ok().flatten();
 
     match (binary_build_id, debug_build_id) {
@@ -302,7 +301,7 @@ pub fn try_load_debug_file<P: AsRef<Path>>(
     binary_path: P,
     user_search_paths: &[String],
     allow_loose_debug_match: bool,
-) -> Result<Option<(PathBuf, memmap2::Mmap)>> {
+) -> Result<Option<MappedFile>> {
     let binary_path = binary_path.as_ref();
 
     match find_debug_file(binary_path, user_search_paths, allow_loose_debug_match)? {
@@ -311,11 +310,7 @@ pub fn try_load_debug_file<P: AsRef<Path>>(
                 "Loading debug info from separate file: {}",
                 debug_path.display()
             );
-
-            let file = File::open(&debug_path)?;
-            let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
-
-            Ok(Some((debug_path, mmap)))
+            Ok(Some(MappedFile::open(&debug_path)?))
         }
         None => Ok(None),
     }

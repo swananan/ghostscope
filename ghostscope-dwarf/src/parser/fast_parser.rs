@@ -6,7 +6,7 @@ use crate::{
         demangle::{demangle_by_lang, demangled_leaf},
         IndexEntry, Result,
     },
-    data::{
+    index::{
         directory_from_index, resolve_file_path, LightweightFileIndex, LightweightIndex,
         LineMappingTable, ScopedFileIndexManager,
     },

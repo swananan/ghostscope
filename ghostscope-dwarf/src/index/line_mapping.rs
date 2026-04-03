@@ -26,7 +26,7 @@ impl LineMappingTable {
     /// This builds canonical path-based indices so basename lookups can take the fast path.
     pub(crate) fn from_entries_with_scoped_manager(
         mut entries: Vec<LineEntry>,
-        scoped: &crate::data::ScopedFileIndexManager,
+        scoped: &crate::index::ScopedFileIndexManager,
     ) -> Self {
         let mut address_to_line_map = BTreeMap::new();
         let mut path_line_to_addresses: HashMap<(String, u64), Vec<u64>> = HashMap::new();

@@ -5,7 +5,7 @@
 //! - Finding typedef DIEs by name
 
 use crate::core::IndexFlags;
-use crate::data::LightweightIndex;
+use crate::index::LightweightIndex;
 use gimli::DwTag;
 use std::collections::HashMap;
 use tracing::info;

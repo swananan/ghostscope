@@ -54,7 +54,7 @@ impl DetailedParser {
     }
 
     /// Attach a cross-CU type name index for faster completion
-    pub fn set_type_name_index(&mut self, _index: std::sync::Arc<crate::data::TypeNameIndex>) {}
+    pub fn set_type_name_index(&mut self, _index: std::sync::Arc<crate::index::TypeNameIndex>) {}
 
     // Full type resolution intentionally removed; only shallow type resolution is supported.
 

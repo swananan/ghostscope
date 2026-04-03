@@ -2,7 +2,7 @@
 //! This version actually parses DWARF DIEs instead of returning hardcoded data
 
 use crate::{
-    core::Result, data::TypeNameIndex, parser::DetailedParser, parser::VariableWithEvaluation,
+    core::Result, index::TypeNameIndex, parser::DetailedParser, parser::VariableWithEvaluation,
 };
 use gimli::{EndianArcSlice, LittleEndian};
 // Use upper-case aliases to satisfy non_upper_case_globals lint on pattern constants

@@ -405,7 +405,7 @@ impl DwarfAnalyzer {
     pub fn get_all_variables_at_address(
         &mut self,
         module_address: &ModuleAddress,
-    ) -> Result<Vec<crate::data::VariableWithEvaluation>> {
+    ) -> Result<Vec<crate::VariableWithEvaluation>> {
         tracing::info!(
             "Looking up variables at address 0x{:x} in module {}",
             module_address.address,
@@ -432,7 +432,7 @@ impl DwarfAnalyzer {
         module_address: &ModuleAddress,
         base_var: &str,
         chain: &[String],
-    ) -> Result<Option<crate::data::VariableWithEvaluation>> {
+    ) -> Result<Option<crate::VariableWithEvaluation>> {
         if let Some(module_data) = self.modules.get_mut(&module_address.module_path) {
             module_data.plan_chain_access(module_address.address, base_var, chain)
         } else {
@@ -484,7 +484,7 @@ impl DwarfAnalyzer {
         prefer_module: &PathBuf,
         base: &str,
         fields: &[String],
-    ) -> Result<Option<(PathBuf, crate::data::VariableWithEvaluation)>> {
+    ) -> Result<Option<(PathBuf, crate::VariableWithEvaluation)>> {
         // 1) Globals across modules (strict)
         let matches = self.find_global_variables_by_name(base);
         if matches.is_empty() {
@@ -520,7 +520,7 @@ impl DwarfAnalyzer {
                     } else {
                         format!("{base}.{}", fields.join("."))
                     };
-                    let var = crate::data::VariableWithEvaluation {
+                    let var = crate::VariableWithEvaluation {
                         name,
                         type_name: final_ty.type_name(),
                         dwarf_type: Some(final_ty),
@@ -571,7 +571,7 @@ impl DwarfAnalyzer {
         module_path: P,
         cu_off: gimli::DebugInfoOffset,
         die_off: gimli::UnitOffset,
-    ) -> Result<crate::data::VariableWithEvaluation> {
+    ) -> Result<crate::VariableWithEvaluation> {
         let path_buf = module_path.as_ref().to_path_buf();
         if let Some(module_data) = self.modules.get_mut(&path_buf) {
             let items = vec![(cu_off, die_off)];
