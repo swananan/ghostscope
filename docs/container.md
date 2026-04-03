@@ -522,7 +522,7 @@ So today's container support should be understood more narrowly:
 
 - GhostScope can run on the host and observe target processes that happen to run inside containers on that host. This is the primary container story.
 - GhostScope can run inside a container and observe processes in that same container PID namespace.
-- Descendant / nested PID namespaces that remain visible from that container are still within the intended scope, and `-p` now has a dedicated "outer container -> child container target" validation path. Re-enabling that topology in the full container-e2e CI matrix is deferred until nested target-mode lifecycle support exists for the outer-container `/proc` PID view. Nested `-t` lifecycle maintenance is still a separate limitation.
+- Descendant / nested PID namespaces that remain visible from that container are still within the intended scope, and `-p` now has a dedicated "outer container -> child container target" validation path. That topology is back in the full container-e2e CI matrix for dedicated validation of the supported coverage, while nested `-t` lifecycle maintenance remains a separate limitation.
 - More specifically, nested child-container `-t` is not currently treated as supported coverage. `event_pid` is learned in host-view terms, while `proc_module_offsets` is still keyed by the outer container's `/proc` PID view, and the project no longer relies on post-hoc trace-event PID alias guessing to bridge that gap.
 - GhostScope can run inside a `--pid=host` container and observe host-visible processes because the PID view is shared with the host.
 
