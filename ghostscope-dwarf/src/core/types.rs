@@ -1,6 +1,5 @@
 //! Core data types for DWARF analysis
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Module address pair - combines module path with address offset
@@ -62,13 +61,6 @@ pub struct LineInfo {
     pub line_number: u32,
     pub file_path: String,
     pub address: u64,
-}
-
-/// Memory mapped file data
-#[derive(Debug)]
-pub struct MappedFile {
-    pub data: memmap2::Mmap,
-    pub path: PathBuf,
 }
 
 /// Cooked index entry - inspired by GDB's cooked_index_entry

@@ -12,7 +12,7 @@ use gimli::{EndianArcSlice, LittleEndian};
 /// Utilities for DIE-level chain access planning
 pub struct AccessPlanner<'dwarf> {
     dwarf: &'dwarf gimli::Dwarf<EndianArcSlice<LittleEndian>>,
-    type_index: Option<std::sync::Arc<crate::data::TypeNameIndex>>,
+    type_index: Option<std::sync::Arc<crate::index::TypeNameIndex>>,
     strict_index: bool,
 }
 
@@ -35,7 +35,7 @@ impl<'dwarf> AccessPlanner<'dwarf> {
 
     pub fn new_with_index(
         dwarf: &'dwarf gimli::Dwarf<EndianArcSlice<LittleEndian>>,
-        type_index: std::sync::Arc<crate::data::TypeNameIndex>,
+        type_index: std::sync::Arc<crate::index::TypeNameIndex>,
         strict_index: bool,
     ) -> Self {
         Self {
@@ -363,7 +363,7 @@ impl<'dwarf> AccessPlanner<'dwarf> {
 mod tests {
     use super::*;
     use crate::core::{IndexEntry, IndexFlags};
-    use crate::data::{LightweightIndex, TypeNameIndex};
+    use crate::index::{LightweightIndex, TypeNameIndex};
     use gimli::constants;
     use gimli::write::{
         AttributeValue as WriteAttributeValue, Dwarf as WriteDwarf, EndianVec, LineProgram,

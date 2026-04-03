@@ -7,12 +7,13 @@
 pub mod core;
 
 // Internal implementation modules
-pub(crate) mod data;
-pub(crate) mod debuglink;
+pub(crate) mod binary;
+pub(crate) mod index;
 pub(crate) mod loader;
 pub(crate) mod module;
 pub(crate) mod parser;
 pub(crate) mod planner;
+pub(crate) mod resolver;
 pub(crate) mod semantics;
 
 // Main entry point
@@ -48,7 +49,7 @@ pub use ghostscope_protocol::{
 };
 
 // Re-export data types needed by external users
-pub use data::VariableWithEvaluation;
+pub use parser::VariableWithEvaluation;
 
 // Re-export gimli types that external users need
 pub use gimli::{constants, DwAte};

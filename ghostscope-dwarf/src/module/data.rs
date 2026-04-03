@@ -22,13 +22,14 @@ mod file_selection_scoring {
 }
 
 use crate::{
-    core::{
-        mapping::ModuleMapping, GlobalVariableInfo, MappedFile, Result, SectionType, SourceLocation,
-    },
-    data::{
-        CfiIndex, LightweightIndex, LineMappingTable, OnDemandResolver, ScopedFileIndexManager,
+    binary::{try_load_debug_file, MappedFile},
+    core::{mapping::ModuleMapping, GlobalVariableInfo, Result, SectionType, SourceLocation},
+    index::{
+        BlockIndex, BlockIndexBuilder, CfiIndex, FunctionBlocks, LightweightIndex,
+        LineMappingTable, ScopedFileIndexManager, TypeNameIndex, VarRef,
     },
     parser::{CompilationUnit, ExpressionEvaluator, SourceFile},
+    resolver::{ChainSpec, OnDemandResolver},
     semantics::{resolve_attr_with_unit_origins, resolve_name_with_origins},
 };
 use gimli::{LittleEndian, Reader};
@@ -64,9 +65,9 @@ pub(crate) struct ModuleData {
     /// Memory mapped file for binary (used for vaddr to file offset calculation)
     _binary_mapped_file: std::sync::Arc<MappedFile>,
     /// Per-function block/variable index (blockvector-like)
-    block_index: crate::data::BlockIndex,
+    block_index: BlockIndex,
     /// Type name index for cross-CU completion
-    type_name_index: crate::data::TypeNameIndex,
+    type_name_index: TypeNameIndex,
     /// Demangled name maps for flexible lookups
     demangled_function_map: HashMap<String, Vec<usize>>,
     demangled_function_leaf_map: HashMap<String, Vec<usize>>,
@@ -76,7 +77,7 @@ pub(crate) struct ModuleData {
 
 impl ModuleData {
     // Find the innermost inline node containing the PC
-    fn find_innermost_inline_node(func: &crate::data::FunctionBlocks, pc: u64) -> Option<usize> {
+    fn find_innermost_inline_node(func: &FunctionBlocks, pc: u64) -> Option<usize> {
         let path = func.block_path_for_pc(pc);
         path.iter()
             .rev()
@@ -87,11 +88,11 @@ impl ModuleData {
     // Try to apply call-site parameter mapping for an inline node at a given PC
     fn try_apply_call_site_mapping(
         &self,
-        func: &crate::data::FunctionBlocks,
+        func: &FunctionBlocks,
         inline_idx: usize,
         address: u64,
-        vars: &mut [crate::data::VariableWithEvaluation],
-        _var_refs: &[crate::data::block_index::VarRef],
+        vars: &mut [crate::VariableWithEvaluation],
+        _var_refs: &[VarRef],
         get_cfa: &dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>,
     ) {
         let dwarf = self.resolver.dwarf_ref();
@@ -394,7 +395,7 @@ impl ModuleData {
         );
 
         // Memory map the binary file
-        let binary_mapped = std::sync::Arc::new(Self::map_file(&module_mapping.path)?);
+        let binary_mapped = std::sync::Arc::new(MappedFile::open(&module_mapping.path)?);
 
         // Try to load DWARF sections from the binary file first
         let dwarf_result = Self::load_dwarf_sections(&binary_mapped);
@@ -418,20 +419,17 @@ impl ModuleData {
                         "No debug info in binary, searching for .gnu_debuglink: {}",
                         module_mapping.path.display()
                     );
-                    match crate::debuglink::try_load_debug_file(
+                    match try_load_debug_file(
                         &module_mapping.path,
                         debug_search_paths,
                         allow_loose_debug_match,
                     )? {
-                        Some((debug_path, debug_mmap)) => {
+                        Some(debug_mapped) => {
                             tracing::info!(
                                 "Loading DWARF from separate debug file: {}",
-                                debug_path.display()
+                                debug_mapped.path.display()
                             );
-                            let debug_mapped = std::sync::Arc::new(MappedFile {
-                                data: debug_mmap,
-                                path: debug_path.clone(),
-                            });
+                            let debug_mapped = std::sync::Arc::new(debug_mapped);
                             let debug_dwarf = Self::load_dwarf_sections(&debug_mapped)?;
                             (std::sync::Arc::new(debug_dwarf), debug_mapped)
                         }
@@ -495,10 +493,8 @@ impl ModuleData {
             tokio::task::spawn_blocking({
                 let binary_for_cfi = std::sync::Arc::clone(&binary_mapped);
                 let module_path = module_mapping.path.clone();
-                move || -> Result<Option<crate::data::CfiIndex>> {
-                    // Convert MappedFile data to Arc<[u8]>
-                    let file_data_arc: std::sync::Arc<[u8]> = binary_for_cfi.data[..].into();
-                    match crate::data::CfiIndex::from_arc_data(file_data_arc) {
+                move || -> Result<Option<CfiIndex>> {
+                    match CfiIndex::from_mapped_file(binary_for_cfi) {
                         Ok(cfi) => {
                             tracing::info!(
                                 "CFI index initialized successfully for {}",
@@ -545,11 +541,11 @@ impl ModuleData {
 
         // Build type name index from lightweight index
         let type_name_index =
-            crate::data::TypeNameIndex::build_from_lightweight(&parse_result.lightweight_index);
+            TypeNameIndex::build_from_lightweight(&parse_result.lightweight_index);
         let type_index_arc = std::sync::Arc::new(type_name_index.clone());
 
         // Create resolver with parsed data and type index
-        let resolver = crate::data::OnDemandResolver::new_with_type_index(
+        let resolver = OnDemandResolver::new_with_type_index(
             std::sync::Arc::try_unwrap(dwarf)
                 .map_err(|_| anyhow::anyhow!("Failed to unwrap DWARF Arc"))?,
             type_index_arc,
@@ -603,7 +599,7 @@ impl ModuleData {
             compilation_units: parse_result.compilation_units,
             cfi_index,
             resolver,
-            block_index: crate::data::BlockIndex::new(),
+            block_index: BlockIndex::new(),
             type_name_index,
             _dwarf_mapped_file: mapped_file,
             _binary_mapped_file: binary_mapped,
@@ -611,18 +607,6 @@ impl ModuleData {
             demangled_function_leaf_map,
             demangled_variable_map,
             demangled_variable_leaf_map,
-        })
-    }
-
-    /// Memory map the file
-    fn map_file(path: &PathBuf) -> Result<MappedFile> {
-        use std::fs::File;
-        let file = File::open(path)?;
-        let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
-
-        Ok(MappedFile {
-            data: mmap,
-            path: path.clone(),
         })
     }
 
@@ -642,29 +626,35 @@ impl ModuleData {
         file_data: &std::sync::Arc<MappedFile>,
     ) -> Result<gimli::Dwarf<gimli::EndianArcSlice<LittleEndian>>> {
         use gimli::EndianArcSlice;
-        use std::sync::Arc;
 
         // Parse object file
-        let object = object::File::parse(&file_data.data[..])?;
+        let object = file_data.parse_object()?;
 
         // Load DWARF sections
         let load_section = |id: gimli::SectionId| -> Result<EndianArcSlice<LittleEndian>> {
             if let Some(section) = object.section_by_name(id.name()) {
                 // Get section file range
                 if let Some((start, size)) = section.file_range() {
-                    let start = start as usize;
-                    let end = start + size as usize;
-
-                    // Create Arc slice for this section (zero-copy: shares ownership with file_data)
-                    let section_arc: Arc<[u8]> = Arc::from(&file_data.data[start..end]);
+                    let section_arc =
+                        file_data
+                            .copy_file_range_to_arc(start, size)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("Invalid DWARF section range for {}", id.name())
+                            })?;
                     Ok(EndianArcSlice::new(section_arc, LittleEndian))
                 } else {
                     // Section has no file range
-                    Ok(EndianArcSlice::new(Arc::from(vec![]), LittleEndian))
+                    Ok(EndianArcSlice::new(
+                        MappedFile::empty_arc_bytes(),
+                        LittleEndian,
+                    ))
                 }
             } else {
                 // Return empty slice if section not found
-                Ok(EndianArcSlice::new(Arc::from(vec![]), LittleEndian))
+                Ok(EndianArcSlice::new(
+                    MappedFile::empty_arc_bytes(),
+                    LittleEndian,
+                ))
             }
         };
 
@@ -728,7 +718,7 @@ impl ModuleData {
     pub(crate) fn get_all_variables_at_address(
         &mut self,
         address: u64,
-    ) -> Result<Vec<crate::data::VariableWithEvaluation>> {
+    ) -> Result<Vec<crate::VariableWithEvaluation>> {
         let t0 = Instant::now();
         let mut built_funcs: usize = 0;
         let mut build_ms: u128 = 0;
@@ -741,7 +731,7 @@ impl ModuleData {
         if self.block_index.find_function_by_pc(address).is_none() {
             let b0 = Instant::now();
             if let Some(cu_off) = self.lightweight_index.find_cu_by_address(address) {
-                let builder = crate::data::BlockIndexBuilder::new(self.resolver.dwarf_ref());
+                let builder = BlockIndexBuilder::new(self.resolver.dwarf_ref());
                 if let Some(funcs) = builder.build_for_unit(cu_off) {
                     tracing::info!(
                         "BlockIndex: built {} functions for CU {:?}",
@@ -844,7 +834,7 @@ impl ModuleData {
                 // Minimal de-dup for parameters: keep first occurrence per name.
                 let mut seen_param_names: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
-                let mut filtered: Vec<crate::data::VariableWithEvaluation> =
+                let mut filtered: Vec<crate::VariableWithEvaluation> =
                     Vec::with_capacity(vars.len());
                 for v in vars.into_iter() {
                     if v.is_parameter {
@@ -880,7 +870,7 @@ impl ModuleData {
         address: u64,
         base_var: &str,
         chain: &[String],
-    ) -> Result<Option<crate::data::VariableWithEvaluation>> {
+    ) -> Result<Option<crate::VariableWithEvaluation>> {
         let t0 = Instant::now();
         let mut built_funcs: usize = 0;
         let mut build_ms: u128 = 0;
@@ -894,7 +884,7 @@ impl ModuleData {
         // Build block index lazily and try fast path
         if self.block_index.find_function_by_pc(address).is_none() {
             let b0 = Instant::now();
-            let builder = crate::data::BlockIndexBuilder::new(self.resolver.dwarf_ref());
+            let builder = BlockIndexBuilder::new(self.resolver.dwarf_ref());
             // Prefer building only the containing subprogram if we can identify it
             if let Some(func_entry) = self.lightweight_index.find_function_by_address(address) {
                 if let Some(fb) =
@@ -1008,7 +998,7 @@ impl ModuleData {
                             func.cu_offset,
                             func.die_offset,
                             v.die_offset,
-                            crate::data::on_demand_resolver::ChainSpec {
+                            ChainSpec {
                                 base: base_var,
                                 fields: chain,
                             },
@@ -1031,7 +1021,7 @@ impl ModuleData {
         if !globals.is_empty() {
             // Try each candidate until one plans successfully
             for info in globals {
-                let spec = crate::data::on_demand_resolver::ChainSpec {
+                let spec = ChainSpec {
                     base: base_var,
                     fields: chain,
                 };
@@ -1123,7 +1113,7 @@ impl ModuleData {
     pub(crate) fn is_inline_at(&mut self, address: u64) -> Option<bool> {
         // Ensure block index has the containing function built (lazy build similar to variable lookup)
         if self.block_index.find_function_by_pc(address).is_none() {
-            let builder = crate::data::BlockIndexBuilder::new(self.resolver.dwarf_ref());
+            let builder = BlockIndexBuilder::new(self.resolver.dwarf_ref());
             // Prefer building only the containing subprogram if we can identify it via lightweight index
             if let Some(func_entry) = self.lightweight_index.find_function_by_address(address) {
                 if let Some(fb) =
@@ -1568,7 +1558,7 @@ impl ModuleData {
     }
 
     /// Get lightweight index for stats access
-    pub(crate) fn get_lightweight_index(&self) -> &crate::data::LightweightIndex {
+    pub(crate) fn get_lightweight_index(&self) -> &LightweightIndex {
         &self.lightweight_index
     }
 
@@ -1612,7 +1602,7 @@ impl ModuleData {
     /// Returns a CfaResult representing the frame base expression (register+offset or expression steps).
     fn compute_frame_base_for_pc(
         &self,
-        func: &crate::data::FunctionBlocks,
+        func: &FunctionBlocks,
         pc: u64,
     ) -> Option<crate::core::CfaResult> {
         let dwarf = self.resolver.dwarf_ref();
@@ -2264,7 +2254,7 @@ impl ModuleData {
         &mut self,
         address: u64,
         items: &[(gimli::DebugInfoOffset, gimli::UnitOffset)],
-    ) -> Result<Vec<crate::data::VariableWithEvaluation>> {
+    ) -> Result<Vec<crate::VariableWithEvaluation>> {
         self.resolver
             .resolve_variables_by_offsets_at_address(address, items, None)
     }

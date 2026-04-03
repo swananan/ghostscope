@@ -5,7 +5,7 @@
 //! - Shared line table support to avoid duplication
 //! - DWARF version-aware file indexing (1-based vs 0-based)
 
-use crate::data::path::resolve_file_path;
+use crate::index::path::resolve_file_path;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 

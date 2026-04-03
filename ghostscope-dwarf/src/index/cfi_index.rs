@@ -3,30 +3,32 @@
 //! This module provides efficient access to CFA (Canonical Frame Address) rules
 //! by utilizing eh_frame_hdr's binary search table when available.
 
-use crate::core::{CfaResult, ComputeStep, Result};
+use crate::{
+    binary::MappedFile,
+    core::{CfaResult, ComputeStep, Result},
+};
 use anyhow::{anyhow, Context};
+use gimli::LittleEndian as LE;
 use gimli::{
-    BaseAddresses, CfaRule, CieOrFde, EhFrame, EhFrameHdr, FrameDescriptionEntry, LittleEndian,
-    ParsedEhFrameHdr, UnwindContext, UnwindSection,
+    BaseAddresses, CfaRule, CieOrFde, EhFrame, EhFrameHdr, EndianArcSlice, FrameDescriptionEntry,
+    LittleEndian, ParsedEhFrameHdr, UnwindContext, UnwindSection,
 };
 use object::{Object, ObjectSection};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-use gimli::{EndianSlice, LittleEndian as LE};
-
 /// CFI index for fast CFA rule lookup
 pub struct CfiIndex {
     /// Keep file data alive
-    _file_data: Arc<[u8]>,
+    _file_data: Arc<MappedFile>,
     /// Keep eh_frame section data alive
     _eh_frame_data: Arc<[u8]>,
     /// Keep eh_frame_hdr section data alive (if present)
     _eh_frame_hdr_data: Option<Arc<[u8]>>,
-    /// Parsed eh_frame section (using 'static via Box::leak)
-    eh_frame: EhFrame<EndianSlice<'static, LE>>,
+    /// Parsed eh_frame section
+    eh_frame: EhFrame<EndianArcSlice<LE>>,
     /// Parsed eh_frame_hdr for fast lookup (if available)
-    eh_frame_hdr: Option<ParsedEhFrameHdr<EndianSlice<'static, LE>>>,
+    eh_frame_hdr: Option<ParsedEhFrameHdr<EndianArcSlice<LE>>>,
     /// Base addresses for DWARF sections
     bases: BaseAddresses,
     /// Whether we have eh_frame_hdr for fast lookup
@@ -44,8 +46,10 @@ impl std::fmt::Debug for CfiIndex {
 
 impl CfiIndex {
     /// Create a new CFI index from an object file data
-    pub fn from_arc_data(file_data: Arc<[u8]>) -> Result<Self> {
-        let object = object::File::parse(&file_data[..]).context("Failed to parse object file")?;
+    pub fn from_mapped_file(file_data: Arc<MappedFile>) -> Result<Self> {
+        let object = file_data
+            .parse_object()
+            .context("Failed to parse object file")?;
 
         // Load eh_frame section (required)
         let eh_frame_section = object
@@ -56,15 +60,10 @@ impl CfiIndex {
         let (eh_frame_start, eh_frame_size) = eh_frame_section
             .file_range()
             .ok_or_else(|| anyhow!(".eh_frame section has no file range"))?;
-        let eh_frame_start = eh_frame_start as usize;
-        let eh_frame_end = eh_frame_start + eh_frame_size as usize;
-
-        // Create Arc slice for eh_frame and leak to 'static
-        // Note: We must copy once for Box::leak (gimli's EhFrame requires 'static lifetime)
-        let eh_frame_data = file_data[eh_frame_start..eh_frame_end].to_vec();
-        let eh_frame_static: &'static [u8] = Box::leak(eh_frame_data.into_boxed_slice());
-        let eh_frame_arc: Arc<[u8]> = Arc::from(eh_frame_static); // Zero-copy: reference leaked data
-        let eh_frame = EhFrame::new(eh_frame_static, LittleEndian);
+        let eh_frame_arc = file_data
+            .copy_file_range_to_arc(eh_frame_start, eh_frame_size)
+            .ok_or_else(|| anyhow!("Failed to copy .eh_frame bytes from mapped file"))?;
+        let eh_frame = EhFrame::from(EndianArcSlice::new(Arc::clone(&eh_frame_arc), LittleEndian));
 
         // Try to load eh_frame_hdr for fast lookup (optional)
         let mut hdr_arc_opt: Option<Arc<[u8]>> = None;
@@ -73,15 +72,13 @@ impl CfiIndex {
                 let (hdr_start, hdr_size) = hdr_section_obj
                     .file_range()
                     .ok_or_else(|| anyhow!(".eh_frame_hdr section has no file range"))?;
-                let hdr_start = hdr_start as usize;
-                let hdr_end = hdr_start + hdr_size as usize;
-
-                // Create Arc slice for eh_frame_hdr and leak to 'static
-                let hdr_data = file_data[hdr_start..hdr_end].to_vec();
-                let hdr_static: &'static [u8] = Box::leak(hdr_data.into_boxed_slice());
-                let hdr_arc: Arc<[u8]> = Arc::from(hdr_static); // Zero-copy: reference leaked data
-                hdr_arc_opt = Some(hdr_arc);
-                let hdr_section = EhFrameHdr::new(hdr_static, LittleEndian);
+                let hdr_arc = file_data
+                    .copy_file_range_to_arc(hdr_start, hdr_size)
+                    .ok_or_else(|| {
+                        anyhow!("Failed to copy .eh_frame_hdr bytes from mapped file")
+                    })?;
+                hdr_arc_opt = Some(Arc::clone(&hdr_arc));
+                let hdr_section = EhFrameHdr::from(EndianArcSlice::new(hdr_arc, LittleEndian));
 
                 // Parse with proper address_size
                 let address_size = if object.is_64() { 8 } else { 4 };
@@ -129,7 +126,7 @@ impl CfiIndex {
         }
 
         Ok(Self {
-            _file_data: file_data.clone(),
+            _file_data: file_data,
             _eh_frame_data: eh_frame_arc,
             _eh_frame_hdr_data: hdr_arc_opt,
             eh_frame,
@@ -187,7 +184,7 @@ impl CfiIndex {
     fn find_fde_for_address(
         &self,
         address: u64,
-    ) -> Result<FrameDescriptionEntry<EndianSlice<'static, LE>, usize>> {
+    ) -> Result<FrameDescriptionEntry<EndianArcSlice<LE>, usize>> {
         if let Some(hdr) = &self.eh_frame_hdr {
             // Fast path: O(log n) binary search using eh_frame_hdr
             debug!(
