@@ -1,4 +1,4 @@
-use crate::config::{MergedConfig, ParsedArgs, ResolvedPidInfo};
+use crate::config::{MergedConfig, ParsedArgs, PidViews};
 use crate::source_path::SourcePathResolver;
 use crate::trace::TraceManager;
 use anyhow::Result;
@@ -8,18 +8,45 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
+#[derive(Debug, Clone)]
+pub struct RuntimePidContext {
+    /// PID used for `/proc/<pid>/...` access and DWARF loading in GhostScope's current view.
+    pub proc_pid: u32,
+    /// PID passed to uprobe attach restrictions in GhostScope's current userspace view.
+    pub attach_pid: u32,
+    /// Host-view PID kept for logs, UI display, and legacy host-TGID fallback paths.
+    pub host_pid: u32,
+    /// Optional resolved PID views for namespace/container scenarios.
+    pub pid_views: Option<PidViews>,
+}
+
+impl RuntimePidContext {
+    fn from_config(config: &MergedConfig) -> Option<Self> {
+        config.pid.map(|proc_pid| Self {
+            proc_pid,
+            attach_pid: proc_pid,
+            host_pid: config.host_pid.unwrap_or(proc_pid),
+            pid_views: config.pid_views.clone(),
+        })
+    }
+
+    fn legacy(proc_pid: u32) -> Self {
+        Self {
+            proc_pid,
+            attach_pid: proc_pid,
+            host_pid: proc_pid,
+            pid_views: None,
+        }
+    }
+}
+
 /// Ghost session state - manages binary analysis, process tracking, and trace instances
 #[derive(Debug)]
 pub struct GhostSession {
     pub process_analyzer: Option<DwarfAnalyzer>,
     pub target_binary: Option<String>,
     pub target_args: Vec<String>,
-    /// PID used for userspace /proc operations.
-    pub target_pid: Option<u32>,
-    /// Host PID used by eBPF PID filter and uprobe attach.
-    pub target_host_pid: Option<u32>,
-    /// Optional mapping diagnostics for PID namespace/container scenarios.
-    pub pid_mapping: Option<ResolvedPidInfo>,
+    pid_context: Option<RuntimePidContext>,
     pub trace_manager: TraceManager, // Manages all trace instances with their loaders
     pub source_path_resolver: SourcePathResolver, // Resolves DWARF paths to actual filesystem paths
     #[allow(dead_code)]
@@ -38,9 +65,7 @@ impl GhostSession {
             process_analyzer: None,
             target_binary: config.target_path.clone(),
             target_args: config.binary_args.clone(),
-            target_pid: config.pid,
-            target_host_pid: config.host_pid.or(config.pid),
-            pid_mapping: config.pid_mapping.clone(),
+            pid_context: RuntimePidContext::from_config(config),
             debug_file: config
                 .debug_file
                 .as_ref()
@@ -52,8 +77,8 @@ impl GhostSession {
             sysmon: None,
         };
 
-        if let Some(ref mapping) = s.pid_mapping {
-            info!("Session PID mapping: {}", mapping.compact_display());
+        if let Some(pid_views) = s.pid_views() {
+            info!("Session PID views: {}", pid_views.compact_display());
         }
         if let Some(cfg) = s.config.as_ref() {
             if let Some(env) = cfg.runtime_env.as_ref() {
@@ -67,7 +92,7 @@ impl GhostSession {
         // Start sysmon:
         // -t executable: always start (PID collection is constrained in eBPF)
         // -t shared library: start only if enabled in config
-        if s.target_pid.is_none() && s.target_binary.is_some() {
+        if s.proc_pid().is_none() && s.target_binary.is_some() {
             let tpath = PathBuf::from(s.target_binary.as_ref().unwrap());
             let is_shared = ghostscope_process::is_shared_object(&tpath);
             let should_start = if is_shared {
@@ -110,9 +135,7 @@ impl GhostSession {
             process_analyzer: None,
             target_binary: args.target_path.clone(),
             target_args: args.binary_args.clone(),
-            target_pid: args.pid,
-            target_host_pid: args.pid,
-            pid_mapping: None,
+            pid_context: args.pid.map(RuntimePidContext::legacy),
             debug_file: args
                 .debug_file
                 .as_ref()
@@ -123,14 +146,13 @@ impl GhostSession {
             coordinator: Arc::new(Mutex::new(ProcessManager::new())),
             sysmon: None,
         };
-        if let Some(pid) = s.target_pid {
+        if let Some(pid_context) = s.pid_context.as_ref() {
             info!(
                 "Session PID (legacy mode): proc_pid={} host_pid={}",
-                pid,
-                s.target_host_pid.unwrap_or(pid)
+                pid_context.proc_pid, pid_context.host_pid
             );
         }
-        if s.target_pid.is_none() && s.target_binary.is_some() {
+        if s.proc_pid().is_none() && s.target_binary.is_some() {
             let target_module = s.target_binary.as_ref().map(PathBuf::from);
             let cfg = SysmonConfig {
                 target_module,
@@ -170,11 +192,11 @@ impl GhostSession {
         let debug_search_paths = self.get_debug_search_paths();
         let allow_loose = self.get_allow_loose_debug_match();
 
-        let process_analyzer = if let Some(pid) = self.target_pid {
-            info!("Loading binary from PID: {} (parallel)", pid);
+        let process_analyzer = if let Some(proc_pid) = self.proc_pid() {
+            info!("Loading binary from PID: {} (parallel)", proc_pid);
             Some(
                 DwarfAnalyzer::from_pid_parallel_with_config(
-                    pid,
+                    proc_pid,
                     &debug_search_paths,
                     allow_loose,
                     |_| {},
@@ -213,11 +235,14 @@ impl GhostSession {
         let debug_search_paths = self.get_debug_search_paths();
         let allow_loose = self.get_allow_loose_debug_match();
 
-        let process_analyzer = if let Some(pid) = self.target_pid {
-            info!("Loading binary from PID: {} (parallel with progress)", pid);
+        let process_analyzer = if let Some(proc_pid) = self.proc_pid() {
+            info!(
+                "Loading binary from PID: {} (parallel with progress)",
+                proc_pid
+            );
             Some(
                 DwarfAnalyzer::from_pid_parallel_with_config(
-                    pid,
+                    proc_pid,
                     &debug_search_paths,
                     allow_loose,
                     progress_callback,
@@ -293,34 +318,37 @@ impl GhostSession {
         self.target_binary.clone()
     }
 
-    /// Get PID if available
-    pub fn pid(&self) -> Option<u32> {
-        self.target_pid
-    }
-
     /// PID to use for userspace /proc reads.
-    pub fn pid_for_proc(&self) -> Option<u32> {
-        self.target_pid
+    pub fn proc_pid(&self) -> Option<u32> {
+        self.pid_context
+            .as_ref()
+            .map(|pid_context| pid_context.proc_pid)
     }
 
-    /// PID to use for eBPF-side filtering.
-    pub fn pid_for_filter(&self) -> Option<u32> {
-        self.target_host_pid.or(self.target_pid)
+    /// Host-view PID kept for logs, UI display, and host-TGID fallback paths.
+    pub fn host_pid(&self) -> Option<u32> {
+        self.pid_context
+            .as_ref()
+            .map(|pid_context| pid_context.host_pid)
     }
 
-    /// PID to use for uprobe attach and userspace /proc access.
-    pub fn pid_for_attach(&self) -> Option<u32> {
-        self.target_pid
+    /// PID to use for uprobe attach restrictions.
+    pub fn attach_pid(&self) -> Option<u32> {
+        self.pid_context
+            .as_ref()
+            .map(|pid_context| pid_context.attach_pid)
     }
 
     /// Get resolved PID mapping diagnostics if available.
-    pub fn pid_mapping(&self) -> Option<&ResolvedPidInfo> {
-        self.pid_mapping.as_ref()
+    pub fn pid_views(&self) -> Option<&PidViews> {
+        self.pid_context
+            .as_ref()
+            .and_then(|pid_context| pid_context.pid_views.as_ref())
     }
 
     /// Check if session was started with target path (target file mode)
     pub fn is_target_mode(&self) -> bool {
-        self.target_pid.is_none() && self.target_binary.is_some()
+        self.proc_pid().is_none() && self.target_binary.is_some()
     }
 }
 

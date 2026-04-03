@@ -1,4 +1,4 @@
-use crate::trace::instance::{TraceInstance, TraceInstanceArgs};
+use crate::trace::instance::{TraceInstance, TraceInstanceArgs, TracePidContext};
 use crate::trace::snapshot::{TraceSnapshot, TraceSummary};
 use anyhow::Result;
 use futures::future::{select_all, BoxFuture};
@@ -29,8 +29,7 @@ pub struct AddTraceParams {
     pub pc: u64,
     pub binary_path: String,
     pub target_display: String,
-    pub target_pid: Option<u32>,
-    pub target_proc_pid: Option<u32>,
+    pub pid_context: TracePidContext,
     pub loader: Option<GhostScopeLoader>,
     pub ebpf_function_name: String,
     pub address_global_index: Option<usize>,
@@ -79,8 +78,7 @@ impl TraceManager {
             pc: params.pc,
             binary_path: params.binary_path,
             target_display: params.target_display,
-            target_pid: params.target_pid,
-            target_proc_pid: params.target_proc_pid,
+            pid_context: params.pid_context,
             loader: params.loader,
             ebpf_function_name: params.ebpf_function_name,
             address_global_index: params.address_global_index,
@@ -191,8 +189,7 @@ impl TraceManager {
             script_content: trace.script_content.clone(),
             binary_path: trace.binary_path.clone(),
             target_display: trace.target_display.clone(),
-            target_pid: trace.target_pid,
-            target_proc_pid: trace.target_proc_pid,
+            pid_context: trace.pid_context,
             is_enabled: trace.is_enabled,
             pc: trace.pc,
             ebpf_function_name: trace.ebpf_function_name.clone(),

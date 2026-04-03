@@ -9,6 +9,7 @@ pub mod script; // New instruction generator
 
 use crate::script::compiler::AstCompiler;
 use ebpf::context::CodeGenError;
+pub use ghostscope_process::{PidFilterSpec, PidNamespaceId};
 use script::parser::ParseError;
 use tracing::info;
 
@@ -51,24 +52,6 @@ pub enum EventMapType {
     PerfEventArray,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PidFilterSpec {
-    /// Compare against host TGID from bpf_get_current_pid_tgid() >> 32.
-    HostTgid { target_pid: u32 },
-    /// Compare against TGID in a specific PID namespace via bpf_get_ns_current_pid_tgid.
-    NamespaceTgid {
-        target_pid: u32,
-        pid_ns_dev: u64,
-        pid_ns_inode: u64,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PidNamespaceSpec {
-    pub pid_ns_dev: u64,
-    pub pid_ns_inode: u64,
-}
-
 /// Compilation options including save options and eBPF map configuration
 #[derive(Debug, Clone)]
 pub struct CompileOptions {
@@ -94,7 +77,7 @@ pub struct CompileOptions {
     pub pid_filter_spec: Option<PidFilterSpec>,
     /// Optional PID namespace context used by special vars like `$pid`/`$tid`.
     /// This is independent of PID filtering and is primarily for `-t` mode.
-    pub special_pid_ns: Option<PidNamespaceSpec>,
+    pub special_pid_ns: Option<PidNamespaceId>,
     /// Optional PID namespace context used by `proc_module_offsets` lookups.
     ///
     /// In `-p` mode this only switches to the target PID-namespace view when
@@ -105,10 +88,10 @@ pub struct CompileOptions {
     ///
     /// In `-t` mode we continue to use GhostScope's own `/proc` view, because
     /// offsets are discovered from `/proc/<pid>/maps` in that namespace.
-    pub proc_offsets_pid_ns: Option<PidNamespaceSpec>,
+    pub proc_offsets_pid_ns: Option<PidNamespaceId>,
     /// Optional original `-p` input PID for `$input_pid`.
     /// This is only available in `-p` mode.
-    pub special_input_pid: Option<u32>,
+    pub input_pid: Option<u32>,
 }
 
 impl Default for CompileOptions {
@@ -129,7 +112,7 @@ impl Default for CompileOptions {
             pid_filter_spec: None,
             special_pid_ns: None,
             proc_offsets_pid_ns: None,
-            special_input_pid: None,
+            input_pid: None,
         }
     }
 }

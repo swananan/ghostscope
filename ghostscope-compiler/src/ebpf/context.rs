@@ -526,7 +526,7 @@ impl<'ctx> EbpfContext<'ctx> {
         let pid_filter_spec = self
             .compile_options
             .pid_filter_spec
-            .or_else(|| target_pid.map(|pid| crate::PidFilterSpec::HostTgid { target_pid: pid }));
+            .or_else(|| target_pid.map(|pid| crate::PidFilterSpec::HostTgid { filter_pid: pid }));
         if let Some(spec) = pid_filter_spec {
             self.add_pid_filter(spec)?;
         }
@@ -604,17 +604,20 @@ impl<'ctx> EbpfContext<'ctx> {
     /// This generates LLVM IR to check PID and early-return if not matching.
     fn add_pid_filter(&mut self, spec: crate::PidFilterSpec) -> Result<()> {
         match spec {
-            crate::PidFilterSpec::HostTgid { target_pid } => self.add_host_pid_filter(target_pid),
-            crate::PidFilterSpec::NamespaceTgid {
-                target_pid,
-                pid_ns_dev,
-                pid_ns_inode,
-            } => self.add_namespace_pid_filter(target_pid, pid_ns_dev, pid_ns_inode),
+            crate::PidFilterSpec::HostTgid { filter_pid } => self.add_host_pid_filter(filter_pid),
+            crate::PidFilterSpec::NamespaceTgid { filter_pid, pid_ns } => {
+                let (pid_ns_dev, pid_ns_inode) = pid_ns.helper_dev_inode().ok_or_else(|| {
+                    CodeGenError::LLVMError(
+                        "Namespace TGID filter requires pid namespace device id".to_string(),
+                    )
+                })?;
+                self.add_namespace_pid_filter(filter_pid, pid_ns_dev, pid_ns_inode)
+            }
         }
     }
 
-    fn add_host_pid_filter(&mut self, target_pid: u32) -> Result<()> {
-        info!("Adding host TGID filter for target PID: {}", target_pid);
+    fn add_host_pid_filter(&mut self, filter_pid: u32) -> Result<()> {
+        info!("Adding host TGID filter for filter PID: {}", filter_pid);
 
         // Get current function and entry block
         let current_fn = self
@@ -642,8 +645,8 @@ impl<'ctx> EbpfContext<'ctx> {
             .build_right_shift(pid_tgid_value, shift_amount, false, "current_tgid")
             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
 
-        // Convert target_pid to i64 and compare
-        let target_pid_value = self.context.i64_type().const_int(target_pid as u64, false);
+        // Convert filter_pid to i64 and compare
+        let target_pid_value = self.context.i64_type().const_int(filter_pid as u64, false);
         let pid_matches = self
             .builder
             .build_int_compare(
@@ -669,15 +672,15 @@ impl<'ctx> EbpfContext<'ctx> {
         self.builder.position_at_end(continue_block);
 
         info!(
-            "Host TGID filter added successfully for target PID: {}",
-            target_pid
+            "Host TGID filter added successfully for filter PID: {}",
+            filter_pid
         );
         Ok(())
     }
 
     fn add_namespace_pid_filter(
         &mut self,
-        target_pid: u32,
+        filter_pid: u32,
         pid_ns_dev: u64,
         pid_ns_inode: u64,
     ) -> Result<()> {
@@ -685,8 +688,8 @@ impl<'ctx> EbpfContext<'ctx> {
         const BPF_PIDNS_INFO_SIZE: u64 = 8; // struct { u32 pid; u32 tgid; }
 
         info!(
-            "Adding namespace TGID filter: target_pid={} ns_dev={} ns_inode={}",
-            target_pid, pid_ns_dev, pid_ns_inode
+            "Adding namespace TGID filter: filter_pid={} ns_dev={} ns_inode={}",
+            filter_pid, pid_ns_dev, pid_ns_inode
         );
 
         let current_fn = self
@@ -778,7 +781,7 @@ impl<'ctx> EbpfContext<'ctx> {
             .builder
             .build_int_z_extend(ns_tgid, i64_type, "ns_tgid_i64")
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        let target_pid_value = i64_type.const_int(target_pid as u64, false);
+        let target_pid_value = i64_type.const_int(filter_pid as u64, false);
         let pid_matches = self
             .builder
             .build_int_compare(
@@ -799,8 +802,8 @@ impl<'ctx> EbpfContext<'ctx> {
 
         self.builder.position_at_end(continue_block);
         info!(
-            "Namespace TGID filter added successfully for target PID: {}",
-            target_pid
+            "Namespace TGID filter added successfully for filter PID: {}",
+            filter_pid
         );
         Ok(())
     }

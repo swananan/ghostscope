@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use crate::config::{
-    CliColorMode, Config, LayoutMode, ParsedArgs, ResolvedPidInfo, RuntimeEnvironmentInfo,
+    CliColorMode, Config, LayoutMode, ParsedArgs, PidViews, RuntimeEnvironmentInfo,
     ScriptOutputMode, ScriptTimestampFormat,
 };
 
@@ -13,24 +13,26 @@ pub struct MergedConfig {
     pub binary_path: Option<String>,
     pub target_path: Option<String>,
     pub binary_args: Vec<String>,
+    /// Original PID entered by the user with `-p`.
+    pub input_pid: Option<u32>,
     /// PID used for userspace /proc reads in current namespace view.
     pub pid: Option<u32>,
     /// Host PID used for eBPF PID filtering/attach when namespace differs.
     pub host_pid: Option<u32>,
-    /// Detailed PID mapping diagnostics (if PID mode is used).
-    pub pid_mapping: Option<ResolvedPidInfo>,
+    /// Resolved runtime PID views (if PID mode is used).
+    pub pid_views: Option<PidViews>,
     /// Runtime environment detection summary (container/host/unknown).
     pub runtime_env: Option<RuntimeEnvironmentInfo>,
     /// Effective eBPF-side PID filter strategy used by compiler.
-    pub pid_filter_spec: Option<ghostscope_compiler::PidFilterSpec>,
+    pub pid_filter_spec: Option<ghostscope_process::PidFilterSpec>,
     /// Optional namespace context for special vars (`$pid`/`$tid`) in eBPF.
-    pub special_pid_ns: Option<ghostscope_compiler::PidNamespaceSpec>,
+    pub special_pid_ns: Option<ghostscope_process::PidNamespaceId>,
     /// Optional namespace context for proc_module_offsets map lookups.
     ///
     /// This follows GhostScope's own `/proc` view, so the offsets map key uses
     /// the same PID namespace that userspace used when reading
     /// `/proc/<proc_pid>/maps`.
-    pub proc_offsets_pid_ns: Option<ghostscope_compiler::PidNamespaceSpec>,
+    pub proc_offsets_pid_ns: Option<ghostscope_process::PidNamespaceId>,
     pub log_file: PathBuf,
     pub emit_ready_marker: Option<String>,
     pub enable_logging: bool,
@@ -183,9 +185,10 @@ impl MergedConfig {
             binary_path: args.binary_path,
             target_path: args.target_path,
             binary_args: args.binary_args,
+            input_pid: args.pid,
             pid: args.pid,
             host_pid: args.pid,
-            pid_mapping: None,
+            pid_views: None,
             runtime_env: None,
             pid_filter_spec: None,
             special_pid_ns: None,
@@ -356,11 +359,7 @@ impl MergedConfig {
             pid_filter_spec: self.pid_filter_spec,
             special_pid_ns: self.special_pid_ns,
             proc_offsets_pid_ns: self.proc_offsets_pid_ns,
-            special_input_pid: self
-                .pid_mapping
-                .as_ref()
-                .map(|mapping| mapping.input_pid)
-                .or(self.pid),
+            input_pid: self.input_pid,
         }
     }
 }

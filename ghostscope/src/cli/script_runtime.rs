@@ -129,10 +129,10 @@ async fn run_cli_with_session(
             info!("Binary arguments: {:?}", session.target_args);
         }
     }
-    if let Some(mapping) = session.pid_mapping() {
-        info!("PID mapping: {}", mapping.compact_display());
-    } else if let Some(pid) = session.target_pid {
-        info!("Target PID: {}", pid);
+    if let Some(pid_views) = session.pid_views() {
+        info!("PID views: {}", pid_views.compact_display());
+    } else if let Some(proc_pid) = session.proc_pid() {
+        info!("Target PID: {}", proc_pid);
     }
     if let Some(env) = config.runtime_env.as_ref() {
         info!("Runtime environment: {}", env.compact_display());
@@ -168,12 +168,13 @@ async fn run_cli_with_session(
                     .host_pid
                     .map(|pid| format!(" (host PID for eBPF filter: {pid})"))
                     .unwrap_or_default();
+                let requested_pid = config.input_pid.or(config.pid).unwrap_or(0);
                 return Err(anyhow::anyhow!(
                     "Process analysis failed! Cannot proceed without process information. \
                     Possible solutions: 1. Check that PID {} exists: ps -p {}, \
                     2. Check process permissions, 3. Run with sudo if needed for /proc access{}",
-                    config.pid.unwrap_or(0),
-                    config.pid.unwrap_or(0),
+                    requested_pid,
+                    requested_pid,
                     host_hint
                 ));
             }
