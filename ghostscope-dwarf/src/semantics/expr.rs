@@ -1,8 +1,7 @@
-use gimli::{EndianArcSlice, EndianSlice, LittleEndian, Reader};
+use crate::binary::DwarfReader;
+use gimli::{EndianSlice, LittleEndian, Reader};
 
-pub(crate) fn eval_member_offset_expr(
-    expr: &gimli::Expression<EndianArcSlice<LittleEndian>>,
-) -> Option<u64> {
+pub(crate) fn eval_member_offset_expr(expr: &gimli::Expression<DwarfReader>) -> Option<u64> {
     let bytes_cow = expr.0.to_slice().ok()?;
     let bytes: &[u8] = &bytes_cow;
     if bytes.is_empty() {

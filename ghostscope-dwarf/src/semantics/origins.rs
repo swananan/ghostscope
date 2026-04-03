@@ -1,7 +1,7 @@
-use gimli::{EndianArcSlice, LittleEndian, Reader};
+use crate::binary::DwarfReader;
+use gimli::Reader;
 use std::collections::HashSet;
 
-type DwarfReader = EndianArcSlice<LittleEndian>;
 type DwarfUnit = gimli::Unit<DwarfReader>;
 type DwarfEntry = gimli::DebuggingInformationEntry<DwarfReader>;
 

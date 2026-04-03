@@ -2,4 +2,6 @@ pub(crate) mod debuglink;
 pub(crate) mod mapped_file;
 
 pub(crate) use debuglink::try_load_debug_file;
-pub(crate) use mapped_file::MappedFile;
+#[cfg(test)]
+pub(crate) use mapped_file::dwarf_reader_from_arc;
+pub(crate) use mapped_file::{empty_dwarf_reader, DwarfData, DwarfReader, MappedFile};

@@ -1,3 +1,4 @@
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -27,17 +28,51 @@ impl MappedFile {
         object::File::parse(self.as_bytes())
     }
 
-    /// Copy a file range from the mapped file into an owned Arc-backed slice.
-    pub fn copy_file_range_to_arc(&self, start: u64, size: u64) -> Option<Arc<[u8]>> {
+    /// Create a DWARF reader over the whole mapped file.
+    pub fn dwarf_reader(file: Arc<Self>) -> DwarfReader {
+        DwarfReader::new(DwarfBytes::Mapped(file), gimli::LittleEndian)
+    }
+
+    /// Create a DWARF reader over a file range without copying the mapped data.
+    pub fn dwarf_reader_range(file: Arc<Self>, start: u64, size: u64) -> Option<DwarfReader> {
         let start = usize::try_from(start).ok()?;
         let size = usize::try_from(size).ok()?;
         let end = start.checked_add(size)?;
-        let bytes = self.as_bytes().get(start..end)?;
-        Some(Arc::from(bytes))
+        if end > file.as_bytes().len() {
+            return None;
+        }
+        Some(Self::dwarf_reader(file).range(start..end))
     }
+}
 
-    /// Return an empty owned byte slice for missing sections.
-    pub fn empty_arc_bytes() -> Arc<[u8]> {
-        Arc::<[u8]>::from(&[][..])
+/// Shared backing storage for gimli readers.
+#[derive(Clone, Debug)]
+pub(crate) enum DwarfBytes {
+    Owned(Arc<[u8]>),
+    Mapped(Arc<MappedFile>),
+}
+
+impl Deref for DwarfBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Mapped(file) => file.as_bytes(),
+        }
     }
+}
+
+unsafe impl gimli::StableDeref for DwarfBytes {}
+unsafe impl gimli::CloneStableDeref for DwarfBytes {}
+
+pub(crate) type DwarfReader = gimli::EndianReader<gimli::LittleEndian, DwarfBytes>;
+pub(crate) type DwarfData = gimli::Dwarf<DwarfReader>;
+
+pub(crate) fn dwarf_reader_from_arc(bytes: Arc<[u8]>) -> DwarfReader {
+    DwarfReader::new(DwarfBytes::Owned(bytes), gimli::LittleEndian)
+}
+
+pub(crate) fn empty_dwarf_reader() -> DwarfReader {
+    dwarf_reader_from_arc(Arc::<[u8]>::from(&[][..]))
 }

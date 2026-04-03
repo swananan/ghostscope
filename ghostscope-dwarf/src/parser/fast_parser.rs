@@ -2,6 +2,7 @@
 
 use super::fast_paths::resolve_name_in_unit_fast;
 use crate::{
+    binary::DwarfReader,
     core::{
         demangle::{demangle_by_lang, demangled_leaf},
         IndexEntry, Result,
@@ -12,7 +13,7 @@ use crate::{
     },
     parser::RangeExtractor,
 };
-use gimli::{EndianArcSlice, LittleEndian, Reader};
+use gimli::Reader;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use tracing::debug;
@@ -100,14 +101,14 @@ pub(crate) struct DwarfParseStats {
 
 /// Unified DWARF parser - parses everything in optimized single pass
 pub(crate) struct DwarfParser<'a> {
-    dwarf: &'a gimli::Dwarf<EndianArcSlice<LittleEndian>>,
+    dwarf: &'a gimli::Dwarf<DwarfReader>,
 }
 
 /// Internal builder for accumulating parse results
 impl<'a> DwarfParser<'a> {
     fn process_unit_shard(
         &self,
-        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
+        unit: &gimli::Unit<DwarfReader>,
         unit_offset: gimli::DebugInfoOffset,
         cu_language: Option<gimli::DwLang>,
     ) -> Result<InfoShard> {
@@ -398,14 +399,14 @@ impl<'a> DwarfParser<'a> {
         }
         Ok(shard)
     }
-    pub fn new(dwarf: &'a gimli::Dwarf<EndianArcSlice<LittleEndian>>) -> Self {
+    pub fn new(dwarf: &'a gimli::Dwarf<DwarfReader>) -> Self {
         Self { dwarf }
     }
 
     fn extract_attr_string(
-        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
-        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
-        attr_value: gimli::AttributeValue<EndianArcSlice<LittleEndian>>,
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        attr_value: gimli::AttributeValue<DwarfReader>,
     ) -> Result<Option<String>> {
         if let Ok(string) = dwarf.attr_string(unit, attr_value) {
             if let Ok(s_str) = string.to_string_lossy() {
@@ -419,18 +420,18 @@ impl<'a> DwarfParser<'a> {
     // Helper methods (extracted from unified_builder.rs)
     fn extract_name(
         &self,
-        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
-        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
-        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
     ) -> Result<Option<String>> {
         Ok(resolve_name_in_unit_fast(dwarf, unit, entry)?)
     }
 
     fn extract_linkage_name(
         &self,
-        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
-        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
-        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
     ) -> Result<Option<(String, bool)>> {
         if let Some(attr) = entry.attr(gimli::constants::DW_AT_linkage_name) {
             if let Some(name) = Self::extract_attr_string(dwarf, unit, attr.value())? {
@@ -445,9 +446,7 @@ impl<'a> DwarfParser<'a> {
         Ok(None)
     }
 
-    fn extract_inline_flag(
-        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
-    ) -> Result<bool> {
+    fn extract_inline_flag(entry: &gimli::DebuggingInformationEntry<DwarfReader>) -> Result<bool> {
         if let Some(attr) = entry.attr(gimli::constants::DW_AT_inline) {
             if let gimli::AttributeValue::Inline(inline_attr) = attr.value() {
                 return Ok(inline_attr == gimli::DW_INL_inlined
@@ -459,9 +458,9 @@ impl<'a> DwarfParser<'a> {
 
     fn resolve_function_metadata(
         &self,
-        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
-        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
-        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
         cache: &mut HashMap<gimli::UnitOffset, FunctionMetadata>,
         visited: &mut HashSet<gimli::UnitOffset>,
     ) -> Result<FunctionMetadata> {
@@ -540,7 +539,7 @@ impl<'a> DwarfParser<'a> {
     }
 
     fn bool_attr(
-        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
         attr: gimli::DwAt,
     ) -> Result<Option<bool>> {
         let Some(attr) = entry.attr(attr) else {
@@ -554,7 +553,7 @@ impl<'a> DwarfParser<'a> {
 
     fn is_static_symbol(
         &self,
-        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
     ) -> Result<bool> {
         if let Some(is_external) = Self::bool_attr(entry, gimli::constants::DW_AT_external)? {
             return Ok(!is_external);
@@ -581,7 +580,7 @@ impl<'a> DwarfParser<'a> {
     // storage. Only pure address location expressions should survive this gate.
     fn is_static_variable_symbol(
         &self,
-        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
         absolute_address: Option<u64>,
     ) -> Result<bool> {
         if let Some(is_external) = Self::bool_attr(entry, gimli::constants::DW_AT_external)? {
@@ -594,9 +593,7 @@ impl<'a> DwarfParser<'a> {
         Ok(absolute_address.is_some())
     }
 
-    fn is_declaration(
-        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
-    ) -> Result<bool> {
+    fn is_declaration(entry: &gimli::DebuggingInformationEntry<DwarfReader>) -> Result<bool> {
         Ok(Self::bool_attr(entry, gimli::constants::DW_AT_declaration)?.unwrap_or(false))
     }
 
@@ -604,9 +601,9 @@ impl<'a> DwarfParser<'a> {
     /// Supports DW_AT_low_pc/high_pc and DW_AT_ranges (returns all ranges)
     fn extract_address_ranges(
         &self,
-        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
-        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
-        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
     ) -> Result<Vec<(u64, u64)>> {
         // Use RangeExtractor for unified logic
         RangeExtractor::extract_all_ranges(entry, unit, dwarf)
@@ -633,8 +630,8 @@ impl<'a> DwarfParser<'a> {
     /// commonly encoded this way.
     fn extract_variable_address(
         &self,
-        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
-        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
     ) -> Result<Option<u64>> {
         if let Some(attr) = entry.attr(gimli::constants::DW_AT_location) {
             match attr.value() {
@@ -682,8 +679,8 @@ impl<'a> DwarfParser<'a> {
 
     fn extract_absolute_storage_address_from_expr(
         &self,
-        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
-        mut expr: gimli::Expression<EndianArcSlice<LittleEndian>>,
+        unit: &gimli::Unit<DwarfReader>,
+        mut expr: gimli::Expression<DwarfReader>,
     ) -> Option<u64> {
         let mut operations = Vec::new();
         while let Ok(op) = gimli::Operation::parse(&mut expr.0, unit.encoding()) {
@@ -707,7 +704,7 @@ impl<'a> DwarfParser<'a> {
 
     fn extract_entry_pc(
         &self,
-        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
     ) -> Result<Option<u64>> {
         if let Some(attr) = entry.attr(gimli::constants::DW_AT_entry_pc) {
             if let gimli::AttributeValue::Addr(addr) = attr.value() {
@@ -721,7 +718,7 @@ impl<'a> DwarfParser<'a> {
 
     fn is_main_function(
         &self,
-        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
         name: &str,
     ) -> Result<bool> {
         // Check for DW_AT_main_subprogram attribute
@@ -738,8 +735,8 @@ impl<'a> DwarfParser<'a> {
 
     fn extract_language(
         &self,
-        _dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
-        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
+        _dwarf: &gimli::Dwarf<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
     ) -> Option<gimli::DwLang> {
         // Try to get language from compilation unit
         let mut entries = unit.entries();
@@ -760,7 +757,7 @@ impl<'a> DwarfParser<'a> {
         debug!("Starting debug_line-only parsing for: {}", module_path);
 
         // Collect CU headers once
-        let mut headers: Vec<gimli::UnitHeader<EndianArcSlice<LittleEndian>>> = Vec::new();
+        let mut headers: Vec<gimli::UnitHeader<DwarfReader>> = Vec::new();
         let mut units = self.dwarf.units();
         while let Ok(Some(h)) = units.next() {
             headers.push(h);
@@ -895,7 +892,7 @@ impl<'a> DwarfParser<'a> {
     pub fn parse_debug_info(&self, module_path: &str) -> Result<DebugParseResult> {
         debug!("Starting debug_info-only parsing for: {}", module_path);
         // Collect headers once
-        let mut headers: Vec<gimli::UnitHeader<EndianArcSlice<LittleEndian>>> = Vec::new();
+        let mut headers: Vec<gimli::UnitHeader<DwarfReader>> = Vec::new();
         let mut units = self.dwarf.units();
         while let Ok(Some(h)) = units.next() {
             headers.push(h);
@@ -1004,9 +1001,9 @@ impl<'a> DwarfParser<'a> {
 
     /// Static version of extract_file_info_from_line_program for parallel use
     fn extract_file_info_from_line_program_static(
-        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
-        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
-        line_program: &gimli::IncompleteLineProgram<EndianArcSlice<LittleEndian>>,
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        line_program: &gimli::IncompleteLineProgram<DwarfReader>,
     ) -> Result<CompilationUnit> {
         let cu_name = Self::extract_cu_name_from_dwarf(dwarf, unit)
             .unwrap_or_else(|| format!("unknown_cu_{:?}", unit.header.offset()));
@@ -1067,8 +1064,8 @@ impl<'a> DwarfParser<'a> {
     }
 
     fn extract_cu_name_from_dwarf(
-        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
-        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
     ) -> Option<String> {
         let mut entries = unit.entries();
         let entry = entries.next_dfs().ok()??;
@@ -1085,8 +1082,8 @@ impl<'a> DwarfParser<'a> {
     }
 
     fn extract_comp_dir_from_dwarf(
-        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
-        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
     ) -> Option<String> {
         let mut entries = unit.entries();
         let entry = entries.next_dfs().ok()??;
@@ -1103,10 +1100,10 @@ impl<'a> DwarfParser<'a> {
     }
 
     fn extract_source_file_static(
-        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
-        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
         file_index: u64,
-        file_entry: &gimli::FileEntry<EndianArcSlice<LittleEndian>>,
+        file_entry: &gimli::FileEntry<DwarfReader>,
         compilation_unit: &str,
         base_directory: &str,
         include_directories: &[String],
@@ -1156,14 +1153,15 @@ impl<'a> DwarfParser<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::binary::dwarf_reader_from_arc;
     use gimli::write::{
         Address, AttributeValue as WriteAttributeValue, Dwarf as WriteDwarf, EndianVec,
         Expression as WriteExpression, LineProgram, Sections, Unit,
     };
-    use gimli::{EndianArcSlice, Format};
+    use gimli::{Format, LittleEndian};
     use std::sync::Arc;
 
-    fn build_variable_index_fixture() -> gimli::Dwarf<EndianArcSlice<LittleEndian>> {
+    fn build_variable_index_fixture() -> gimli::Dwarf<DwarfReader> {
         let encoding = gimli::Encoding {
             format: Format::Dwarf32,
             version: 4,
@@ -1238,9 +1236,8 @@ mod tests {
         })
         .unwrap();
 
-        dwarf_sections.borrow(|section| {
-            EndianArcSlice::new(Arc::<[u8]>::from(section.as_slice()), LittleEndian)
-        })
+        dwarf_sections
+            .borrow(|section| dwarf_reader_from_arc(Arc::<[u8]>::from(section.as_slice())))
     }
 
     #[test]

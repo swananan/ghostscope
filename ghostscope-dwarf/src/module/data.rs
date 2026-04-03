@@ -22,7 +22,7 @@ mod file_selection_scoring {
 }
 
 use crate::{
-    binary::{try_load_debug_file, MappedFile},
+    binary::{empty_dwarf_reader, try_load_debug_file, DwarfData, MappedFile},
     core::{mapping::ModuleMapping, GlobalVariableInfo, Result, SectionType, SourceLocation},
     index::{
         BlockIndex, BlockIndexBuilder, CfiIndex, FunctionBlocks, LightweightIndex,
@@ -32,7 +32,7 @@ use crate::{
     resolver::{ChainSpec, OnDemandResolver},
     semantics::{resolve_attr_with_unit_origins, resolve_name_with_origins},
 };
-use gimli::{LittleEndian, Reader};
+use gimli::Reader;
 use object::{Object, ObjectSection, ObjectSegment};
 use std::{
     collections::{HashMap, HashSet},
@@ -613,7 +613,7 @@ impl ModuleData {
     /// Check if DWARF data contains debug information
     ///
     /// Returns true if .debug_info section has at least one compilation unit
-    fn has_debug_info(dwarf: &gimli::Dwarf<gimli::EndianArcSlice<LittleEndian>>) -> bool {
+    fn has_debug_info(dwarf: &DwarfData) -> bool {
         // Try to get the first unit header - need to check if it actually exists
         match dwarf.units().next() {
             Ok(Some(_)) => true, // Has at least one unit
@@ -621,40 +621,27 @@ impl ModuleData {
         }
     }
 
-    /// Load DWARF sections using gimli with Arc-based data
-    fn load_dwarf_sections(
-        file_data: &std::sync::Arc<MappedFile>,
-    ) -> Result<gimli::Dwarf<gimli::EndianArcSlice<LittleEndian>>> {
-        use gimli::EndianArcSlice;
-
+    /// Load DWARF sections using gimli over mmap-backed readers.
+    fn load_dwarf_sections(file_data: &std::sync::Arc<MappedFile>) -> Result<DwarfData> {
         // Parse object file
         let object = file_data.parse_object()?;
 
         // Load DWARF sections
-        let load_section = |id: gimli::SectionId| -> Result<EndianArcSlice<LittleEndian>> {
+        let load_section = |id: gimli::SectionId| -> Result<_> {
             if let Some(section) = object.section_by_name(id.name()) {
                 // Get section file range
                 if let Some((start, size)) = section.file_range() {
-                    let section_arc =
-                        file_data
-                            .copy_file_range_to_arc(start, size)
-                            .ok_or_else(|| {
-                                anyhow::anyhow!("Invalid DWARF section range for {}", id.name())
-                            })?;
-                    Ok(EndianArcSlice::new(section_arc, LittleEndian))
+                    MappedFile::dwarf_reader_range(std::sync::Arc::clone(file_data), start, size)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Invalid DWARF section range for {}", id.name())
+                        })
                 } else {
                     // Section has no file range
-                    Ok(EndianArcSlice::new(
-                        MappedFile::empty_arc_bytes(),
-                        LittleEndian,
-                    ))
+                    Ok(empty_dwarf_reader())
                 }
             } else {
                 // Return empty slice if section not found
-                Ok(EndianArcSlice::new(
-                    MappedFile::empty_arc_bytes(),
-                    LittleEndian,
-                ))
+                Ok(empty_dwarf_reader())
             }
         };
 
