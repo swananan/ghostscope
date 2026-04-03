@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DWARF Perf History</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f5f1e8;
+      --panel: #fffaf0;
+      --ink: #1f2328;
+      --accent: #b45309;
+      --muted: #6b7280;
+      --border: #dfd6c3;
+    }
+    body {
+      margin: 0;
+      font-family: "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+      background: linear-gradient(180deg, #efe7d8 0%, var(--bg) 100%);
+      color: var(--ink);
+    }
+    main {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 40px 24px 56px;
+    }
+    h1, h2 {
+      margin: 0 0 12px;
+      letter-spacing: 0.01em;
+    }
+    p, li, td, th {
+      line-height: 1.5;
+      font-size: 15px;
+    }
+    code {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: 0.92em;
+    }
+    .hero, .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      box-shadow: 0 10px 30px rgba(68, 54, 20, 0.08);
+    }
+    .hero {
+      padding: 28px;
+      margin-bottom: 24px;
+    }
+    .hero p {
+      color: var(--muted);
+      max-width: 68ch;
+    }
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 14px;
+      margin: 24px 0 10px;
+    }
+    .card {
+      background: #fffdf8;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 16px 18px;
+    }
+    .card h2 {
+      font-size: 14px;
+      color: var(--muted);
+      margin-bottom: 10px;
+    }
+    .card p {
+      margin: 0;
+      font-size: 28px;
+      color: var(--accent);
+    }
+    .panel {
+      padding: 24px;
+      margin-top: 24px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 18px;
+    }
+    th, td {
+      text-align: left;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+    }
+    th {
+      color: var(--muted);
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    a {
+      color: var(--accent);
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="hero">
+      <h1>DWARF Perf History</h1>
+      <p>
+        Main-branch and scheduled DWARF perf baselines for <strong>swananan/ghostscope</strong>.
+        This page records the current fast-parse and source-line query trends from CI.
+      </p>
+      
+      <p><strong>Latest run:</strong> 2026-04-03T00:29:14Z for <a href="https://github.com/swananan/ghostscope/actions/runs/23928257384">63faca7183ac</a> on <code>main</code>.</p>
+      <div class="cards"><article class="card"><h2>Fast Parse P50</h2><p>970.817 ms</p></article><article class="card"><h2>Fast Parse P95</h2><p>1052.034 ms</p></article><article class="card"><h2>Query P50</h2><p>3.620 ms</p></article><article class="card"><h2>Query P95</h2><p>4.044 ms</p></article></div>
+    </section>
+    <section class="panel">
+      <h2>Latest Query Snapshot</h2>
+      <ul><li>Source: <code>/home/runner/work/ghostscope/ghostscope/scripts/dwarf-perf/corpus/src/query-hotspot/query_hotspot.c:119</code></li><li>Address count: 1</li><li>Total variables: 16</li><li>First address: <code>0x40164f</code></li></ul>
+    </section>
+    <section class="panel">
+      <h2>Recent History</h2>
+      <table><thead><tr><th>Generated At</th><th>Commit</th><th>Event</th><th>Fast Parse P50</th><th>Fast Parse P95</th><th>Query P50</th><th>Query P95</th><th>Snapshot</th></tr></thead><tbody><tr><td>2026-04-03T00:29:14Z</td><td><a href="https://github.com/swananan/ghostscope/actions/runs/23928257384">63faca7183ac</a></td><td>push</td><td>970.817</td><td>1052.034</td><td>3.620</td><td>4.044</td><td><a href="data/runs/20260403T002914Z-63faca7183ac.json">json</a></td></tr></tbody></table>
+    </section>
+  </main>
+</body>
+</html>
