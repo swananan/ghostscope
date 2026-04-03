@@ -161,6 +161,9 @@ Use that document for:
 - `source-line query` benchmark semantics and commands
 - output locations for generated corpus artifacts and `perf-results/`
 
+The current published history dashboard is available at
+<https://swananan.github.io/ghostscope/>.
+
 ### Agent E2E Runner (Codex)
 
 This runner path is for running e2e from an AI agent environment, where the agent may not be able to execute `sudo cargo test` directly.

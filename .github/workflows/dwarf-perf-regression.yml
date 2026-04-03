@@ -62,7 +62,7 @@ jobs:
 
           benchmark_changed=false
           if printf '%s\n' "$changed_files" | grep -Eq \
-            '^(scripts/dwarf-perf/corpus/|scripts/dwarf-perf/build_corpus\.sh$|scripts/dwarf-perf/build_corpus_in_container\.sh$|scripts/dwarf-perf/generate_parse_stress\.py$|scripts/dwarf-perf/builder_image_ref\.txt$|scripts/dwarf-perf/compare_baseline\.py$|\.github/workflows/dwarf-perf-regression\.yml$)'; then
+            '^(scripts/dwarf-perf/corpus/|scripts/dwarf-perf/build_corpus\.sh$|scripts/dwarf-perf/build_corpus_in_container\.sh$|scripts/dwarf-perf/run_baseline\.sh$|scripts/dwarf-perf/generate_parse_stress\.py$|scripts/dwarf-perf/builder_image_ref\.txt$|scripts/dwarf-perf/compare_baseline\.py$|\.github/workflows/dwarf-perf-regression\.yml$)'; then
             benchmark_changed=true
           fi
 
