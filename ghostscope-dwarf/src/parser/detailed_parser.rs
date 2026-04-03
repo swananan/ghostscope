@@ -6,6 +6,7 @@
 //! - Scope-aware variable resolution
 
 use crate::{
+    binary::DwarfReader,
     core::{EvaluationResult, Result},
     parser::ExpressionEvaluator,
     semantics::{
@@ -14,7 +15,7 @@ use crate::{
     },
     TypeInfo,
 };
-use gimli::{EndianArcSlice, LittleEndian, Reader};
+use gimli::Reader;
 // Alias gimli constants to upper-case identifiers to satisfy naming lints without allow attributes
 use gimli::constants::{
     DW_AT_byte_size as DW_AT_BYTE_SIZE, DW_AT_encoding as DW_AT_ENCODING, DW_AT_name as DW_AT_NAME,
@@ -61,8 +62,8 @@ impl DetailedParser {
     /// Shallow type resolution (no recursive member expansion)
     /// Returns minimal TypeInfo with name/size where possible.
     pub fn resolve_type_shallow_at_offset(
-        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
-        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
         mut type_offset: gimli::UnitOffset,
     ) -> Option<TypeInfo> {
         let mut visited = std::collections::HashSet::new();
@@ -727,9 +728,9 @@ impl DetailedParser {
     /// Parse a variable and optionally skip full DWARF type resolution
     pub fn parse_variable_entry_with_mode(
         &mut self,
-        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
-        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
-        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        dwarf: &gimli::Dwarf<DwarfReader>,
         address: u64,
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
         scope_depth: usize,
@@ -761,18 +762,18 @@ impl DetailedParser {
     /// This function follows DW_AT_type chains (pointer/const/array/typedef) and
     /// includes a recursion guard to break true cycles (e.g., typedef A->B->A).
     fn resolve_type_name(
-        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
-        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
-        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        dwarf: &gimli::Dwarf<DwarfReader>,
     ) -> Result<String> {
         let mut visited_types: HashSet<gimli::UnitOffset> = HashSet::new();
         Self::resolve_type_name_rec(entry, unit, dwarf, &mut visited_types)
     }
 
     fn resolve_type_name_rec(
-        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
-        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
-        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        dwarf: &gimli::Dwarf<DwarfReader>,
         visited: &mut HashSet<gimli::UnitOffset>,
     ) -> Result<String> {
         // Follow DW_AT_type if present
@@ -836,9 +837,9 @@ impl DetailedParser {
     /// Parse location attribute
     pub fn parse_location(
         &self,
-        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
-        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
-        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        dwarf: &gimli::Dwarf<DwarfReader>,
         address: u64,
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
     ) -> Result<EvaluationResult> {
@@ -854,18 +855,18 @@ impl DetailedParser {
     }
 
     fn resolve_name_with_origins(
-        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
-        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
-        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        dwarf: &gimli::Dwarf<DwarfReader>,
         _visited: &mut HashSet<gimli::UnitOffset>,
     ) -> Result<Option<String>> {
         Ok(resolve_name_with_origins(dwarf, unit, entry)?)
     }
 
     fn resolve_type_ref(
-        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
-        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
-        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        dwarf: &gimli::Dwarf<DwarfReader>,
     ) -> Result<Option<gimli::UnitOffset>> {
         resolve_type_ref_in_same_unit_with_origins(dwarf, entry, unit)
     }

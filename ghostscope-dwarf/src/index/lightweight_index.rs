@@ -7,10 +7,11 @@
 //! - Fast binary search for symbol lookup
 
 use crate::{
+    binary::DwarfReader,
     core::{demangle_by_lang, demangled_leaf, IndexEntry},
     semantics::range_contains_pc,
 };
-use gimli::{DebugInfoOffset, EndianArcSlice, LittleEndian};
+use gimli::DebugInfoOffset;
 use std::collections::{BTreeMap, HashMap};
 use tracing::debug;
 
@@ -211,10 +212,7 @@ impl LightweightIndex {
     }
 
     /// Build CU range map from .debug_aranges, if present. Returns true if any ranges were added.
-    pub fn build_cu_maps_from_aranges(
-        &mut self,
-        _dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
-    ) -> bool {
+    pub fn build_cu_maps_from_aranges(&mut self, _dwarf: &gimli::Dwarf<DwarfReader>) -> bool {
         // Build CU range map using .debug_aranges if available.
         // This accelerates PC→CU lookups and mirrors how debuggers seed CU maps.
         let mut new_map: BTreeMap<u64, (u64, DebugInfoOffset)> = BTreeMap::new();

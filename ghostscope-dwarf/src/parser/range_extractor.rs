@@ -3,8 +3,7 @@
 //! Provides reusable logic for extracting address ranges from DIEs,
 //! supporting both single ranges (low_pc/high_pc) and multiple ranges (DW_AT_ranges)
 
-use crate::core::Result;
-use gimli::{EndianArcSlice, LittleEndian};
+use crate::{binary::DwarfReader, core::Result};
 use tracing::{debug, trace, warn};
 
 /// Utility for extracting address ranges from DWARF DIEs
@@ -18,9 +17,9 @@ impl RangeExtractor {
     /// 2. Multiple ranges from DW_AT_ranges
     /// 3. Return empty vec if no ranges found
     pub fn extract_all_ranges(
-        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
-        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
-        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        dwarf: &gimli::Dwarf<DwarfReader>,
     ) -> Result<Vec<(u64, u64)>> {
         // First try single range
         if let Some(range) = Self::extract_single_range(entry)? {
@@ -41,7 +40,7 @@ impl RangeExtractor {
 
     /// Extract single address range from DW_AT_low_pc and DW_AT_high_pc
     pub fn extract_single_range(
-        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
     ) -> Result<Option<(u64, u64)>> {
         let mut low_pc = None;
         let mut high_pc = None;
@@ -76,9 +75,9 @@ impl RangeExtractor {
 
     /// Extract multiple address ranges from DW_AT_ranges
     pub fn extract_multiple_ranges(
-        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
-        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
-        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        dwarf: &gimli::Dwarf<DwarfReader>,
     ) -> Result<Option<Vec<(u64, u64)>>> {
         // Check for DW_AT_ranges attribute
         let ranges_attr = match entry.attr(gimli::constants::DW_AT_ranges) {

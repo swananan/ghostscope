@@ -1,17 +1,19 @@
 //! DWARF access planner: plan chain access using DIE-level traversal without
 //! requiring full TypeInfo expansion.
 
-use crate::core::{EvaluationResult, Result};
 pub(crate) use crate::semantics::TypeLoc;
 use crate::semantics::{
     eval_member_offset_expr, resolve_type_ref_with_origins, strip_typedef_qualified,
 };
+use crate::{
+    binary::DwarfReader,
+    core::{EvaluationResult, Result},
+};
 use gimli::Reader;
-use gimli::{EndianArcSlice, LittleEndian};
 
 /// Utilities for DIE-level chain access planning
 pub struct AccessPlanner<'dwarf> {
-    dwarf: &'dwarf gimli::Dwarf<EndianArcSlice<LittleEndian>>,
+    dwarf: &'dwarf gimli::Dwarf<DwarfReader>,
     type_index: Option<std::sync::Arc<crate::index::TypeNameIndex>>,
     strict_index: bool,
 }
@@ -25,7 +27,7 @@ pub struct MemberParentCtx {
 }
 
 impl<'dwarf> AccessPlanner<'dwarf> {
-    pub fn new(dwarf: &'dwarf gimli::Dwarf<EndianArcSlice<LittleEndian>>) -> Self {
+    pub fn new(dwarf: &'dwarf gimli::Dwarf<DwarfReader>) -> Self {
         Self {
             dwarf,
             type_index: None,
@@ -34,7 +36,7 @@ impl<'dwarf> AccessPlanner<'dwarf> {
     }
 
     pub fn new_with_index(
-        dwarf: &'dwarf gimli::Dwarf<EndianArcSlice<LittleEndian>>,
+        dwarf: &'dwarf gimli::Dwarf<DwarfReader>,
         type_index: std::sync::Arc<crate::index::TypeNameIndex>,
         strict_index: bool,
     ) -> Self {
@@ -48,8 +50,8 @@ impl<'dwarf> AccessPlanner<'dwarf> {
     /// Public wrapper for resolving DW_AT_type via origins/specification chain
     pub fn resolve_type_ref_with_origins_public(
         &self,
-        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
-        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
     ) -> crate::core::Result<Option<TypeLoc>> {
         resolve_type_ref_with_origins(self.dwarf, entry, unit)
     }
@@ -67,8 +69,8 @@ impl<'dwarf> AccessPlanner<'dwarf> {
     /// DIE, but it must not be used as the trigger for declaration completion.
     fn maybe_complete_aggregate(
         &self,
-        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
-        die: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
+        unit: &gimli::Unit<DwarfReader>,
+        die: &gimli::DebuggingInformationEntry<DwarfReader>,
     ) -> crate::core::Result<(Option<gimli::DebugInfoOffset>, gimli::UnitOffset)> {
         let mut is_decl = false;
         if let Some(attr) = die.attr(gimli::DW_AT_declaration) {
@@ -362,6 +364,7 @@ impl<'dwarf> AccessPlanner<'dwarf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::binary::dwarf_reader_from_arc;
     use crate::core::{IndexEntry, IndexFlags};
     use crate::index::{LightweightIndex, TypeNameIndex};
     use gimli::constants;
@@ -369,13 +372,13 @@ mod tests {
         AttributeValue as WriteAttributeValue, Dwarf as WriteDwarf, EndianVec, LineProgram,
         Sections, Unit,
     };
-    use gimli::{DebugInfoOffset, EndianArcSlice, Format};
+    use gimli::{DebugInfoOffset, Format, LittleEndian};
     use std::collections::HashMap;
     use std::sync::Arc;
 
     type PlannerRegressionFixture = (
-        gimli::Dwarf<EndianArcSlice<LittleEndian>>,
-        gimli::Unit<EndianArcSlice<LittleEndian>>,
+        gimli::Dwarf<DwarfReader>,
+        gimli::Unit<DwarfReader>,
         gimli::UnitOffset,
         DebugInfoOffset,
         gimli::UnitOffset,
@@ -465,9 +468,8 @@ mod tests {
             )
         })
         .unwrap();
-        let read_dwarf = dwarf_sections.borrow(|section| {
-            EndianArcSlice::new(Arc::<[u8]>::from(section.as_slice()), LittleEndian)
-        });
+        let read_dwarf = dwarf_sections
+            .borrow(|section| dwarf_reader_from_arc(Arc::<[u8]>::from(section.as_slice())));
 
         let mut units = read_dwarf.units();
         let decl_header = units.next().unwrap().unwrap();
@@ -581,9 +583,8 @@ mod tests {
             )
         })
         .unwrap();
-        let read_dwarf = dwarf_sections.borrow(|section| {
-            EndianArcSlice::new(Arc::<[u8]>::from(section.as_slice()), LittleEndian)
-        });
+        let read_dwarf = dwarf_sections
+            .borrow(|section| dwarf_reader_from_arc(Arc::<[u8]>::from(section.as_slice())));
 
         let mut units = read_dwarf.units();
         let empty_header = units.next().unwrap().unwrap();
@@ -624,8 +625,8 @@ mod tests {
     }
 
     fn find_struct_offset(
-        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
-        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
         expected_name: &str,
         expected_is_declaration: bool,
         expected_has_children: bool,
@@ -662,8 +663,8 @@ mod tests {
     }
 
     fn legacy_has_children_via_next_dfs(
-        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
-        die: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
+        unit: &gimli::Unit<DwarfReader>,
+        die: &gimli::DebuggingInformationEntry<DwarfReader>,
     ) -> bool {
         let mut entries = unit.entries_at_offset(die.offset()).unwrap();
         let _ = entries.next_entry().unwrap();

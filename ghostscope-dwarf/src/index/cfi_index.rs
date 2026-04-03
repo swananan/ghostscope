@@ -4,14 +4,13 @@
 //! by utilizing eh_frame_hdr's binary search table when available.
 
 use crate::{
-    binary::MappedFile,
+    binary::{DwarfReader, MappedFile},
     core::{CfaResult, ComputeStep, Result},
 };
 use anyhow::{anyhow, Context};
-use gimli::LittleEndian as LE;
 use gimli::{
-    BaseAddresses, CfaRule, CieOrFde, EhFrame, EhFrameHdr, EndianArcSlice, FrameDescriptionEntry,
-    LittleEndian, ParsedEhFrameHdr, UnwindContext, UnwindSection,
+    BaseAddresses, CfaRule, CieOrFde, EhFrame, EhFrameHdr, FrameDescriptionEntry, ParsedEhFrameHdr,
+    UnwindContext, UnwindSection,
 };
 use object::{Object, ObjectSection};
 use std::sync::Arc;
@@ -21,14 +20,10 @@ use tracing::{debug, info, warn};
 pub struct CfiIndex {
     /// Keep file data alive
     _file_data: Arc<MappedFile>,
-    /// Keep eh_frame section data alive
-    _eh_frame_data: Arc<[u8]>,
-    /// Keep eh_frame_hdr section data alive (if present)
-    _eh_frame_hdr_data: Option<Arc<[u8]>>,
     /// Parsed eh_frame section
-    eh_frame: EhFrame<EndianArcSlice<LE>>,
+    eh_frame: EhFrame<DwarfReader>,
     /// Parsed eh_frame_hdr for fast lookup (if available)
-    eh_frame_hdr: Option<ParsedEhFrameHdr<EndianArcSlice<LE>>>,
+    eh_frame_hdr: Option<ParsedEhFrameHdr<DwarfReader>>,
     /// Base addresses for DWARF sections
     bases: BaseAddresses,
     /// Whether we have eh_frame_hdr for fast lookup
@@ -60,25 +55,21 @@ impl CfiIndex {
         let (eh_frame_start, eh_frame_size) = eh_frame_section
             .file_range()
             .ok_or_else(|| anyhow!(".eh_frame section has no file range"))?;
-        let eh_frame_arc = file_data
-            .copy_file_range_to_arc(eh_frame_start, eh_frame_size)
-            .ok_or_else(|| anyhow!("Failed to copy .eh_frame bytes from mapped file"))?;
-        let eh_frame = EhFrame::from(EndianArcSlice::new(Arc::clone(&eh_frame_arc), LittleEndian));
+        let eh_frame_reader =
+            MappedFile::dwarf_reader_range(Arc::clone(&file_data), eh_frame_start, eh_frame_size)
+                .ok_or_else(|| anyhow!("Invalid .eh_frame range in mapped file"))?;
+        let eh_frame = EhFrame::from(eh_frame_reader);
 
         // Try to load eh_frame_hdr for fast lookup (optional)
-        let mut hdr_arc_opt: Option<Arc<[u8]>> = None;
         let (eh_frame_hdr, has_fast_lookup) = match object.section_by_name(".eh_frame_hdr") {
             Some(hdr_section_obj) => {
                 let (hdr_start, hdr_size) = hdr_section_obj
                     .file_range()
                     .ok_or_else(|| anyhow!(".eh_frame_hdr section has no file range"))?;
-                let hdr_arc = file_data
-                    .copy_file_range_to_arc(hdr_start, hdr_size)
-                    .ok_or_else(|| {
-                        anyhow!("Failed to copy .eh_frame_hdr bytes from mapped file")
-                    })?;
-                hdr_arc_opt = Some(Arc::clone(&hdr_arc));
-                let hdr_section = EhFrameHdr::from(EndianArcSlice::new(hdr_arc, LittleEndian));
+                let hdr_reader =
+                    MappedFile::dwarf_reader_range(Arc::clone(&file_data), hdr_start, hdr_size)
+                        .ok_or_else(|| anyhow!("Invalid .eh_frame_hdr range in mapped file"))?;
+                let hdr_section = EhFrameHdr::from(hdr_reader);
 
                 // Parse with proper address_size
                 let address_size = if object.is_64() { 8 } else { 4 };
@@ -127,8 +118,6 @@ impl CfiIndex {
 
         Ok(Self {
             _file_data: file_data,
-            _eh_frame_data: eh_frame_arc,
-            _eh_frame_hdr_data: hdr_arc_opt,
             eh_frame,
             eh_frame_hdr,
             bases,
@@ -184,7 +173,7 @@ impl CfiIndex {
     fn find_fde_for_address(
         &self,
         address: u64,
-    ) -> Result<FrameDescriptionEntry<EndianArcSlice<LE>, usize>> {
+    ) -> Result<FrameDescriptionEntry<DwarfReader, usize>> {
         if let Some(hdr) = &self.eh_frame_hdr {
             // Fast path: O(log n) binary search using eh_frame_hdr
             debug!(

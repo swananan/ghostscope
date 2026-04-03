@@ -6,10 +6,10 @@
 //! - Provides fast lookup of in-scope variables at a given PC
 
 use crate::{
+    binary::DwarfReader,
     parser::RangeExtractor,
     semantics::{ranges_contain_pc, resolve_origin_entry},
 };
-use gimli::{EndianArcSlice, LittleEndian};
 use std::collections::BTreeMap;
 
 /// Reference to a variable DIE within a unit (minimal info)
@@ -174,11 +174,11 @@ impl BlockIndex {
 
 /// Builder for block index using DWARF data
 pub struct BlockIndexBuilder<'a> {
-    dwarf: &'a gimli::Dwarf<EndianArcSlice<LittleEndian>>,
+    dwarf: &'a gimli::Dwarf<DwarfReader>,
 }
 
 impl<'a> BlockIndexBuilder<'a> {
-    pub fn new(dwarf: &'a gimli::Dwarf<EndianArcSlice<LittleEndian>>) -> Self {
+    pub fn new(dwarf: &'a gimli::Dwarf<DwarfReader>) -> Self {
         Self { dwarf }
     }
 
@@ -241,8 +241,8 @@ impl<'a> BlockIndexBuilder<'a> {
 
     fn build_blocks_for_function(
         &self,
-        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
-        func_entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
+        unit: &gimli::Unit<DwarfReader>,
+        func_entry: &gimli::DebuggingInformationEntry<DwarfReader>,
         fb: &mut FunctionBlocks,
     ) {
         // DFS but only within this function's subtree
@@ -255,8 +255,8 @@ impl<'a> BlockIndexBuilder<'a> {
 
     fn walk_children(
         &self,
-        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
-        node: gimli::EntriesTreeNode<EndianArcSlice<LittleEndian>>,
+        unit: &gimli::Unit<DwarfReader>,
+        node: gimli::EntriesTreeNode<DwarfReader>,
         parent_idx: usize,
         fb: &mut FunctionBlocks,
     ) {

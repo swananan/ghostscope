@@ -1,5 +1,5 @@
 use super::origins::resolve_origin_entry;
-use gimli::{EndianArcSlice, LittleEndian};
+use crate::binary::DwarfReader;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TypeLoc {
@@ -8,9 +8,9 @@ pub(crate) struct TypeLoc {
 }
 
 fn resolve_debug_info_ref(
-    dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
+    dwarf: &gimli::Dwarf<DwarfReader>,
     debug_info_off: gimli::DebugInfoOffset,
-) -> crate::core::Result<Option<(gimli::Unit<EndianArcSlice<LittleEndian>>, TypeLoc)>> {
+) -> crate::core::Result<Option<(gimli::Unit<DwarfReader>, TypeLoc)>> {
     let mut units = dwarf.units();
     while let Some(header) = units.next()? {
         if let Some(die_off) = debug_info_off.to_unit_offset(&header) {
@@ -26,9 +26,9 @@ fn resolve_debug_info_ref(
 }
 
 fn type_loc_from_attr_value(
-    dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
-    unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
-    value: gimli::AttributeValue<EndianArcSlice<LittleEndian>>,
+    dwarf: &gimli::Dwarf<DwarfReader>,
+    unit: &gimli::Unit<DwarfReader>,
+    value: gimli::AttributeValue<DwarfReader>,
 ) -> crate::core::Result<Option<TypeLoc>> {
     let cu_off = unit
         .header
@@ -47,14 +47,14 @@ fn type_loc_from_attr_value(
 }
 
 pub(crate) fn resolve_type_ref_with_origins(
-    dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
-    entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
-    unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
+    dwarf: &gimli::Dwarf<DwarfReader>,
+    entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+    unit: &gimli::Unit<DwarfReader>,
 ) -> crate::core::Result<Option<TypeLoc>> {
     fn inner(
-        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
-        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
-        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
         visited: &mut std::collections::HashSet<gimli::DebugInfoOffset>,
     ) -> crate::core::Result<Option<TypeLoc>> {
         if let Some(value) = entry.attr_value(gimli::constants::DW_AT_type) {
@@ -102,9 +102,9 @@ pub(crate) fn resolve_type_ref_with_origins(
 }
 
 pub(crate) fn resolve_type_ref_in_same_unit_with_origins(
-    dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
-    entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
-    unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
+    dwarf: &gimli::Dwarf<DwarfReader>,
+    entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+    unit: &gimli::Unit<DwarfReader>,
 ) -> crate::core::Result<Option<gimli::UnitOffset>> {
     let unit_cu_off = unit
         .header
@@ -116,7 +116,7 @@ pub(crate) fn resolve_type_ref_in_same_unit_with_origins(
 }
 
 pub(crate) fn strip_typedef_qualified(
-    dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
+    dwarf: &gimli::Dwarf<DwarfReader>,
     mut type_loc: TypeLoc,
 ) -> crate::core::Result<TypeLoc> {
     loop {

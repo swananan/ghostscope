@@ -2,13 +2,12 @@
 //!
 //! Converts DWARF location expressions to EvaluationResult for eBPF code generation
 
+use crate::binary::DwarfReader;
 use crate::core::{
     ComputeStep, DirectValueResult, EvaluationResult, LocationResult, MemoryAccessSize, Result,
 };
 use crate::semantics::{range_contains_pc, resolve_attr_with_unit_origins};
-use gimli::{
-    read::RawLocListEntry, EndianArcSlice, EndianSlice, Expression, LittleEndian, Operation, Reader,
-};
+use gimli::{read::RawLocListEntry, EndianSlice, Expression, LittleEndian, Operation, Reader};
 use tracing::{debug, trace, warn};
 
 /// DWARF expression evaluator
@@ -17,9 +16,9 @@ pub struct ExpressionEvaluator;
 impl ExpressionEvaluator {
     /// Evaluate a variable's location from its DIE attributes
     pub fn evaluate_location(
-        entry: &gimli::DebuggingInformationEntry<EndianArcSlice<LittleEndian>>,
-        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
-        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        dwarf: &gimli::Dwarf<DwarfReader>,
         address: u64,
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
     ) -> Result<EvaluationResult> {
@@ -498,8 +497,8 @@ impl ExpressionEvaluator {
 
     /// Parse location lists from .debug_loclists or .debug_loc section
     pub fn parse_location_lists(
-        unit: &gimli::Unit<EndianArcSlice<LittleEndian>>,
-        dwarf: &gimli::Dwarf<EndianArcSlice<LittleEndian>>,
+        unit: &gimli::Unit<DwarfReader>,
+        dwarf: &gimli::Dwarf<DwarfReader>,
         offset: gimli::LocationListsOffset<usize>,
         address: u64,
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
