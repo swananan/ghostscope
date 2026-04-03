@@ -162,6 +162,9 @@ DWARF 解析性能基线的完整说明单独放在
 - `source-line query` 基线的语义和执行命令
 - 生成产物目录和 `perf-results/` 结果目录
 
+当前已经发布的历史页面地址是：
+<https://swananan.github.io/ghostscope/>。
+
 ### Agent E2E Runner（Codex）
 
 该流程用于在 AI agent 环境中执行 e2e，目的是规避 agent 无法直接执行 `sudo cargo test` 的限制。

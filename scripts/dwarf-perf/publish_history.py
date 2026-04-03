@@ -88,6 +88,17 @@ def dedupe_and_sort(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return unique[:MAX_HISTORY_ENTRIES]
 
 
+def prune_stale_run_snapshots(runs_dir: Path, history: list[dict[str, Any]]) -> None:
+    referenced = {
+        Path(entry["artifact_path"]).name
+        for entry in history
+        if entry.get("artifact_path", "").startswith("data/runs/")
+    }
+    for snapshot_path in runs_dir.glob("*.json"):
+        if snapshot_path.name not in referenced:
+            snapshot_path.unlink()
+
+
 def render_summary_cards(latest: dict[str, Any]) -> str:
     parse_metrics = latest["metrics"]["fast_parse_ms"]
     query_metrics = latest["metrics"]["source_line_query_ms"]
@@ -303,6 +314,7 @@ def main() -> int:
     history = maybe_load_json(history_path, [])
     history.append(build_entry(args, baseline, run_relative_path))
     history = dedupe_and_sort(history)
+    prune_stale_run_snapshots(runs_dir, history)
 
     latest = history[0]
 
