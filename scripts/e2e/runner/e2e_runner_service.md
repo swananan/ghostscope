@@ -2,10 +2,10 @@
 
 ## Shared Skill Install
 
-Install project skill for Codex:
+Install the internal runner skill for Codex:
 
 ```bash
-./scripts/e2e/runner/install_codex_skill.sh
+./scripts/e2e/runner/install_ghostscope_e2e_runner_skill.sh
 ```
 
 Then restart Codex.

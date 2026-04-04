@@ -22,21 +22,94 @@
 
 ## Overview
 
-GhostScope is a **runtime tracing tool** that brings the simplicity of printf debugging to production systems.
+GhostScope is for **source-aware userspace runtime tracing** on live Linux processes. If you have DWARF debug info and cannot afford to stop the target, GhostScope lets you attach at function, source-line, or instruction granularity and print the values that matter: locals, parameters, globals, nested fields, and raw bytes.
 
 > *"The most effective debugging tool is still careful thought, coupled with judiciously placed print statements."* — Brian Kernighan
 
-### How It Works: The Magic of DWARF + eBPF
+### When To Use GhostScope
 
-Imagine navigating a vast, uncharted forest of binary data — memory addresses, register values, stack frames — all meaningless numbers without context. **DWARF debug information is our map**: it tells us that stack address `RSP-0x18` stores local variable `count`, heap address `0x5621a8c0` is a `user` object with string pointer `user.name` at offset `+0x20`; it tracks where each variable lives throughout program execution — parameter `x` is in register `RDI` now but will move to stack offset `RSP-0x10` later.
+- You are diagnosing a production service that must stay online: GDB-style stop-the-world debugging would cause too much disruption, and you prefer an eBPF-based workflow with stronger safety boundaries and lower overhead than traditional kernel-module instrumentation.
+- You care about source lines and real variable values, not just function entry arguments.
+- You want a low-friction path from "I wish I had one more printf here" to a runnable trace script.
+- You want an AI agent to turn GhostScope docs, source paths, and DWARF-backed binaries into concrete tracing commands.
 
-With this map in hand, GhostScope leverages **eBPF and uprobe** technology to safely extract binary data from any instruction point in your running program. The combination is powerful: DWARF reveals the meaning of every byte in the process's virtual address space, while eBPF safely retrieves exactly what we need. The result? You can print variable values (local or global), function arguments, complex data structures, even stack backtraces from any point in your program — all without stopping or modifying it.
+### When Not To Use GhostScope
+
+- Use GDB when you need breakpoints, single-stepping, memory writes, or coredump debugging.
+- Use bpftrace or SystemTap when you want broad kernel + userspace event aggregation in one script.
+- Do not expect source-level variable tracing to work well without DWARF debug info for the modules you care about.
+
+### GhostScope vs GDB, bpftrace, and SystemTap
+
+| Tool | Best at | Less ideal when |
+|---|---|---|
+| GhostScope | Low-overhead, source-aware userspace tracing on live processes | You need interactive execution control, or broad kernel-space data observation built around eBPF |
+| GDB | Breakpoints, stepping, coredumps, state mutation | The target process cannot be paused in a production environment |
+| bpftrace | Mixed kernel + userspace observation and quick event aggregation | You need reliable DWARF-based source-level semantic reconstruction of a userspace process |
+| SystemTap | Broad system tracing, existing tapset ecosystems, aggregation-oriented workflows | You want a userspace tracing tool that integrates better with AI or offers a friendlier TUI |
+
+See the [Tool Comparison](docs/comparison.md) guide for a deeper breakdown and the [FAQ](docs/faq.md) for related guidance.
+
+### AI Runtime Analysis Skill
+
+GhostScope supports two modes: an interactive TUI mode, and a CLI mode built around `--script` and `--script-file`. The latter is the more AI-optimized workflow for automation and agent-driven runtime analysis.
+
+Install the shared skill for Codex or Claude Code:
+
+```bash
+./scripts/skills/install_ghostscope_runtime_analysis_skill.sh --copy
+```
+
+Use `--codex`, `--claude`, or `--all` when you want to force a target. Restart Codex or Claude Code after installation.
+
+When the agent shares your workspace, it can often discover the source checkout path and DWARF/debug-symbol status on its own. If it cannot determine them reliably, it should ask before generating a source-backed trace. A typical session looks like this.
+
+Context the agent can discover locally in this example:
+
+- Source checkout: `/mnt/500g/code/openresty/openresty-1.27.1.1/build/nginx-1.27.1`
+- Target binary: `/usr/local/openresty/nginx/sbin/nginx`
+- Debug info: embedded DWARF is available
+
+Prompt:
+
+```text
+$ghostscope-runtime-analysis trace the running nginx worker and show the raw request body bytes
+```
+
+Generated command:
+
+```bash
+WORKER_PID=$(pgrep -n -f 'nginx: worker process')
+sudo ghostscope -p "$WORKER_PID" --script-file /tmp/ghostscope-nginx-body-discard.gs --script-output plain
+```
+
+Generated script:
+
+```ghostscope
+trace /mnt/500g/code/openresty/openresty-1.27.1.1/build/nginx-1.27.1/src/http/ngx_http_request_body.c:671 {
+    if size > 0 {
+        let req_line_len = r.request_line.len;
+        let body_len = size;
+
+        print "src=discard-preread pid={} req={:p} line={:s.req_line_len$} body_len={} body={:x.body_len$}",
+            $pid, r, r.request_line.data, body_len, r.header_in.pos;
+    }
+}
+```
+
+Observed output:
+
+```text
+src=discard-preread pid=3385842 req=0x55ce5fcb0650 line=POST /demo HTTP/1.1 body_len=10 body=00 01 02 68 65 6c 6c 6f ff 10
+```
+
+For best results, make sure the relevant source tree is available, the modules you care about carry DWARF debug information, and GhostScope has the privileges needed to load eBPF programs. When that information is not discoverable locally, the skill should ask for it before generating a source-backed trace. Re-run the same installer after pulling updates; the installed skill is versioned and refreshes automatically when the version changes.
 
 ### The Printf That Should Have Been
 
-GhostScope transforms compiled binaries into observable systems. Place trace points at function entries, specific source lines, or anywhere in between. Print local variables, global variables, function parameters, complex nested structures, even stack backtraces. All with the simplicity of printf debugging, but the power of modern tracing.
+GhostScope turns compiled binaries into observable systems. In the TUI, that experience unfolds progressively: first find the function or source line you care about, then inspect the variables visible at that point, enter Script Mode from that location, and finally watch the live output panel update while the target keeps running. It feels less like a generic dashboard and more like source-guided runtime printf debugging.
 
-The demo below shows GhostScope tracing an nginx worker process with debug information. You can see how GhostScope supports conditional logic, easily extracts information from complex data structures, and operates without disrupting the process.
+The demo below follows exactly that path on a DWARF-enabled nginx worker: locate the code path, drop a trace at the right line, add a small script, and immediately see conditional logic, source-oriented variable access, and live output from the running process.
 
 <br />
 
@@ -44,6 +117,12 @@ The demo below shows GhostScope tracing an nginx worker process with debug infor
   <img src="https://raw.githubusercontent.com/swananan/ghostscope/main/assets/demo.gif" alt="GhostScope Demo" width="100%"/>
   <p><sub><i>Real-time tracing of a running nginx worker process</i></sub></p>
 </div>
+
+### How It Works
+
+Imagine navigating a vast, uncharted forest of binary data — memory addresses, register values, stack frames — all meaningless numbers without context. **DWARF debug information is our map**: it tells us that stack address `RSP-0x18` stores local variable `count`, heap address `0x5621a8c0` is a `user` object with string pointer `user.name` at offset `+0x20`; it tracks where each variable lives throughout program execution — parameter `x` is in register `RDI` now but will move to stack offset `RSP-0x10` later.
+
+With this map in hand, GhostScope leverages **eBPF and uprobe** technology to safely extract binary data from any instruction point in your running program. The combination is powerful: DWARF reveals the meaning of every byte in the process's virtual address space, while eBPF safely retrieves exactly what we need. The result? You can print variable values (local or global), function arguments, complex data structures, even stack backtraces from any point in your program — all without stopping or modifying it.
 
 ## ✨ Highlights
 
@@ -90,6 +169,8 @@ The demo below shows GhostScope tracing an nginx worker process with debug infor
 >
 > We are continuously improving stability and accuracy, and look forward to removing this disclaimer in future versions.
 
+See [Limitations](docs/limitations.md) for the current list of hard and soft constraints.
+
 ## 📚 Documentation
 
 <table>
@@ -103,6 +184,9 @@ The demo below shows GhostScope tracing an nginx worker process with debug infor
 
 - [**Quick Tutorial**](docs/tutorial.md)
   Learn the basics in 10 minutes
+
+- [**Tool Comparison**](docs/comparison.md)
+  Choose between GhostScope, GDB, bpftrace, and SystemTap
 
 - [**FAQ**](docs/faq.md)
   Common questions answered
