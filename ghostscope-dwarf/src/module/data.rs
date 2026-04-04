@@ -22,7 +22,7 @@ mod file_selection_scoring {
 }
 
 use crate::{
-    binary::{empty_dwarf_reader, try_load_debug_file, DwarfData, MappedFile},
+    binary::{empty_dwarf_reader, try_load_debug_file, DwarfData, DwarfReader, MappedFile},
     core::{mapping::ModuleMapping, GlobalVariableInfo, Result, SectionType, SourceLocation},
     index::{
         BlockIndex, BlockIndexBuilder, CfiIndex, FunctionBlocks, LightweightIndex,
@@ -30,7 +30,10 @@ use crate::{
     },
     parser::{CompilationUnit, ExpressionEvaluator, SourceFile},
     resolver::{ChainSpec, OnDemandResolver},
-    semantics::{resolve_attr_with_unit_origins, resolve_name_with_origins},
+    semantics::{
+        range_contains_pc, resolve_attr_with_unit_origins, resolve_name_with_origins,
+        resolve_origin_entry,
+    },
 };
 use gimli::Reader;
 use object::{Object, ObjectSection, ObjectSegment};
@@ -1802,16 +1805,19 @@ impl ModuleData {
     ///
     /// Semantics
     /// - Inline (DW_TAG_inlined_subroutine):
-    ///   Return exactly one address per inline DIE, using the inline instance
-    ///   "start" (low_pc) semantics. Implemented as the minimum of all range
-    ///   starts when ranges exist; otherwise fall back to entry_pc. Intentionally
-    ///   do not scan for is_stmt here to preserve entry-like behavior and keep
-    ///   entry-view locations available.
+    ///   Return exactly one address per inline DIE. Prefer DW_AT_entry_pc when
+    ///   available because compilers use it to identify the true entry into the
+    ///   inlined body. If entry_pc is missing, preserve the first DWARF-emitted
+    ///   range start so hot/cold partitioning does not drift to a lower-address
+    ///   cold fragment; only fall back to the minimum range start as a final
+    ///   recovery path. Intentionally do not scan for is_stmt here to preserve
+    ///   entry-like behavior and keep entry-view locations available.
     /// - Non-inline (DW_TAG_subprogram):
     ///   For each selected executable range, return the first executable address
-    ///   after the prologue (prologue-skip). If any formal parameter uses
-    ///   DW_OP_entry_value, prefer the true entry (range start) to preserve
-    ///   entry context. When DW_AT_ranges contains partitioned hot/cold code,
+    ///   after the prologue (prologue-skip). If any formal parameter's active
+    ///   location at the selected probe PC uses DW_OP_entry_value, prefer the
+    ///   true entry (range start) to preserve entry context. When DW_AT_ranges
+    ///   contains partitioned hot/cold code,
     ///   prefer the range containing DW_AT_entry_pc; otherwise preserve the
     ///   first DWARF-emitted range because compilers typically list the entry/
     ///   hot partition first even when a later address sort would put `.cold`
@@ -1849,9 +1855,8 @@ impl ModuleData {
                 tracing::debug!("Inline '{}' has no ranges; entry_pc={epc_dbg}", entry.name);
             }
 
-            let low_pc = ranges.iter().map(|(s, _)| *s).min();
-            if let Some(addr) = low_pc.or(entry.entry_pc) {
-                tracing::debug!("Inline '{}' selected=0x{addr:x} (low_pc)", entry.name);
+            if let Some(addr) = Self::selected_inline_address(entry) {
+                tracing::debug!("Inline '{}' selected=0x{addr:x}", entry.name);
                 out.push(addr);
             } else {
                 tracing::warn!(
@@ -1861,19 +1866,25 @@ impl ModuleData {
                 );
             }
         } else {
-            // If function parameters use DW_OP_entry_value, prefer the true entry (no prologue skip)
-            let prefer_entry = self.function_uses_entry_value(entry).unwrap_or(false);
             let nranges = Self::selected_non_inline_ranges(entry);
-            for (start, _end) in &nranges {
-                let addr = if prefer_entry {
-                    *start
-                } else {
-                    self.line_mapping.find_first_executable_address(*start)
+            for (start, end) in &nranges {
+                let candidate = {
+                    let first_exec = self.line_mapping.find_first_executable_address(*start);
+                    Self::selected_non_inline_probe_address(*start, *end, first_exec)
                 };
+                // Only force the true entry when the location active at the
+                // probe PC already relies on DW_OP_entry_value. Some optimized
+                // functions switch to entry_value later in the body, but still
+                // have stable register locations at the first executable
+                // instruction after the prologue.
+                let prefer_entry = self
+                    .function_uses_entry_value_at(entry, candidate)
+                    .unwrap_or(false);
+                let addr = if prefer_entry { *start } else { candidate };
                 if prefer_entry {
                     tracing::debug!(
-                        "Non-inline '{}' entry_value=true, using entry start=0x{start:x}",
-                        entry.name
+                        "Non-inline '{}' entry_value active at 0x{candidate:x}, using entry start=0x{start:x}",
+                        entry.name,
                     );
                 } else {
                     let off = addr.saturating_sub(*start);
@@ -1881,11 +1892,24 @@ impl ModuleData {
                         "Non-inline '{}' start=0x{start:x} first_exec=0x{addr:x} (+0x{off:x})",
                         entry.name
                     );
+                    if addr == *start {
+                        tracing::debug!(
+                            "Non-inline '{}' kept entry start because prologue-skip candidate escaped range [0x{start:x}, 0x{end:x})",
+                            entry.name
+                        );
+                    }
                 }
                 out.push(addr);
             }
         }
         out
+    }
+
+    fn selected_inline_address(entry: &crate::core::IndexEntry) -> Option<u64> {
+        let first_start = entry.address_ranges.first().map(|(start, _)| *start);
+        let low_pc = entry.address_ranges.iter().map(|(start, _)| *start).min();
+
+        entry.entry_pc.or(first_start).or(low_pc)
     }
 
     fn selected_non_inline_ranges(entry: &crate::core::IndexEntry) -> Vec<(u64, u64)> {
@@ -1907,8 +1931,21 @@ impl ModuleData {
         vec![ranges[0]]
     }
 
-    /// Check if this subprogram uses DW_OP_entry_value in any formal parameter location
-    fn function_uses_entry_value(&self, idx_entry: &crate::core::IndexEntry) -> Result<bool> {
+    fn selected_non_inline_probe_address(start: u64, end: u64, candidate: u64) -> u64 {
+        if start <= candidate && candidate < end {
+            candidate
+        } else {
+            start
+        }
+    }
+
+    /// Check if this subprogram uses DW_OP_entry_value for any formal parameter
+    /// location active at the given PC.
+    fn function_uses_entry_value_at(
+        &self,
+        idx_entry: &crate::core::IndexEntry,
+        pc: u64,
+    ) -> Result<bool> {
         let dwarf = self.resolver.dwarf_ref();
         let header = dwarf
             .unit_header(idx_entry.unit_offset)
@@ -1919,38 +1956,340 @@ impl ModuleData {
         let entry = unit
             .entry(idx_entry.die_offset)
             .map_err(|e| anyhow::anyhow!("entry load error: {}", e))?;
+        Self::subprogram_uses_entry_value_at(dwarf, &unit, &entry, pc)
+    }
+
+    #[cfg(test)]
+    fn subprogram_uses_entry_value(
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+    ) -> Result<bool> {
+        let mut visited = HashSet::with_capacity(4);
+        if let Some(entry_abs) = entry.offset().to_debug_info_offset(&unit.header) {
+            visited.insert(entry_abs);
+        }
+
+        Self::subprogram_uses_entry_value_inner(dwarf, unit, entry, &mut visited)
+    }
+
+    fn subprogram_uses_entry_value_at(
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+        pc: u64,
+    ) -> Result<bool> {
+        let mut visited = HashSet::with_capacity(4);
+        if let Some(entry_abs) = entry.offset().to_debug_info_offset(&unit.header) {
+            visited.insert(entry_abs);
+        }
+
+        Self::subprogram_uses_entry_value_at_inner(dwarf, unit, entry, pc, &mut visited)
+    }
+
+    #[cfg(test)]
+    fn subprogram_uses_entry_value_inner(
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+        visited: &mut HashSet<gimli::DebugInfoOffset>,
+    ) -> Result<bool> {
         if entry.tag() != gimli::constants::DW_TAG_subprogram {
             return Ok(false);
         }
+
+        if let Some(uses_entry_value) =
+            Self::direct_formal_parameters_entry_value_state(unit, entry)?
+        {
+            return Ok(uses_entry_value);
+        }
+
+        for origin_attr in [
+            gimli::constants::DW_AT_abstract_origin,
+            gimli::constants::DW_AT_specification,
+        ] {
+            if let Some(value) = entry.attr_value(origin_attr) {
+                if let Some((origin_abs, origin_unit, origin_entry)) =
+                    resolve_origin_entry(dwarf, unit, value)
+                        .map_err(|e| anyhow::anyhow!("origin resolution error: {}", e))?
+                {
+                    if visited.insert(origin_abs)
+                        && Self::subprogram_uses_entry_value_inner(
+                            dwarf,
+                            &origin_unit,
+                            &origin_entry,
+                            visited,
+                        )?
+                    {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    fn subprogram_uses_entry_value_at_inner(
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+        pc: u64,
+        visited: &mut HashSet<gimli::DebugInfoOffset>,
+    ) -> Result<bool> {
+        if entry.tag() != gimli::constants::DW_TAG_subprogram {
+            return Ok(false);
+        }
+
+        if let Some(uses_entry_value) =
+            Self::direct_formal_parameters_entry_value_state_at_pc(dwarf, unit, entry, pc)?
+        {
+            return Ok(uses_entry_value);
+        }
+
+        for origin_attr in [
+            gimli::constants::DW_AT_abstract_origin,
+            gimli::constants::DW_AT_specification,
+        ] {
+            if let Some(value) = entry.attr_value(origin_attr) {
+                if let Some((origin_abs, origin_unit, origin_entry)) =
+                    resolve_origin_entry(dwarf, unit, value)
+                        .map_err(|e| anyhow::anyhow!("origin resolution error: {}", e))?
+                {
+                    if visited.insert(origin_abs)
+                        && Self::subprogram_uses_entry_value_at_inner(
+                            dwarf,
+                            &origin_unit,
+                            &origin_entry,
+                            pc,
+                            visited,
+                        )?
+                    {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    #[cfg(test)]
+    fn direct_formal_parameters_entry_value_state(
+        unit: &gimli::Unit<DwarfReader>,
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+    ) -> Result<Option<bool>> {
+        let mut saw_parameter = false;
 
         if let Ok(mut tree) = unit.entries_tree(Some(entry.offset())) {
             if let Ok(root) = tree.root() {
                 let mut children = root.children();
                 while let Ok(Some(child)) = children.next() {
                     let e = child.entry();
-                    if e.tag() == gimli::constants::DW_TAG_formal_parameter {
-                        if let Ok(Some(gimli::AttributeValue::Exprloc(expr))) =
-                            resolve_attr_with_unit_origins(
-                                e,
-                                &unit,
-                                gimli::constants::DW_AT_location,
-                            )
-                        {
-                            // Parse ops and look for EntryValue
-                            let mut expression = gimli::Expression(expr.0);
-                            while let Ok(op) =
-                                gimli::Operation::parse(&mut expression.0, unit.encoding())
-                            {
-                                if matches!(op, gimli::Operation::EntryValue { .. }) {
-                                    return Ok(true);
-                                }
-                            }
+                    if e.tag() != gimli::constants::DW_TAG_formal_parameter {
+                        continue;
+                    }
+                    saw_parameter = true;
+
+                    if let Ok(Some(gimli::AttributeValue::Exprloc(expr))) =
+                        resolve_attr_with_unit_origins(e, unit, gimli::constants::DW_AT_location)
+                    {
+                        if Self::expression_uses_entry_value(unit, gimli::Expression(expr.0)) {
+                            return Ok(Some(true));
                         }
                     }
                 }
             }
         }
-        Ok(false)
+
+        if saw_parameter {
+            Ok(Some(false))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn direct_formal_parameters_entry_value_state_at_pc(
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+        pc: u64,
+    ) -> Result<Option<bool>> {
+        let mut saw_parameter = false;
+
+        if let Ok(mut tree) = unit.entries_tree(Some(entry.offset())) {
+            if let Ok(root) = tree.root() {
+                let mut children = root.children();
+                while let Ok(Some(child)) = children.next() {
+                    let e = child.entry();
+                    if e.tag() != gimli::constants::DW_TAG_formal_parameter {
+                        continue;
+                    }
+                    saw_parameter = true;
+
+                    if let Ok(Some(value)) =
+                        resolve_attr_with_unit_origins(e, unit, gimli::constants::DW_AT_location)
+                    {
+                        if Self::attribute_uses_entry_value_at_pc(dwarf, unit, value, pc)? {
+                            return Ok(Some(true));
+                        }
+                    }
+                }
+            }
+        }
+
+        if saw_parameter {
+            Ok(Some(false))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn attribute_uses_entry_value_at_pc(
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        value: gimli::AttributeValue<DwarfReader>,
+        pc: u64,
+    ) -> Result<bool> {
+        match value {
+            gimli::AttributeValue::Exprloc(expr) => Ok(Self::expression_uses_entry_value(
+                unit,
+                gimli::Expression(expr.0),
+            )),
+            gimli::AttributeValue::LocationListsRef(offset) => {
+                Self::location_list_uses_entry_value_at_pc(
+                    dwarf,
+                    unit,
+                    gimli::LocationListsOffset(offset.0),
+                    pc,
+                )
+            }
+            gimli::AttributeValue::SecOffset(offset) => Self::location_list_uses_entry_value_at_pc(
+                dwarf,
+                unit,
+                gimli::LocationListsOffset(offset),
+                pc,
+            ),
+            _ => Ok(false),
+        }
+    }
+
+    fn location_list_uses_entry_value_at_pc(
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        offset: gimli::LocationListsOffset<usize>,
+        pc: u64,
+    ) -> Result<bool> {
+        if let Ok(mut locations) = dwarf.locations(unit, offset) {
+            let default_location_uses_entry_value = None;
+            loop {
+                match locations.next() {
+                    Ok(Some(location_list_entry)) => {
+                        if range_contains_pc(
+                            location_list_entry.range.begin,
+                            location_list_entry.range.end,
+                            pc,
+                        ) {
+                            return Ok(Self::expression_uses_entry_value(
+                                unit,
+                                location_list_entry.data,
+                            ));
+                        }
+                    }
+                    Ok(None) => {
+                        if let Some(value) = default_location_uses_entry_value {
+                            return Ok(value);
+                        }
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
+        let mut raw_locations = match dwarf.raw_locations(unit, offset) {
+            Ok(iter) => iter,
+            Err(_) => return Ok(false),
+        };
+
+        let mut base_address = unit.low_pc;
+        let mut default_location_uses_entry_value = None;
+        while let Some(raw_entry) = raw_locations
+            .next()
+            .map_err(|e| anyhow::anyhow!("raw location list iteration error: {:?}", e))?
+        {
+            match raw_entry {
+                gimli::RawLocListEntry::BaseAddress { addr } => {
+                    base_address = addr;
+                }
+                gimli::RawLocListEntry::BaseAddressx { addr } => {
+                    if let Ok(resolved) = dwarf.address(unit, addr) {
+                        base_address = resolved;
+                    }
+                }
+                gimli::RawLocListEntry::StartLength {
+                    begin,
+                    length,
+                    data,
+                } => {
+                    if range_contains_pc(begin, begin.wrapping_add(length), pc) {
+                        return Ok(Self::expression_uses_entry_value(unit, data));
+                    }
+                }
+                gimli::RawLocListEntry::StartEnd { begin, end, data } => {
+                    if range_contains_pc(begin, end, pc) {
+                        return Ok(Self::expression_uses_entry_value(unit, data));
+                    }
+                }
+                gimli::RawLocListEntry::OffsetPair { begin, end, data }
+                | gimli::RawLocListEntry::AddressOrOffsetPair { begin, end, data } => {
+                    let start = base_address.wrapping_add(begin);
+                    let end_addr = base_address.wrapping_add(end);
+                    if range_contains_pc(start, end_addr, pc) {
+                        return Ok(Self::expression_uses_entry_value(unit, data));
+                    }
+                }
+                gimli::RawLocListEntry::StartxLength {
+                    begin,
+                    length,
+                    data,
+                } => {
+                    if let Ok(start) = dwarf.address(unit, begin) {
+                        if range_contains_pc(start, start.wrapping_add(length), pc) {
+                            return Ok(Self::expression_uses_entry_value(unit, data));
+                        }
+                    }
+                }
+                gimli::RawLocListEntry::StartxEndx { begin, end, data } => {
+                    if let (Ok(start), Ok(end_addr)) =
+                        (dwarf.address(unit, begin), dwarf.address(unit, end))
+                    {
+                        if range_contains_pc(start, end_addr, pc) {
+                            return Ok(Self::expression_uses_entry_value(unit, data));
+                        }
+                    }
+                }
+                gimli::RawLocListEntry::DefaultLocation { data } => {
+                    default_location_uses_entry_value =
+                        Some(Self::expression_uses_entry_value(unit, data));
+                }
+            }
+        }
+
+        Ok(default_location_uses_entry_value.unwrap_or(false))
+    }
+
+    fn expression_uses_entry_value(
+        unit: &gimli::Unit<DwarfReader>,
+        mut expression: gimli::Expression<DwarfReader>,
+    ) -> bool {
+        while let Ok(op) = gimli::Operation::parse(&mut expression.0, unit.encoding()) {
+            if matches!(op, gimli::Operation::EntryValue { .. }) {
+                return true;
+            }
+        }
+
+        false
     }
 
     /// Lookup function addresses by any of: DW_AT_name, linkage name, or demangled name
@@ -2425,8 +2764,14 @@ impl ModuleData {
 #[cfg(test)]
 mod tests {
     use super::ModuleData;
+    use crate::binary::{dwarf_reader_from_arc, DwarfReader};
     use crate::core::{IndexEntry, IndexFlags};
     use gimli::constants;
+    use gimli::write::{
+        Address, AttributeValue as WriteAttributeValue, Dwarf as WriteDwarf, EndianVec,
+        Expression as WriteExpression, LineProgram, Location, LocationList, Sections, Unit,
+    };
+    use gimli::{Format, Register};
     use std::sync::Arc;
 
     fn subprogram_entry(ranges: &[(u64, u64)], entry_pc: Option<u64>) -> IndexEntry {
@@ -2440,6 +2785,219 @@ mod tests {
             address_ranges: ranges.to_vec(),
             entry_pc,
         }
+    }
+
+    fn inline_entry(ranges: &[(u64, u64)], entry_pc: Option<u64>) -> IndexEntry {
+        let mut entry = subprogram_entry(ranges, entry_pc);
+        entry.tag = constants::DW_TAG_inlined_subroutine;
+        entry.flags.is_inline = true;
+        entry
+    }
+
+    fn build_origin_backed_entry_value_fixture(
+        origin_attr: gimli::DwAt,
+    ) -> gimli::Dwarf<DwarfReader> {
+        let encoding = gimli::Encoding {
+            format: Format::Dwarf32,
+            version: 4,
+            address_size: 8,
+        };
+
+        let mut dwarf = WriteDwarf::new();
+        let unit_id = dwarf.units.add(Unit::new(encoding, LineProgram::none()));
+        let unit = dwarf.units.get_mut(unit_id);
+        let root = unit.root();
+
+        let origin_id = unit.add(root, constants::DW_TAG_subprogram);
+        unit.get_mut(origin_id).set(
+            constants::DW_AT_name,
+            WriteAttributeValue::String(b"entry_value_target".to_vec()),
+        );
+
+        let origin_param_id = unit.add(origin_id, constants::DW_TAG_formal_parameter);
+        let mut inner = WriteExpression::new();
+        inner.op_reg(Register(5));
+        let mut origin_param_loc = WriteExpression::new();
+        origin_param_loc.op_entry_value(inner);
+        unit.get_mut(origin_param_id).set(
+            constants::DW_AT_location,
+            WriteAttributeValue::Exprloc(origin_param_loc),
+        );
+
+        let concrete_id = unit.add(root, constants::DW_TAG_subprogram);
+        unit.get_mut(concrete_id)
+            .set(origin_attr, WriteAttributeValue::UnitRef(origin_id));
+
+        let mut sections = Sections::new(EndianVec::new(gimli::LittleEndian));
+        dwarf.write(&mut sections).unwrap();
+
+        let dwarf_sections: gimli::DwarfSections<Vec<u8>> = gimli::DwarfSections::load(|id| {
+            Ok::<_, gimli::Error>(
+                sections
+                    .get(id)
+                    .map(|section| section.slice().to_vec())
+                    .unwrap_or_default(),
+            )
+        })
+        .unwrap();
+
+        dwarf_sections
+            .borrow(|section| dwarf_reader_from_arc(Arc::<[u8]>::from(section.as_slice())))
+    }
+
+    fn build_origin_backed_entry_value_override_fixture(
+        origin_attr: gimli::DwAt,
+    ) -> gimli::Dwarf<DwarfReader> {
+        let encoding = gimli::Encoding {
+            format: Format::Dwarf32,
+            version: 4,
+            address_size: 8,
+        };
+
+        let mut dwarf = WriteDwarf::new();
+        let unit_id = dwarf.units.add(Unit::new(encoding, LineProgram::none()));
+        let unit = dwarf.units.get_mut(unit_id);
+        let root = unit.root();
+
+        let origin_id = unit.add(root, constants::DW_TAG_subprogram);
+        unit.get_mut(origin_id).set(
+            constants::DW_AT_name,
+            WriteAttributeValue::String(b"entry_value_override_target".to_vec()),
+        );
+
+        let origin_param_id = unit.add(origin_id, constants::DW_TAG_formal_parameter);
+        let mut inner = WriteExpression::new();
+        inner.op_reg(Register(5));
+        let mut origin_param_loc = WriteExpression::new();
+        origin_param_loc.op_entry_value(inner);
+        unit.get_mut(origin_param_id).set(
+            constants::DW_AT_location,
+            WriteAttributeValue::Exprloc(origin_param_loc),
+        );
+
+        let concrete_id = unit.add(root, constants::DW_TAG_subprogram);
+        unit.get_mut(concrete_id)
+            .set(origin_attr, WriteAttributeValue::UnitRef(origin_id));
+
+        let concrete_param_id = unit.add(concrete_id, constants::DW_TAG_formal_parameter);
+        let concrete_param = unit.get_mut(concrete_param_id);
+        concrete_param.set(
+            constants::DW_AT_abstract_origin,
+            WriteAttributeValue::UnitRef(origin_param_id),
+        );
+        let mut concrete_param_loc = WriteExpression::new();
+        concrete_param_loc.op_reg(Register(6));
+        concrete_param.set(
+            constants::DW_AT_location,
+            WriteAttributeValue::Exprloc(concrete_param_loc),
+        );
+
+        let mut sections = Sections::new(EndianVec::new(gimli::LittleEndian));
+        dwarf.write(&mut sections).unwrap();
+
+        let dwarf_sections: gimli::DwarfSections<Vec<u8>> = gimli::DwarfSections::load(|id| {
+            Ok::<_, gimli::Error>(
+                sections
+                    .get(id)
+                    .map(|section| section.slice().to_vec())
+                    .unwrap_or_default(),
+            )
+        })
+        .unwrap();
+
+        dwarf_sections
+            .borrow(|section| dwarf_reader_from_arc(Arc::<[u8]>::from(section.as_slice())))
+    }
+
+    fn build_origin_backed_entry_value_range_fixture(
+        origin_attr: gimli::DwAt,
+    ) -> gimli::Dwarf<DwarfReader> {
+        let encoding = gimli::Encoding {
+            format: Format::Dwarf32,
+            version: 5,
+            address_size: 8,
+        };
+
+        let mut dwarf = WriteDwarf::new();
+        let unit_id = dwarf.units.add(Unit::new(encoding, LineProgram::none()));
+        let unit = dwarf.units.get_mut(unit_id);
+        let root = unit.root();
+
+        let origin_id = unit.add(root, constants::DW_TAG_subprogram);
+        unit.get_mut(origin_id).set(
+            constants::DW_AT_name,
+            WriteAttributeValue::String(b"entry_value_range_target".to_vec()),
+        );
+
+        let origin_param_id = unit.add(origin_id, constants::DW_TAG_formal_parameter);
+        let mut direct_loc = WriteExpression::new();
+        direct_loc.op_reg(Register(5));
+        let mut inner = WriteExpression::new();
+        inner.op_reg(Register(5));
+        let mut entry_value_loc = WriteExpression::new();
+        entry_value_loc.op_entry_value(inner);
+        let loc_id = unit.locations.add(LocationList(vec![
+            Location::StartEnd {
+                begin: Address::Constant(0x1470),
+                end: Address::Constant(0x1477),
+                data: direct_loc,
+            },
+            Location::StartEnd {
+                begin: Address::Constant(0x1477),
+                end: Address::Constant(0x147b),
+                data: entry_value_loc,
+            },
+        ]));
+        unit.get_mut(origin_param_id).set(
+            constants::DW_AT_location,
+            WriteAttributeValue::LocationListRef(loc_id),
+        );
+
+        let concrete_id = unit.add(root, constants::DW_TAG_subprogram);
+        unit.get_mut(concrete_id)
+            .set(origin_attr, WriteAttributeValue::UnitRef(origin_id));
+
+        let mut sections = Sections::new(EndianVec::new(gimli::LittleEndian));
+        dwarf.write(&mut sections).unwrap();
+
+        let dwarf_sections: gimli::DwarfSections<Vec<u8>> = gimli::DwarfSections::load(|id| {
+            Ok::<_, gimli::Error>(
+                sections
+                    .get(id)
+                    .map(|section| section.slice().to_vec())
+                    .unwrap_or_default(),
+            )
+        })
+        .unwrap();
+
+        dwarf_sections
+            .borrow(|section| dwarf_reader_from_arc(Arc::<[u8]>::from(section.as_slice())))
+    }
+
+    fn first_unit(dwarf: &gimli::Dwarf<DwarfReader>) -> gimli::Unit<DwarfReader> {
+        let mut units = dwarf.units();
+        let header = units.next().unwrap().unwrap();
+        dwarf.unit(header).unwrap()
+    }
+
+    fn find_subprogram_with_origin_attr(
+        unit: &gimli::Unit<DwarfReader>,
+        origin_attr: gimli::DwAt,
+    ) -> gimli::UnitOffset {
+        let mut tree = unit.entries_tree(None).unwrap();
+        let root = tree.root().unwrap();
+        let mut children = root.children();
+
+        while let Some(child) = children.next().unwrap() {
+            let entry = child.entry();
+            if entry.tag() == constants::DW_TAG_subprogram
+                && entry.attr_value(origin_attr).is_some()
+            {
+                return entry.offset();
+            }
+        }
+
+        panic!("failed to find subprogram with origin attr {origin_attr:?}");
     }
 
     #[test]
@@ -2480,6 +3038,199 @@ mod tests {
         assert_eq!(
             ModuleData::selected_non_inline_ranges(&entry),
             vec![(0x100, 0x110)],
+        );
+    }
+
+    #[test]
+    fn selected_non_inline_probe_address_clamps_prologue_skip_to_function_range() {
+        // Regression scenario:
+        // The hot/cold fix intentionally prologue-skips non-inline functions by
+        // asking the line table for the first executable PC after range start.
+        // On optimized binaries the line table can sometimes return a PC from
+        // the next function entirely. If we trust that blindly, function-level
+        // tracing attaches to a sibling symbol and silently misses the target.
+        //
+        // This locks in the clamp: a candidate outside [start, end) must fall
+        // back to the function's own start, while an in-range candidate is kept.
+        assert_eq!(
+            ModuleData::selected_non_inline_probe_address(0x1470, 0x147b, 0x14f2),
+            0x1470
+        );
+        assert_eq!(
+            ModuleData::selected_non_inline_probe_address(0x1470, 0x147b, 0x1474),
+            0x1474
+        );
+    }
+
+    #[test]
+    fn selected_inline_address_prefers_entry_pc_over_cold_min_range() {
+        // Regression scenario:
+        // A DW_TAG_inlined_subroutine can carry multiple ranges, including a
+        // lower-address cold fragment. Using min(range.start) would incorrectly
+        // place the probe on the cold block even when DW_AT_entry_pc points at
+        // the real hot entry into the inlined body.
+        //
+        // This test mirrors the CGPsend shape and ensures entry_pc wins.
+        let entry = inline_entry(
+            &[
+                (0x8eb12b, 0x8eb139),
+                (0x8eb150, 0x8eb157),
+                (0x8eb16a, 0x8eb1b0),
+                (0x76e798, 0x76e7a2),
+            ],
+            Some(0x8eb16a),
+        );
+
+        assert_eq!(ModuleData::selected_inline_address(&entry), Some(0x8eb16a));
+    }
+
+    #[test]
+    fn selected_inline_address_without_entry_pc_keeps_first_emitted_hot_range() {
+        // Regression scenario:
+        // Some inline DIEs omit DW_AT_entry_pc but still emit ranges in
+        // compiler order, with the hot fragment first and a lower-address cold
+        // fragment later. Sorting and taking min(range.start) reintroduces the
+        // same cold-placement bug.
+        //
+        // This keeps the fallback policy stable: if entry_pc is missing, prefer
+        // the first emitted range before considering a pure minimum.
+        let entry = inline_entry(
+            &[
+                (0x8eb12b, 0x8eb139),
+                (0x8eb150, 0x8eb157),
+                (0x76e798, 0x76e7a2),
+            ],
+            None,
+        );
+
+        assert_eq!(ModuleData::selected_inline_address(&entry), Some(0x8eb12b));
+    }
+
+    #[test]
+    fn subprogram_uses_entry_value_via_abstract_origin_parameters() {
+        // Regression scenario:
+        // After concrete out-of-line subprograms stopped inheriting is_inline,
+        // they began using the non-inline address path again. That path needs to
+        // know when parameter recovery depends on DW_OP_entry_value so it can
+        // preserve the true entry PC instead of prologue-skipping.
+        //
+        // Optimized DWARF may place the formal parameters only on the abstract
+        // origin, with the concrete subprogram inheriting them via
+        // DW_AT_abstract_origin. This test ensures that inherited parameter DIEs
+        // are still consulted for entry_value detection.
+        let dwarf = build_origin_backed_entry_value_fixture(constants::DW_AT_abstract_origin);
+        let unit = first_unit(&dwarf);
+        let concrete_offset =
+            find_subprogram_with_origin_attr(&unit, constants::DW_AT_abstract_origin);
+        let concrete = unit.entry(concrete_offset).unwrap();
+
+        assert_eq!(
+            ModuleData::direct_formal_parameters_entry_value_state(&unit, &concrete).unwrap(),
+            None,
+            "concrete DIE should not expose direct parameter children in this fixture"
+        );
+        assert!(
+            ModuleData::subprogram_uses_entry_value(&dwarf, &unit, &concrete).unwrap(),
+            "entry_value should be discovered through DW_AT_abstract_origin"
+        );
+    }
+
+    #[test]
+    fn subprogram_uses_entry_value_via_specification_parameters() {
+        // Same as the abstract-origin case above, but for compilers that route
+        // concrete subprograms through DW_AT_specification instead. Both origin
+        // chains must preserve entry_value-driven entry selection.
+        let dwarf = build_origin_backed_entry_value_fixture(constants::DW_AT_specification);
+        let unit = first_unit(&dwarf);
+        let concrete_offset =
+            find_subprogram_with_origin_attr(&unit, constants::DW_AT_specification);
+        let concrete = unit.entry(concrete_offset).unwrap();
+
+        assert_eq!(
+            ModuleData::direct_formal_parameters_entry_value_state(&unit, &concrete).unwrap(),
+            None,
+            "concrete DIE should not expose direct parameter children in this fixture"
+        );
+        assert!(
+            ModuleData::subprogram_uses_entry_value(&dwarf, &unit, &concrete).unwrap(),
+            "entry_value should be discovered through DW_AT_specification"
+        );
+    }
+
+    #[test]
+    fn subprogram_uses_entry_value_does_not_override_concrete_parameter_locations() {
+        // Regression scenario:
+        // A concrete optimized subprogram may have its own formal_parameter
+        // children that override the abstract origin's DW_AT_location, often via
+        // DW_AT_abstract_origin on the parameter DIE itself. In that shape, the
+        // concrete child is authoritative and origin-level entry_value must not
+        // force prefer_entry=true.
+        //
+        // This test ensures direct concrete parameter locations win over the
+        // origin's location expression.
+        let dwarf =
+            build_origin_backed_entry_value_override_fixture(constants::DW_AT_abstract_origin);
+        let unit = first_unit(&dwarf);
+        let concrete_offset =
+            find_subprogram_with_origin_attr(&unit, constants::DW_AT_abstract_origin);
+        let concrete = unit.entry(concrete_offset).unwrap();
+
+        assert_eq!(
+            ModuleData::direct_formal_parameters_entry_value_state(&unit, &concrete).unwrap(),
+            Some(false),
+            "concrete DIE should treat its own parameter children as authoritative"
+        );
+        assert!(
+            !ModuleData::subprogram_uses_entry_value(&dwarf, &unit, &concrete).unwrap(),
+            "origin-level entry_value must not override concrete parameter locations"
+        );
+    }
+
+    #[test]
+    fn subprogram_uses_entry_value_at_pc_only_when_active_location_uses_it() {
+        // Regression scenario:
+        // The original entry_value check was too coarse: if any loclist segment
+        // used DW_OP_entry_value anywhere in the function, we forced the probe
+        // back to the raw entry. That breaks functions like optimized
+        // calculate_something, where the first executable instruction still has
+        // direct register locations and entry_value only appears later.
+        //
+        // This test builds that exact shape in miniature and verifies the new
+        // rule: only the location expression active at the candidate probe PC
+        // may trigger prefer_entry=true.
+        let dwarf = build_origin_backed_entry_value_range_fixture(constants::DW_AT_abstract_origin);
+        let unit = first_unit(&dwarf);
+        let concrete_offset =
+            find_subprogram_with_origin_attr(&unit, constants::DW_AT_abstract_origin);
+        let concrete = unit.entry(concrete_offset).unwrap();
+
+        assert!(
+            !ModuleData::subprogram_uses_entry_value_at(&dwarf, &unit, &concrete, 0x1474).unwrap(),
+            "entry_value should not force the true entry while the active location is still a direct register"
+        );
+        assert!(
+            ModuleData::subprogram_uses_entry_value_at(&dwarf, &unit, &concrete, 0x1478).unwrap(),
+            "entry_value should still be detected once the active location range switches to it"
+        );
+    }
+
+    #[test]
+    fn subprogram_uses_entry_value_at_pc_respects_concrete_parameter_overrides() {
+        // This complements the test above: even with PC-sensitive loclist
+        // evaluation, we must still honor concrete parameter overrides before
+        // walking up to abstract origins/specifications. Otherwise an origin
+        // loclist with entry_value could reclassify a concrete out-of-line body
+        // that already exposed usable direct-register parameter locations.
+        let dwarf =
+            build_origin_backed_entry_value_override_fixture(constants::DW_AT_abstract_origin);
+        let unit = first_unit(&dwarf);
+        let concrete_offset =
+            find_subprogram_with_origin_attr(&unit, constants::DW_AT_abstract_origin);
+        let concrete = unit.entry(concrete_offset).unwrap();
+
+        assert!(
+            !ModuleData::subprogram_uses_entry_value_at(&dwarf, &unit, &concrete, 0x1478).unwrap(),
+            "concrete parameter locations must remain authoritative at the selected probe PC"
         );
     }
 }
