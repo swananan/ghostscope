@@ -121,6 +121,9 @@ impl<'ctx> EbpfContext<'ctx> {
         self.builder
             .build_store(offset_ptr, new_off)
             .expect("store new_off failed");
+        self.compile_time_event_bytes_upper_bound = self
+            .compile_time_event_bytes_upper_bound
+            .saturating_add(size as usize);
 
         dest_i8
     }
@@ -178,6 +181,7 @@ impl<'ctx> EbpfContext<'ctx> {
     /// Send TraceEventHeader as first segment
     pub fn send_trace_event_header(&mut self) -> Result<()> {
         info!("Sending TraceEventHeader segment");
+        self.compile_time_event_bytes_upper_bound = 0;
 
         // For PerfEventArray: Reset accumulation buffer offset to 0
         if matches!(
