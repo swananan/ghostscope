@@ -92,6 +92,10 @@ pub struct EbpfContext<'ctx> {
     pub pm_key_alloca: Option<inkwell::values::PointerValue<'ctx>>, // [3 x i32] alloca
     // Per-invocation event accumulation offset (u32) stored on stack (entry block)
     pub event_offset_alloca: Option<inkwell::values::PointerValue<'ctx>>,
+    // Compile-time upper bound for bytes that may already be reserved in the current trace event.
+    // This is maintained across structured control flow so later instructions can budget against
+    // the worst-case path without double-counting sibling branches.
+    pub compile_time_event_bytes_upper_bound: usize,
     // Tracks whether the last proc_module_offsets lookup succeeded (used to skip reads)
     pub offsets_found_flag: Option<inkwell::values::PointerValue<'ctx>>,
 
@@ -207,6 +211,7 @@ impl<'ctx> EbpfContext<'ctx> {
             current_resolved_var_module_path: None,
             pm_key_alloca: None,
             event_offset_alloca: None,
+            compile_time_event_bytes_upper_bound: 0,
             offsets_found_flag: None,
             compile_options: compile_options.clone(),
 

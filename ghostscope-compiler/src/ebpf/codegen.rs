@@ -7,8 +7,8 @@ use super::context::{CodeGenError, EbpfContext, Result};
 use crate::script::{PrintStatement, Program, Statement};
 use aya_ebpf_bindings::bindings::bpf_func_id::BPF_FUNC_probe_read_user;
 use ghostscope_protocol::trace_event::{
-    BacktraceData, InstructionHeader, PrintComplexVariableData, PrintStringIndexData,
-    PrintVariableIndexData, VariableStatus,
+    BacktraceData, EndInstructionData, InstructionHeader, PrintComplexFormatData,
+    PrintComplexVariableData, PrintStringIndexData, PrintVariableIndexData, VariableStatus,
 };
 use ghostscope_protocol::{InstructionType, TraceContext, TypeKind};
 use inkwell::values::{BasicValueEnum, IntValue};
@@ -68,8 +68,109 @@ struct ComplexArg<'ctx> {
     source: ComplexArgSource<'ctx>,
 }
 
+const DYNAMIC_READ_ERROR_PAYLOAD_LEN: usize = 12;
+
+fn print_complex_format_instruction_budget(
+    max_trace_event_size: usize,
+    bytes_reserved_so_far: usize,
+) -> usize {
+    let end_instruction_size =
+        std::mem::size_of::<InstructionHeader>() + std::mem::size_of::<EndInstructionData>();
+    let event_budget = max_trace_event_size
+        .saturating_sub(bytes_reserved_so_far)
+        .saturating_sub(end_instruction_size);
+    let instruction_budget_cap = std::mem::size_of::<InstructionHeader>() + u16::MAX as usize;
+    event_budget.min(instruction_budget_cap)
+}
+
+fn distribute_budget_fairly(caps: &[usize], budget: usize) -> Vec<usize> {
+    let mut allocations = vec![0; caps.len()];
+    let mut active: Vec<usize> = caps
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, cap)| (*cap > 0).then_some(idx))
+        .collect();
+    let mut remaining = budget;
+
+    while remaining > 0 && !active.is_empty() {
+        let share = remaining / active.len();
+        if share == 0 {
+            for &idx in active.iter().take(remaining) {
+                allocations[idx] += 1;
+            }
+            break;
+        }
+
+        let mut consumed = 0usize;
+        let mut next_active = Vec::with_capacity(active.len());
+        for idx in active {
+            let cap_left = caps[idx].saturating_sub(allocations[idx]);
+            let take = share.min(cap_left);
+            allocations[idx] += take;
+            consumed += take;
+            if allocations[idx] < caps[idx] {
+                next_active.push(idx);
+            }
+        }
+
+        if consumed == 0 {
+            break;
+        }
+
+        remaining = remaining.saturating_sub(consumed);
+        active = next_active;
+    }
+
+    allocations
+}
+
+fn allocate_dynamic_payload_reservations(max_lens: &[usize], available: usize) -> Vec<usize> {
+    if max_lens.is_empty() || available == 0 {
+        return vec![0; max_lens.len()];
+    }
+
+    let base_caps = vec![DYNAMIC_READ_ERROR_PAYLOAD_LEN; max_lens.len()];
+    let base_budget = available.min(DYNAMIC_READ_ERROR_PAYLOAD_LEN.saturating_mul(max_lens.len()));
+    let mut reservations = distribute_budget_fairly(&base_caps, base_budget);
+    let remaining_budget = available.saturating_sub(reservations.iter().sum::<usize>());
+    if remaining_budget == 0 {
+        return reservations;
+    }
+
+    let extra_caps: Vec<usize> = max_lens
+        .iter()
+        .zip(reservations.iter())
+        .map(|(max_len, reserved)| {
+            max_len
+                .max(&DYNAMIC_READ_ERROR_PAYLOAD_LEN)
+                .saturating_sub(*reserved)
+        })
+        .collect();
+    let extras = distribute_budget_fairly(&extra_caps, remaining_budget);
+    for (reservation, extra) in reservations.iter_mut().zip(extras) {
+        *reservation += extra;
+    }
+
+    reservations
+}
+
 impl<'ctx> EbpfContext<'ctx> {
     const UNKNOWN_CHAR_ARRAY_READ_FALLBACK: usize = 256;
+
+    fn build_errno_i32(&self, ret: IntValue<'ctx>, name: &str) -> Result<IntValue<'ctx>> {
+        let i32_ty = self.context.i32_type();
+        match ret.get_type().get_bit_width().cmp(&32) {
+            std::cmp::Ordering::Greater => self
+                .builder
+                .build_int_truncate(ret, i32_ty, name)
+                .map_err(|e| CodeGenError::LLVMError(e.to_string())),
+            std::cmp::Ordering::Less => self
+                .builder
+                .build_int_s_extend(ret, i32_ty, name)
+                .map_err(|e| CodeGenError::LLVMError(e.to_string())),
+            std::cmp::Ordering::Equal => Ok(ret),
+        }
+    }
 
     /// Unified expression resolver: returns a ComplexArg carrying
     /// a consistent var_name_index/type_index/access_path/data_len/source
@@ -1255,6 +1356,7 @@ impl<'ctx> EbpfContext<'ctx> {
                 then_body,
                 else_body,
             } => {
+                let entry_event_bytes = self.compile_time_event_bytes_upper_bound;
                 // Prepare condition context (runtime error capture)
                 // Pretty expression text for warning
                 let expr_text = self.expr_to_name(condition);
@@ -1325,6 +1427,7 @@ impl<'ctx> EbpfContext<'ctx> {
 
                 // Error path: emit ExprError and decide destination
                 self.builder.position_at_end(err_block);
+                self.compile_time_event_bytes_upper_bound = entry_event_bytes;
                 let cond_err_ptr = self.get_or_create_cond_error_global();
                 let err_code = self
                     .builder
@@ -1349,6 +1452,7 @@ impl<'ctx> EbpfContext<'ctx> {
                 // Decide where to go on error: if else_body is If (else-if), go to else_block to continue;
                 // otherwise, skip else (suppress) and jump to merge.
                 let goto_else = matches!(else_body.as_deref(), Some(Statement::If { .. }));
+                let err_path_event_bytes = self.compile_time_event_bytes_upper_bound;
                 if goto_else {
                     self.builder
                         .build_unconditional_branch(else_block)
@@ -1369,6 +1473,7 @@ impl<'ctx> EbpfContext<'ctx> {
 
                 // No-error path: branch on boolean condition
                 self.builder.position_at_end(ok_block);
+                self.compile_time_event_bytes_upper_bound = entry_event_bytes;
                 self.builder
                     .build_conditional_branch(cond_bool, then_block, else_block)
                     .map_err(|e| {
@@ -1377,12 +1482,14 @@ impl<'ctx> EbpfContext<'ctx> {
 
                 // Build then block
                 self.builder.position_at_end(then_block);
+                self.compile_time_event_bytes_upper_bound = entry_event_bytes;
                 let mut then_instructions = 0u16;
                 self.enter_scope();
                 for stmt in then_body {
                     then_instructions += self.compile_statement(stmt)?;
                 }
                 self.exit_scope();
+                let then_event_bytes = self.compile_time_event_bytes_upper_bound;
                 self.builder
                     .build_unconditional_branch(merge_block)
                     .map_err(|e| {
@@ -1391,6 +1498,12 @@ impl<'ctx> EbpfContext<'ctx> {
 
                 // Build else block
                 self.builder.position_at_end(else_block);
+                let else_entry_event_bytes = if goto_else {
+                    entry_event_bytes.max(err_path_event_bytes)
+                } else {
+                    entry_event_bytes
+                };
+                self.compile_time_event_bytes_upper_bound = else_entry_event_bytes;
                 let mut else_instructions = 0u16;
                 if let Some(else_stmt) = else_body {
                     self.enter_scope();
@@ -1402,9 +1515,17 @@ impl<'ctx> EbpfContext<'ctx> {
                     .map_err(|e| {
                         CodeGenError::LLVMError(format!("Failed to branch to merge: {e}"))
                     })?;
+                let else_event_bytes = self.compile_time_event_bytes_upper_bound;
 
                 // Continue with merge block
                 self.builder.position_at_end(merge_block);
+                self.compile_time_event_bytes_upper_bound = if goto_else {
+                    then_event_bytes.max(else_event_bytes)
+                } else {
+                    then_event_bytes
+                        .max(else_event_bytes)
+                        .max(err_path_event_bytes)
+                };
 
                 // Return the maximum instructions from either branch
                 Ok(std::cmp::max(then_instructions, else_instructions))
@@ -2090,12 +2211,14 @@ impl<'ctx> EbpfContext<'ctx> {
         format_string_index: u16,
         complex_args: &[ComplexArg<'ctx>],
     ) -> Result<()> {
-        use ghostscope_protocol::trace_event::PrintComplexFormatData;
         use InstructionType::PrintComplexFormat as IT;
 
-        // Calculate total size with buffer-capacity awareness to avoid overflow
-        // Instruction buffer capacity is currently 4096 (see create_instruction_buffer)
-        const INSTR_BUF_CAP: usize = 4096;
+        // Keep a single formatted print within the remaining event budget on the current
+        // control-flow path, while still leaving room for EndInstruction.
+        let instruction_budget = print_complex_format_instruction_budget(
+            self.compile_options.max_trace_event_size as usize,
+            self.compile_time_event_bytes_upper_bound,
+        );
         let fixed_overhead = std::mem::size_of::<InstructionHeader>()
             + std::mem::size_of::<PrintComplexFormatData>();
 
@@ -2103,9 +2226,9 @@ impl<'ctx> EbpfContext<'ctx> {
         let mut arg_count = 0u8;
         let mut headers_total = 0usize;
         let mut static_payload_total = 0usize;
-        let mut dynamic_indices: Vec<(usize, usize)> = Vec::new(); // (arg_idx, max_len)
+        let mut dynamic_max_lens: Vec<usize> = Vec::new();
         let mut header_lens: Vec<usize> = Vec::with_capacity(complex_args.len());
-        for (idx, a) in complex_args.iter().enumerate() {
+        for a in complex_args {
             // Header bytes per-arg: var_name_index(2) + type_index(2) + access_path_len(1) + status(1) + data_len(2) + access_path
             let header_len = 2 + 2 + 1 + 1 + 2 + a.access_path.len();
             header_lens.push(header_len);
@@ -2115,50 +2238,44 @@ impl<'ctx> EbpfContext<'ctx> {
                 ComplexArgSource::ImmediateBytes { bytes } => static_payload_total += bytes.len(),
                 ComplexArgSource::AddressValue { .. } => static_payload_total += 8,
                 ComplexArgSource::RuntimeRead { .. } => {
-                    static_payload_total += std::cmp::max(a.data_len, 12)
+                    static_payload_total +=
+                        std::cmp::max(a.data_len, DYNAMIC_READ_ERROR_PAYLOAD_LEN)
                 }
                 ComplexArgSource::ComputedInt { byte_len, .. } => static_payload_total += *byte_len,
                 ComplexArgSource::MemDump { len, .. } => {
-                    static_payload_total += std::cmp::max(*len, 12)
+                    static_payload_total += std::cmp::max(*len, DYNAMIC_READ_ERROR_PAYLOAD_LEN)
                 }
-                ComplexArgSource::MemDumpDynamic { max_len, .. } => {
-                    dynamic_indices.push((idx, *max_len))
-                }
+                ComplexArgSource::MemDumpDynamic { max_len, .. } => dynamic_max_lens.push(*max_len),
             }
             arg_count = arg_count.saturating_add(1);
         }
 
-        // Available space for all argument payloads within the instruction buffer
-        // Ensure we never exceed INSTR_BUF_CAP
-        let mut remaining_for_payload = INSTR_BUF_CAP
+        // Static payload keeps its existing layout; dynamic payload shares the remaining
+        // instruction budget fairly so later {:s.*}/{:x.*} arguments do not get starved.
+        let remaining_for_payload = instruction_budget
             .saturating_sub(fixed_overhead)
-            .saturating_sub(headers_total);
-
-        // Allocate static payload first
-        remaining_for_payload = remaining_for_payload.saturating_sub(static_payload_total);
+            .saturating_sub(headers_total)
+            .saturating_sub(static_payload_total);
+        let dynamic_reservations =
+            allocate_dynamic_payload_reservations(&dynamic_max_lens, remaining_for_payload);
+        let mut dynamic_reservations_iter = dynamic_reservations.into_iter();
 
         // Second pass: decide effective reserved payload for each arg
-        // Default to computed static payload; dynamic args get clamped to remaining space
+        // Default to computed static payload; dynamic args share the event-derived budget
         let mut effective_reserved: Vec<usize> = Vec::with_capacity(complex_args.len());
-        for (idx, a) in complex_args.iter().enumerate() {
+        for a in complex_args {
             let reserved = match &a.source {
                 ComplexArgSource::ImmediateBytes { bytes } => bytes.len(),
                 ComplexArgSource::AddressValue { .. } => 8,
-                ComplexArgSource::RuntimeRead { .. } => std::cmp::max(a.data_len, 12),
+                ComplexArgSource::RuntimeRead { .. } => {
+                    std::cmp::max(a.data_len, DYNAMIC_READ_ERROR_PAYLOAD_LEN)
+                }
                 ComplexArgSource::ComputedInt { byte_len, .. } => *byte_len,
-                ComplexArgSource::MemDump { len, .. } => std::cmp::max(*len, 12),
+                ComplexArgSource::MemDump { len, .. } => {
+                    std::cmp::max(*len, DYNAMIC_READ_ERROR_PAYLOAD_LEN)
+                }
                 ComplexArgSource::MemDumpDynamic { .. } => {
-                    // find max_len for this dynamic arg and clamp to remaining
-                    let (_, max_len) = dynamic_indices
-                        .iter()
-                        .copied()
-                        .find(|(i, _)| *i == idx)
-                        .unwrap_or((idx, 0));
-                    // Ensure we always have space for error payload (errno+addr = 12 bytes) if possible
-                    let need = std::cmp::max(12usize, max_len);
-                    let eff = std::cmp::min(need, remaining_for_payload);
-                    remaining_for_payload = remaining_for_payload.saturating_sub(eff);
-                    eff
+                    dynamic_reservations_iter.next().unwrap_or(0)
                 }
             };
             effective_reserved.push(reserved);
@@ -2577,8 +2694,9 @@ impl<'ctx> EbpfContext<'ctx> {
                             "errno_ptr",
                         )
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    let errno = self.build_errno_i32(ret, "errno_i32")?;
                     self.builder
-                        .build_store(errno_ptr, ret)
+                        .build_store(errno_ptr, errno)
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
                     let addr_ptr_i8 = unsafe {
                         self.builder
@@ -2791,38 +2909,43 @@ impl<'ctx> EbpfContext<'ctx> {
                                 .const_int(VariableStatus::ReadError as u64, false),
                         )
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    let errno_ptr = self
-                        .builder
-                        .build_pointer_cast(
-                            var_data_ptr,
-                            self.context.ptr_type(AddressSpace::default()),
-                            "mdd_errno_ptr",
-                        )
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    self.builder
-                        .build_store(errno_ptr, ret)
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    let addr_ptr_i8 = unsafe {
-                        self.builder
-                            .build_gep(
-                                self.context.i8_type(),
+                    if eff_max_len >= 4 {
+                        let errno_ptr = self
+                            .builder
+                            .build_pointer_cast(
                                 var_data_ptr,
-                                &[self.context.i32_type().const_int(4, false)],
-                                "mdd_addr_ptr_i8",
+                                self.context.ptr_type(AddressSpace::default()),
+                                "mdd_errno_ptr",
                             )
-                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-                    };
-                    let addr_ptr = self
-                        .builder
-                        .build_pointer_cast(
-                            addr_ptr_i8,
-                            self.context.ptr_type(AddressSpace::default()),
-                            "mdd_addr_ptr",
-                        )
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    self.builder
-                        .build_store(addr_ptr, *src_addr)
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        let errno = self.build_errno_i32(ret, "mdd_errno_i32")?;
+                        self.builder
+                            .build_store(errno_ptr, errno)
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    }
+                    if eff_max_len as usize >= DYNAMIC_READ_ERROR_PAYLOAD_LEN {
+                        let addr_ptr_i8 = unsafe {
+                            self.builder
+                                .build_gep(
+                                    self.context.i8_type(),
+                                    var_data_ptr,
+                                    &[self.context.i32_type().const_int(4, false)],
+                                    "mdd_addr_ptr_i8",
+                                )
+                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                        };
+                        let addr_ptr = self
+                            .builder
+                            .build_pointer_cast(
+                                addr_ptr_i8,
+                                self.context.ptr_type(AddressSpace::default()),
+                                "mdd_addr_ptr",
+                            )
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        self.builder
+                            .build_store(addr_ptr, *src_addr)
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    }
                     self.mark_any_fail()?;
                     self.builder
                         .build_unconditional_branch(cont_b)
@@ -4553,8 +4676,9 @@ impl<'ctx> EbpfContext<'ctx> {
                 "errno_ptr",
             )
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast errno ptr: {e}")))?;
+        let errno = self.build_errno_i32(ret, "readerr_errno_i32")?;
         self.builder
-            .build_store(errno_ptr, ret)
+            .build_store(errno_ptr, errno)
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store errno: {e}")))?;
         // write addr at [4..12]
         let addr_ptr_i8 = unsafe {
@@ -4619,6 +4743,69 @@ impl<'ctx> EbpfContext<'ctx> {
 mod tests {
     use super::*;
     use crate::CompileOptions;
+    use ghostscope_protocol::trace_event::{TraceEventHeader, TraceEventMessage};
+
+    #[test]
+    fn print_complex_format_budget_tracks_event_size() {
+        let bytes_reserved_so_far =
+            std::mem::size_of::<TraceEventHeader>() + std::mem::size_of::<TraceEventMessage>();
+        let expected = 32768
+            - (bytes_reserved_so_far
+                + std::mem::size_of::<InstructionHeader>()
+                + std::mem::size_of::<EndInstructionData>());
+        assert_eq!(
+            print_complex_format_instruction_budget(32768, bytes_reserved_so_far),
+            expected
+        );
+        assert!(print_complex_format_instruction_budget(32768, bytes_reserved_so_far) > 4096);
+    }
+
+    #[test]
+    fn print_complex_format_budget_shrinks_after_prior_instructions() {
+        let bytes_reserved_so_far = std::mem::size_of::<TraceEventHeader>()
+            + std::mem::size_of::<TraceEventMessage>()
+            + 2048;
+        let base_budget = print_complex_format_instruction_budget(
+            32768,
+            std::mem::size_of::<TraceEventHeader>() + std::mem::size_of::<TraceEventMessage>(),
+        );
+        assert_eq!(
+            print_complex_format_instruction_budget(32768, bytes_reserved_so_far),
+            base_budget - 2048
+        );
+    }
+
+    #[test]
+    fn dynamic_payload_reservations_share_budget_fairly() {
+        let reservations = allocate_dynamic_payload_reservations(&[256, 256, 256, 256], 512);
+        assert_eq!(reservations, vec![128, 128, 128, 128]);
+    }
+
+    #[test]
+    fn dynamic_payload_reservations_keep_error_headroom_when_possible() {
+        let reservations = allocate_dynamic_payload_reservations(&[256, 256, 256], 36);
+        assert_eq!(reservations, vec![12, 12, 12]);
+    }
+
+    #[test]
+    fn build_errno_i32_truncates_i64_errors() {
+        let context = inkwell::context::Context::create();
+        let opts = CompileOptions::default();
+        let ctx =
+            EbpfContext::new(&context, "test_mod", Some(0), &opts).expect("create EbpfContext");
+        let fn_type = context.i32_type().fn_type(&[], false);
+        let function = ctx.module.add_function("errno_test", fn_type, None);
+        let block = context.append_basic_block(function, "entry");
+        ctx.builder.position_at_end(block);
+
+        let errno = ctx
+            .build_errno_i32(
+                context.i64_type().const_int((-14i64) as u64, true),
+                "errno_i32",
+            )
+            .expect("truncate errno");
+        assert_eq!(errno.get_type().get_bit_width(), 32);
+    }
 
     #[test]
     fn computed_int_store_i64_compiles() {
