@@ -22,8 +22,10 @@ use std::ffi::OsString;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use tempfile::{Builder, NamedTempFile};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 
 const ENV_GHOSTSCOPE_LOG_LEVEL: &str = "E2E_GHOSTSCOPE_LOG_LEVEL";
@@ -258,7 +260,7 @@ impl GhostscopeRunner {
         let stdout_handle = child.stdout.take().unwrap();
         let stderr_handle = child.stderr.take().unwrap();
         let mut stdout_reader = BufReader::new(stdout_handle);
-        let mut stderr_reader = BufReader::new(stderr_handle);
+        let stderr_reader = BufReader::new(stderr_handle);
 
         let mut stdout_content = String::new();
         let mut stderr_content = String::new();
@@ -304,58 +306,27 @@ impl GhostscopeRunner {
             })?);
         }
 
+        let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+        let stdout_task =
+            spawn_output_reader(stdout_reader, OutputStream::Stdout, output_tx.clone());
+        let stderr_task = spawn_output_reader(stderr_reader, OutputStream::Stderr, output_tx);
+
         if !ready_fired {
             let pre_ready_task = async {
-                let mut stdout_line = String::new();
-                let mut stderr_line = String::new();
                 loop {
-                    stdout_line.clear();
-                    if let Ok(Ok(n)) = timeout(
-                        Duration::from_millis(50),
-                        stdout_reader.read_line(&mut stdout_line),
-                    )
-                    .await
+                    if let Ok(Some(output_line)) =
+                        timeout(Duration::from_millis(100), output_rx.recv()).await
                     {
-                        if n > 0 {
-                            stdout_content.push_str(&stdout_line);
-                            if ready_marker
-                                .as_deref()
-                                .is_some_and(|marker| stdout_line.trim_end() == marker)
-                            {
-                                if runner_debug {
-                                    eprintln!(
-                                        "[ghostscope-test-runner] observed ready marker on stdout from {}",
-                                        sandbox.label()
-                                    );
-                                }
-                                ready_fired = true;
-                                break;
-                            }
-                        }
-                    }
-
-                    stderr_line.clear();
-                    if let Ok(Ok(n)) = timeout(
-                        Duration::from_millis(50),
-                        stderr_reader.read_line(&mut stderr_line),
-                    )
-                    .await
-                    {
-                        if n > 0 {
-                            stderr_content.push_str(&stderr_line);
-                            if ready_marker
-                                .as_deref()
-                                .is_some_and(|marker| stderr_line.trim_end() == marker)
-                            {
-                                if runner_debug {
-                                    eprintln!(
-                                        "[ghostscope-test-runner] observed ready marker on stderr from {}",
-                                        sandbox.label()
-                                    );
-                                }
-                                ready_fired = true;
-                                break;
-                            }
+                        if handle_output_line(
+                            output_line,
+                            &mut stdout_content,
+                            &mut stderr_content,
+                            ready_marker.as_deref(),
+                            runner_debug,
+                            &sandbox,
+                        ) {
+                            ready_fired = true;
+                            break;
                         }
                     }
 
@@ -457,31 +428,18 @@ impl GhostscopeRunner {
 
         let timed_out = if ready_fired {
             let read_task = async {
-                let mut stdout_line = String::new();
-                let mut stderr_line = String::new();
                 loop {
-                    stdout_line.clear();
-                    if let Ok(Ok(n)) = timeout(
-                        Duration::from_millis(50),
-                        stdout_reader.read_line(&mut stdout_line),
-                    )
-                    .await
+                    if let Ok(Some(output_line)) =
+                        timeout(Duration::from_millis(100), output_rx.recv()).await
                     {
-                        if n > 0 {
-                            stdout_content.push_str(&stdout_line);
-                        }
-                    }
-
-                    stderr_line.clear();
-                    if let Ok(Ok(n)) = timeout(
-                        Duration::from_millis(50),
-                        stderr_reader.read_line(&mut stderr_line),
-                    )
-                    .await
-                    {
-                        if n > 0 {
-                            stderr_content.push_str(&stderr_line);
-                        }
+                        handle_output_line(
+                            output_line,
+                            &mut stdout_content,
+                            &mut stderr_content,
+                            ready_marker.as_deref(),
+                            runner_debug,
+                            &sandbox,
+                        );
                     }
 
                     if let Ok(Some(_status)) = child.try_wait() {
@@ -540,28 +498,16 @@ impl GhostscopeRunner {
             }
         };
 
-        {
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match stdout_reader.read_line(&mut line).await {
-                    Ok(0) => break,
-                    Ok(_) => stdout_content.push_str(&line),
-                    Err(_) => break,
-                }
-            }
-        }
-        {
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match stderr_reader.read_line(&mut line).await {
-                    Ok(0) => break,
-                    Ok(_) => stderr_content.push_str(&line),
-                    Err(_) => break,
-                }
-            }
-        }
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+        drain_output_channel(
+            &mut output_rx,
+            &mut stdout_content,
+            &mut stderr_content,
+            ready_marker.as_deref(),
+            runner_debug,
+            &sandbox,
+        );
 
         if exit_code == -1 && (!stdout_content.is_empty() || !stderr_content.is_empty()) {
             exit_code = 0;
@@ -653,6 +599,97 @@ struct EffectiveLoggingConfig {
     level: Option<String>,
     enable_logging: bool,
     enable_console_logging: bool,
+}
+
+#[derive(Clone, Copy)]
+enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+struct OutputLine {
+    stream: OutputStream,
+    line: String,
+}
+
+fn spawn_output_reader<R>(
+    mut reader: BufReader<R>,
+    stream: OutputStream,
+    tx: UnboundedSender<OutputLine>,
+) -> JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    if tx
+                        .send(OutputLine {
+                            stream,
+                            line: line.clone(),
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+fn handle_output_line(
+    output_line: OutputLine,
+    stdout_content: &mut String,
+    stderr_content: &mut String,
+    ready_marker: Option<&str>,
+    runner_debug: bool,
+    sandbox: &SandboxHandle,
+) -> bool {
+    let target = match output_line.stream {
+        OutputStream::Stdout => stdout_content,
+        OutputStream::Stderr => stderr_content,
+    };
+    target.push_str(&output_line.line);
+
+    let saw_ready = ready_marker.is_some_and(|marker| output_line.line.trim_end() == marker);
+    if saw_ready && runner_debug {
+        let stream = match output_line.stream {
+            OutputStream::Stdout => "stdout",
+            OutputStream::Stderr => "stderr",
+        };
+        eprintln!(
+            "[ghostscope-test-runner] observed ready marker on {stream} from {}",
+            sandbox.label()
+        );
+    }
+
+    saw_ready
+}
+
+fn drain_output_channel(
+    output_rx: &mut UnboundedReceiver<OutputLine>,
+    stdout_content: &mut String,
+    stderr_content: &mut String,
+    ready_marker: Option<&str>,
+    runner_debug: bool,
+    sandbox: &SandboxHandle,
+) {
+    while let Ok(output_line) = output_rx.try_recv() {
+        handle_output_line(
+            output_line,
+            stdout_content,
+            stderr_content,
+            ready_marker,
+            runner_debug,
+            sandbox,
+        );
+    }
 }
 
 fn create_script_file() -> Result<NamedTempFile> {
