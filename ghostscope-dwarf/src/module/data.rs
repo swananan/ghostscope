@@ -3107,6 +3107,24 @@ mod tests {
     }
 
     #[test]
+    fn selected_inline_address_ignores_entry_pc_outside_inline_ranges() {
+        // Regression scenario:
+        // Some optimized GCC builds emit an inlined_subroutine whose
+        // DW_AT_entry_pc points at the caller-side setup block, while the
+        // inline DIE's own ranges only cover the actual inlined body. Trusting
+        // entry_pc unconditionally selects a PC where the inline parameters are
+        // not in scope and later eBPF compilation fails with "Variable not in
+        // scope".
+        //
+        // This mirrors the container CI failure shape: entry_pc=0x1215 but the
+        // inline instance itself only covers [0x1289, 0x1293). A correct
+        // selection must stay inside the inline DIE's own ranges.
+        let entry = inline_entry(&[(0x1289, 0x1293)], Some(0x1215));
+
+        assert_eq!(ModuleData::selected_inline_address(&entry), Some(0x1289));
+    }
+
+    #[test]
     fn subprogram_uses_entry_value_via_abstract_origin_parameters() {
         // Regression scenario:
         // After concrete out-of-line subprograms stopped inheriting is_inline,
