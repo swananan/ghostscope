@@ -497,7 +497,6 @@ impl<'a> DwarfParser<'a> {
             if metadata.name.is_none() {
                 metadata.name = origin_metadata.name.clone();
             }
-            metadata.is_inline |= origin_metadata.is_inline;
             if metadata.is_external.is_none() {
                 metadata.is_external = origin_metadata.is_external;
             }
@@ -1240,6 +1239,62 @@ mod tests {
             .borrow(|section| dwarf_reader_from_arc(Arc::<[u8]>::from(section.as_slice())))
     }
 
+    fn build_inline_origin_fixture() -> gimli::Dwarf<DwarfReader> {
+        let encoding = gimli::Encoding {
+            format: Format::Dwarf32,
+            version: 4,
+            address_size: 8,
+        };
+
+        let mut dwarf = WriteDwarf::new();
+        let unit_id = dwarf.units.add(Unit::new(encoding, LineProgram::none()));
+        let unit = dwarf.units.get_mut(unit_id);
+        let root = unit.root();
+
+        let abstract_id = unit.add(root, gimli::constants::DW_TAG_subprogram);
+        let abstract_fn = unit.get_mut(abstract_id);
+        abstract_fn.set(
+            gimli::constants::DW_AT_name,
+            WriteAttributeValue::String(b"CGPsend".to_vec()),
+        );
+        abstract_fn.set(
+            gimli::constants::DW_AT_inline,
+            WriteAttributeValue::Inline(gimli::DW_INL_inlined),
+        );
+        abstract_fn.set(
+            gimli::constants::DW_AT_external,
+            WriteAttributeValue::Flag(true),
+        );
+
+        let concrete_id = unit.add(root, gimli::constants::DW_TAG_subprogram);
+        unit.get_mut(concrete_id).set(
+            gimli::constants::DW_AT_abstract_origin,
+            WriteAttributeValue::UnitRef(abstract_id),
+        );
+
+        let inlined_id = unit.add(root, gimli::constants::DW_TAG_inlined_subroutine);
+        unit.get_mut(inlined_id).set(
+            gimli::constants::DW_AT_abstract_origin,
+            WriteAttributeValue::UnitRef(abstract_id),
+        );
+
+        let mut sections = Sections::new(EndianVec::new(LittleEndian));
+        dwarf.write(&mut sections).unwrap();
+
+        let dwarf_sections: gimli::DwarfSections<Vec<u8>> = gimli::DwarfSections::load(|id| {
+            Ok::<_, gimli::Error>(
+                sections
+                    .get(id)
+                    .map(|section| section.slice().to_vec())
+                    .unwrap_or_default(),
+            )
+        })
+        .unwrap();
+
+        dwarf_sections
+            .borrow(|section| dwarf_reader_from_arc(Arc::<[u8]>::from(section.as_slice())))
+    }
+
     #[test]
     fn parse_debug_info_skips_stack_value_address_locals_from_global_index() {
         let dwarf = build_variable_index_fixture();
@@ -1267,6 +1322,70 @@ mod tests {
         assert!(
             optimized_local.is_empty(),
             "address-valued optimized local must not be indexed as a global: {optimized_local:?}"
+        );
+    }
+
+    #[test]
+    fn parse_debug_info_keeps_concrete_abstract_origin_subprogram_non_inline() {
+        // Regression scenario:
+        // GCC/Clang can emit all three DIE shapes for one logical function:
+        // 1. an abstract DW_TAG_subprogram marked DW_AT_inline,
+        // 2. a concrete out-of-line DW_TAG_subprogram with DW_AT_abstract_origin,
+        // 3. one or more DW_TAG_inlined_subroutine instances.
+        //
+        // The bug was that merge_from_origin copied is_inline from (1) onto (2).
+        // Once that happened, the concrete body was routed through the inline
+        // address-selection path and could pick the wrong cold-partition PC.
+        //
+        // This test keeps the synthetic DIE graph minimal and asserts the parser
+        // preserves the intended split:
+        // - abstract definition stays inline
+        // - concrete out-of-line body stays non-inline
+        // - inlined_subroutine instance stays inline
+        let dwarf = build_inline_origin_fixture();
+        let parser = DwarfParser { dwarf: &dwarf };
+
+        let result = parser.parse_debug_info("synthetic").unwrap();
+        let entries = result
+            .lightweight_index
+            .find_dies_by_function_name("CGPsend");
+
+        let concrete_entries: Vec<_> = entries
+            .iter()
+            .copied()
+            .filter(|entry| entry.tag == gimli::constants::DW_TAG_subprogram)
+            .filter(|entry| !entry.flags.is_inline)
+            .collect();
+        let abstract_entries: Vec<_> = entries
+            .iter()
+            .copied()
+            .filter(|entry| entry.tag == gimli::constants::DW_TAG_subprogram)
+            .filter(|entry| entry.flags.is_inline)
+            .collect();
+        let inlined_entries: Vec<_> = entries
+            .iter()
+            .copied()
+            .filter(|entry| entry.tag == gimli::constants::DW_TAG_inlined_subroutine)
+            .collect();
+
+        assert_eq!(
+            concrete_entries.len(),
+            1,
+            "concrete out-of-line subprogram should stay non-inline: {entries:?}"
+        );
+        assert_eq!(
+            abstract_entries.len(),
+            1,
+            "only the abstract inline definition should carry the inline flag: {entries:?}"
+        );
+        assert_eq!(
+            inlined_entries.len(),
+            1,
+            "expected one inlined subroutine instance: {entries:?}"
+        );
+        assert!(
+            inlined_entries[0].flags.is_inline,
+            "DW_TAG_inlined_subroutine must remain inline: {entries:?}"
         );
     }
 }
