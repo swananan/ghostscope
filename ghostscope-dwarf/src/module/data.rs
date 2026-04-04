@@ -1805,11 +1805,12 @@ impl ModuleData {
     ///
     /// Semantics
     /// - Inline (DW_TAG_inlined_subroutine):
-    ///   Return exactly one address per inline DIE. Prefer DW_AT_entry_pc when
-    ///   available because compilers use it to identify the true entry into the
-    ///   inlined body. If entry_pc is missing, preserve the first DWARF-emitted
-    ///   range start so hot/cold partitioning does not drift to a lower-address
-    ///   cold fragment; only fall back to the minimum range start as a final
+    ///   Return exactly one address per inline DIE. Prefer DW_AT_entry_pc only
+    ///   when it falls inside the DIE's own ranges; some producers point
+    ///   entry_pc at caller-side setup code instead of the inlined body. If the
+    ///   validated entry_pc is missing, preserve the first DWARF-emitted range
+    ///   start so hot/cold partitioning does not drift to a lower-address cold
+    ///   fragment; only fall back to the minimum range start as a final
     ///   recovery path. Intentionally do not scan for is_stmt here to preserve
     ///   entry-like behavior and keep entry-view locations available.
     /// - Non-inline (DW_TAG_subprogram):
@@ -1828,7 +1829,7 @@ impl ModuleData {
     ///   computations to ensure stable behavior across compilers/toolchains.
     fn compute_addresses_for_entry(&self, entry: &crate::core::IndexEntry) -> Vec<u64> {
         let mut out = Vec::new();
-        if entry.flags.is_inline {
+        if entry.is_inline_instance() {
             // Debug: print ranges & entry_pc once per inline entry
             let mut ranges = entry.address_ranges.clone();
             ranges.sort_unstable_by_key(|(s, _)| *s);
@@ -1909,7 +1910,7 @@ impl ModuleData {
         let first_start = entry.address_ranges.first().map(|(start, _)| *start);
         let low_pc = entry.address_ranges.iter().map(|(start, _)| *start).min();
 
-        entry.entry_pc.or(first_start).or(low_pc)
+        entry.validated_entry_pc().or(first_start).or(low_pc)
     }
 
     fn selected_non_inline_ranges(entry: &crate::core::IndexEntry) -> Vec<(u64, u64)> {
@@ -2790,7 +2791,7 @@ mod tests {
     fn inline_entry(ranges: &[(u64, u64)], entry_pc: Option<u64>) -> IndexEntry {
         let mut entry = subprogram_entry(ranges, entry_pc);
         entry.tag = constants::DW_TAG_inlined_subroutine;
-        entry.flags.is_inline = true;
+        entry.flags.is_inline_instance = true;
         entry
     }
 

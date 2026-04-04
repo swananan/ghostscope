@@ -386,9 +386,9 @@ impl LightweightIndex {
 
             tracing::trace!("Found {} entries for function '{}'", entries.len(), name);
             for entry in &entries {
-                let display_addr = if entry.flags.is_inline {
+                let display_addr = if entry.is_inline_instance() {
                     entry
-                        .entry_pc
+                        .validated_entry_pc()
                         .or_else(|| entry.address_ranges.first().map(|(start, _)| *start))
                 } else {
                     entry.address_ranges.first().map(|(start, _)| *start)
@@ -399,7 +399,7 @@ impl LightweightIndex {
                         "    - {} at 0x{:x} (inline={}, {} ranges)",
                         entry.name,
                         addr,
-                        entry.flags.is_inline,
+                        entry.is_inline_instance(),
                         entry.address_ranges.len()
                     );
                 }

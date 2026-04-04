@@ -21,7 +21,7 @@ use tracing::debug;
 #[derive(Clone, Default)]
 struct FunctionMetadata {
     name: Option<String>,
-    is_inline: bool,
+    has_inline_attribute: bool,
     is_linkage_name: bool,
     is_external: Option<bool>,
 }
@@ -140,7 +140,8 @@ impl<'a> DwarfParser<'a> {
                         let flags = crate::core::IndexFlags {
                             is_static,
                             is_main,
-                            is_inline: metadata.is_inline,
+                            is_inline_instance: false,
+                            has_inline_attribute: metadata.has_inline_attribute,
                             is_linkage: metadata.is_linkage_name,
                             ..Default::default()
                         };
@@ -203,7 +204,8 @@ impl<'a> DwarfParser<'a> {
                             .unwrap_or(false);
                         let flags = crate::core::IndexFlags {
                             is_static,
-                            is_inline: true,
+                            is_inline_instance: true,
+                            has_inline_attribute: metadata.has_inline_attribute,
                             is_linkage: metadata.is_linkage_name,
                             ..Default::default()
                         };
@@ -446,7 +448,9 @@ impl<'a> DwarfParser<'a> {
         Ok(None)
     }
 
-    fn extract_inline_flag(entry: &gimli::DebuggingInformationEntry<DwarfReader>) -> Result<bool> {
+    fn extract_inline_attribute(
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+    ) -> Result<bool> {
         if let Some(attr) = entry.attr(gimli::constants::DW_AT_inline) {
             if let gimli::AttributeValue::Inline(inline_attr) = attr.value() {
                 return Ok(inline_attr == gimli::DW_INL_inlined
@@ -481,7 +485,7 @@ impl<'a> DwarfParser<'a> {
             metadata.is_linkage_name = is_linkage;
         }
 
-        metadata.is_inline = Self::extract_inline_flag(entry)?;
+        metadata.has_inline_attribute = Self::extract_inline_attribute(entry)?;
 
         metadata.is_external = Self::bool_attr(entry, gimli::constants::DW_AT_external)?;
 
@@ -1333,7 +1337,9 @@ mod tests {
         // 2. a concrete out-of-line DW_TAG_subprogram with DW_AT_abstract_origin,
         // 3. one or more DW_TAG_inlined_subroutine instances.
         //
-        // The bug was that merge_from_origin copied is_inline from (1) onto (2).
+        // The bug was that merge_from_origin copied the abstract function's
+        // inline attribute from (1) onto (2) and downstream code treated that
+        // as if the concrete body were an inline instance.
         // Once that happened, the concrete body was routed through the inline
         // address-selection path and could pick the wrong cold-partition PC.
         //
@@ -1354,13 +1360,14 @@ mod tests {
             .iter()
             .copied()
             .filter(|entry| entry.tag == gimli::constants::DW_TAG_subprogram)
-            .filter(|entry| !entry.flags.is_inline)
+            .filter(|entry| !entry.is_inline_instance())
+            .filter(|entry| !entry.flags.has_inline_attribute)
             .collect();
         let abstract_entries: Vec<_> = entries
             .iter()
             .copied()
             .filter(|entry| entry.tag == gimli::constants::DW_TAG_subprogram)
-            .filter(|entry| entry.flags.is_inline)
+            .filter(|entry| entry.flags.has_inline_attribute)
             .collect();
         let inlined_entries: Vec<_> = entries
             .iter()
@@ -1384,8 +1391,12 @@ mod tests {
             "expected one inlined subroutine instance: {entries:?}"
         );
         assert!(
-            inlined_entries[0].flags.is_inline,
+            inlined_entries[0].is_inline_instance(),
             "DW_TAG_inlined_subroutine must remain inline: {entries:?}"
+        );
+        assert!(
+            !concrete_entries[0].flags.has_inline_attribute,
+            "concrete out-of-line body should not inherit the abstract inline attribute: {entries:?}"
         );
     }
 }

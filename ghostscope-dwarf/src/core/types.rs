@@ -84,8 +84,27 @@ pub struct IndexEntry {
     /// For variables: vec![(address, address)] if static
     /// Empty vec if no address (e.g., types, inlined functions without concrete instances)
     pub address_ranges: Vec<(u64, u64)>,
-    /// Optional DW_AT_entry_pc for inline/call site DIEs (single-point locations)
+    /// Optional raw DW_AT_entry_pc for inline/call site DIEs.
+    /// Callers should prefer `validated_entry_pc()` when selecting probe PCs.
     pub entry_pc: Option<u64>,
+}
+
+impl IndexEntry {
+    /// True when this DIE is a concrete DW_TAG_inlined_subroutine instance.
+    pub fn is_inline_instance(&self) -> bool {
+        self.flags.is_inline_instance || self.tag == gimli::constants::DW_TAG_inlined_subroutine
+    }
+
+    /// Return entry_pc only when it lies inside one of this DIE's own ranges.
+    /// Some producers emit caller-side setup PCs that do not belong to the
+    /// inline instance itself.
+    pub fn validated_entry_pc(&self) -> Option<u64> {
+        self.entry_pc.filter(|pc| {
+            self.address_ranges
+                .iter()
+                .any(|(start, end)| *start <= *pc && *pc < *end)
+        })
+    }
 }
 
 /// Index flags (inspired by GDB's cooked_index_flag_enum)
@@ -95,8 +114,10 @@ pub struct IndexFlags {
     pub is_static: bool,
     /// True if this is the program's main function
     pub is_main: bool,
-    /// True if this is an inline function
-    pub is_inline: bool,
+    /// True if this DIE is a concrete DW_TAG_inlined_subroutine instance.
+    pub is_inline_instance: bool,
+    /// True if this DIE carries DW_AT_inline (or inherits that declaration).
+    pub has_inline_attribute: bool,
     /// True if this entry uses the linkage name
     pub is_linkage: bool,
     /// True if this is just a type declaration (not definition)
