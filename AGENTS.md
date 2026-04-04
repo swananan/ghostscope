@@ -58,4 +58,5 @@
 - Keep the subject concise and specific, use a lowercase type, and do not end the subject with a period.
 - Avoid vague subjects such as `update stuff` or `fix issue`.
 - Add a body only when the reason, scope, or risk is not obvious from the subject. Keep the body short and focused on why the change exists.
+- Wrap commit body lines at 80 columns or fewer.
 - Prefer one logical change per commit.
