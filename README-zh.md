@@ -18,21 +18,94 @@
 
 ## 概述
 
-GhostScope 是一个**运行时追踪工具**，将 printf 调试的简单性带入生产系统。
+GhostScope 的定位是 **面向源码语义的用户态运行时追踪**。如果你手上有 DWARF 调试信息，但又不能停住目标进程，GhostScope 可以让你在函数、源码行、甚至指令级别设点，并直接打印真正重要的数据：局部变量、参数、全局变量、嵌套字段，以及原始字节。
 
-> *"最有效的调试工具仍然是仔细的思考，加上恰当放置的打印语句。"* — Brian Kernighan
+> *"The most effective debugging tool is still careful thought, coupled with judiciously placed print statements."* — Brian Kernighan
 
-### 工作原理：DWARF + eBPF 的魔法
+### 什么时候适合用 GhostScope
 
-想象一下，你面对的是一片广袤的二进制数据荒野 —— 内存地址、寄存器值、栈帧数据 —— 没有上下文，它们只是毫无意义的数字。**DWARF 调试信息就是我们的地图**：它告诉我们栈地址 `RSP-0x18` 存储着局部变量 `count`，堆地址 `0x5621a8c0` 处的结构体是 `user` 对象，其偏移 `+0x20` 处是字符串指针 `user.name`；它追踪每个变量在程序执行过程中的位置变化 —— 参数 `x` 现在在寄存器 `RDI` 中，之后会被移到栈上 `RSP-0x10` 的位置。
+- 你在排查线上正在运行的服务，不能接受 GDB 式 stop-the-world 带来的巨大性能扰动，同时又更希望使用基于 eBPF 的工作流，获得比传统内核模块式探测更好的安全边界和更低开销。
+- 你关心的是源码行和真实变量值，而不只是函数入口参数。
+- 你想把“这里要是能加一条 printf 就好了”快速变成一个可运行的追踪脚本。
+- 你希望让 AI agent 基于 GhostScope 文档、源码路径和 DWARF 二进制直接产出追踪命令。
 
-有了这张地图，GhostScope 利用 **eBPF 和 uprobe** 技术从运行中的程序任意指令点安全地提取二进制数据。这种组合威力强大：DWARF 揭示进程虚拟地址空间中每个字节的含义，eBPF 安全地获取我们需要的数据。结果呢？你可以从程序的任何位置打印变量值（局部变量或全局变量）、函数参数、复杂数据结构，甚至回溯函数调用栈 —— 完全无需停止或修改程序。
+### 什么时候不适合用 GhostScope
+
+- 如果你需要断点、单步、改内存、调 coredump，用 GDB。
+- 如果你要在同一套脚本里混合大量内核 + 用户态事件做聚合，优先考虑 bpftrace 或 SystemTap。
+- 如果目标模块没有 DWARF 调试信息，就不要期待源码级变量追踪能很好地工作。
+
+### GhostScope 和 GDB、bpftrace、SystemTap 的区别
+
+| 工具 | 最擅长什么 | 不太适合什么 |
+|---|---|---|
+| GhostScope | 面向活跃进程的低开销、源码语义用户态追踪 | 需要交互式控制执行，或者做基于 eBPF 的内核态大范围数据观测 |
+| GDB | 断点、单步、coredump、改状态 | 生产级别环境下目标进程不能被停住 |
+| bpftrace | 快速做内核 + 用户态混合观测和事件聚合 | 需要基于 DWARF 可靠地做用户态进程源码级别语义还原 |
+| SystemTap | 更宽泛的系统级追踪、已有 tapset 生态、偏聚合式工作流 | 你更希望使用一个和 AI 更好适配，或者具备友好 TUI 界面的用户态追踪工具 |
+
+更详细的比较可以看 [工具对比](docs/zh/comparison.md) 和 [常见问题](docs/zh/faq.md)。
+
+### AI 运行时分析 Skill
+
+GhostScope 支持两种模式：一种是交互式 TUI 模式，另一种是基于 `--script` 和 `--script-file` 的 CLI 模式。后者是更适合 AI 和自动化的工作流。
+
+给 Codex 或 Claude Code 安装共享 skill：
+
+```bash
+./scripts/skills/install_ghostscope_runtime_analysis_skill.sh --copy
+```
+
+如果你想强制指定目标，可以追加 `--codex`、`--claude` 或 `--all`。安装后需要重启 Codex 或 Claude Code。
+
+当 AI 和你共享同一个 workspace 时，它通常可以自己发现源码 checkout 路径以及 DWARF/调试符号状态。只有在这些信息无法可靠判断时，它才应该先追问，再生成带源码依据的结果。一个典型的会话可以拆成四步。
+
+这个例子里，AI 可以在本地自行发现的上下文：
+
+- 源码 checkout：`/mnt/500g/code/openresty/openresty-1.27.1.1/build/nginx-1.27.1`
+- 目标二进制：`/usr/local/openresty/nginx/sbin/nginx`
+- 调试信息状态：二进制内带有 DWARF 调试信息
+
+提问：
+
+```text
+$ghostscope-runtime-analysis 跟踪正在运行的 nginx worker，并把请求 body 的原始字节打印出来
+```
+
+生成的命令：
+
+```bash
+WORKER_PID=$(pgrep -n -f 'nginx: worker process')
+sudo ghostscope -p "$WORKER_PID" --script-file /tmp/ghostscope-nginx-body-discard.gs --script-output plain
+```
+
+生成的脚本：
+
+```ghostscope
+trace /mnt/500g/code/openresty/openresty-1.27.1.1/build/nginx-1.27.1/src/http/ngx_http_request_body.c:671 {
+    if size > 0 {
+        let req_line_len = r.request_line.len;
+        let body_len = size;
+
+        print "src=discard-preread pid={} req={:p} line={:s.req_line_len$} body_len={} body={:x.body_len$}",
+            $pid, r, r.request_line.data, body_len, r.header_in.pos;
+    }
+}
+```
+
+实际输出：
+
+```text
+src=discard-preread pid=3385842 req=0x55ce5fcb0650 line=POST /demo HTTP/1.1 body_len=10 body=00 01 02 68 65 6c 6c 6f ff 10
+```
+
+为了得到最好效果，请确保相关源码树可用、你关心的模块带有 DWARF 调试信息，并且 GhostScope 具备加载 eBPF 程序所需的权限。如果这些信息无法在本地可靠发现，skill 应该先追问，再生成带源码依据的追踪结果。拉取仓库更新后，重新执行同一个安装脚本即可；安装的 skill 自带版本号，版本变化时会自动刷新。
 
 ### 理想中的 Printf
 
-GhostScope 将编译后的二进制文件转变为可观测系统。在函数入口、特定源代码行或任何中间位置设置追踪点，打印局部变量、全局变量、函数参数、复杂嵌套结构，甚至函数调用栈。既拥有 printf 调试的简单性，又具备现代追踪技术的强大功能。
+GhostScope 把编译后的二进制重新变成“可观测系统”。在 TUI 里，这个过程是递进展开的：先定位到感兴趣的函数或源码行，看清楚当前可见的变量，再从那个位置进入 Script Mode 设点，最后一边让目标进程继续运行，一边在输出面板里看实时结果。它不是一个泛泛的监控面板，而是一个沿着源码路径逐步展开的运行时 printf 调试界面。
 
-下面的演示展示了使用 GhostScope 追踪带有调试信息的 nginx worker 进程。可以看到，GhostScope 支持条件判断逻辑，能够轻松提取复杂数据结构的内部信息，且完全不影响进程的正常运行。
+下面这个演示就是按这条路径展开的：先在带 DWARF 的 nginx worker 里找到目标代码，再在对应行写一小段脚本，最后立刻看到条件判断、按源码语义访问变量，以及运行中进程的实时输出。
 
 <br />
 
@@ -40,6 +113,12 @@ GhostScope 将编译后的二进制文件转变为可观测系统。在函数入
   <img src="https://raw.githubusercontent.com/swananan/ghostscope/main/assets/demo.gif" alt="GhostScope Demo" width="100%"/>
   <p><sub><i>实时追踪运行中的 nginx worker 进程</i></sub></p>
 </div>
+
+### 工作原理
+
+想象一下，你面对的是一片广袤的二进制数据荒野 —— 内存地址、寄存器值、栈帧数据 —— 没有上下文，它们只是毫无意义的数字。**DWARF 调试信息就是我们的地图**：它告诉我们栈地址 `RSP-0x18` 存储着局部变量 `count`，堆地址 `0x5621a8c0` 处的结构体是 `user` 对象，其偏移 `+0x20` 处是字符串指针 `user.name`；它追踪每个变量在程序执行过程中的位置变化 —— 参数 `x` 现在在寄存器 `RDI` 中，之后会被移到栈上 `RSP-0x10` 的位置。
+
+有了这张地图，GhostScope 利用 **eBPF 和 uprobe** 技术从运行中的程序任意指令点安全地提取二进制数据。这种组合威力强大：DWARF 揭示进程虚拟地址空间中每个字节的含义，eBPF 安全地获取我们需要的数据。结果呢？你可以从程序的任何位置打印变量值（局部变量或全局变量）、函数参数、复杂数据结构，甚至回溯函数调用栈 —— 完全无需停止或修改程序。
 
 ## ✨ 核心特性
 
@@ -86,6 +165,8 @@ GhostScope 将编译后的二进制文件转变为可观测系统。在函数入
 >
 > 我们正在持续改进稳定性和准确性，期待未来版本能够移除此声明。
 
+当前的硬性限制和软性限制，请参阅 [使用限制](docs/zh/limitations.md)。
+
 ## 📚 文档
 
 <table>
@@ -99,6 +180,9 @@ GhostScope 将编译后的二进制文件转变为可观测系统。在函数入
 
 - [**快速教程**](docs/zh/tutorial.md)
   10分钟学习基础知识
+
+- [**工具对比**](docs/zh/comparison.md)
+  在 GhostScope、GDB、bpftrace 和 SystemTap 之间做选择
 
 - [**常见问题**](docs/zh/faq.md)
   常见问题解答

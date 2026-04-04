@@ -1,0 +1,4 @@
+interface:
+  display_name: "GhostScope Runtime Analysis"
+  short_description: "Guide source-aware GhostScope runtime tracing"
+  default_prompt: "Use $ghostscope-runtime-analysis to turn GhostScope docs into concrete tracing commands, scripts, and issue-prep steps."

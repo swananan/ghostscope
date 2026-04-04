@@ -67,6 +67,7 @@ nginx*
 
 # Python cache
 __pycache__/
+*.py[cod]
 
 # DWARF perf generated artifacts
 scripts/dwarf-perf/corpus/out/

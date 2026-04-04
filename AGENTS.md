@@ -3,7 +3,7 @@
 ## Working Rules
 - Keep CI workflows and developer-facing docs on normal project test commands.
 - Prefer skill `ghostscope-e2e-runner` for all e2e execution requests.
-- Install shared project skill with `./scripts/e2e/runner/install_codex_skill.sh` and restart Codex.
+- Install the internal runner skill with `./scripts/e2e/runner/install_ghostscope_e2e_runner_skill.sh` and restart Codex.
 - Agent-driven e2e should default to the runner service API instead of invoking local container helper scripts directly.
 - If the runner service is not running, tell the user to start it manually instead of trying to start it on their behalf, because it typically requires `sudo`.
 - Do not create commits unless the user explicitly asks for a commit.
