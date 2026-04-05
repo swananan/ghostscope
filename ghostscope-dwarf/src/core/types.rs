@@ -87,12 +87,39 @@ pub struct IndexEntry {
     /// Optional raw DW_AT_entry_pc for inline/call site DIEs.
     /// Callers should prefer `validated_entry_pc()` when selecting probe PCs.
     pub entry_pc: Option<u64>,
+    /// Explicit function role for addressable function-like DIEs.
+    pub function_kind: FunctionDieKind,
 }
 
 impl IndexEntry {
+    pub fn function_kind(&self) -> FunctionDieKind {
+        if self.function_kind != FunctionDieKind::NotFunction {
+            return self.function_kind;
+        }
+
+        match self.tag {
+            gimli::constants::DW_TAG_inlined_subroutine => FunctionDieKind::InlineInstance,
+            gimli::constants::DW_TAG_subprogram => {
+                if self.flags.is_inline_instance {
+                    FunctionDieKind::InlineInstance
+                } else if !self.address_ranges.is_empty() || self.entry_pc.is_some() {
+                    FunctionDieKind::ConcreteSubprogram
+                } else {
+                    FunctionDieKind::AbstractSubprogram
+                }
+            }
+            _ => FunctionDieKind::NotFunction,
+        }
+    }
+
     /// True when this DIE is a concrete DW_TAG_inlined_subroutine instance.
     pub fn is_inline_instance(&self) -> bool {
-        self.flags.is_inline_instance || self.tag == gimli::constants::DW_TAG_inlined_subroutine
+        self.function_kind() == FunctionDieKind::InlineInstance
+    }
+
+    /// True when this DIE is a concrete, addressable subprogram body.
+    pub fn is_concrete_subprogram(&self) -> bool {
+        self.function_kind() == FunctionDieKind::ConcreteSubprogram
     }
 
     /// Return entry_pc when it is usable as this DIE's own entry address.
@@ -112,6 +139,19 @@ impl IndexEntry {
                     .any(|(start, end)| *start <= *pc && *pc < *end)
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FunctionDieKind {
+    #[default]
+    NotFunction,
+    /// Addressless DW_TAG_subprogram, typically an abstract definition or
+    /// declaration-like node used only for origin/specification metadata.
+    AbstractSubprogram,
+    /// Concrete out-of-line DW_TAG_subprogram with executable code ranges.
+    ConcreteSubprogram,
+    /// Concrete DW_TAG_inlined_subroutine instance inside a caller.
+    InlineInstance,
 }
 
 /// Index flags (inspired by GDB's cooked_index_flag_enum)
