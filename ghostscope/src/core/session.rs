@@ -1,4 +1,4 @@
-use crate::config::{MergedConfig, ParsedArgs, PidViews};
+use crate::config::{ParsedArgs, PidViews, ResolvedConfig};
 use crate::source_path::SourcePathResolver;
 use crate::trace::TraceManager;
 use anyhow::Result;
@@ -21,12 +21,12 @@ pub struct RuntimePidContext {
 }
 
 impl RuntimePidContext {
-    fn from_config(config: &MergedConfig) -> Option<Self> {
-        config.pid.map(|proc_pid| Self {
+    fn from_config(config: &ResolvedConfig) -> Option<Self> {
+        config.runtime.proc_pid.map(|proc_pid| Self {
             proc_pid,
             attach_pid: proc_pid,
-            host_pid: config.host_pid.unwrap_or(proc_pid),
-            pid_views: config.pid_views.clone(),
+            host_pid: config.runtime.host_pid.unwrap_or(proc_pid),
+            pid_views: config.runtime.pid_views.clone(),
         })
     }
 
@@ -51,14 +51,14 @@ pub struct GhostSession {
     pub source_path_resolver: SourcePathResolver, // Resolves DWARF paths to actual filesystem paths
     #[allow(dead_code)]
     pub debug_file: Option<String>, // Optional debug file path
-    pub config: Option<MergedConfig>, // Holds the merged configuration
+    pub config: Option<ResolvedConfig>, // Holds the resolved configuration
     pub coordinator: Arc<Mutex<ProcessManager>>, // Manages PID/module offsets prefill and application
     pub sysmon: Option<Arc<Mutex<ProcessSysmon>>>, // Realtime process monitor (exec/fork/exit)
 }
 
 impl GhostSession {
     /// Create a new ghost session with merged configuration
-    pub fn new_with_config(config: &MergedConfig) -> Self {
+    pub fn new_with_config(config: &ResolvedConfig) -> Self {
         info!("Creating ghost session with merged configuration");
 
         let mut s = Self {
@@ -81,10 +81,11 @@ impl GhostSession {
             info!("Session PID views: {}", pid_views.compact_display());
         }
         if let Some(cfg) = s.config.as_ref() {
-            if let Some(env) = cfg.runtime_env.as_ref() {
-                info!("Session runtime environment: {}", env.compact_display());
-            }
-            if let Some(filter) = cfg.pid_filter_spec {
+            info!(
+                "Session runtime environment: {}",
+                cfg.runtime.runtime_env.compact_display()
+            );
+            if let Some(filter) = cfg.runtime.pid_filter_spec {
                 info!("Session PID filter spec: {:?}", filter);
             }
         }
@@ -284,7 +285,7 @@ impl GhostSession {
 
     /// Create a new session with config and binary loading in parallel mode with progress callback
     pub async fn new_with_config_and_progress<F>(
-        config: &MergedConfig,
+        config: &ResolvedConfig,
         progress_callback: F,
     ) -> Result<Self>
     where
@@ -355,7 +356,9 @@ impl GhostSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::runtime::RuntimeContext;
     use crate::config::settings::{PathSubstitution, SourceConfig};
+    use crate::config::UserConfig;
 
     #[test]
     fn test_new_with_config_sets_source_resolver() {
@@ -407,10 +410,14 @@ mod tests {
             ..Default::default()
         };
 
-        let merged_config = MergedConfig::new(args, config);
+        let user_config = UserConfig::new(args, config);
+        let resolved_config = ResolvedConfig {
+            user: user_config,
+            runtime: RuntimeContext::default(),
+        };
 
         // Create session with config - should automatically set resolver
-        let session = GhostSession::new_with_config(&merged_config);
+        let session = GhostSession::new_with_config(&resolved_config);
 
         // Verify resolver was set correctly from config
         let rules = session.source_path_resolver.get_all_rules();

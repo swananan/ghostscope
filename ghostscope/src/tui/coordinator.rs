@@ -1,4 +1,4 @@
-use crate::config::{MergedConfig, ParsedArgs};
+use crate::config::ResolvedConfig;
 use crate::core::GhostSession;
 use crate::tui::{dwarf_loader, info_handlers, source_handlers, trace_handlers};
 use anyhow::Result;
@@ -52,56 +52,18 @@ fn forward_trace_event(
 }
 
 /// Run GhostScope in TUI mode with merged configuration
-pub async fn run_tui_coordinator_with_config(config: MergedConfig) -> Result<()> {
+pub async fn run_tui_coordinator_with_config(config: ResolvedConfig) -> Result<()> {
     info!("Starting GhostScope in TUI mode with merged configuration");
 
-    // Pass the UI configuration to the TUI system
     let ui_config = config.get_ui_config();
 
-    // Clone config for session creation before converting to ParsedArgs
-    let config_for_session = config.clone();
-
-    // Convert MergedConfig back to ParsedArgs for existing code compatibility
-    // TODO: Refactor to use MergedConfig directly throughout the TUI system
-    let parsed_args = ParsedArgs {
-        binary_path: config.binary_path,
-        target_path: config.target_path,
-        binary_args: config.binary_args,
-        log_file: Some(config.log_file),
-        emit_ready_marker: config.emit_ready_marker,
-        enable_logging: config.enable_logging,
-        enable_console_logging: config.enable_console_logging,
-        log_level: config.log_level,
-        config: None, // Not needed for runtime conversion
-        debug_file: config.debug_file,
-        script: config.script,
-        script_file: config.script_file,
-        pid: config.pid,
-        tui_mode: config.tui_mode,
-        script_output: Some(config.script_output_mode),
-        script_timestamp: Some(config.script_timestamp_format),
-        should_save_llvm_ir: config.should_save_llvm_ir,
-        should_save_ebpf: config.should_save_ebpf,
-        should_save_ast: config.should_save_ast,
-        layout_mode: config.layout_mode,
-        has_explicit_log_flag: false, // Not relevant for TUI conversion
-        has_explicit_console_log_flag: false, // Not relevant for TUI conversion
-        force_perf_event_array: config.ebpf_config.force_perf_event_array,
-        enable_sysmon_for_shared_lib: config.ebpf_config.enable_sysmon_for_shared_lib,
-        allow_loose_debug_match: config.dwarf_allow_loose_debug_match,
-        source_panel: false,
-        no_source_panel: false,
-    };
-
-    run_tui_coordinator_with_ui_config_and_merged_config(parsed_args, ui_config, config_for_session)
-        .await
+    run_tui_coordinator_with_ui_config_and_config(ui_config, config).await
 }
 
 /// Internal function to run TUI coordinator with UI configuration
-async fn run_tui_coordinator_with_ui_config_and_merged_config(
-    parsed_args: ParsedArgs,
+async fn run_tui_coordinator_with_ui_config_and_config(
     ui_config: ghostscope_ui::UiConfig,
-    merged_config: MergedConfig,
+    resolved_config: ResolvedConfig,
 ) -> Result<()> {
     info!("Starting GhostScope in TUI mode");
 
@@ -111,9 +73,8 @@ async fn run_tui_coordinator_with_ui_config_and_merged_config(
     // Initialize DWARF information processing in background
     let dwarf_task = {
         let status_sender = runtime_channels.create_status_sender();
-        let config_clone = merged_config.clone();
+        let config_clone = resolved_config.clone();
         tokio::spawn(async move {
-            // Pass MergedConfig directly to ensure search_paths are available during DWARF loading
             let session =
                 dwarf_loader::initialize_dwarf_processing(&config_clone, status_sender).await?;
             Ok::<_, anyhow::Error>(session)
@@ -129,10 +90,10 @@ async fn run_tui_coordinator_with_ui_config_and_merged_config(
                 // Derive a binary path hint from the session (main executable), if available
                 let binary_path_hint = crate::util::derive_binary_path_hint(&session);
 
-                let compile_options = merged_config.get_compile_options(
-                    parsed_args.should_save_llvm_ir,
-                    parsed_args.should_save_ebpf,
-                    parsed_args.should_save_ast,
+                let compile_options = resolved_config.get_compile_options(
+                    resolved_config.should_save_llvm_ir,
+                    resolved_config.should_save_ebpf,
+                    resolved_config.should_save_ast,
                     binary_path_hint,
                 );
 
@@ -140,21 +101,20 @@ async fn run_tui_coordinator_with_ui_config_and_merged_config(
             }
             Ok(Err(e)) => {
                 error!("DWARF processing failed: {}", e);
-                // Fall back to defaults if session failed
-                let compile_options = merged_config.get_compile_options(
-                    parsed_args.should_save_llvm_ir,
-                    parsed_args.should_save_ebpf,
-                    parsed_args.should_save_ast,
+                let compile_options = resolved_config.get_compile_options(
+                    resolved_config.should_save_llvm_ir,
+                    resolved_config.should_save_ebpf,
+                    resolved_config.should_save_ast,
                     None,
                 );
                 run_runtime_coordinator(runtime_channels, None, compile_options).await
             }
             Err(e) => {
                 error!("DWARF task panicked: {}", e);
-                let compile_options = merged_config.get_compile_options(
-                    parsed_args.should_save_llvm_ir,
-                    parsed_args.should_save_ebpf,
-                    parsed_args.should_save_ast,
+                let compile_options = resolved_config.get_compile_options(
+                    resolved_config.should_save_llvm_ir,
+                    resolved_config.should_save_ebpf,
+                    resolved_config.should_save_ast,
                     None,
                 );
                 run_runtime_coordinator(runtime_channels, None, compile_options).await

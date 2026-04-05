@@ -8,15 +8,15 @@
 //! 4. ./ghostscope.toml
 
 pub mod args;
-pub mod merged;
-pub mod runtime_env;
+pub mod runtime;
 pub mod settings;
+pub mod user;
 
 pub use args::{
     Args, BpffsCommand, BpffsPruneArgs, LayoutMode, ParsedArgs, ParsedCommand, ScriptOutputMode,
     ScriptTimestampFormat,
 };
-pub use ghostscope_process::{resolve_input_pid, PidViews};
-pub use merged::MergedConfig;
-pub use runtime_env::{detect_runtime_environment, RuntimeEnvironmentInfo};
+pub use ghostscope_process::PidViews;
+pub use runtime::ResolvedConfig;
 pub use settings::{CliColorMode, Config, LogLevel, PanelType};
+pub use user::UserConfig;

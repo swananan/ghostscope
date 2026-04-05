@@ -1,4 +1,4 @@
-use crate::config::MergedConfig;
+use crate::config::ResolvedConfig;
 use crate::core::GhostSession;
 use anyhow::Result;
 use ghostscope_dwarf::ModuleLoadingEvent;
@@ -60,7 +60,7 @@ fn convert_loading_event_to_runtime_status(event: ModuleLoadingEvent) -> Runtime
 
 /// Initialize DWARF processing in background
 pub async fn initialize_dwarf_processing(
-    config: &MergedConfig,
+    config: &ResolvedConfig,
     status_sender: tokio::sync::mpsc::UnboundedSender<RuntimeStatus>,
 ) -> Result<GhostSession> {
     initialize_dwarf_processing_with_progress(config, status_sender).await
@@ -68,7 +68,7 @@ pub async fn initialize_dwarf_processing(
 
 /// Initialize DWARF processing in background with detailed progress reporting
 pub async fn initialize_dwarf_processing_with_progress(
-    config: &MergedConfig,
+    config: &ResolvedConfig,
     status_sender: tokio::sync::mpsc::UnboundedSender<RuntimeStatus>,
 ) -> Result<GhostSession> {
     // Send status update: starting DWARF loading
@@ -120,7 +120,7 @@ pub async fn initialize_dwarf_processing_with_progress(
                     Ok(session)
                 }
                 None => {
-                    let pid_hint = match (config.pid, config.host_pid) {
+                    let pid_hint = match (config.runtime.proc_pid, config.runtime.host_pid) {
                         (Some(proc_pid), Some(host_pid)) if proc_pid != host_pid => {
                             format!(" (host PID for eBPF filter: {host_pid})")
                         }
@@ -128,7 +128,7 @@ pub async fn initialize_dwarf_processing_with_progress(
                     };
                     let error_msg = format!(
                         "Binary analysis failed! Cannot load DWARF information for PID {}{} or binary path {:?}",
-                        config.pid.unwrap_or(0),
+                        config.runtime.proc_pid.unwrap_or(0),
                         pid_hint,
                         config.binary_path
                     );
