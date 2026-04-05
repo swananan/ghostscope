@@ -1053,6 +1053,37 @@ trace globals_program.c:32 {
 }
 
 #[tokio::test]
+async fn test_multiple_dynamic_ascii_format_specifiers_in_one_print() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let target = spawn_globals_program(&binary_path).await?;
+
+    let script = r#"
+trace globals_program.c:32 {
+    // Regression guard: a single print with repeated {:s.*} must keep later fields populated.
+    print "GM={:s.*} LM={:s.*} NAME={:s.*} GLOB={:s.*}",
+        5, gm,
+        4, lm,
+        7, s.name,
+        5, g_message;
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 3, &target).await?;
+    target.terminate().await?;
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+
+    let re = Regex::new(r"GM=Hello LM=LIB_ NAME=(?:INIT|RUNNING) GLOB=Hello").unwrap();
+    assert!(
+        stdout.lines().any(|l| re.is_match(l)),
+        "Expected one formatted line with all dynamic strings populated. STDOUT: {stdout}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_large_pattern_dump_and_checks() -> anyhow::Result<()> {
     init();
 
@@ -1106,15 +1137,15 @@ async fn test_format_capture_len_zero_and_exceed_cap() -> anyhow::Result<()> {
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
     let target = spawn_globals_program(&binary_path).await?;
 
-    // With project-level ghostscope.toml setting mem_dump_cap=64,
+    // The default mem_dump_cap is 256, so larger dynamic requests are truncated there.
     // - len=0 should yield empty
-    // - len=128 should truncate to 64 bytes
+    // - len=512 should truncate to 256 bytes
     let script = r#"
 trace globals_program.c:32 {
     let z = 0;
-    let big = 128;
+    let big = 512;
     print "Z0={:x.z$}", lib_pattern;     // expect empty
-    print "XC={:x.big$}", lib_pattern;   // expect 64 bytes due to cap
+    print "XC={:x.big$}", lib_pattern;   // expect 256 bytes due to cap
 }
 "#;
 
@@ -1128,14 +1159,14 @@ trace globals_program.c:32 {
     let re_z0_empty = Regex::new(r"^\s*Z0=\s*$").unwrap();
     let has_z0_empty = stdout.lines().any(|l| re_z0_empty.is_match(l));
 
-    // 64 bytes hex: two hex digits repeated 64 times with optional spaces between
-    let re_64_hex = Regex::new(r"XC=([0-9a-fA-F]{2}(\s+[0-9a-fA-F]{2}){63})").unwrap();
-    let has_trunc_64 = stdout.lines().any(|l| re_64_hex.is_match(l));
+    // 256 bytes hex: two hex digits repeated 256 times with optional spaces between
+    let re_256_hex = Regex::new(r"XC=([0-9a-fA-F]{2}(\s+[0-9a-fA-F]{2}){255})").unwrap();
+    let has_trunc_256 = stdout.lines().any(|l| re_256_hex.is_match(l));
 
     assert!(has_z0_empty, "Expected Z0= (empty). STDOUT: {stdout}");
     assert!(
-        has_trunc_64,
-        "Expected XC= to contain exactly 64 bytes due to cap. STDOUT: {stdout}"
+        has_trunc_256,
+        "Expected XC= to contain exactly 256 bytes due to cap. STDOUT: {stdout}"
     );
 
     Ok(())

@@ -105,7 +105,7 @@ impl Default for CompileOptions {
             proc_module_offsets_max_entries: 4096, // Default
             perf_page_count: 64,                   // 64 pages = 256KB per CPU
             event_map_type: EventMapType::RingBuf, // Default to RingBuf
-            mem_dump_cap: 4096,                    // Default per-arg dump cap (bytes)
+            mem_dump_cap: 256,                     // Default per-arg dump cap (bytes)
             compare_cap: 64,                       // Default compare cap for strncmp/memcmp (bytes)
             max_trace_event_size: 32768,           // Default event size cap (32KB)
             selected_index: None,

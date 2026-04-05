@@ -400,7 +400,8 @@ perf_page_count = 64  # 默认（每 CPU 256KB）
 proc_module_offsets_max_entries = 4096  # 默认
 
 # 扩展格式占位符（{:x}/{:s}）单个参数的内存转储上限（字节）。
-mem_dump_cap = 4096
+# 超过该上限的请求会被截断。
+mem_dump_cap = 256
 
 # 内置比较（strncmp/starts_with/memcmp）的最大比较字节数。
 # 实际比较长度为 min(max(len, 0), compare_cap)。
@@ -598,6 +599,7 @@ GhostScope 在启动时验证配置：
    - **ebpf_max_messages**：必须至少为 100
 8. **eBPF 配置**：
    - **ringbuf_size**：必须是 2 的幂，范围 4096-16777216 字节
+   - **mem_dump_cap**：单参数内存转储上限（字节），例如 256/512/1024/4096
    - **proc_module_offsets_max_entries**：必须在 64-65536 范围内
 
 无效配置将产生清晰的错误消息和修复建议。

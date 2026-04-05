@@ -403,8 +403,8 @@ perf_page_count = 64  # Default (256KB per CPU)
 proc_module_offsets_max_entries = 4096  # Default
 
 # Per-argument memory dump cap for extended format specifiers ({:x}/{:s}).
-# Increase to dump more bytes per argument.
-mem_dump_cap = 4096
+# Requests beyond this cap are truncated.
+mem_dump_cap = 256
 
 # Compare cap for built-in comparisons (strncmp/starts_with/memcmp).
 # Controls the maximum number of bytes compared per call.
@@ -608,7 +608,7 @@ GhostScope validates configuration at startup:
 8. **eBPF Configuration**:
    - **ringbuf_size**: Must be power of 2, range 4096-16777216 bytes
    - **perf_page_count**: Must be power of 2, range 8-1024 pages
-   - **mem_dump_cap**: Per-argument memory dump cap (bytes), e.g., 1024/2048/4096
+   - **mem_dump_cap**: Per-argument memory dump cap (bytes), e.g., 256/512/1024/4096
    - **max_trace_event_size**: Max bytes per trace event (PerfEventArray accumulation buffer)
    - **proc_module_offsets_max_entries**: Must be in range 64-65536
 

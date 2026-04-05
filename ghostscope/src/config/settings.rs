@@ -195,7 +195,7 @@ pub struct EbpfConfig {
     #[serde(default = "default_force_perf_event_array")]
     pub force_perf_event_array: bool,
     /// Per-argument memory dump cap for extended format specifiers ({:x}/{:s})
-    /// Default: 1024 bytes; increase for larger previews.
+    /// Default: 256 bytes; larger requests are truncated to this cap.
     #[serde(default = "default_mem_dump_cap")]
     pub mem_dump_cap: u32,
     /// Max bytes compared by builtins (strncmp/starts_with/memcmp)
@@ -314,7 +314,7 @@ fn default_force_perf_event_array() -> bool {
 }
 
 fn default_mem_dump_cap() -> u32 {
-    4096
+    256
 }
 
 fn default_max_trace_event_size() -> u32 {
