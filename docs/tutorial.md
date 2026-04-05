@@ -4,6 +4,24 @@ Learn to trace running applications with GhostScope in 10 minutes!
 
 ## Quick Start
 
+### Start With AI-Assisted Tracing
+
+If you are using Codex or Claude Code in the same workspace, the fastest way to get started is often to let the shared `ghostscope-runtime-analysis` skill generate the first attach command and trace script for you, then come back to the TUI to inspect and refine it.
+
+Install the skill:
+
+```bash
+./scripts/skills/install_ghostscope_runtime_analysis_skill.sh --copy
+```
+
+Then ask for a concrete tracing workflow:
+
+```text
+$ghostscope-runtime-analysis trace the running nginx worker and show the raw request body bytes
+```
+
+This works especially well when you want a repeatable CLI flow with `--script-file`. After the AI gives you a starting point, the TUI is still the best place to inspect source, tweak trace points, and iterate on the script interactively. If you want the hands-on details of using GhostScope itself, continue with the tutorial below.
+
 ### Launch GhostScope
 
 GhostScope offers two modes for attaching to processes, both using Linux uprobe + eBPF mechanism:

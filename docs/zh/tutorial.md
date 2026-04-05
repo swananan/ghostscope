@@ -4,6 +4,24 @@
 
 ## 快速开始
 
+### 从 AI 辅助追踪开始
+
+如果你正在同一个 workspace 里使用 Codex 或 Claude Code，最快的上手方式通常是先让共享的 `ghostscope-runtime-analysis` skill 帮你生成第一版 attach 命令和追踪脚本，然后再回到 TUI 里做检查和微调。
+
+先安装这个 skill：
+
+```bash
+./scripts/skills/install_ghostscope_runtime_analysis_skill.sh --copy
+```
+
+然后直接提一个具体的追踪需求：
+
+```text
+$ghostscope-runtime-analysis 跟踪正在运行的 nginx worker，并把请求 body 的原始字节打印出来
+```
+
+这条路径特别适合想先拿到一套可复用的 `--script-file` CLI 工作流的人。AI 给出初版之后，TUI 仍然是查看源码、微调设点和迭代脚本的最佳位置。如果你想继续了解 GhostScope 的具体使用细节，也可以继续参考下面的教程。
+
 ### 启动 GhostScope
 
 GhostScope 提供两种模式来附加到进程，两者都使用 Linux uprobe + eBPF 机制：
