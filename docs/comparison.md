@@ -6,7 +6,7 @@ GhostScope is designed for a narrow but high-value job: **source-aware userspace
 
 | If you need... | Prefer... | Why |
 |---|---|---|
-| Breakpoints, stepping, memory writes, or coredump debugging | GDB | It is an interactive debugger with full execution control |
+| Interactive debugging with breakpoints, stepping, memory writes, or coredump debugging | GDB | It is an interactive debugger with full execution control |
 | Mixed kernel + userspace event aggregation | bpftrace or SystemTap | They are broader system tracing tools |
 | Source-line, local-variable, and typed userspace runtime inspection without stopping the target | GhostScope | It combines runtime DWARF evaluation with low-overhead userspace tracing |
 | Existing tapsets or a mature SystemTap workflow | SystemTap | Reuse often matters more than switching tools |

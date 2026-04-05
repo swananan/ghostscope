@@ -22,7 +22,7 @@
 
 ## Overview
 
-GhostScope is for **source-aware userspace runtime tracing** on live Linux processes. If you have DWARF debug info and cannot afford to stop the target, GhostScope lets you attach at function, source-line, or instruction granularity and print the values that matter: locals, parameters, globals, nested fields, and raw bytes.
+GhostScope is a **source-aware userspace tracer** for live Linux processes. With DWARF debug info, it lets you attach at function, source-line, or instruction granularity and print the values that matter without stopping the target.
 
 > *"The most effective debugging tool is still careful thought, coupled with judiciously placed print statements."* — Brian Kernighan
 
@@ -35,7 +35,7 @@ GhostScope is for **source-aware userspace runtime tracing** on live Linux proce
 
 ### When Not To Use GhostScope
 
-- Use GDB when you need breakpoints, single-stepping, memory writes, or coredump debugging.
+- Use GDB when you want an interactive debugging experience with breakpoints, single-stepping, memory writes, or coredump debugging.
 - Use bpftrace or SystemTap when you want broad kernel + userspace event aggregation in one script.
 - Do not expect source-level variable tracing to work well without DWARF debug info for the modules you care about.
 
@@ -97,11 +97,9 @@ trace /mnt/500g/code/openresty/openresty-1.27.1.1/build/nginx-1.27.1/src/http/ng
 }
 ```
 
-Observed output:
+Demo:
 
-```text
-src=discard-preread pid=3385842 req=0x55ce5fcb0650 line=POST /demo HTTP/1.1 body_len=10 body=00 01 02 68 65 6c 6c 6f ff 10
-```
+![GhostScope CLI demo](assets/demo-cli.gif)
 
 For best results, make sure the relevant source tree is available, the modules you care about carry DWARF debug information, and GhostScope has the privileges needed to load eBPF programs. When that information is not discoverable locally, the skill should ask for it before generating a source-backed trace. Re-run the same installer after pulling updates; the installed skill is versioned and refreshes automatically when the version changes.
 
