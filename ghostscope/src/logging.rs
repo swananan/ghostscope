@@ -9,6 +9,17 @@ const DEFAULT_LOG_FILE: &str = "ghostscope.log";
 
 static INIT_GUARD: OnceLock<()> = OnceLock::new();
 
+pub fn initialize_from_user_config(user_config: &crate::config::UserConfig) -> Result<()> {
+    let log_file_string = user_config.log_file.to_string_lossy().to_string();
+    initialize_logging_with_config(
+        Some(log_file_string.as_str()),
+        user_config.enable_logging,
+        user_config.enable_console_logging,
+        user_config.log_level,
+        user_config.tui_mode,
+    )
+}
+
 /// Initialize logging with enhanced configuration options
 pub fn initialize_logging_with_config(
     log_file_path: Option<&str>,

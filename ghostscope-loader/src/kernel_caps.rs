@@ -45,6 +45,36 @@ pub struct KernelCapabilities {
 }
 
 impl KernelCapabilities {
+    /// Detect kernel capabilities for process startup, including startup-oriented logs and
+    /// user-facing error context.
+    pub fn detect_for_startup(
+        force_perf_event_array: bool,
+    ) -> Result<&'static Self, KernelCapabilityError> {
+        let capabilities = if force_perf_event_array {
+            warn!("⚠️  TESTING MODE: force_perf_event_array=true - will use PerfEventArray");
+            Self::get_perf_only().map_err(|err| {
+                KernelCapabilityError::new(format!(
+                    "{err}\nGhostScope requires Linux kernel >= 4.3 with PerfEventArray enabled."
+                ))
+            })?
+        } else {
+            Self::get().map_err(|err| {
+                KernelCapabilityError::new(format!(
+                    "{err}\nHint: ensure CONFIG_BPF, CONFIG_BPF_SYSCALL and CONFIG_UPROBE_EVENTS are enabled in your kernel."
+                ))
+            })?
+        };
+
+        info!(
+            "Kernel eBPF startup summary: ringbuf_supported={} perf_event_array_supported={} helper_ns_current_pid_tgid={}",
+            capabilities.supports_ringbuf,
+            capabilities.supports_perf_event_array,
+            capabilities.supports_ns_current_pid_tgid_helper
+        );
+
+        Ok(capabilities)
+    }
+
     /// Get global kernel capabilities (detected once on first call)
     /// Returns an error if neither RingBuf nor PerfEventArray is supported
     pub fn get() -> Result<&'static Self, KernelCapabilityError> {

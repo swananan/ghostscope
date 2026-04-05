@@ -44,6 +44,8 @@ impl RuntimeContext {
         };
 
         runtime.log_resolution(&pid_session, helper_supported);
+        // Successful PID resolution already proved `/proc/<pid>` exists, so validation can skip
+        // the duplicate liveness check on that path.
         user_config.validate_with_pid_state(
             user_config.input_pid.is_some() && runtime.pid_views.is_some(),
         )?;

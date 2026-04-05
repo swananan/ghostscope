@@ -201,6 +201,17 @@ impl UserConfig {
         Ok(Self::new(args, config))
     }
 
+    pub fn config_source_message(&self) -> String {
+        if let Some(config_path) = &self.config_file_path {
+            format!("Configuration loaded from: {}", config_path.display())
+        } else {
+            let home_hint = std::env::var("HOME").unwrap_or_else(|_| "(unset)".into());
+            format!(
+                "Using built-in defaults (no config found at {home_hint}/.ghostscope/config.toml or ./ghostscope.toml)"
+            )
+        }
+    }
+
     pub(crate) fn validate_with_pid_state(&self, pid_already_verified: bool) -> Result<()> {
         if self.input_pid.is_none() && self.target_path.is_none() {
             return Err(anyhow::anyhow!(
