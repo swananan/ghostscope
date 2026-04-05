@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Args as ClapArgs, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
-use tracing::{info, warn};
+use tracing::warn;
 
 #[derive(Debug, Clone, Copy, PartialEq, ValueEnum, serde::Serialize, serde::Deserialize)]
 pub enum LayoutMode {
@@ -600,85 +600,6 @@ impl Args {
             has_explicit_console_log_flag,
         )
     }
-}
-
-impl ParsedArgs {
-    /// Validate command line arguments for consistency and completeness
-    pub fn validate(&self) -> Result<()> {
-        // Require either PID (-p) or target file (-t)
-        if self.pid.is_none() && self.target_path.is_none() {
-            return Err(anyhow::anyhow!(
-                "No target specified. Please provide either --pid <PID> or --target <PATH>."
-            ));
-        }
-
-        // Target path validation
-        if let Some(target_path) = &self.target_path {
-            let target_file = PathBuf::from(target_path);
-            if !target_file.exists() {
-                return Err(anyhow::anyhow!(
-                    "Target file does not exist: {}",
-                    target_path
-                ));
-            }
-            if !target_file.is_file() {
-                return Err(anyhow::anyhow!(
-                    "Target path is not a file: {}",
-                    target_path
-                ));
-            }
-            info!("✓ Target file found: {}", target_path);
-        }
-
-        if let Some(pid) = self.pid {
-            if !is_pid_running(pid) {
-                return Err(anyhow::anyhow!(
-                    "Process with PID {} is not running. Use 'ps -p {}' to verify the process exists",
-                    pid,
-                    pid
-                ));
-            }
-            info!("✓ Target PID {} is running", pid);
-        }
-
-        // Script file must exist if specified
-        if let Some(script_file) = &self.script_file {
-            if !script_file.exists() {
-                return Err(anyhow::anyhow!(
-                    "Script file does not exist: {}",
-                    script_file.display()
-                ));
-            }
-            if !script_file.is_file() {
-                return Err(anyhow::anyhow!(
-                    "Script path is not a file: {}",
-                    script_file.display()
-                ));
-            }
-        }
-
-        // Debug file must exist if specified
-        if let Some(debug_file) = &self.debug_file {
-            if !debug_file.exists() {
-                return Err(anyhow::anyhow!(
-                    "Debug file does not exist: {}",
-                    debug_file.display()
-                ));
-            }
-        }
-
-        info!("✓ Command line arguments validated successfully");
-        Ok(())
-    }
-}
-
-/// Check if a process with given PID is currently running
-fn is_pid_running(pid: u32) -> bool {
-    use std::path::Path;
-
-    // On Linux, check if /proc/PID exists and is a directory
-    let proc_path = format!("/proc/{pid}");
-    Path::new(&proc_path).is_dir()
 }
 
 #[cfg(test)]

@@ -1,6 +1,8 @@
 mod plan;
 mod procfs;
 mod resolve;
+mod runtime_env;
+mod session;
 mod types;
 
 pub use plan::{
@@ -13,4 +15,6 @@ pub use resolve::{
     host_pid_for_proc_pid, resolve_event_pid_for_proc, resolve_input_pid, resolve_proc_pid,
     resolve_proc_pid_for_event,
 };
+pub use runtime_env::{detect_runtime_environment, RuntimeEnvironment, RuntimeEnvironmentInfo};
+pub use session::{resolve_pid_session, ResolvePidSessionError, ResolvedPidSession};
 pub use types::{PidAttachRequest, PidNamespaceId, PidResolveSource, PidViews};

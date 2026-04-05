@@ -2,10 +2,11 @@ use std::fmt;
 use std::fs;
 use std::path::Path;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RuntimeEnvironment {
     ContainerLikely,
     HostLikely,
+    #[default]
     Unknown,
 }
 
@@ -19,7 +20,7 @@ impl fmt::Display for RuntimeEnvironment {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RuntimeEnvironmentInfo {
     pub environment: RuntimeEnvironment,
     pub evidence: Vec<String>,

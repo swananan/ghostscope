@@ -1,6 +1,6 @@
 //! CLI script-mode runtime orchestration.
 
-use crate::config::MergedConfig;
+use crate::config::ResolvedConfig;
 use crate::core::GhostSession;
 use anyhow::Result;
 use ghostscope_dwarf::ModuleLoadingEvent;
@@ -29,7 +29,7 @@ async fn wait_for_shutdown_signal() -> io::Result<&'static str> {
 }
 
 /// Run GhostScope in command line mode with merged configuration
-pub async fn run_command_line_runtime_with_config(config: MergedConfig) -> Result<()> {
+pub async fn run_command_line_runtime_with_config(config: ResolvedConfig) -> Result<()> {
     info!("Starting GhostScope in command line mode");
 
     // Step 1: Get script content
@@ -112,7 +112,7 @@ fn spawn_loading_reporter(
 async fn run_cli_with_session(
     mut session: GhostSession,
     script_content: String,
-    config: &MergedConfig,
+    config: &ResolvedConfig,
 ) -> Result<()> {
     let show_cli_status = should_print_cli_status(config);
     let stderr_colors = crate::cli::color::CliColors::for_stderr(config.script_color_mode);
@@ -134,15 +134,16 @@ async fn run_cli_with_session(
     } else if let Some(proc_pid) = session.proc_pid() {
         info!("Target PID: {}", proc_pid);
     }
-    if let Some(env) = config.runtime_env.as_ref() {
-        info!("Runtime environment: {}", env.compact_display());
-    }
-    if let Some(spec) = config.pid_filter_spec {
+    info!(
+        "Runtime environment: {}",
+        config.runtime.runtime_env.compact_display()
+    );
+    if let Some(spec) = config.runtime.pid_filter_spec {
         info!("PID filter strategy: {:?}", spec);
     }
 
     // Step 4: Validate binary analysis
-    if config.pid.is_some() || config.binary_path.is_some() {
+    if config.runtime.proc_pid.is_some() || config.binary_path.is_some() {
         match session.get_module_stats() {
             Some(stats) => {
                 info!("✓ Process analysis successful");
@@ -165,10 +166,11 @@ async fn run_cli_with_session(
             }
             None => {
                 let host_hint = config
+                    .runtime
                     .host_pid
                     .map(|pid| format!(" (host PID for eBPF filter: {pid})"))
                     .unwrap_or_default();
-                let requested_pid = config.input_pid.or(config.pid).unwrap_or(0);
+                let requested_pid = config.input_pid.or(config.runtime.proc_pid).unwrap_or(0);
                 return Err(anyhow::anyhow!(
                     "Process analysis failed! Cannot proceed without process information. \
                     Possible solutions: 1. Check that PID {} exists: ps -p {}, \
@@ -295,7 +297,7 @@ async fn run_cli_with_session(
     Ok(())
 }
 
-fn should_print_cli_status(config: &MergedConfig) -> bool {
+fn should_print_cli_status(config: &ResolvedConfig) -> bool {
     !is_console_stderr_logging_active(config.enable_logging, config.enable_console_logging)
         && io::stderr().is_terminal()
 }
@@ -304,12 +306,12 @@ fn is_console_stderr_logging_active(enable_logging: bool, enable_console_logging
     enable_logging && enable_console_logging
 }
 
-fn should_use_script_stdout_color(config: &MergedConfig) -> bool {
+fn should_use_script_stdout_color(config: &ResolvedConfig) -> bool {
     crate::cli::color::CliColors::for_stdout(config.script_color_mode).enabled()
 }
 
 /// Get script content from merged configuration or provide default
-fn get_script_content_from_config(config: &MergedConfig) -> Result<String> {
+fn get_script_content_from_config(config: &ResolvedConfig) -> Result<String> {
     match (&config.script, &config.script_file) {
         (Some(script), _) => {
             info!("Using inline script from command line");
