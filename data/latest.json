@@ -1,29 +1,29 @@
 {
-  "generated_at": "2026-04-05T05:22:52Z",
-  "sha": "b3f110e92901cfe2ca0fdf3a0437bf09e9aee601",
-  "sha_short": "b3f110e92901",
+  "generated_at": "2026-04-05T09:40:39Z",
+  "sha": "2f84f138a08f410163501bd69f603b1705ca7788",
+  "sha_short": "2f84f138a08f",
   "ref": "main",
-  "event": "schedule",
-  "run_id": "23994974045",
-  "run_number": "8",
+  "event": "push",
+  "run_id": "23998868617",
+  "run_number": "9",
   "run_attempt": "1",
-  "run_url": "https://github.com/swananan/ghostscope/actions/runs/23994974045",
-  "artifact_path": "data/runs/20260405T052252Z-b3f110e92901.json",
+  "run_url": "https://github.com/swananan/ghostscope/actions/runs/23998868617",
+  "artifact_path": "data/runs/20260405T094039Z-2f84f138a08f.json",
   "metrics": {
     "fast_parse_ms": {
-      "average": 977.317,
-      "p50": 966.105,
-      "p95": 1048.794,
-      "min": 962.299,
-      "max": 1048.794
+      "average": 1007.914,
+      "p50": 982.756,
+      "p95": 1064.351,
+      "min": 975.33,
+      "max": 1064.351
     },
     "source_line_query_ms": {
-      "first_run": 3.956078,
-      "average": 3.6194499999999996,
-      "p50": 3.5692760000000003,
-      "p95": 3.956078,
-      "min": 3.537367,
-      "max": 3.956078
+      "first_run": 4.1024080000000005,
+      "average": 3.7303856999999994,
+      "p50": 3.674201,
+      "p95": 4.1024080000000005,
+      "min": 3.646018,
+      "max": 4.1024080000000005
     }
   },
   "query_result": {
