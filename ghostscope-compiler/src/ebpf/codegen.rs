@@ -1159,6 +1159,31 @@ impl<'ctx> EbpfContext<'ctx> {
         }
     }
 
+    fn unwrap_alias_candidate_dwarf_type(
+        mut t: &ghostscope_dwarf::TypeInfo,
+    ) -> &ghostscope_dwarf::TypeInfo {
+        while let ghostscope_dwarf::TypeInfo::TypedefType {
+            underlying_type, ..
+        }
+        | ghostscope_dwarf::TypeInfo::QualifiedType {
+            underlying_type, ..
+        } = t
+        {
+            t = underlying_type.as_ref();
+        }
+        t
+    }
+
+    fn is_aliasable_dwarf_type(t: &ghostscope_dwarf::TypeInfo) -> bool {
+        matches!(
+            Self::unwrap_alias_candidate_dwarf_type(t),
+            ghostscope_dwarf::TypeInfo::PointerType { .. }
+                | ghostscope_dwarf::TypeInfo::ArrayType { .. }
+                | ghostscope_dwarf::TypeInfo::StructType { .. }
+                | ghostscope_dwarf::TypeInfo::UnionType { .. }
+        )
+    }
+
     fn expr_to_name(&self, expr: &crate::script::ast::Expr) -> String {
         use crate::script::ast::Expr as E;
         fn inner(e: &E) -> String {
@@ -1241,9 +1266,15 @@ impl<'ctx> EbpfContext<'ctx> {
                 (self.is_alias_candidate_expr(left) && is_const_nonneg(right))
                     || (self.is_alias_candidate_expr(right) && is_const_nonneg(left))
             }
-            // Otherwise, probe DWARF type: any DWARF-backed expression (pointer/array/struct/union/enum)
-            // is treated as an alias so it can be used as a reusable base for member/index/address-of.
-            other => matches!(self.query_dwarf_for_complex_expr(other), Ok(Some(_))),
+            // Otherwise, only keep address-like or aggregate DWARF expressions as aliases.
+            // Scalar DWARF expressions should stay concrete so `let n = foo.len;` behaves
+            // like an integer script variable and remains usable in capture-length formatting.
+            other => self
+                .query_dwarf_for_complex_expr(other)
+                .ok()
+                .flatten()
+                .and_then(|var| var.dwarf_type)
+                .is_some_and(|ty| Self::is_aliasable_dwarf_type(&ty)),
         }
     }
 

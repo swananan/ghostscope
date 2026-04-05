@@ -416,6 +416,41 @@ async fn run_ghostscope_with_script(
 }
 
 #[tokio::test]
+async fn test_capture_len_uses_scalar_script_var_from_dwarf_expr() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("sample_program")?;
+    let mut analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to load DWARF for sample_program: {e}"))?;
+    let script_content = r#"
+trace sample_lib.c:45 {
+    let n = len;
+    print "LEN_MSG={:s.n$}", str;
+}
+"#;
+
+    let compile_options = ghostscope_compiler::CompileOptions {
+        binary_path_hint: Some(binary_path.to_string_lossy().into_owned()),
+        ..Default::default()
+    };
+    let result = ghostscope_compiler::compile_script(
+        script_content,
+        &mut analyzer,
+        None,
+        Some(1),
+        &compile_options,
+    )
+    .map_err(|e| anyhow::anyhow!("compile_script failed: {e}"))?;
+
+    assert!(
+        !result.uprobe_configs.is_empty(),
+        "expected at least one compiled uprobe config"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_logical_or_short_circuit_chain() -> anyhow::Result<()> {
     init();
     ensure_global_cleanup_registered();
