@@ -2181,33 +2181,6 @@ impl ModuleData {
         offset: gimli::LocationListsOffset<usize>,
         pc: u64,
     ) -> Result<bool> {
-        if let Ok(mut locations) = dwarf.locations(unit, offset) {
-            let default_location_uses_entry_value = None;
-            loop {
-                match locations.next() {
-                    Ok(Some(location_list_entry)) => {
-                        if range_contains_pc(
-                            location_list_entry.range.begin,
-                            location_list_entry.range.end,
-                            pc,
-                        ) {
-                            return Ok(Self::expression_uses_entry_value(
-                                unit,
-                                location_list_entry.data,
-                            ));
-                        }
-                    }
-                    Ok(None) => {
-                        if let Some(value) = default_location_uses_entry_value {
-                            return Ok(value);
-                        }
-                        break;
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
-
         let mut raw_locations = match dwarf.raw_locations(unit, offset) {
             Ok(iter) => iter,
             Err(_) => return Ok(false),
@@ -2975,6 +2948,69 @@ mod tests {
             .borrow(|section| dwarf_reader_from_arc(Arc::<[u8]>::from(section.as_slice())))
     }
 
+    fn build_origin_backed_default_location_entry_value_fixture(
+        origin_attr: gimli::DwAt,
+    ) -> gimli::Dwarf<DwarfReader> {
+        let encoding = gimli::Encoding {
+            format: Format::Dwarf32,
+            version: 5,
+            address_size: 8,
+        };
+
+        let mut dwarf = WriteDwarf::new();
+        let unit_id = dwarf.units.add(Unit::new(encoding, LineProgram::none()));
+        let unit = dwarf.units.get_mut(unit_id);
+        let root = unit.root();
+
+        let origin_id = unit.add(root, constants::DW_TAG_subprogram);
+        unit.get_mut(origin_id).set(
+            constants::DW_AT_name,
+            WriteAttributeValue::String(b"entry_value_default_location_target".to_vec()),
+        );
+
+        let origin_param_id = unit.add(origin_id, constants::DW_TAG_formal_parameter);
+        let mut direct_loc = WriteExpression::new();
+        direct_loc.op_reg(Register(5));
+        let mut inner = WriteExpression::new();
+        inner.op_reg(Register(5));
+        let mut default_entry_value_loc = WriteExpression::new();
+        default_entry_value_loc.op_entry_value(inner);
+        let loc_id = unit.locations.add(LocationList(vec![
+            Location::DefaultLocation {
+                data: default_entry_value_loc,
+            },
+            Location::StartEnd {
+                begin: Address::Constant(0x1470),
+                end: Address::Constant(0x147b),
+                data: direct_loc,
+            },
+        ]));
+        unit.get_mut(origin_param_id).set(
+            constants::DW_AT_location,
+            WriteAttributeValue::LocationListRef(loc_id),
+        );
+
+        let concrete_id = unit.add(root, constants::DW_TAG_subprogram);
+        unit.get_mut(concrete_id)
+            .set(origin_attr, WriteAttributeValue::UnitRef(origin_id));
+
+        let mut sections = Sections::new(EndianVec::new(gimli::LittleEndian));
+        dwarf.write(&mut sections).unwrap();
+
+        let dwarf_sections: gimli::DwarfSections<Vec<u8>> = gimli::DwarfSections::load(|id| {
+            Ok::<_, gimli::Error>(
+                sections
+                    .get(id)
+                    .map(|section| section.slice().to_vec())
+                    .unwrap_or_default(),
+            )
+        })
+        .unwrap();
+
+        dwarf_sections
+            .borrow(|section| dwarf_reader_from_arc(Arc::<[u8]>::from(section.as_slice())))
+    }
+
     fn first_unit(dwarf: &gimli::Dwarf<DwarfReader>) -> gimli::Unit<DwarfReader> {
         let mut units = dwarf.units();
         let header = units.next().unwrap().unwrap();
@@ -3126,6 +3162,19 @@ mod tests {
     }
 
     #[test]
+    fn selected_inline_address_keeps_entry_pc_only_point_scopes() {
+        // Regression scenario:
+        // Some inline/call-site DIEs are encoded as a single point with only
+        // DW_AT_entry_pc and no ranges at all. Those scopes are still
+        // addressable elsewhere in the DWARF pipeline, so inline address
+        // selection must not drop them just because there is no range to
+        // validate against.
+        let entry = inline_entry(&[], Some(0x1289));
+
+        assert_eq!(ModuleData::selected_inline_address(&entry), Some(0x1289));
+    }
+
+    #[test]
     fn subprogram_uses_entry_value_via_abstract_origin_parameters() {
         // Regression scenario:
         // After concrete out-of-line subprograms stopped inheriting is_inline,
@@ -3250,6 +3299,36 @@ mod tests {
         assert!(
             !ModuleData::subprogram_uses_entry_value_at(&dwarf, &unit, &concrete, 0x1478).unwrap(),
             "concrete parameter locations must remain authoritative at the selected probe PC"
+        );
+    }
+
+    #[test]
+    fn subprogram_uses_entry_value_at_pc_prefers_specific_loclist_ranges_over_default_location() {
+        // Regression scenario:
+        // DWARF5 loclists may start with DW_LLE_default_location and then
+        // override it with a later range-specific entry. gimli::locations()
+        // normalizes the default to [0, u64::MAX), which can mask the later
+        // specific range and incorrectly report entry_value everywhere.
+        //
+        // This fixture keeps entry_value in the default location but switches
+        // to a direct register location for [0x1470, 0x147b). The specific
+        // range must win at PCs inside that span, while the default still
+        // applies outside it.
+        let dwarf = build_origin_backed_default_location_entry_value_fixture(
+            constants::DW_AT_abstract_origin,
+        );
+        let unit = first_unit(&dwarf);
+        let concrete_offset =
+            find_subprogram_with_origin_attr(&unit, constants::DW_AT_abstract_origin);
+        let concrete = unit.entry(concrete_offset).unwrap();
+
+        assert!(
+            !ModuleData::subprogram_uses_entry_value_at(&dwarf, &unit, &concrete, 0x1474).unwrap(),
+            "the specific direct-register range should override the default-location entry_value"
+        );
+        assert!(
+            ModuleData::subprogram_uses_entry_value_at(&dwarf, &unit, &concrete, 0x1500).unwrap(),
+            "outside the specific range, the default-location entry_value should still apply"
         );
     }
 }

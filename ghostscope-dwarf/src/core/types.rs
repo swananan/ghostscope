@@ -95,14 +95,21 @@ impl IndexEntry {
         self.flags.is_inline_instance || self.tag == gimli::constants::DW_TAG_inlined_subroutine
     }
 
-    /// Return entry_pc only when it lies inside one of this DIE's own ranges.
-    /// Some producers emit caller-side setup PCs that do not belong to the
-    /// inline instance itself.
+    /// Return entry_pc when it is usable as this DIE's own entry address.
+    ///
+    /// Most DIEs with an entry_pc also carry ranges, and some producers emit
+    /// caller-side setup PCs that do not belong to the inline instance itself.
+    /// Reject those out-of-range PCs. However, DWARF can also encode
+    /// single-point inline/call-site scopes using only entry_pc and no ranges;
+    /// in that shape the point entry_pc is the only addressable location and
+    /// should be preserved.
     pub fn validated_entry_pc(&self) -> Option<u64> {
         self.entry_pc.filter(|pc| {
-            self.address_ranges
-                .iter()
-                .any(|(start, end)| *start <= *pc && *pc < *end)
+            self.address_ranges.is_empty()
+                || self
+                    .address_ranges
+                    .iter()
+                    .any(|(start, end)| *start <= *pc && *pc < *end)
         })
     }
 }
