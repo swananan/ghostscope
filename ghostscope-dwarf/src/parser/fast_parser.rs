@@ -26,6 +26,18 @@ struct FunctionMetadata {
     is_external: Option<bool>,
 }
 
+#[derive(Clone)]
+struct FunctionEntrySeed {
+    die_offset: gimli::UnitOffset,
+    tag: gimli::DwTag,
+    unit_offset: gimli::DebugInfoOffset,
+    flags: crate::core::IndexFlags,
+    language: Option<gimli::DwLang>,
+    address_ranges: Vec<(u64, u64)>,
+    entry_pc: Option<u64>,
+    function_kind: FunctionDieKind,
+}
+
 /// Compilation unit information with associated directories and files.
 #[derive(Debug, Clone)]
 pub(crate) struct CompilationUnit {
@@ -132,6 +144,14 @@ impl<'a> DwarfParser<'a> {
                         &mut visited,
                     )?;
                     if let Some(name) = metadata.name.clone() {
+                        let address_ranges =
+                            self.extract_address_ranges(self.dwarf, unit, entry)?;
+                        let entry_pc_cached = self.extract_entry_pc(entry)?;
+                        let function_kind = Self::classify_function_kind(
+                            entry.tag(),
+                            &address_ranges,
+                            entry_pc_cached,
+                        );
                         let is_main = self.is_main_function(entry, &name).unwrap_or(false);
                         let is_static = metadata
                             .is_external
@@ -140,66 +160,30 @@ impl<'a> DwarfParser<'a> {
                         let flags = crate::core::IndexFlags {
                             is_static,
                             is_main,
-                            is_inline_instance: false,
+                            is_inline_instance: function_kind == FunctionDieKind::InlineInstance,
                             has_inline_attribute: metadata.has_inline_attribute,
                             is_linkage: metadata.is_linkage_name,
                             ..Default::default()
                         };
-                        let address_ranges =
-                            self.extract_address_ranges(self.dwarf, unit, entry)?;
-                        let entry_pc_cached = self.extract_entry_pc(entry)?;
-                        let index_entry = IndexEntry {
-                            name: std::sync::Arc::from(name.as_str()),
+                        let linkage_name = self
+                            .extract_linkage_name(self.dwarf, unit, entry)?
+                            .map(|(linkage_name, _)| linkage_name);
+                        let seed = FunctionEntrySeed {
                             die_offset: entry.offset(),
-                            unit_offset,
                             tag: entry.tag(),
+                            unit_offset,
                             flags,
                             language: cu_language,
-                            address_ranges: address_ranges.clone(),
+                            address_ranges,
                             entry_pc: entry_pc_cached,
-                            function_kind: if !address_ranges.is_empty()
-                                || entry_pc_cached.is_some()
-                            {
-                                FunctionDieKind::ConcreteSubprogram
-                            } else {
-                                FunctionDieKind::AbstractSubprogram
-                            },
+                            function_kind,
                         };
-                        shard
-                            .functions
-                            .entry(name.clone())
-                            .or_default()
-                            .push(index_entry);
-                        if let Some((linkage_name, _)) =
-                            self.extract_linkage_name(self.dwarf, unit, entry)?
-                        {
-                            if linkage_name != metadata.name.clone().unwrap_or_default() {
-                                let mut alias_flags = flags;
-                                alias_flags.is_linkage = true;
-                                let index_entry_linkage = IndexEntry {
-                                    name: std::sync::Arc::from(linkage_name.as_str()),
-                                    die_offset: entry.offset(),
-                                    unit_offset,
-                                    tag: entry.tag(),
-                                    flags: alias_flags,
-                                    language: cu_language,
-                                    address_ranges: address_ranges.clone(),
-                                    entry_pc: entry_pc_cached,
-                                    function_kind: if !address_ranges.is_empty()
-                                        || entry_pc_cached.is_some()
-                                    {
-                                        FunctionDieKind::ConcreteSubprogram
-                                    } else {
-                                        FunctionDieKind::AbstractSubprogram
-                                    },
-                                };
-                                shard
-                                    .functions
-                                    .entry(linkage_name)
-                                    .or_default()
-                                    .push(index_entry_linkage);
-                            }
-                        }
+                        Self::push_function_entries(
+                            &mut shard.functions,
+                            &name,
+                            linkage_name,
+                            &seed,
+                        );
                     }
                 }
                 gimli::constants::DW_TAG_inlined_subroutine => {
@@ -212,60 +196,44 @@ impl<'a> DwarfParser<'a> {
                         &mut visited,
                     )?;
                     if let Some(name) = metadata.name.clone() {
+                        let address_ranges =
+                            self.extract_address_ranges(self.dwarf, unit, entry)?;
+                        let entry_pc_cached = self.extract_entry_pc(entry)?;
+                        let function_kind = Self::classify_function_kind(
+                            entry.tag(),
+                            &address_ranges,
+                            entry_pc_cached,
+                        );
                         let is_static = metadata
                             .is_external
                             .map(|external| !external)
                             .unwrap_or(false);
                         let flags = crate::core::IndexFlags {
                             is_static,
-                            is_inline_instance: true,
+                            is_inline_instance: function_kind == FunctionDieKind::InlineInstance,
                             has_inline_attribute: metadata.has_inline_attribute,
                             is_linkage: metadata.is_linkage_name,
                             ..Default::default()
                         };
-                        let address_ranges =
-                            self.extract_address_ranges(self.dwarf, unit, entry)?;
-                        let entry_pc_cached = self.extract_entry_pc(entry)?;
-                        let index_entry = IndexEntry {
-                            name: std::sync::Arc::from(name.as_str()),
+                        let linkage_name = self
+                            .extract_linkage_name(self.dwarf, unit, entry)?
+                            .map(|(linkage_name, _)| linkage_name);
+                        let seed = FunctionEntrySeed {
                             die_offset: entry.offset(),
-                            unit_offset,
                             tag: entry.tag(),
+                            unit_offset,
                             flags,
                             language: cu_language,
-                            address_ranges: address_ranges.clone(),
+                            address_ranges,
                             entry_pc: entry_pc_cached,
-                            function_kind: FunctionDieKind::InlineInstance,
+                            function_kind,
                         };
-                        shard
-                            .functions
-                            .entry(name.clone())
-                            .or_default()
-                            .push(index_entry);
-                        if let Some((linkage_name, _)) =
-                            self.extract_linkage_name(self.dwarf, unit, entry)?
-                        {
-                            if linkage_name != metadata.name.clone().unwrap_or_default() {
-                                let mut alias_flags = flags;
-                                alias_flags.is_linkage = true;
-                                let index_entry_linkage = IndexEntry {
-                                    name: std::sync::Arc::from(linkage_name.as_str()),
-                                    die_offset: entry.offset(),
-                                    unit_offset,
-                                    tag: entry.tag(),
-                                    flags: alias_flags,
-                                    language: cu_language,
-                                    address_ranges: address_ranges.clone(),
-                                    entry_pc: entry_pc_cached,
-                                    function_kind: FunctionDieKind::InlineInstance,
-                                };
-                                shard
-                                    .functions
-                                    .entry(linkage_name)
-                                    .or_default()
-                                    .push(index_entry_linkage);
-                            }
-                        }
+                        Self::push_function_entries(
+                            &mut shard.functions,
+                            &name,
+                            linkage_name,
+                            &seed,
+                        );
                     }
                 }
                 gimli::constants::DW_TAG_variable => {
@@ -421,6 +389,61 @@ impl<'a> DwarfParser<'a> {
     }
     pub fn new(dwarf: &'a gimli::Dwarf<DwarfReader>) -> Self {
         Self { dwarf }
+    }
+
+    fn classify_function_kind(
+        tag: gimli::DwTag,
+        address_ranges: &[(u64, u64)],
+        entry_pc: Option<u64>,
+    ) -> FunctionDieKind {
+        match tag {
+            gimli::constants::DW_TAG_inlined_subroutine => FunctionDieKind::InlineInstance,
+            gimli::constants::DW_TAG_subprogram => {
+                if !address_ranges.is_empty() || entry_pc.is_some() {
+                    FunctionDieKind::ConcreteSubprogram
+                } else {
+                    FunctionDieKind::AbstractSubprogram
+                }
+            }
+            _ => FunctionDieKind::NotFunction,
+        }
+    }
+
+    fn build_function_index_entry(name: &str, seed: &FunctionEntrySeed) -> IndexEntry {
+        IndexEntry {
+            name: std::sync::Arc::from(name),
+            die_offset: seed.die_offset,
+            unit_offset: seed.unit_offset,
+            tag: seed.tag,
+            flags: seed.flags,
+            language: seed.language,
+            address_ranges: seed.address_ranges.clone(),
+            entry_pc: seed.entry_pc,
+            function_kind: seed.function_kind,
+        }
+    }
+
+    fn push_function_entries(
+        functions: &mut HashMap<String, Vec<IndexEntry>>,
+        name: &str,
+        linkage_name: Option<String>,
+        seed: &FunctionEntrySeed,
+    ) {
+        functions
+            .entry(name.to_owned())
+            .or_default()
+            .push(Self::build_function_index_entry(name, seed));
+
+        if let Some(linkage_name) = linkage_name.filter(|linkage_name| linkage_name != name) {
+            let mut alias_seed = seed.clone();
+            let mut alias_flags = alias_seed.flags;
+            alias_flags.is_linkage = true;
+            alias_seed.flags = alias_flags;
+            functions
+                .entry(linkage_name.clone())
+                .or_default()
+                .push(Self::build_function_index_entry(&linkage_name, &alias_seed));
+        }
     }
 
     fn extract_attr_string(
