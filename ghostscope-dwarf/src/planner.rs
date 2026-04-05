@@ -365,7 +365,7 @@ impl<'dwarf> AccessPlanner<'dwarf> {
 mod tests {
     use super::*;
     use crate::binary::dwarf_reader_from_arc;
-    use crate::core::{IndexEntry, IndexFlags};
+    use crate::core::{FunctionDieKind, IndexEntry, IndexFlags};
     use crate::index::{LightweightIndex, TypeNameIndex};
     use gimli::constants;
     use gimli::write::{
@@ -493,6 +493,7 @@ mod tests {
                 language: None,
                 address_ranges: Vec::new(),
                 entry_pc: None,
+                function_kind: FunctionDieKind::NotFunction,
             }],
         );
         let type_index = Arc::new(TypeNameIndex::build_from_lightweight(
@@ -608,6 +609,7 @@ mod tests {
                 language: None,
                 address_ranges: Vec::new(),
                 entry_pc: None,
+                function_kind: FunctionDieKind::NotFunction,
             }],
         );
         let type_index = Arc::new(TypeNameIndex::build_from_lightweight(

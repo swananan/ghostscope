@@ -396,9 +396,10 @@ impl LightweightIndex {
 
                 if let Some(addr) = display_addr {
                     tracing::trace!(
-                        "    - {} at 0x{:x} (inline={}, {} ranges)",
+                        "    - {} at 0x{:x} (role={:?}, inline={}, {} ranges)",
                         entry.name,
                         addr,
+                        entry.function_kind(),
                         entry.is_inline_instance(),
                         entry.address_ranges.len()
                     );

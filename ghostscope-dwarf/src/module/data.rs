@@ -1829,79 +1829,89 @@ impl ModuleData {
     ///   computations to ensure stable behavior across compilers/toolchains.
     fn compute_addresses_for_entry(&self, entry: &crate::core::IndexEntry) -> Vec<u64> {
         let mut out = Vec::new();
-        if entry.is_inline_instance() {
-            // Debug: print ranges & entry_pc once per inline entry
-            let mut ranges = entry.address_ranges.clone();
-            ranges.sort_unstable_by_key(|(s, _)| *s);
-            if !ranges.is_empty() {
-                let parts: Vec<String> = ranges
-                    .iter()
-                    .map(|(s, e)| format!("(0x{s:x},0x{e:x})"))
-                    .collect();
-                let epc_dbg = entry
-                    .entry_pc
-                    .map(|v| format!("0x{v:x}"))
-                    .unwrap_or("None".to_string());
-                let rlen = ranges.len();
-                let rlist = parts.join(", ");
-                tracing::debug!(
-                    "Inline '{}' entry_pc={epc_dbg} ranges({rlen}): [{rlist}]",
-                    entry.name
-                );
-            } else {
-                let epc_dbg = entry
-                    .entry_pc
-                    .map(|v| format!("0x{v:x}"))
-                    .unwrap_or("None".to_string());
-                tracing::debug!("Inline '{}' has no ranges; entry_pc={epc_dbg}", entry.name);
-            }
-
-            if let Some(addr) = Self::selected_inline_address(entry) {
-                tracing::debug!("Inline '{}' selected=0x{addr:x}", entry.name);
-                out.push(addr);
-            } else {
-                tracing::warn!(
-                    "Inline entry has no usable address (no ranges/entry_pc): unit_off={:?}, die_off={:?}",
-                    entry.unit_offset,
-                    entry.die_offset
-                );
-            }
-        } else {
-            let nranges = Self::selected_non_inline_ranges(entry);
-            for (start, end) in &nranges {
-                let candidate = {
-                    let first_exec = self.line_mapping.find_first_executable_address(*start);
-                    Self::selected_non_inline_probe_address(*start, *end, first_exec)
-                };
-                // Only force the true entry when the location active at the
-                // probe PC already relies on DW_OP_entry_value. Some optimized
-                // functions switch to entry_value later in the body, but still
-                // have stable register locations at the first executable
-                // instruction after the prologue.
-                let prefer_entry = self
-                    .function_uses_entry_value_at(entry, candidate)
-                    .unwrap_or(false);
-                let addr = if prefer_entry { *start } else { candidate };
-                if prefer_entry {
+        match entry.function_kind() {
+            crate::core::FunctionDieKind::InlineInstance => {
+                // Debug: print ranges & entry_pc once per inline entry
+                let mut ranges = entry.address_ranges.clone();
+                ranges.sort_unstable_by_key(|(s, _)| *s);
+                if !ranges.is_empty() {
+                    let parts: Vec<String> = ranges
+                        .iter()
+                        .map(|(s, e)| format!("(0x{s:x},0x{e:x})"))
+                        .collect();
+                    let epc_dbg = entry
+                        .entry_pc
+                        .map(|v| format!("0x{v:x}"))
+                        .unwrap_or("None".to_string());
+                    let rlen = ranges.len();
+                    let rlist = parts.join(", ");
                     tracing::debug!(
-                        "Non-inline '{}' entry_value active at 0x{candidate:x}, using entry start=0x{start:x}",
-                        entry.name,
-                    );
-                } else {
-                    let off = addr.saturating_sub(*start);
-                    tracing::debug!(
-                        "Non-inline '{}' start=0x{start:x} first_exec=0x{addr:x} (+0x{off:x})",
+                        "Inline '{}' entry_pc={epc_dbg} ranges({rlen}): [{rlist}]",
                         entry.name
                     );
-                    if addr == *start {
+                } else {
+                    let epc_dbg = entry
+                        .entry_pc
+                        .map(|v| format!("0x{v:x}"))
+                        .unwrap_or("None".to_string());
+                    tracing::debug!("Inline '{}' has no ranges; entry_pc={epc_dbg}", entry.name);
+                }
+
+                if let Some(addr) = Self::selected_inline_address(entry) {
+                    tracing::debug!("Inline '{}' selected=0x{addr:x}", entry.name);
+                    out.push(addr);
+                } else {
+                    tracing::warn!(
+                        "Inline entry has no usable address (no ranges/entry_pc): unit_off={:?}, die_off={:?}",
+                        entry.unit_offset,
+                        entry.die_offset
+                    );
+                }
+            }
+            crate::core::FunctionDieKind::ConcreteSubprogram => {
+                let nranges = Self::selected_non_inline_ranges(entry);
+                for (start, end) in &nranges {
+                    let candidate = {
+                        let first_exec = self.line_mapping.find_first_executable_address(*start);
+                        Self::selected_non_inline_probe_address(*start, *end, first_exec)
+                    };
+                    // Only force the true entry when the location active at the
+                    // probe PC already relies on DW_OP_entry_value. Some optimized
+                    // functions switch to entry_value later in the body, but still
+                    // have stable register locations at the first executable
+                    // instruction after the prologue.
+                    let prefer_entry = self
+                        .function_uses_entry_value_at(entry, candidate)
+                        .unwrap_or(false);
+                    let addr = if prefer_entry { *start } else { candidate };
+                    if prefer_entry {
                         tracing::debug!(
-                            "Non-inline '{}' kept entry start because prologue-skip candidate escaped range [0x{start:x}, 0x{end:x})",
+                            "Non-inline '{}' entry_value active at 0x{candidate:x}, using entry start=0x{start:x}",
+                            entry.name,
+                        );
+                    } else {
+                        let off = addr.saturating_sub(*start);
+                        tracing::debug!(
+                            "Non-inline '{}' start=0x{start:x} first_exec=0x{addr:x} (+0x{off:x})",
                             entry.name
                         );
+                        if addr == *start {
+                            tracing::debug!(
+                                "Non-inline '{}' kept entry start because prologue-skip candidate escaped range [0x{start:x}, 0x{end:x})",
+                                entry.name
+                            );
+                        }
                     }
+                    out.push(addr);
                 }
-                out.push(addr);
             }
+            crate::core::FunctionDieKind::AbstractSubprogram => {
+                tracing::debug!(
+                    "Skipping abstract subprogram '{}' with no concrete code ranges",
+                    entry.name
+                );
+            }
+            crate::core::FunctionDieKind::NotFunction => {}
         }
         out
     }
@@ -2739,7 +2749,7 @@ impl ModuleData {
 mod tests {
     use super::ModuleData;
     use crate::binary::{dwarf_reader_from_arc, DwarfReader};
-    use crate::core::{IndexEntry, IndexFlags};
+    use crate::core::{FunctionDieKind, IndexEntry, IndexFlags};
     use gimli::constants;
     use gimli::write::{
         Address, AttributeValue as WriteAttributeValue, Dwarf as WriteDwarf, EndianVec,
@@ -2758,6 +2768,7 @@ mod tests {
             language: None,
             address_ranges: ranges.to_vec(),
             entry_pc,
+            function_kind: FunctionDieKind::ConcreteSubprogram,
         }
     }
 
@@ -2765,6 +2776,7 @@ mod tests {
         let mut entry = subprogram_entry(ranges, entry_pc);
         entry.tag = constants::DW_TAG_inlined_subroutine;
         entry.flags.is_inline_instance = true;
+        entry.function_kind = FunctionDieKind::InlineInstance;
         entry
     }
 

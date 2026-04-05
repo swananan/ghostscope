@@ -5,7 +5,7 @@ use crate::{
     binary::DwarfReader,
     core::{
         demangle::{demangle_by_lang, demangled_leaf},
-        IndexEntry, Result,
+        FunctionDieKind, IndexEntry, Result,
     },
     index::{
         directory_from_index, resolve_file_path, LightweightFileIndex, LightweightIndex,
@@ -157,6 +157,13 @@ impl<'a> DwarfParser<'a> {
                             language: cu_language,
                             address_ranges: address_ranges.clone(),
                             entry_pc: entry_pc_cached,
+                            function_kind: if !address_ranges.is_empty()
+                                || entry_pc_cached.is_some()
+                            {
+                                FunctionDieKind::ConcreteSubprogram
+                            } else {
+                                FunctionDieKind::AbstractSubprogram
+                            },
                         };
                         shard
                             .functions
@@ -178,6 +185,13 @@ impl<'a> DwarfParser<'a> {
                                     language: cu_language,
                                     address_ranges: address_ranges.clone(),
                                     entry_pc: entry_pc_cached,
+                                    function_kind: if !address_ranges.is_empty()
+                                        || entry_pc_cached.is_some()
+                                    {
+                                        FunctionDieKind::ConcreteSubprogram
+                                    } else {
+                                        FunctionDieKind::AbstractSubprogram
+                                    },
                                 };
                                 shard
                                     .functions
@@ -221,6 +235,7 @@ impl<'a> DwarfParser<'a> {
                             language: cu_language,
                             address_ranges: address_ranges.clone(),
                             entry_pc: entry_pc_cached,
+                            function_kind: FunctionDieKind::InlineInstance,
                         };
                         shard
                             .functions
@@ -242,6 +257,7 @@ impl<'a> DwarfParser<'a> {
                                     language: cu_language,
                                     address_ranges: address_ranges.clone(),
                                     entry_pc: entry_pc_cached,
+                                    function_kind: FunctionDieKind::InlineInstance,
                                 };
                                 shard
                                     .functions
@@ -355,6 +371,7 @@ impl<'a> DwarfParser<'a> {
                             language: cu_language,
                             address_ranges: var_ranges.clone(),
                             entry_pc: None,
+                            function_kind: FunctionDieKind::NotFunction,
                         };
                         tracing::trace!(
                             "Registering variable alias '{}' (linkage={}, lang={:?}, die={:?})",
@@ -391,6 +408,7 @@ impl<'a> DwarfParser<'a> {
                             language: cu_language,
                             address_ranges: Vec::new(),
                             entry_pc: None,
+                            function_kind: FunctionDieKind::NotFunction,
                         };
                         shard.types.entry(name).or_default().push(index_entry);
                     }
@@ -1271,9 +1289,18 @@ mod tests {
         );
 
         let concrete_id = unit.add(root, gimli::constants::DW_TAG_subprogram);
-        unit.get_mut(concrete_id).set(
+        let concrete_fn = unit.get_mut(concrete_id);
+        concrete_fn.set(
             gimli::constants::DW_AT_abstract_origin,
             WriteAttributeValue::UnitRef(abstract_id),
+        );
+        concrete_fn.set(
+            gimli::constants::DW_AT_low_pc,
+            WriteAttributeValue::Address(Address::Constant(0x8e97c0)),
+        );
+        concrete_fn.set(
+            gimli::constants::DW_AT_high_pc,
+            WriteAttributeValue::Udata(0x420),
         );
 
         let inlined_id = unit.add(root, gimli::constants::DW_TAG_inlined_subroutine);
@@ -1359,20 +1386,21 @@ mod tests {
         let concrete_entries: Vec<_> = entries
             .iter()
             .copied()
-            .filter(|entry| entry.tag == gimli::constants::DW_TAG_subprogram)
-            .filter(|entry| !entry.is_inline_instance())
-            .filter(|entry| !entry.flags.has_inline_attribute)
+            .filter(|entry| {
+                entry.function_kind() == crate::core::FunctionDieKind::ConcreteSubprogram
+            })
             .collect();
         let abstract_entries: Vec<_> = entries
             .iter()
             .copied()
-            .filter(|entry| entry.tag == gimli::constants::DW_TAG_subprogram)
-            .filter(|entry| entry.flags.has_inline_attribute)
+            .filter(|entry| {
+                entry.function_kind() == crate::core::FunctionDieKind::AbstractSubprogram
+            })
             .collect();
         let inlined_entries: Vec<_> = entries
             .iter()
             .copied()
-            .filter(|entry| entry.tag == gimli::constants::DW_TAG_inlined_subroutine)
+            .filter(|entry| entry.function_kind() == crate::core::FunctionDieKind::InlineInstance)
             .collect();
 
         assert_eq!(
@@ -1392,11 +1420,15 @@ mod tests {
         );
         assert!(
             inlined_entries[0].is_inline_instance(),
-            "DW_TAG_inlined_subroutine must remain inline: {entries:?}"
+            "DW_TAG_inlined_subroutine must remain an inline instance: {entries:?}"
         );
         assert!(
             !concrete_entries[0].flags.has_inline_attribute,
             "concrete out-of-line body should not inherit the abstract inline attribute: {entries:?}"
+        );
+        assert!(
+            abstract_entries[0].flags.has_inline_attribute,
+            "abstract definition should retain its original DW_AT_inline attribute: {entries:?}"
         );
     }
 }
