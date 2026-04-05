@@ -38,39 +38,19 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Initialize logging with full configuration
-    let log_file_string = user_config.log_file.to_string_lossy().to_string();
-    let log_file_path = Some(log_file_string.as_str());
-    if let Err(e) = logging::initialize_logging_with_config(
-        log_file_path,
-        user_config.enable_logging,
-        user_config.enable_console_logging,
-        user_config.log_level,
-        user_config.tui_mode,
-    ) {
+    if let Err(e) = logging::initialize_from_user_config(&user_config) {
         eprintln!("Failed to initialize logging: {e}");
         return Err(anyhow::anyhow!("Failed to initialize logging: {}", e));
     }
 
-    // Log which configuration file was loaded (after logging is initialized)
-    if let Some(config_path) = &user_config.config_file_path {
-        info!("Configuration loaded from: {}", config_path.display());
-    } else {
-        let home_hint = std::env::var("HOME").unwrap_or_else(|_| "(unset)".into());
-        info!(
-            "Using built-in defaults (no config found at {}/.ghostscope/config.toml or ./ghostscope.toml)",
-            home_hint
-        );
-    }
+    info!("{}", user_config.config_source_message());
 
     // Ensure we have the privileges needed for eBPF interaction
     crate::util::ensure_privileges();
 
-    let kernel_caps = if user_config.ebpf_config.force_perf_event_array {
-        ghostscope_loader::KernelCapabilities::get_perf_only()
-    } else {
-        ghostscope_loader::KernelCapabilities::get()
-    }?;
+    let kernel_caps = ghostscope_loader::KernelCapabilities::detect_for_startup(
+        user_config.ebpf_config.force_perf_event_array,
+    )?;
     let resolved_config = config::ResolvedConfig::resolve(user_config, kernel_caps)?;
 
     // Best-effort cleanup for this process's bpffs pins on graceful shutdown and panic unwind.
