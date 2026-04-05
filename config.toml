@@ -211,8 +211,8 @@ proc_module_offsets_max_entries = 4096
 perf_page_count = 32
 
 # Per-argument memory dump cap for extended format specifiers ({:x}/{:s}).
-# Increase this to dump more bytes per argument (e.g., 8192 or 16384).
-mem_dump_cap = 4096
+# Requests beyond this cap are truncated. Increase it to dump more bytes per argument.
+mem_dump_cap = 256
 
 # Maximum size (in bytes) of a single trace event message.
 # Applies to PerfEventArray accumulation buffer and serves as an upper bound

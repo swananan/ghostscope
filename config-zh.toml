@@ -198,8 +198,8 @@ proc_module_offsets_max_entries = 4096
 perf_page_count = 32
 
 # 扩展格式占位符（{:x}/{:s}）单个参数的内存转储上限（字节数）。
-# 可根据需要增大，例如 8192 或 16384。
-mem_dump_cap = 4096
+# 超过该上限的请求会被截断；如有需要可继续调大。
+mem_dump_cap = 256
 
 # 单条 trace 事件消息的最大大小（字节）。
 # 适用于 PerfEventArray 模式的累计缓冲区，也作为内核端构造打印指令时的上界。

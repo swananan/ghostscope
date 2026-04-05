@@ -291,7 +291,7 @@ Notes:
   - `.*`: dynamic (consumes two args: len then value).
   - `.name$`: capture script variable `name` as length; does not consume an extra value arg.
 - Kernel performs bounded reads; user space renders hex/ASCII. For `{:s}` ASCII, rendering stops at first NUL; non‑printables show as `\xNN`.
-- Per‑argument read cap is controlled by `ebpf.mem_dump_cap` (default 4096 bytes). Requests beyond cap are truncated; if event payload is exceeded, output may also truncate with `…`.
+- Per‑argument read cap is controlled by `ebpf.mem_dump_cap` (default 256 bytes). Requests beyond cap are truncated; if event payload is exceeded, output may also truncate with `…`.
 - On read failure (e.g., null deref, offsets unavailable, permission), extended specifiers print `<MISSING_ARG>`.
 
 **Note**: Format strings use Rust‑style placeholders, not `%d`/`%s`.
