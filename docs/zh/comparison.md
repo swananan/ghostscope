@@ -23,6 +23,39 @@ GhostScope 的目标很明确：**针对带有 DWARF 调试信息的活跃进程
 
 如果时序不能被破坏，优先用 GhostScope。如果你需要一步一步推进执行过程，优先用 GDB。
 
+## GhostScope vs GDB 实测性能快照
+
+现在仓库里已经有一套可重复执行的单线程 benchmark，用来回答一个很窄但很实际的问题：**在热点函数每次命中时，读取同一个局部变量到底要付出多大代价？** harness 在 [`../scripts/compare/compare_hot_function_bench.py`](../scripts/compare/compare_hot_function_bench.py)，目标程序在 [`../scripts/compare/compare_hot_function_target.c`](../scripts/compare/compare_hot_function_target.c)，runner service 的入口在 [`../ghostscope/tests/manual_gdb_ghostscope_benchmark.rs`](../ghostscope/tests/manual_gdb_ghostscope_benchmark.rs)。
+
+### 方法
+
+- 测试时间：`2026-04-06`。机器是一台 x86_64 Ubuntu 开发机，CPU 为 Intel i7-8700K，内核 `6.14.0-37-generic`，GDB `15.0.50`，GhostScope `0.1.2`。
+- 目标程序编译参数为 `-O2 -g -fno-omit-frame-pointer -fno-pie -no-pie`。
+- 每轮执行 `2000` 次 `bench_hot_fn` 命中，每次命中额外做 `4096` 个 inner work 单元。目标程序只在 observer ready 之后开始记录内部耗时，所以 setup 成本和稳态运行成本是分开的。
+- 共同观测意图：在 `bench_hot_fn` 内的源码第 `21` 行求值局部变量 `local_probe`，但不持续输出结果。
+  GhostScope 使用 `trace compare_hot_function_target.c:21 { if local_probe == 0 { print "never"; } }`。
+  GDB 使用 batch 行断点脚本，在同一源码行命中时执行 `if local_probe == 0`、`silent` 和 `continue`。
+- 目标进程会一直阻塞到 observer 报告 ready。
+  对 GhostScope 来说，ready marker 只有在 `compile_and_load_script_for_cli` 完成后才会发出，所以 DWARF 索引和 script load 时间被单独记到 ready latency 列，而不会算进 steady-state target time。
+- 下表取 `5` 轮中位数。对 GDB 来说，暂停时间本来就是执行模型的一部分，所以有意计入目标运行时间。
+
+### 结果
+
+| 模式 | 稳态目标中位耗时 (ms) | 目标最小-最大 (ms) | 相对无观测减速 | 中位 ready 延迟 (ms，已排除) |
+|---|---:|---:|---:|---:|
+| 无观测 | 13.36 | 13.34-13.43 | 1.00x | n/a |
+| GhostScope | 18.68 | 17.16-19.95 | 1.40x | 153.33 |
+| GDB | 527.64 | 517.71-555.77 | 39.48x | 133.25 |
+
+### 怎么读这组结果
+
+- 在这个场景里，GhostScope 的 attach 延迟略高于 GDB，但一旦开始跑热点路径，稳态扰动明显更低。
+- GhostScope 的 `153.33ms` ready latency 就是 DWARF 索引和脚本加载主要出现的位置。它被单独报告，但没有算进 `18.68ms` 的稳态目标耗时。
+- 这不是一句泛化的“谁更快”。它只回答一个具体问题：在同一台机器上，对同一个热点路径局部变量做重复的源码语义观测，代价分别是多少。
+- 这里 GhostScope 的减速看起来也不低，是因为这次压测故意盯住了一个高频热点路径，并且每次命中都做观测。这是压力测试，不是推荐的生产使用模式。
+- 正常诊断里，GhostScope 更适合放在有针对性的 trace point 上，而不是持续盯住线上服务的核心热点路径。对在线产品服务，不建议直接跟踪延迟敏感的热点路径，除非你已经明确为这部分开销做过预算。
+- 下一步最值得补的场景是：多线程热点路径、低频错误路径，以及短生命周期进程。
+
 ## GhostScope vs bpftrace
 
 | 维度 | GhostScope | bpftrace |
