@@ -978,6 +978,41 @@ trace globals_program.c:32 {
 }
 
 #[tokio::test]
+async fn test_builtin_failure_inside_print_emits_exprerror() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let target = spawn_globals_program(&binary_path).await?;
+
+    // s.lib flips between NULL and &LIB_STATE each tick.
+    // On NULL, starts_with should keep the print line alive but also emit ExprError.
+    let script = r#"
+trace globals_program.c:32 {
+    print "SW:{} AFTER", starts_with(s.lib, "LIB");
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 5, &target).await?;
+    target.terminate().await?;
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+
+    assert!(
+        stdout.contains("ExprError"),
+        "Expected ExprError for builtin failure inside print. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.lines().any(|l| l.contains("SW:true AFTER")),
+        "Expected SW:true AFTER at least once. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.lines().any(|l| l.contains("SW:false AFTER")),
+        "Expected SW:false AFTER at least once. STDOUT: {stdout}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_rodata_char_element() -> anyhow::Result<()> {
     init();
 
