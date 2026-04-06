@@ -1242,6 +1242,142 @@ impl<'ctx> EbpfContext<'ctx> {
         }
     }
 
+    fn expr_contains_builtin(expr: &crate::script::ast::Expr) -> bool {
+        use crate::script::ast::Expr as E;
+
+        match expr {
+            E::BuiltinCall { .. } => true,
+            E::UnaryNot(inner)
+            | E::PointerDeref(inner)
+            | E::AddressOf(inner)
+            | E::MemberAccess(inner, _) => Self::expr_contains_builtin(inner),
+            E::ArrayAccess(base, index) => {
+                Self::expr_contains_builtin(base) || Self::expr_contains_builtin(index)
+            }
+            E::BinaryOp { left, right, .. } => {
+                Self::expr_contains_builtin(left) || Self::expr_contains_builtin(right)
+            }
+            E::Int(_)
+            | E::Float(_)
+            | E::String(_)
+            | E::Bool(_)
+            | E::Variable(_)
+            | E::ChainAccess(_)
+            | E::SpecialVar(_) => false,
+        }
+    }
+
+    fn compile_print_expr_with_builtin_exprerror<T, F>(
+        &mut self,
+        expr: &crate::script::ast::Expr,
+        compile: F,
+    ) -> Result<T>
+    where
+        F: FnOnce(&mut Self) -> Result<T>,
+    {
+        if !Self::expr_contains_builtin(expr) {
+            return compile(self);
+        }
+
+        let prev_context_active = self.condition_context_active;
+        if prev_context_active {
+            return compile(self);
+        }
+
+        let expr_index = self.trace_context.add_string(self.expr_to_name(expr));
+        let entry_event_bytes = self.compile_time_event_bytes_upper_bound;
+
+        self.reset_condition_error()?;
+        self.condition_context_active = true;
+        let compiled = compile(self);
+        self.condition_context_active = prev_context_active;
+        let compiled = compiled?;
+
+        let current_function = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| CodeGenError::LLVMError("No current basic block".to_string()))?
+            .get_parent()
+            .ok_or_else(|| CodeGenError::LLVMError("No parent function".to_string()))?;
+        let err_block = self
+            .context
+            .append_basic_block(current_function, "print_expr_err_block");
+        let ok_block = self
+            .context
+            .append_basic_block(current_function, "print_expr_ok_block");
+        let merge_block = self
+            .context
+            .append_basic_block(current_function, "print_expr_merge_block");
+        let cond_err_pred = self.build_condition_error_predicate()?;
+        self.builder
+            .build_conditional_branch(cond_err_pred, err_block, ok_block)
+            .map_err(|e| {
+                CodeGenError::LLVMError(format!("Failed to branch on print expr error: {e}"))
+            })?;
+
+        self.builder.position_at_end(err_block);
+        self.compile_time_event_bytes_upper_bound = entry_event_bytes;
+        self.emit_current_condition_exprerror(expr_index, "print_expr")?;
+        let err_path_event_bytes = self.compile_time_event_bytes_upper_bound;
+        self.builder
+            .build_unconditional_branch(merge_block)
+            .map_err(|e| {
+                CodeGenError::LLVMError(format!(
+                    "Failed to branch from print expr error block: {e}"
+                ))
+            })?;
+
+        self.builder.position_at_end(ok_block);
+        self.compile_time_event_bytes_upper_bound = entry_event_bytes;
+        self.builder
+            .build_unconditional_branch(merge_block)
+            .map_err(|e| {
+                CodeGenError::LLVMError(format!("Failed to branch from print expr ok block: {e}"))
+            })?;
+
+        self.builder.position_at_end(merge_block);
+        self.compile_time_event_bytes_upper_bound = entry_event_bytes.max(err_path_event_bytes);
+        Ok(compiled)
+    }
+
+    fn emit_current_condition_exprerror(
+        &mut self,
+        expr_index: u16,
+        name_prefix: &str,
+    ) -> Result<()> {
+        let cond_err_ptr = self.get_or_create_cond_error_global();
+        let err_code = self
+            .builder
+            .build_load(
+                self.context.i8_type(),
+                cond_err_ptr,
+                &format!("{name_prefix}_err_code"),
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_int_value();
+        let cond_err_addr_ptr = self.get_or_create_cond_error_addr_global();
+        let err_addr = self
+            .builder
+            .build_load(
+                self.context.i64_type(),
+                cond_err_addr_ptr,
+                &format!("{name_prefix}_err_addr"),
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_int_value();
+        let cond_err_flags_ptr = self.get_or_create_cond_error_flags_global();
+        let err_flags = self
+            .builder
+            .build_load(
+                self.context.i8_type(),
+                cond_err_flags_ptr,
+                &format!("{name_prefix}_err_flags"),
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_int_value();
+        self.generate_expr_error(expr_index, err_code, err_flags, err_addr)
+    }
+
     /// Heuristic to decide if an expression should be bound as a DWARF alias variable.
     /// Prefer shapes that resolve to a runtime address via DWARF or address-of:
     /// - AddressOf(...)
@@ -1459,27 +1595,7 @@ impl<'ctx> EbpfContext<'ctx> {
                 // Error path: emit ExprError and decide destination
                 self.builder.position_at_end(err_block);
                 self.compile_time_event_bytes_upper_bound = entry_event_bytes;
-                let cond_err_ptr = self.get_or_create_cond_error_global();
-                let err_code = self
-                    .builder
-                    .build_load(self.context.i8_type(), cond_err_ptr, "cond_err_code")
-                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-                    .into_int_value();
-                // Also load failing address (i64)
-                let cond_err_addr_ptr = self.get_or_create_cond_error_addr_global();
-                let err_addr = self
-                    .builder
-                    .build_load(self.context.i64_type(), cond_err_addr_ptr, "cond_err_addr")
-                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-                    .into_int_value();
-                // Load flags
-                let cond_err_flags_ptr = self.get_or_create_cond_error_flags_global();
-                let err_flags = self
-                    .builder
-                    .build_load(self.context.i8_type(), cond_err_flags_ptr, "cond_err_flags")
-                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-                    .into_int_value();
-                self.generate_expr_error(expr_index, err_code, err_flags, err_addr)?;
+                self.emit_current_condition_exprerror(expr_index, "cond")?;
                 // Decide where to go on error: if else_body is If (else-if), go to else_block to continue;
                 // otherwise, skip else (suppress) and jump to merge.
                 let goto_else = matches!(else_body.as_deref(), Some(Statement::If { .. }));
@@ -1614,7 +1730,9 @@ impl<'ctx> EbpfContext<'ctx> {
             }
             PrintStatement::ComplexVariable(expr) => {
                 info!("Processing complex variable: {:?}", expr);
-                let arg = self.resolve_expr_to_arg(expr)?;
+                let arg = self.compile_print_expr_with_builtin_exprerror(expr, |ctx| {
+                    ctx.resolve_expr_to_arg(expr)
+                })?;
                 let n = self.emit_print_from_arg(arg)?;
                 tracing::trace!(
                     instructions = n,
@@ -1724,7 +1842,10 @@ impl<'ctx> EbpfContext<'ctx> {
                     if ai >= args.len() {
                         break;
                     }
-                    let a = self.resolve_expr_to_arg(&args[ai])?;
+                    let expr = &args[ai];
+                    let a = self.compile_print_expr_with_builtin_exprerror(expr, |ctx| {
+                        ctx.resolve_expr_to_arg(expr)
+                    })?;
                     complex_args.push(a);
                     ai += 1;
                 }
