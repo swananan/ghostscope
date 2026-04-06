@@ -21,9 +21,14 @@ impl CliLoadingReporter {
     pub fn new(
         console_stderr_logging_active: bool,
         color_mode: crate::config::CliColorMode,
+        status_enabled: bool,
     ) -> Self {
         Self::new_with_enabled(
-            !console_stderr_logging_active && io::stderr().is_terminal(),
+            should_enable_loading_reporter(
+                console_stderr_logging_active,
+                status_enabled,
+                io::stderr().is_terminal(),
+            ),
             crate::cli::color::CliColors::for_stderr(color_mode),
             DEFAULT_RENDER_DELAY,
         )
@@ -91,6 +96,14 @@ impl CliLoadingReporter {
         self.last_render_width = 0;
         self.rendered_anything = false;
     }
+}
+
+fn should_enable_loading_reporter(
+    console_stderr_logging_active: bool,
+    status_enabled: bool,
+    stderr_is_terminal: bool,
+) -> bool {
+    status_enabled && !console_stderr_logging_active && stderr_is_terminal
 }
 
 #[derive(Debug)]
@@ -265,7 +278,9 @@ fn format_duration(duration: Duration) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{progress_bar, short_module_name, CliLoadingReporter};
+    use super::{
+        progress_bar, short_module_name, should_enable_loading_reporter, CliLoadingReporter,
+    };
     use crate::config::CliColorMode;
     use ghostscope_dwarf::{ModuleLoadingEvent, ModuleLoadingStats};
     use std::time::Duration;
@@ -332,7 +347,17 @@ mod tests {
 
     #[test]
     fn reporter_accepts_color_mode() {
-        let reporter = CliLoadingReporter::new(false, CliColorMode::Never);
+        let reporter = CliLoadingReporter::new(false, CliColorMode::Never, true);
         assert!(!reporter.colors.enabled());
+    }
+
+    #[test]
+    fn status_enabled_keeps_interactive_loading_reporter_enabled_on_tty() {
+        assert!(should_enable_loading_reporter(false, true, true));
+    }
+
+    #[test]
+    fn disabled_status_turns_off_interactive_loading_reporter() {
+        assert!(!should_enable_loading_reporter(false, false, true));
     }
 }

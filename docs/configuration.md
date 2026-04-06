@@ -59,10 +59,13 @@ ghostscope --script 'trace("main:entry") { print "Started"; }'
 # Run script from file
 ghostscope --script-file trace.gs
 
-# Choose script-mode stdout rendering
-ghostscope --script-output pretty   # default: timestamp + TraceID/PID/TID header
-ghostscope --script-output plain    # payload lines only
-ghostscope --script-output quiet    # suppress event stdout
+# Choose script-mode event stdout rendering
+ghostscope --script-output pretty   # default: formatted stdout
+ghostscope --script-output plain    # payload-only stdout
+
+# Control interactive status prompts on stderr
+ghostscope --status                 # default
+ghostscope --no-status              # hide DWARF/script/attach status prompts
 
 # Control timestamp style for pretty output
 ghostscope --script-timestamp local # default
@@ -71,8 +74,10 @@ ghostscope --script-timestamp none
 
 # Output streams in script mode:
 # - trace events stay on stdout
-# - interactive progress/status messages (DWARF loading, script compile, attach summary) go to stderr
-# - these stderr status messages are shown only for interactive terminals and are not part of the event stream contract
+# - DWARF loading, script compile, and attach status prompts go to stderr
+# - --script-output only controls event stdout formatting
+# - --status / --no-status controls those interactive stderr status prompts
+# - fatal errors still go to stderr regardless of mode
 # - ANSI colors for pretty stdout and interactive stderr status can be controlled with [script].color in config.toml
 
 # Start in TUI mode (default if no script provided)
@@ -208,7 +213,9 @@ Behavior:
 | `--target <PATH>` | `-t` | Target executable or library | None |
 | `--script <SCRIPT>` | `-s` | Inline script to execute | None |
 | `--script-file <PATH>` | | Script file to execute | None |
-| `--script-output <MODE>` | | Script stdout mode: pretty, plain, quiet | pretty |
+| `--script-output <MODE>` | | Script event stdout mode: pretty, plain | pretty |
+| `--status` | | Enable interactive DWARF/script/attach stderr status prompts | On |
+| `--no-status` | | Disable interactive DWARF/script/attach stderr status prompts | Off override |
 | `--script-timestamp <FORMAT>` | | Pretty output timestamp: local, boot, none | local |
 | `--debug-file <PATH>` | `-d` | Debug info file path | Auto-detect |
 | `--tui` | | Start in TUI mode | Auto |
@@ -268,12 +275,13 @@ enable_console_logging = false
 log_level = "warn"
 
 [script]
-# Stdout rendering for non-TUI script mode
+# Event stdout rendering for non-TUI script mode
 # pretty: timestamp + TraceID/PID/TID header + indented payload
 # plain: payload lines only
-# quiet: suppress event stdout
-# Interactive status/progress messages use stderr and are shown only on TTYs.
 output = "pretty"
+
+# Interactive DWARF/script/attach status prompts on stderr
+status = true
 
 # Timestamp format for pretty script output: local, boot, none
 timestamp = "local"

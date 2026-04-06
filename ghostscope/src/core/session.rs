@@ -381,6 +381,8 @@ mod tests {
             script_file: None,
             tui_mode: false,
             script_output: None,
+            status_enabled: true,
+            has_explicit_status_flag: false,
             script_timestamp: None,
             should_save_llvm_ir: false,
             should_save_ebpf: false,
