@@ -1069,10 +1069,13 @@ async fn test_bitfields_correctness() -> anyhow::Result<()> {
         FIXTURES.get_test_binary_with_opt("complex_types_program", OptimizationLevel::Debug)?;
     let target = spawn_complex_types_binary(&binary_path).await?;
 
-    // Use source-line attach inside update_complex after bitfield assignments
-    // so c.active/c.flags reflect the current i in the same frame.
+    // Use source-line attach on the executed line inside the friend_ref branch.
+    // Attaching to the `if` condition line can observe multiple line-table rows
+    // around the branch decision, which has been flaky in child-container e2e.
+    // Line 15 still runs in the same frame after the bitfield writes, but only
+    // on the stable, post-branch path for `b`.
     let script_fn = r#"
-trace complex_types_program.c:14 {
+trace complex_types_program.c:15 {
     print "I={} ACTIVE={} FLAGS={}", i, c.active, c.flags;
 }
 "#;
