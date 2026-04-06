@@ -452,6 +452,25 @@ impl<'ctx> EbpfContext<'ctx> {
                     .into())
             }
 
+            DirectValueResult::AbsoluteAddress(value) => {
+                debug!("Generating rebased absolute address: 0x{value:x}");
+                let module_hint = self.current_resolved_var_module_path.clone();
+                let status_ptr = if self.condition_context_active {
+                    Some(self.get_or_create_cond_error_global())
+                } else {
+                    None
+                };
+                let eval = ghostscope_dwarf::EvaluationResult::MemoryLocation(
+                    ghostscope_dwarf::LocationResult::Address(*value),
+                );
+                self.evaluation_result_to_address_with_hint(
+                    &eval,
+                    status_ptr,
+                    module_hint.as_deref(),
+                )
+                .map(Into::into)
+            }
+
             DirectValueResult::ImplicitValue(bytes) => {
                 debug!("Generating implicit value: {} bytes", bytes.len());
                 // Convert bytes to integer value (little-endian)
@@ -2038,6 +2057,9 @@ impl<'ctx> EbpfContext<'ctx> {
                     )),
                     DV::Constant(val) => Ok(EvaluationResult::MemoryLocation(
                         LocationResult::Address(*val as u64),
+                    )),
+                    DV::AbsoluteAddress(val) => Ok(EvaluationResult::MemoryLocation(
+                        LocationResult::Address(*val),
                     )),
                     DV::ImplicitValue(bytes) => {
                         // Assemble up to 8 bytes little-endian into u64

@@ -99,6 +99,37 @@ trace globals_program.c:32 {
 }
 
 #[tokio::test]
+async fn test_memcmp_hex_helper_infers_len_on_dwarf_pointer_globals() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let target = spawn_globals_program(&binary_path).await?;
+
+    // gm/lm are DWARF-backed local const char* aliases to rodata.
+    // Omitting len should infer it from the hex literal and still compile/run.
+    let script = r#"
+trace globals_program.c:32 {
+    if memcmp(gm, hex("48656c6c6f2c20")) { print "HEX_OK_INFER"; }
+    if memcmp(lm, hex("4c49425f")) { print "HEX_LM_INFER"; }
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 4, &target).await?;
+    target.terminate().await?;
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(
+        stdout.contains("HEX_OK_INFER"),
+        "Expected HEX_OK_INFER. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("HEX_LM_INFER"),
+        "Expected HEX_LM_INFER. STDOUT: {stdout}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_if_memcmp_failure_emits_exprerror_and_suppress_else() -> anyhow::Result<()> {
     init();
 

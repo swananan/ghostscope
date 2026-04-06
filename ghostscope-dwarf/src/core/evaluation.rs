@@ -33,6 +33,10 @@ pub enum DirectValueResult {
     /// Literal constant from DWARF expression (DW_OP_lit*, DW_OP_const*)
     Constant(i64),
 
+    /// Link-time absolute address that must be rebased to a runtime address
+    /// before use (for example, DW_OP_implicit_pointer targeting static storage).
+    AbsoluteAddress(u64),
+
     /// Implicit value embedded in DWARF (DW_OP_implicit_value)
     ImplicitValue(Vec<u8>),
 
@@ -491,6 +495,7 @@ impl fmt::Display for DirectValueResult {
                     write!(f, "0x{c:x}")
                 }
             }
+            DirectValueResult::AbsoluteAddress(addr) => write!(f, "&@0x{addr:x}"),
             DirectValueResult::RegisterValue(r) => {
                 if let Some(name) = dwarf_reg_to_name(*r) {
                     write!(f, "{name}")

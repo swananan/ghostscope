@@ -14,6 +14,8 @@ use tracing::{debug, trace, warn};
 pub struct ExpressionEvaluator;
 
 impl ExpressionEvaluator {
+    const MAX_IMPLICIT_POINTER_DEPTH: usize = 8;
+
     /// Evaluate a variable's location from its DIE attributes
     pub fn evaluate_location(
         entry: &gimli::DebuggingInformationEntry<DwarfReader>,
@@ -21,6 +23,17 @@ impl ExpressionEvaluator {
         dwarf: &gimli::Dwarf<DwarfReader>,
         address: u64,
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
+    ) -> Result<EvaluationResult> {
+        Self::evaluate_location_with_depth(entry, unit, dwarf, address, get_cfa, 0)
+    }
+
+    fn evaluate_location_with_depth(
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        address: u64,
+        get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
+        depth: usize,
     ) -> Result<EvaluationResult> {
         // Get DW_AT_location attribute (follow origins/specification for inlined/declared vars)
         let location_attr =
@@ -30,11 +43,13 @@ impl ExpressionEvaluator {
             Some(gimli::AttributeValue::Exprloc(expr)) => {
                 // Direct expression
                 debug!("Found Exprloc, parsing DWARF expression");
-                Self::parse_expression(
+                Self::parse_expression_with_context(
                     expr.0.to_slice().ok().as_deref().unwrap_or(&[]),
                     unit.encoding(),
+                    Some(dwarf),
                     address,
                     get_cfa,
+                    depth,
                 )
             }
             Some(gimli::AttributeValue::LocationListsRef(offset)) => {
@@ -43,12 +58,13 @@ impl ExpressionEvaluator {
                     "Found LocationListsRef at offset 0x{:x}, parsing location list",
                     offset.0
                 );
-                Self::parse_location_lists(
+                Self::parse_location_lists_with_depth(
                     unit,
                     dwarf,
                     gimli::LocationListsOffset(offset.0),
                     address,
                     get_cfa,
+                    depth,
                 )
             }
             Some(gimli::AttributeValue::SecOffset(offset)) => {
@@ -57,12 +73,13 @@ impl ExpressionEvaluator {
                     "Found SecOffset location list at 0x{:x}, parsing as location list",
                     offset
                 );
-                Self::parse_location_lists(
+                Self::parse_location_lists_with_depth(
                     unit,
                     dwarf,
                     gimli::LocationListsOffset(offset),
                     address,
                     get_cfa,
+                    depth,
                 )
             }
             None => {
@@ -93,11 +110,13 @@ impl ExpressionEvaluator {
                         }
                         gimli::AttributeValue::Exprloc(expr) => {
                             // Some compilers may encode an implicit value via expression
-                            match Self::parse_expression(
+                            match Self::parse_expression_with_context(
                                 expr.0.to_slice().ok().as_deref().unwrap_or(&[]),
                                 unit.encoding(),
+                                Some(dwarf),
                                 address,
                                 get_cfa,
+                                depth,
                             )? {
                                 EvaluationResult::DirectValue(v) => {
                                     EvaluationResult::DirectValue(v)
@@ -130,27 +149,47 @@ impl ExpressionEvaluator {
         }
     }
 
-    /// Parse a DWARF expression into an EvaluationResult
-    pub fn parse_expression(
+    pub fn parse_expression_in_unit(
         expr_bytes: &[u8],
-        encoding: gimli::Encoding,
+        unit: &gimli::Unit<DwarfReader>,
+        dwarf: &gimli::Dwarf<DwarfReader>,
         address: u64,
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
+    ) -> Result<EvaluationResult> {
+        Self::parse_expression_with_context(
+            expr_bytes,
+            unit.encoding(),
+            Some(dwarf),
+            address,
+            get_cfa,
+            0,
+        )
+    }
+
+    fn parse_expression_with_context(
+        expr_bytes: &[u8],
+        encoding: gimli::Encoding,
+        dwarf: Option<&gimli::Dwarf<DwarfReader>>,
+        address: u64,
+        get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
+        depth: usize,
     ) -> Result<EvaluationResult> {
         if expr_bytes.is_empty() {
             return Ok(EvaluationResult::Optimized);
         }
 
         // Parse all expressions through unified handler
-        Self::parse_full_expression(expr_bytes, encoding, address, get_cfa)
+        Self::parse_full_expression(expr_bytes, encoding, dwarf, address, get_cfa, depth)
     }
 
     /// Parse a full multi-operation DWARF expression
     fn parse_full_expression(
         expr_bytes: &[u8],
         encoding: gimli::Encoding,
+        dwarf: Option<&gimli::Dwarf<DwarfReader>>,
         address: u64,
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
+        depth: usize,
     ) -> Result<EvaluationResult> {
         let mut expression = Expression(EndianSlice::new(expr_bytes, LittleEndian));
         let mut operations = Vec::new();
@@ -207,7 +246,7 @@ impl ExpressionEvaluator {
 
         // Fast path for single operations - avoid compute processing
         if operations.len() == 1 {
-            return Self::handle_single_operation(&operations[0], address, get_cfa);
+            return Self::handle_single_operation(&operations[0], dwarf, address, get_cfa, depth);
         }
 
         // Build compute steps from operations
@@ -230,6 +269,42 @@ impl ExpressionEvaluator {
                         // DW_OP_reg* means the value IS in the register (direct value)
                         // We'll handle this specially below
                         steps.push(ComputeStep::LoadRegister(register.0));
+                    }
+                    Operation::FrameOffset { offset } => {
+                        let Some(get_cfa_fn) = get_cfa else {
+                            return Err(anyhow::anyhow!(
+                                "DW_OP_fbreg but no CFA provider available"
+                            ));
+                        };
+                        let Some(cfa) = get_cfa_fn(address)? else {
+                            return Err(anyhow::anyhow!(
+                                "DW_OP_fbreg but no CFA available at address 0x{:x}",
+                                address
+                            ));
+                        };
+
+                        match cfa {
+                            crate::core::CfaResult::RegisterPlusOffset {
+                                register,
+                                offset: cfa_offset,
+                            } => {
+                                steps.push(ComputeStep::LoadRegister(register));
+                                let total_offset = cfa_offset.saturating_add(*offset);
+                                if total_offset != 0 {
+                                    steps.push(ComputeStep::PushConstant(total_offset));
+                                    steps.push(ComputeStep::Add);
+                                }
+                            }
+                            crate::core::CfaResult::Expression {
+                                steps: mut cfa_steps,
+                            } => {
+                                steps.append(&mut cfa_steps);
+                                if *offset != 0 {
+                                    steps.push(ComputeStep::PushConstant(*offset));
+                                    steps.push(ComputeStep::Add);
+                                }
+                            }
+                        }
                     }
                     Operation::PlusConstant { value } => {
                         steps.push(ComputeStep::PushConstant(*value as i64));
@@ -369,11 +444,13 @@ impl ExpressionEvaluator {
     /// Handle single DWARF operation - fast path without compute processing
     fn handle_single_operation<R>(
         op: &Operation<R>,
+        dwarf: Option<&gimli::Dwarf<DwarfReader>>,
         address: u64,
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
+        depth: usize,
     ) -> Result<EvaluationResult>
     where
-        R: gimli::Reader,
+        R: gimli::Reader<Offset = usize>,
     {
         use crate::core::{CfaResult, ComputeStep};
 
@@ -480,6 +557,14 @@ impl ExpressionEvaluator {
                     DirectValueResult::ImplicitValue(data_slice.to_vec()),
                 ))
             }
+            Operation::ImplicitPointer { value, byte_offset } => {
+                let Some(dwarf) = dwarf else {
+                    return Err(anyhow::anyhow!(
+                        "DW_OP_implicit_pointer requires DWARF context"
+                    ));
+                };
+                Self::resolve_implicit_pointer(*value, *byte_offset, dwarf, address, get_cfa, depth)
+            }
 
             // These operations don't make sense as single operations
             Operation::StackValue => Err(anyhow::anyhow!(
@@ -495,6 +580,131 @@ impl ExpressionEvaluator {
         }
     }
 
+    fn resolve_implicit_pointer(
+        value: gimli::DebugInfoOffset<usize>,
+        byte_offset: i64,
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        address: u64,
+        get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
+        depth: usize,
+    ) -> Result<EvaluationResult> {
+        if depth >= Self::MAX_IMPLICIT_POINTER_DEPTH {
+            return Err(anyhow::anyhow!(
+                "DW_OP_implicit_pointer recursion depth exceeded"
+            ));
+        }
+
+        let mut headers = dwarf.units();
+        let mut containing_header = None;
+        while let Some(header) = headers.next()? {
+            if value.to_unit_offset(&header).is_some() {
+                containing_header = Some(header);
+                break;
+            }
+        }
+        let header = containing_header.ok_or_else(|| {
+            anyhow::anyhow!(
+                "DW_OP_implicit_pointer target 0x{:x} is not inside any compilation unit",
+                value.0
+            )
+        })?;
+        let unit_offset = value.to_unit_offset(&header).ok_or_else(|| {
+            anyhow::anyhow!(
+                "DW_OP_implicit_pointer target 0x{:x} is outside its compilation unit",
+                value.0
+            )
+        })?;
+        let unit = dwarf
+            .unit(header)
+            .map_err(|e| anyhow::anyhow!("DW_OP_implicit_pointer unit parse failed: {e}"))?;
+        let entry = unit
+            .entry(unit_offset)
+            .map_err(|e| anyhow::anyhow!("DW_OP_implicit_pointer entry parse failed: {e}"))?;
+        let referenced = Self::evaluate_location_with_depth(
+            &entry,
+            &unit,
+            dwarf,
+            address,
+            get_cfa,
+            depth + 1,
+        )
+        .map_err(|e| anyhow::anyhow!("DW_OP_implicit_pointer target evaluation failed: {e}"))?;
+
+        Self::addressable_location_to_pointer_value(referenced, byte_offset)
+    }
+
+    fn addressable_location_to_pointer_value(
+        location: EvaluationResult,
+        byte_offset: i64,
+    ) -> Result<EvaluationResult> {
+        use crate::core::{ComputeStep, DirectValueResult, EvaluationResult, LocationResult};
+
+        fn checked_add_i64(base: i64, delta: i64) -> Result<i64> {
+            base.checked_add(delta)
+                .ok_or_else(|| anyhow::anyhow!("implicit pointer offset overflow"))
+        }
+
+        fn checked_add_u64(base: u64, delta: i64) -> Result<u64> {
+            if delta >= 0 {
+                base.checked_add(delta as u64)
+                    .ok_or_else(|| anyhow::anyhow!("implicit pointer offset overflow"))
+            } else {
+                base.checked_sub(delta.unsigned_abs())
+                    .ok_or_else(|| anyhow::anyhow!("implicit pointer offset underflow"))
+            }
+        }
+
+        match location {
+            EvaluationResult::MemoryLocation(LocationResult::Address(addr)) => {
+                Ok(EvaluationResult::DirectValue(
+                    DirectValueResult::AbsoluteAddress(checked_add_u64(addr, byte_offset)?),
+                ))
+            }
+            EvaluationResult::MemoryLocation(LocationResult::RegisterAddress {
+                register,
+                offset,
+                ..
+            }) => {
+                let total_offset = checked_add_i64(offset.unwrap_or(0), byte_offset)?;
+                if total_offset == 0 {
+                    Ok(EvaluationResult::DirectValue(
+                        DirectValueResult::RegisterValue(register),
+                    ))
+                } else {
+                    Ok(EvaluationResult::DirectValue(
+                        DirectValueResult::ComputedValue {
+                            steps: vec![
+                                ComputeStep::LoadRegister(register),
+                                ComputeStep::PushConstant(total_offset),
+                                ComputeStep::Add,
+                            ],
+                            result_size: MemoryAccessSize::U64,
+                        },
+                    ))
+                }
+            }
+            EvaluationResult::MemoryLocation(LocationResult::ComputedLocation { mut steps }) => {
+                if byte_offset != 0 {
+                    steps.push(ComputeStep::PushConstant(byte_offset));
+                    steps.push(ComputeStep::Add);
+                }
+                Ok(EvaluationResult::DirectValue(
+                    DirectValueResult::ComputedValue {
+                        steps,
+                        result_size: MemoryAccessSize::U64,
+                    },
+                ))
+            }
+            EvaluationResult::Optimized => Ok(EvaluationResult::Optimized),
+            EvaluationResult::Composite(_) => Err(anyhow::anyhow!(
+                "DW_OP_implicit_pointer target is a composite location"
+            )),
+            EvaluationResult::DirectValue(_) => Err(anyhow::anyhow!(
+                "DW_OP_implicit_pointer target has no addressable location"
+            )),
+        }
+    }
+
     /// Parse location lists from .debug_loclists or .debug_loc section
     pub fn parse_location_lists(
         unit: &gimli::Unit<DwarfReader>,
@@ -502,6 +712,17 @@ impl ExpressionEvaluator {
         offset: gimli::LocationListsOffset<usize>,
         address: u64,
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
+    ) -> Result<EvaluationResult> {
+        Self::parse_location_lists_with_depth(unit, dwarf, offset, address, get_cfa, 0)
+    }
+
+    fn parse_location_lists_with_depth(
+        unit: &gimli::Unit<DwarfReader>,
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        offset: gimli::LocationListsOffset<usize>,
+        address: u64,
+        get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
+        depth: usize,
     ) -> Result<EvaluationResult> {
         debug!(
             "Getting location lists for offset 0x{:x} (dwarf.locations method)",
@@ -561,7 +782,7 @@ impl ExpressionEvaluator {
 
                     // Parse the expression data for this PC range
                     // Use the actual PC range for address-specific parsing
-                    let location_expr = Self::parse_expression(
+                    let location_expr = Self::parse_expression_with_context(
                         location_list_entry
                             .data
                             .0
@@ -570,8 +791,10 @@ impl ExpressionEvaluator {
                             .as_deref()
                             .unwrap_or(&[]),
                         unit.encoding(),
+                        Some(dwarf),
                         address,
                         get_cfa,
+                        depth,
                     )?;
 
                     debug!("  Parsed expression: {:?}", location_expr);
@@ -637,11 +860,13 @@ impl ExpressionEvaluator {
                             );
 
                             if contains {
-                                let location_expr = Self::parse_expression(
+                                let location_expr = Self::parse_expression_with_context(
                                     data.0.to_slice().ok().as_deref().unwrap_or(&[]),
                                     unit.encoding(),
+                                    Some(dwarf),
                                     address,
                                     get_cfa,
+                                    depth,
                                 )?;
 
                                 debug!("   Raw fallback expression result: {:?}", location_expr);
@@ -668,11 +893,13 @@ impl ExpressionEvaluator {
                             );
 
                             if contains {
-                                let location_expr = Self::parse_expression(
+                                let location_expr = Self::parse_expression_with_context(
                                     data.0.to_slice().ok().as_deref().unwrap_or(&[]),
                                     unit.encoding(),
+                                    Some(dwarf),
                                     address,
                                     get_cfa,
+                                    depth,
                                 )?;
 
                                 debug!("   Raw fallback expression result: {:?}", location_expr);
@@ -702,11 +929,13 @@ impl ExpressionEvaluator {
                             );
 
                             if contains {
-                                let location_expr = Self::parse_expression(
+                                let location_expr = Self::parse_expression_with_context(
                                     data.0.to_slice().ok().as_deref().unwrap_or(&[]),
                                     unit.encoding(),
+                                    Some(dwarf),
                                     address,
                                     get_cfa,
+                                    depth,
                                 )?;
 
                                 debug!("   Raw fallback expression result: {:?}", location_expr);
@@ -739,11 +968,13 @@ impl ExpressionEvaluator {
                                 );
 
                                 if contains {
-                                    let location_expr = Self::parse_expression(
+                                    let location_expr = Self::parse_expression_with_context(
                                         data.0.to_slice().ok().as_deref().unwrap_or(&[]),
                                         unit.encoding(),
+                                        Some(dwarf),
                                         address,
                                         get_cfa,
+                                        depth,
                                     )?;
 
                                     debug!(
@@ -777,11 +1008,13 @@ impl ExpressionEvaluator {
                                 );
 
                                 if contains {
-                                    let location_expr = Self::parse_expression(
+                                    let location_expr = Self::parse_expression_with_context(
                                         data.0.to_slice().ok().as_deref().unwrap_or(&[]),
                                         unit.encoding(),
+                                        Some(dwarf),
                                         address,
                                         get_cfa,
+                                        depth,
                                     )?;
 
                                     debug!(
@@ -801,11 +1034,13 @@ impl ExpressionEvaluator {
                         }
                         RawLocListEntry::DefaultLocation { data } => {
                             debug!("  Raw fallback default location entry");
-                            let location_expr = Self::parse_expression(
+                            let location_expr = Self::parse_expression_with_context(
                                 data.0.to_slice().ok().as_deref().unwrap_or(&[]),
                                 unit.encoding(),
+                                Some(dwarf),
                                 address,
                                 get_cfa,
+                                depth,
                             )?;
 
                             debug!("   Raw fallback expression result: {:?}", location_expr);
@@ -826,5 +1061,25 @@ impl ExpressionEvaluator {
             entry_count, offset.0
         );
         Ok(EvaluationResult::Optimized)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ExpressionEvaluator;
+    use crate::core::{DirectValueResult, EvaluationResult, LocationResult};
+
+    #[test]
+    fn implicit_pointer_to_static_storage_preserves_absolute_address_semantics() {
+        let result = ExpressionEvaluator::addressable_location_to_pointer_value(
+            EvaluationResult::MemoryLocation(LocationResult::Address(0x1234)),
+            0x10,
+        )
+        .expect("static address should convert to an implicit pointer value");
+
+        assert_eq!(
+            result,
+            EvaluationResult::DirectValue(DirectValueResult::AbsoluteAddress(0x1244))
+        );
     }
 }
