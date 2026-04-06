@@ -178,9 +178,10 @@ impl ModuleData {
                                 // Prefer DW_AT_location (exprloc); fallback to DW_AT_const_value
                                 let loc_attr = pe.attr_value(gimli::constants::DW_AT_location);
                                 if let Some(gimli::AttributeValue::Exprloc(expr)) = loc_attr {
-                                    if let Ok(ev) = ExpressionEvaluator::parse_expression(
+                                    if let Ok(ev) = ExpressionEvaluator::parse_expression_in_unit(
                                         expr.0.to_slice().ok().as_deref().unwrap_or(&[]),
-                                        unit.encoding(),
+                                        &unit,
+                                        dwarf,
                                         address,
                                         Some(get_cfa),
                                     ) {
@@ -1619,9 +1620,10 @@ impl ModuleData {
                     // Evaluate to EvaluationResult using existing evaluator paths
                     let eval_res = match val {
                         gimli::AttributeValue::Exprloc(expr) => {
-                            ExpressionEvaluator::parse_expression(
+                            ExpressionEvaluator::parse_expression_in_unit(
                                 expr.0.to_slice().ok().as_deref().unwrap_or(&[]),
-                                unit.encoding(),
+                                &unit,
+                                dwarf,
                                 pc,
                                 None,
                             )

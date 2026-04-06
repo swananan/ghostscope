@@ -344,6 +344,9 @@ impl<'dwarf> AccessPlanner<'dwarf> {
             EvaluationResult::DirectValue(DirectValueResult::Constant(value)) => {
                 EvaluationResult::MemoryLocation(LocationResult::Address(value as u64))
             }
+            EvaluationResult::DirectValue(DirectValueResult::AbsoluteAddress(value)) => {
+                EvaluationResult::MemoryLocation(LocationResult::Address(value))
+            }
             EvaluationResult::DirectValue(DirectValueResult::ImplicitValue(bytes)) => {
                 let mut value = 0u64;
                 for (idx, byte) in bytes.iter().take(8).enumerate() {

@@ -22,6 +22,10 @@ lazy_static! {
     static ref COMPILE_COMPLEX_DEBUG_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
     static ref COMPILE_COMPLEX_OPT_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
     static ref COMPILE_COMPLEX_NOPIE_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
+    static ref COMPILE_MEMBER_POINTER_DEBUG_RESULT: Mutex<Option<anyhow::Result<()>>> =
+        Mutex::new(None);
+    static ref COMPILE_MEMBER_POINTER_OPTIMIZED_RESULT: Mutex<Option<anyhow::Result<()>>> =
+        Mutex::new(None);
     static ref COMPILE_LATE_GLOBALS_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
     static ref COMPILE_INLINE_CALLSITE_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
     static ref COMPILE_PARTITIONED_RANGES_RESULT: Mutex<Option<anyhow::Result<()>>> =
@@ -42,6 +46,7 @@ enum CleanupCommand {
 enum RegisteredFixtureKind {
     Sample,
     ComplexTypes,
+    MemberPointer,
     Globals,
     LateGlobals,
     RustGlobal,
@@ -74,6 +79,12 @@ const REGISTERED_FIXTURES: &[RegisteredFixture] = &[
         directory: "complex_types_program",
         cleanup: CleanupCommand::Make,
         kind: RegisteredFixtureKind::ComplexTypes,
+    },
+    RegisteredFixture {
+        name: "member_pointer_program",
+        directory: "member_pointer_program",
+        cleanup: CleanupCommand::Make,
+        kind: RegisteredFixtureKind::MemberPointer,
     },
     RegisteredFixture {
         name: "globals_program",
@@ -280,6 +291,21 @@ impl RegisteredFixture {
                 };
                 Ok(dir.join(bin_name))
             }
+            RegisteredFixtureKind::MemberPointer => {
+                ensure_member_pointer_program_compiled_with_opt(opt_level)?;
+                let bin_name = match opt_level {
+                    OptimizationLevel::Debug => "member_pointer_program",
+                    OptimizationLevel::O1 => "member_pointer_program_o1",
+                    OptimizationLevel::O2 => "member_pointer_program_o2",
+                    OptimizationLevel::O3 => "member_pointer_program_o3",
+                    OptimizationLevel::Stripped => {
+                        anyhow::bail!(
+                            "Stripped optimization level not supported for member_pointer_program"
+                        )
+                    }
+                };
+                Ok(dir.join(bin_name))
+            }
             RegisteredFixtureKind::Globals => {
                 ensure_globals_program_compiled()?;
                 Ok(dir.join("globals_program"))
@@ -458,6 +484,8 @@ fn compile_sample_program(opt_level: OptimizationLevel) -> anyhow::Result<()> {
 static COMPILE_COMPLEX_DEBUG: Once = Once::new();
 static COMPILE_COMPLEX_OPT: Once = Once::new();
 static COMPILE_COMPLEX_NOPIE: Once = Once::new();
+static COMPILE_MEMBER_POINTER_DEBUG: Once = Once::new();
+static COMPILE_MEMBER_POINTER_OPTIMIZED: Once = Once::new();
 
 fn ensure_complex_program_compiled_with_opt(opt_level: OptimizationLevel) -> anyhow::Result<()> {
     match opt_level {
@@ -528,6 +556,135 @@ fn compile_complex_program(opt_level: OptimizationLevel) -> anyhow::Result<()> {
         Err(anyhow::anyhow!(
             "Failed to compile complex_types_program {}: {}",
             opt_level.description(),
+            stderr
+        ))
+    }
+}
+
+fn ensure_member_pointer_program_compiled_with_opt(
+    opt_level: OptimizationLevel,
+) -> anyhow::Result<()> {
+    match opt_level {
+        OptimizationLevel::Debug => {
+            COMPILE_MEMBER_POINTER_DEBUG.call_once(|| {
+                let compile_result = compile_member_pointer_program(opt_level);
+                *COMPILE_MEMBER_POINTER_DEBUG_RESULT.lock().unwrap() = Some(compile_result);
+            });
+            match COMPILE_MEMBER_POINTER_DEBUG_RESULT.lock().unwrap().as_ref() {
+                Some(Ok(())) => Ok(()),
+                Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
+                None => panic!("Compilation result should be set after call_once"),
+            }
+        }
+        _ => {
+            COMPILE_MEMBER_POINTER_OPTIMIZED.call_once(|| {
+                let compile_result = compile_member_pointer_program_variants(&[
+                    OptimizationLevel::O1,
+                    OptimizationLevel::O2,
+                    OptimizationLevel::O3,
+                ]);
+                *COMPILE_MEMBER_POINTER_OPTIMIZED_RESULT.lock().unwrap() = Some(compile_result);
+            });
+            match COMPILE_MEMBER_POINTER_OPTIMIZED_RESULT
+                .lock()
+                .unwrap()
+                .as_ref()
+            {
+                Some(Ok(())) => Ok(()),
+                Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
+                None => panic!("Compilation result should be set after call_once"),
+            }
+        }
+    }
+}
+
+fn compile_member_pointer_program(opt_level: OptimizationLevel) -> anyhow::Result<()> {
+    let fixtures_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let program_dir = fixtures_path.join("member_pointer_program");
+
+    println!(
+        "Compiling member_pointer_program {} in {program_dir:?}",
+        opt_level.description()
+    );
+
+    let target = match opt_level {
+        OptimizationLevel::Debug => "member_pointer_program",
+        OptimizationLevel::O1 => "member_pointer_program_o1",
+        OptimizationLevel::O2 => "member_pointer_program_o2",
+        OptimizationLevel::O3 => "member_pointer_program_o3",
+        OptimizationLevel::Stripped => {
+            anyhow::bail!("Stripped optimization level not supported for member_pointer_program")
+        }
+    };
+
+    let output = Command::new("make")
+        .arg(target)
+        .current_dir(program_dir)
+        .output()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to run make for member_pointer_program {}: {}",
+                opt_level.description(),
+                e
+            )
+        })?;
+
+    if output.status.success() {
+        println!(
+            "✓ Successfully compiled member_pointer_program {}",
+            opt_level.description()
+        );
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(anyhow::anyhow!(
+            "Failed to compile member_pointer_program {}: {}",
+            opt_level.description(),
+            stderr
+        ))
+    }
+}
+
+fn compile_member_pointer_program_variants(opt_levels: &[OptimizationLevel]) -> anyhow::Result<()> {
+    let fixtures_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let program_dir = fixtures_path.join("member_pointer_program");
+
+    let requested = opt_levels
+        .iter()
+        .map(OptimizationLevel::description)
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("Compiling member_pointer_program variants [{requested}] in {program_dir:?}");
+
+    let mut command = Command::new("make");
+    for opt_level in opt_levels {
+        command.arg(match opt_level {
+            OptimizationLevel::Debug => "member_pointer_program",
+            OptimizationLevel::O1 => "member_pointer_program_o1",
+            OptimizationLevel::O2 => "member_pointer_program_o2",
+            OptimizationLevel::O3 => "member_pointer_program_o3",
+            OptimizationLevel::Stripped => {
+                anyhow::bail!(
+                    "Stripped optimization level not supported for member_pointer_program"
+                )
+            }
+        });
+    }
+
+    let output = command.current_dir(program_dir).output().map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to run make for member_pointer_program variants [{requested}]: {}",
+            e
+        )
+    })?;
+
+    if output.status.success() {
+        println!("✓ Successfully compiled member_pointer_program variants [{requested}]");
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(anyhow::anyhow!(
+            "Failed to compile member_pointer_program variants [{requested}]: {}",
             stderr
         ))
     }
