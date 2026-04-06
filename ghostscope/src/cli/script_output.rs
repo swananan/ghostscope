@@ -20,7 +20,7 @@ impl ScriptOutputRenderer {
     pub fn new(options: ScriptOutputOptions) -> Self {
         let pretty_timestamp = match options.mode {
             ScriptOutputMode::Pretty => Some(PrettyTimestampFormatter::new(options.timestamp)),
-            ScriptOutputMode::Plain | ScriptOutputMode::Quiet => None,
+            ScriptOutputMode::Plain => None,
         };
 
         Self {
@@ -32,7 +32,6 @@ impl ScriptOutputRenderer {
 
     pub fn render_event_lines(&mut self, event: &ParsedTraceEvent) -> Vec<String> {
         match self.mode {
-            ScriptOutputMode::Quiet => Vec::new(),
             ScriptOutputMode::Plain => {
                 let formatted_output = event.to_formatted_output();
                 if formatted_output.is_empty() {
@@ -244,20 +243,6 @@ mod tests {
     }
 
     #[test]
-    fn quiet_output_suppresses_stdout_lines() {
-        let lines = render_with_renderer(
-            &sample_event(),
-            ScriptOutputOptions {
-                mode: ScriptOutputMode::Quiet,
-                timestamp: ScriptTimestampFormat::Boot,
-                color_enabled: false,
-            },
-        );
-
-        assert!(lines.is_empty());
-    }
-
-    #[test]
     fn pretty_output_can_omit_timestamp() {
         let lines = render_with_renderer(
             &sample_event(),
@@ -270,18 +255,6 @@ mod tests {
 
         assert_eq!(lines[0], "TraceID:7 PID:4321 TID:4322");
     }
-
-    #[test]
-    fn renderer_quiet_mode_short_circuits_without_lines() {
-        let mut renderer = ScriptOutputRenderer::new(ScriptOutputOptions {
-            mode: ScriptOutputMode::Quiet,
-            timestamp: ScriptTimestampFormat::Local,
-            color_enabled: false,
-        });
-
-        assert!(renderer.render_event_lines(&sample_event()).is_empty());
-    }
-
     #[test]
     fn local_timestamp_formatter_reuses_same_second_prefix() {
         let mut formatter =

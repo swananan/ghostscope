@@ -60,10 +60,13 @@ ghostscope --script 'trace("main:entry") { print "Started"; }'
 # 从文件运行脚本
 ghostscope --script-file trace.gs
 
-# 选择脚本模式的 stdout 渲染方式
-ghostscope --script-output pretty   # 默认：时间戳 + TraceID/PID/TID 头信息
-ghostscope --script-output plain    # 只输出 payload 行
-ghostscope --script-output quiet    # 完全静默，不输出事件
+# 选择脚本模式的事件 stdout 输出方式
+ghostscope --script-output pretty   # 默认：格式化 stdout
+ghostscope --script-output plain    # 仅保留 payload stdout
+
+# 控制 stderr 上的交互式状态提示
+ghostscope --status                 # 默认
+ghostscope --no-status              # 隐藏 DWARF/脚本/attach 状态提示
 
 # 控制 pretty 模式的时间戳格式
 ghostscope --script-timestamp local # 默认
@@ -72,8 +75,10 @@ ghostscope --script-timestamp none
 
 # 脚本模式的输出流约定：
 # - trace 事件始终走 stdout
-# - 交互式进度/状态提示（DWARF 加载、脚本编译、attach 摘要）走 stderr
-# - 这些 stderr 状态提示只在交互式终端显示，不属于事件输出契约
+# - DWARF 加载、脚本编译、attach 状态提示走 stderr
+# - `--script-output` 只控制事件 stdout 的渲染
+# - `--status` / `--no-status` 控制这些交互式 stderr 状态提示
+# - 无论哪种模式，致命错误仍会输出到 stderr
 # - pretty stdout 和交互式 stderr 状态的 ANSI 色彩可通过 config.toml 里的 [script].color 控制
 
 # 以 TUI 模式启动（未提供脚本时的默认模式）
@@ -209,7 +214,9 @@ ghostscope bpffs prune --dry-run --json
 | `--target <PATH>` | `-t` | 目标可执行文件或库 | 无 |
 | `--script <SCRIPT>` | `-s` | 要执行的内联脚本 | 无 |
 | `--script-file <PATH>` | | 要执行的脚本文件 | 无 |
-| `--script-output <MODE>` | | 脚本 stdout 模式：pretty, plain, quiet | pretty |
+| `--script-output <MODE>` | | 脚本事件 stdout 模式：pretty, plain | pretty |
+| `--status` | | 启用交互式 DWARF/脚本/attach stderr 状态提示 | 开 |
+| `--no-status` | | 禁用交互式 DWARF/脚本/attach stderr 状态提示 | 关闭覆盖 |
 | `--script-timestamp <FORMAT>` | | pretty 输出时间戳：local, boot, none | local |
 | `--debug-file <PATH>` | `-d` | 调试信息文件路径 | 自动检测 |
 | `--tui` | | 以 TUI 模式启动 | 自动 |
@@ -269,12 +276,13 @@ enable_console_logging = false
 log_level = "warn"
 
 [script]
-# 非 TUI 脚本模式的 stdout 渲染
+# 非 TUI 脚本模式的事件 stdout 渲染
 # pretty: 时间戳 + TraceID/PID/TID 头信息 + 缩进 payload
 # plain: 只输出 payload 行
-# quiet: 不输出事件 stdout
-# 交互式状态/进度提示走 stderr，且仅在 TTY 下显示。
 output = "pretty"
+
+# stderr 上的交互式 DWARF/脚本/attach 状态提示
+status = true
 
 # pretty 模式的时间戳格式：local, boot, none
 timestamp = "local"

@@ -44,6 +44,7 @@ pub async fn run_command_line_runtime_with_config(config: ResolvedConfig) -> Res
         crate::cli::loading_reporter::CliLoadingReporter::new(
             console_stderr_logging_active,
             config.script_color_mode,
+            config.script_status,
         ),
     ));
     let reporter_task = spawn_loading_reporter(Arc::clone(&reporter));
@@ -298,8 +299,16 @@ async fn run_cli_with_session(
 }
 
 fn should_print_cli_status(config: &ResolvedConfig) -> bool {
-    !is_console_stderr_logging_active(config.enable_logging, config.enable_console_logging)
-        && io::stderr().is_terminal()
+    should_print_cli_status_with_terminal(config, io::stderr().is_terminal())
+}
+
+fn should_print_cli_status_with_terminal(
+    config: &ResolvedConfig,
+    stderr_is_terminal: bool,
+) -> bool {
+    config.script_status
+        && !is_console_stderr_logging_active(config.enable_logging, config.enable_console_logging)
+        && stderr_is_terminal
 }
 
 fn is_console_stderr_logging_active(enable_logging: bool, enable_console_logging: bool) -> bool {
@@ -343,7 +352,14 @@ fn get_script_content_from_config(config: &ResolvedConfig) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_console_stderr_logging_active;
+    use super::{is_console_stderr_logging_active, should_print_cli_status_with_terminal};
+    use crate::config::{
+        runtime::RuntimeContext,
+        settings::{EbpfConfig, LogLevel},
+        CliColorMode, LayoutMode, ResolvedConfig, ScriptOutputMode, ScriptTimestampFormat,
+        UserConfig,
+    };
+    use std::path::PathBuf;
 
     #[test]
     fn console_stderr_logging_requires_logging_to_be_enabled() {
@@ -351,5 +367,68 @@ mod tests {
         assert!(!is_console_stderr_logging_active(false, true));
         assert!(!is_console_stderr_logging_active(true, false));
         assert!(is_console_stderr_logging_active(true, true));
+    }
+
+    #[test]
+    fn script_output_modes_focus_on_stdout_rendering() {
+        assert_eq!(ScriptOutputMode::Plain, ScriptOutputMode::Plain);
+        assert_eq!(ScriptOutputMode::Pretty, ScriptOutputMode::Pretty);
+    }
+
+    fn sample_config(script_output_mode: ScriptOutputMode, script_status: bool) -> ResolvedConfig {
+        ResolvedConfig {
+            user: UserConfig {
+                binary_path: None,
+                target_path: None,
+                binary_args: Vec::new(),
+                input_pid: None,
+                log_file: PathBuf::from("ghostscope.log"),
+                emit_ready_marker: None,
+                enable_logging: false,
+                enable_console_logging: false,
+                log_level: LogLevel::Warn,
+                debug_file: None,
+                script: Some("trace main { print 1; }".to_string()),
+                script_file: None,
+                script_output_mode,
+                script_status,
+                script_timestamp_format: ScriptTimestampFormat::Local,
+                script_color_mode: CliColorMode::Auto,
+                tui_mode: false,
+                should_save_llvm_ir: false,
+                should_save_ebpf: false,
+                should_save_ast: false,
+                layout_mode: LayoutMode::Horizontal,
+                default_focus: crate::config::PanelType::InteractiveCommand,
+                panel_ratios: [4, 3, 3],
+                show_source_panel: true,
+                two_panel_ratios: [1, 1],
+                history_enabled: true,
+                history_max_entries: 100,
+                ebpf_max_messages: 1000,
+                dwarf_search_paths: Vec::new(),
+                dwarf_allow_loose_debug_match: false,
+                ebpf_config: EbpfConfig::default(),
+                source: Default::default(),
+                config_file_path: None,
+            },
+            runtime: RuntimeContext::default(),
+        }
+    }
+
+    #[test]
+    fn status_flag_controls_cli_status_on_tty() {
+        assert!(should_print_cli_status_with_terminal(
+            &sample_config(ScriptOutputMode::Plain, true),
+            true,
+        ));
+        assert!(!should_print_cli_status_with_terminal(
+            &sample_config(ScriptOutputMode::Plain, false),
+            true,
+        ));
+        assert!(should_print_cli_status_with_terminal(
+            &sample_config(ScriptOutputMode::Pretty, true),
+            true,
+        ));
     }
 }

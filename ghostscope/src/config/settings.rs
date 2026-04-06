@@ -124,6 +124,9 @@ pub struct ScriptConfig {
     /// Stdout rendering mode for non-TUI script execution
     #[serde(default)]
     pub output: ScriptOutputMode,
+    /// Whether to show interactive DWARF/script/attach status prompts on stderr
+    #[serde(default = "default_script_status")]
+    pub status: bool,
     /// Timestamp format used when script output mode is `pretty`
     #[serde(default)]
     pub timestamp: ScriptTimestampFormat,
@@ -290,6 +293,10 @@ fn default_enable_console_logging() -> bool {
     false // Console logging disabled by default for cleaner output
 }
 
+fn default_script_status() -> bool {
+    true
+}
+
 fn default_debug_search_paths() -> Vec<String> {
     vec![
         "/usr/lib/debug".to_string(),
@@ -385,6 +392,7 @@ impl Default for ScriptConfig {
     fn default() -> Self {
         Self {
             output: ScriptOutputMode::Pretty,
+            status: default_script_status(),
             timestamp: ScriptTimestampFormat::Local,
             color: CliColorMode::Auto,
         }

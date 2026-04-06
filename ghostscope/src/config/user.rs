@@ -25,6 +25,7 @@ pub struct UserConfig {
     pub script: Option<String>,
     pub script_file: Option<PathBuf>,
     pub script_output_mode: ScriptOutputMode,
+    pub script_status: bool,
     pub script_timestamp_format: ScriptTimestampFormat,
     pub script_color_mode: CliColorMode,
     pub tui_mode: bool,
@@ -132,6 +133,12 @@ impl UserConfig {
             config.ui.show_source_panel
         };
 
+        let script_status = if args.has_explicit_status_flag {
+            args.status_enabled
+        } else {
+            config.script.status
+        };
+
         let two_panel_ratios = if let Some(r) = config.ui.two_panel_ratios {
             r
         } else {
@@ -152,6 +159,7 @@ impl UserConfig {
             script: args.script,
             script_file: args.script_file,
             script_output_mode: args.script_output.unwrap_or(config.script.output),
+            script_status,
             script_timestamp_format: args.script_timestamp.unwrap_or(config.script.timestamp),
             script_color_mode: config.script.color,
             tui_mode,

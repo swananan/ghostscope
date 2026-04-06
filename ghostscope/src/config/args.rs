@@ -19,7 +19,6 @@ pub enum ScriptOutputMode {
     #[default]
     Pretty,
     Plain,
-    Quiet,
 }
 
 #[derive(
@@ -200,9 +199,17 @@ pub struct Args {
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub tui: bool,
 
-    /// Script-mode stdout formatting: pretty, plain, or quiet
+    /// Script-mode event stdout formatting: pretty or plain
     #[arg(long, value_name = "MODE", value_enum)]
     pub script_output: Option<ScriptOutputMode>,
+
+    /// Enable interactive DWARF/script/attach status prompts on stderr
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub status: bool,
+
+    /// Disable interactive DWARF/script/attach status prompts on stderr
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub no_status: bool,
 
     /// Timestamp style used by pretty script output: local, boot, or none
     #[arg(long, value_name = "FORMAT", value_enum)]
@@ -282,6 +289,8 @@ pub struct ParsedArgs {
     pub pid: Option<u32>,
     pub tui_mode: bool,
     pub script_output: Option<ScriptOutputMode>,
+    pub status_enabled: bool,
+    pub has_explicit_status_flag: bool,
     pub script_timestamp: Option<ScriptTimestampFormat>,
     pub should_save_llvm_ir: bool,
     pub should_save_ebpf: bool,
@@ -408,6 +417,7 @@ impl Args {
         let should_save_ast = Self::should_save_ast(&parsed);
         let tui_mode = Self::determine_tui_mode(&parsed);
         let target_path = Self::resolve_target_path(&parsed);
+        let (status_enabled, has_explicit_status_flag) = Self::determine_status_config(&parsed);
         let (
             enable_logging,
             enable_console_logging,
@@ -434,6 +444,8 @@ impl Args {
             pid: parsed.pid,
             tui_mode,
             script_output: parsed.script_output,
+            status_enabled,
+            has_explicit_status_flag,
             script_timestamp: parsed.script_timestamp,
             should_save_llvm_ir,
             should_save_ebpf,
@@ -600,6 +612,12 @@ impl Args {
             has_explicit_console_log_flag,
         )
     }
+
+    fn determine_status_config(parsed: &Args) -> (bool, bool) {
+        let has_explicit_status_flag = parsed.status || parsed.no_status;
+        let status_enabled = !parsed.no_status;
+        (status_enabled, has_explicit_status_flag)
+    }
 }
 
 #[cfg(test)]
@@ -702,6 +720,26 @@ mod tests {
             ParsedCommand::Trace(args) => {
                 assert_eq!(args.script_output, Some(ScriptOutputMode::Plain));
                 assert_eq!(args.script_timestamp, Some(ScriptTimestampFormat::Boot));
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_status_flags() {
+        let parsed = Args::parse_args_from(vec![
+            "ghostscope".to_string(),
+            "--pid".to_string(),
+            "1234".to_string(),
+            "--script-file".to_string(),
+            "trace.gs".to_string(),
+            "--no-status".to_string(),
+        ]);
+
+        match parsed {
+            ParsedCommand::Trace(args) => {
+                assert!(!args.status_enabled);
+                assert!(args.has_explicit_status_flag);
             }
             other => panic!("unexpected parse result: {other:?}"),
         }
