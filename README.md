@@ -36,19 +36,14 @@ GhostScope is a **source-aware userspace tracer** for live Linux processes. With
 ### When Not To Use GhostScope
 
 - Use GDB when you want an interactive debugging experience with breakpoints, single-stepping, memory writes, or coredump debugging.
+- Use `perf probe` when you want a quick one-off probe at a function, source line, or local variable inside the perf ecosystem.
 - Use bpftrace or SystemTap when you want broad kernel + userspace event aggregation in one script.
 - Do not expect source-level variable tracing to work well without DWARF debug info for the modules you care about.
 
-### GhostScope vs GDB, bpftrace, and SystemTap
+### GhostScope vs perf, GDB, bpftrace, and SystemTap
 
-| Tool | Best at | Less ideal when |
-|---|---|---|
-| GhostScope | Low-overhead, source-aware userspace tracing on live processes | You need interactive execution control, or broad kernel-space data observation built around eBPF |
-| GDB | Breakpoints, stepping, coredumps, state mutation | The target process cannot be paused in a production environment |
-| bpftrace | Mixed kernel + userspace observation and quick event aggregation | You need reliable DWARF-based source-level semantic reconstruction of a userspace process |
-| SystemTap | Broad system tracing, existing tapset ecosystems, aggregation-oriented workflows | You want a userspace tracing tool that integrates better with AI or offers a friendlier TUI |
-
-See the [Tool Comparison](docs/comparison.md) guide for a deeper breakdown and the [FAQ](docs/faq.md) for related guidance.
+For the full, centrally maintained comparison, see the [Tool Comparison](docs/comparison.md).
+You can also refer to the [FAQ](docs/faq.md).
 
 ### AI Runtime Analysis Skill
 
@@ -184,7 +179,7 @@ See [Limitations](docs/limitations.md) for the current list of hard and soft con
   Learn the basics in 10 minutes
 
 - [**Tool Comparison**](docs/comparison.md)
-  Choose between GhostScope, GDB, bpftrace, and SystemTap
+  Choose between GhostScope, perf, GDB, bpftrace, and SystemTap
 
 - [**FAQ**](docs/faq.md)
   Common questions answered
