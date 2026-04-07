@@ -31,6 +31,47 @@ impl<'a> ProcMapEntry<'a> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedProcMapEntry {
+    pub start: u64,
+    pub end: u64,
+    pub perms: String,
+    pub offset: u64,
+    pub dev_major: u64,
+    pub dev_minor: u64,
+    pub inode: u64,
+    path: Option<String>,
+}
+
+impl OwnedProcMapEntry {
+    pub fn path(&self) -> Option<&str> {
+        self.path.as_deref()
+    }
+
+    pub fn normalized_path(&self) -> Option<&str> {
+        self.path().map(normalize_mapped_module_path)
+    }
+
+    pub fn executable(&self) -> bool {
+        self.perms.contains('x')
+    }
+}
+
+impl From<ProcMapEntry<'_>> for OwnedProcMapEntry {
+    fn from(entry: ProcMapEntry<'_>) -> Self {
+        Self {
+            start: entry.start,
+            end: entry.end,
+            perms: entry.perms.to_owned(),
+            offset: entry.offset,
+            dev_major: entry.dev_major,
+            dev_minor: entry.dev_minor,
+            inode: entry.inode,
+            path: entry.path().map(str::to_owned),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ModuleIdentity {
     dev_major: Option<u64>,
@@ -110,6 +151,12 @@ where
     visit_maps_reader(BufReader::new(file), visitor)
 }
 
+pub fn read_proc_maps(pid: u32) -> Result<Vec<OwnedProcMapEntry>> {
+    let maps_path = format!("/proc/{pid}/maps");
+    let file = File::open(&maps_path)?;
+    read_maps_reader(BufReader::new(file))
+}
+
 fn visit_maps_reader<R, F>(mut reader: R, mut visitor: F) -> Result<()>
 where
     R: BufRead,
@@ -132,6 +179,18 @@ where
     }
 
     Ok(())
+}
+
+fn read_maps_reader<R>(reader: R) -> Result<Vec<OwnedProcMapEntry>>
+where
+    R: BufRead,
+{
+    let mut entries = Vec::new();
+    visit_maps_reader(reader, |entry| {
+        entries.push(entry.into());
+        ControlFlow::Continue(())
+    })?;
+    Ok(entries)
 }
 
 pub fn normalize_mapped_module_path(path: &str) -> &str {
@@ -226,5 +285,19 @@ mod tests {
         .unwrap();
 
         assert_eq!(seen.get(), 1);
+    }
+
+    #[test]
+    fn read_maps_reader_collects_owned_entries() {
+        let lines =
+            b"7f1-7f2 r-xp 00000000 08:02 1 /tmp/a.so\n7f2-7f3 rw-p 00001000 08:02 1 /tmp/a.so\n";
+        let reader = BufReader::new(&lines[..]);
+
+        let entries = read_maps_reader(reader).unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].path(), Some("/tmp/a.so"));
+        assert!(entries[0].executable());
+        assert_eq!(entries[1].offset, 0x1000);
     }
 }
