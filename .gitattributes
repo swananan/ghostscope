@@ -9,3 +9,7 @@ ghostscope-process/ebpf/build_sysmon_bpf.sh linguist-vendored
 scripts/dwarf-perf/*.py linguist-vendored
 scripts/dwarf-perf/*.sh linguist-vendored
 scripts/dwarf-perf/corpus/** linguist-vendored
+# Exclude docs and agent metadata from language statistics
+*.md linguist-documentation
+.github/** linguist-vendored
+skills/** linguist-vendored
