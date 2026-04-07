@@ -5,9 +5,17 @@ use gimli::DwLang;
 /// Demangle a symbol string using language hint when available.
 /// Returns None if demangling fails or is not applicable.
 pub fn demangle_by_lang(lang: Option<DwLang>, s: &str) -> Option<String> {
-    // 1) Trust DW_AT_language when available
+    let looks_rust = is_rust_mangled(s) || looks_like_legacy_rust(s);
+    let looks_cpp = is_itanium_cpp_mangled(s);
+    if !looks_rust && !looks_cpp {
+        return None;
+    }
+
+    // Try the hinted demangler first when the symbol shape matches it cleanly.
+    // Keep heuristic fallback for mixed/LTO objects whose CU language does not
+    // match the linkage symbol's mangling style.
     match lang {
-        Some(gimli::DW_LANG_Rust) => {
+        Some(gimli::DW_LANG_Rust) if looks_rust => {
             if let Some(d) = demangle_rust(s) {
                 return Some(d);
             }
@@ -16,7 +24,9 @@ pub fn demangle_by_lang(lang: Option<DwLang>, s: &str) -> Option<String> {
         | Some(gimli::DW_LANG_C_plus_plus_11)
         | Some(gimli::DW_LANG_C_plus_plus_14)
         | Some(gimli::DW_LANG_C_plus_plus_17)
-        | Some(gimli::DW_LANG_C_plus_plus_20) => {
+        | Some(gimli::DW_LANG_C_plus_plus_20)
+            if looks_cpp && !looks_rust =>
+        {
             if let Some(d) = demangle_cpp(s) {
                 return Some(d);
             }
@@ -24,14 +34,23 @@ pub fn demangle_by_lang(lang: Option<DwLang>, s: &str) -> Option<String> {
         _ => {}
     }
 
-    // 2) Fall back to heuristics if language hint missing or demangle failed
-    if is_rust_mangled(s) || looks_like_legacy_rust(s) {
-        demangle_rust(s)
-    } else if is_itanium_cpp_mangled(s) {
-        demangle_cpp(s)
-    } else {
-        None
+    // Fall back heuristically when the hint was missing, mismatched, or failed.
+    if looks_rust {
+        if let Some(d) = demangle_rust(s) {
+            return Some(d);
+        }
     }
+    if looks_cpp {
+        if let Some(d) = demangle_cpp(s) {
+            return Some(d);
+        }
+    }
+    None
+}
+
+pub fn is_likely_mangled(lang: Option<DwLang>, s: &str) -> bool {
+    let _ = lang;
+    is_rust_mangled(s) || looks_like_legacy_rust(s) || is_itanium_cpp_mangled(s)
 }
 
 /// Return a friendly leaf name from a demangled full name.
@@ -85,5 +104,59 @@ fn demangle_cpp(s: &str) -> Option<String> {
     match cpp_demangle::Symbol::new(s) {
         Ok(sym) => Some(sym.to_string()),
         Err(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{demangle_by_lang, is_likely_mangled};
+
+    #[test]
+    fn skips_plain_names_even_with_language_hint() {
+        assert!(!is_likely_mangled(
+            Some(gimli::DW_LANG_Rust),
+            "std::thread::spawn"
+        ));
+        assert!(!is_likely_mangled(
+            Some(gimli::DW_LANG_C_plus_plus_17),
+            "ns::Widget::run"
+        ));
+        assert_eq!(
+            demangle_by_lang(Some(gimli::DW_LANG_Rust), "std::thread::spawn"),
+            None
+        );
+        assert_eq!(
+            demangle_by_lang(Some(gimli::DW_LANG_C_plus_plus_17), "ns::Widget::run"),
+            None
+        );
+    }
+
+    #[test]
+    fn still_demangles_mangled_symbols() {
+        let rust_name = "_RNvCs73fAdSrgOJL_4test4main";
+        let cpp_name = "_ZN2ns6Widget3runEv";
+
+        assert!(is_likely_mangled(Some(gimli::DW_LANG_Rust), rust_name));
+        assert!(is_likely_mangled(
+            Some(gimli::DW_LANG_C_plus_plus_17),
+            cpp_name
+        ));
+        assert!(demangle_by_lang(Some(gimli::DW_LANG_Rust), rust_name).is_some());
+        assert!(demangle_by_lang(Some(gimli::DW_LANG_C_plus_plus_17), cpp_name).is_some());
+    }
+
+    #[test]
+    fn falls_back_when_cu_language_does_not_match_symbol_style() {
+        let rust_name = "_RNvCs73fAdSrgOJL_4test4main";
+        let cpp_name = "_ZN2ns6Widget3runEv";
+
+        assert_eq!(
+            demangle_by_lang(Some(gimli::DW_LANG_Rust), cpp_name),
+            demangle_by_lang(Some(gimli::DW_LANG_C_plus_plus_17), cpp_name)
+        );
+        assert_eq!(
+            demangle_by_lang(Some(gimli::DW_LANG_C_plus_plus_17), rust_name),
+            demangle_by_lang(Some(gimli::DW_LANG_Rust), rust_name)
+        );
     }
 }

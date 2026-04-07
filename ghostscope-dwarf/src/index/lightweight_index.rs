@@ -125,6 +125,11 @@ impl LightweightIndex {
         // Ensure demangled aliases exist for variables even if DW_AT_name was missing.
         for (idx, entry) in entries.iter().enumerate() {
             if entry.tag == gimli::constants::DW_TAG_variable {
+                let should_attempt_demangle = entry.flags.is_linkage
+                    || crate::core::is_likely_mangled(entry.language, entry.name.as_ref());
+                if !should_attempt_demangle {
+                    continue;
+                }
                 if let Some(demangled) = demangle_by_lang(entry.language, entry.name.as_ref()) {
                     let leaf = demangled_leaf(&demangled);
                     if leaf != entry.name.as_ref() {
