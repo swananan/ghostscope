@@ -1,5 +1,43 @@
 [
   {
+    "generated_at": "2026-04-07T05:21:24Z",
+    "sha": "75b8d4bf2998f9aae326639e017f0985c096e6bd",
+    "sha_short": "75b8d4bf2998",
+    "ref": "main",
+    "event": "schedule",
+    "run_id": "24065698155",
+    "run_number": "12",
+    "run_attempt": "1",
+    "run_url": "https://github.com/swananan/ghostscope/actions/runs/24065698155",
+    "artifact_path": "data/runs/20260407T052124Z-75b8d4bf2998.json",
+    "metrics": {
+      "fast_parse_ms": {
+        "average": 998.952,
+        "p50": 981.08,
+        "p95": 1056.252,
+        "min": 960.672,
+        "max": 1056.252
+      },
+      "source_line_query_ms": {
+        "first_run": 3.977126,
+        "average": 3.6196974999999996,
+        "p50": 3.572998,
+        "p95": 3.977126,
+        "min": 3.541489,
+        "max": 3.977126
+      }
+    },
+    "query_result": {
+      "source": {
+        "path": "/home/runner/work/ghostscope/ghostscope/scripts/dwarf-perf/corpus/src/query-hotspot/query_hotspot.c",
+        "line": 119
+      },
+      "address_count": 1,
+      "total_variables": 16,
+      "first_address": "0x40164f"
+    }
+  },
+  {
     "generated_at": "2026-04-06T09:46:52Z",
     "sha": "fa1eea421d05b1f29c913599273b6c67e579fbcb",
     "sha_short": "fa1eea421d05",
