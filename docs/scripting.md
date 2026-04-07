@@ -115,10 +115,10 @@ let result = a + b;
 | Integer (i64) | `123`, `-42` | 64‑bit signed integer | +, -, *, /; mixes with DWARF integer‑like scalars |
 | Boolean (bool) | `true`, `false`, or from comparison `a < b` | From literals/comparisons/logical ops | logical AND/OR; when mixing with DWARF integers, treated as 0/1 |
 | String | `"hello"` | UTF‑8 string literal | Equality `==`, `!=` with DWARF C strings; no ordering |
-| Alias (DWARF expr alias) | `let a = global.arr;`, `let p = &buf[0];` | A named alias to any DWARF expression (variable, member, array, pointer deref, or address‑of). Lets you give short names to complex types/paths and reuse them. | Supports the same complex access as the underlying DWARF type: member access (`a.field`), constant index (`a[0]`), address‑of (`&a`), and use in `memcmp/strncmp/starts_with` and `{:x.N}`/`{:s.N}`/`{:p}`. Pointer arithmetic remains limited to adding a non‑negative constant. |
+| Alias (DWARF expr alias) | `let a = global.arr;`, `let p = &buf[0];` | A named alias to any DWARF expression (variable, member, array, pointer deref, or address‑of). Lets you give short names to complex types/paths and reuse them. | Supports the same complex access as the underlying DWARF type: member access (`a.field`), integer‑literal index (`a[0]`), address‑of (`&a`), and use in `memcmp/strncmp/starts_with` and `{:x.N}`/`{:s.N}`/`{:p}`. Pointer arithmetic remains limited to adding a non‑negative constant. |
 
 Notes:
-1. Script variables do not expose structs/arrays/pointers. Access those through DWARF variables (member access, deref, constant index) to obtain scalars first. The exception is an alias variable, which can bind to any DWARF expression and be used as a reusable base for member/index access, address‑of, and memory formatting.
+1. Script variables do not expose structs/arrays/pointers. Access those through DWARF variables (member access, deref, integer‑literal index) to obtain scalars first. The exception is an alias variable, which can bind to any DWARF expression and be used as a reusable base for member/index access, address‑of, and memory formatting.
 
 Examples:
 
@@ -126,7 +126,7 @@ Examples:
 // Alias a complex DWARF path and reuse it
 let a = global_var.arr;   // arr is DWARF array/aggregate
 print "ptr={:p}", &a;     // take address of alias
-print a[1];               // index on alias
+print a[1];               // integer-literal index on alias
 
 // Address-of aliases still work
 let p = &conn.buf[0];
@@ -160,7 +160,7 @@ DWARF variables include locals, parameters, and globals from the traced program.
 | Char | `char`, `unsigned char` | 1‑byte int/char | Printed as 1‑byte integer; arrays/pointers see below |
 | C string | `char*`, `const char*`, `char[]` | CString (rendered as string) | Printable; equality `==`, `!=` with script strings |
 | Pointer | `T*`, `void*`, function pointer | Pointer/NullPointer (address) | Supports `*` deref and `==`/`!=`; auto‑deref for locals/params/globals when safe |
-| Array | `T[N]` | Array | Constant index reads (top‑level or chain‑tail); dynamic/mid indexes and multi‑dim not supported |
+| Array | `T[N]` | Array | Integer‑literal index reads (top‑level or chain‑tail); dynamic/mid indexes and multi‑dim not supported |
 | Struct/Class | `struct Foo`, `class Bar` | Struct | Use `.` member access; operate on scalar members only |
 | Union | `union U` | Union | Show one member view; access members then treat as scalar |
 | Enum | `enum E` | Enum (via base int) | Printed as `Type::Variant`; arithmetic/compare uses base integer |
@@ -179,9 +179,9 @@ print x;
 print person.name;
 print config.settings.timeout;
 
-// Array access
+// Array access (integer-literal indices only)
 print arr[0];
-print arr[i];
+print arr[1];
 
 // Pointer dereference
 print *ptr;
@@ -197,7 +197,7 @@ print arr[0].name;
 
 Tips:
 - Auto‑dereference is supported for locals/params/globals. You don’t need to write `*ptr` or `->`; when safe, pointers are read and dereferenced automatically.
-- Array access: supported for top‑level `arr[const]` and chain‑tail `a.b.c[const]`. Not supported: chain‑middle indices (`a.b[2].c`), dynamic indices (`arr[i]`), and multi‑dim arrays.
+- Array access: supported for top‑level `arr[<int literal>]` and chain‑tail `a.b.c[<int literal>]`. Not supported: chain‑middle indices (`a.b[2].c`), variable/expression indices (`arr[i]`, `arr[i + 1]`), and multi‑dim arrays.
 
 ## Special Variables
 
