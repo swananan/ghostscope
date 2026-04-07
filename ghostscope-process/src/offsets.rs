@@ -1,10 +1,11 @@
 use crate::module_probe::ModuleProbe;
 use crate::proc_maps::{
-    normalize_mapped_module_path, should_skip_mapped_module_path, visit_proc_maps, ModuleIdentity,
+    normalize_mapped_module_path, read_proc_maps, should_skip_mapped_module_path, visit_proc_maps,
+    ModuleIdentity, OwnedProcMapEntry,
 };
 use anyhow::Result;
 use object::{Object, ObjectSection, ObjectSegment};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::ops::ControlFlow;
 use std::os::unix::fs::MetadataExt;
@@ -49,6 +50,96 @@ struct CachedEntry {
     pid: u32,
     cookie: u64,
     offsets: SectionOffsets,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ModuleMapSummary {
+    candidates: Vec<(u64, u64)>,
+    min_start: Option<u64>,
+    max_end: Option<u64>,
+}
+
+impl ModuleMapSummary {
+    fn observe(&mut self, entry: &OwnedProcMapEntry) {
+        self.min_start = Some(self.min_start.map_or(entry.start, |v| v.min(entry.start)));
+        self.max_end = Some(self.max_end.map_or(entry.end, |v| v.max(entry.end)));
+        self.candidates.push((entry.offset, entry.start));
+    }
+
+    fn base(&self) -> u64 {
+        self.min_start.unwrap_or(0)
+    }
+
+    fn size(&self) -> u64 {
+        let base = self.base();
+        self.max_end.unwrap_or(base).saturating_sub(base)
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.candidates.extend(other.candidates.iter().copied());
+        if let Some(start) = other.min_start {
+            self.min_start = Some(self.min_start.map_or(start, |v| v.min(start)));
+        }
+        if let Some(end) = other.max_end {
+            self.max_end = Some(self.max_end.map_or(end, |v| v.max(end)));
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ModuleMapIdentityKey {
+    dev_major: u64,
+    dev_minor: u64,
+    inode: u64,
+}
+
+impl ModuleMapIdentityKey {
+    fn from_entry(entry: &OwnedProcMapEntry) -> Self {
+        Self {
+            dev_major: entry.dev_major,
+            dev_minor: entry.dev_minor,
+            inode: entry.inode,
+        }
+    }
+
+    fn from_metadata(meta: &fs::Metadata) -> Self {
+        let dev = meta.dev() as libc::dev_t;
+        Self {
+            dev_major: libc::major(dev) as u64,
+            dev_minor: libc::minor(dev) as u64,
+            inode: meta.ino(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ModulePathSummaries {
+    by_identity: BTreeMap<ModuleMapIdentityKey, ModuleMapSummary>,
+}
+
+impl ModulePathSummaries {
+    fn observe(&mut self, entry: &OwnedProcMapEntry) {
+        self.by_identity
+            .entry(ModuleMapIdentityKey::from_entry(entry))
+            .or_default()
+            .observe(entry);
+    }
+
+    fn summary_for_path(&self, module_path: &str) -> Option<ModuleMapSummary> {
+        match fs::metadata(module_path) {
+            Ok(meta) => self
+                .by_identity
+                .get(&ModuleMapIdentityKey::from_metadata(&meta))
+                .cloned(),
+            Err(_) => {
+                let mut merged = ModuleMapSummary::default();
+                for summary in self.by_identity.values() {
+                    merged.merge(summary);
+                }
+                (!merged.candidates.is_empty()).then_some(merged)
+            }
+        }
+    }
 }
 
 impl ProcessManager {
@@ -168,30 +259,52 @@ impl ProcessManager {
         if self.prefilled_pids.contains(&pid) {
             return Ok(0);
         }
-        let mut modules: BTreeSet<String> = BTreeSet::new();
-        visit_proc_maps(pid, |entry| {
+        let maps = read_proc_maps(pid)?;
+        let mut module_summaries: BTreeMap<String, ModulePathSummaries> = BTreeMap::new();
+        for entry in &maps {
             let Some(path) = entry.path() else {
-                return ControlFlow::Continue(());
+                continue;
             };
             if should_skip_mapped_module_path(path) {
-                return ControlFlow::Continue(());
+                continue;
             }
             let path_trim = normalize_mapped_module_path(path);
-            modules.insert(path_trim.to_string());
-            ControlFlow::Continue(())
-        })?;
+            module_summaries
+                .entry(path_trim.to_string())
+                .or_default()
+                .observe(entry);
+        }
         let mut list: Vec<PidOffsetsEntry> = Vec::new();
-        for m in modules {
-            match self.compute_section_offsets_for_process(pid, &m) {
+        for (module_path, summaries) in module_summaries {
+            let Some(summary) = summaries.summary_for_path(&module_path) else {
+                tracing::debug!(
+                    "ProcessManager: skip module {} for pid {}: no maps matched current file identity",
+                    module_path,
+                    pid
+                );
+                continue;
+            };
+            match self.compute_section_offsets_from_candidates(
+                pid,
+                &module_path,
+                &summary.candidates,
+                summary.base(),
+                summary.size(),
+            ) {
                 Ok((cookie, off, base, size)) => list.push(PidOffsetsEntry {
-                    module_path: m,
+                    module_path,
                     cookie,
                     offsets: off,
                     base,
                     size,
                 }),
                 Err(e) => {
-                    tracing::debug!("ProcessManager: skip module {} for pid {}: {}", m, pid, e)
+                    tracing::debug!(
+                        "ProcessManager: skip module {} for pid {}: {}",
+                        module_path,
+                        pid,
+                        e
+                    )
                 }
             }
         }
@@ -226,6 +339,19 @@ impl ProcessManager {
             candidates.push((entry.offset, entry.start));
             ControlFlow::Continue(())
         })?;
+        let base = min_start.unwrap_or(0);
+        let size = max_end.unwrap_or(base).saturating_sub(base);
+        self.compute_section_offsets_from_candidates(pid, module_path, &candidates, base, size)
+    }
+
+    fn compute_section_offsets_from_candidates(
+        &self,
+        pid: u32,
+        module_path: &str,
+        candidates: &[(u64, u64)],
+        base: u64,
+        size: u64,
+    ) -> Result<(u64, SectionOffsets, u64, u64)> {
         let probe = ModuleProbe::open(module_path)?;
         let obj = probe.object()?;
         let page_mask: u64 = !0xfffu64;
@@ -297,8 +423,6 @@ impl ProcessManager {
         offsets.data = module_base;
         offsets.bss = module_base;
         let cookie = probe.cookie_for_object(&obj);
-        let base = min_start.unwrap_or(0);
-        let size = max_end.unwrap_or(base).saturating_sub(base);
         if offsets.text == 0 && offsets.rodata == 0 && offsets.data == 0 && offsets.bss == 0 {
             if seg_bias.is_empty() {
                 // No segment matches at all: genuine failure to map offsets
@@ -424,6 +548,8 @@ fn is_same_executable_as_current(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proc_maps::parse_maps_line;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn forget_pid_clears_pid_caches_and_module_entries() {
@@ -462,5 +588,72 @@ mod tests {
         let module_entries = mgr.module_cache.get("/tmp/a.so").unwrap();
         assert_eq!(module_entries.len(), 1);
         assert_eq!(module_entries[0].pid, 7);
+    }
+
+    #[test]
+    fn path_summaries_prefer_current_file_identity_when_metadata_exists() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("ghostscope-offsets-{suffix}.so"));
+        std::fs::write(&path, b"current").unwrap();
+
+        let meta = std::fs::metadata(&path).unwrap();
+        let dev = meta.dev() as libc::dev_t;
+        let dev_major = libc::major(dev) as u64;
+        let dev_minor = libc::minor(dev) as u64;
+        let inode = meta.ino();
+        let path_str = path.to_string_lossy().to_string();
+
+        let current_entry: OwnedProcMapEntry = parse_maps_line(&format!(
+            "2000-3000 r-xp 00001000 {dev_major:02x}:{dev_minor:02x} {inode} {path_str}"
+        ))
+        .unwrap()
+        .into();
+        let stale_entry: OwnedProcMapEntry = parse_maps_line(&format!(
+            "1000-2000 r-xp 00000000 {dev_major:02x}:{dev_minor:02x} {} {path_str}",
+            inode + 1
+        ))
+        .unwrap()
+        .into();
+
+        let mut summaries = ModulePathSummaries::default();
+        summaries.observe(&stale_entry);
+        summaries.observe(&current_entry);
+
+        let summary = summaries.summary_for_path(&path_str).unwrap();
+        assert_eq!(summary.candidates, vec![(0x1000, 0x2000)]);
+        assert_eq!(summary.base(), 0x2000);
+        assert_eq!(summary.size(), 0x1000);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn path_summaries_merge_groups_when_metadata_is_unavailable() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = format!("/tmp/ghostscope-missing-{suffix}.so");
+
+        let first: OwnedProcMapEntry =
+            parse_maps_line(&format!("1000-2000 r-xp 00000000 08:01 10 {path}"))
+                .unwrap()
+                .into();
+        let second: OwnedProcMapEntry =
+            parse_maps_line(&format!("3000-5000 r-xp 00002000 08:01 11 {path}"))
+                .unwrap()
+                .into();
+
+        let mut summaries = ModulePathSummaries::default();
+        summaries.observe(&first);
+        summaries.observe(&second);
+
+        let summary = summaries.summary_for_path(&path).unwrap();
+        assert_eq!(summary.candidates, vec![(0, 0x1000), (0x2000, 0x3000)]);
+        assert_eq!(summary.base(), 0x1000);
+        assert_eq!(summary.size(), 0x4000);
     }
 }
