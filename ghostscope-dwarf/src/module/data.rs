@@ -37,6 +37,7 @@ use crate::{
 };
 use gimli::Reader;
 use object::{Object, ObjectSection, ObjectSegment};
+use rayon::prelude::*;
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
@@ -45,6 +46,24 @@ use std::{
 
 // Clippy: factor complex HashMap<String, Vec<usize>> type into an alias
 type NameIndex = HashMap<String, Vec<usize>>;
+
+#[derive(Debug, Default)]
+struct DemangledNameMaps {
+    function_map: NameIndex,
+    function_leaf_map: NameIndex,
+    variable_map: NameIndex,
+    variable_leaf_map: NameIndex,
+}
+
+#[derive(Debug)]
+struct DemangledMapEntry {
+    idx: usize,
+    tag: gimli::DwTag,
+    full: Option<String>,
+    full_normalized: Option<String>,
+    leaf: String,
+    leaf_normalized: Option<String>,
+}
 
 /// Complete DWARF data for a single module
 #[derive(Debug)]
@@ -71,11 +90,8 @@ pub(crate) struct ModuleData {
     block_index: BlockIndex,
     /// Type name index for cross-CU completion
     type_name_index: TypeNameIndex,
-    /// Demangled name maps for flexible lookups
-    demangled_function_map: HashMap<String, Vec<usize>>,
-    demangled_function_leaf_map: HashMap<String, Vec<usize>>,
-    demangled_variable_map: HashMap<String, Vec<usize>>,
-    demangled_variable_leaf_map: HashMap<String, Vec<usize>>,
+    /// Demangled name maps for flexible lookups, built eagerly during module load.
+    demangled_maps: DemangledNameMaps,
 }
 
 impl ModuleData {
@@ -393,6 +409,7 @@ impl ModuleData {
         debug_search_paths: &[String],
         allow_loose_debug_match: bool,
     ) -> Result<Self> {
+        let load_started_at = Instant::now();
         tracing::debug!(
             "Loading module in parallel: {}",
             module_mapping.path.display()
@@ -529,6 +546,7 @@ impl ModuleData {
             info_result,
             module_mapping.path.to_string_lossy().to_string(),
         );
+        let parse_elapsed_ms = load_started_at.elapsed().as_millis();
 
         // Optionally log CFI stats to ensure associated APIs are exercised
         if let Some(ref cfi) = cfi_index {
@@ -543,9 +561,23 @@ impl ModuleData {
             }
         }
 
-        // Build type name index from lightweight index
-        let type_name_index =
-            TypeNameIndex::build_from_lightweight(&parse_result.lightweight_index);
+        let crate::parser::DwarfParseResult {
+            lightweight_index,
+            line_mapping,
+            scoped_file_manager,
+            compilation_units,
+            stats,
+        } = parse_result;
+        let index_started_at = Instant::now();
+        let (lightweight_index, type_name_index, demangled_maps) =
+            tokio::task::spawn_blocking(move || {
+                let (type_name_index, demangled_maps) = rayon::join(
+                    || TypeNameIndex::build_from_lightweight(&lightweight_index),
+                    || Self::build_demangled_maps(&lightweight_index),
+                );
+                (lightweight_index, type_name_index, demangled_maps)
+            })
+            .await?;
         let type_index_arc = std::sync::Arc::new(type_name_index.clone());
 
         // Create resolver with parsed data and type index
@@ -576,42 +608,37 @@ impl ModuleData {
         } else {
             "PartialSuccess"
         };
+        let index_elapsed_ms = index_started_at.elapsed().as_millis();
 
-        tracing::info!(
-            "True parallel loading completed for {}: {} functions, {} variables, {} line entries, {} files (state: {:?})",
-            module_mapping.path.display(),
-            parse_result.stats.total_functions,
-            parse_result.stats.total_variables,
-            parse_result.stats.total_line_entries,
-            parse_result.stats.total_files,
-            state_label
-        );
-
-        // Build demangled name indices from the lightweight index
-        let (
-            demangled_function_map,
-            demangled_function_leaf_map,
-            demangled_variable_map,
-            demangled_variable_leaf_map,
-        ) = Self::build_demangled_maps(&parse_result.lightweight_index);
-
-        Ok(Self {
+        let module = Self {
             module_mapping: module_mapping.clone(),
-            lightweight_index: parse_result.lightweight_index,
-            line_mapping: parse_result.line_mapping,
-            scoped_file_manager: parse_result.scoped_file_manager,
-            compilation_units: parse_result.compilation_units,
+            lightweight_index,
+            line_mapping,
+            scoped_file_manager,
+            compilation_units,
             cfi_index,
             resolver,
             block_index: BlockIndex::new(),
             type_name_index,
             _dwarf_mapped_file: mapped_file,
             _binary_mapped_file: binary_mapped,
-            demangled_function_map,
-            demangled_function_leaf_map,
-            demangled_variable_map,
-            demangled_variable_leaf_map,
-        })
+            demangled_maps,
+        };
+
+        tracing::info!(
+            "True parallel loading completed for {}: {} functions, {} variables, {} line entries, {} files (state: {}, parse_ms: {}, index_ms: {}, total_ms: {})",
+            module.module_mapping.path.display(),
+            stats.total_functions,
+            stats.total_variables,
+            stats.total_line_entries,
+            stats.total_files,
+            state_label,
+            parse_elapsed_ms,
+            index_elapsed_ms,
+            load_started_at.elapsed().as_millis()
+        );
+
+        Ok(module)
     }
 
     /// Check if DWARF data contains debug information
@@ -1706,101 +1733,149 @@ impl ModuleData {
     }
 
     /// Build demangled name maps from the lightweight index
-    fn build_demangled_maps(ix: &LightweightIndex) -> (NameIndex, NameIndex, NameIndex, NameIndex) {
-        let mut fn_full: NameIndex = HashMap::new();
-        let mut fn_leaf: NameIndex = HashMap::new();
-        let mut var_full: NameIndex = HashMap::new();
-        let mut var_leaf: NameIndex = HashMap::new();
-
-        // Cache demangled results to avoid repeated demangle cost for identical (lang, name)
-        let mut demangle_cache: HashMap<(u16, std::sync::Arc<str>), String> = HashMap::new();
-
-        // Normalize a demangled signature string by removing extra spaces
-        // e.g., "ns1::add(int, int)" -> "ns1::add(int,int)"
-        let normalize_sig = |s: &str| -> String {
+    fn build_demangled_maps(ix: &LightweightIndex) -> DemangledNameMaps {
+        fn normalize_sig(s: &str) -> String {
             let mut out = s.replace(", ", ",");
             out = out.replace("( ", "(");
             out = out.replace(" )", ")");
             out = out.replace(" ,", ",");
             out
-        };
+        }
 
-        // demangle_cache declared above; reuse it here
+        fn normalized_variant(s: &str) -> Option<String> {
+            let norm = normalize_sig(s);
+            (norm != s).then_some(norm)
+        }
+
+        let mut fn_full: NameIndex = HashMap::new();
+        let mut fn_leaf: NameIndex = HashMap::new();
+        let mut var_full: NameIndex = HashMap::new();
+        let mut var_leaf: NameIndex = HashMap::new();
         let (_, _, total) = ix.get_stats();
+        let mut demangle_jobs = Vec::new();
+        let mut seen_jobs: HashSet<(u16, std::sync::Arc<str>)> = HashSet::new();
         for idx in 0..total {
-            if let Some(entry) = ix.entry(idx) {
-                let tag = entry.tag;
-                // Prefer demangled names when applicable
-                let lang_code: u16 = entry.language.map(|l| l.0).unwrap_or(u16::MAX);
-                let key = (lang_code, entry.name.clone());
-                let demangled_opt = if let Some(cached) = demangle_cache.get(&key) {
-                    Some(cached.clone())
-                } else {
-                    let d = crate::core::demangle_by_lang(entry.language, entry.name.as_ref());
-                    if let Some(ref s) = d {
-                        demangle_cache.insert(key.clone(), s.clone());
-                    }
-                    d
-                };
-
-                if let Some(d) = demangled_opt {
-                    let leaf = crate::core::demangled_leaf(&d);
-                    let d_norm = normalize_sig(&d);
-                    let leaf_norm = normalize_sig(&leaf);
-                    match tag {
-                        gimli::constants::DW_TAG_subprogram
-                        | gimli::constants::DW_TAG_inlined_subroutine => {
-                            fn_full.entry(d.clone()).or_default().push(idx);
-                            if d_norm != d {
-                                fn_full.entry(d_norm).or_default().push(idx);
-                            }
-                            fn_leaf.entry(leaf.clone()).or_default().push(idx);
-                            if leaf_norm != leaf {
-                                fn_leaf.entry(leaf_norm).or_default().push(idx);
-                            }
-                        }
-                        gimli::constants::DW_TAG_variable => {
-                            var_full.entry(d.clone()).or_default().push(idx);
-                            if d_norm != d {
-                                var_full.entry(d_norm).or_default().push(idx);
-                            }
-                            var_leaf.entry(leaf.clone()).or_default().push(idx);
-                            if leaf_norm != leaf {
-                                var_leaf.entry(leaf_norm).or_default().push(idx);
-                            }
-                        }
-                        _ => {}
-                    }
-                } else {
-                    // Always index a leaf for non-demangled names too (last component or the whole name)
-                    let last = entry
-                        .name
-                        .rsplit("::")
-                        .next()
-                        .unwrap_or(&entry.name)
-                        .to_string();
-                    let last_norm = normalize_sig(&last);
-                    match tag {
-                        gimli::constants::DW_TAG_subprogram
-                        | gimli::constants::DW_TAG_inlined_subroutine => {
-                            fn_leaf.entry(last.clone()).or_default().push(idx);
-                            if last_norm != last {
-                                fn_leaf.entry(last_norm).or_default().push(idx);
-                            }
-                        }
-                        gimli::constants::DW_TAG_variable => {
-                            var_leaf.entry(last.clone()).or_default().push(idx);
-                            if last_norm != last {
-                                var_leaf.entry(last_norm).or_default().push(idx);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+            let Some(entry) = ix.entry(idx) else {
+                continue;
+            };
+            if !matches!(
+                entry.tag,
+                gimli::constants::DW_TAG_subprogram
+                    | gimli::constants::DW_TAG_inlined_subroutine
+                    | gimli::constants::DW_TAG_variable
+            ) {
+                continue;
+            }
+            let should_attempt_demangle = entry.flags.is_linkage
+                || crate::core::is_likely_mangled(entry.language, entry.name.as_ref());
+            if !should_attempt_demangle {
+                continue;
+            }
+            let lang_code: u16 = entry.language.map(|l| l.0).unwrap_or(u16::MAX);
+            let key = (lang_code, entry.name.clone());
+            if seen_jobs.insert(key.clone()) {
+                demangle_jobs.push((key, entry.language));
             }
         }
 
-        (fn_full, fn_leaf, var_full, var_leaf)
+        let demangle_cache: HashMap<(u16, std::sync::Arc<str>), String> = demangle_jobs
+            .into_par_iter()
+            .filter_map(|(key, lang)| {
+                crate::core::demangle_by_lang(lang, key.1.as_ref())
+                    .map(|demangled| (key, demangled))
+            })
+            .collect();
+
+        let indexed_entries: Vec<Option<DemangledMapEntry>> = (0..total)
+            .into_par_iter()
+            .map(|idx| {
+                let entry = ix.entry(idx)?;
+                if !matches!(
+                    entry.tag,
+                    gimli::constants::DW_TAG_subprogram
+                        | gimli::constants::DW_TAG_inlined_subroutine
+                        | gimli::constants::DW_TAG_variable
+                ) {
+                    return None;
+                }
+
+                let demangled_opt = if entry.flags.is_linkage
+                    || crate::core::is_likely_mangled(entry.language, entry.name.as_ref())
+                {
+                    let lang_code: u16 = entry.language.map(|l| l.0).unwrap_or(u16::MAX);
+                    demangle_cache
+                        .get(&(lang_code, entry.name.clone()))
+                        .cloned()
+                } else {
+                    None
+                };
+
+                Some(if let Some(full) = demangled_opt {
+                    let leaf = crate::core::demangled_leaf(&full);
+                    DemangledMapEntry {
+                        idx,
+                        tag: entry.tag,
+                        full: Some(full.clone()),
+                        full_normalized: normalized_variant(&full),
+                        leaf_normalized: normalized_variant(&leaf),
+                        leaf,
+                    }
+                } else {
+                    let leaf = entry
+                        .name
+                        .rsplit("::")
+                        .next()
+                        .unwrap_or(entry.name.as_ref())
+                        .to_string();
+                    DemangledMapEntry {
+                        idx,
+                        tag: entry.tag,
+                        full: None,
+                        full_normalized: None,
+                        leaf_normalized: normalized_variant(&leaf),
+                        leaf,
+                    }
+                })
+            })
+            .collect();
+
+        for entry in indexed_entries.into_iter().flatten() {
+            match entry.tag {
+                gimli::constants::DW_TAG_subprogram
+                | gimli::constants::DW_TAG_inlined_subroutine => {
+                    if let Some(full) = entry.full {
+                        fn_full.entry(full).or_default().push(entry.idx);
+                    }
+                    if let Some(full_norm) = entry.full_normalized {
+                        fn_full.entry(full_norm).or_default().push(entry.idx);
+                    }
+                    fn_leaf.entry(entry.leaf).or_default().push(entry.idx);
+                    if let Some(leaf_norm) = entry.leaf_normalized {
+                        fn_leaf.entry(leaf_norm).or_default().push(entry.idx);
+                    }
+                }
+                gimli::constants::DW_TAG_variable => {
+                    if let Some(full) = entry.full {
+                        var_full.entry(full).or_default().push(entry.idx);
+                    }
+                    if let Some(full_norm) = entry.full_normalized {
+                        var_full.entry(full_norm).or_default().push(entry.idx);
+                    }
+                    var_leaf.entry(entry.leaf).or_default().push(entry.idx);
+                    if let Some(leaf_norm) = entry.leaf_normalized {
+                        var_leaf.entry(leaf_norm).or_default().push(entry.idx);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        DemangledNameMaps {
+            function_map: fn_full,
+            function_leaf_map: fn_leaf,
+            variable_map: var_full,
+            variable_leaf_map: var_leaf,
+        }
     }
 
     /// Compute addresses for a function entry (deterministic ordering)
@@ -2285,6 +2360,7 @@ impl ModuleData {
         if !addrs.is_empty() {
             return addrs;
         }
+        let demangled_maps = &self.demangled_maps;
 
         // Helper: normalize demangled signature spacing (e.g., "(int, int)" -> "(int,int)")
         let normalize_sig = |s: &str| -> Option<String> {
@@ -2303,7 +2379,7 @@ impl ModuleData {
         };
 
         // Demangled full match
-        if let Some(indices) = self.demangled_function_map.get(name) {
+        if let Some(indices) = demangled_maps.function_map.get(name) {
             let mut out = Vec::new();
             for &idx in indices {
                 if let Some(entry) = self.lightweight_index.entry(idx) {
@@ -2318,7 +2394,7 @@ impl ModuleData {
         }
         // Try normalized variant
         if let Some(norm) = normalize_sig(name) {
-            if let Some(indices) = self.demangled_function_map.get(&norm) {
+            if let Some(indices) = demangled_maps.function_map.get(&norm) {
                 let mut out = Vec::new();
                 for &idx in indices {
                     if let Some(entry) = self.lightweight_index.entry(idx) {
@@ -2334,7 +2410,7 @@ impl ModuleData {
         }
 
         // Demangled leaf match
-        if let Some(indices) = self.demangled_function_leaf_map.get(name) {
+        if let Some(indices) = demangled_maps.function_leaf_map.get(name) {
             let mut out = Vec::new();
             for &idx in indices {
                 if let Some(entry) = self.lightweight_index.entry(idx) {
@@ -2349,7 +2425,7 @@ impl ModuleData {
         }
         // Try normalized leaf variant
         if let Some(norm) = normalize_sig(name) {
-            if let Some(indices) = self.demangled_function_leaf_map.get(&norm) {
+            if let Some(indices) = demangled_maps.function_leaf_map.get(&norm) {
                 let mut out = Vec::new();
                 for &idx in indices {
                     if let Some(entry) = self.lightweight_index.entry(idx) {
@@ -2386,6 +2462,7 @@ impl ModuleData {
         if !base.is_empty() {
             return base;
         }
+        let demangled_maps = &self.demangled_maps;
 
         // Build object file once for section classification
         let obj = match object::File::parse(&self._binary_mapped_file.data[..]) {
@@ -2398,7 +2475,7 @@ impl ModuleData {
         let mut seen_offsets: HashSet<(u64, u64)> = HashSet::new();
 
         // Try demangled full (preserve the demangled name that matched)
-        if let Some(indices) = self.demangled_variable_map.get(name) {
+        if let Some(indices) = demangled_maps.variable_map.get(name) {
             for &idx in indices {
                 if let Some(entry) = self.lightweight_index.entry(idx) {
                     let key = (entry.unit_offset.0 as u64, entry.die_offset.0 as u64);
@@ -2428,7 +2505,7 @@ impl ModuleData {
         }
 
         // Try demangled leaf (preserve the demangled name that matched)
-        if let Some(indices) = self.demangled_variable_leaf_map.get(name) {
+        if let Some(indices) = demangled_maps.variable_leaf_map.get(name) {
             for &idx in indices {
                 if let Some(entry) = self.lightweight_index.entry(idx) {
                     let key = (entry.unit_offset.0 as u64, entry.die_offset.0 as u64);
@@ -2509,8 +2586,8 @@ impl ModuleData {
                     let section = link_address.and_then(|addr| self.classify_section(&obj, addr));
                     scan.push(GlobalVariableInfo {
                         name: if last == name
-                            || self.demangled_variable_map.contains_key(name)
-                            || self.demangled_variable_leaf_map.contains_key(name)
+                            || demangled_maps.variable_map.contains_key(name)
+                            || demangled_maps.variable_leaf_map.contains_key(name)
                         {
                             name.to_string()
                         } else {
@@ -2752,12 +2829,14 @@ mod tests {
     use super::ModuleData;
     use crate::binary::{dwarf_reader_from_arc, DwarfReader};
     use crate::core::{FunctionDieKind, IndexEntry, IndexFlags};
+    use crate::index::LightweightIndex;
     use gimli::constants;
     use gimli::write::{
         Address, AttributeValue as WriteAttributeValue, Dwarf as WriteDwarf, EndianVec,
         Expression as WriteExpression, LineProgram, Location, LocationList, Sections, Unit,
     };
     use gimli::{Format, Register};
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     fn subprogram_entry(ranges: &[(u64, u64)], entry_pc: Option<u64>) -> IndexEntry {
@@ -3344,5 +3423,38 @@ mod tests {
             ModuleData::subprogram_uses_entry_value_at(&dwarf, &unit, &concrete, 0x1500).unwrap(),
             "outside the specific range, the default-location entry_value should still apply"
         );
+    }
+
+    #[test]
+    fn build_demangled_maps_indexes_demangled_function_aliases() {
+        let mangled = "_ZN2ns6Widget3runEv".to_string();
+        let demangled =
+            crate::core::demangle_by_lang(Some(gimli::DW_LANG_C_plus_plus_17), &mangled).unwrap();
+        let leaf = crate::core::demangled_leaf(&demangled);
+
+        let mut functions = HashMap::new();
+        functions.insert(
+            mangled.clone(),
+            vec![IndexEntry {
+                name: Arc::<str>::from(mangled.as_str()),
+                die_offset: gimli::UnitOffset(0),
+                unit_offset: gimli::DebugInfoOffset(0),
+                tag: constants::DW_TAG_subprogram,
+                flags: IndexFlags {
+                    is_linkage: true,
+                    ..Default::default()
+                },
+                language: Some(gimli::DW_LANG_C_plus_plus_17),
+                address_ranges: vec![(0x1000, 0x1010)],
+                entry_pc: Some(0x1000),
+                function_kind: FunctionDieKind::ConcreteSubprogram,
+            }],
+        );
+
+        let ix = LightweightIndex::from_builder_data(functions, HashMap::new(), HashMap::new());
+        let maps = ModuleData::build_demangled_maps(&ix);
+
+        assert_eq!(maps.function_map.get(&demangled), Some(&vec![0]));
+        assert_eq!(maps.function_leaf_map.get(&leaf), Some(&vec![0]));
     }
 }
