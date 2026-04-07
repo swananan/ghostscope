@@ -22,6 +22,10 @@ async fn main() -> Result<()> {
         config::ParsedCommand::Bpffs(config::BpffsCommand::Prune(prune_args)) => {
             return cli::run_bpffs_prune(&prune_args);
         }
+        config::ParsedCommand::ScriptHelp => {
+            cli::print_script_help();
+            return Ok(());
+        }
     };
 
     // Load and merge configuration

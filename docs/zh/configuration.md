@@ -60,6 +60,9 @@ ghostscope --script 'trace("main:entry") { print "Started"; }'
 # 从文件运行脚本
 ghostscope --script-file trace.gs
 
+# 输出内嵌的脚本语言参考并退出
+ghostscope --script-help
+
 # 选择脚本模式的事件 stdout 输出方式
 ghostscope --script-output pretty   # 默认：格式化 stdout
 ghostscope --script-output plain    # 仅保留 payload stdout
@@ -214,6 +217,7 @@ ghostscope bpffs prune --dry-run --json
 | `--target <PATH>` | `-t` | 目标可执行文件或库 | 无 |
 | `--script <SCRIPT>` | `-s` | 要执行的内联脚本 | 无 |
 | `--script-file <PATH>` | | 要执行的脚本文件 | 无 |
+| `--script-help` | | 输出内嵌的脚本语言参考并退出 | 关 |
 | `--script-output <MODE>` | | 脚本事件 stdout 模式：pretty, plain | pretty |
 | `--status` | | 启用交互式 DWARF/脚本/attach stderr 状态提示 | 开 |
 | `--no-status` | | 禁用交互式 DWARF/脚本/attach stderr 状态提示 | 关闭覆盖 |

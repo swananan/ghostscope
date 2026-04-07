@@ -15,9 +15,9 @@ Prefer repository docs as the source of truth. When the user is writing in Chine
 1. Classify the request before answering.
 - Capabilities, positioning, tool comparisons, or "should I use GhostScope here?": read `references/doc-map.md`, then use `README.md`, `docs/comparison.md`, and `docs/faq.md` or `README-zh.md`, `docs/zh/comparison.md`, and `docs/zh/faq.md`.
 - Installation, permissions, or debug symbols: read `references/cli-cookbook.md`, then `docs/install.md` or `docs/zh/install.md`.
-- Exact CLI flags or launch syntax: read `references/cli-cookbook.md`, then `docs/configuration.md` or `docs/zh/configuration.md`.
+- Exact CLI flags or launch syntax: run `ghostscope --help` first, and use subcommand help such as `ghostscope bpffs prune --help` when relevant. If `ghostscope` is unavailable but the shared workspace is the GhostScope repo, fall back to `references/cli-cookbook.md`, then `docs/configuration.md` or `docs/zh/configuration.md`.
 - TUI commands such as `trace`, `info`, `source`, `save traces`, or `srcpath`: read `references/cli-cookbook.md`, then `docs/input-commands.md` or `docs/zh/input-commands.md`.
-- Trace script authoring: read `docs/scripting.md` or `docs/zh/scripting.md` before generating DSL.
+- Trace script authoring: run `ghostscope --script-help` first and treat its output as the source of truth for the current installed DSL. If `ghostscope` is unavailable but the shared workspace is the GhostScope repo, fall back to `docs/scripting.md` or `docs/zh/scripting.md`.
 - Container or PID confusion: read `docs/container.md` or `docs/zh/container.md`.
 - Limits or caveats: read `docs/limitations.md` or `docs/zh/limitations.md`.
 - Crash, cannot-capture, or bug-report preparation: read `references/issue-reporting.md`, then `docs/install.md`, `docs/container.md`, and `docs/limitations.md` or their `docs/zh/` counterparts.
@@ -55,14 +55,14 @@ Prefer repository docs as the source of truth. When the user is writing in Chine
 - If the command needs privileges and the user is likely to rerun it, prefer offering either a `setcap` command or a ready-to-run `sudo` wrapper script.
 
 5. Avoid common mistakes.
-- Do not invent GhostScope DSL syntax. Validate it against `docs/scripting.md` or `docs/zh/scripting.md`.
+- Do not invent GhostScope DSL syntax. Validate it against `ghostscope --script-help`, or fall back to `docs/scripting.md` or `docs/zh/scripting.md` only when GhostScope is unavailable.
 - Do not guess PID conversions across containers. Follow the current-namespace PID rule from `docs/container.md`.
 - Do not overpromise unsupported behavior. Check `docs/limitations.md` for caveats first.
 - Do not pretend source-line workflows are fully ready when the source tree path cannot be discovered. Ask the user for the source checkout path instead.
 - Do not pretend DWARF-backed variable tracing is ready when the relevant module lacks debug info. Ask the user for the debug-enabled binary or debug file instead.
 - For `-t` shared-library targets where new processes must expose globals, mention `--enable-sysmon-shared-lib`.
 - When source paths do not resolve, prefer `srcpath map` over telling the user to move files manually.
-- When docs and generated examples seem inconsistent, prefer the current user docs and exact CLI definitions in `ghostscope/src/config/args.rs`.
+- When docs and generated examples seem inconsistent, prefer the installed CLI help output from `ghostscope --help` and relevant subcommand help.
 
 6. Prepare issue reports when the problem still looks like a GhostScope bug.
 - First rule out missing privileges, missing debug symbols, wrong `-p` PID semantics, and known `-t` shared-library caveats.
