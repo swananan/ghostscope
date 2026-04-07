@@ -1,6 +1,7 @@
 //! CLI module - handles command line interface and non-TUI mode runtime
 
 mod color;
+mod docs;
 mod loading_reporter;
 pub mod script_output;
 pub mod script_runtime;
@@ -190,4 +191,5 @@ fn print_human_report(args: &BpffsPruneArgs, report: &BpffsPruneReport) {
 }
 
 // Re-export main functions for convenience
+pub use docs::print_script_help;
 pub use script_runtime::run_command_line_runtime_with_config;

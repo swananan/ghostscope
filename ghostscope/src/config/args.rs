@@ -36,6 +36,7 @@ pub enum ScriptTimestampFormat {
 pub enum ParsedCommand {
     Trace(Box<ParsedArgs>),
     Bpffs(BpffsCommand),
+    ScriptHelp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,6 +196,10 @@ pub struct Args {
     #[arg(long, value_name = "PATH")]
     pub script_file: Option<PathBuf>,
 
+    /// Print the current embedded GhostScope script reference and exit
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub script_help: bool,
+
     /// Start in TUI mode (default behavior when no script provided)
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub tui: bool,
@@ -319,8 +324,14 @@ impl Args {
 
     fn parse_args_from(args: Vec<String>) -> ParsedCommand {
         let bpffs_prune_invocation = Self::is_bpffs_prune_invocation(&args);
+        let args_pos = args.iter().position(|arg| arg == "--args");
+        let script_help_invocation = Self::is_script_help_invocation(&args, args_pos);
 
-        if let Some(args_pos) = args.iter().position(|arg| arg == "--args") {
+        if script_help_invocation {
+            return Self::try_parse_dispatch(&args).unwrap_or_else(|e| e.exit());
+        }
+
+        if let Some(args_pos) = args_pos {
             // `--args` belongs to trace mode; bpffs maintenance commands do not use it.
             if bpffs_prune_invocation {
                 return Self::try_parse_dispatch(&args).unwrap_or_else(|e| e.exit());
@@ -351,6 +362,12 @@ impl Args {
             ),
             (Some("bpffs"), Some("prune"))
         )
+    }
+
+    fn is_script_help_invocation(args: &[String], args_pos: Option<usize>) -> bool {
+        args[..args_pos.unwrap_or(args.len())]
+            .iter()
+            .any(|arg| arg == "--script-help")
     }
 
     fn parse_trace_args(args: Vec<String>) -> ParsedArgs {
@@ -401,6 +418,9 @@ impl Args {
         }
 
         let parsed = Args::from_arg_matches(&matches)?;
+        if parsed.script_help {
+            return Ok(ParsedCommand::ScriptHelp);
+        }
         let binary_path = parsed.binary.clone();
         Ok(ParsedCommand::Trace(Box::new(
             Self::parsed_trace_args_from_clap(parsed, binary_path, Vec::new()),
@@ -672,6 +692,30 @@ mod tests {
     fn root_help_lists_bpffs_subcommand() {
         let help = Args::command_with_bpffs().render_long_help().to_string();
         assert!(help.contains("bpffs"));
+        assert!(help.contains("--script-help"));
+    }
+
+    #[test]
+    fn parses_script_help_flag_as_maintenance_command() {
+        let parsed =
+            Args::parse_args_from(vec!["ghostscope".to_string(), "--script-help".to_string()]);
+
+        match parsed {
+            ParsedCommand::ScriptHelp => {}
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ignores_script_help_after_args_for_detection() {
+        let args = vec![
+            "ghostscope".to_string(),
+            "--args".to_string(),
+            "demo-program".to_string(),
+            "--script-help".to_string(),
+        ];
+
+        assert!(!Args::is_script_help_invocation(&args, Some(1)));
     }
 
     #[test]

@@ -59,6 +59,9 @@ ghostscope --script 'trace("main:entry") { print "Started"; }'
 # Run script from file
 ghostscope --script-file trace.gs
 
+# Print the embedded script language reference and exit
+ghostscope --script-help
+
 # Choose script-mode event stdout rendering
 ghostscope --script-output pretty   # default: formatted stdout
 ghostscope --script-output plain    # payload-only stdout
@@ -213,6 +216,7 @@ Behavior:
 | `--target <PATH>` | `-t` | Target executable or library | None |
 | `--script <SCRIPT>` | `-s` | Inline script to execute | None |
 | `--script-file <PATH>` | | Script file to execute | None |
+| `--script-help` | | Print the embedded script language reference and exit | Off |
 | `--script-output <MODE>` | | Script event stdout mode: pretty, plain | pretty |
 | `--status` | | Enable interactive DWARF/script/attach stderr status prompts | On |
 | `--no-status` | | Disable interactive DWARF/script/attach stderr status prompts | Off override |

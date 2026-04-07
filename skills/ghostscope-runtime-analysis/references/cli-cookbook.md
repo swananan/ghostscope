@@ -25,6 +25,25 @@ export PATH="$HOME/.ghostscope/bin:$PATH"
 
 If `ghostscope` is missing, prefer this install flow before anything else.
 
+### Get The Current CLI Flags
+
+```bash
+ghostscope --help
+ghostscope bpffs prune --help
+```
+
+Use installed command help as the source of truth for currently supported flags and subcommands.
+If `ghostscope` is unavailable but you are working inside the GhostScope repository, fall back to `docs/configuration.md`.
+
+### Get The Current DSL Reference
+
+```bash
+ghostscope --script-help
+```
+
+Use this as the source of truth for the currently installed GhostScope script syntax.
+If `ghostscope` is unavailable but you are working inside the GhostScope repository, fall back to `docs/scripting.md`.
+
 ### Ask For Source And Debug Inputs
 
 Before giving file:line tracing or variable-inspection workflows, confirm:
@@ -206,7 +225,8 @@ Use `plain` when the user wants payload-only stdout and less formatting noise.
 - Optimized builds may show variables as optimized out.
 - Source-oriented workflows depend on knowing the relevant source tree location, whether discovered locally or provided by the user.
 - Variable and source-level tracing depend on debug info for the modules the user cares about.
-- If the user needs exact supported flags, check `docs/configuration.md` and `ghostscope/src/config/args.rs`.
+- For exact script syntax on the installed version, run `ghostscope --script-help`.
+- If the user needs exact supported flags, run `ghostscope --help` and relevant subcommand help such as `ghostscope bpffs prune --help`.
 
 ## When To Escalate Into A GitHub Issue
 
