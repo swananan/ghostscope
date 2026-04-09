@@ -11,8 +11,10 @@
 先安装这个 skill：
 
 ```bash
-./scripts/skills/install_ghostscope_runtime_analysis_skill.sh --copy
+curl -fsSL https://raw.githubusercontent.com/swananan/ghostscope/main/scripts/skills/install_ghostscope_runtime_analysis_skill.sh | bash -s -- --copy
 ```
+
+如果你已经把仓库 clone 到本地，也可以继续使用 `./scripts/skills/install_ghostscope_runtime_analysis_skill.sh --copy`。
 
 然后直接提一个具体的追踪需求：
 

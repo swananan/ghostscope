@@ -5,8 +5,10 @@
 Install the internal runner skill for Codex:
 
 ```bash
-./scripts/e2e/runner/install_ghostscope_e2e_runner_skill.sh
+curl -fsSL https://raw.githubusercontent.com/swananan/ghostscope/main/scripts/e2e/runner/install_ghostscope_e2e_runner_skill.sh | bash
 ```
+
+If you are already inside a local checkout, `./scripts/e2e/runner/install_ghostscope_e2e_runner_skill.sh` still works.
 
 Then restart Codex.
 
