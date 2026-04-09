@@ -136,6 +136,20 @@ fn registered_fixture(name: &str) -> Option<&'static RegisteredFixture> {
         .find(|fixture| fixture.name == name)
 }
 
+fn fixture_cargo_target_dir(fixture_dir: &std::path::Path) -> PathBuf {
+    match std::env::var_os("CARGO_TARGET_DIR") {
+        Some(target_dir) => {
+            let target_dir = PathBuf::from(target_dir);
+            if target_dir.is_absolute() {
+                target_dir
+            } else {
+                fixture_dir.join(target_dir)
+            }
+        }
+        None => fixture_dir.join("target"),
+    }
+}
+
 #[allow(dead_code)]
 pub(crate) fn host_pid_is_running(pid: u32) -> bool {
     PathBuf::from(format!("/proc/{pid}")).is_dir()
@@ -316,7 +330,9 @@ impl RegisteredFixture {
             }
             RegisteredFixtureKind::RustGlobal => {
                 ensure_rust_global_program_compiled()?;
-                Ok(dir.join("target").join("debug").join("rust_global_program"))
+                Ok(fixture_cargo_target_dir(&dir)
+                    .join("debug")
+                    .join("rust_global_program"))
             }
             RegisteredFixtureKind::InlineCallsite => {
                 ensure_inline_callsite_program_compiled()?;

@@ -144,10 +144,17 @@ docker build -t ghostscope-builder:ubuntu20.04 -f docker/base-build/Dockerfile .
 
 ## 测试
 
-### 集成测试和 UT
+### Workspace 测试
 
 ```bash
-sudo cargo test
+cargo test --all-features
+```
+
+### E2E 测试
+
+```bash
+cargo build -p ghostscope -p dwarf-tool --all-features
+sudo cargo test -p ghostscope-e2e-tests --tests --all-features -- --nocapture
 ```
 
 ### DWARF 性能基线
@@ -167,7 +174,7 @@ DWARF 解析性能基线的完整说明单独放在
 
 ### Agent E2E Runner（Codex）
 
-该流程用于在 AI agent 环境中执行 e2e，目的是规避 agent 无法直接执行 `sudo cargo test` 的限制。
+该流程用于在 AI agent 环境中执行 e2e，目的是规避 agent 无法直接执行 `sudo cargo test -p ghostscope-e2e-tests ...` 的限制。
 
 `runner service` 需要开发者自行使用 `sudo` 启动：
 
@@ -206,13 +213,16 @@ curl -sS -X POST http://127.0.0.1:8788/runs \
 - `E2E_CHILD_CONTAINER_IMAGE=<image-ref>`
   覆盖 nested `child-container` 目标使用的镜像。默认会继承 `E2E_CONTAINER_IMAGE`，也就是外层 sandbox 和子容器默认共用同一张 runtime 镜像，除非你显式指定不同镜像。
 - `E2E_GHOSTSCOPE_LOG_LEVEL=error|warn|info|debug|trace`
-  为直接执行的 `cargo test` 打开 GhostScope 日志并设置日志级别。
+  为直接执行的 e2e `cargo test` 打开 GhostScope 日志并设置日志级别。
   设置该变量后，测试 helper 会自动启用 GhostScope 的文件日志和控制台日志。
 
-如果要在直接执行 `cargo test` 时收集 GhostScope 日志，可设置：
+如果要在直接执行 e2e `cargo test` 时收集 GhostScope 日志，可设置：
 
 ```bash
-E2E_GHOSTSCOPE_LOG_LEVEL=debug cargo test --all-features --test script_execution test_correct_pid_filtering -- --nocapture
+cargo build -p ghostscope -p dwarf-tool --all-features
+sudo env \
+  E2E_GHOSTSCOPE_LOG_LEVEL=debug \
+  cargo test -p ghostscope-e2e-tests --all-features --test script_execution test_correct_pid_filtering -- --nocapture
 ```
 
 测试 helper 会在该次运行里自动打开 GhostScope 的文件日志和控制台日志。
@@ -249,21 +259,23 @@ curl -sS -X POST http://127.0.0.1:8788/runs \
 通过 topology-aware Rust e2e 框架，对当前主要支持的容器场景运行全量 e2e：
 
 ```bash
+cargo build -p ghostscope -p dwarf-tool --all-features
+
 sudo env \
   E2E_GHOSTSCOPE_SANDBOX=host \
   E2E_TARGET_SANDBOX=docker-private \
-  cargo test --all-features -- --nocapture
+  cargo test -p ghostscope-e2e-tests --all-features -- --nocapture
 
 sudo env \
   E2E_GHOSTSCOPE_SANDBOX=docker-private \
   E2E_TARGET_SANDBOX=docker-private \
-  cargo test --all-features -- --nocapture
+  cargo test -p ghostscope-e2e-tests --all-features -- --nocapture
 
 sudo env \
   E2E_GHOSTSCOPE_SANDBOX=docker-private \
   E2E_TARGET_SANDBOX=docker-private \
   E2E_TARGET_MODE=child-container \
-  cargo test --all-features -- --nocapture
+  cargo test -p ghostscope-e2e-tests --all-features -- --nocapture
 ```
 
 `docker-host` 同 sandbox 的场景继续保留聚焦 `-p` 的 smoke 用例：
@@ -274,7 +286,7 @@ for test_case in test_invalid_pid_handling test_correct_pid_filtering test_pid_s
   sudo env \
     E2E_GHOSTSCOPE_SANDBOX=docker-host \
     E2E_TARGET_SANDBOX=docker-host \
-    cargo test --all-features --test script_execution "$test_case" -- --nocapture
+    cargo test -p ghostscope-e2e-tests --all-features --test script_execution "$test_case" -- --nocapture
 done
 ```
 
@@ -282,7 +294,8 @@ done
 
 - Rust 测试 harness 仍运行在宿主机上，GhostScope 和目标进程会按指定拓扑进入对应容器 sandbox。
 - 当 GhostScope 和目标使用同一种 sandbox 类型时，topology-aware e2e helper 会自动复用同一个 sandbox 实例。
-- `host -> docker-private`、`docker-private -> same docker-private` 和 `docker-private -> child-container` 是当前在 CI 中跑全量 e2e 的容器场景。
+- 主 `CI` workflow 会在默认 host-host 环境下跑完整的 `ghostscope-e2e-tests` 套件，其中也包括 `container_topology_execution`。
+- `host -> docker-private`、`docker-private -> same docker-private` 和 `docker-private -> child-container` 是当前在独立 `Container E2E` workflow 中按显式 topology 跑全量 e2e 的容器场景。
 - `docker-private -> child-container` 通过 `E2E_TARGET_MODE=child-container` 启用，表示目标进程运行在外层 private sandbox 里再启动的子容器中。这个拓扑现在已经进入 full-CI 矩阵，但 nested child-container 的 `-t` 用例在 Rust 测试内部仍然沿用现有的显式跳过路径。
 - `docker-host -> same docker-host` 仍保留为 smoke，因为它更接近默认的 host PID 视角。
 - `docker-private` 这一组通常需要 `sudo`，因为宿主机上的测试 harness 需要检查该 sandbox 的 PID namespace。
@@ -298,7 +311,9 @@ done
 
 GhostScope 提供了一个独立的 `dwarf-tool` 用于测试和调试 DWARF 解析：
 
+```bash
 cargo build -p dwarf-tool
+```
 
 ### Debug 输出文件
 

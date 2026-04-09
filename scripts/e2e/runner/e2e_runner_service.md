@@ -51,7 +51,7 @@ curl -sS -X POST http://127.0.0.1:8788/runs \
   }'
 ```
 
-The service builds and runs GhostScope integration e2e only: effectively `cargo test -p ghostscope --tests --all-features ...`, plus `cargo build -p dwarf-tool`.
+The service builds and runs GhostScope workspace-level e2e only: effectively `cargo build -p ghostscope --all-features`, `cargo build -p dwarf-tool`, and `cargo test -p ghostscope-e2e-tests --tests --all-features ...`.
 
 ## Agent-side trigger
 
@@ -117,13 +117,13 @@ for test_case in test_invalid_pid_handling test_correct_pid_filtering test_pid_s
   sudo env \
     E2E_GHOSTSCOPE_SANDBOX=docker-private \
     E2E_TARGET_SANDBOX=docker-private \
-    cargo test -p ghostscope --all-features --test script_execution "$test_case" -- --nocapture
+    cargo test -p ghostscope-e2e-tests --all-features --test script_execution "$test_case" -- --nocapture
 done
 
 for test_case in test_invalid_pid_handling test_correct_pid_filtering test_pid_specificity_with_multiple_processes; do
   sudo env \
     E2E_GHOSTSCOPE_SANDBOX=docker-host \
     E2E_TARGET_SANDBOX=docker-host \
-    cargo test -p ghostscope --all-features --test script_execution "$test_case" -- --nocapture
+    cargo test -p ghostscope-e2e-tests --all-features --test script_execution "$test_case" -- --nocapture
 done
 ```

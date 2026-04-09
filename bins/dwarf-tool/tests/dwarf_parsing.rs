@@ -15,7 +15,7 @@ fn ws_root() -> PathBuf {
         .to_path_buf()
 }
 fn fixtures_dir() -> PathBuf {
-    ws_root().join("ghostscope/tests/fixtures")
+    ws_root().join("e2e-tests/tests/fixtures")
 }
 
 static BUILD_DEBUG_ONCE: Once = Once::new();

@@ -1,0 +1,29 @@
+[package]
+name = "ghostscope-e2e-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Workspace-level end-to-end tests for the GhostScope CLI and sandbox topologies."
+publish = false
+
+[dev-dependencies]
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }
+tempfile = { workspace = true }
+lazy_static = { workspace = true }
+scopeguard = { workspace = true }
+serial_test = { workspace = true }
+object = { workspace = true }
+ghostscope-compiler = { version = "0.1.1", path = "../ghostscope-compiler" }
+ghostscope-dwarf = { version = "0.1.1", path = "../ghostscope-dwarf" }
+ghostscope-process = { version = "0.1.1", path = "../ghostscope-process" }
+libc = "0.2"
+regex = "1"

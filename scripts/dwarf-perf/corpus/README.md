@@ -2,7 +2,7 @@
 
 This directory holds reproducible programs used for DWARF parser performance baselines.
 
-The corpus is intentionally separate from `ghostscope/tests/fixtures`:
+The corpus is intentionally separate from `e2e-tests/tests/fixtures`:
 
 - correctness fixtures stay small and easy to reason about
 - perf fixtures can grow in size and DWARF density without making routine e2e work slower

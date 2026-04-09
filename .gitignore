@@ -52,8 +52,25 @@ test_*
 !scripts/**/*.sh
 # Keep other C files in test fixtures but exclude random C files in root
 /*.c
-ghostscope/tests/fixtures/inline_callsite_program/inline_callsite_program
-ghostscope/tests/fixtures/late_globals_program/late_globals_program
+e2e-tests/tests/fixtures/complex_types_program/complex_types_program
+e2e-tests/tests/fixtures/complex_types_program/complex_types_program_o*
+e2e-tests/tests/fixtures/complex_types_program/complex_types_program_nopie
+e2e-tests/tests/fixtures/cpp_complex_program/cpp_complex_program
+e2e-tests/tests/fixtures/globals_program/globals_program
+e2e-tests/tests/fixtures/globals_program/libgvars.so
+e2e-tests/tests/fixtures/inline_callsite_program/inline_callsite_program
+e2e-tests/tests/fixtures/late_globals_program/late_globals_program
+e2e-tests/tests/fixtures/member_pointer_program/member_pointer_program
+e2e-tests/tests/fixtures/member_pointer_program/member_pointer_program_o*
+e2e-tests/tests/fixtures/partitioned_ranges_program/partitioned_ranges_program
+e2e-tests/tests/fixtures/rust_global_program/target/
+e2e-tests/tests/fixtures/sample_program/sample_lib.o
+e2e-tests/tests/fixtures/sample_program/sample_program
+e2e-tests/tests/fixtures/sample_program/sample_program.o
+e2e-tests/tests/fixtures/sample_program/sample_program_stripped
+e2e-tests/tests/fixtures/sample_program/sample_program_stripped.debug
+e2e-tests/tests/fixtures/static_scope_program/static_scope_program
+e2e-tests/tests/fixtures/static_scope_program/static_scope_program_clang_dwarf5
 CLA*
 IMPL*
 DWARF*

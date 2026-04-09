@@ -32,7 +32,7 @@ Use GhostScope when preserving process timing matters. Use GDB when you need to 
 
 ## GhostScope vs GDB Performance Snapshot
 
-We now ship a reproducible single-thread benchmark for one narrow question: "what does it cost to evaluate the same local variable on every hot-function hit?" The harness lives in [`../scripts/compare/compare_hot_function_bench.py`](../scripts/compare/compare_hot_function_bench.py), the target program is [`../scripts/compare/compare_hot_function_target.c`](../scripts/compare/compare_hot_function_target.c), and the runner-service entrypoint is [`../ghostscope/tests/manual_gdb_ghostscope_benchmark.rs`](../ghostscope/tests/manual_gdb_ghostscope_benchmark.rs).
+We now ship a reproducible single-thread benchmark for one narrow question: "what does it cost to evaluate the same local variable on every hot-function hit?" The harness lives in [`../scripts/compare/compare_hot_function_bench.py`](../scripts/compare/compare_hot_function_bench.py), the target program is [`../scripts/compare/compare_hot_function_target.c`](../scripts/compare/compare_hot_function_target.c), and the runner-service entrypoint is [`../e2e-tests/tests/manual_gdb_ghostscope_benchmark.rs`](../e2e-tests/tests/manual_gdb_ghostscope_benchmark.rs).
 
 ### Method
 

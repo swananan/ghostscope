@@ -143,10 +143,17 @@ After rebuilding, a regular workspace build will pick up the new objects automat
 
 ## Testing
 
-### Integration Tests and Unit Tests
+### Workspace Tests
 
 ```bash
-sudo cargo test
+cargo test --all-features
+```
+
+### E2E Tests
+
+```bash
+cargo build -p ghostscope -p dwarf-tool --all-features
+sudo cargo test -p ghostscope-e2e-tests --tests --all-features -- --nocapture
 ```
 
 ### DWARF Performance Baselines
@@ -166,7 +173,7 @@ The current published history dashboard is available at
 
 ### Agent E2E Runner (Codex)
 
-This runner path is for running e2e from an AI agent environment, where the agent may not be able to execute `sudo cargo test` directly.
+This runner path is for running e2e from an AI agent environment, where the agent may not be able to execute `sudo cargo test -p ghostscope-e2e-tests ...` directly.
 
 The service must be started by the developer manually with `sudo`:
 
@@ -205,13 +212,16 @@ Test-framework environment variables:
 - `E2E_CHILD_CONTAINER_IMAGE=<image-ref>`
   Overrides the image used for nested `child-container` targets. By default it inherits `E2E_CONTAINER_IMAGE`, so the outer sandbox and nested child container use the same runtime image unless you explicitly split them.
 - `E2E_GHOSTSCOPE_LOG_LEVEL=error|warn|info|debug|trace`
-  Enables GhostScope logging for direct `cargo test` runs and sets the log level.
+  Enables GhostScope logging for direct e2e `cargo test` runs and sets the log level.
   The test helper automatically turns on GhostScope file+console logging when this is set.
 
-To collect GhostScope logs during a direct `cargo test` run, set:
+To collect GhostScope logs during a direct e2e `cargo test` run, set:
 
 ```bash
-E2E_GHOSTSCOPE_LOG_LEVEL=debug cargo test --all-features --test script_execution test_correct_pid_filtering -- --nocapture
+cargo build -p ghostscope -p dwarf-tool --all-features
+sudo env \
+  E2E_GHOSTSCOPE_LOG_LEVEL=debug \
+  cargo test -p ghostscope-e2e-tests --all-features --test script_execution test_correct_pid_filtering -- --nocapture
 ```
 
 The test helper will enable GhostScope file+console logging automatically for that run.
@@ -248,21 +258,23 @@ Supported levels:
 Run full e2e for the primary supported container scenarios:
 
 ```bash
+cargo build -p ghostscope -p dwarf-tool --all-features
+
 sudo env \
   E2E_GHOSTSCOPE_SANDBOX=host \
   E2E_TARGET_SANDBOX=docker-private \
-  cargo test --all-features -- --nocapture
+  cargo test -p ghostscope-e2e-tests --all-features -- --nocapture
 
 sudo env \
   E2E_GHOSTSCOPE_SANDBOX=docker-private \
   E2E_TARGET_SANDBOX=docker-private \
-  cargo test --all-features -- --nocapture
+  cargo test -p ghostscope-e2e-tests --all-features -- --nocapture
 
 sudo env \
   E2E_GHOSTSCOPE_SANDBOX=docker-private \
   E2E_TARGET_SANDBOX=docker-private \
   E2E_TARGET_MODE=child-container \
-  cargo test --all-features -- --nocapture
+  cargo test -p ghostscope-e2e-tests --all-features -- --nocapture
 ```
 
 Run the PID-focused smoke subset for the host-PID same-sandbox topology:
@@ -273,7 +285,7 @@ for test_case in test_invalid_pid_handling test_correct_pid_filtering test_pid_s
   sudo env \
     E2E_GHOSTSCOPE_SANDBOX=docker-host \
     E2E_TARGET_SANDBOX=docker-host \
-    cargo test --all-features --test script_execution "$test_case" -- --nocapture
+    cargo test -p ghostscope-e2e-tests --all-features --test script_execution "$test_case" -- --nocapture
 done
 ```
 
@@ -281,7 +293,8 @@ Notes:
 
 - These commands keep the Rust test harness on the host and move GhostScope plus the traced target into the requested container sandbox topology.
 - When GhostScope and target use the same sandbox kind, the topology-aware e2e helper automatically reuses the same sandbox instance.
-- `host -> docker-private`, `docker-private -> same docker-private`, and `docker-private -> child-container` are the container scenarios that currently run the full e2e suite in CI.
+- The main `CI` workflow runs the full `ghostscope-e2e-tests` suite under the default host-host environment, including `container_topology_execution`.
+- `host -> docker-private`, `docker-private -> same docker-private`, and `docker-private -> child-container` are the explicit topology scenarios that currently run the full e2e suite in the dedicated `Container E2E` workflow.
 - `docker-private -> child-container` uses `E2E_TARGET_MODE=child-container` and launches the target in a nested Docker child container inside the outer private sandbox. The full suite now runs in CI for that topology, while nested child-container `-t` cases still follow the existing explicit skip path inside the Rust tests.
 - `docker-host -> same docker-host` remains a smoke run because it is close to the default host PID view.
 - Running the `docker-private` variant usually requires `sudo` because the host-side test harness must inspect the sandbox PID namespace.

@@ -73,6 +73,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ github.job }}-${{ matrix.name }}-target-
 
+      - name: Build GhostScope CLI and dwarf-tool
+        run: cargo build -p ghostscope -p dwarf-tool --all-features
+
       - name: Run container topology full e2e
         env:
           E2E_CONTAINER_IMAGE: ghcr.io/swananan/ghostscope-e2e-runtime@sha256:d5df1b977c38f7a51bbf28b878f2246705a05b83ac6df7cb6be8f8a4de4105f4
@@ -89,7 +92,7 @@ jobs:
             E2E_GHOSTSCOPE_SANDBOX="$E2E_GHOSTSCOPE_SANDBOX" \
             E2E_TARGET_SANDBOX="$E2E_TARGET_SANDBOX" \
             E2E_TARGET_MODE="$E2E_TARGET_MODE" \
-            "$(which cargo)" test -p ghostscope --tests --all-features -- --nocapture
+            "$(which cargo)" test -p ghostscope-e2e-tests --tests --all-features -- --nocapture
 
       - name: Cleanup session sandboxes
         if: always()
@@ -155,6 +158,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ github.job }}-${{ matrix.name }}-target-
 
+      - name: Build GhostScope CLI and dwarf-tool
+        run: cargo build -p ghostscope -p dwarf-tool --all-features
+
       - name: Run host-PID same-sandbox smoke
         env:
           E2E_CONTAINER_IMAGE: ghcr.io/swananan/ghostscope-e2e-runtime@sha256:d5df1b977c38f7a51bbf28b878f2246705a05b83ac6df7cb6be8f8a4de4105f4
@@ -176,7 +182,7 @@ jobs:
               E2E_GHOSTSCOPE_SANDBOX="$E2E_GHOSTSCOPE_SANDBOX" \
               E2E_TARGET_SANDBOX="$E2E_TARGET_SANDBOX" \
               E2E_TARGET_MODE="$E2E_TARGET_MODE" \
-              "$(which cargo)" test -p ghostscope --all-features --test script_execution "$test_case" -- --nocapture
+              "$(which cargo)" test -p ghostscope-e2e-tests --all-features --test script_execution "$test_case" -- --nocapture
           done
 
       - name: Cleanup session sandboxes

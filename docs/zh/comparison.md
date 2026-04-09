@@ -32,7 +32,7 @@ GhostScope 的目标很明确：**针对带有 DWARF 调试信息的活跃进程
 
 ## GhostScope vs GDB 实测性能快照
 
-现在仓库里已经有一套可重复执行的单线程 benchmark，用来回答一个很窄但很实际的问题：**在热点函数每次命中时，读取同一个局部变量到底要付出多大代价？** harness 在 [`../scripts/compare/compare_hot_function_bench.py`](../scripts/compare/compare_hot_function_bench.py)，目标程序在 [`../scripts/compare/compare_hot_function_target.c`](../scripts/compare/compare_hot_function_target.c)，runner service 的入口在 [`../ghostscope/tests/manual_gdb_ghostscope_benchmark.rs`](../ghostscope/tests/manual_gdb_ghostscope_benchmark.rs)。
+现在仓库里已经有一套可重复执行的单线程 benchmark，用来回答一个很窄但很实际的问题：**在热点函数每次命中时，读取同一个局部变量到底要付出多大代价？** harness 在 [`../scripts/compare/compare_hot_function_bench.py`](../scripts/compare/compare_hot_function_bench.py)，目标程序在 [`../scripts/compare/compare_hot_function_target.c`](../scripts/compare/compare_hot_function_target.c)，runner service 的入口在 [`../e2e-tests/tests/manual_gdb_ghostscope_benchmark.rs`](../e2e-tests/tests/manual_gdb_ghostscope_benchmark.rs)。
 
 ### 方法
 
