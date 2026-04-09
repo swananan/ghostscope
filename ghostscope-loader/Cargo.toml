@@ -14,9 +14,9 @@ categories.workspace = true
 description = "Loads compiled GhostScope programs, manages sessions, and orchestrates eBPF lifecycle."
 
 [dependencies]
-ghostscope-compiler = { version = "0.1.1", path = "../ghostscope-compiler" }
-ghostscope-protocol = { version = "0.1.1", path = "../ghostscope-protocol" }
-ghostscope-process = { version = "0.1.1", path = "../ghostscope-process" }
+ghostscope-compiler = { version = "0.1.3", path = "../ghostscope-compiler" }
+ghostscope-protocol = { version = "0.1.3", path = "../ghostscope-protocol" }
+ghostscope-process = { version = "0.1.3", path = "../ghostscope-process" }
 aya = { workspace = true }
 aya-obj = { workspace = true }
 tracing = { workspace = true }

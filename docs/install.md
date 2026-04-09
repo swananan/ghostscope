@@ -39,7 +39,7 @@ Restart the terminal and run `ghostscope --version` to verify.
 
 2. Extract the binary:
 ```bash
-tar -xzf ghostscope-v0.1.0-x86_64-linux.tar.gz
+tar -xzf ghostscope-v0.1.3-x86_64-linux.tar.gz
 ```
 
 3. Move to system path (optional):

@@ -22,8 +22,8 @@ lazy_static = { workspace = true }
 scopeguard = { workspace = true }
 serial_test = { workspace = true }
 object = { workspace = true }
-ghostscope-compiler = { version = "0.1.1", path = "../ghostscope-compiler" }
-ghostscope-dwarf = { version = "0.1.1", path = "../ghostscope-dwarf" }
-ghostscope-process = { version = "0.1.1", path = "../ghostscope-process" }
+ghostscope-compiler = { version = "0.1.3", path = "../ghostscope-compiler" }
+ghostscope-dwarf = { version = "0.1.3", path = "../ghostscope-dwarf" }
+ghostscope-process = { version = "0.1.3", path = "../ghostscope-process" }
 libc = "0.2"
 regex = "1"
