@@ -11,8 +11,10 @@ If you are using Codex or Claude Code in the same workspace, the fastest way to 
 Install the skill:
 
 ```bash
-./scripts/skills/install_ghostscope_runtime_analysis_skill.sh --copy
+curl -fsSL https://raw.githubusercontent.com/swananan/ghostscope/main/scripts/skills/install_ghostscope_runtime_analysis_skill.sh | bash -s -- --copy
 ```
+
+If you already have the repository checked out locally, `./scripts/skills/install_ghostscope_runtime_analysis_skill.sh --copy` works too.
 
 Then ask for a concrete tracing workflow:
 

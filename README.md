@@ -52,8 +52,10 @@ GhostScope supports two modes: an interactive TUI mode, and a CLI mode built aro
 Install the shared skill for Codex or Claude Code:
 
 ```bash
-./scripts/skills/install_ghostscope_runtime_analysis_skill.sh --copy
+curl -fsSL https://raw.githubusercontent.com/swananan/ghostscope/main/scripts/skills/install_ghostscope_runtime_analysis_skill.sh | bash -s -- --copy
 ```
+
+If you already have the repository checked out locally, `./scripts/skills/install_ghostscope_runtime_analysis_skill.sh --copy` works too.
 
 Use `--codex`, `--claude`, or `--all` when you want to force a target. Restart Codex or Claude Code after installation.
 

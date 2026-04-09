@@ -2,12 +2,29 @@
 set -euo pipefail
 
 MODE="link"
+MODE_EXPLICIT="0"
 FORCE="0"
 INSTALL_CODEX="0"
 INSTALL_CLAUDE="0"
 EXPLICIT_TARGETS="0"
 PRINT_VERSION="0"
 SKILL_NAME=""
+REPO="${GHOSTSCOPE_SKILL_REPO:-swananan/ghostscope}"
+REQUESTED_REF="${GHOSTSCOPE_SKILL_REF:-}"
+ARCHIVE_URL_OVERRIDE="${GHOSTSCOPE_SKILL_ARCHIVE_URL:-}"
+SKILL_SRC=""
+SKILL_SOURCE_KIND=""
+SKILL_SOURCE_REF=""
+SKILL_VERSION="0.0.0-dev"
+TMPDIR_CREATED=""
+
+cleanup() {
+  if [[ -n "$TMPDIR_CREATED" && -d "$TMPDIR_CREATED" ]]; then
+    rm -rf "$TMPDIR_CREATED"
+  fi
+}
+
+trap cleanup EXIT
 
 usage() {
   cat <<'EOF'
@@ -15,6 +32,7 @@ Install a shared GhostScope skill into Codex and/or Claude Code personal skill d
 
 Usage:
   ./scripts/skills/install_skill.sh <skill-name> [--link|--copy] [--force] [--codex|--claude|--all] [--print-version]
+  curl -fsSL https://raw.githubusercontent.com/swananan/ghostscope/main/scripts/skills/install_skill.sh | bash -s -- <skill-name> [--copy] [--force] [--codex|--claude|--all] [--print-version]
 
 Options:
   --link    Install as symlink (default)
@@ -28,17 +46,127 @@ Options:
 When no target flag is provided, the script auto-detects Codex and Claude Code by
 checking CODEX_HOME / CLAUDE_HOME, existing ~/.codex / ~/.claude homes, and the
 presence of the codex / claude commands.
+
+Remote mode:
+  When the script cannot find a local GhostScope checkout, it downloads the skill
+  from the latest GitHub release. If no release is available, it falls back to
+  the repository's main branch.
+
+Environment:
+  GHOSTSCOPE_SKILL_REPO         Override the GitHub repo (default: swananan/ghostscope)
+  GHOSTSCOPE_SKILL_REF          Override the Git ref to download in remote mode
+  GHOSTSCOPE_SKILL_ARCHIVE_URL  Override the archive URL in remote mode
 EOF
+}
+
+log() {
+  echo "==> $*" >&2
+}
+
+ensure_command() {
+  local cmd="$1"
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "Required command not found: $cmd" >&2
+    exit 1
+  fi
+}
+
+make_tempdir() {
+  if [[ -z "$TMPDIR_CREATED" ]]; then
+    TMPDIR_CREATED="$(mktemp -d)"
+  fi
+}
+
+resolve_latest_release_ref() {
+  ensure_command curl
+
+  local redirect_url=""
+  local normalized_url=""
+  local tag=""
+
+  if redirect_url="$(curl -fsSL -o /dev/null -w '%{url_effective}' "https://github.com/${REPO}/releases/latest")"; then
+    normalized_url="${redirect_url%%[\?#]*}"
+    if [[ "$normalized_url" == "https://github.com/${REPO}/releases/tag/"* ]]; then
+      tag="${normalized_url##*/}"
+    fi
+    if [[ -n "$tag" ]]; then
+      printf '%s\n' "$tag"
+      return 0
+    fi
+  fi
+
+  printf '%s\n' "main"
+}
+
+resolve_local_skill_source() {
+  local script_path="${BASH_SOURCE[0]:-}"
+  local script_dir=""
+  local repo_root=""
+  local candidate=""
+
+  if [[ -z "$script_path" || ! -e "$script_path" ]]; then
+    return 1
+  fi
+
+  script_dir="$(cd "$(dirname "$script_path")" && pwd)"
+  repo_root="$(cd "$script_dir/../.." && pwd)"
+  candidate="$repo_root/skills/$SKILL_NAME"
+
+  if [[ ! -d "$candidate" || ! -f "$candidate/SKILL.md" ]]; then
+    return 1
+  fi
+
+  SKILL_SRC="$candidate"
+  SKILL_SOURCE_KIND="local"
+  SKILL_SOURCE_REF="local-checkout"
+  return 0
+}
+
+resolve_remote_skill_source() {
+  ensure_command curl
+  ensure_command tar
+  make_tempdir
+
+  local archive_url="$ARCHIVE_URL_OVERRIDE"
+  local archive_path="$TMPDIR_CREATED/ghostscope-skill.tar.gz"
+  local skill_file=""
+
+  if [[ -z "$archive_url" ]]; then
+    if [[ -z "$REQUESTED_REF" ]]; then
+      REQUESTED_REF="$(resolve_latest_release_ref)"
+    fi
+    archive_url="https://codeload.github.com/${REPO}/tar.gz/${REQUESTED_REF}"
+  fi
+
+  if [[ -z "$REQUESTED_REF" ]]; then
+    REQUESTED_REF="archive-url"
+  fi
+
+  log "Downloading '$SKILL_NAME' from ${REPO}@${REQUESTED_REF}"
+  curl -fsSL "$archive_url" -o "$archive_path"
+  tar -xzf "$archive_path" -C "$TMPDIR_CREATED"
+
+  skill_file="$(find "$TMPDIR_CREATED" -path "*/skills/$SKILL_NAME/SKILL.md" -type f -print -quit)"
+  if [[ -z "$skill_file" ]]; then
+    echo "Skill source not found in downloaded archive: $SKILL_NAME" >&2
+    exit 1
+  fi
+
+  SKILL_SRC="$(dirname "$skill_file")"
+  SKILL_SOURCE_KIND="remote"
+  SKILL_SOURCE_REF="$REQUESTED_REF"
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --copy)
       MODE="copy"
+      MODE_EXPLICIT="1"
       shift
       ;;
     --link)
       MODE="link"
+      MODE_EXPLICIT="1"
       shift
       ;;
     --force)
@@ -91,17 +219,26 @@ if [[ -z "$SKILL_NAME" ]]; then
   exit 2
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-SKILL_SRC="$REPO_ROOT/skills/$SKILL_NAME"
-SKILL_VERSION_FILE="$SKILL_SRC/VERSION"
-SKILL_VERSION="0.0.0-dev"
+if ! resolve_local_skill_source; then
+  resolve_remote_skill_source
+fi
 
 if [[ ! -d "$SKILL_SRC" || ! -f "$SKILL_SRC/SKILL.md" ]]; then
   echo "Skill source not found: $SKILL_SRC" >&2
   exit 1
 fi
 
+if [[ "$SKILL_SOURCE_KIND" == "remote" ]]; then
+  if [[ "$MODE_EXPLICIT" == "1" && "$MODE" == "link" ]]; then
+    echo "--link is only supported when installing from a local GhostScope checkout." >&2
+    exit 1
+  fi
+  if [[ "$MODE_EXPLICIT" != "1" ]]; then
+    MODE="copy"
+  fi
+fi
+
+SKILL_VERSION_FILE="$SKILL_SRC/VERSION"
 if [[ -f "$SKILL_VERSION_FILE" ]]; then
   SKILL_VERSION="$(tr -d '[:space:]' < "$SKILL_VERSION_FILE")"
 fi
@@ -182,6 +319,10 @@ fi
 
 if [[ "$INSTALL_CLAUDE" == "1" ]]; then
   install_one "Claude Code" "${CLAUDE_HOME:-$HOME/.claude}"
+fi
+
+if [[ "$SKILL_SOURCE_KIND" == "remote" ]]; then
+  log "Installed from ${REPO}@${SKILL_SOURCE_REF}"
 fi
 
 echo "Restart Codex and/or Claude Code to pick up the new skill."
