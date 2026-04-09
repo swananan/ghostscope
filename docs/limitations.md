@@ -17,7 +17,7 @@ Currently only supports **Linux** operating system due to its core dependency on
 ## Soft Limitations
 
 ### 1. Language Support
-Primary focus is on **C language**, which has the best support. C++ and Rust are supported with limitations - advanced language features such as Rust async functions and C++ templates have limited support and require significant effort to improve gradually.
+Primary focus is on **C language**, which currently has the best end-to-end support. **C++** and **Rust** are supported in a more limited, DWARF-layout-oriented way: GhostScope can automatically demangle function names and global/static symbols, but most language-specific features are not modeled yet. In practice, simple C-like layouts work best, while advanced Rust and C++ features still require substantial future work.
 
 For interpreted languages (Lua, Python, Ruby, etc.), only the interpreter itself can be traced (since interpreters are typically implemented in compiled languages). Tracing script code is technically feasible but requires substantial development time. JIT language support is an even more distant goal.
 
