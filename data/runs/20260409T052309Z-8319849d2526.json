@@ -1,0 +1,88 @@
+{
+  "schema_version": 2,
+  "generated_at": "2026-04-09T05:23:09Z",
+  "repo_root": "/home/runner/work/ghostscope/ghostscope",
+  "corpus_dir": "/home/runner/work/ghostscope/ghostscope/scripts/dwarf-perf/corpus/out",
+  "manifest_path": "/home/runner/work/ghostscope/ghostscope/scripts/dwarf-perf/corpus/out/manifest.json",
+  "result_path": "/home/runner/work/ghostscope/ghostscope/.tmp/dwarf-perf-results/main.json",
+  "parse_benchmark": {
+    "description": "Fast parse benchmark: analyzer load plus initial DWARF fast-parse/index build.",
+    "binary": "/home/runner/work/ghostscope/ghostscope/scripts/dwarf-perf/corpus/out/parse-stress/parse_stress",
+    "runs": 10,
+    "metrics_ms": {
+      "average": 1088.721,
+      "p50": 1066.658,
+      "p95": 1157.155,
+      "min": 1055.513,
+      "max": 1157.155
+    }
+  },
+  "query_benchmark": {
+    "description": "End-to-end source-line query benchmark: source-line lookup, address resolution, and variable collection for all matched addresses.",
+    "binary": "/home/runner/work/ghostscope/ghostscope/scripts/dwarf-perf/corpus/out/query-hotspot/query_hotspot",
+    "source": {
+      "path": "/home/runner/work/ghostscope/ghostscope/scripts/dwarf-perf/corpus/src/query-hotspot/query_hotspot.c",
+      "line": 119
+    },
+    "loading_time_ms": 2,
+    "runs": 10,
+    "metrics_ms": {
+      "first_run": 4.24895,
+      "average": 3.7834683,
+      "p50": 3.7189889999999997,
+      "p95": 4.24895,
+      "min": 3.7114779999999996,
+      "max": 4.24895
+    }
+  },
+  "query_result": {
+    "description": "Snapshot of the matched query result for the benchmarked source line.",
+    "source": {
+      "path": "/home/runner/work/ghostscope/ghostscope/scripts/dwarf-perf/corpus/src/query-hotspot/query_hotspot.c",
+      "line": 119
+    },
+    "first_address": "0x40164f",
+    "address_count": 1,
+    "total_variables": 16
+  },
+  "corpus_manifest": {
+    "schema_version": 1,
+    "builder_image": "ghcr.io/swananan/ghostscope-dwarf-perf-builder@sha256:ed99b20a96a4fb2abc4845ca55e7e3780e97752d3281da441b8aa335b56b9ecb",
+    "compiler": {
+      "cc": "gcc",
+      "dwarf_version": 5
+    },
+    "artifacts": [
+      {
+        "name": "query-hotspot",
+        "kind": "single-address-query",
+        "relative_path": "query-hotspot/query_hotspot",
+        "sha256": "cb837cf400627c5dec8702e46246ae4cb7a6362f548993ae5726ef2c79087b83",
+        "size_bytes": 49264,
+        "source_path": "scripts/dwarf-perf/corpus/src/query-hotspot/query_hotspot.c",
+        "query_anchor": {
+          "function": "dwarf_perf_query_hotspot",
+          "source_marker": "DWARF_PERF_QUERY_HOTSPOT",
+          "source_line": 119
+        }
+      },
+      {
+        "name": "parse-stress",
+        "kind": "fast-parse",
+        "relative_path": "parse-stress/parse_stress",
+        "sha256": "c280ebe972e59f480d298ed56ceb03c6b62013ab88ee8a8c1b3a8b905157d1b2",
+        "size_bytes": 6753512,
+        "generator": {
+          "script": "scripts/dwarf-perf/generate_parse_stress.py",
+          "preset": "large",
+          "units": 48,
+          "types_per_unit": 24,
+          "functions_per_unit": 72,
+          "history_len": 16,
+          "generated_c_files": 49,
+          "generated_header_files": 50
+        }
+      }
+    ]
+  }
+}
