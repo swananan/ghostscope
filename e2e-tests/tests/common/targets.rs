@@ -356,7 +356,7 @@ fn ensure_sample_program_ready(
     ensure_test_program_compiled_with_opt(opt_level)?;
 
     sandbox.repo_path_for_fixture_binary(Path::new(&format!(
-        "ghostscope/tests/fixtures/sample_program/{}",
+        "e2e-tests/tests/fixtures/sample_program/{}",
         opt_level.as_binary_name()
     )))
 }

@@ -722,15 +722,9 @@ dependencies = [
  "ghostscope-process",
  "ghostscope-protocol",
  "ghostscope-ui",
- "lazy_static",
  "libc",
- "object",
- "regex",
- "scopeguard",
  "serde",
  "serde_json",
- "serial_test",
- "tempfile",
  "thiserror 2.0.12",
  "tokio",
  "toml",
@@ -779,6 +773,25 @@ dependencies = [
  "thiserror 2.0.12",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "ghostscope-e2e-tests"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "ghostscope-compiler",
+ "ghostscope-dwarf",
+ "ghostscope-process",
+ "lazy_static",
+ "libc",
+ "object",
+ "regex",
+ "scopeguard",
+ "serial_test",
+ "tempfile",
+ "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]

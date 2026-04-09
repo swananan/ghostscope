@@ -72,7 +72,7 @@ VALID_TARGET_MODE_ALIASES = {
     "descendant": "child-container",
 }
 VALID_LOG_LEVELS = {"error", "warn", "info", "debug", "trace"}
-E2E_TEST_PACKAGE = "ghostscope"
+E2E_TEST_PACKAGE = "ghostscope-e2e-tests"
 
 
 def ghostscope_e2e_cargo_args(*extra: str) -> List[str]:
@@ -337,8 +337,12 @@ class JobStore:
             build_cmd.append(test_case)
 
         return [
-            StepResult(name="build_test_binaries", command=build_cmd),
+            StepResult(
+                name="build_ghostscope_cli",
+                command=["cargo", "build", "-p", "ghostscope", "--all-features"],
+            ),
             StepResult(name="build_dwarf_tool", command=["cargo", "build", "-p", "dwarf-tool"]),
+            StepResult(name="build_test_binaries", command=build_cmd),
             StepResult(
                 name="run_e2e_case" if test_case else "run_e2e",
                 command=self._resolve_test_command(use_sudo, test_case),

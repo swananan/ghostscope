@@ -128,10 +128,63 @@ jobs:
       - name: Build dwarf-tool (required by tests)
         run: cargo build -p dwarf-tool
 
-      - name: Run tests with sudo
-        run: sudo -E $(which cargo) test --all-features
+      - name: Run workspace tests
+        run: cargo test --all-features
         env:
           RUST_BACKTRACE: 1
+
+  e2e:
+    name: Standard E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      LLVM_SYS_181_PREFIX: /usr/lib/llvm-18
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install LLVM 18 and Polly
+        run: |
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 18
+          sudo apt-get install -y llvm-18-dev libpolly-18-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-index-
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-${{ github.job }}-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ github.job }}-target-
+
+      - name: Build GhostScope CLI and dwarf-tool
+        run: cargo build -p ghostscope -p dwarf-tool --all-features
+
+      - name: Run e2e
+        env:
+          RUST_BACKTRACE: 1
+        run: sudo -E "$(which cargo)" test -p ghostscope-e2e-tests --tests --all-features -- --nocapture
 
   build:
     name: Build

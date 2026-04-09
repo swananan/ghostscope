@@ -129,21 +129,23 @@ done
 Fallback local topology commands:
 
 ```bash
+cargo build -p ghostscope -p dwarf-tool --all-features
+
 sudo env \
   E2E_GHOSTSCOPE_SANDBOX=host \
   E2E_TARGET_SANDBOX=docker-private \
-  cargo test -p ghostscope --tests --all-features -- --nocapture
+  cargo test -p ghostscope-e2e-tests --tests --all-features -- --nocapture
 
 sudo env \
   E2E_GHOSTSCOPE_SANDBOX=docker-private \
   E2E_TARGET_SANDBOX=docker-private \
-  cargo test -p ghostscope --tests --all-features -- --nocapture
+  cargo test -p ghostscope-e2e-tests --tests --all-features -- --nocapture
 
 for test_case in test_invalid_pid_handling test_correct_pid_filtering test_pid_specificity_with_multiple_processes; do
   sudo env \
     E2E_GHOSTSCOPE_SANDBOX=docker-host \
     E2E_TARGET_SANDBOX=docker-host \
-    cargo test -p ghostscope --all-features --test script_execution "$test_case" -- --nocapture
+    cargo test -p ghostscope-e2e-tests --all-features --test script_execution "$test_case" -- --nocapture
 done
 ```
 

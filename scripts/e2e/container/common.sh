@@ -210,6 +210,17 @@ execute_topology_cargo() {
   )
 }
 
+build_ghostscope_e2e_prereqs() {
+  local cargo_bin
+  cargo_bin="$(resolve_cargo_bin)"
+
+  echo "[container-e2e] building ghostscope CLI and dwarf-tool prerequisites"
+  (
+    cd "$REPO_DIR"
+    "$cargo_bin" build -p ghostscope -p dwarf-tool --all-features
+  )
+}
+
 run_ghostscope_container_full() {
   local ghostscope_sandbox="$1"
   local target_sandbox="$2"
@@ -222,8 +233,9 @@ run_ghostscope_container_full() {
   fi
 
   init_e2e_container_session "${ghostscope_sandbox}-to-${target_sandbox}-${target_mode}"
+  build_ghostscope_e2e_prereqs
 
-  local -a cargo_args=(test -p ghostscope --tests --all-features)
+  local -a cargo_args=(test -p ghostscope-e2e-tests --tests --all-features)
   if [[ ${#CONTAINER_SCRIPT_ARGS[@]} -gt 0 ]]; then
     cargo_args+=("${CONTAINER_SCRIPT_ARGS[@]}")
   fi
@@ -247,8 +259,9 @@ run_ghostscope_container_topology_case() {
   fi
 
   init_e2e_container_session "${ghostscope_sandbox}-to-${target_sandbox}-${target_mode}"
+  build_ghostscope_e2e_prereqs
 
-  local -a cargo_args=(test -p ghostscope --all-features --test "$test_binary")
+  local -a cargo_args=(test -p ghostscope-e2e-tests --all-features --test "$test_binary")
   if [[ ${#CONTAINER_SCRIPT_ARGS[@]} -gt 0 ]]; then
     cargo_args+=("${CONTAINER_SCRIPT_ARGS[@]}")
   else
@@ -277,10 +290,11 @@ run_ghostscope_container_smoke() {
   fi
 
   init_e2e_container_session "${ghostscope_sandbox}-to-${target_sandbox}-smoke"
+  build_ghostscope_e2e_prereqs
 
   local test_case
   for test_case in "${tests[@]}"; do
-    local -a cargo_args=(test -p ghostscope --all-features --test script_execution "$test_case")
+    local -a cargo_args=(test -p ghostscope-e2e-tests --all-features --test script_execution "$test_case")
     append_cargo_test_runner_args cargo_args
     echo "[container-e2e] session=$E2E_SANDBOX_SESSION smoke=$test_case topology=${ghostscope_sandbox}->${target_sandbox}"
     execute_topology_cargo \

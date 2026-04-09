@@ -35,12 +35,3 @@ anyhow = { workspace = true }
 futures = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
-
-[dev-dependencies]
-# Test dependencies for integration tests
-tempfile = { workspace = true }
-lazy_static = { workspace = true }
-scopeguard = { workspace = true }
-serial_test = { workspace = true }
-regex = "1"
-object = { workspace = true }

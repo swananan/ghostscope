@@ -17,7 +17,21 @@ fn ws_root() -> PathBuf {
 }
 
 fn fixtures_dir() -> PathBuf {
-    ws_root().join("ghostscope/tests/fixtures")
+    ws_root().join("e2e-tests/tests/fixtures")
+}
+
+fn fixture_cargo_target_dir(fixture_dir: &std::path::Path) -> PathBuf {
+    match std::env::var_os("CARGO_TARGET_DIR") {
+        Some(target_dir) => {
+            let target_dir = PathBuf::from(target_dir);
+            if target_dir.is_absolute() {
+                target_dir
+            } else {
+                fixture_dir.join(target_dir)
+            }
+        }
+        None => fixture_dir.join("target"),
+    }
 }
 
 // Ensure any spawned fixture process is terminated even if the test returns early
@@ -55,7 +69,7 @@ fn build_rust_fixture(name: &str) -> PathBuf {
         "cargo build failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    dir.join("target/debug").join(name)
+    fixture_cargo_target_dir(&dir).join("debug").join(name)
 }
 
 async fn run_dwarf_tool_text(
