@@ -22,7 +22,7 @@ tracing-log = { workspace = true }
 thiserror = { workspace = true }
 tracing-subscriber = { workspace = true }
 aya-ebpf-bindings = { workspace = true }
-ghostscope-dwarf = { version = "0.1.1", path = "../ghostscope-dwarf" }
-ghostscope-protocol = { version = "0.1.1", path = "../ghostscope-protocol" }
-ghostscope-platform = { version = "0.1.1", path = "../ghostscope-platform" }
-ghostscope-process = { version = "0.1.1", path = "../ghostscope-process" }
+ghostscope-dwarf = { version = "0.1.3", path = "../ghostscope-dwarf" }
+ghostscope-protocol = { version = "0.1.3", path = "../ghostscope-protocol" }
+ghostscope-platform = { version = "0.1.3", path = "../ghostscope-platform" }
+ghostscope-process = { version = "0.1.3", path = "../ghostscope-process" }
