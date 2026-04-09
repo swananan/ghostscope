@@ -71,7 +71,9 @@ expand_path() {
 }
 
 cleanup() {
-  [[ -n "${TMPDIR_CREATED:-}" ]] && rm -rf "$TMPDIR_CREATED"
+  if [[ -n "${TMPDIR_CREATED:-}" ]]; then
+    rm -rf "$TMPDIR_CREATED"
+  fi
 }
 
 trap cleanup EXIT
@@ -111,11 +113,102 @@ map_arch() {
   esac
 }
 
+release_tag_from_url() {
+  local url="$1"
+  case "$url" in
+    *"/releases/tag/"*)
+      printf '%s\n' "${url##*/}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+latest_release_tag_from_feed() {
+  ensure_command curl
+  ensure_command python3
+
+  local feed_url="https://github.com/${REPO}/releases.atom"
+  local feed
+  if ! feed="$(curl -fsSL "$feed_url" 2>/dev/null)"; then
+    debug_log "curl request failed for ${feed_url}"
+    return 1
+  fi
+
+  python3 - "$feed" <<'PY'
+import re
+import sys
+import xml.etree.ElementTree as ET
+
+feed = sys.argv[1]
+ns = {"atom": "http://www.w3.org/2005/Atom"}
+
+try:
+    root = ET.fromstring(feed)
+except ET.ParseError:
+    raise SystemExit(1)
+
+for entry in root.findall("atom:entry", ns):
+    link = entry.find("atom:link[@rel='alternate']", ns)
+    href = link.get("href", "") if link is not None else ""
+    match = re.search(r"/releases/tag/([^/?#]+)$", href)
+    if match:
+        print(match.group(1))
+        raise SystemExit(0)
+
+raise SystemExit(1)
+PY
+}
+
+release_asset_names_for_tag() {
+  local tag="$1"
+  local arch="$2"
+  local aliases=("$arch")
+
+  case "$arch" in
+    x86_64) aliases+=("amd64") ;;
+    amd64) aliases+=("x86_64") ;;
+    aarch64) aliases+=("arm64") ;;
+    arm64) aliases+=("aarch64") ;;
+  esac
+
+  local alias
+  for alias in "${aliases[@]}"; do
+    printf '%s\n' \
+      "${BIN_NAME}-${tag}-${alias}-linux.tar.gz" \
+      "${BIN_NAME}-${tag}-${alias}-unknown-linux-gnu.tar.gz" \
+      "${BIN_NAME}-${tag}-${alias}.tar.gz"
+  done | awk '!seen[$0]++'
+}
+
+resolve_release_asset_from_tag() {
+  local tag="$1"
+  local arch="$2"
+
+  ensure_command curl
+
+  local asset_name
+  while IFS= read -r asset_name; do
+    [[ -n "$asset_name" ]] || continue
+    local download_url="https://github.com/${REPO}/releases/download/${tag}/${asset_name}"
+    debug_log "Trying direct release asset URL: $download_url"
+    if curl -fsSIL -o /dev/null "$download_url" 2>/dev/null; then
+      printf '%s\n%s\n%s\n' "$tag" "$download_url" "$asset_name"
+      return 0
+    fi
+  done < <(release_asset_names_for_tag "$tag" "$arch")
+
+  return 1
+}
+
 resolve_release_asset() {
   local version="$1"
   local arch="$2"
   local json=""
   local endpoint=""
+  local tag=""
+  local direct_result=""
 
   debug_log "Resolving release for version='$version' arch='$arch'"
   if [[ "$version" == "latest" ]]; then
@@ -128,12 +221,26 @@ resolve_release_asset() {
       ensure_command curl
       local redirect_url
       if redirect_url="$(curl -fsSL -o /dev/null -w '%{url_effective}' "https://github.com/${REPO}/releases/latest")"; then
-        local tag="${redirect_url##*/}"
+        tag="$(release_tag_from_url "$redirect_url" || true)"
         debug_log "Redirect latest -> tag=$tag"
         if [[ -n "$tag" && "$tag" != "latest" ]]; then
-          log "Following redirect to tag $tag"
-          json="$(github_api_request "/releases/tags/$tag")" || true
-          debug_log "GET /releases/tags/$tag returned length=${#json}"
+          if direct_result="$(resolve_release_asset_from_tag "$tag" "$arch")"; then
+            log "Using release tag $tag from redirect"
+            printf '%s' "$direct_result"
+            return 0
+          fi
+        fi
+      fi
+      if [[ -z "$json" ]]; then
+        log "Checking releases feed for latest tag"
+        tag="$(latest_release_tag_from_feed || true)"
+        debug_log "Feed latest -> tag=$tag"
+        if [[ -n "$tag" ]]; then
+          if direct_result="$(resolve_release_asset_from_tag "$tag" "$arch")"; then
+            log "Using release tag $tag from Atom feed"
+            printf '%s' "$direct_result"
+            return 0
+          fi
         fi
       fi
       if [[ -z "$json" ]]; then
@@ -176,6 +283,19 @@ PY
         break
       fi
     done
+    if [[ -z "$json" ]]; then
+      local candidate_tags=("$version")
+      if [[ "$version" != v* ]]; then
+        candidate_tags=("v$version" "${candidate_tags[@]}")
+      fi
+      for tag in "${candidate_tags[@]}"; do
+        if direct_result="$(resolve_release_asset_from_tag "$tag" "$arch")"; then
+          log "Using direct release asset URL for tag $tag"
+          printf '%s' "$direct_result"
+          return 0
+        fi
+      done
+    fi
   fi
 
   if [[ -z "$json" ]]; then
