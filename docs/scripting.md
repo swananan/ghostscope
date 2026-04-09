@@ -5,15 +5,16 @@ GhostScope uses a domain‑specific language to define trace points and actions.
 ## Table of Contents
 1. [Basic Syntax](#basic-syntax)
 2. [Trace Statements](#trace-statements)
-3. [Variables](#variables)
-4. [Print Statement](#print-statement)
-5. [Conditional Statements](#conditional-statements)
-6. [Expressions](#expressions)
-7. [Built-in Functions](#built-in-functions)
-8. [Special Variables](#special-variables)
-9. [Examples](#examples)
-10. [Limitations](#limitations)
-11. [Runtime Expression Failures (ExprError)](#runtime-expression-failures-exprerror)
+3. [Source Language Support](#source-language-support)
+4. [Variables](#variables)
+5. [Print Statement](#print-statement)
+6. [Conditional Statements](#conditional-statements)
+7. [Expressions](#expressions)
+8. [Built-in Functions](#built-in-functions)
+9. [Special Variables](#special-variables)
+10. [Examples](#examples)
+11. [Limitations](#limitations)
+12. [Runtime Expression Failures (ExprError)](#runtime-expression-failures-exprerror)
 
 ## Basic Syntax
 
@@ -92,6 +93,21 @@ trace libc.so.6:0x1234 {
 Notes:
 - For `0xADDR`, the default module depends on startup mode: `-t <binary>` uses `<binary>`; `-p <pid>` uses the main executable.
 - `module_suffix:0xADDR` allows selecting a module by full path or unique suffix; ambiguous suffixes will list candidates.
+
+## Source Language Support
+
+GhostScope's script syntax is source-language agnostic, but real-world support depends on how directly the traced program's DWARF maps back to runtime memory. Today the support level is uneven:
+
+| Source language | Support level | What to expect |
+| --- | --- | --- |
+| C | Best | This is the primary target. Plain locals, globals, pointers, arrays, structs, enums, and C strings map most directly to the current DWARF readers and script operators. |
+| C++ | Limited | Automatic demangling is supported for function names in `trace ...` patterns and for global/static variable lookup. Beyond name resolution, most C++-specific language features are not modeled yet, so the best results come from simple, C-like layouts and scalar fields. |
+| Rust | Limited | Automatic demangling is supported for function names in `trace ...` patterns and for global/static variable lookup. Beyond name resolution, most Rust-specific language features are not modeled yet, so the best results come from plain globals, scalar fields, and straightforward struct layouts. |
+
+Practical guidance:
+- Prefer C targets when you need the highest success rate for complex DWARF expressions.
+- For C++ and Rust, think of GhostScope as "DWARF layout aware" rather than "language semantics aware".
+- In C++ and Rust, start from demangled function/global names, then probe simple fields first. If name lookup is ambiguous, fall back to line- or address-based trace patterns.
 
 ## Variables
 
@@ -704,6 +720,7 @@ trace foo {
 4. Limited string operations (CString equality and built‑ins only)
 5. Limited arithmetic (no bitwise operators yet)
 6. No dynamic memory allocation in eBPF
+7. Uneven source-language coverage: C works best; C++ and Rust currently rely mostly on automatic demangling plus DWARF-layout-based access, with most language-specific features unsupported
 
 ## Best Practices
 
