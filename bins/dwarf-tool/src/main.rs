@@ -5,9 +5,10 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use ghostscope_dwarf::core::SectionType;
-use ghostscope_dwarf::{DwarfAnalyzer, ModuleAddress};
+use ghostscope_dwarf::{DwarfAnalyzer, ModuleAddress, ModuleLoadingEvent, ModuleLoadingStats};
 use std::path::PathBuf;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tracing::warn;
 
 #[derive(Parser)]
@@ -199,10 +200,19 @@ struct BenchmarkSummary {
     max_ms: f64,
 }
 
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+struct LoadTimingBreakdown {
+    module_count: usize,
+    parse_time_ms: u64,
+    index_time_ms: u64,
+    internal_total_time_ms: u64,
+}
+
 #[derive(Debug, serde::Serialize)]
 struct SourceLineBenchmarkResult {
     source_location: String,
     loading_time_ms: u64,
+    load_breakdown: LoadTimingBreakdown,
     address_count: usize,
     total_variables: usize,
     first_address: Option<String>,
@@ -443,6 +453,69 @@ async fn load_analyzer(pid: Option<u32>, target_path: Option<&str>) -> Result<Dw
             "Either PID or target path must be specified"
         ))
     }
+}
+
+fn summarize_millis(samples_ms: &[u64]) -> Result<BenchmarkSummary> {
+    let durations: Vec<Duration> = samples_ms
+        .iter()
+        .copied()
+        .map(Duration::from_millis)
+        .collect();
+    summarize_durations(&durations)
+}
+
+fn summarize_load_breakdown(stats: &[ModuleLoadingStats]) -> LoadTimingBreakdown {
+    let mut out = LoadTimingBreakdown {
+        module_count: stats.len(),
+        ..Default::default()
+    };
+
+    for stat in stats {
+        out.parse_time_ms += stat.parse_time_ms;
+        out.index_time_ms += stat.index_time_ms;
+        out.internal_total_time_ms += stat.module_total_time_ms;
+    }
+
+    out
+}
+
+async fn load_analyzer_with_breakdown(
+    pid: Option<u32>,
+    target_path: Option<&str>,
+) -> Result<(DwarfAnalyzer, LoadTimingBreakdown)> {
+    let completed_stats = Arc::new(Mutex::new(Vec::<ModuleLoadingStats>::new()));
+    let progress_stats = Arc::clone(&completed_stats);
+    let progress_callback = move |event: ModuleLoadingEvent| {
+        if let ModuleLoadingEvent::LoadingCompleted { stats, .. } = event {
+            progress_stats.lock().unwrap().push(stats);
+        }
+    };
+
+    let analyzer = if let Some(pid) = pid {
+        DwarfAnalyzer::from_pid_parallel_with_progress(pid, progress_callback).await?
+    } else if let Some(target_path) = target_path {
+        DwarfAnalyzer::from_exec_path_with_config_and_progress(
+            target_path,
+            &[],
+            false,
+            progress_callback,
+        )
+        .await?
+    } else {
+        return Err(anyhow::anyhow!(
+            "Either PID or target path must be specified"
+        ));
+    };
+
+    let stats = completed_stats.lock().unwrap().clone();
+    let breakdown = summarize_load_breakdown(&stats);
+    if breakdown.module_count == 0 {
+        return Err(anyhow::anyhow!(
+            "No module load statistics were captured during analyzer load"
+        ));
+    }
+
+    Ok((analyzer, breakdown))
 }
 
 async fn load_analyzer_and_execute(cli: Cli) -> Result<std::time::Duration> {
@@ -858,16 +931,28 @@ async fn run_benchmark(pid: Option<u32>, target_path: Option<&str>, runs: usize)
 
         print!("Loading: ");
         let mut load_times = Vec::new();
+        let mut parse_phase_ms = Vec::with_capacity(runs);
+        let mut index_phase_ms = Vec::with_capacity(runs);
+        let mut internal_total_phase_ms = Vec::with_capacity(runs);
+        let mut module_counts = Vec::with_capacity(runs);
 
         for _ in 0..runs {
             print!(".");
             std::io::Write::flush(&mut std::io::stdout()).unwrap();
             let start = Instant::now();
-            let _analyzer = DwarfAnalyzer::from_pid_parallel(pid).await?;
+            let (_analyzer, breakdown) = load_analyzer_with_breakdown(Some(pid), None).await?;
             load_times.push(start.elapsed());
+            parse_phase_ms.push(breakdown.parse_time_ms);
+            index_phase_ms.push(breakdown.index_time_ms);
+            internal_total_phase_ms.push(breakdown.internal_total_time_ms);
+            module_counts.push(breakdown.module_count);
         }
         println!();
         let summary = summarize_durations(&load_times)?;
+        let parse_summary = summarize_millis(&parse_phase_ms)?;
+        let index_summary = summarize_millis(&index_phase_ms)?;
+        let internal_total_summary = summarize_millis(&internal_total_phase_ms)?;
+        let module_count = *module_counts.first().unwrap_or(&0);
 
         println!("\nResults:");
         println!("  Average load time: {:.3}ms", summary.average_ms);
@@ -875,21 +960,65 @@ async fn run_benchmark(pid: Option<u32>, target_path: Option<&str>, runs: usize)
         println!("  P95: {:.3}ms", summary.p95_ms);
         println!("  Min: {:.3}ms", summary.min_ms);
         println!("  Max: {:.3}ms", summary.max_ms);
+        println!("\nInternal load phases (per-run sums across loaded modules):");
+        println!("  Internal module count: {module_count}");
+        println!("  Parse avg: {:.3}ms", parse_summary.average_ms);
+        println!("  Parse p50: {:.3}ms", parse_summary.p50_ms);
+        println!("  Parse p95: {:.3}ms", parse_summary.p95_ms);
+        println!("  Parse min: {:.3}ms", parse_summary.min_ms);
+        println!("  Parse max: {:.3}ms", parse_summary.max_ms);
+        println!("  Index avg: {:.3}ms", index_summary.average_ms);
+        println!("  Index p50: {:.3}ms", index_summary.p50_ms);
+        println!("  Index p95: {:.3}ms", index_summary.p95_ms);
+        println!("  Index min: {:.3}ms", index_summary.min_ms);
+        println!("  Index max: {:.3}ms", index_summary.max_ms);
+        println!(
+            "  Internal total avg: {:.3}ms",
+            internal_total_summary.average_ms
+        );
+        println!(
+            "  Internal total p50: {:.3}ms",
+            internal_total_summary.p50_ms
+        );
+        println!(
+            "  Internal total p95: {:.3}ms",
+            internal_total_summary.p95_ms
+        );
+        println!(
+            "  Internal total min: {:.3}ms",
+            internal_total_summary.min_ms
+        );
+        println!(
+            "  Internal total max: {:.3}ms",
+            internal_total_summary.max_ms
+        );
     } else if let Some(target) = target_path {
         println!("Benchmarking target file loading for {target} ({runs} runs)...\n");
 
         print!("Loading: ");
         let mut load_times = Vec::new();
+        let mut parse_phase_ms = Vec::with_capacity(runs);
+        let mut index_phase_ms = Vec::with_capacity(runs);
+        let mut internal_total_phase_ms = Vec::with_capacity(runs);
+        let mut module_counts = Vec::with_capacity(runs);
 
         for _ in 0..runs {
             print!(".");
             std::io::Write::flush(&mut std::io::stdout()).unwrap();
             let start = Instant::now();
-            let _analyzer = DwarfAnalyzer::from_exec_path(target).await?;
+            let (_analyzer, breakdown) = load_analyzer_with_breakdown(None, Some(target)).await?;
             load_times.push(start.elapsed());
+            parse_phase_ms.push(breakdown.parse_time_ms);
+            index_phase_ms.push(breakdown.index_time_ms);
+            internal_total_phase_ms.push(breakdown.internal_total_time_ms);
+            module_counts.push(breakdown.module_count);
         }
         println!();
         let summary = summarize_durations(&load_times)?;
+        let parse_summary = summarize_millis(&parse_phase_ms)?;
+        let index_summary = summarize_millis(&index_phase_ms)?;
+        let internal_total_summary = summarize_millis(&internal_total_phase_ms)?;
+        let module_count = *module_counts.first().unwrap_or(&0);
 
         println!("\nResults:");
         println!("  Average load time: {:.3}ms", summary.average_ms);
@@ -897,6 +1026,38 @@ async fn run_benchmark(pid: Option<u32>, target_path: Option<&str>, runs: usize)
         println!("  P95: {:.3}ms", summary.p95_ms);
         println!("  Min: {:.3}ms", summary.min_ms);
         println!("  Max: {:.3}ms", summary.max_ms);
+        println!("\nInternal load phases (per-run sums across loaded modules):");
+        println!("  Internal module count: {module_count}");
+        println!("  Parse avg: {:.3}ms", parse_summary.average_ms);
+        println!("  Parse p50: {:.3}ms", parse_summary.p50_ms);
+        println!("  Parse p95: {:.3}ms", parse_summary.p95_ms);
+        println!("  Parse min: {:.3}ms", parse_summary.min_ms);
+        println!("  Parse max: {:.3}ms", parse_summary.max_ms);
+        println!("  Index avg: {:.3}ms", index_summary.average_ms);
+        println!("  Index p50: {:.3}ms", index_summary.p50_ms);
+        println!("  Index p95: {:.3}ms", index_summary.p95_ms);
+        println!("  Index min: {:.3}ms", index_summary.min_ms);
+        println!("  Index max: {:.3}ms", index_summary.max_ms);
+        println!(
+            "  Internal total avg: {:.3}ms",
+            internal_total_summary.average_ms
+        );
+        println!(
+            "  Internal total p50: {:.3}ms",
+            internal_total_summary.p50_ms
+        );
+        println!(
+            "  Internal total p95: {:.3}ms",
+            internal_total_summary.p95_ms
+        );
+        println!(
+            "  Internal total min: {:.3}ms",
+            internal_total_summary.min_ms
+        );
+        println!(
+            "  Internal total max: {:.3}ms",
+            internal_total_summary.max_ms
+        );
     } else {
         return Err(anyhow::anyhow!(
             "Either PID or target path must be specified for benchmark"
@@ -928,7 +1089,7 @@ async fn run_source_line_benchmark(
     let (file_path, line_number) = parse_source_line(source)?;
 
     let load_start = Instant::now();
-    let mut analyzer = load_analyzer(pid, target_path).await?;
+    let (mut analyzer, load_breakdown) = load_analyzer_with_breakdown(pid, target_path).await?;
     let loading_time = load_start.elapsed();
 
     let mut query_times = Vec::with_capacity(runs);
@@ -938,6 +1099,13 @@ async fn run_source_line_benchmark(
 
     if !json {
         println!("Loaded in {}ms", loading_time.as_millis());
+        println!(
+            "Internal load breakdown: modules={} parse={}ms index={}ms internal_total={}ms",
+            load_breakdown.module_count,
+            load_breakdown.parse_time_ms,
+            load_breakdown.index_time_ms,
+            load_breakdown.internal_total_time_ms
+        );
         print!("Querying: ");
         std::io::Write::flush(&mut std::io::stdout()).unwrap();
     }
@@ -974,6 +1142,7 @@ async fn run_source_line_benchmark(
     let result = SourceLineBenchmarkResult {
         source_location: source.to_string(),
         loading_time_ms: loading_time.as_millis() as u64,
+        load_breakdown,
         address_count,
         total_variables,
         first_address,

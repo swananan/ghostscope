@@ -47,11 +47,17 @@ for var_name in \
     DWARF_PERF_DWARF_VERSION \
     DWARF_PERF_CFLAGS \
     DWARF_PERF_LDFLAGS \
+    DWARF_PERF_RUSTC \
+    DWARF_PERF_RUSTFLAGS \
     PARSE_STRESS_PRESET \
     PARSE_STRESS_UNITS \
     PARSE_STRESS_TYPES_PER_UNIT \
     PARSE_STRESS_FUNCTIONS_PER_UNIT \
-    PARSE_STRESS_HISTORY_LEN
+    PARSE_STRESS_HISTORY_LEN \
+    RUST_PARSE_STRESS_PRESET \
+    RUST_PARSE_STRESS_MODULES \
+    RUST_PARSE_STRESS_TYPES_PER_MODULE \
+    RUST_PARSE_STRESS_FUNCTIONS_PER_MODULE
 do
     if [[ -n "${!var_name:-}" ]]; then
         env_args+=(-e "$var_name")
@@ -59,8 +65,9 @@ do
 done
 
 docker run --rm \
-    --user "$(id -u):$(id -g)" \
     -e DWARF_PERF_BUILDER_IMAGE_REF="$IMAGE_REF" \
+    -e HOST_UID="$(id -u)" \
+    -e HOST_GID="$(id -g)" \
     "${env_args[@]}" \
     -v "$REPO_ROOT:/workspace" \
     -w /workspace \
@@ -70,5 +77,6 @@ docker run --rm \
 echo "Host artifacts:"
 echo "  $OUT_DIR/query-hotspot/query_hotspot"
 echo "  $OUT_DIR/parse-stress/parse_stress"
+echo "  $OUT_DIR/rust-parse-stress/rust_parse_stress"
 echo "  $OUT_DIR/manifest.json"
 echo

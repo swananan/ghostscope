@@ -92,6 +92,10 @@ pub(crate) struct ModuleData {
     type_name_index: TypeNameIndex,
     /// Demangled name maps for flexible lookups, built eagerly during module load.
     demangled_maps: DemangledNameMaps,
+    /// Timings captured during initial module load.
+    load_parse_ms: u64,
+    load_index_ms: u64,
+    load_total_ms: u64,
 }
 
 impl ModuleData {
@@ -610,6 +614,8 @@ impl ModuleData {
         };
         let index_elapsed_ms = index_started_at.elapsed().as_millis();
 
+        let load_total_ms = load_started_at.elapsed().as_millis() as u64;
+
         let module = Self {
             module_mapping: module_mapping.clone(),
             lightweight_index,
@@ -623,6 +629,9 @@ impl ModuleData {
             _dwarf_mapped_file: mapped_file,
             _binary_mapped_file: binary_mapped,
             demangled_maps,
+            load_parse_ms: parse_elapsed_ms as u64,
+            load_index_ms: index_elapsed_ms as u64,
+            load_total_ms,
         };
 
         tracing::info!(
@@ -635,7 +644,7 @@ impl ModuleData {
             state_label,
             parse_elapsed_ms,
             index_elapsed_ms,
-            load_started_at.elapsed().as_millis()
+            load_total_ms
         );
 
         Ok(module)
@@ -1606,6 +1615,11 @@ impl ModuleData {
     /// Get cache statistics
     pub(crate) fn get_cache_stats(&self) -> (usize, usize) {
         self.resolver.get_cache_stats()
+    }
+
+    /// Get initial module-load timing breakdown in milliseconds.
+    pub(crate) fn get_load_timing_ms(&self) -> (u64, u64, u64) {
+        (self.load_parse_ms, self.load_index_ms, self.load_total_ms)
     }
 
     /// Get CFA result at given PC

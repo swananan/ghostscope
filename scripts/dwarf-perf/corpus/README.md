@@ -15,6 +15,9 @@ The corpus is intentionally separate from `e2e-tests/tests/fixtures`:
 - `src/parse-stress/`
   - documentation for the generated multi-translation-unit corpus
   - sources are emitted by `scripts/dwarf-perf/generate_parse_stress.py` during the build
+- `src/rust-parse-stress/`
+  - documentation for the generated Rust large-symbol corpus
+  - sources are emitted by `scripts/dwarf-perf/generate_rust_parse_stress.py` during the build
 
 ## Build Flow
 
@@ -42,6 +45,7 @@ The build writes artifacts under `scripts/dwarf-perf/corpus/out/`:
 
 - `query-hotspot/query_hotspot`
 - `parse-stress/parse_stress`
+- `rust-parse-stress/rust_parse_stress`
 - `manifest.json`
 
 These generated outputs are ignored by Git through the repository
@@ -59,6 +63,12 @@ This will:
 - run the parse benchmark through `dwarf-tool benchmark`
 - run the query benchmark through `dwarf-tool benchmark-source-line`
 - write a JSON result under `perf-results/`
+
+To switch the parse benchmark to the Rust large-symbol corpus:
+
+```bash
+./scripts/dwarf-perf/run_baseline.sh --parse-target rust-parse-stress
+```
 
 `perf-results/` is also ignored by Git and is intended for local or CI
 benchmark result snapshots.
@@ -93,6 +103,10 @@ The generated parse corpus is deterministic and can be scaled without editing so
 - `PARSE_STRESS_TYPES_PER_UNIT`
 - `PARSE_STRESS_FUNCTIONS_PER_UNIT`
 - `PARSE_STRESS_HISTORY_LEN`
+- `RUST_PARSE_STRESS_PRESET`
+- `RUST_PARSE_STRESS_MODULES`
+- `RUST_PARSE_STRESS_TYPES_PER_MODULE`
+- `RUST_PARSE_STRESS_FUNCTIONS_PER_MODULE`
 
 Preset defaults:
 
@@ -100,9 +114,16 @@ Preset defaults:
 - `large`: `48` units, `24` types/unit, `72` helper functions/unit, `16` history entries
 - `xlarge`: `96` units, `40` types/unit, `128` helper functions/unit, `24` history entries
 
+Rust large-symbol preset defaults:
+
+- `medium`: `24` modules, `16` types/module, `48` worker functions/module
+- `large`: `64` modules, `24` types/module, `96` worker functions/module
+- `xlarge`: `96` modules, `32` types/module, `160` worker functions/module
+
 Current default:
 
 - `PARSE_STRESS_PRESET=large`
+- `RUST_PARSE_STRESS_PRESET=large`
 
 The generator now emits:
 
@@ -118,10 +139,18 @@ The compiler and DWARF flavor are also configurable:
 - `DWARF_PERF_DWARF_VERSION`
 - `DWARF_PERF_CFLAGS`
 - `DWARF_PERF_LDFLAGS`
+- `DWARF_PERF_RUSTC`
+- `DWARF_PERF_RUSTFLAGS`
 
 Compiler default:
 
 - `DWARF_PERF_CC=gcc`
+- `DWARF_PERF_RUSTC=rustc`
 
 `gcc` is the default because the current `dwarf-tool` query flows resolve the `query-hotspot`
 sample more reliably with GCC-generated DWARF than with Clang-generated DWARF.
+
+The Rust parse corpus is intentionally tuned for DWARF density rather than runtime
+performance. It keeps debug info in the binary, references a broad slice of `std`,
+and compiles with `-C link-dead-code=yes` so it is useful for fast-index pressure
+tests.

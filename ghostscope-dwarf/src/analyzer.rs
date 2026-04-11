@@ -46,6 +46,9 @@ pub struct ModuleLoadingStats {
     pub variables: usize,
     pub types: usize,
     pub load_time_ms: u64,
+    pub parse_time_ms: u64,
+    pub index_time_ms: u64,
+    pub module_total_time_ms: u64,
 }
 
 /// DWARF analyzer - unified entry point for all DWARF analysis
@@ -294,6 +297,8 @@ impl DwarfAnalyzer {
         {
             Ok(module_data) => {
                 let (functions, variables, types) = module_data.get_lightweight_index().get_stats();
+                let (parse_time_ms, index_time_ms, module_total_time_ms) =
+                    module_data.get_load_timing_ms();
                 progress_callback(ModuleLoadingEvent::LoadingCompleted {
                     module_path,
                     stats: ModuleLoadingStats {
@@ -301,6 +306,9 @@ impl DwarfAnalyzer {
                         variables,
                         types,
                         load_time_ms: start_time.elapsed().as_millis() as u64,
+                        parse_time_ms,
+                        index_time_ms,
+                        module_total_time_ms,
                     },
                     current: 1,
                     total: 1,

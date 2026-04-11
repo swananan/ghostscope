@@ -144,11 +144,16 @@ impl ModuleLoader {
                             // Extract stats for progress reporting
                             let (functions, variables, types) =
                                 module.get_lightweight_index().get_stats();
+                            let (parse_time_ms, index_time_ms, module_total_time_ms) =
+                                module.get_load_timing_ms();
                             let stats = ModuleLoadingStats {
                                 functions,
                                 variables,
                                 types,
                                 load_time_ms,
+                                parse_time_ms,
+                                index_time_ms,
+                                module_total_time_ms,
                             };
 
                             progress_callback(ModuleLoadingEvent::LoadingCompleted {
