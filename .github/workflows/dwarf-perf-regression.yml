@@ -62,7 +62,7 @@ jobs:
 
           benchmark_changed=false
           if printf '%s\n' "$changed_files" | grep -Eq \
-            '^(scripts/dwarf-perf/corpus/|scripts/dwarf-perf/build_corpus\.sh$|scripts/dwarf-perf/build_corpus_in_container\.sh$|scripts/dwarf-perf/run_baseline\.sh$|scripts/dwarf-perf/generate_parse_stress\.py$|scripts/dwarf-perf/builder_image_ref\.txt$|scripts/dwarf-perf/compare_baseline\.py$|\.github/workflows/dwarf-perf-regression\.yml$)'; then
+            '^(scripts/dwarf-perf/corpus/|scripts/dwarf-perf/build_corpus\.sh$|scripts/dwarf-perf/build_corpus_in_container\.sh$|scripts/dwarf-perf/run_baseline\.sh$|scripts/dwarf-perf/generate_parse_stress\.py$|scripts/dwarf-perf/generate_rust_parse_stress\.py$|scripts/dwarf-perf/builder_image_ref\.txt$|scripts/dwarf-perf/compare_baseline\.py$|\.github/workflows/dwarf-perf-regression\.yml$)'; then
             benchmark_changed=true
           fi
 
@@ -115,21 +115,48 @@ jobs:
       - name: Prepare result directories
         run: mkdir -p "$DWARF_PERF_RESULTS_DIR"
 
-      - name: Run base baseline
+      - name: Build base corpus
         if: steps.detect.outputs.base_supported == 'true'
+        id: base_corpus
         working-directory: base
         run: |
           set -euo pipefail
           ./scripts/dwarf-perf/build_corpus.sh
+          manifest="$GITHUB_WORKSPACE/base/scripts/dwarf-perf/corpus/out/manifest.json"
+          if jq -e '.artifacts[] | select(.name=="rust-parse-stress")' "$manifest" >/dev/null; then
+            echo "has_rust_target=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_rust_target=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run base parse-stress baseline
+        if: steps.detect.outputs.base_supported == 'true'
+        working-directory: base
+        run: |
+          set -euo pipefail
           ./scripts/dwarf-perf/run_baseline.sh \
             --skip-build \
             --corpus-dir "$GITHUB_WORKSPACE/base/scripts/dwarf-perf/corpus/out" \
             --results-dir "$DWARF_PERF_RESULTS_DIR" \
-            --result-name base \
+            --result-name base-parse-stress \
             --runs 10 \
             --cargo-target-dir "$CARGO_TARGET_DIR"
 
-      - name: Run head baseline with base corpus
+      - name: Run base rust-parse-stress baseline
+        if: steps.base_corpus.outputs.has_rust_target == 'true'
+        working-directory: base
+        run: |
+          set -euo pipefail
+          ./scripts/dwarf-perf/run_baseline.sh \
+            --skip-build \
+            --corpus-dir "$GITHUB_WORKSPACE/base/scripts/dwarf-perf/corpus/out" \
+            --results-dir "$DWARF_PERF_RESULTS_DIR" \
+            --result-name base-rust-parse-stress \
+            --parse-target rust-parse-stress \
+            --runs 10 \
+            --cargo-target-dir "$CARGO_TARGET_DIR"
+
+      - name: Run head parse-stress baseline with base corpus
         if: steps.detect.outputs.base_supported == 'true'
         working-directory: head
         run: |
@@ -138,21 +165,55 @@ jobs:
             --skip-build \
             --corpus-dir "$GITHUB_WORKSPACE/base/scripts/dwarf-perf/corpus/out" \
             --results-dir "$DWARF_PERF_RESULTS_DIR" \
-            --result-name head \
+            --result-name head-parse-stress \
             --runs 10 \
             --cargo-target-dir "$CARGO_TARGET_DIR"
 
-      - name: Run head-only baseline
-        if: steps.detect.outputs.base_supported != 'true'
+      - name: Run head rust-parse-stress baseline with base corpus
+        if: steps.base_corpus.outputs.has_rust_target == 'true'
+        working-directory: head
+        run: |
+          set -euo pipefail
+          ./scripts/dwarf-perf/run_baseline.sh \
+            --skip-build \
+            --corpus-dir "$GITHUB_WORKSPACE/base/scripts/dwarf-perf/corpus/out" \
+            --results-dir "$DWARF_PERF_RESULTS_DIR" \
+            --result-name head-rust-parse-stress \
+            --parse-target rust-parse-stress \
+            --runs 10 \
+            --cargo-target-dir "$CARGO_TARGET_DIR"
+
+      - name: Build head corpus for bootstrap targets
+        if: steps.detect.outputs.base_supported != 'true' || steps.base_corpus.outputs.has_rust_target != 'true'
         working-directory: head
         run: |
           set -euo pipefail
           ./scripts/dwarf-perf/build_corpus.sh
+
+      - name: Run head-only parse-stress baseline
+        if: steps.detect.outputs.base_supported != 'true'
+        working-directory: head
+        run: |
+          set -euo pipefail
           ./scripts/dwarf-perf/run_baseline.sh \
             --skip-build \
             --corpus-dir "$GITHUB_WORKSPACE/head/scripts/dwarf-perf/corpus/out" \
             --results-dir "$DWARF_PERF_RESULTS_DIR" \
-            --result-name head \
+            --result-name head-parse-stress \
+            --runs 10 \
+            --cargo-target-dir "$CARGO_TARGET_DIR"
+
+      - name: Run head-only rust-parse-stress baseline
+        if: steps.detect.outputs.base_supported != 'true' || steps.base_corpus.outputs.has_rust_target != 'true'
+        working-directory: head
+        run: |
+          set -euo pipefail
+          ./scripts/dwarf-perf/run_baseline.sh \
+            --skip-build \
+            --corpus-dir "$GITHUB_WORKSPACE/head/scripts/dwarf-perf/corpus/out" \
+            --results-dir "$DWARF_PERF_RESULTS_DIR" \
+            --result-name head-rust-parse-stress \
+            --parse-target rust-parse-stress \
             --runs 10 \
             --cargo-target-dir "$CARGO_TARGET_DIR"
 
@@ -162,28 +223,82 @@ jobs:
         working-directory: head
         env:
           REPORT_ONLY: ${{ steps.detect.outputs.benchmark_changed }}
+          BASE_HAS_RUST_TARGET: ${{ steps.base_corpus.outputs.has_rust_target }}
         run: |
           set +e
 
-          args=(
-            --base "$DWARF_PERF_RESULTS_DIR/base.json"
-            --head "$DWARF_PERF_RESULTS_DIR/head.json"
-            --base-label "base:${BASE_SHA::12}"
-            --head-label "head:${HEAD_SHA::12}"
-            --summary-file "$DWARF_PERF_RESULTS_DIR/summary.md"
-            --result-file "$DWARF_PERF_RESULTS_DIR/compare.json"
-          )
+          compare_target() {
+            local target="$1"
+            local safe_target="$2"
+            local base_result="$DWARF_PERF_RESULTS_DIR/base-${target}.json"
+            local head_result="$DWARF_PERF_RESULTS_DIR/head-${target}.json"
+            local summary_result="$DWARF_PERF_RESULTS_DIR/summary-${safe_target}.md"
+            local compare_result="$DWARF_PERF_RESULTS_DIR/compare-${safe_target}.json"
+            local target_exit=0
+            local -a args
 
-          if [[ "$REPORT_ONLY" == "true" ]]; then
-            args+=(
-              --report-only
-              --report-only-reason "Benchmark inputs changed in this PR, so thresholds were not enforced."
+            args=(
+              --base "$base_result"
+              --head "$head_result"
+              --base-label "base:${BASE_SHA::12}"
+              --head-label "head:${HEAD_SHA::12}"
+              --summary-file "$summary_result"
+              --result-file "$compare_result"
             )
+
+            if [[ "$REPORT_ONLY" == "true" ]]; then
+              args+=(
+                --report-only
+                --report-only-reason "Benchmark inputs changed in this PR, so thresholds were not enforced."
+              )
+            fi
+
+            python3 scripts/dwarf-perf/compare_baseline.py "${args[@]}"
+            target_exit=$?
+
+            {
+              echo "### Parse Target: \`$target\`"
+              echo
+              sed '1,2d' "$summary_result"
+              echo
+            } >> "$DWARF_PERF_RESULTS_DIR/summary.md"
+
+            return "$target_exit"
+          }
+
+          cat > "$DWARF_PERF_RESULTS_DIR/summary.md" <<EOF
+          ## DWARF Perf Regression
+
+          EOF
+          overall_exit=0
+
+          compare_target "parse-stress" "parse_stress"
+          parse_exit=$?
+          if [[ "$parse_exit" -ne 0 ]]; then
+            overall_exit="$parse_exit"
           fi
 
-          python3 scripts/dwarf-perf/compare_baseline.py "${args[@]}"
-          exit_code=$?
-          echo "exit_code=$exit_code" >> "$GITHUB_OUTPUT"
+          if [[ "$BASE_HAS_RUST_TARGET" == "true" ]]; then
+            compare_target "rust-parse-stress" "rust_parse_stress"
+            rust_exit=$?
+            if [[ "$rust_exit" -ne 0 ]]; then
+              overall_exit="$rust_exit"
+            fi
+          else
+            cat >> "$DWARF_PERF_RESULTS_DIR/summary.md" <<EOF
+            ### Parse Target: \`rust-parse-stress\`
+
+            - Mode: \`bootstrap\`
+            - Base: \`${BASE_SHA::12}\`
+            - Head: \`${HEAD_SHA::12}\`
+            - Note: The base revision does not provide the \`rust-parse-stress\` corpus yet, so threshold comparison was skipped.
+
+            A head-only Rust parse baseline was generated and uploaded as an artifact for inspection.
+
+            EOF
+          fi
+
+          echo "exit_code=$overall_exit" >> "$GITHUB_OUTPUT"
           exit 0
 
       - name: Write bootstrap summary
@@ -197,7 +312,7 @@ jobs:
           - Head: \`${HEAD_SHA::12}\`
           - Note: The base revision does not contain the DWARF perf baseline tooling yet, so regression gating was skipped.
 
-          A head-only baseline was generated and uploaded as an artifact for inspection.
+          Head-only baselines for \`parse-stress\` and \`rust-parse-stress\` were generated and uploaded as artifacts for inspection.
           EOF
 
       - name: Publish summary
