@@ -1,5 +1,59 @@
 [
   {
+    "generated_at": "2026-04-11T13:26:54Z",
+    "sha": "25dee2d4800deccf72d3220f6d684f3154503fee",
+    "sha_short": "25dee2d4800d",
+    "ref": "main",
+    "event": "push",
+    "run_id": "24283413000",
+    "run_number": "22",
+    "run_attempt": "1",
+    "run_url": "https://github.com/swananan/ghostscope/actions/runs/24283413000",
+    "artifact_path": "data/runs/20260411T132654Z-25dee2d4800d.json",
+    "metrics": {
+      "fast_parse_ms": {
+        "average": 978.039,
+        "p50": 964.112,
+        "p95": 1046.422,
+        "min": 947.997,
+        "max": 1046.422
+      },
+      "fast_parse_targets_ms": {
+        "parse-stress": {
+          "average": 978.039,
+          "p50": 964.112,
+          "p95": 1046.422,
+          "min": 947.997,
+          "max": 1046.422
+        },
+        "rust-parse-stress": {
+          "average": 5439.467,
+          "p50": 5401.45,
+          "p95": 5739.774,
+          "min": 5218.935,
+          "max": 5739.774
+        }
+      },
+      "source_line_query_ms": {
+        "first_run": 4.092509000000001,
+        "average": 3.6426553999999998,
+        "p50": 3.589992,
+        "p95": 4.092509000000001,
+        "min": 3.580414,
+        "max": 4.092509000000001
+      }
+    },
+    "query_result": {
+      "source": {
+        "path": "/home/runner/work/ghostscope/ghostscope/scripts/dwarf-perf/corpus/src/query-hotspot/query_hotspot.c",
+        "line": 119
+      },
+      "address_count": 1,
+      "total_variables": 16,
+      "first_address": "0x40164f"
+    }
+  },
+  {
     "generated_at": "2026-04-11T05:06:06Z",
     "sha": "b07519bb683ee0251695bd0c5fb33a92160c5b6b",
     "sha_short": "b07519bb683e",

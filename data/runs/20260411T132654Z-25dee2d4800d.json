@@ -1,0 +1,208 @@
+{
+  "schema_version": 2,
+  "generated_at": "2026-04-11T13:26:54Z",
+  "repo_root": "/home/runner/work/ghostscope/ghostscope",
+  "corpus_dir": "/home/runner/work/ghostscope/ghostscope/scripts/dwarf-perf/corpus/out",
+  "manifest_path": "/home/runner/work/ghostscope/ghostscope/scripts/dwarf-perf/corpus/out/manifest.json",
+  "result_path": "/home/runner/work/ghostscope/ghostscope/.tmp/dwarf-perf-results/main-parse-stress.json",
+  "parse_benchmark": {
+    "description": "Fast parse benchmark: analyzer load plus initial DWARF fast-parse/index build.",
+    "artifact_name": "parse-stress",
+    "binary": "/home/runner/work/ghostscope/ghostscope/scripts/dwarf-perf/corpus/out/parse-stress/parse_stress",
+    "runs": 10,
+    "metrics_ms": {
+      "average": 978.039,
+      "p50": 964.112,
+      "p95": 1046.422,
+      "min": 947.997,
+      "max": 1046.422
+    },
+    "internal_metrics_ms": {
+      "module_count": 1,
+      "parse_phase": {
+        "average": 954.8,
+        "p50": 942.0,
+        "p95": 1010.0,
+        "min": 927.0,
+        "max": 1010.0
+      },
+      "index_phase": {
+        "average": 22.3,
+        "p50": 21.0,
+        "p95": 35.0,
+        "min": 20.0,
+        "max": 35.0
+      },
+      "internal_total": {
+        "average": 977.3,
+        "p50": 964.0,
+        "p95": 1046.0,
+        "min": 947.0,
+        "max": 1046.0
+      }
+    }
+  },
+  "query_benchmark": {
+    "description": "End-to-end source-line query benchmark: source-line lookup, address resolution, and variable collection for all matched addresses.",
+    "binary": "/home/runner/work/ghostscope/ghostscope/scripts/dwarf-perf/corpus/out/query-hotspot/query_hotspot",
+    "source": {
+      "path": "/home/runner/work/ghostscope/ghostscope/scripts/dwarf-perf/corpus/src/query-hotspot/query_hotspot.c",
+      "line": 119
+    },
+    "loading_time_ms": 2,
+    "runs": 10,
+    "metrics_ms": {
+      "first_run": 4.092509000000001,
+      "average": 3.6426553999999998,
+      "p50": 3.589992,
+      "p95": 4.092509000000001,
+      "min": 3.580414,
+      "max": 4.092509000000001
+    }
+  },
+  "query_result": {
+    "description": "Snapshot of the matched query result for the benchmarked source line.",
+    "source": {
+      "path": "/home/runner/work/ghostscope/ghostscope/scripts/dwarf-perf/corpus/src/query-hotspot/query_hotspot.c",
+      "line": 119
+    },
+    "first_address": "0x40164f",
+    "address_count": 1,
+    "total_variables": 16
+  },
+  "corpus_manifest": {
+    "schema_version": 1,
+    "builder_image": "ghcr.io/swananan/ghostscope-dwarf-perf-builder@sha256:ed99b20a96a4fb2abc4845ca55e7e3780e97752d3281da441b8aa335b56b9ecb",
+    "compiler": {
+      "cc": "gcc",
+      "rustc": "rustc",
+      "dwarf_version": 5
+    },
+    "artifacts": [
+      {
+        "name": "query-hotspot",
+        "kind": "single-address-query",
+        "relative_path": "query-hotspot/query_hotspot",
+        "sha256": "cb837cf400627c5dec8702e46246ae4cb7a6362f548993ae5726ef2c79087b83",
+        "size_bytes": 49264,
+        "source_path": "scripts/dwarf-perf/corpus/src/query-hotspot/query_hotspot.c",
+        "query_anchor": {
+          "function": "dwarf_perf_query_hotspot",
+          "source_marker": "DWARF_PERF_QUERY_HOTSPOT",
+          "source_line": 119
+        }
+      },
+      {
+        "name": "parse-stress",
+        "kind": "fast-parse",
+        "relative_path": "parse-stress/parse_stress",
+        "sha256": "c280ebe972e59f480d298ed56ceb03c6b62013ab88ee8a8c1b3a8b905157d1b2",
+        "size_bytes": 6753512,
+        "generator": {
+          "script": "scripts/dwarf-perf/generate_parse_stress.py",
+          "preset": "large",
+          "units": 48,
+          "types_per_unit": 24,
+          "functions_per_unit": 72,
+          "history_len": 16,
+          "generated_c_files": 49,
+          "generated_header_files": 50
+        }
+      },
+      {
+        "name": "rust-parse-stress",
+        "kind": "fast-parse",
+        "language": "rust",
+        "relative_path": "rust-parse-stress/rust_parse_stress",
+        "sha256": "99c119a6a41c71884f9b544203183dd0c750bc43d75f142e045e11ee1510ec90",
+        "size_bytes": 53510776,
+        "generator": {
+          "script": "scripts/dwarf-perf/generate_rust_parse_stress.py",
+          "preset": "large",
+          "modules": 64,
+          "types_per_module": 24,
+          "functions_per_module": 96,
+          "generated_module_files": 64,
+          "generated_rust_files": 66
+        }
+      }
+    ]
+  },
+  "primary_parse_target": "parse-stress",
+  "parse_targets": {
+    "parse-stress": {
+      "description": "Fast parse benchmark: analyzer load plus initial DWARF fast-parse/index build.",
+      "artifact_name": "parse-stress",
+      "binary": "/home/runner/work/ghostscope/ghostscope/scripts/dwarf-perf/corpus/out/parse-stress/parse_stress",
+      "runs": 10,
+      "metrics_ms": {
+        "average": 978.039,
+        "p50": 964.112,
+        "p95": 1046.422,
+        "min": 947.997,
+        "max": 1046.422
+      },
+      "internal_metrics_ms": {
+        "module_count": 1,
+        "parse_phase": {
+          "average": 954.8,
+          "p50": 942.0,
+          "p95": 1010.0,
+          "min": 927.0,
+          "max": 1010.0
+        },
+        "index_phase": {
+          "average": 22.3,
+          "p50": 21.0,
+          "p95": 35.0,
+          "min": 20.0,
+          "max": 35.0
+        },
+        "internal_total": {
+          "average": 977.3,
+          "p50": 964.0,
+          "p95": 1046.0,
+          "min": 947.0,
+          "max": 1046.0
+        }
+      }
+    },
+    "rust-parse-stress": {
+      "description": "Fast parse benchmark: analyzer load plus initial DWARF fast-parse/index build.",
+      "artifact_name": "rust-parse-stress",
+      "binary": "/home/runner/work/ghostscope/ghostscope/scripts/dwarf-perf/corpus/out/rust-parse-stress/rust_parse_stress",
+      "runs": 10,
+      "metrics_ms": {
+        "average": 5439.467,
+        "p50": 5401.45,
+        "p95": 5739.774,
+        "min": 5218.935,
+        "max": 5739.774
+      },
+      "internal_metrics_ms": {
+        "module_count": 1,
+        "parse_phase": {
+          "average": 4495.6,
+          "p50": 4454.0,
+          "p95": 4743.0,
+          "min": 4289.0,
+          "max": 4743.0
+        },
+        "index_phase": {
+          "average": 942.7,
+          "p50": 929.0,
+          "p95": 996.0,
+          "min": 921.0,
+          "max": 996.0
+        },
+        "internal_total": {
+          "average": 5438.9,
+          "p50": 5401.0,
+          "p95": 5739.0,
+          "min": 5218.0,
+          "max": 5739.0
+        }
+      }
+    }
+  }
+}

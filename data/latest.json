@@ -1,45 +1,45 @@
 {
-  "generated_at": "2026-04-11T05:06:06Z",
-  "sha": "b07519bb683ee0251695bd0c5fb33a92160c5b6b",
-  "sha_short": "b07519bb683e",
+  "generated_at": "2026-04-11T13:26:54Z",
+  "sha": "25dee2d4800deccf72d3220f6d684f3154503fee",
+  "sha_short": "25dee2d4800d",
   "ref": "main",
-  "event": "schedule",
-  "run_id": "24275272573",
-  "run_number": "21",
+  "event": "push",
+  "run_id": "24283413000",
+  "run_number": "22",
   "run_attempt": "1",
-  "run_url": "https://github.com/swananan/ghostscope/actions/runs/24275272573",
-  "artifact_path": "data/runs/20260411T050606Z-b07519bb683e.json",
+  "run_url": "https://github.com/swananan/ghostscope/actions/runs/24283413000",
+  "artifact_path": "data/runs/20260411T132654Z-25dee2d4800d.json",
   "metrics": {
     "fast_parse_ms": {
-      "average": 1082.117,
-      "p50": 1071.349,
-      "p95": 1170.856,
-      "min": 1063.435,
-      "max": 1170.856
+      "average": 978.039,
+      "p50": 964.112,
+      "p95": 1046.422,
+      "min": 947.997,
+      "max": 1046.422
     },
     "fast_parse_targets_ms": {
       "parse-stress": {
-        "average": 1082.117,
-        "p50": 1071.349,
-        "p95": 1170.856,
-        "min": 1063.435,
-        "max": 1170.856
+        "average": 978.039,
+        "p50": 964.112,
+        "p95": 1046.422,
+        "min": 947.997,
+        "max": 1046.422
       },
       "rust-parse-stress": {
-        "average": 5874.562,
-        "p50": 5841.629,
-        "p95": 6054.809,
-        "min": 5779.844,
-        "max": 6054.809
+        "average": 5439.467,
+        "p50": 5401.45,
+        "p95": 5739.774,
+        "min": 5218.935,
+        "max": 5739.774
       }
     },
     "source_line_query_ms": {
-      "first_run": 4.255432,
-      "average": 3.8186048999999995,
-      "p50": 3.763194,
-      "p95": 4.255432,
-      "min": 3.742192,
-      "max": 4.255432
+      "first_run": 4.092509000000001,
+      "average": 3.6426553999999998,
+      "p50": 3.589992,
+      "p95": 4.092509000000001,
+      "min": 3.580414,
+      "max": 4.092509000000001
     }
   },
   "query_result": {
