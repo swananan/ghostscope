@@ -47,8 +47,49 @@ def format_metric(value: float) -> str:
     return f"{value:.3f}"
 
 
+def extract_parse_targets(
+    baseline_or_entry: dict[str, Any],
+) -> dict[str, dict[str, float]]:
+    metrics = baseline_or_entry.get("metrics")
+    if isinstance(metrics, dict):
+        fast_parse_targets = metrics.get("fast_parse_targets_ms")
+        if isinstance(fast_parse_targets, dict):
+            return fast_parse_targets
+        fast_parse = metrics.get("fast_parse_ms")
+        if isinstance(fast_parse, dict):
+            return {"parse-stress": fast_parse}
+
+    if "parse_targets" in baseline_or_entry:
+        return {
+            target: parse_info["metrics_ms"]
+            for target, parse_info in baseline_or_entry["parse_targets"].items()
+        }
+
+    parse_benchmark = baseline_or_entry["parse_benchmark"]
+    return {
+        parse_benchmark.get("artifact_name", "parse-stress"): parse_benchmark["metrics_ms"]
+    }
+
+
+def metric_or_dash(
+    parse_targets: dict[str, dict[str, float]],
+    target: str,
+    percentile: str,
+) -> str:
+    metrics = parse_targets.get(target)
+    if metrics is None:
+        return "-"
+    return format_metric(float(metrics[percentile]))
+
+
 def build_entry(args: argparse.Namespace, baseline: dict[str, Any], artifact_path: str) -> dict[str, Any]:
-    parse_metrics = baseline["parse_benchmark"]["metrics_ms"]
+    parse_targets = extract_parse_targets(baseline)
+    primary_parse_target = baseline.get("primary_parse_target")
+    if primary_parse_target is None:
+        primary_parse_target = baseline["parse_benchmark"].get(
+            "artifact_name", "parse-stress"
+        )
+    parse_metrics = parse_targets[primary_parse_target]
     query_metrics = baseline["query_benchmark"]["metrics_ms"]
     query_result = baseline["query_result"]
 
@@ -65,6 +106,7 @@ def build_entry(args: argparse.Namespace, baseline: dict[str, Any], artifact_pat
         "artifact_path": artifact_path,
         "metrics": {
             "fast_parse_ms": parse_metrics,
+            "fast_parse_targets_ms": parse_targets,
             "source_line_query_ms": query_metrics,
         },
         "query_result": {
@@ -100,11 +142,19 @@ def prune_stale_run_snapshots(runs_dir: Path, history: list[dict[str, Any]]) -> 
 
 
 def render_summary_cards(latest: dict[str, Any]) -> str:
-    parse_metrics = latest["metrics"]["fast_parse_ms"]
+    parse_targets = extract_parse_targets(latest)
     query_metrics = latest["metrics"]["source_line_query_ms"]
     cards = [
-        ("Fast Parse P50", format_metric(parse_metrics["p50"])),
-        ("Fast Parse P95", format_metric(parse_metrics["p95"])),
+        ("parse-stress P50", metric_or_dash(parse_targets, "parse-stress", "p50")),
+        ("parse-stress P95", metric_or_dash(parse_targets, "parse-stress", "p95")),
+        (
+            "rust-parse-stress P50",
+            metric_or_dash(parse_targets, "rust-parse-stress", "p50"),
+        ),
+        (
+            "rust-parse-stress P95",
+            metric_or_dash(parse_targets, "rust-parse-stress", "p95"),
+        ),
         ("Query P50", format_metric(query_metrics["p50"])),
         ("Query P95", format_metric(query_metrics["p95"])),
     ]
@@ -121,15 +171,17 @@ def render_summary_cards(latest: dict[str, Any]) -> str:
 def render_history_table(history: list[dict[str, Any]]) -> str:
     rows = []
     for entry in history:
-        parse_metrics = entry["metrics"]["fast_parse_ms"]
+        parse_targets = extract_parse_targets(entry)
         query_metrics = entry["metrics"]["source_line_query_ms"]
         rows.append(
             "<tr>"
             f"<td>{html.escape(entry['generated_at'])}</td>"
             f"<td><a href=\"{html.escape(entry['run_url'])}\">{html.escape(entry['sha_short'])}</a></td>"
             f"<td>{html.escape(entry['event'])}</td>"
-            f"<td>{format_metric(parse_metrics['p50'])}</td>"
-            f"<td>{format_metric(parse_metrics['p95'])}</td>"
+            f"<td>{metric_or_dash(parse_targets, 'parse-stress', 'p50')}</td>"
+            f"<td>{metric_or_dash(parse_targets, 'parse-stress', 'p95')}</td>"
+            f"<td>{metric_or_dash(parse_targets, 'rust-parse-stress', 'p50')}</td>"
+            f"<td>{metric_or_dash(parse_targets, 'rust-parse-stress', 'p95')}</td>"
             f"<td>{format_metric(query_metrics['p50'])}</td>"
             f"<td>{format_metric(query_metrics['p95'])}</td>"
             f"<td><a href=\"{html.escape(entry['artifact_path'])}\">json</a></td>"
@@ -140,7 +192,8 @@ def render_history_table(history: list[dict[str, Any]]) -> str:
         "<table>"
         "<thead><tr>"
         "<th>Generated At</th><th>Commit</th><th>Event</th>"
-        "<th>Fast Parse P50</th><th>Fast Parse P95</th>"
+        "<th>parse-stress P50</th><th>parse-stress P95</th>"
+        "<th>rust-parse-stress P50</th><th>rust-parse-stress P95</th>"
         "<th>Query P50</th><th>Query P95</th><th>Snapshot</th>"
         "</tr></thead>"
         f"<tbody>{''.join(rows)}</tbody>"
@@ -273,7 +326,7 @@ def render_index(repo: str, latest: dict[str, Any], history: list[dict[str, Any]
       <h1>DWARF Perf History</h1>
       <p>
         Main-branch and scheduled DWARF perf baselines for <strong>{html.escape(repo)}</strong>.
-        This page records the current fast-parse and source-line query trends from CI.
+        This page records the current C parse, Rust parse, and source-line query trends from CI.
       </p>
       {site_meta}
       {latest_meta}
