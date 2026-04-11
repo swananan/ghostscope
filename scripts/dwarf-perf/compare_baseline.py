@@ -35,6 +35,24 @@ class MetricComparison:
     enforced: bool
 
 
+@dataclass(frozen=True)
+class SupplementalMetricRule:
+    name: str
+    json_path: str
+    description: str
+
+
+@dataclass
+class SupplementalMetricComparison:
+    name: str
+    description: str
+    base_ms: float | None
+    head_ms: float | None
+    delta_ms: float | None
+    delta_pct: float | None
+    status: str
+
+
 RULES = [
     MetricRule(
         name="fast_parse_p50",
@@ -67,6 +85,34 @@ RULES = [
         absolute_regression_ms=0.8,
         severity="warn",
         description="Source-line query p95",
+    ),
+]
+
+INDEX_PHASE_RULES = [
+    SupplementalMetricRule(
+        name="index_phase_average",
+        json_path="parse_benchmark.internal_metrics_ms.index_phase.average",
+        description="Index phase average",
+    ),
+    SupplementalMetricRule(
+        name="index_phase_p50",
+        json_path="parse_benchmark.internal_metrics_ms.index_phase.p50",
+        description="Index phase p50",
+    ),
+    SupplementalMetricRule(
+        name="index_phase_p95",
+        json_path="parse_benchmark.internal_metrics_ms.index_phase.p95",
+        description="Index phase p95",
+    ),
+    SupplementalMetricRule(
+        name="index_phase_min",
+        json_path="parse_benchmark.internal_metrics_ms.index_phase.min",
+        description="Index phase min",
+    ),
+    SupplementalMetricRule(
+        name="index_phase_max",
+        json_path="parse_benchmark.internal_metrics_ms.index_phase.max",
+        description="Index phase max",
     ),
 ]
 
@@ -125,6 +171,18 @@ def get_nested(data: dict[str, Any], dotted_path: str) -> float:
     return float(current)
 
 
+def get_nested_optional(data: dict[str, Any], dotted_path: str) -> float | None:
+    current: Any = data
+    for segment in dotted_path.split("."):
+        if not isinstance(current, dict) or segment not in current:
+            return None
+        current = current[segment]
+
+    if current is None:
+        return None
+    return float(current)
+
+
 def compare_metric(
     base_data: dict[str, Any],
     head_data: dict[str, Any],
@@ -169,6 +227,42 @@ def compare_metric(
     )
 
 
+def compare_supplemental_metric(
+    base_data: dict[str, Any],
+    head_data: dict[str, Any],
+    rule: SupplementalMetricRule,
+) -> SupplementalMetricComparison:
+    base_ms = get_nested_optional(base_data, rule.json_path)
+    head_ms = get_nested_optional(head_data, rule.json_path)
+
+    if base_ms is None or head_ms is None:
+        return SupplementalMetricComparison(
+            name=rule.name,
+            description=rule.description,
+            base_ms=base_ms,
+            head_ms=head_ms,
+            delta_ms=None,
+            delta_pct=None,
+            status="missing",
+        )
+
+    delta_ms = head_ms - base_ms
+    if base_ms <= 0.0:
+        delta_pct = math.inf if head_ms > 0.0 else 0.0
+    else:
+        delta_pct = (delta_ms / base_ms) * 100.0
+
+    return SupplementalMetricComparison(
+        name=rule.name,
+        description=rule.description,
+        base_ms=base_ms,
+        head_ms=head_ms,
+        delta_ms=delta_ms,
+        delta_pct=delta_pct,
+        status="available",
+    )
+
+
 def format_delta_pct(delta_pct: float) -> str:
     if math.isinf(delta_pct):
         return "inf"
@@ -184,6 +278,95 @@ def format_metric_row(metric: MetricComparison) -> str:
         f"{metric.delta_ms:+.3f} | {format_delta_pct(metric.delta_pct)} | "
         f"{threshold} | {metric.severity} | {metric.status} |"
     )
+
+
+def format_optional_ms(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value:.3f}"
+
+
+def format_optional_delta_pct(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    return format_delta_pct(value)
+
+
+def format_optional_ms_with_suffix(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value:.3f}ms"
+
+
+def format_supplemental_metric_row(metric: SupplementalMetricComparison) -> str:
+    return (
+        f"| {metric.description} | {format_optional_ms(metric.base_ms)} | "
+        f"{format_optional_ms(metric.head_ms)} | {format_optional_ms(metric.delta_ms)} | "
+        f"{format_optional_delta_pct(metric.delta_pct)} | {metric.status} |"
+    )
+
+
+def resolve_parse_target_name(
+    base_data: dict[str, Any], head_data: dict[str, Any]
+) -> str:
+    for candidate in [head_data, base_data]:
+        parse_benchmark = candidate.get("parse_benchmark")
+        if isinstance(parse_benchmark, dict):
+            artifact_name = parse_benchmark.get("artifact_name")
+            if isinstance(artifact_name, str) and artifact_name:
+                return artifact_name
+    return "unknown-target"
+
+
+def format_console_metric_line(metric: MetricComparison) -> str:
+    return (
+        f"  [{metric.status:<10}] {metric.description:<22} "
+        f"{metric.base_ms:9.3f}ms -> {metric.head_ms:9.3f}ms "
+        f"({metric.delta_ms:+9.3f}ms, {format_delta_pct(metric.delta_pct):>8})"
+    )
+
+
+def format_console_supplemental_line(metric: SupplementalMetricComparison) -> str:
+    return (
+        f"  [{metric.status:<10}] {metric.description:<22} "
+        f"{format_optional_ms_with_suffix(metric.base_ms):>12} -> "
+        f"{format_optional_ms_with_suffix(metric.head_ms):>12} "
+        f"({format_optional_ms_with_suffix(metric.delta_ms):>12}, "
+        f"{format_optional_delta_pct(metric.delta_pct):>8})"
+    )
+
+
+def build_console_report(
+    parse_target_name: str,
+    metrics: list[MetricComparison],
+    index_phase_metrics: list[SupplementalMetricComparison],
+    base_label: str,
+    head_label: str,
+    report_only: bool,
+    report_only_reason: str,
+    overall_status: str,
+) -> str:
+    mode = "report-only" if report_only else "enforced"
+    lines = [
+        f"DWARF perf regression: {parse_target_name}",
+        f"  mode: {mode}",
+        f"  base: {base_label}",
+        f"  head: {head_label}",
+        f"  verdict: {overall_status}",
+        "  guarded metrics:",
+    ]
+    lines.extend(format_console_metric_line(metric) for metric in metrics)
+    lines.extend(
+        [
+            "  index phase:",
+        ]
+    )
+    lines.extend(
+        format_console_supplemental_line(metric) for metric in index_phase_metrics
+    )
+    if report_only_reason:
+        lines.append(f"  note: {report_only_reason}")
+    return "\n".join(lines)
 
 
 def determine_overall_status(metrics: list[MetricComparison], report_only: bool) -> str:
@@ -205,7 +388,9 @@ def determine_overall_status(metrics: list[MetricComparison], report_only: bool)
 
 
 def build_summary(
+    parse_target_name: str,
     metrics: list[MetricComparison],
+    index_phase_metrics: list[SupplementalMetricComparison],
     base_label: str,
     head_label: str,
     report_only: bool,
@@ -216,6 +401,7 @@ def build_summary(
     lines = [
         "## DWARF Perf Regression",
         "",
+        f"- Parse target: `{parse_target_name}`",
         f"- Mode: `{mode}`",
         f"- Base: `{base_label}`",
         f"- Head: `{head_label}`",
@@ -234,6 +420,18 @@ def build_summary(
     )
 
     lines.extend(format_metric_row(metric) for metric in metrics)
+    lines.extend(
+        [
+            "",
+            "### Index Phase Breakdown",
+            "",
+            "| Metric | Base (ms) | Head (ms) | Delta (ms) | Delta % | Availability |",
+            "| --- | ---: | ---: | ---: | ---: | --- |",
+        ]
+    )
+    lines.extend(
+        format_supplemental_metric_row(metric) for metric in index_phase_metrics
+    )
     lines.extend(["", f"Overall verdict: `{overall_status}`"])
     return "\n".join(lines) + "\n"
 
@@ -246,10 +444,17 @@ def main() -> int:
     metrics = [
         compare_metric(base_data, head_data, rule, args.report_only) for rule in RULES
     ]
+    index_phase_metrics = [
+        compare_supplemental_metric(base_data, head_data, rule)
+        for rule in INDEX_PHASE_RULES
+    ]
     overall_status = determine_overall_status(metrics, args.report_only)
+    parse_target_name = resolve_parse_target_name(base_data, head_data)
 
     summary = build_summary(
+        parse_target_name,
         metrics,
+        index_phase_metrics,
         args.base_label,
         args.head_label,
         args.report_only,
@@ -259,22 +464,32 @@ def main() -> int:
     Path(args.summary_file).write_text(summary)
 
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
         "mode": "report-only" if args.report_only else "enforced",
         "report_only_reason": args.report_only_reason,
+        "parse_target": parse_target_name,
         "base": {"label": args.base_label, "path": args.base},
         "head": {"label": args.head_label, "path": args.head},
         "overall_status": overall_status,
         "metrics": [asdict(metric) for metric in metrics],
+        "supplemental_metrics": {
+            "index_phase": [asdict(metric) for metric in index_phase_metrics]
+        },
     }
     Path(args.result_file).write_text(json.dumps(result, indent=2) + "\n")
 
-    print(f"DWARF perf regression verdict: {overall_status}")
-    for metric in metrics:
-        print(
-            f"  {metric.description}: {metric.base_ms:.3f}ms -> {metric.head_ms:.3f}ms "
-            f"({metric.delta_ms:+.3f}ms, {format_delta_pct(metric.delta_pct)}) [{metric.status}]"
+    print(
+        build_console_report(
+            parse_target_name,
+            metrics,
+            index_phase_metrics,
+            args.base_label,
+            args.head_label,
+            args.report_only,
+            args.report_only_reason,
+            overall_status,
         )
+    )
 
     if args.report_only:
         return 0
