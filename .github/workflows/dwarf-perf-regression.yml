@@ -266,10 +266,10 @@ jobs:
             return "$target_exit"
           }
 
-          cat > "$DWARF_PERF_RESULTS_DIR/summary.md" <<EOF
-          ## DWARF Perf Regression
-
-          EOF
+          {
+            printf '%s\n' '## DWARF Perf Regression'
+            printf '\n'
+          } > "$DWARF_PERF_RESULTS_DIR/summary.md"
           overall_exit=0
 
           compare_target "parse-stress" "parse_stress"
@@ -285,17 +285,17 @@ jobs:
               overall_exit="$rust_exit"
             fi
           else
-            cat >> "$DWARF_PERF_RESULTS_DIR/summary.md" <<EOF
-            ### Parse Target: \`rust-parse-stress\`
-
-            - Mode: \`bootstrap\`
-            - Base: \`${BASE_SHA::12}\`
-            - Head: \`${HEAD_SHA::12}\`
-            - Note: The base revision does not provide the \`rust-parse-stress\` corpus yet, so threshold comparison was skipped.
-
-            A head-only Rust parse baseline was generated and uploaded as an artifact for inspection.
-
-            EOF
+            {
+              printf '%s\n' '### Parse Target: `rust-parse-stress`'
+              printf '\n'
+              printf '%s\n' '- Mode: `bootstrap`'
+              printf '%s\n' "- Base: \`${BASE_SHA::12}\`"
+              printf '%s\n' "- Head: \`${HEAD_SHA::12}\`"
+              printf '%s\n' '- Note: The base revision does not provide the `rust-parse-stress` corpus yet, so threshold comparison was skipped.'
+              printf '\n'
+              printf '%s\n' 'A head-only Rust parse baseline was generated and uploaded as an artifact for inspection.'
+              printf '\n'
+            } >> "$DWARF_PERF_RESULTS_DIR/summary.md"
           fi
 
           echo "exit_code=$overall_exit" >> "$GITHUB_OUTPUT"
@@ -304,20 +304,29 @@ jobs:
       - name: Write bootstrap summary
         if: steps.detect.outputs.base_supported != 'true'
         run: |
-          cat > "$DWARF_PERF_RESULTS_DIR/summary.md" <<EOF
-          ## DWARF Perf Regression
-
-          - Mode: \`bootstrap\`
-          - Base: \`${BASE_SHA::12}\`
-          - Head: \`${HEAD_SHA::12}\`
-          - Note: The base revision does not contain the DWARF perf baseline tooling yet, so regression gating was skipped.
-
-          Head-only baselines for \`parse-stress\` and \`rust-parse-stress\` were generated and uploaded as artifacts for inspection.
-          EOF
+          {
+            printf '%s\n' '## DWARF Perf Regression'
+            printf '\n'
+            printf '%s\n' '- Mode: `bootstrap`'
+            printf '%s\n' "- Base: \`${BASE_SHA::12}\`"
+            printf '%s\n' "- Head: \`${HEAD_SHA::12}\`"
+            printf '%s\n' '- Note: The base revision does not contain the DWARF perf baseline tooling yet, so regression gating was skipped.'
+            printf '\n'
+            printf '%s\n' 'Head-only baselines for `parse-stress` and `rust-parse-stress` were generated and uploaded as artifacts for inspection.'
+          } > "$DWARF_PERF_RESULTS_DIR/summary.md"
 
       - name: Publish summary
         if: always()
-        run: cat "$DWARF_PERF_RESULTS_DIR/summary.md" >> "$GITHUB_STEP_SUMMARY"
+        run: |
+          if [[ -f "$DWARF_PERF_RESULTS_DIR/summary.md" ]]; then
+            cat "$DWARF_PERF_RESULTS_DIR/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              printf '%s\n' '## DWARF Perf Regression'
+              printf '\n'
+              printf '%s\n' 'Summary file was not produced. Inspect earlier workflow logs for the first failing step.'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Upload perf artifacts
         if: always()
