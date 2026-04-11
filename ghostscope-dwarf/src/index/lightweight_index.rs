@@ -8,7 +8,7 @@
 
 use crate::{
     binary::DwarfReader,
-    core::{demangle_by_lang, demangled_leaf, IndexEntry},
+    core::{extract_name_fragments, IndexEntry},
     semantics::range_contains_pc,
 };
 use gimli::DebugInfoOffset;
@@ -20,7 +20,9 @@ use tracing::debug;
 pub(crate) struct LightweightIndexShard {
     pub(crate) entries: Vec<IndexEntry>,
     pub(crate) function_map: HashMap<String, Vec<usize>>,
+    pub(crate) function_fragment_map: HashMap<String, Vec<usize>>,
     pub(crate) variable_map: HashMap<String, Vec<usize>>,
+    pub(crate) variable_fragment_map: HashMap<String, Vec<usize>>,
     pub(crate) type_map: HashMap<String, Vec<usize>>,
 }
 
@@ -29,26 +31,22 @@ impl LightweightIndexShard {
         let idx = self.entries.len();
         self.entries.push(entry);
         self.function_map.entry(key).or_default().push(idx);
+        Self::push_name_fragments(
+            &mut self.function_fragment_map,
+            self.entries[idx].name.as_ref(),
+            idx,
+        );
     }
 
     pub(crate) fn push_variable_entry(&mut self, key: String, entry: IndexEntry) {
         let idx = self.entries.len();
-        let leaf_alias = if entry.tag == gimli::constants::DW_TAG_variable
-            && (entry.flags.is_linkage
-                || crate::core::is_likely_mangled(entry.language, entry.name.as_ref()))
-        {
-            demangle_by_lang(entry.language, entry.name.as_ref())
-                .map(|demangled| demangled_leaf(&demangled))
-                .filter(|leaf| leaf != entry.name.as_ref())
-        } else {
-            None
-        };
-
         self.entries.push(entry);
         self.variable_map.entry(key).or_default().push(idx);
-        if let Some(alias) = leaf_alias {
-            self.variable_map.entry(alias).or_default().push(idx);
-        }
+        Self::push_name_fragments(
+            &mut self.variable_fragment_map,
+            self.entries[idx].name.as_ref(),
+            idx,
+        );
     }
 
     pub(crate) fn push_type_entry(&mut self, key: String, entry: IndexEntry) {
@@ -85,13 +83,21 @@ impl LightweightIndexShard {
 
         shard
     }
+
+    fn push_name_fragments(fragment_map: &mut HashMap<String, Vec<usize>>, key: &str, idx: usize) {
+        for fragment in extract_name_fragments(key) {
+            fragment_map.entry(fragment).or_default().push(idx);
+        }
+    }
 }
 
 #[derive(Debug, Default)]
 struct NameIndexShard {
     entry_base: usize,
     function_map: HashMap<String, Vec<usize>>,
+    function_fragment_map: HashMap<String, Vec<usize>>,
     variable_map: HashMap<String, Vec<usize>>,
+    variable_fragment_map: HashMap<String, Vec<usize>>,
     type_map: HashMap<String, Vec<usize>>,
 }
 
@@ -158,7 +164,9 @@ impl LightweightIndex {
             name_shards.push(NameIndexShard {
                 entry_base,
                 function_map: shard.function_map,
+                function_fragment_map: shard.function_fragment_map,
                 variable_map: shard.variable_map,
+                variable_fragment_map: shard.variable_fragment_map,
                 type_map: shard.type_map,
             });
         }
@@ -241,6 +249,67 @@ impl LightweightIndex {
         matches
     }
 
+    fn candidate_indices_for_fragments<'a>(
+        &'a self,
+        query: &str,
+        map_of: impl Fn(&'a NameIndexShard) -> &'a HashMap<String, Vec<usize>>,
+    ) -> Vec<usize> {
+        let mut fragment_hits: Vec<(String, usize)> = extract_name_fragments(query)
+            .into_iter()
+            .filter_map(|fragment| {
+                let hits = self
+                    .name_shards
+                    .iter()
+                    .map(|shard| map_of(shard).get(&fragment).map_or(0, Vec::len))
+                    .sum::<usize>();
+                (hits > 0).then_some((fragment, hits))
+            })
+            .collect();
+
+        if fragment_hits.is_empty() {
+            return Vec::new();
+        }
+
+        fragment_hits.sort_by_key(|(_, hits)| *hits);
+
+        let mut candidates = self.collect_fragment_indices(&fragment_hits[0].0, &map_of);
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+
+        for (fragment, _) in fragment_hits.iter().skip(1) {
+            if candidates.len() <= 1 {
+                break;
+            }
+
+            let fragment_indices = self.collect_fragment_indices(fragment, &map_of);
+            if fragment_indices.is_empty() {
+                continue;
+            }
+            candidates.retain(|idx| fragment_indices.contains(idx));
+        }
+
+        let mut ordered: Vec<usize> = candidates.into_iter().collect();
+        ordered.sort_unstable();
+        ordered
+    }
+
+    fn collect_fragment_indices<'a>(
+        &'a self,
+        fragment: &str,
+        map_of: impl Fn(&'a NameIndexShard) -> &'a HashMap<String, Vec<usize>>,
+    ) -> HashSet<usize> {
+        let mut indices = HashSet::new();
+        for shard in &self.name_shards {
+            if let Some(local_indices) = map_of(shard).get(fragment) {
+                for &local_idx in local_indices {
+                    indices.insert(shard.entry_base + local_idx);
+                }
+            }
+        }
+        indices
+    }
+
     /// Get all function names for debugging
     pub fn get_function_names(&self) -> Vec<&String> {
         self.unique_names(|shard| &shard.function_map)
@@ -249,6 +318,14 @@ impl LightweightIndex {
     /// Get all variable names for debugging
     pub fn get_variable_names(&self) -> Vec<&String> {
         self.unique_names(|shard| &shard.variable_map)
+    }
+
+    pub(crate) fn function_candidate_indices_by_fragment(&self, query: &str) -> Vec<usize> {
+        self.candidate_indices_for_fragments(query, |shard| &shard.function_fragment_map)
+    }
+
+    pub(crate) fn variable_candidate_indices_by_fragment(&self, query: &str) -> Vec<usize> {
+        self.candidate_indices_for_fragments(query, |shard| &shard.variable_fragment_map)
     }
 
     /// Internal: visit type-map entries across all shards.
@@ -263,6 +340,10 @@ impl LightweightIndex {
     /// Internal: get a raw entry by index
     pub(crate) fn entry(&self, idx: usize) -> Option<&IndexEntry> {
         self.entries.get(idx)
+    }
+
+    pub(crate) fn entry_count(&self) -> usize {
+        self.entries.len()
     }
 
     /// Get total statistics
