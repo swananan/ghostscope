@@ -88,6 +88,36 @@ fi
 
 mkdir -p "$RESULTS_DIR"
 
+require_json_value() {
+    local name=$1
+    local value=$2
+    local output=$3
+    if [[ -z "$value" || "$value" == "null" ]]; then
+        echo "failed to parse required benchmark field: $name" >&2
+        printf '%s\n' "$output" >&2
+        exit 1
+    fi
+    printf '%s' "$value"
+}
+
+optional_json_value() {
+    local value=$1
+    if [[ -z "$value" || "$value" == "null" ]]; then
+        printf 'null'
+    else
+        printf '%s' "$value"
+    fi
+}
+
+display_metric_ms() {
+    local value=$1
+    if [[ "$value" == "null" ]]; then
+        printf 'n/a'
+    else
+        printf '%sms' "$value"
+    fi
+}
+
 if [[ "$BUILD_CORPUS" -eq 1 ]]; then
     "$SCRIPT_DIR/build_corpus.sh" "$CORPUS_DIR"
 fi
@@ -135,37 +165,37 @@ QUERY_OUTPUT=$(CARGO_TARGET_DIR="$CARGO_TARGET_DIR_VALUE" \
     --runs "$RUNS" \
     --json)
 
-PARSE_AVG_MS=$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Average load time:/ {gsub("ms","",$4); print $4}')
-PARSE_P50_MS=$(printf '%s\n' "$PARSE_OUTPUT" | awk '/P50:/ {gsub("ms","",$2); print $2}')
-PARSE_P95_MS=$(printf '%s\n' "$PARSE_OUTPUT" | awk '/P95:/ {gsub("ms","",$2); print $2}')
-PARSE_MIN_MS=$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Min:/ {gsub("ms","",$2); print $2}')
-PARSE_MAX_MS=$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Max:/ {gsub("ms","",$2); print $2}')
-PARSE_INTERNAL_MODULE_COUNT=$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Internal module count:/ {print $4}')
-PARSE_PHASE_AVG_MS=$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Parse avg:/ {gsub("ms","",$3); print $3}')
-PARSE_PHASE_P50_MS=$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Parse p50:/ {gsub("ms","",$3); print $3}')
-PARSE_PHASE_P95_MS=$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Parse p95:/ {gsub("ms","",$3); print $3}')
-PARSE_PHASE_MIN_MS=$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Parse min:/ {gsub("ms","",$3); print $3}')
-PARSE_PHASE_MAX_MS=$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Parse max:/ {gsub("ms","",$3); print $3}')
-INDEX_PHASE_AVG_MS=$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Index avg:/ {gsub("ms","",$3); print $3}')
-INDEX_PHASE_P50_MS=$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Index p50:/ {gsub("ms","",$3); print $3}')
-INDEX_PHASE_P95_MS=$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Index p95:/ {gsub("ms","",$3); print $3}')
-INDEX_PHASE_MIN_MS=$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Index min:/ {gsub("ms","",$3); print $3}')
-INDEX_PHASE_MAX_MS=$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Index max:/ {gsub("ms","",$3); print $3}')
-INTERNAL_TOTAL_AVG_MS=$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Internal total avg:/ {gsub("ms","",$4); print $4}')
-INTERNAL_TOTAL_P50_MS=$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Internal total p50:/ {gsub("ms","",$4); print $4}')
-INTERNAL_TOTAL_P95_MS=$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Internal total p95:/ {gsub("ms","",$4); print $4}')
-INTERNAL_TOTAL_MIN_MS=$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Internal total min:/ {gsub("ms","",$4); print $4}')
-INTERNAL_TOTAL_MAX_MS=$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Internal total max:/ {gsub("ms","",$4); print $4}')
+PARSE_AVG_MS=$(require_json_value "parse average" "$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Average load time:/ {gsub("ms","",$4); print $4}')" "$PARSE_OUTPUT")
+PARSE_P50_MS=$(require_json_value "parse p50" "$(printf '%s\n' "$PARSE_OUTPUT" | awk '/P50:/ {gsub("ms","",$2); print $2}')" "$PARSE_OUTPUT")
+PARSE_P95_MS=$(require_json_value "parse p95" "$(printf '%s\n' "$PARSE_OUTPUT" | awk '/P95:/ {gsub("ms","",$2); print $2}')" "$PARSE_OUTPUT")
+PARSE_MIN_MS=$(require_json_value "parse min" "$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Min:/ {gsub("ms","",$2); print $2}')" "$PARSE_OUTPUT")
+PARSE_MAX_MS=$(require_json_value "parse max" "$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Max:/ {gsub("ms","",$2); print $2}')" "$PARSE_OUTPUT")
+PARSE_INTERNAL_MODULE_COUNT=$(optional_json_value "$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Internal module count:/ {print $4}')")
+PARSE_PHASE_AVG_MS=$(optional_json_value "$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Parse avg:/ {gsub("ms","",$3); print $3}')")
+PARSE_PHASE_P50_MS=$(optional_json_value "$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Parse p50:/ {gsub("ms","",$3); print $3}')")
+PARSE_PHASE_P95_MS=$(optional_json_value "$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Parse p95:/ {gsub("ms","",$3); print $3}')")
+PARSE_PHASE_MIN_MS=$(optional_json_value "$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Parse min:/ {gsub("ms","",$3); print $3}')")
+PARSE_PHASE_MAX_MS=$(optional_json_value "$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Parse max:/ {gsub("ms","",$3); print $3}')")
+INDEX_PHASE_AVG_MS=$(optional_json_value "$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Index avg:/ {gsub("ms","",$3); print $3}')")
+INDEX_PHASE_P50_MS=$(optional_json_value "$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Index p50:/ {gsub("ms","",$3); print $3}')")
+INDEX_PHASE_P95_MS=$(optional_json_value "$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Index p95:/ {gsub("ms","",$3); print $3}')")
+INDEX_PHASE_MIN_MS=$(optional_json_value "$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Index min:/ {gsub("ms","",$3); print $3}')")
+INDEX_PHASE_MAX_MS=$(optional_json_value "$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Index max:/ {gsub("ms","",$3); print $3}')")
+INTERNAL_TOTAL_AVG_MS=$(optional_json_value "$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Internal total avg:/ {gsub("ms","",$4); print $4}')")
+INTERNAL_TOTAL_P50_MS=$(optional_json_value "$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Internal total p50:/ {gsub("ms","",$4); print $4}')")
+INTERNAL_TOTAL_P95_MS=$(optional_json_value "$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Internal total p95:/ {gsub("ms","",$4); print $4}')")
+INTERNAL_TOTAL_MIN_MS=$(optional_json_value "$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Internal total min:/ {gsub("ms","",$4); print $4}')")
+INTERNAL_TOTAL_MAX_MS=$(optional_json_value "$(printf '%s\n' "$PARSE_OUTPUT" | awk '/Internal total max:/ {gsub("ms","",$4); print $4}')")
 QUERY_JSON=$(printf '%s\n' "$QUERY_OUTPUT" | sed -n '/^{/,$p')
-QUERY_LOADING_MS=$(printf '%s\n' "$QUERY_JSON" | jq '.loading_time_ms')
-QUERY_FIRST_RUN_MS=$(printf '%s\n' "$QUERY_JSON" | jq '.benchmark.first_run_ms')
-QUERY_AVG_MS=$(printf '%s\n' "$QUERY_JSON" | jq '.benchmark.average_ms')
-QUERY_P50_MS=$(printf '%s\n' "$QUERY_JSON" | jq '.benchmark.p50_ms')
-QUERY_P95_MS=$(printf '%s\n' "$QUERY_JSON" | jq '.benchmark.p95_ms')
-QUERY_MIN_MS=$(printf '%s\n' "$QUERY_JSON" | jq '.benchmark.min_ms')
-QUERY_MAX_MS=$(printf '%s\n' "$QUERY_JSON" | jq '.benchmark.max_ms')
-QUERY_TOTAL_VARS=$(printf '%s\n' "$QUERY_JSON" | jq '.total_variables')
-QUERY_ADDRESS_COUNT=$(printf '%s\n' "$QUERY_JSON" | jq '.address_count')
+QUERY_LOADING_MS=$(require_json_value "query loading time" "$(printf '%s\n' "$QUERY_JSON" | jq '.loading_time_ms')" "$QUERY_JSON")
+QUERY_FIRST_RUN_MS=$(require_json_value "query first run" "$(printf '%s\n' "$QUERY_JSON" | jq '.benchmark.first_run_ms')" "$QUERY_JSON")
+QUERY_AVG_MS=$(require_json_value "query average" "$(printf '%s\n' "$QUERY_JSON" | jq '.benchmark.average_ms')" "$QUERY_JSON")
+QUERY_P50_MS=$(require_json_value "query p50" "$(printf '%s\n' "$QUERY_JSON" | jq '.benchmark.p50_ms')" "$QUERY_JSON")
+QUERY_P95_MS=$(require_json_value "query p95" "$(printf '%s\n' "$QUERY_JSON" | jq '.benchmark.p95_ms')" "$QUERY_JSON")
+QUERY_MIN_MS=$(require_json_value "query min" "$(printf '%s\n' "$QUERY_JSON" | jq '.benchmark.min_ms')" "$QUERY_JSON")
+QUERY_MAX_MS=$(require_json_value "query max" "$(printf '%s\n' "$QUERY_JSON" | jq '.benchmark.max_ms')" "$QUERY_JSON")
+QUERY_TOTAL_VARS=$(require_json_value "query total variables" "$(printf '%s\n' "$QUERY_JSON" | jq '.total_variables')" "$QUERY_JSON")
+QUERY_ADDRESS_COUNT=$(require_json_value "query address count" "$(printf '%s\n' "$QUERY_JSON" | jq '.address_count')" "$QUERY_JSON")
 QUERY_FIRST_ADDRESS=$(printf '%s\n' "$QUERY_JSON" | jq -r '.first_address // empty')
 
 jq -n \
@@ -298,15 +328,15 @@ echo "  p95: ${PARSE_P95_MS}ms"
 echo "  min: ${PARSE_MIN_MS}ms"
 echo "  max: ${PARSE_MAX_MS}ms"
 echo "  internal modules: ${PARSE_INTERNAL_MODULE_COUNT}"
-echo "  parse phase avg: ${PARSE_PHASE_AVG_MS}ms"
-echo "  parse phase p50: ${PARSE_PHASE_P50_MS}ms"
-echo "  parse phase p95: ${PARSE_PHASE_P95_MS}ms"
-echo "  index phase avg: ${INDEX_PHASE_AVG_MS}ms"
-echo "  index phase p50: ${INDEX_PHASE_P50_MS}ms"
-echo "  index phase p95: ${INDEX_PHASE_P95_MS}ms"
-echo "  internal total avg: ${INTERNAL_TOTAL_AVG_MS}ms"
-echo "  internal total p50: ${INTERNAL_TOTAL_P50_MS}ms"
-echo "  internal total p95: ${INTERNAL_TOTAL_P95_MS}ms"
+echo "  parse phase avg: $(display_metric_ms "$PARSE_PHASE_AVG_MS")"
+echo "  parse phase p50: $(display_metric_ms "$PARSE_PHASE_P50_MS")"
+echo "  parse phase p95: $(display_metric_ms "$PARSE_PHASE_P95_MS")"
+echo "  index phase avg: $(display_metric_ms "$INDEX_PHASE_AVG_MS")"
+echo "  index phase p50: $(display_metric_ms "$INDEX_PHASE_P50_MS")"
+echo "  index phase p95: $(display_metric_ms "$INDEX_PHASE_P95_MS")"
+echo "  internal total avg: $(display_metric_ms "$INTERNAL_TOTAL_AVG_MS")"
+echo "  internal total p50: $(display_metric_ms "$INTERNAL_TOTAL_P50_MS")"
+echo "  internal total p95: $(display_metric_ms "$INTERNAL_TOTAL_P95_MS")"
 echo
 echo "Source-line query benchmark:"
 echo "  meaning: source-line lookup + address resolution + variable collection for matched addresses"
