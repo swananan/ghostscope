@@ -27,8 +27,9 @@ pub struct TypeNameIndex {
 impl TypeNameIndex {
     pub fn build_from_lightweight(ix: &LightweightIndex) -> Self {
         let mut by_name: HashMap<String, Vec<TypeLoc>> = HashMap::new();
-        for (name, indices) in ix.type_map_iter() {
-            for &idx in indices {
+        ix.for_each_type_map_entry(|name, entry_base, indices| {
+            for &local_idx in indices {
+                let idx = entry_base + local_idx;
                 if let Some(entry) = ix.entry(idx) {
                     let tag = entry.tag;
                     // Include aggregates and typedefs
@@ -51,7 +52,7 @@ impl TypeNameIndex {
                     }
                 }
             }
-        }
+        });
         Self { by_name }
     }
 
