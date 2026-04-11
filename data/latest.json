@@ -1,45 +1,45 @@
 {
-  "generated_at": "2026-04-11T04:16:53Z",
-  "sha": "1d701a4fd19600a1cde788655a5b69216798ee51",
-  "sha_short": "1d701a4fd196",
+  "generated_at": "2026-04-11T04:45:27Z",
+  "sha": "b07519bb683ee0251695bd0c5fb33a92160c5b6b",
+  "sha_short": "b07519bb683e",
   "ref": "main",
   "event": "push",
-  "run_id": "24274422963",
-  "run_number": "19",
+  "run_id": "24274911159",
+  "run_number": "20",
   "run_attempt": "1",
-  "run_url": "https://github.com/swananan/ghostscope/actions/runs/24274422963",
-  "artifact_path": "data/runs/20260411T041653Z-1d701a4fd196.json",
+  "run_url": "https://github.com/swananan/ghostscope/actions/runs/24274911159",
+  "artifact_path": "data/runs/20260411T044527Z-b07519bb683e.json",
   "metrics": {
     "fast_parse_ms": {
-      "average": 980.336,
-      "p50": 949.429,
-      "p95": 1040.265,
-      "min": 944.777,
-      "max": 1040.265
+      "average": 983.51,
+      "p50": 960.192,
+      "p95": 1053.692,
+      "min": 949.82,
+      "max": 1053.692
     },
     "fast_parse_targets_ms": {
       "parse-stress": {
-        "average": 980.336,
-        "p50": 949.429,
-        "p95": 1040.265,
-        "min": 944.777,
-        "max": 1040.265
+        "average": 983.51,
+        "p50": 960.192,
+        "p95": 1053.692,
+        "min": 949.82,
+        "max": 1053.692
       },
       "rust-parse-stress": {
-        "average": 5496.347,
-        "p50": 5448.968,
-        "p95": 5843.491,
-        "min": 5422.406,
-        "max": 5843.491
+        "average": 5492.292,
+        "p50": 5451.973,
+        "p95": 5747.704,
+        "min": 5365.539,
+        "max": 5747.704
       }
     },
     "source_line_query_ms": {
-      "first_run": 4.0864389999999995,
-      "average": 3.6661793000000005,
-      "p50": 3.616007,
-      "p95": 4.0864389999999995,
-      "min": 3.592563,
-      "max": 4.0864389999999995
+      "first_run": 4.068493999999999,
+      "average": 3.6722774,
+      "p50": 3.6264190000000003,
+      "p95": 4.068493999999999,
+      "min": 3.5959920000000003,
+      "max": 4.068493999999999
     }
   },
   "query_result": {
