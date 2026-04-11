@@ -87,6 +87,7 @@ def main() -> int:
     combined = dict(primary)
     combined["primary_parse_target"] = parse_target_name(primary)
     combined["parse_targets"] = parse_targets
+    combined["result_path"] = str(Path(args.output))
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)

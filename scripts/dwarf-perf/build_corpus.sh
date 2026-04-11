@@ -44,8 +44,10 @@ CONTAINER_OUT_DIR="/workspace${OUT_DIR#"$REPO_ROOT"}"
 env_args=()
 for var_name in \
     DWARF_PERF_CC \
+    DWARF_PERF_CXX \
     DWARF_PERF_DWARF_VERSION \
     DWARF_PERF_CFLAGS \
+    DWARF_PERF_CXXFLAGS \
     DWARF_PERF_LDFLAGS \
     DWARF_PERF_RUSTC \
     DWARF_PERF_RUSTFLAGS \
@@ -57,7 +59,21 @@ for var_name in \
     RUST_PARSE_STRESS_PRESET \
     RUST_PARSE_STRESS_MODULES \
     RUST_PARSE_STRESS_TYPES_PER_MODULE \
-    RUST_PARSE_STRESS_FUNCTIONS_PER_MODULE
+    RUST_PARSE_STRESS_FUNCTIONS_PER_MODULE \
+    CPP_TEMPLATE_STRESS_PRESET \
+    CPP_TEMPLATE_STRESS_UNITS \
+    CPP_TEMPLATE_STRESS_FAMILIES_PER_UNIT \
+    CPP_TEMPLATE_STRESS_INSTANTIATIONS_PER_FAMILY \
+    CPP_TEMPLATE_STRESS_METHODS_PER_FAMILY \
+    RUST_GENERIC_STRESS_PRESET \
+    RUST_GENERIC_STRESS_MODULES \
+    RUST_GENERIC_STRESS_FAMILIES_PER_MODULE \
+    RUST_GENERIC_STRESS_MONOMORPHS_PER_FAMILY \
+    CPP_DEEP_NAMESPACE_PRESET \
+    CPP_DEEP_NAMESPACE_UNITS \
+    CPP_DEEP_NAMESPACE_NAMESPACE_DEPTH \
+    CPP_DEEP_NAMESPACE_BRANCHES_PER_UNIT \
+    CPP_DEEP_NAMESPACE_FUNCTIONS_PER_BRANCH
 do
     if [[ -n "${!var_name:-}" ]]; then
         env_args+=(-e "$var_name")
@@ -78,5 +94,8 @@ echo "Host artifacts:"
 echo "  $OUT_DIR/query-hotspot/query_hotspot"
 echo "  $OUT_DIR/parse-stress/parse_stress"
 echo "  $OUT_DIR/rust-parse-stress/rust_parse_stress"
+echo "  $OUT_DIR/cpp-template-stress/cpp_template_stress"
+echo "  $OUT_DIR/rust-generic-stress/rust_generic_stress"
+echo "  $OUT_DIR/cpp-deep-namespace/cpp_deep_namespace"
 echo "  $OUT_DIR/manifest.json"
 echo

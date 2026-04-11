@@ -27,7 +27,7 @@ jobs:
   build:
     name: Build DWARF Perf History
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 75
     permissions:
       contents: write
     env:
@@ -86,22 +86,36 @@ jobs:
         run: |
           set -euo pipefail
           ./scripts/dwarf-perf/build_corpus.sh
-          ./scripts/dwarf-perf/run_baseline.sh \
-            --skip-build \
-            --results-dir "$DWARF_PERF_RESULTS_DIR" \
-            --result-name main-parse-stress \
-            --runs 10 \
-            --cargo-target-dir "$CARGO_TARGET_DIR"
-          ./scripts/dwarf-perf/run_baseline.sh \
-            --skip-build \
-            --results-dir "$DWARF_PERF_RESULTS_DIR" \
-            --result-name main-rust-parse-stress \
-            --parse-target rust-parse-stress \
-            --runs 10 \
-            --cargo-target-dir "$CARGO_TARGET_DIR"
+          parse_targets=(
+            parse-stress
+            rust-parse-stress
+            cpp-template-stress
+            rust-generic-stress
+            cpp-deep-namespace
+          )
+          combine_args=()
+          primary_json=""
+
+          for target in "${parse_targets[@]}"; do
+            result_json="$DWARF_PERF_RESULTS_DIR/main-${target}.json"
+            ./scripts/dwarf-perf/run_baseline.sh \
+              --skip-build \
+              --results-dir "$DWARF_PERF_RESULTS_DIR" \
+              --result-name "main-${target}" \
+              --runs 10 \
+              --cargo-target-dir "$CARGO_TARGET_DIR" \
+              --parse-target "$target"
+
+            if [[ -z "$primary_json" ]]; then
+              primary_json="$result_json"
+            else
+              combine_args+=(--additional "$result_json")
+            fi
+          done
+
           python3 scripts/dwarf-perf/combine_baselines.py \
-            --primary "$DWARF_PERF_RESULTS_DIR/main-parse-stress.json" \
-            --additional "$DWARF_PERF_RESULTS_DIR/main-rust-parse-stress.json" \
+            --primary "$primary_json" \
+            "${combine_args[@]}" \
             --output "$DWARF_PERF_RESULTS_DIR/main.json"
 
       - name: Restore history state worktree
