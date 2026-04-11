@@ -3228,7 +3228,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_fallback_matches_rust_v0_demangled_function_queries() {
+    fn fragment_candidates_match_rust_v0_demangled_function_queries() {
         let mangled = "_RNvCs73fAdSrgOJL_4test4main".to_string();
         let demangled = crate::core::demangle_by_lang(Some(gimli::DW_LANG_Rust), &mangled).unwrap();
 
@@ -3253,14 +3253,8 @@ mod tests {
 
         let ix = LightweightIndex::from_builder_data(functions, HashMap::new(), HashMap::new());
 
-        assert!(ix
-            .function_candidate_indices_by_fragment(&demangled)
-            .is_empty());
         assert_eq!(
-            ModuleData::scan_matching_candidate_indices(&ix, &demangled, |tag| matches!(
-                tag,
-                constants::DW_TAG_subprogram | constants::DW_TAG_inlined_subroutine
-            )),
+            ix.function_candidate_indices_by_fragment(&demangled),
             vec![0]
         );
     }
