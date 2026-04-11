@@ -116,38 +116,63 @@ impl<'a> DwarfParser<'a> {
         cu_language: Option<gimli::DwLang>,
     ) -> Result<InfoShard> {
         let mut shard = InfoShard::default();
-        let mut entries = unit.entries();
+        let mut entries = unit.entries_raw(None)?;
         let mut metadata_cache: HashMap<gimli::UnitOffset, FunctionMetadata> = HashMap::new();
         let mut tag_stack: Vec<gimli::DwTag> = Vec::new();
-        while let Some(entry) = entries.next_dfs()? {
-            let d: usize = entry.depth() as usize;
+        while !entries.is_empty() {
+            let d: usize = entries.next_depth() as usize;
+            let entry_offset = entries.next_offset();
             while tag_stack.len() > d {
                 tag_stack.pop();
             }
-            match entry.tag() {
+            let Some(abbrev) = entries.read_abbreviation()? else {
+                continue;
+            };
+            let tag = abbrev.tag();
+            let needs_full_entry = matches!(
+                tag,
+                gimli::constants::DW_TAG_subprogram
+                    | gimli::constants::DW_TAG_inlined_subroutine
+                    | gimli::constants::DW_TAG_variable
+                    | gimli::constants::DW_TAG_structure_type
+                    | gimli::constants::DW_TAG_class_type
+                    | gimli::constants::DW_TAG_union_type
+                    | gimli::constants::DW_TAG_enumeration_type
+                    | gimli::constants::DW_TAG_typedef
+            );
+
+            if !needs_full_entry {
+                // Most DIEs are not indexable. Skip their attributes without materializing
+                // a full DebuggingInformationEntry so template-heavy CUs stay cheaper.
+                entries.skip_attributes(abbrev.attributes())?;
+                tag_stack.push(tag);
+                continue;
+            }
+
+            let entry = unit.entry(entry_offset)?;
+            entries.skip_attributes(abbrev.attributes())?;
+
+            match tag {
                 gimli::constants::DW_TAG_subprogram => {
                     let mut visited = HashSet::new();
                     let metadata = self.resolve_function_metadata(
                         self.dwarf,
                         unit,
-                        entry,
+                        &entry,
                         &mut metadata_cache,
                         &mut visited,
                     )?;
                     if let Some(name) = metadata.name.clone() {
                         let address_ranges =
-                            self.extract_address_ranges(self.dwarf, unit, entry)?;
-                        let entry_pc_cached = self.extract_entry_pc(entry)?;
-                        let function_kind = Self::classify_function_kind(
-                            entry.tag(),
-                            &address_ranges,
-                            entry_pc_cached,
-                        );
-                        let is_main = self.is_main_function(entry, &name).unwrap_or(false);
+                            self.extract_address_ranges(self.dwarf, unit, &entry)?;
+                        let entry_pc_cached = self.extract_entry_pc(&entry)?;
+                        let function_kind =
+                            Self::classify_function_kind(tag, &address_ranges, entry_pc_cached);
+                        let is_main = self.is_main_function(&entry, &name).unwrap_or(false);
                         let is_static = metadata
                             .is_external
                             .map(|external| !external)
-                            .unwrap_or_else(|| self.is_static_symbol(entry).unwrap_or(false));
+                            .unwrap_or_else(|| self.is_static_symbol(&entry).unwrap_or(false));
                         let flags = crate::core::IndexFlags {
                             is_static,
                             is_main,
@@ -157,11 +182,11 @@ impl<'a> DwarfParser<'a> {
                             ..Default::default()
                         };
                         let linkage_name = self
-                            .extract_linkage_name(self.dwarf, unit, entry)?
+                            .extract_linkage_name(self.dwarf, unit, &entry)?
                             .map(|(linkage_name, _)| linkage_name);
                         let seed = FunctionEntrySeed {
                             die_offset: entry.offset(),
-                            tag: entry.tag(),
+                            tag,
                             unit_offset,
                             flags,
                             language: cu_language,
@@ -177,19 +202,16 @@ impl<'a> DwarfParser<'a> {
                     let metadata = self.resolve_function_metadata(
                         self.dwarf,
                         unit,
-                        entry,
+                        &entry,
                         &mut metadata_cache,
                         &mut visited,
                     )?;
                     if let Some(name) = metadata.name.clone() {
                         let address_ranges =
-                            self.extract_address_ranges(self.dwarf, unit, entry)?;
-                        let entry_pc_cached = self.extract_entry_pc(entry)?;
-                        let function_kind = Self::classify_function_kind(
-                            entry.tag(),
-                            &address_ranges,
-                            entry_pc_cached,
-                        );
+                            self.extract_address_ranges(self.dwarf, unit, &entry)?;
+                        let entry_pc_cached = self.extract_entry_pc(&entry)?;
+                        let function_kind =
+                            Self::classify_function_kind(tag, &address_ranges, entry_pc_cached);
                         let is_static = metadata
                             .is_external
                             .map(|external| !external)
@@ -202,11 +224,11 @@ impl<'a> DwarfParser<'a> {
                             ..Default::default()
                         };
                         let linkage_name = self
-                            .extract_linkage_name(self.dwarf, unit, entry)?
+                            .extract_linkage_name(self.dwarf, unit, &entry)?
                             .map(|(linkage_name, _)| linkage_name);
                         let seed = FunctionEntrySeed {
                             die_offset: entry.offset(),
-                            tag: entry.tag(),
+                            tag,
                             unit_offset,
                             flags,
                             language: cu_language,
@@ -223,9 +245,9 @@ impl<'a> DwarfParser<'a> {
                         entry.offset(),
                         unit_offset
                     );
-                    let var_addr = self.extract_variable_address(entry, unit)?;
+                    let var_addr = self.extract_variable_address(&entry, unit)?;
                     let is_static_symbol = self
-                        .is_static_variable_symbol(entry, var_addr)
+                        .is_static_variable_symbol(&entry, var_addr)
                         .unwrap_or(false);
                     let in_function_scope = tag_stack.iter().any(|t| {
                         *t == gimli::constants::DW_TAG_subprogram
@@ -238,7 +260,7 @@ impl<'a> DwarfParser<'a> {
                             tag_stack
                         );
                         // Skip local variables
-                        tag_stack.push(entry.tag());
+                        tag_stack.push(tag);
                         continue;
                     } else if in_function_scope {
                         // Rust (and some C compilers) sometimes nest file-scoped statics under the
@@ -251,12 +273,12 @@ impl<'a> DwarfParser<'a> {
                             tag_stack
                         );
                     }
-                    if Self::is_declaration(entry).unwrap_or(false) {
+                    if Self::is_declaration(&entry).unwrap_or(false) {
                         tracing::trace!(
                             "Skipping variable at {:?} (declaration-only DIE)",
                             entry.offset()
                         );
-                        tag_stack.push(entry.tag());
+                        tag_stack.push(tag);
                         continue;
                     }
                     let mut collected_names: Vec<(String, bool)> = Vec::new();
@@ -273,12 +295,12 @@ impl<'a> DwarfParser<'a> {
                         collected_names.push((candidate, is_linkage_alias));
                     };
 
-                    if let Some(name) = self.extract_name(self.dwarf, unit, entry)? {
+                    if let Some(name) = self.extract_name(self.dwarf, unit, &entry)? {
                         push_unique_name(name, false);
                     }
 
                     if let Some((linkage_name, _)) =
-                        self.extract_linkage_name(self.dwarf, unit, entry)?
+                        self.extract_linkage_name(self.dwarf, unit, &entry)?
                     {
                         push_unique_name(linkage_name.clone(), true);
                     }
@@ -289,7 +311,7 @@ impl<'a> DwarfParser<'a> {
                             entry.offset(),
                             cu_language
                         );
-                        tag_stack.push(entry.tag());
+                        tag_stack.push(tag);
                         continue;
                     }
 
@@ -306,7 +328,7 @@ impl<'a> DwarfParser<'a> {
                             name: std::sync::Arc::from(name.as_str()),
                             die_offset: entry.offset(),
                             unit_offset,
-                            tag: entry.tag(),
+                            tag,
                             flags: entry_flags,
                             language: cu_language,
                             address_ranges: var_ranges.clone(),
@@ -328,8 +350,8 @@ impl<'a> DwarfParser<'a> {
                 | gimli::constants::DW_TAG_union_type
                 | gimli::constants::DW_TAG_enumeration_type
                 | gimli::constants::DW_TAG_typedef => {
-                    if let Some(name) = self.extract_name(self.dwarf, unit, entry)? {
-                        let is_decl = Self::bool_attr(entry, gimli::constants::DW_AT_declaration)?
+                    if let Some(name) = self.extract_name(self.dwarf, unit, &entry)? {
+                        let is_decl = Self::bool_attr(&entry, gimli::constants::DW_AT_declaration)?
                             .unwrap_or(false);
                         let flags = crate::core::IndexFlags {
                             is_type_declaration: is_decl,
@@ -339,7 +361,7 @@ impl<'a> DwarfParser<'a> {
                             name: std::sync::Arc::from(name.as_str()),
                             die_offset: entry.offset(),
                             unit_offset,
-                            tag: entry.tag(),
+                            tag,
                             flags,
                             language: cu_language,
                             address_ranges: Vec::new(),
@@ -351,7 +373,7 @@ impl<'a> DwarfParser<'a> {
                 }
                 _ => {}
             }
-            tag_stack.push(entry.tag());
+            tag_stack.push(tag);
         }
         Ok(shard)
     }
