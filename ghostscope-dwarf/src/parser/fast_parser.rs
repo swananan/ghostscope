@@ -3,10 +3,7 @@
 use super::fast_paths::resolve_name_in_unit_fast;
 use crate::{
     binary::DwarfReader,
-    core::{
-        demangle::{demangle_by_lang, demangled_leaf},
-        FunctionDieKind, IndexEntry, Result,
-    },
+    core::{FunctionDieKind, IndexEntry, Result},
     index::{
         directory_from_index, resolve_file_path, LightweightFileIndex, LightweightIndex,
         LightweightIndexShard, LineMappingTable, ScopedFileIndexManager,
@@ -276,26 +273,17 @@ impl<'a> DwarfParser<'a> {
                         collected_names.push((candidate, is_linkage_alias));
                     };
 
-                    let mut have_primary_name = false;
                     if let Some(name) = self.extract_name(self.dwarf, unit, entry)? {
                         push_unique_name(name, false);
-                        have_primary_name = true;
                     }
 
                     if let Some((linkage_name, _)) =
                         self.extract_linkage_name(self.dwarf, unit, entry)?
                     {
-                        if let Some(demangled) =
-                            demangle_by_lang(cu_language, linkage_name.as_str())
-                        {
-                            let leaf = demangled_leaf(&demangled);
-                            push_unique_name(leaf, false);
-                            have_primary_name = true;
-                        }
                         push_unique_name(linkage_name.clone(), true);
                     }
 
-                    if !have_primary_name {
+                    if collected_names.is_empty() {
                         tracing::trace!(
                             "DWARF variable at {:?} missing usable name (CU lang={:?}); skipping alias registration",
                             entry.offset(),
