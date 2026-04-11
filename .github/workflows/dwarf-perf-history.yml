@@ -89,9 +89,20 @@ jobs:
           ./scripts/dwarf-perf/run_baseline.sh \
             --skip-build \
             --results-dir "$DWARF_PERF_RESULTS_DIR" \
-            --result-name main \
+            --result-name main-parse-stress \
             --runs 10 \
             --cargo-target-dir "$CARGO_TARGET_DIR"
+          ./scripts/dwarf-perf/run_baseline.sh \
+            --skip-build \
+            --results-dir "$DWARF_PERF_RESULTS_DIR" \
+            --result-name main-rust-parse-stress \
+            --parse-target rust-parse-stress \
+            --runs 10 \
+            --cargo-target-dir "$CARGO_TARGET_DIR"
+          python3 scripts/dwarf-perf/combine_baselines.py \
+            --primary "$DWARF_PERF_RESULTS_DIR/main-parse-stress.json" \
+            --additional "$DWARF_PERF_RESULTS_DIR/main-rust-parse-stress.json" \
+            --output "$DWARF_PERF_RESULTS_DIR/main.json"
 
       - name: Restore history state worktree
         env:
