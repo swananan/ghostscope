@@ -41,11 +41,27 @@ def parse_target_name(baseline: dict[str, Any]) -> str:
 
 
 def ensure_compatible(primary: dict[str, Any], candidate: dict[str, Any], candidate_path: str) -> None:
-    if candidate["query_benchmark"] != primary["query_benchmark"]:
+    primary_source = primary["query_benchmark"]["source"]
+    candidate_source = candidate["query_benchmark"]["source"]
+    if candidate_source != primary_source:
         raise ValueError(
-            f"query_benchmark mismatch while combining baseline: {candidate_path}"
+            f"query source mismatch while combining baseline: {candidate_path}"
         )
-    if candidate["query_result"] != primary["query_result"]:
+
+    if candidate["query_result"]["source"] != primary["query_result"]["source"]:
+        raise ValueError(
+            f"query result source mismatch while combining baseline: {candidate_path}"
+        )
+
+    primary_result_shape = {
+        key: primary["query_result"][key]
+        for key in ["address_count", "total_variables", "first_address"]
+    }
+    candidate_result_shape = {
+        key: candidate["query_result"][key]
+        for key in ["address_count", "total_variables", "first_address"]
+    }
+    if candidate_result_shape != primary_result_shape:
         raise ValueError(
             f"query_result mismatch while combining baseline: {candidate_path}"
         )
