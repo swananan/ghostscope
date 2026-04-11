@@ -12,22 +12,97 @@ use crate::{
     semantics::range_contains_pc,
 };
 use gimli::DebugInfoOffset;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use tracing::debug;
+
+/// Per-CU shard produced during parallel DWARF parsing.
+#[derive(Debug, Default)]
+pub(crate) struct LightweightIndexShard {
+    pub(crate) entries: Vec<IndexEntry>,
+    pub(crate) function_map: HashMap<String, Vec<usize>>,
+    pub(crate) variable_map: HashMap<String, Vec<usize>>,
+    pub(crate) type_map: HashMap<String, Vec<usize>>,
+}
+
+impl LightweightIndexShard {
+    pub(crate) fn push_function_entry(&mut self, key: String, entry: IndexEntry) {
+        let idx = self.entries.len();
+        self.entries.push(entry);
+        self.function_map.entry(key).or_default().push(idx);
+    }
+
+    pub(crate) fn push_variable_entry(&mut self, key: String, entry: IndexEntry) {
+        let idx = self.entries.len();
+        let leaf_alias = if entry.tag == gimli::constants::DW_TAG_variable
+            && (entry.flags.is_linkage
+                || crate::core::is_likely_mangled(entry.language, entry.name.as_ref()))
+        {
+            demangle_by_lang(entry.language, entry.name.as_ref())
+                .map(|demangled| demangled_leaf(&demangled))
+                .filter(|leaf| leaf != entry.name.as_ref())
+        } else {
+            None
+        };
+
+        self.entries.push(entry);
+        self.variable_map.entry(key).or_default().push(idx);
+        if let Some(alias) = leaf_alias {
+            self.variable_map.entry(alias).or_default().push(idx);
+        }
+    }
+
+    pub(crate) fn push_type_entry(&mut self, key: String, entry: IndexEntry) {
+        let idx = self.entries.len();
+        self.entries.push(entry);
+        self.type_map.entry(key).or_default().push(idx);
+    }
+
+    #[allow(dead_code)]
+    fn from_builder_data(
+        functions: HashMap<String, Vec<IndexEntry>>,
+        variables: HashMap<String, Vec<IndexEntry>>,
+        types: HashMap<String, Vec<IndexEntry>>,
+    ) -> Self {
+        let mut shard = Self::default();
+
+        for (name, func_entries) in functions {
+            for entry in func_entries {
+                shard.push_function_entry(name.clone(), entry);
+            }
+        }
+
+        for (name, var_entries) in variables {
+            for entry in var_entries {
+                shard.push_variable_entry(name.clone(), entry);
+            }
+        }
+
+        for (name, ty_entries) in types {
+            for entry in ty_entries {
+                shard.push_type_entry(name.clone(), entry);
+            }
+        }
+
+        shard
+    }
+}
+
+#[derive(Debug, Default)]
+struct NameIndexShard {
+    entry_base: usize,
+    function_map: HashMap<String, Vec<usize>>,
+    variable_map: HashMap<String, Vec<usize>>,
+    type_map: HashMap<String, Vec<usize>>,
+}
 
 /// Cooked index - inspired by GDB's cooked_index design
 /// Contains lightweight entries for fast symbol lookup
 #[derive(Debug)]
 pub struct LightweightIndex {
-    /// All index entries sorted by name for fast binary search
-    /// GDB insight: Single flat vector instead of multiple hash maps
+    /// All index entries kept in a flat vector for stable `entry(usize)` access.
     entries: Vec<IndexEntry>,
-    /// Function name -> entry indices (for O(1) function lookup)
-    function_map: HashMap<String, Vec<usize>>,
-    /// Variable name -> entry indices (for O(1) variable lookup)
-    variable_map: HashMap<String, Vec<usize>>,
-    /// Type name -> entry indices (struct/class/union/enum) for fast type lookup by name
-    type_map: HashMap<String, Vec<usize>>,
+    /// Per-CU name maps kept as shards to avoid post-parse global merges.
+    name_shards: Vec<NameIndexShard>,
     /// Address map: start_address -> entry index
     /// Uses BTreeMap for efficient range queries (similar to GDB's addrmap)
     /// Only includes entries with address ranges
@@ -47,9 +122,7 @@ impl LightweightIndex {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
-            function_map: HashMap::new(),
-            variable_map: HashMap::new(),
-            type_map: HashMap::new(),
+            name_shards: Vec::new(),
             address_map: BTreeMap::new(),
             total_functions: 0,
             total_variables: 0,
@@ -60,54 +133,51 @@ impl LightweightIndex {
 
     /// Build cooked index from parsed data (called from DwarfParser)
     /// Follows GDB's cooked index pattern
+    #[allow(dead_code)]
     pub fn from_builder_data(
         functions: HashMap<String, Vec<IndexEntry>>,
         variables: HashMap<String, Vec<IndexEntry>>,
         types: HashMap<String, Vec<IndexEntry>>,
     ) -> Self {
+        Self::from_shards(vec![LightweightIndexShard::from_builder_data(
+            functions, variables, types,
+        )])
+    }
+
+    /// Build cooked index directly from per-CU shards.
+    pub(crate) fn from_shards(shards: Vec<LightweightIndexShard>) -> Self {
         debug!("Building lightweight index from parsed data");
 
-        let mut entries = Vec::new();
-        let mut function_map = HashMap::new();
-        let mut variable_map = HashMap::new();
-        let mut type_map = HashMap::new();
+        let total_entry_capacity: usize = shards.iter().map(|shard| shard.entries.len()).sum();
+        let mut entries = Vec::with_capacity(total_entry_capacity);
+        let mut name_shards = Vec::with_capacity(shards.len());
 
-        // Add all function entries to flat vector
-        let mut total_functions = 0;
-        for (name, func_entries) in functions {
-            let start_idx = entries.len();
-            entries.extend(func_entries);
-            let indices: Vec<usize> = (start_idx..entries.len()).collect();
-            function_map.insert(name, indices);
-            total_functions += entries.len() - start_idx;
+        for shard in shards {
+            let entry_base = entries.len();
+            entries.extend(shard.entries);
+            name_shards.push(NameIndexShard {
+                entry_base,
+                function_map: shard.function_map,
+                variable_map: shard.variable_map,
+                type_map: shard.type_map,
+            });
         }
 
-        // Add all variable entries to flat vector
-        let mut total_variables = 0;
-        for (name, var_entries) in variables {
-            let start_idx = entries.len();
-            entries.extend(var_entries);
-            let indices: Vec<usize> = (start_idx..entries.len()).collect();
-            variable_map.insert(name, indices);
-            total_variables += entries.len() - start_idx;
-        }
-
-        // Add all type entries (struct/class/union/enum)
-        for (name, ty_entries) in &types {
-            let start_idx = entries.len();
-            entries.extend(ty_entries.clone());
-            let indices: Vec<usize> = (start_idx..entries.len()).collect();
-            type_map.insert(name.clone(), indices);
-        }
-
-        // IMPORTANT: Do NOT sort entries! This would invalidate the indices
-        // stored in function_map and variable_map
-        // GDB uses sorted entries for binary search, but we use HashMap for O(1) lookup
-
-        // Build address map for entries with addresses
-        // Include functions and variables so address-based lookups work for .text and .data/.bss
         let mut address_map = BTreeMap::new();
+        let mut total_functions = 0;
+        let mut total_variables = 0;
         for (idx, entry) in entries.iter().enumerate() {
+            match entry.tag {
+                gimli::constants::DW_TAG_subprogram
+                | gimli::constants::DW_TAG_inlined_subroutine => {
+                    total_functions += 1;
+                }
+                gimli::constants::DW_TAG_variable => {
+                    total_variables += 1;
+                }
+                _ => {}
+            }
+
             // Add all ranges for this entry to the map. For variables we expect (addr, addr).
             for (start_addr, _end_addr) in &entry.address_ranges {
                 address_map.insert(*start_addr, idx);
@@ -118,39 +188,17 @@ impl LightweightIndex {
         }
 
         debug!(
-            "Built lightweight index: {} functions, {} variables, {} total entries, {} with addresses",
-            total_functions, total_variables, entries.len(), address_map.len()
+            "Built lightweight index: {} function entries, {} variable entries, {} total entries, {} shards, {} with addresses",
+            total_functions,
+            total_variables,
+            entries.len(),
+            name_shards.len(),
+            address_map.len()
         );
-
-        // Ensure demangled aliases exist for variables even if DW_AT_name was missing.
-        for (idx, entry) in entries.iter().enumerate() {
-            if entry.tag == gimli::constants::DW_TAG_variable {
-                let should_attempt_demangle = entry.flags.is_linkage
-                    || crate::core::is_likely_mangled(entry.language, entry.name.as_ref());
-                if !should_attempt_demangle {
-                    continue;
-                }
-                if let Some(demangled) = demangle_by_lang(entry.language, entry.name.as_ref()) {
-                    let leaf = demangled_leaf(&demangled);
-                    if leaf != entry.name.as_ref() {
-                        tracing::trace!(
-                            "LightweightIndex: alias '{}' -> '{}' (idx {}, lang={:?})",
-                            entry.name,
-                            leaf,
-                            idx,
-                            entry.language
-                        );
-                        variable_map.entry(leaf).or_default().push(idx);
-                    }
-                }
-            }
-        }
 
         Self {
             entries,
-            function_map,
-            variable_map,
-            type_map,
+            name_shards,
             address_map,
             total_functions,
             total_variables,
@@ -159,19 +207,57 @@ impl LightweightIndex {
         }
     }
 
+    fn unique_names<'a>(
+        &'a self,
+        map_of: impl Fn(&'a NameIndexShard) -> &'a HashMap<String, Vec<usize>>,
+    ) -> Vec<&'a String> {
+        let mut names = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        for shard in &self.name_shards {
+            for name in map_of(shard).keys() {
+                if seen.insert(name.as_str()) {
+                    names.push(name);
+                }
+            }
+        }
+        names
+    }
+
+    fn entries_for_name<'a>(
+        &'a self,
+        name: &str,
+        map_of: impl Fn(&'a NameIndexShard) -> &'a HashMap<String, Vec<usize>>,
+    ) -> Vec<&'a IndexEntry> {
+        let mut matches = Vec::new();
+        for shard in &self.name_shards {
+            if let Some(indices) = map_of(shard).get(name) {
+                matches.extend(
+                    indices
+                        .iter()
+                        .filter_map(|&local_idx| self.entries.get(shard.entry_base + local_idx)),
+                );
+            }
+        }
+        matches
+    }
+
     /// Get all function names for debugging
     pub fn get_function_names(&self) -> Vec<&String> {
-        self.function_map.keys().collect()
+        self.unique_names(|shard| &shard.function_map)
     }
 
     /// Get all variable names for debugging
     pub fn get_variable_names(&self) -> Vec<&String> {
-        self.variable_map.keys().collect()
+        self.unique_names(|shard| &shard.variable_map)
     }
 
-    /// Internal: iterate type_map entries (name -> indices)
-    pub(crate) fn type_map_iter(&self) -> impl Iterator<Item = (&String, &Vec<usize>)> {
-        self.type_map.iter()
+    /// Internal: visit type-map entries across all shards.
+    pub(crate) fn for_each_type_map_entry(&self, mut visit: impl FnMut(&String, usize, &[usize])) {
+        for shard in &self.name_shards {
+            for (name, indices) in &shard.type_map {
+                visit(name, shard.entry_base, indices);
+            }
+        }
     }
 
     /// Internal: get a raw entry by index
@@ -386,10 +472,10 @@ impl LightweightIndex {
     pub fn find_dies_by_function_name(&self, name: &str) -> Vec<&IndexEntry> {
         tracing::debug!("find_dies_by_function_name: '{}'", name);
 
-        if let Some(indices) = self.function_map.get(name) {
-            let entries: Vec<&IndexEntry> = indices.iter().map(|&idx| &self.entries[idx]).collect();
-
+        let entries = self.entries_for_name(name, |shard| &shard.function_map);
+        if !entries.is_empty() {
             tracing::trace!("Found {} entries for function '{}'", entries.len(), name);
+
             for entry in &entries {
                 let display_addr = if entry.is_inline_instance() {
                     entry
@@ -410,12 +496,11 @@ impl LightweightIndex {
                     );
                 }
             }
-
-            entries
         } else {
             tracing::debug!("No entries found for function '{}'", name);
-            vec![]
         }
+
+        entries
     }
 
     /// Find DIE entries by variable name - returns all matching DIEs
@@ -423,14 +508,12 @@ impl LightweightIndex {
     pub fn find_variables_by_name(&self, name: &str) -> Vec<&IndexEntry> {
         tracing::debug!("find_variables_by_name: '{}'", name);
 
-        if let Some(indices) = self.variable_map.get(name) {
-            indices.iter().map(|&idx| &self.entries[idx]).collect()
-        } else {
+        let entries = self.entries_for_name(name, |shard| &shard.variable_map);
+        if entries.is_empty() {
             tracing::debug!("No entries found for variable '{}'", name);
-            vec![]
         }
+        entries
     }
-
     // find_types_by_name removed; type resolution should go through TypeNameIndex instead.
 }
 

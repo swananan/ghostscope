@@ -9,7 +9,7 @@ use crate::{
     },
     index::{
         directory_from_index, resolve_file_path, LightweightFileIndex, LightweightIndex,
-        LineMappingTable, ScopedFileIndexManager,
+        LightweightIndexShard, LineMappingTable, ScopedFileIndexManager,
     },
     parser::RangeExtractor,
 };
@@ -60,13 +60,7 @@ pub(crate) struct SourceFile {
     pub full_path: String,
 }
 
-// Shard container for per-CU parsed results (functions/variables/types)
-#[derive(Default)]
-struct InfoShard {
-    functions: HashMap<String, Vec<IndexEntry>>,
-    variables: HashMap<String, Vec<IndexEntry>>,
-    types: HashMap<String, Vec<IndexEntry>>,
-}
+type InfoShard = LightweightIndexShard;
 
 // Shard for line info per CU
 #[derive(Default)]
@@ -178,12 +172,7 @@ impl<'a> DwarfParser<'a> {
                             entry_pc: entry_pc_cached,
                             function_kind,
                         };
-                        Self::push_function_entries(
-                            &mut shard.functions,
-                            &name,
-                            linkage_name,
-                            &seed,
-                        );
+                        Self::push_function_entries(&mut shard, &name, linkage_name, &seed);
                     }
                 }
                 gimli::constants::DW_TAG_inlined_subroutine => {
@@ -228,12 +217,7 @@ impl<'a> DwarfParser<'a> {
                             entry_pc: entry_pc_cached,
                             function_kind,
                         };
-                        Self::push_function_entries(
-                            &mut shard.functions,
-                            &name,
-                            linkage_name,
-                            &seed,
-                        );
+                        Self::push_function_entries(&mut shard, &name, linkage_name, &seed);
                     }
                 }
                 gimli::constants::DW_TAG_variable => {
@@ -348,11 +332,7 @@ impl<'a> DwarfParser<'a> {
                             cu_language,
                             entry.offset()
                         );
-                        shard
-                            .variables
-                            .entry(name.clone())
-                            .or_default()
-                            .push(index_entry);
+                        shard.push_variable_entry(name.clone(), index_entry);
                     }
                 }
                 gimli::constants::DW_TAG_structure_type
@@ -378,7 +358,7 @@ impl<'a> DwarfParser<'a> {
                             entry_pc: None,
                             function_kind: FunctionDieKind::NotFunction,
                         };
-                        shard.types.entry(name).or_default().push(index_entry);
+                        shard.push_type_entry(name, index_entry);
                     }
                 }
                 _ => {}
@@ -424,25 +404,25 @@ impl<'a> DwarfParser<'a> {
     }
 
     fn push_function_entries(
-        functions: &mut HashMap<String, Vec<IndexEntry>>,
+        shard: &mut InfoShard,
         name: &str,
         linkage_name: Option<String>,
         seed: &FunctionEntrySeed,
     ) {
-        functions
-            .entry(name.to_owned())
-            .or_default()
-            .push(Self::build_function_index_entry(name, seed));
+        shard.push_function_entry(
+            name.to_owned(),
+            Self::build_function_index_entry(name, seed),
+        );
 
         if let Some(linkage_name) = linkage_name.filter(|linkage_name| linkage_name != name) {
             let mut alias_seed = seed.clone();
             let mut alias_flags = alias_seed.flags;
             alias_flags.is_linkage = true;
             alias_seed.flags = alias_flags;
-            functions
-                .entry(linkage_name.clone())
-                .or_default()
-                .push(Self::build_function_index_entry(&linkage_name, &alias_seed));
+            shard.push_function_entry(
+                linkage_name.clone(),
+                Self::build_function_index_entry(&linkage_name, &alias_seed),
+            );
         }
     }
 
@@ -942,10 +922,6 @@ impl<'a> DwarfParser<'a> {
             headers.push(h);
         }
 
-        let mut functions: HashMap<String, Vec<IndexEntry>> = HashMap::new();
-        let mut variables: HashMap<String, Vec<IndexEntry>> = HashMap::new();
-        let mut types: HashMap<String, Vec<IndexEntry>> = HashMap::new();
-
         // Always process in parallel at CU granularity, and propagate per-CU errors
         let shard_results: Vec<Result<InfoShard>> = headers
             .into_par_iter()
@@ -961,37 +937,14 @@ impl<'a> DwarfParser<'a> {
             })
             .collect();
 
+        let mut shards = Vec::with_capacity(shard_results.len());
         for sr in shard_results {
-            let shard = sr?;
-            for (k, mut v) in shard.functions {
-                functions.entry(k).or_default().append(&mut v);
-            }
-            for (k, mut v) in shard.variables {
-                variables.entry(k).or_default().append(&mut v);
-            }
-            for (k, mut v) in shard.types {
-                types.entry(k).or_default().append(&mut v);
-            }
+            shards.push(sr?);
         }
 
-        // Stabilize entry order for determinism: sort by (unit_offset, die_offset)
-        let sort_entries = |m: &mut HashMap<String, Vec<IndexEntry>>| {
-            for vec in m.values_mut() {
-                vec.sort_by(|a, b| {
-                    let ka = (a.unit_offset.0, a.die_offset.0);
-                    let kb = (b.unit_offset.0, b.die_offset.0);
-                    ka.cmp(&kb)
-                });
-            }
-        };
-        sort_entries(&mut functions);
-        sort_entries(&mut variables);
-        sort_entries(&mut types);
-
-        let functions_count = functions.len();
-        let variables_count = variables.len();
-        let mut lightweight_index =
-            LightweightIndex::from_builder_data(functions, variables, types);
+        let mut lightweight_index = LightweightIndex::from_shards(shards);
+        let functions_count = lightweight_index.get_function_names().len();
+        let variables_count = lightweight_index.get_variable_names().len();
         // Build per-CU function address maps
         lightweight_index.build_cu_maps();
         // Prefer CU range map from .debug_aranges if available
@@ -1349,6 +1302,57 @@ mod tests {
             .borrow(|section| dwarf_reader_from_arc(Arc::<[u8]>::from(section.as_slice())))
     }
 
+    fn build_multi_cu_shared_function_fixture() -> gimli::Dwarf<DwarfReader> {
+        let encoding = gimli::Encoding {
+            format: Format::Dwarf32,
+            version: 4,
+            address_size: 8,
+        };
+
+        let mut dwarf = WriteDwarf::new();
+
+        for (cu_name, low_pc) in [("unit_one.rs", 0x401000_u64), ("unit_two.rs", 0x402000_u64)] {
+            let unit_id = dwarf.units.add(Unit::new(encoding, LineProgram::none()));
+            let unit = dwarf.units.get_mut(unit_id);
+            let root = unit.root();
+            unit.get_mut(root).set(
+                gimli::constants::DW_AT_name,
+                WriteAttributeValue::String(cu_name.as_bytes().to_vec()),
+            );
+
+            let subprogram_id = unit.add(root, gimli::constants::DW_TAG_subprogram);
+            let subprogram = unit.get_mut(subprogram_id);
+            subprogram.set(
+                gimli::constants::DW_AT_name,
+                WriteAttributeValue::String(b"shared".to_vec()),
+            );
+            subprogram.set(
+                gimli::constants::DW_AT_low_pc,
+                WriteAttributeValue::Address(Address::Constant(low_pc)),
+            );
+            subprogram.set(
+                gimli::constants::DW_AT_high_pc,
+                WriteAttributeValue::Udata(0x20),
+            );
+        }
+
+        let mut sections = Sections::new(EndianVec::new(LittleEndian));
+        dwarf.write(&mut sections).unwrap();
+
+        let dwarf_sections: gimli::DwarfSections<Vec<u8>> = gimli::DwarfSections::load(|id| {
+            Ok::<_, gimli::Error>(
+                sections
+                    .get(id)
+                    .map(|section| section.slice().to_vec())
+                    .unwrap_or_default(),
+            )
+        })
+        .unwrap();
+
+        dwarf_sections
+            .borrow(|section| dwarf_reader_from_arc(Arc::<[u8]>::from(section.as_slice())))
+    }
+
     #[test]
     fn parse_debug_info_skips_stack_value_address_locals_from_global_index() {
         let dwarf = build_variable_index_fixture();
@@ -1452,6 +1456,36 @@ mod tests {
         assert!(
             abstract_entries[0].flags.has_inline_attribute,
             "abstract definition should retain its original DW_AT_inline attribute: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn parse_debug_info_keeps_sharded_name_lookup_without_duplicate_keys() {
+        let dwarf = build_multi_cu_shared_function_fixture();
+        let parser = DwarfParser { dwarf: &dwarf };
+
+        let result = parser.parse_debug_info("synthetic").unwrap();
+        let entries = result
+            .lightweight_index
+            .find_dies_by_function_name("shared");
+        let names = result.lightweight_index.get_function_names();
+
+        assert_eq!(
+            result.functions_count, 1,
+            "unique function-name count should stay deduplicated across shards"
+        );
+        assert_eq!(
+            entries.len(),
+            2,
+            "function lookup should fan out across CU shards: {entries:?}"
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.as_str() == "shared")
+                .count(),
+            1,
+            "function name listing should not duplicate shard-local keys: {names:?}"
         );
     }
 }
