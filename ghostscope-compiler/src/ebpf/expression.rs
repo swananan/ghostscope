@@ -440,6 +440,7 @@ impl<'ctx> EbpfContext<'ctx> {
                             dty,
                             &var.name,
                             self.get_compile_time_context()?.pc_address,
+                            None,
                         )?;
                         match val_any {
                             IntValue(iv) => Ok(iv),
@@ -1075,6 +1076,7 @@ impl<'ctx> EbpfContext<'ctx> {
                                 ty,
                                 &var.name,
                                 self.get_compile_time_context()?.pc_address,
+                                None,
                             )?;
                             match val_any {
                                 BasicValueEnum::IntValue(iv) => iv,
@@ -2199,6 +2201,7 @@ impl<'ctx> EbpfContext<'ctx> {
             dwarf_type,
             &variable_with_eval.name,
             compile_context.pc_address,
+            None,
         )
     }
 
@@ -2327,6 +2330,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     var.dwarf_type.as_ref().unwrap(),
                     &var.name,
                     self.get_compile_time_context()?.pc_address,
+                    None,
                 )?;
                 let ptr_i64 = match val_any {
                     BasicValueEnum::IntValue(iv) => iv,
@@ -2537,8 +2541,11 @@ impl<'ctx> EbpfContext<'ctx> {
                 match parse_type_name(&var.type_name) {
                     ParsedKind::PtrChar => {
                         // Load pointer value from variable location (assume 64-bit)
-                        let ptr_any = self
-                            .generate_memory_read(addr, ghostscope_dwarf::MemoryAccessSize::U64)?;
+                        let ptr_any = self.generate_memory_read(
+                            addr,
+                            ghostscope_dwarf::MemoryAccessSize::U64,
+                            None,
+                        )?;
                         let ptr_i64 = match ptr_any {
                             BasicValueEnum::IntValue(iv) => iv,
                             _ => {

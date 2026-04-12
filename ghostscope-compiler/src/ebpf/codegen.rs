@@ -3815,15 +3815,12 @@ impl<'ctx> EbpfContext<'ctx> {
             }
         };
 
-        match self.resolve_variable_value(var_name, type_encoding) {
-            Ok(var_data) => self.generate_successful_variable_instruction(
-                var_name_index,
-                type_encoding,
-                type_index,
-                var_data,
-            ),
-            Err(e) => Err(e),
-        }
+        self.generate_successful_variable_instruction(
+            var_name_index,
+            type_encoding,
+            type_index,
+            var_name,
+        )
     }
 
     /// Generate successful variable instruction with data
@@ -3832,7 +3829,7 @@ impl<'ctx> EbpfContext<'ctx> {
         var_name_index: u16,
         type_encoding: TypeKind,
         type_index: u16,
-        var_data: BasicValueEnum<'ctx>,
+        var_name: &str,
     ) -> Result<()> {
         // Determine data size based on type
         let data_size = match type_encoding {
@@ -4026,7 +4023,7 @@ impl<'ctx> EbpfContext<'ctx> {
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store type_index: {e}")))?;
 
         // Store status (set to 0)
-        let reserved_ptr = unsafe {
+        let status_ptr = unsafe {
             self.builder
                 .build_gep(
                     self.context.i8_type(),
@@ -4039,13 +4036,15 @@ impl<'ctx> EbpfContext<'ctx> {
                 )
                 .map_err(|e| CodeGenError::LLVMError(format!("Failed to get status GEP: {e}")))?
         };
-        let reserved_val = self
+        let status_val = self
             .context
             .i8_type()
             .const_int(VariableStatus::Ok as u64, false);
         self.builder
-            .build_store(reserved_ptr, reserved_val)
+            .build_store(status_ptr, status_val)
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store status: {e}")))?;
+
+        let var_data = self.resolve_variable_value(var_name, type_encoding, Some(status_ptr))?;
 
         // Store actual variable data after PrintVariableIndexData structure
         let var_data_ptr = unsafe {
@@ -4312,6 +4311,7 @@ impl<'ctx> EbpfContext<'ctx> {
         &mut self,
         var_name: &str,
         type_encoding: TypeKind,
+        status_ptr: Option<inkwell::values::PointerValue<'ctx>>,
     ) -> Result<BasicValueEnum<'ctx>> {
         info!(
             "Resolving variable value: {} ({:?})",
@@ -4345,6 +4345,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     dwarf_type,
                     var_name,
                     compile_context.pc_address,
+                    status_ptr,
                 )
             }
             None => {
