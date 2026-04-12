@@ -1,6 +1,5 @@
 //! Unified DWARF parser - true single-pass parsing
 
-use super::fast_paths::resolve_name_in_unit_fast;
 use crate::{
     binary::DwarfReader,
     core::{FunctionDieKind, IndexEntry, Result},
@@ -8,7 +7,6 @@ use crate::{
         directory_from_index, resolve_file_path, LightweightFileIndex, LightweightIndex,
         LightweightIndexShard, LineMappingTable, ScopedFileIndexManager,
     },
-    parser::RangeExtractor,
 };
 use gimli::Reader;
 use rayon::prelude::*;
@@ -33,6 +31,24 @@ struct FunctionEntrySeed {
     address_ranges: Vec<(u64, u64)>,
     entry_pc: Option<u64>,
     function_kind: FunctionDieKind,
+}
+
+#[derive(Clone, Default)]
+struct RawDieAttrs {
+    name: Option<String>,
+    linkage_name: Option<String>,
+    has_inline_attribute: bool,
+    is_external: Option<bool>,
+    is_declaration: Option<bool>,
+    low_pc: Option<u64>,
+    high_pc: Option<u64>,
+    high_pc_offset: Option<u64>,
+    ranges_attr: Option<gimli::AttributeValue<DwarfReader>>,
+    entry_pc: Option<u64>,
+    location_attr: Option<gimli::AttributeValue<DwarfReader>>,
+    has_main_subprogram: bool,
+    abstract_origin: Option<gimli::UnitOffset>,
+    specification: Option<gimli::UnitOffset>,
 }
 
 /// Compilation unit information with associated directories and files.
@@ -149,30 +165,29 @@ impl<'a> DwarfParser<'a> {
                 continue;
             }
 
-            let entry = unit.entry(entry_offset)?;
-            entries.skip_attributes(abbrev.attributes())?;
+            let raw_attrs = self.read_selected_raw_attrs(unit, &mut entries, abbrev)?;
 
             match tag {
                 gimli::constants::DW_TAG_subprogram => {
                     let mut visited = HashSet::new();
-                    let metadata = self.resolve_function_metadata(
-                        self.dwarf,
+                    let metadata = self.resolve_function_metadata_from_raw(
                         unit,
-                        &entry,
+                        entry_offset,
+                        &raw_attrs,
                         &mut metadata_cache,
                         &mut visited,
                     )?;
                     if let Some(name) = metadata.name.clone() {
                         let address_ranges =
-                            self.extract_address_ranges(self.dwarf, unit, &entry)?;
-                        let entry_pc_cached = self.extract_entry_pc(&entry)?;
+                            self.extract_address_ranges_from_raw(unit, &raw_attrs)?;
+                        let entry_pc_cached = raw_attrs.entry_pc;
                         let function_kind =
                             Self::classify_function_kind(tag, &address_ranges, entry_pc_cached);
-                        let is_main = self.is_main_function(&entry, &name).unwrap_or(false);
+                        let is_main = Self::is_main_function_from_raw(&raw_attrs, &name);
                         let is_static = metadata
                             .is_external
                             .map(|external| !external)
-                            .unwrap_or_else(|| self.is_static_symbol(&entry).unwrap_or(false));
+                            .unwrap_or_else(|| Self::is_static_symbol_from_raw(&raw_attrs));
                         let flags = crate::core::IndexFlags {
                             is_static,
                             is_main,
@@ -181,11 +196,9 @@ impl<'a> DwarfParser<'a> {
                             is_linkage: metadata.is_linkage_name,
                             ..Default::default()
                         };
-                        let linkage_name = self
-                            .extract_linkage_name(self.dwarf, unit, &entry)?
-                            .map(|(linkage_name, _)| linkage_name);
+                        let linkage_name = raw_attrs.linkage_name.clone();
                         let seed = FunctionEntrySeed {
-                            die_offset: entry.offset(),
+                            die_offset: entry_offset,
                             tag,
                             unit_offset,
                             flags,
@@ -199,17 +212,17 @@ impl<'a> DwarfParser<'a> {
                 }
                 gimli::constants::DW_TAG_inlined_subroutine => {
                     let mut visited = HashSet::new();
-                    let metadata = self.resolve_function_metadata(
-                        self.dwarf,
+                    let metadata = self.resolve_function_metadata_from_raw(
                         unit,
-                        &entry,
+                        entry_offset,
+                        &raw_attrs,
                         &mut metadata_cache,
                         &mut visited,
                     )?;
                     if let Some(name) = metadata.name.clone() {
                         let address_ranges =
-                            self.extract_address_ranges(self.dwarf, unit, &entry)?;
-                        let entry_pc_cached = self.extract_entry_pc(&entry)?;
+                            self.extract_address_ranges_from_raw(unit, &raw_attrs)?;
+                        let entry_pc_cached = raw_attrs.entry_pc;
                         let function_kind =
                             Self::classify_function_kind(tag, &address_ranges, entry_pc_cached);
                         let is_static = metadata
@@ -223,11 +236,9 @@ impl<'a> DwarfParser<'a> {
                             is_linkage: metadata.is_linkage_name,
                             ..Default::default()
                         };
-                        let linkage_name = self
-                            .extract_linkage_name(self.dwarf, unit, &entry)?
-                            .map(|(linkage_name, _)| linkage_name);
+                        let linkage_name = raw_attrs.linkage_name.clone();
                         let seed = FunctionEntrySeed {
-                            die_offset: entry.offset(),
+                            die_offset: entry_offset,
                             tag,
                             unit_offset,
                             flags,
@@ -242,13 +253,12 @@ impl<'a> DwarfParser<'a> {
                 gimli::constants::DW_TAG_variable => {
                     tracing::trace!(
                         "Evaluating global variable DIE {:?} in CU {:?}",
-                        entry.offset(),
+                        entry_offset,
                         unit_offset
                     );
-                    let var_addr = self.extract_variable_address(&entry, unit)?;
-                    let is_static_symbol = self
-                        .is_static_variable_symbol(&entry, var_addr)
-                        .unwrap_or(false);
+                    let var_addr = self.extract_variable_address_from_raw(unit, &raw_attrs)?;
+                    let is_static_symbol =
+                        Self::is_static_variable_symbol_from_raw(&raw_attrs, var_addr);
                     let in_function_scope = tag_stack.iter().any(|t| {
                         *t == gimli::constants::DW_TAG_subprogram
                             || *t == gimli::constants::DW_TAG_inlined_subroutine
@@ -256,7 +266,7 @@ impl<'a> DwarfParser<'a> {
                     if in_function_scope && !is_static_symbol {
                         tracing::trace!(
                             "Skipping variable at {:?} (in function scope, stack={:?})",
-                            entry.offset(),
+                            entry_offset,
                             tag_stack
                         );
                         // Skip local variables
@@ -269,14 +279,14 @@ impl<'a> DwarfParser<'a> {
                         // stack/register locals must stay out of the global index.
                         tracing::trace!(
                             "Treating static variable at {:?} as global despite function scope (stack={:?})",
-                            entry.offset(),
+                            entry_offset,
                             tag_stack
                         );
                     }
-                    if Self::is_declaration(&entry).unwrap_or(false) {
+                    if Self::is_declaration_from_raw(&raw_attrs) {
                         tracing::trace!(
                             "Skipping variable at {:?} (declaration-only DIE)",
-                            entry.offset()
+                            entry_offset
                         );
                         tag_stack.push(tag);
                         continue;
@@ -295,20 +305,21 @@ impl<'a> DwarfParser<'a> {
                         collected_names.push((candidate, is_linkage_alias));
                     };
 
-                    if let Some(name) = self.extract_name(self.dwarf, unit, &entry)? {
+                    let mut visited = HashSet::with_capacity(4);
+                    if let Some(name) =
+                        self.resolve_name_from_raw(unit, entry_offset, &raw_attrs, &mut visited)?
+                    {
                         push_unique_name(name, false);
                     }
 
-                    if let Some((linkage_name, _)) =
-                        self.extract_linkage_name(self.dwarf, unit, &entry)?
-                    {
-                        push_unique_name(linkage_name.clone(), true);
+                    if let Some(linkage_name) = raw_attrs.linkage_name.clone() {
+                        push_unique_name(linkage_name, true);
                     }
 
                     if collected_names.is_empty() {
                         tracing::trace!(
                             "DWARF variable at {:?} missing usable name (CU lang={:?}); skipping alias registration",
-                            entry.offset(),
+                            entry_offset,
                             cu_language
                         );
                         tag_stack.push(tag);
@@ -326,7 +337,7 @@ impl<'a> DwarfParser<'a> {
                         entry_flags.is_linkage = is_linkage_alias;
                         let index_entry = IndexEntry {
                             name: std::sync::Arc::from(name.as_str()),
-                            die_offset: entry.offset(),
+                            die_offset: entry_offset,
                             unit_offset,
                             tag,
                             flags: entry_flags,
@@ -340,7 +351,7 @@ impl<'a> DwarfParser<'a> {
                             name,
                             entry_flags.is_linkage,
                             cu_language,
-                            entry.offset()
+                            entry_offset
                         );
                         shard.push_variable_entry(name.clone(), index_entry);
                     }
@@ -350,16 +361,18 @@ impl<'a> DwarfParser<'a> {
                 | gimli::constants::DW_TAG_union_type
                 | gimli::constants::DW_TAG_enumeration_type
                 | gimli::constants::DW_TAG_typedef => {
-                    if let Some(name) = self.extract_name(self.dwarf, unit, &entry)? {
-                        let is_decl = Self::bool_attr(&entry, gimli::constants::DW_AT_declaration)?
-                            .unwrap_or(false);
+                    let mut visited = HashSet::with_capacity(4);
+                    if let Some(name) =
+                        self.resolve_name_from_raw(unit, entry_offset, &raw_attrs, &mut visited)?
+                    {
+                        let is_decl = Self::is_declaration_from_raw(&raw_attrs);
                         let flags = crate::core::IndexFlags {
                             is_type_declaration: is_decl,
                             ..Default::default()
                         };
                         let index_entry = IndexEntry {
                             name: std::sync::Arc::from(name.as_str()),
-                            die_offset: entry.offset(),
+                            die_offset: entry_offset,
                             unit_offset,
                             tag,
                             flags,
@@ -451,83 +464,205 @@ impl<'a> DwarfParser<'a> {
 
     /// Process single compilation unit - decoupled debug_line and debug_info processing
     // Helper methods (extracted from unified_builder.rs)
-    fn extract_name(
-        &self,
-        dwarf: &gimli::Dwarf<DwarfReader>,
+    fn same_unit_ref(
         unit: &gimli::Unit<DwarfReader>,
-        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+        value: gimli::AttributeValue<DwarfReader>,
+    ) -> Option<gimli::UnitOffset> {
+        match value {
+            gimli::AttributeValue::UnitRef(offset) => Some(offset),
+            gimli::AttributeValue::DebugInfoRef(offset) => offset.to_unit_offset(&unit.header),
+            _ => None,
+        }
+    }
+
+    fn should_read_raw_attr(attr: gimli::DwAt) -> bool {
+        matches!(
+            attr,
+            gimli::constants::DW_AT_name
+                | gimli::constants::DW_AT_linkage_name
+                | gimli::constants::DW_AT_MIPS_linkage_name
+                | gimli::constants::DW_AT_inline
+                | gimli::constants::DW_AT_external
+                | gimli::constants::DW_AT_declaration
+                | gimli::constants::DW_AT_low_pc
+                | gimli::constants::DW_AT_high_pc
+                | gimli::constants::DW_AT_ranges
+                | gimli::constants::DW_AT_entry_pc
+                | gimli::constants::DW_AT_location
+                | gimli::constants::DW_AT_main_subprogram
+                | gimli::constants::DW_AT_abstract_origin
+                | gimli::constants::DW_AT_specification
+        )
+    }
+
+    fn read_selected_raw_attrs(
+        &self,
+        unit: &gimli::Unit<DwarfReader>,
+        entries: &mut gimli::EntriesRaw<'_, DwarfReader>,
+        abbrev: &gimli::Abbreviation,
+    ) -> Result<RawDieAttrs> {
+        let mut attrs = RawDieAttrs::default();
+        for spec in abbrev.attributes() {
+            if !Self::should_read_raw_attr(spec.name()) {
+                entries.skip_attributes(std::slice::from_ref(spec))?;
+                continue;
+            }
+
+            let attr = entries.read_attribute(*spec)?;
+            let value = attr.value();
+            match attr.name() {
+                gimli::constants::DW_AT_name => {
+                    attrs.name = Self::extract_attr_string(self.dwarf, unit, value)?;
+                }
+                gimli::constants::DW_AT_linkage_name
+                | gimli::constants::DW_AT_MIPS_linkage_name => {
+                    if attrs.linkage_name.is_none() {
+                        attrs.linkage_name = Self::extract_attr_string(self.dwarf, unit, value)?;
+                    }
+                }
+                gimli::constants::DW_AT_inline => {
+                    if let gimli::AttributeValue::Inline(inline_attr) = value {
+                        attrs.has_inline_attribute = inline_attr == gimli::DW_INL_inlined
+                            || inline_attr == gimli::DW_INL_declared_inlined;
+                    }
+                }
+                gimli::constants::DW_AT_external => {
+                    attrs.is_external = Self::flag_attr_value(value);
+                }
+                gimli::constants::DW_AT_declaration => {
+                    attrs.is_declaration = Self::flag_attr_value(value);
+                }
+                gimli::constants::DW_AT_low_pc => {
+                    if let gimli::AttributeValue::Addr(addr) = value {
+                        attrs.low_pc = Some(addr);
+                    }
+                }
+                gimli::constants::DW_AT_high_pc => match value {
+                    gimli::AttributeValue::Addr(addr) => attrs.high_pc = Some(addr),
+                    _ => attrs.high_pc_offset = Self::high_pc_offset_value(value),
+                },
+                gimli::constants::DW_AT_ranges => {
+                    attrs.ranges_attr = Some(value);
+                }
+                gimli::constants::DW_AT_entry_pc => {
+                    if let gimli::AttributeValue::Addr(addr) = value {
+                        attrs.entry_pc = Some(addr);
+                    }
+                }
+                gimli::constants::DW_AT_location => {
+                    attrs.location_attr = Some(value);
+                }
+                gimli::constants::DW_AT_main_subprogram => {
+                    attrs.has_main_subprogram = true;
+                }
+                gimli::constants::DW_AT_abstract_origin => {
+                    attrs.abstract_origin = Self::same_unit_ref(unit, value);
+                }
+                gimli::constants::DW_AT_specification => {
+                    attrs.specification = Self::same_unit_ref(unit, value);
+                }
+                _ => {}
+            }
+        }
+        Ok(attrs)
+    }
+
+    fn read_selected_raw_attrs_at(
+        &self,
+        unit: &gimli::Unit<DwarfReader>,
+        offset: gimli::UnitOffset,
+    ) -> Result<RawDieAttrs> {
+        let mut entries = unit.entries_raw(Some(offset))?;
+        let Some(abbrev) = entries.read_abbreviation()? else {
+            return Ok(RawDieAttrs::default());
+        };
+        self.read_selected_raw_attrs(unit, &mut entries, abbrev)
+    }
+
+    fn resolve_name_from_raw(
+        &self,
+        unit: &gimli::Unit<DwarfReader>,
+        entry_offset: gimli::UnitOffset,
+        attrs: &RawDieAttrs,
+        visited: &mut HashSet<gimli::UnitOffset>,
     ) -> Result<Option<String>> {
-        Ok(resolve_name_in_unit_fast(dwarf, unit, entry)?)
+        if let Some(name) = attrs.name.clone() {
+            return Ok(Some(name));
+        }
+
+        if !visited.insert(entry_offset) {
+            return Ok(None);
+        }
+
+        let mut resolved = None;
+        for origin_offset in [attrs.specification, attrs.abstract_origin]
+            .into_iter()
+            .flatten()
+        {
+            if visited.contains(&origin_offset) {
+                continue;
+            }
+
+            let origin_attrs = self.read_selected_raw_attrs_at(unit, origin_offset)?;
+            if let Some(name) =
+                self.resolve_name_from_raw(unit, origin_offset, &origin_attrs, visited)?
+            {
+                resolved = Some(name);
+                break;
+            }
+        }
+
+        visited.remove(&entry_offset);
+        Ok(resolved)
     }
 
-    fn extract_linkage_name(
+    fn resolve_function_metadata_from_raw(
         &self,
-        dwarf: &gimli::Dwarf<DwarfReader>,
         unit: &gimli::Unit<DwarfReader>,
-        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
-    ) -> Result<Option<(String, bool)>> {
-        if let Some(attr) = entry.attr(gimli::constants::DW_AT_linkage_name) {
-            if let Some(name) = Self::extract_attr_string(dwarf, unit, attr.value())? {
-                return Ok(Some((name, true)));
-            }
-        }
-        if let Some(attr) = entry.attr(gimli::constants::DW_AT_MIPS_linkage_name) {
-            if let Some(name) = Self::extract_attr_string(dwarf, unit, attr.value())? {
-                return Ok(Some((name, true)));
-            }
-        }
-        Ok(None)
-    }
-
-    fn extract_inline_attribute(
-        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
-    ) -> Result<bool> {
-        if let Some(attr) = entry.attr(gimli::constants::DW_AT_inline) {
-            if let gimli::AttributeValue::Inline(inline_attr) = attr.value() {
-                return Ok(inline_attr == gimli::DW_INL_inlined
-                    || inline_attr == gimli::DW_INL_declared_inlined);
-            }
-        }
-        Ok(false)
-    }
-
-    fn resolve_function_metadata(
-        &self,
-        dwarf: &gimli::Dwarf<DwarfReader>,
-        unit: &gimli::Unit<DwarfReader>,
-        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+        entry_offset: gimli::UnitOffset,
+        attrs: &RawDieAttrs,
         cache: &mut HashMap<gimli::UnitOffset, FunctionMetadata>,
         visited: &mut HashSet<gimli::UnitOffset>,
     ) -> Result<FunctionMetadata> {
-        let offset = entry.offset();
-        if let Some(cached) = cache.get(&offset) {
+        if let Some(cached) = cache.get(&entry_offset) {
             return Ok(cached.clone());
         }
 
-        if !visited.insert(offset) {
+        if !visited.insert(entry_offset) {
             return Ok(FunctionMetadata::default());
         }
 
         let mut metadata = FunctionMetadata::default();
-        if let Some(name) = self.extract_name(dwarf, unit, entry)? {
+        let mut name_visited = HashSet::with_capacity(4);
+        if let Some(name) =
+            self.resolve_name_from_raw(unit, entry_offset, attrs, &mut name_visited)?
+        {
             metadata.name = Some(name);
-        } else if let Some((name, is_linkage)) = self.extract_linkage_name(dwarf, unit, entry)? {
+        } else if let Some(name) = attrs.linkage_name.clone() {
             metadata.name = Some(name);
-            metadata.is_linkage_name = is_linkage;
+            metadata.is_linkage_name = true;
         }
 
-        metadata.has_inline_attribute = Self::extract_inline_attribute(entry)?;
-
-        metadata.is_external = Self::bool_attr(entry, gimli::constants::DW_AT_external)?;
+        metadata.has_inline_attribute = attrs.has_inline_attribute;
+        metadata.is_external = attrs.is_external;
 
         let mut merge_from_origin = |origin_offset: gimli::UnitOffset| -> Result<()> {
             if visited.contains(&origin_offset) {
                 return Ok(());
             }
 
-            let origin_entry = unit.entry(origin_offset)?;
-            let origin_metadata =
-                self.resolve_function_metadata(dwarf, unit, &origin_entry, cache, visited)?;
+            let origin_metadata = if let Some(cached) = cache.get(&origin_offset) {
+                cached.clone()
+            } else {
+                let origin_attrs = self.read_selected_raw_attrs_at(unit, origin_offset)?;
+                self.resolve_function_metadata_from_raw(
+                    unit,
+                    origin_offset,
+                    &origin_attrs,
+                    cache,
+                    visited,
+                )?
+            };
 
             if metadata.name.is_none() {
                 metadata.name = origin_metadata.name.clone();
@@ -539,60 +674,42 @@ impl<'a> DwarfParser<'a> {
             Ok(())
         };
 
-        if let Some(attr) = entry.attr(gimli::constants::DW_AT_abstract_origin) {
-            match attr.value() {
-                gimli::AttributeValue::UnitRef(unit_ref) => {
-                    merge_from_origin(unit_ref)?;
-                }
-                gimli::AttributeValue::DebugInfoRef(debug_info_ref) => {
-                    if let Some(unit_ref) = debug_info_ref.to_unit_offset(&unit.header) {
-                        merge_from_origin(unit_ref)?;
-                    }
-                }
-                _ => {}
-            }
+        if let Some(origin_offset) = attrs.abstract_origin {
+            merge_from_origin(origin_offset)?;
         }
 
-        if let Some(attr) = entry.attr(gimli::constants::DW_AT_specification) {
-            match attr.value() {
-                gimli::AttributeValue::UnitRef(unit_ref) => {
-                    merge_from_origin(unit_ref)?;
-                }
-                gimli::AttributeValue::DebugInfoRef(debug_info_ref) => {
-                    if let Some(unit_ref) = debug_info_ref.to_unit_offset(&unit.header) {
-                        merge_from_origin(unit_ref)?;
-                    }
-                }
-                _ => {}
-            }
+        if let Some(origin_offset) = attrs.specification {
+            merge_from_origin(origin_offset)?;
         }
 
-        visited.remove(&offset);
-        cache.insert(offset, metadata.clone());
+        visited.remove(&entry_offset);
+        cache.insert(entry_offset, metadata.clone());
         Ok(metadata)
     }
 
-    fn bool_attr(
-        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
-        attr: gimli::DwAt,
-    ) -> Result<Option<bool>> {
-        let Some(attr) = entry.attr(attr) else {
-            return Ok(None);
-        };
-        Ok(match attr.value() {
+    fn flag_attr_value(value: gimli::AttributeValue<DwarfReader>) -> Option<bool> {
+        match value {
             gimli::AttributeValue::Flag(v) => Some(v),
             _ => None,
-        })
+        }
     }
 
-    fn is_static_symbol(
-        &self,
-        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
-    ) -> Result<bool> {
-        if let Some(is_external) = Self::bool_attr(entry, gimli::constants::DW_AT_external)? {
-            return Ok(!is_external);
+    fn high_pc_offset_value(value: gimli::AttributeValue<DwarfReader>) -> Option<u64> {
+        match value {
+            gimli::AttributeValue::Udata(offset) => Some(offset),
+            gimli::AttributeValue::Data1(offset) => Some(offset as u64),
+            gimli::AttributeValue::Data2(offset) => Some(offset as u64),
+            gimli::AttributeValue::Data4(offset) => Some(offset as u64),
+            gimli::AttributeValue::Data8(offset) => Some(offset),
+            _ => None,
         }
-        Ok(true)
+    }
+
+    fn is_static_symbol_from_raw(attrs: &RawDieAttrs) -> bool {
+        attrs
+            .is_external
+            .map(|is_external| !is_external)
+            .unwrap_or(true)
     }
 
     // DW_AT_external only answers "is this visible outside the CU?".
@@ -612,35 +729,67 @@ impl<'a> DwarfParser<'a> {
     //
     // so we must not treat every address-valued expression as proof of static
     // storage. Only pure address location expressions should survive this gate.
-    fn is_static_variable_symbol(
-        &self,
-        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+    fn is_static_variable_symbol_from_raw(
+        attrs: &RawDieAttrs,
         absolute_address: Option<u64>,
-    ) -> Result<bool> {
-        if let Some(is_external) = Self::bool_attr(entry, gimli::constants::DW_AT_external)? {
-            return Ok(!is_external);
+    ) -> bool {
+        if let Some(is_external) = attrs.is_external {
+            return !is_external;
         }
 
         // DW_AT_external is often omitted on local stack/register variables. Only keep
         // function-scoped variables in the global index when DWARF gives them a true
         // absolute storage address.
-        Ok(absolute_address.is_some())
+        absolute_address.is_some()
     }
 
-    fn is_declaration(entry: &gimli::DebuggingInformationEntry<DwarfReader>) -> Result<bool> {
-        Ok(Self::bool_attr(entry, gimli::constants::DW_AT_declaration)?.unwrap_or(false))
+    fn is_declaration_from_raw(attrs: &RawDieAttrs) -> bool {
+        attrs.is_declaration.unwrap_or(false)
     }
 
     /// Extract all address ranges from DIE (for functions)
     /// Supports DW_AT_low_pc/high_pc and DW_AT_ranges (returns all ranges)
-    fn extract_address_ranges(
+    fn extract_address_ranges_from_raw(
         &self,
-        dwarf: &gimli::Dwarf<DwarfReader>,
         unit: &gimli::Unit<DwarfReader>,
-        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+        attrs: &RawDieAttrs,
     ) -> Result<Vec<(u64, u64)>> {
-        // Use RangeExtractor for unified logic
-        RangeExtractor::extract_all_ranges(entry, unit, dwarf)
+        match (attrs.low_pc, attrs.high_pc, attrs.high_pc_offset) {
+            (Some(low), Some(high), _) => return Ok(vec![(low, high)]),
+            (Some(low), None, Some(offset)) => return Ok(vec![(low, low + offset)]),
+            _ => {}
+        }
+
+        let Some(ranges_attr) = attrs.ranges_attr.clone() else {
+            return Ok(Vec::new());
+        };
+
+        let ranges_offset = match ranges_attr {
+            gimli::AttributeValue::RangeListsRef(offset) => gimli::RangeListsOffset(offset.0),
+            gimli::AttributeValue::SecOffset(offset) => gimli::RangeListsOffset(offset),
+            _ => return Ok(Vec::new()),
+        };
+
+        let base_address = unit.low_pc;
+        let mut ranges_iter = self.dwarf.ranges(unit, ranges_offset)?;
+        let mut ranges = Vec::new();
+        while let Some(range) = ranges_iter.next()? {
+            let begin = range.begin;
+            let end = range.end;
+            if begin > end {
+                continue;
+            }
+
+            let (mut adjusted_begin, mut adjusted_end) = (begin, end);
+            if begin == 0 && base_address != 0 {
+                adjusted_begin = base_address + begin;
+                adjusted_end = base_address + end;
+            }
+
+            ranges.push((adjusted_begin, adjusted_end));
+        }
+
+        Ok(ranges)
     }
 
     /// Extract a variable's absolute storage address from DW_AT_location.
@@ -662,53 +811,53 @@ impl<'a> DwarfParser<'a> {
     /// because those describe the variable's value, not a place where the
     /// variable itself lives. Optimized locals that hold constant addresses are
     /// commonly encoded this way.
-    fn extract_variable_address(
+    fn extract_variable_address_from_raw(
         &self,
-        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
         unit: &gimli::Unit<DwarfReader>,
+        attrs: &RawDieAttrs,
     ) -> Result<Option<u64>> {
-        if let Some(attr) = entry.attr(gimli::constants::DW_AT_location) {
-            match attr.value() {
-                gimli::AttributeValue::Addr(a) => return Ok(Some(a)),
-                gimli::AttributeValue::Exprloc(expr) => {
-                    return Ok(self.extract_absolute_storage_address_from_expr(
-                        unit,
-                        gimli::Expression(expr.0),
-                    ));
-                }
-                gimli::AttributeValue::LocationListsRef(offs) => {
-                    if let Ok(mut locations) = self
-                        .dwarf
-                        .locations(unit, gimli::LocationListsOffset(offs.0))
-                    {
-                        while let Ok(Some(loc)) = locations.next() {
-                            if let Some(address) = self.extract_absolute_storage_address_from_expr(
-                                unit,
-                                gimli::Expression(loc.data.0),
-                            ) {
-                                return Ok(Some(address));
-                            }
+        let Some(location_attr) = attrs.location_attr.clone() else {
+            return Ok(None);
+        };
+
+        match location_attr {
+            gimli::AttributeValue::Addr(a) => Ok(Some(a)),
+            gimli::AttributeValue::Exprloc(expr) => Ok(
+                self.extract_absolute_storage_address_from_expr(unit, gimli::Expression(expr.0))
+            ),
+            gimli::AttributeValue::LocationListsRef(offs) => {
+                if let Ok(mut locations) = self
+                    .dwarf
+                    .locations(unit, gimli::LocationListsOffset(offs.0))
+                {
+                    while let Ok(Some(loc)) = locations.next() {
+                        if let Some(address) = self.extract_absolute_storage_address_from_expr(
+                            unit,
+                            gimli::Expression(loc.data.0),
+                        ) {
+                            return Ok(Some(address));
                         }
                     }
                 }
-                gimli::AttributeValue::SecOffset(off) => {
-                    if let Ok(mut locations) =
-                        self.dwarf.locations(unit, gimli::LocationListsOffset(off))
-                    {
-                        while let Ok(Some(loc)) = locations.next() {
-                            if let Some(address) = self.extract_absolute_storage_address_from_expr(
-                                unit,
-                                gimli::Expression(loc.data.0),
-                            ) {
-                                return Ok(Some(address));
-                            }
-                        }
-                    }
-                }
-                _ => {}
+                Ok(None)
             }
+            gimli::AttributeValue::SecOffset(off) => {
+                if let Ok(mut locations) =
+                    self.dwarf.locations(unit, gimli::LocationListsOffset(off))
+                {
+                    while let Ok(Some(loc)) = locations.next() {
+                        if let Some(address) = self.extract_absolute_storage_address_from_expr(
+                            unit,
+                            gimli::Expression(loc.data.0),
+                        ) {
+                            return Ok(Some(address));
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            _ => Ok(None),
         }
-        Ok(None)
     }
 
     fn extract_absolute_storage_address_from_expr(
@@ -736,35 +885,10 @@ impl<'a> DwarfParser<'a> {
         }
     }
 
-    fn extract_entry_pc(
-        &self,
-        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
-    ) -> Result<Option<u64>> {
-        if let Some(attr) = entry.attr(gimli::constants::DW_AT_entry_pc) {
-            if let gimli::AttributeValue::Addr(addr) = attr.value() {
-                return Ok(Some(addr));
-            }
-        }
-        Ok(None)
-    }
-
     // Additional helper methods for GDB-style cooked index
 
-    fn is_main_function(
-        &self,
-        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
-        name: &str,
-    ) -> Result<bool> {
-        // Check for DW_AT_main_subprogram attribute
-        if entry
-            .attr(gimli::constants::DW_AT_main_subprogram)
-            .is_some()
-        {
-            return Ok(true);
-        }
-
-        // Also check common main function names
-        Ok(name == "main" || name == "_main")
+    fn is_main_function_from_raw(attrs: &RawDieAttrs, name: &str) -> bool {
+        attrs.has_main_subprogram || name == "main" || name == "_main"
     }
 
     fn extract_language(

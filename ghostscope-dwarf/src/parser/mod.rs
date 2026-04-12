@@ -3,7 +3,6 @@
 pub(crate) mod detailed_parser;
 pub(crate) mod expression_evaluator;
 pub(crate) mod fast_parser;
-pub(crate) mod fast_paths;
 pub(crate) mod range_extractor;
 // Full type resolver removed; shallow resolver lives in detailed_parser
 
