@@ -69,6 +69,7 @@ impl<'ctx> EbpfContext<'ctx> {
         dwarf_type: &TypeInfo,
         var_name: &str,
         pc_address: u64,
+        status_ptr: Option<PointerValue<'ctx>>,
     ) -> Result<BasicValueEnum<'ctx>> {
         debug!(
             "Converting EvaluationResult to LLVM value for variable: {}",
@@ -84,7 +85,7 @@ impl<'ctx> EbpfContext<'ctx> {
                 self.generate_direct_value(direct, pt_regs_ptr)
             }
             EvaluationResult::MemoryLocation(location) => {
-                self.generate_memory_location(location, pt_regs_ptr, dwarf_type)
+                self.generate_memory_location(location, pt_regs_ptr, dwarf_type, status_ptr)
             }
             EvaluationResult::Optimized => {
                 debug!("Variable {} is optimized out", var_name);
@@ -104,6 +105,7 @@ impl<'ctx> EbpfContext<'ctx> {
                         dwarf_type,
                         var_name,
                         pc_address,
+                        status_ptr,
                     )
                 } else {
                     Ok(self.context.i64_type().const_zero().into())
@@ -511,6 +513,7 @@ impl<'ctx> EbpfContext<'ctx> {
         location: &LocationResult,
         pt_regs_ptr: PointerValue<'ctx>,
         dwarf_type: &TypeInfo,
+        status_ptr: Option<PointerValue<'ctx>>,
     ) -> Result<BasicValueEnum<'ctx>> {
         match location {
             // Policy note:
@@ -525,17 +528,17 @@ impl<'ctx> EbpfContext<'ctx> {
                 debug!("Generating absolute address: 0x{:x}", addr);
                 // Convert link-time address to runtime address using ASLR offsets when available
                 let module_hint = self.current_resolved_var_module_path.clone();
-                let status_ptr = if self.condition_context_active {
+                let runtime_status_ptr = if self.condition_context_active {
                     Some(self.get_or_create_cond_error_global())
                 } else {
-                    None
+                    status_ptr
                 };
                 let eval = ghostscope_dwarf::EvaluationResult::MemoryLocation(
                     ghostscope_dwarf::LocationResult::Address(*addr),
                 );
                 let rt_addr = self.evaluation_result_to_address_with_hint(
                     &eval,
-                    status_ptr,
+                    runtime_status_ptr,
                     module_hint.as_deref(),
                 )?;
                 // Aggregate types (struct/union/array) are represented as pointers in expressions
@@ -552,7 +555,7 @@ impl<'ctx> EbpfContext<'ctx> {
                 if self.condition_context_active {
                     self.generate_memory_read_with_status(rt_addr, access_size)
                 } else {
-                    self.generate_memory_read(rt_addr, access_size)
+                    self.generate_memory_read(rt_addr, access_size, status_ptr)
                 }
             }
 
@@ -611,20 +614,25 @@ impl<'ctx> EbpfContext<'ctx> {
                 if self.condition_context_active {
                     self.generate_memory_read_with_status(final_addr, access_size)
                 } else {
-                    self.generate_memory_read(final_addr, access_size)
+                    self.generate_memory_read(final_addr, access_size, status_ptr)
                 }
             }
 
             LocationResult::ComputedLocation { steps } => {
                 debug!("Generating computed location: {} steps", steps.len());
                 // Execute steps to compute the address
-                let status_ptr = if self.condition_context_active {
+                let runtime_status_ptr = if self.condition_context_active {
                     Some(self.get_or_create_cond_error_global())
                 } else {
-                    None
+                    status_ptr
                 };
-                let addr_value =
-                    self.generate_compute_steps(steps, pt_regs_ptr, None, status_ptr, None)?;
+                let addr_value = self.generate_compute_steps(
+                    steps,
+                    pt_regs_ptr,
+                    None,
+                    runtime_status_ptr,
+                    None,
+                )?;
                 if let BasicValueEnum::IntValue(addr) = addr_value {
                     // For aggregate types, return pointer to address instead of loading a value
                     if self.is_aggregate_type(dwarf_type) {
@@ -640,7 +648,7 @@ impl<'ctx> EbpfContext<'ctx> {
                     if self.condition_context_active {
                         self.generate_memory_read_with_status(addr, access_size)
                     } else {
-                        self.generate_memory_read(addr, access_size)
+                        self.generate_memory_read(addr, access_size, status_ptr)
                     }
                 } else {
                     Err(CodeGenError::LLVMError(
@@ -897,10 +905,8 @@ impl<'ctx> EbpfContext<'ctx> {
                         let access_size = *size;
                         let loaded_bv = if self.condition_context_active {
                             self.generate_memory_read_with_status(addr, access_size)?
-                        } else if let Some(sp) = status_ptr {
-                            self.generate_memory_read_with_variable_status(addr, access_size, sp)?
                         } else {
-                            self.generate_memory_read(addr, access_size)?
+                            self.generate_memory_read(addr, access_size, status_ptr)?
                         };
                         let loaded_int = if let BasicValueEnum::IntValue(int_val) = loaded_bv {
                             int_val
@@ -2325,7 +2331,7 @@ mod tests {
         };
         let eval = EvaluationResult::MemoryLocation(LocationResult::Address(0x1000));
         let v = ctx
-            .evaluate_result_to_llvm_value(&eval, &st, "S", 0)
+            .evaluate_result_to_llvm_value(&eval, &st, "S", 0, None)
             .expect("eval");
         match v {
             BasicValueEnum::PointerValue(_) => {}
@@ -2343,7 +2349,7 @@ mod tests {
             total_size: Some(16),
         };
         let v2 = ctx
-            .evaluate_result_to_llvm_value(&eval, &arr, "A", 0)
+            .evaluate_result_to_llvm_value(&eval, &arr, "A", 0, None)
             .expect("eval2");
         match v2 {
             BasicValueEnum::PointerValue(_) => {}
@@ -2372,7 +2378,7 @@ mod tests {
         };
         let eval = EvaluationResult::MemoryLocation(LocationResult::Address(0x2000));
         let v = ctx
-            .evaluate_result_to_llvm_value(&eval, &bt, "x", 0)
+            .evaluate_result_to_llvm_value(&eval, &bt, "x", 0, None)
             .expect("eval");
         match v {
             BasicValueEnum::IntValue(_) => {}
