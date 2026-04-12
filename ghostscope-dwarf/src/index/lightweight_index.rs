@@ -260,17 +260,6 @@ impl LightweightIndex {
         entry.representative_addr == Some(address)
     }
 
-    fn entry_contains_address<F>(entry: &IndexEntry, address: u64, resolve_ranges: &mut F) -> bool
-    where
-        F: FnMut(&IndexEntry) -> Option<Vec<(u64, u64)>>,
-    {
-        if Self::is_function_tag(entry.tag) {
-            return Self::entry_contains_function_address(entry, address, resolve_ranges);
-        }
-
-        entry.representative_addr == Some(address)
-    }
-
     fn find_matching_function_in_indices<'a, I, F>(
         &'a self,
         indices: I,
@@ -289,27 +278,6 @@ impl LightweightIndex {
                 continue;
             }
             if Self::entry_contains_function_address(entry, address, resolve_ranges) {
-                return Some(entry);
-            }
-        }
-        None
-    }
-
-    fn find_matching_die_in_indices<'a, I, F>(
-        &'a self,
-        indices: I,
-        address: u64,
-        resolve_ranges: &mut F,
-    ) -> Option<&'a IndexEntry>
-    where
-        I: IntoIterator<Item = usize>,
-        F: FnMut(&IndexEntry) -> Option<Vec<(u64, u64)>>,
-    {
-        for idx in indices {
-            let Some(entry) = self.entries.get(idx) else {
-                continue;
-            };
-            if Self::entry_contains_address(entry, address, resolve_ranges) {
                 return Some(entry);
             }
         }
@@ -646,44 +614,6 @@ impl LightweightIndex {
             &mut resolve_ranges,
         )
     }
-
-    /// Find DIE entry by address - returns the DIE containing this address
-    /// This is the primary interface for address-based lookups
-    pub fn find_die_at_address<F>(&self, address: u64, mut resolve_ranges: F) -> Option<&IndexEntry>
-    where
-        F: FnMut(&IndexEntry) -> Option<Vec<(u64, u64)>>,
-    {
-        tracing::debug!("find_die_at_address: looking for address 0x{:x}", address);
-        tracing::trace!("  Address map has {} entries", self.address_map.len());
-
-        if let Some(entry) = self.find_matching_die_in_indices(
-            self.address_map
-                .range(..=address)
-                .rev()
-                .map(|(_, &idx)| idx),
-            address,
-            &mut resolve_ranges,
-        ) {
-            tracing::debug!("  ✓ Found DIE '{}' (tag={:?})", entry.name, entry.tag);
-            return Some(entry);
-        }
-
-        if let Some(entry) =
-            self.find_matching_die_in_indices(0..self.entries.len(), address, &mut resolve_ranges)
-        {
-            tracing::debug!(
-                "  ✓ Found DIE '{}' (tag={:?}) via fallback scan",
-                entry.name,
-                entry.tag
-            );
-            return Some(entry);
-        }
-
-        tracing::debug!("No DIE found containing address 0x{:x}", address);
-        None
-    }
-
-    // (old global fallback variant removed in favor of unified method above)
 
     /// Find DIE entries by function name - returns all matching DIEs
     /// Supports multiple implementations (including inline functions)

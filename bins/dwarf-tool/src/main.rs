@@ -5,7 +5,9 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use ghostscope_dwarf::core::SectionType;
-use ghostscope_dwarf::{DwarfAnalyzer, ModuleAddress, ModuleLoadingEvent, ModuleLoadingStats};
+use ghostscope_dwarf::{
+    AddressQueryResult, DwarfAnalyzer, FunctionQueryResult, ModuleLoadingEvent, ModuleLoadingStats,
+};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -577,7 +579,7 @@ async fn analyze_source_location(
     loading_time: std::time::Duration,
 ) -> Result<()> {
     let (file_path, line_number) = parse_source_line(source)?;
-    let addresses = analyzer.lookup_addresses_by_source_line(file_path, line_number);
+    let addresses = analyzer.query_source_line(file_path, line_number)?;
 
     if addresses.is_empty() {
         if options.json() {
@@ -594,61 +596,29 @@ async fn analyze_source_location(
         return Ok(());
     }
 
-    let mut address_infos = Vec::new();
-    let mut total_variables = 0;
-
     if options.json() {
-        for module_address in &addresses {
-            let variables = analyzer.get_all_variables_at_address(module_address)?;
-            let source_location = analyzer.lookup_source_location(module_address);
-
-            let var_infos: Vec<VariableInfo> = variables
-                .iter()
-                .map(|var| VariableInfo {
-                    name: var.name.clone(),
-                    type_name: var.type_name.clone(),
-                    location: format!("{}", var.evaluation_result),
-                    is_parameter: var.is_parameter,
-                    scope_depth: var.scope_depth as u32,
-                })
-                .collect();
-
-            total_variables += var_infos.len();
-
-            address_infos.push(AddressInfo {
-                module: module_address.module_display().to_string(),
-                address: format!("0x{:x}", module_address.address),
-                source_file: source_location.as_ref().map(|sl| sl.file_path.clone()),
-                source_line: source_location.as_ref().map(|sl| sl.line_number),
-                source_column: source_location.as_ref().and_then(|sl| sl.column),
-                variables: var_infos,
-            });
-        }
-
         let result = AnalysisResult {
             source_location: source.to_string(),
-            addresses: address_infos,
-            total_variables,
+            addresses: addresses.iter().map(address_info_from_query).collect(),
+            total_variables: total_variables_in_query_results(&addresses),
             loading_time_ms: loading_time.as_millis() as u64,
         };
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
         // Print results for each address
-        for module_address in addresses {
-            let variables = analyzer.get_all_variables_at_address(&module_address)?;
-
+        for address in &addresses {
             if !options.quiet() {
                 println!(
                     "\n=== {} @ {}:{} → 0x{:x} ===",
-                    module_address.module_display(),
+                    address.module_path.display(),
                     file_path,
                     line_number,
-                    module_address.address
+                    address.address
                 );
-                if variables.is_empty() {
+                if query_address_variable_count(address) == 0 {
                     println!("No variables found");
                 } else {
-                    print_variables_with_style(&variables, options);
+                    print_variables_with_style(iter_address_query_variables(address), options);
                 }
             }
         }
@@ -657,14 +627,89 @@ async fn analyze_source_location(
     Ok(())
 }
 
+fn iter_address_query_variables<'a>(
+    address: &'a AddressQueryResult,
+) -> impl Iterator<Item = &'a ghostscope_dwarf::VariableWithEvaluation> + 'a {
+    address.parameters.iter().chain(address.variables.iter())
+}
+
+fn query_address_variable_count(address: &AddressQueryResult) -> usize {
+    address.parameters.len() + address.variables.len()
+}
+
+fn total_variables_in_query_results(addresses: &[AddressQueryResult]) -> usize {
+    addresses.iter().map(query_address_variable_count).sum()
+}
+
+fn variable_info_from_query(variable: &ghostscope_dwarf::VariableWithEvaluation) -> VariableInfo {
+    VariableInfo {
+        name: variable.name.clone(),
+        type_name: variable.type_name.clone(),
+        location: format!("{}", variable.evaluation_result),
+        is_parameter: variable.is_parameter,
+        scope_depth: variable.scope_depth as u32,
+    }
+}
+
+fn address_info_from_query(address: &AddressQueryResult) -> AddressInfo {
+    AddressInfo {
+        module: address.module_path.display().to_string(),
+        address: format!("0x{:x}", address.address),
+        source_file: address.source_file.clone(),
+        source_line: address.source_line,
+        source_column: address.source_column,
+        variables: iter_address_query_variables(address)
+            .map(variable_info_from_query)
+            .collect(),
+    }
+}
+
+fn function_result_from_query(query_result: FunctionQueryResult) -> FunctionResult {
+    let mut modules = Vec::new();
+    let mut current_module: Option<String> = None;
+    let mut current_addresses = Vec::new();
+    let mut total_variables = 0;
+
+    for address in query_result.addresses {
+        let module = address.module_path.display().to_string();
+        total_variables += query_address_variable_count(&address);
+
+        if current_module.as_deref() != Some(module.as_str()) {
+            if let Some(module_name) = current_module.take() {
+                modules.push(FunctionModuleInfo {
+                    module: module_name,
+                    addresses: current_addresses,
+                });
+                current_addresses = Vec::new();
+            }
+            current_module = Some(module.clone());
+        }
+
+        current_addresses.push(address_info_from_query(&address));
+    }
+
+    if let Some(module_name) = current_module {
+        modules.push(FunctionModuleInfo {
+            module: module_name,
+            addresses: current_addresses,
+        });
+    }
+
+    FunctionResult {
+        function_name: query_result.function_name,
+        modules,
+        total_variables,
+    }
+}
+
 async fn analyze_function(
     analyzer: &mut DwarfAnalyzer,
     func_name: &str,
     options: &Commands,
 ) -> Result<()> {
-    let addresses = analyzer.lookup_function_addresses(func_name);
+    let function = analyzer.query_function(func_name)?;
 
-    if addresses.is_empty() {
+    if function.addresses.is_empty() {
         if !options.quiet() {
             if options.json() {
                 let result = FunctionResult {
@@ -681,81 +726,23 @@ async fn analyze_function(
     }
 
     if options.json() {
-        let mut modules = Vec::new();
-        let mut total_variables = 0;
-
-        // Group module addresses by module path
-        use std::collections::HashMap;
-        let mut grouped_by_module: HashMap<std::path::PathBuf, Vec<u64>> = HashMap::new();
-        for module_address in &addresses {
-            grouped_by_module
-                .entry(module_address.module_path.clone())
-                .or_default()
-                .push(module_address.address);
-        }
-
-        for (module_path, addrs) in grouped_by_module {
-            let mut address_infos = Vec::new();
-
-            for addr in &addrs {
-                let module_address = ModuleAddress::new(module_path.clone(), *addr);
-                let variables = analyzer.get_all_variables_at_address(&module_address)?;
-                let source_location = analyzer.lookup_source_location(&module_address);
-
-                let var_infos: Vec<VariableInfo> = variables
-                    .iter()
-                    .map(|var| VariableInfo {
-                        name: var.name.clone(),
-                        type_name: var.type_name.clone(),
-                        location: format!("{}", var.evaluation_result),
-                        is_parameter: var.is_parameter,
-                        scope_depth: var.scope_depth as u32,
-                    })
-                    .collect();
-
-                total_variables += var_infos.len();
-
-                address_infos.push(AddressInfo {
-                    module: module_path.display().to_string(),
-                    address: format!("0x{addr:x}"),
-                    source_file: source_location.as_ref().map(|sl| sl.file_path.clone()),
-                    source_line: source_location.as_ref().map(|sl| sl.line_number),
-                    source_column: source_location.as_ref().and_then(|sl| sl.column),
-                    variables: var_infos,
-                });
-            }
-
-            modules.push(FunctionModuleInfo {
-                module: module_path.display().to_string(),
-                addresses: address_infos,
-            });
-        }
-
-        let result = FunctionResult {
-            function_name: func_name.to_string(),
-            modules,
-            total_variables,
-        };
-
-        println!("{}", serde_json::to_string_pretty(&result)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&function_result_from_query(function))?
+        );
     } else {
         // Text output
         if !options.quiet() {
             println!("\n=== Function: {func_name} ===");
         }
 
-        for module_address in &addresses {
+        for address in &function.addresses {
             if !options.quiet() {
-                println!("\nModule: {}", module_address.module_display());
+                println!("\nModule: {}", address.module_path.display());
             }
 
-            let variables = analyzer.get_all_variables_at_address(module_address)?;
-
-            // Query source location for this address
-            let source_location = analyzer.lookup_source_location(module_address);
-
             if options.quiet() {
-                for var in &variables {
+                for var in iter_address_query_variables(address) {
                     // Use DWARF type if available, otherwise fall back to type name
                     let type_str = if let Some(dwarf_type) = &var.dwarf_type {
                         dwarf_type.to_string()
@@ -766,22 +753,24 @@ async fn analyze_function(
                     println!("{}: {} = {}", var.name, type_str, var.evaluation_result);
                 }
             } else {
-                println!("  Address: 0x{:x}", module_address.address);
+                println!("  Address: 0x{:x}", address.address);
 
                 // Display source location if available
-                if let Some(src_loc) = source_location {
-                    println!("  Source:  {}:{}", src_loc.file_path, src_loc.line_number);
-                    if let Some(column) = src_loc.column {
+                if let (Some(source_file), Some(source_line)) =
+                    (&address.source_file, address.source_line)
+                {
+                    println!("  Source:  {source_file}:{source_line}");
+                    if let Some(column) = address.source_column {
                         println!("  Column:  {column}");
                     }
                 } else {
                     println!("  Source:  (no source information available)");
                 }
 
-                if variables.is_empty() {
+                if query_address_variable_count(address) == 0 {
                     println!("    No variables found");
                 } else {
-                    print_variables_with_indent(&variables, "    ");
+                    print_variables_with_indent(iter_address_query_variables(address), "    ");
                 }
             }
         }
@@ -797,36 +786,16 @@ async fn analyze_module_address(
     options: &Commands,
 ) -> Result<()> {
     let address = parse_address(address_str)?;
-    let module_pathbuf = std::path::PathBuf::from(module_path);
-    let module_address = ModuleAddress::new(module_pathbuf, address);
 
-    match analyzer.get_all_variables_at_address(&module_address) {
-        Ok(variables) => {
+    match analyzer.query_address(module_path, address) {
+        Ok(address_info) => {
             if options.json() {
-                let var_infos: Vec<VariableInfo> = variables
-                    .iter()
-                    .map(|var| VariableInfo {
-                        name: var.name.clone(),
-                        type_name: var.type_name.clone(),
-                        location: format!("{}", var.evaluation_result),
-                        is_parameter: var.is_parameter,
-                        scope_depth: var.scope_depth as u32,
-                    })
-                    .collect();
-
-                let source_location = analyzer.lookup_source_location(&module_address);
-
-                let result = AddressInfo {
-                    module: module_path.to_string(),
-                    address: format!("0x{address:x}"),
-                    source_file: source_location.as_ref().map(|sl| sl.file_path.clone()),
-                    source_line: source_location.as_ref().map(|sl| sl.line_number),
-                    source_column: source_location.as_ref().and_then(|sl| sl.column),
-                    variables: var_infos,
-                };
-                println!("{}", serde_json::to_string_pretty(&result)?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&address_info_from_query(&address_info))?
+                );
             } else if options.quiet() {
-                for var in &variables {
+                for var in iter_address_query_variables(&address_info) {
                     println!(
                         "{}: {} = {}",
                         var.name, var.type_name, var.evaluation_result
@@ -834,10 +803,13 @@ async fn analyze_module_address(
                 }
             } else {
                 println!("\n=== {module_path} @ 0x{address:x} ===");
-                if variables.is_empty() {
+                if query_address_variable_count(&address_info) == 0 {
                     println!("No variables found");
                 } else {
-                    print_variables_with_style(&variables, options);
+                    print_variables_with_style(
+                        iter_address_query_variables(&address_info),
+                        options,
+                    );
                 }
             }
         }
@@ -1202,11 +1174,11 @@ fn percentile_nearest_rank(sorted_samples_ms: &[f64], percentile: f64) -> f64 {
     sorted_samples_ms[index]
 }
 
-fn print_variables_with_style(
-    variables: &[ghostscope_dwarf::VariableWithEvaluation],
+fn print_variables_with_style<'a>(
+    variables: impl IntoIterator<Item = &'a ghostscope_dwarf::VariableWithEvaluation>,
     options: &Commands,
 ) {
-    for (i, var) in variables.iter().enumerate() {
+    for (i, var) in variables.into_iter().enumerate() {
         if options.verbose() {
             println!("═══════════════════════════════════════");
             println!("Variable #{}", i + 1);
@@ -1247,8 +1219,8 @@ fn print_variables_with_style(
     }
 }
 
-fn print_variables_with_indent(
-    variables: &[ghostscope_dwarf::VariableWithEvaluation],
+fn print_variables_with_indent<'a>(
+    variables: impl IntoIterator<Item = &'a ghostscope_dwarf::VariableWithEvaluation>,
     indent: &str,
 ) {
     for var in variables {
