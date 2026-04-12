@@ -7,7 +7,7 @@ use crate::semantics::{
 };
 use crate::{
     binary::DwarfReader,
-    core::{EvaluationResult, Result},
+    core::{attr_u64, EvaluationResult, Result},
 };
 use gimli::Reader;
 
@@ -175,22 +175,17 @@ impl<'dwarf> AccessPlanner<'dwarf> {
                                                 e.attr(gimli::DW_AT_data_member_location)
                                             {
                                                 match a.value() {
-                                                    gimli::AttributeValue::Udata(v) => {
-                                                        off = Some(v)
-                                                    }
                                                     gimli::AttributeValue::Exprloc(expr) => {
                                                         off = eval_member_offset_expr(&expr)
                                                     }
-                                                    _ => {}
+                                                    value => off = attr_u64(value),
                                                 }
                                             }
                                             if off.is_none() {
                                                 if let Some(a) =
                                                     e.attr(gimli::DW_AT_data_bit_offset)
                                                 {
-                                                    if let gimli::AttributeValue::Udata(v) =
-                                                        a.value()
-                                                    {
+                                                    if let Some(v) = attr_u64(a.value()) {
                                                         off = Some(v / 8);
                                                     }
                                                 }

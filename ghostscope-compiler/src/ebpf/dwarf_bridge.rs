@@ -895,7 +895,13 @@ impl<'ctx> EbpfContext<'ctx> {
                         // Read path: load pointer-sized value into tmp then branch to cont
                         self.builder.position_at_end(read_bb);
                         let access_size = *size;
-                        let loaded_bv = self.generate_memory_read(addr, access_size)?;
+                        let loaded_bv = if self.condition_context_active {
+                            self.generate_memory_read_with_status(addr, access_size)?
+                        } else if let Some(sp) = status_ptr {
+                            self.generate_memory_read_with_variable_status(addr, access_size, sp)?
+                        } else {
+                            self.generate_memory_read(addr, access_size)?
+                        };
                         let loaded_int = if let BasicValueEnum::IntValue(int_val) = loaded_bv {
                             int_val
                         } else {
@@ -903,6 +909,11 @@ impl<'ctx> EbpfContext<'ctx> {
                                 "Memory load did not return integer".to_string(),
                             ));
                         };
+                        let value_block = self.builder.get_insert_block().ok_or_else(|| {
+                            CodeGenError::LLVMError(
+                                "No insertion block after dereference read".to_string(),
+                            )
+                        })?;
                         self.builder
                             .build_unconditional_branch(cont_bb)
                             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
@@ -913,7 +924,7 @@ impl<'ctx> EbpfContext<'ctx> {
                             .builder
                             .build_phi(self.context.i64_type(), "deref_phi")
                             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                        phi.add_incoming(&[(&null_val, null_bb), (&loaded_int, read_bb)]);
+                        phi.add_incoming(&[(&null_val, null_bb), (&loaded_int, value_block)]);
                         let merged = phi.as_basic_value().into_int_value();
                         // Update null flag based on loaded pointer value being zero
                         let is_zero_ptr = self
@@ -2367,5 +2378,9 @@ mod tests {
             BasicValueEnum::IntValue(_) => {}
             other => panic!("expected IntValue for scalar, got {other:?}"),
         }
+        assert!(
+            ctx.module.get_global("_temp_read_buffer_4").is_none(),
+            "scalar reads should use per-invocation scratch, not shared temp globals"
+        );
     }
 }
