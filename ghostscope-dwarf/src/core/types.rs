@@ -79,13 +79,16 @@ pub struct IndexEntry {
     pub flags: IndexFlags,
     /// Language of the symbol
     pub language: Option<gimli::DwLang>,
-    /// Address ranges for this entry (if applicable)
-    /// For functions: vec![(low_pc, high_pc)] or multiple ranges from DW_AT_ranges
-    /// For variables: vec![(address, address)] if static
-    /// Empty vec if no address (e.g., types, inlined functions without concrete instances)
-    pub address_ranges: Vec<(u64, u64)>,
+    /// Representative address for this entry (if applicable).
+    ///
+    /// For function-like DIEs this is a cheap parse-time seed used for indexing:
+    /// `low_pc`, otherwise `entry_pc`, otherwise the first emitted
+    /// `DW_AT_ranges` start. Full ranges are resolved on demand from DWARF.
+    ///
+    /// For variables this is the absolute storage address, when one exists.
+    pub representative_addr: Option<u64>,
     /// Optional raw DW_AT_entry_pc for inline/call site DIEs.
-    /// Callers should prefer `validated_entry_pc()` when selecting probe PCs.
+    /// Callers should prefer `validated_entry_pc(ranges)` when selecting probe PCs.
     pub entry_pc: Option<u64>,
     /// Explicit function role for addressable function-like DIEs.
     pub function_kind: FunctionDieKind,
@@ -102,7 +105,7 @@ impl IndexEntry {
             gimli::constants::DW_TAG_subprogram => {
                 if self.flags.is_inline_instance {
                     FunctionDieKind::InlineInstance
-                } else if !self.address_ranges.is_empty() || self.entry_pc.is_some() {
+                } else if self.representative_addr.is_some() || self.entry_pc.is_some() {
                     FunctionDieKind::ConcreteSubprogram
                 } else {
                     FunctionDieKind::AbstractSubprogram
@@ -130,11 +133,10 @@ impl IndexEntry {
     /// single-point inline/call-site scopes using only entry_pc and no ranges;
     /// in that shape the point entry_pc is the only addressable location and
     /// should be preserved.
-    pub fn validated_entry_pc(&self) -> Option<u64> {
+    pub fn validated_entry_pc(&self, ranges: &[(u64, u64)]) -> Option<u64> {
         self.entry_pc.filter(|pc| {
-            self.address_ranges.is_empty()
-                || self
-                    .address_ranges
+            ranges.is_empty()
+                || ranges
                     .iter()
                     .any(|(start, end)| *start <= *pc && *pc < *end)
         })
