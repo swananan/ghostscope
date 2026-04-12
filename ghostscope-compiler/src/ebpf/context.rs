@@ -89,7 +89,8 @@ pub struct EbpfContext<'ctx> {
     pub current_resolved_var_module_path: Option<String>,
 
     // Per-invocation stack key for proc_module_offsets lookups (allocated in entry block)
-    pub pm_key_alloca: Option<inkwell::values::PointerValue<'ctx>>, // [3 x i32] alloca
+    // Backed by `[4 x i32]`, so consumers may only assume i32 alignment.
+    pub pm_key_alloca: Option<inkwell::values::PointerValue<'ctx>>,
     // Per-invocation event accumulation offset (u32) stored on stack (entry block)
     pub event_offset_alloca: Option<inkwell::values::PointerValue<'ctx>>,
     // Compile-time upper bound for bytes that may already be reserved in the current trace event.
@@ -584,6 +585,8 @@ impl<'ctx> EbpfContext<'ctx> {
 
         // Allocate fixed-size per-invocation key buffer on the eBPF stack (entry block)
         // Layout: [ pid:u32, pad:u32, cookie_lo:u32, cookie_hi:u32 ] to match struct {u32; u64}
+        // This remains an i32-aligned slot; probe-read scratch reuse must stay
+        // limited to <=4-byte scalar loads.
         let key_arr_ty = i32_type.array_type(4);
         let key_alloca = self
             .builder

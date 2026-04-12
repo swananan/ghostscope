@@ -7,7 +7,7 @@
 
 use crate::{
     binary::DwarfReader,
-    core::{EvaluationResult, Result},
+    core::{attr_u64, EvaluationResult, Result},
     parser::ExpressionEvaluator,
     semantics::{
         eval_member_offset_expr, resolve_name_with_origins,
@@ -313,14 +313,17 @@ impl DetailedParser {
                                     let mut m_offset: u64 = 0;
                                     if let Some(ml) = ce.attr(gimli::DW_AT_data_member_location) {
                                         match ml.value() {
-                                            gimli::AttributeValue::Udata(v) => m_offset = v,
                                             gimli::AttributeValue::Exprloc(expr) => {
                                                 // Try to eval simple DW_OP_constu / plus_uconst
                                                 if let Some(v) = eval_member_offset_expr(&expr) {
                                                     m_offset = v;
                                                 }
                                             }
-                                            _ => {}
+                                            value => {
+                                                if let Some(v) = attr_u64(value) {
+                                                    m_offset = v;
+                                                }
+                                            }
                                         }
                                     }
                                     // bit offsets/sizes (optional)
@@ -329,19 +332,19 @@ impl DetailedParser {
                                     let mut has_data_bit_offset = false;
                                     let mut bit_size: Option<u8> = None;
                                     if let Some(bo) = ce.attr(gimli::DW_AT_bit_offset) {
-                                        if let gimli::AttributeValue::Udata(v) = bo.value() {
+                                        if let Some(v) = attr_u64(bo.value()) {
                                             raw_bit_offset = Some(v);
                                         }
                                     }
                                     if let Some(bs) = ce.attr(gimli::DW_AT_data_bit_offset) {
-                                        if let gimli::AttributeValue::Udata(v) = bs.value() {
+                                        if let Some(v) = attr_u64(bs.value()) {
                                             has_data_bit_offset = true;
                                             bit_offset = u8::try_from(v % 8).ok();
                                             m_offset = v / 8;
                                         }
                                     }
                                     if let Some(bsz) = ce.attr(gimli::DW_AT_bit_size) {
-                                        if let gimli::AttributeValue::Udata(v) = bsz.value() {
+                                        if let Some(v) = attr_u64(bsz.value()) {
                                             bit_size = u8::try_from(v).ok();
                                         }
                                     }
