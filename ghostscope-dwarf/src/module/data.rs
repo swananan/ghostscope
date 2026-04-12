@@ -31,7 +31,7 @@ use crate::{
         BlockIndex, BlockIndexBuilder, CfiIndex, FunctionBlocks, LightweightIndex,
         LineMappingTable, ScopedFileIndexManager, TypeNameIndex, VarRef,
     },
-    parser::{CompilationUnit, ExpressionEvaluator, SourceFile},
+    parser::{CompilationUnit, ExpressionEvaluator, RangeExtractor, SourceFile},
     resolver::{ChainSpec, OnDemandResolver},
     semantics::{
         range_contains_pc, resolve_attr_with_unit_origins, resolve_name_with_origins,
@@ -887,7 +887,7 @@ impl ModuleData {
             let b0 = Instant::now();
             let builder = BlockIndexBuilder::new(self.resolver.dwarf_ref());
             // Prefer building only the containing subprogram if we can identify it
-            if let Some(func_entry) = self.lightweight_index.find_function_by_address(address) {
+            if let Some(func_entry) = self.find_function_index_entry_by_address(address) {
                 if let Some(fb) =
                     builder.build_for_function(func_entry.unit_offset, func_entry.die_offset)
                 {
@@ -1116,7 +1116,7 @@ impl ModuleData {
         if self.block_index.find_function_by_pc(address).is_none() {
             let builder = BlockIndexBuilder::new(self.resolver.dwarf_ref());
             // Prefer building only the containing subprogram if we can identify it via lightweight index
-            if let Some(func_entry) = self.lightweight_index.find_function_by_address(address) {
+            if let Some(func_entry) = self.find_function_index_entry_by_address(address) {
                 if let Some(fb) =
                     builder.build_for_function(func_entry.unit_offset, func_entry.die_offset)
                 {
@@ -1828,6 +1828,42 @@ impl ModuleData {
         })
     }
 
+    fn resolve_function_ranges(&self, entry: &crate::core::IndexEntry) -> Result<Vec<(u64, u64)>> {
+        if !matches!(
+            entry.tag,
+            gimli::constants::DW_TAG_subprogram | gimli::constants::DW_TAG_inlined_subroutine
+        ) {
+            return Ok(Vec::new());
+        }
+
+        let dwarf = self.resolver.dwarf_ref();
+        let header = dwarf
+            .unit_header(entry.unit_offset)
+            .map_err(|e| anyhow::anyhow!("unit header error: {}", e))?;
+        let unit = dwarf
+            .unit(header)
+            .map_err(|e| anyhow::anyhow!("unit load error: {}", e))?;
+        let die = unit
+            .entry(entry.die_offset)
+            .map_err(|e| anyhow::anyhow!("entry load error: {}", e))?;
+
+        RangeExtractor::extract_all_ranges(&die, &unit, dwarf)
+            .map_err(|e| anyhow::anyhow!("range extraction error: {}", e))
+    }
+
+    fn find_function_index_entry_by_address(
+        &self,
+        address: u64,
+    ) -> Option<&crate::core::IndexEntry> {
+        self.lightweight_index
+            .find_function_by_address(address, |entry| self.resolve_function_ranges(entry).ok())
+    }
+
+    fn find_die_index_entry_by_address(&self, address: u64) -> Option<&crate::core::IndexEntry> {
+        self.lightweight_index
+            .find_die_at_address(address, |entry| self.resolve_function_ranges(entry).ok())
+    }
+
     /// Compute addresses for a function entry (deterministic ordering)
     ///
     /// Semantics
@@ -1856,13 +1892,27 @@ impl ModuleData {
     ///   computations to ensure stable behavior across compilers/toolchains.
     fn compute_addresses_for_entry(&self, entry: &crate::core::IndexEntry) -> Vec<u64> {
         let mut out = Vec::new();
+        let ranges = match self.resolve_function_ranges(entry) {
+            Ok(ranges) => ranges,
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to resolve ranges for '{}' ({:?}/{:?}): {}",
+                    entry.name,
+                    entry.unit_offset,
+                    entry.die_offset,
+                    err
+                );
+                Vec::new()
+            }
+        };
+
         match entry.function_kind() {
             crate::core::FunctionDieKind::InlineInstance => {
                 // Debug: print ranges & entry_pc once per inline entry
-                let mut ranges = entry.address_ranges.clone();
-                ranges.sort_unstable_by_key(|(s, _)| *s);
-                if !ranges.is_empty() {
-                    let parts: Vec<String> = ranges
+                let mut debug_ranges = ranges.clone();
+                debug_ranges.sort_unstable_by_key(|(s, _)| *s);
+                if !debug_ranges.is_empty() {
+                    let parts: Vec<String> = debug_ranges
                         .iter()
                         .map(|(s, e)| format!("(0x{s:x},0x{e:x})"))
                         .collect();
@@ -1870,7 +1920,7 @@ impl ModuleData {
                         .entry_pc
                         .map(|v| format!("0x{v:x}"))
                         .unwrap_or("None".to_string());
-                    let rlen = ranges.len();
+                    let rlen = debug_ranges.len();
                     let rlist = parts.join(", ");
                     tracing::debug!(
                         "Inline '{}' entry_pc={epc_dbg} ranges({rlen}): [{rlist}]",
@@ -1884,7 +1934,7 @@ impl ModuleData {
                     tracing::debug!("Inline '{}' has no ranges; entry_pc={epc_dbg}", entry.name);
                 }
 
-                if let Some(addr) = Self::selected_inline_address(entry) {
+                if let Some(addr) = Self::selected_inline_address(entry, &ranges) {
                     tracing::debug!("Inline '{}' selected=0x{addr:x}", entry.name);
                     out.push(addr);
                 } else {
@@ -1896,7 +1946,7 @@ impl ModuleData {
                 }
             }
             crate::core::FunctionDieKind::ConcreteSubprogram => {
-                let nranges = Self::selected_non_inline_ranges(entry);
+                let nranges = Self::selected_non_inline_ranges(entry, &ranges);
                 for (start, end) in &nranges {
                     let candidate = {
                         let first_exec = self.line_mapping.find_first_executable_address(*start);
@@ -1943,15 +1993,25 @@ impl ModuleData {
         out
     }
 
-    fn selected_inline_address(entry: &crate::core::IndexEntry) -> Option<u64> {
-        let first_start = entry.address_ranges.first().map(|(start, _)| *start);
-        let low_pc = entry.address_ranges.iter().map(|(start, _)| *start).min();
+    fn selected_inline_address(
+        entry: &crate::core::IndexEntry,
+        ranges: &[(u64, u64)],
+    ) -> Option<u64> {
+        let first_start = ranges.first().map(|(start, _)| *start);
+        let low_pc = ranges.iter().map(|(start, _)| *start).min();
 
-        entry.validated_entry_pc().or(first_start).or(low_pc)
+        entry
+            .validated_entry_pc(ranges)
+            .or(first_start)
+            .or(low_pc)
+            .or(entry.representative_addr)
     }
 
-    fn selected_non_inline_ranges(entry: &crate::core::IndexEntry) -> Vec<(u64, u64)> {
-        let ranges = entry.address_ranges.clone();
+    fn selected_non_inline_ranges(
+        entry: &crate::core::IndexEntry,
+        ranges: &[(u64, u64)],
+    ) -> Vec<(u64, u64)> {
+        let ranges = ranges.to_vec();
         if ranges.len() <= 1 {
             return ranges;
         }
@@ -2350,16 +2410,7 @@ impl ModuleData {
                 if !seen_offsets.insert(key) {
                     continue;
                 }
-                let link_address =
-                    entry.address_ranges.first().and_then(
-                        |(lo, hi)| {
-                            if lo == hi {
-                                Some(*lo)
-                            } else {
-                                None
-                            }
-                        },
-                    );
+                let link_address = entry.representative_addr;
                 let section = link_address.and_then(|addr| self.classify_section(&obj, addr));
                 out.push(GlobalVariableInfo {
                     name: name.to_string(),
@@ -2448,11 +2499,10 @@ impl ModuleData {
     /// Find symbol name by address (compatibility method)
     pub(crate) fn find_symbol_by_address(&self, address: u64) -> Option<String> {
         // Prefer optimized function lookup for readability; fallback to any DIE
-        if let Some(entry) = self.lightweight_index.find_function_by_address(address) {
+        if let Some(entry) = self.find_function_index_entry_by_address(address) {
             return Some(entry.name.to_string());
         }
-        self.lightweight_index
-            .find_die_at_address(address)
+        self.find_die_index_entry_by_address(address)
             .map(|entry| entry.name.to_string())
     }
 
@@ -2490,10 +2540,7 @@ impl ModuleData {
                     if !seen_offsets.insert(key) {
                         continue;
                     }
-                    let link_address =
-                        e.address_ranges
-                            .first()
-                            .and_then(|(lo, hi)| if lo == hi { Some(*lo) } else { None });
+                    let link_address = e.representative_addr;
                     out.push(GlobalVariableInfo {
                         name: e.name.to_string(),
                         link_address,
@@ -2511,10 +2558,7 @@ impl ModuleData {
             if !seen_offsets.insert(key) {
                 continue;
             }
-            let link_address =
-                e.address_ranges
-                    .first()
-                    .and_then(|(lo, hi)| if lo == hi { Some(*lo) } else { None });
+            let link_address = e.representative_addr;
 
             let section = link_address.and_then(|addr| self.classify_section(&obj, addr));
 
@@ -2612,7 +2656,7 @@ mod tests {
             tag: constants::DW_TAG_subprogram,
             flags: IndexFlags::default(),
             language: None,
-            address_ranges: ranges.to_vec(),
+            representative_addr: ranges.first().map(|(start, _)| *start).or(entry_pc),
             entry_pc,
             function_kind: FunctionDieKind::ConcreteSubprogram,
         }
@@ -2897,30 +2941,33 @@ mod tests {
 
     #[test]
     fn selected_non_inline_ranges_keeps_hot_partition_first_when_cold_has_lower_address() {
-        let entry = subprogram_entry(&[(0x8e97c0, 0x8e9be0), (0x76e78e, 0x76e798)], None);
+        let ranges = [(0x8e97c0, 0x8e9be0), (0x76e78e, 0x76e798)];
+        let entry = subprogram_entry(&ranges, None);
 
         assert_eq!(
-            ModuleData::selected_non_inline_ranges(&entry),
+            ModuleData::selected_non_inline_ranges(&entry, &ranges),
             vec![(0x8e97c0, 0x8e9be0)],
         );
     }
 
     #[test]
     fn selected_non_inline_ranges_keeps_single_contiguous_range() {
-        let entry = subprogram_entry(&[(0x8ea060, 0x8eb07b)], None);
+        let ranges = [(0x8ea060, 0x8eb07b)];
+        let entry = subprogram_entry(&ranges, None);
 
         assert_eq!(
-            ModuleData::selected_non_inline_ranges(&entry),
+            ModuleData::selected_non_inline_ranges(&entry, &ranges),
             vec![(0x8ea060, 0x8eb07b)],
         );
     }
 
     #[test]
     fn selected_non_inline_ranges_prefers_range_containing_entry_pc() {
-        let entry = subprogram_entry(&[(0x100, 0x180), (0x200, 0x220)], Some(0x208));
+        let ranges = [(0x100, 0x180), (0x200, 0x220)];
+        let entry = subprogram_entry(&ranges, Some(0x208));
 
         assert_eq!(
-            ModuleData::selected_non_inline_ranges(&entry),
+            ModuleData::selected_non_inline_ranges(&entry, &ranges),
             vec![(0x200, 0x220)],
         );
     }
@@ -2928,10 +2975,11 @@ mod tests {
     #[test]
     fn selected_non_inline_ranges_without_entry_pc_keeps_first_range_even_if_later_range_is_larger()
     {
-        let entry = subprogram_entry(&[(0x100, 0x110), (0x200, 0x260)], None);
+        let ranges = [(0x100, 0x110), (0x200, 0x260)];
+        let entry = subprogram_entry(&ranges, None);
 
         assert_eq!(
-            ModuleData::selected_non_inline_ranges(&entry),
+            ModuleData::selected_non_inline_ranges(&entry, &ranges),
             vec![(0x100, 0x110)],
         );
     }
@@ -2976,7 +3024,18 @@ mod tests {
             Some(0x8eb16a),
         );
 
-        assert_eq!(ModuleData::selected_inline_address(&entry), Some(0x8eb16a));
+        assert_eq!(
+            ModuleData::selected_inline_address(
+                &entry,
+                &[
+                    (0x8eb12b, 0x8eb139),
+                    (0x8eb150, 0x8eb157),
+                    (0x8eb16a, 0x8eb1b0),
+                    (0x76e798, 0x76e7a2),
+                ],
+            ),
+            Some(0x8eb16a)
+        );
     }
 
     #[test]
@@ -2998,7 +3057,17 @@ mod tests {
             None,
         );
 
-        assert_eq!(ModuleData::selected_inline_address(&entry), Some(0x8eb12b));
+        assert_eq!(
+            ModuleData::selected_inline_address(
+                &entry,
+                &[
+                    (0x8eb12b, 0x8eb139),
+                    (0x8eb150, 0x8eb157),
+                    (0x76e798, 0x76e7a2),
+                ],
+            ),
+            Some(0x8eb12b)
+        );
     }
 
     #[test]
@@ -3016,7 +3085,10 @@ mod tests {
         // selection must stay inside the inline DIE's own ranges.
         let entry = inline_entry(&[(0x1289, 0x1293)], Some(0x1215));
 
-        assert_eq!(ModuleData::selected_inline_address(&entry), Some(0x1289));
+        assert_eq!(
+            ModuleData::selected_inline_address(&entry, &[(0x1289, 0x1293)]),
+            Some(0x1289)
+        );
     }
 
     #[test]
@@ -3029,7 +3101,10 @@ mod tests {
         // validate against.
         let entry = inline_entry(&[], Some(0x1289));
 
-        assert_eq!(ModuleData::selected_inline_address(&entry), Some(0x1289));
+        assert_eq!(
+            ModuleData::selected_inline_address(&entry, &[]),
+            Some(0x1289)
+        );
     }
 
     #[test]
@@ -3210,7 +3285,7 @@ mod tests {
                     ..Default::default()
                 },
                 language: Some(gimli::DW_LANG_C_plus_plus_17),
-                address_ranges: vec![(0x1000, 0x1010)],
+                representative_addr: Some(0x1000),
                 entry_pc: Some(0x1000),
                 function_kind: FunctionDieKind::ConcreteSubprogram,
             }],
@@ -3245,7 +3320,7 @@ mod tests {
                     ..Default::default()
                 },
                 language: Some(gimli::DW_LANG_Rust),
-                address_ranges: vec![(0x1000, 0x1010)],
+                representative_addr: Some(0x1000),
                 entry_pc: Some(0x1000),
                 function_kind: FunctionDieKind::ConcreteSubprogram,
             }],
@@ -3278,7 +3353,7 @@ mod tests {
                     ..Default::default()
                 },
                 language: Some(gimli::DW_LANG_C_plus_plus_17),
-                address_ranges: vec![(0x1000, 0x1010)],
+                representative_addr: Some(0x1000),
                 entry_pc: Some(0x1000),
                 function_kind: FunctionDieKind::ConcreteSubprogram,
             }],

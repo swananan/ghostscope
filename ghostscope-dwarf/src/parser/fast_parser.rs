@@ -28,7 +28,7 @@ struct FunctionEntrySeed {
     unit_offset: gimli::DebugInfoOffset,
     flags: crate::core::IndexFlags,
     language: Option<gimli::DwLang>,
-    address_ranges: Vec<(u64, u64)>,
+    representative_addr: Option<u64>,
     entry_pc: Option<u64>,
     function_kind: FunctionDieKind,
 }
@@ -178,11 +178,11 @@ impl<'a> DwarfParser<'a> {
                         &mut visited,
                     )?;
                     if let Some(name) = metadata.name.clone() {
-                        let address_ranges =
-                            self.extract_address_ranges_from_raw(unit, &raw_attrs)?;
+                        let representative_addr =
+                            self.extract_representative_address_from_raw(unit, &raw_attrs)?;
                         let entry_pc_cached = raw_attrs.entry_pc;
                         let function_kind =
-                            Self::classify_function_kind(tag, &address_ranges, entry_pc_cached);
+                            Self::classify_function_kind(tag, representative_addr, entry_pc_cached);
                         let is_main = Self::is_main_function_from_raw(&raw_attrs, &name);
                         let is_static = metadata
                             .is_external
@@ -203,7 +203,7 @@ impl<'a> DwarfParser<'a> {
                             unit_offset,
                             flags,
                             language: cu_language,
-                            address_ranges,
+                            representative_addr,
                             entry_pc: entry_pc_cached,
                             function_kind,
                         };
@@ -220,11 +220,11 @@ impl<'a> DwarfParser<'a> {
                         &mut visited,
                     )?;
                     if let Some(name) = metadata.name.clone() {
-                        let address_ranges =
-                            self.extract_address_ranges_from_raw(unit, &raw_attrs)?;
+                        let representative_addr =
+                            self.extract_representative_address_from_raw(unit, &raw_attrs)?;
                         let entry_pc_cached = raw_attrs.entry_pc;
                         let function_kind =
-                            Self::classify_function_kind(tag, &address_ranges, entry_pc_cached);
+                            Self::classify_function_kind(tag, representative_addr, entry_pc_cached);
                         let is_static = metadata
                             .is_external
                             .map(|external| !external)
@@ -243,7 +243,7 @@ impl<'a> DwarfParser<'a> {
                             unit_offset,
                             flags,
                             language: cu_language,
-                            address_ranges,
+                            representative_addr,
                             entry_pc: entry_pc_cached,
                             function_kind,
                         };
@@ -330,7 +330,6 @@ impl<'a> DwarfParser<'a> {
                         is_static: is_static_symbol,
                         ..Default::default()
                     };
-                    let var_ranges = var_addr.map(|a| vec![(a, a)]).unwrap_or_default();
 
                     for (name, is_linkage_alias) in collected_names {
                         let mut entry_flags = flags;
@@ -342,7 +341,7 @@ impl<'a> DwarfParser<'a> {
                             tag,
                             flags: entry_flags,
                             language: cu_language,
-                            address_ranges: var_ranges.clone(),
+                            representative_addr: var_addr,
                             entry_pc: None,
                             function_kind: FunctionDieKind::NotFunction,
                         };
@@ -377,7 +376,7 @@ impl<'a> DwarfParser<'a> {
                             tag,
                             flags,
                             language: cu_language,
-                            address_ranges: Vec::new(),
+                            representative_addr: None,
                             entry_pc: None,
                             function_kind: FunctionDieKind::NotFunction,
                         };
@@ -396,13 +395,13 @@ impl<'a> DwarfParser<'a> {
 
     fn classify_function_kind(
         tag: gimli::DwTag,
-        address_ranges: &[(u64, u64)],
+        representative_addr: Option<u64>,
         entry_pc: Option<u64>,
     ) -> FunctionDieKind {
         match tag {
             gimli::constants::DW_TAG_inlined_subroutine => FunctionDieKind::InlineInstance,
             gimli::constants::DW_TAG_subprogram => {
-                if !address_ranges.is_empty() || entry_pc.is_some() {
+                if representative_addr.is_some() || entry_pc.is_some() {
                     FunctionDieKind::ConcreteSubprogram
                 } else {
                     FunctionDieKind::AbstractSubprogram
@@ -420,7 +419,7 @@ impl<'a> DwarfParser<'a> {
             tag: seed.tag,
             flags: seed.flags,
             language: seed.language,
-            address_ranges: seed.address_ranges.clone(),
+            representative_addr: seed.representative_addr,
             entry_pc: seed.entry_pc,
             function_kind: seed.function_kind,
         }
@@ -747,32 +746,39 @@ impl<'a> DwarfParser<'a> {
         attrs.is_declaration.unwrap_or(false)
     }
 
-    /// Extract all address ranges from DIE (for functions)
-    /// Supports DW_AT_low_pc/high_pc and DW_AT_ranges (returns all ranges)
-    fn extract_address_ranges_from_raw(
+    fn extract_representative_address_from_raw(
         &self,
         unit: &gimli::Unit<DwarfReader>,
         attrs: &RawDieAttrs,
-    ) -> Result<Vec<(u64, u64)>> {
-        match (attrs.low_pc, attrs.high_pc, attrs.high_pc_offset) {
-            (Some(low), Some(high), _) => return Ok(vec![(low, high)]),
-            (Some(low), None, Some(offset)) => return Ok(vec![(low, low + offset)]),
-            _ => {}
+    ) -> Result<Option<u64>> {
+        if let Some(low_pc) = attrs.low_pc {
+            return Ok(Some(low_pc));
         }
 
+        if let Some(entry_pc) = attrs.entry_pc {
+            return Ok(Some(entry_pc));
+        }
+
+        self.peek_first_range_start_from_raw(unit, attrs)
+    }
+
+    fn peek_first_range_start_from_raw(
+        &self,
+        unit: &gimli::Unit<DwarfReader>,
+        attrs: &RawDieAttrs,
+    ) -> Result<Option<u64>> {
         let Some(ranges_attr) = attrs.ranges_attr.clone() else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
 
         let ranges_offset = match ranges_attr {
             gimli::AttributeValue::RangeListsRef(offset) => gimli::RangeListsOffset(offset.0),
             gimli::AttributeValue::SecOffset(offset) => gimli::RangeListsOffset(offset),
-            _ => return Ok(Vec::new()),
+            _ => return Ok(None),
         };
 
         let base_address = unit.low_pc;
         let mut ranges_iter = self.dwarf.ranges(unit, ranges_offset)?;
-        let mut ranges = Vec::new();
         while let Some(range) = ranges_iter.next()? {
             let begin = range.begin;
             let end = range.end;
@@ -780,16 +786,15 @@ impl<'a> DwarfParser<'a> {
                 continue;
             }
 
-            let (mut adjusted_begin, mut adjusted_end) = (begin, end);
+            let mut adjusted_begin = begin;
             if begin == 0 && base_address != 0 {
                 adjusted_begin = base_address + begin;
-                adjusted_end = base_address + end;
             }
 
-            ranges.push((adjusted_begin, adjusted_end));
+            return Ok(Some(adjusted_begin));
         }
 
-        Ok(ranges)
+        Ok(None)
     }
 
     /// Extract a variable's absolute storage address from DW_AT_location.
@@ -1080,7 +1085,7 @@ impl<'a> DwarfParser<'a> {
         let functions_count = lightweight_index.get_function_names().len();
         let variables_count = lightweight_index.get_variable_names().len();
         // Build per-CU function address maps
-        lightweight_index.build_cu_maps();
+        lightweight_index.build_cu_maps(self.dwarf);
         // Prefer CU range map from .debug_aranges if available
         let _ = lightweight_index.build_cu_maps_from_aranges(self.dwarf);
 
@@ -1487,6 +1492,54 @@ mod tests {
             .borrow(|section| dwarf_reader_from_arc(Arc::<[u8]>::from(section.as_slice())))
     }
 
+    fn build_cu_body_lookup_fixture() -> gimli::Dwarf<DwarfReader> {
+        let encoding = gimli::Encoding {
+            format: Format::Dwarf32,
+            version: 4,
+            address_size: 8,
+        };
+
+        let mut dwarf = WriteDwarf::new();
+        let unit_id = dwarf.units.add(Unit::new(encoding, LineProgram::none()));
+        let unit = dwarf.units.get_mut(unit_id);
+        let root = unit.root();
+        unit.get_mut(root).set(
+            gimli::constants::DW_AT_name,
+            WriteAttributeValue::String(b"body_lookup_unit".to_vec()),
+        );
+
+        let subprogram_id = unit.add(root, gimli::constants::DW_TAG_subprogram);
+        let subprogram = unit.get_mut(subprogram_id);
+        subprogram.set(
+            gimli::constants::DW_AT_name,
+            WriteAttributeValue::String(b"body_lookup".to_vec()),
+        );
+        subprogram.set(
+            gimli::constants::DW_AT_low_pc,
+            WriteAttributeValue::Address(Address::Constant(0x401000)),
+        );
+        subprogram.set(
+            gimli::constants::DW_AT_high_pc,
+            WriteAttributeValue::Udata(0x40),
+        );
+
+        let mut sections = Sections::new(EndianVec::new(LittleEndian));
+        dwarf.write(&mut sections).unwrap();
+
+        let dwarf_sections: gimli::DwarfSections<Vec<u8>> = gimli::DwarfSections::load(|id| {
+            Ok::<_, gimli::Error>(
+                sections
+                    .get(id)
+                    .map(|section| section.slice().to_vec())
+                    .unwrap_or_default(),
+            )
+        })
+        .unwrap();
+
+        dwarf_sections
+            .borrow(|section| dwarf_reader_from_arc(Arc::<[u8]>::from(section.as_slice())))
+    }
+
     #[test]
     fn parse_debug_info_skips_stack_value_address_locals_from_global_index() {
         let dwarf = build_variable_index_fixture();
@@ -1620,6 +1673,30 @@ mod tests {
                 .count(),
             1,
             "function name listing should not duplicate shard-local keys: {names:?}"
+        );
+    }
+
+    #[test]
+    fn parse_debug_info_builds_fallback_cu_map_for_function_body_addresses() {
+        let dwarf = build_cu_body_lookup_fixture();
+        let parser = DwarfParser { dwarf: &dwarf };
+
+        let result = parser.parse_debug_info("synthetic").unwrap();
+        let entry = result
+            .lightweight_index
+            .find_function_by_address(0x401020, |entry| {
+                let header = dwarf.unit_header(entry.unit_offset).ok()?;
+                let unit = dwarf.unit(header).ok()?;
+                let die = unit.entry(entry.die_offset).ok()?;
+                crate::parser::RangeExtractor::extract_all_ranges(&die, &unit, &dwarf).ok()
+            })
+            .expect("function body address should resolve through fallback CU map");
+
+        assert_eq!(entry.name.as_ref(), "body_lookup");
+        assert_eq!(
+            result.lightweight_index.find_cu_by_address(0x401020),
+            Some(entry.unit_offset),
+            "fallback CU map should cover addresses inside the function body, not just the representative address"
         );
     }
 }
