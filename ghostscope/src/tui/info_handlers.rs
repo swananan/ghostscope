@@ -1,7 +1,7 @@
 use crate::core::GhostSession;
-use ghostscope_dwarf::ModuleAddress;
+use ghostscope_dwarf::{AddressQueryResult, FunctionQueryResult};
 use ghostscope_ui::{events::*, RuntimeChannels, RuntimeStatus};
-use tracing::{info, warn};
+use tracing::info;
 
 /// Handle InfoTrace command
 pub async fn handle_info_trace(
@@ -408,20 +408,14 @@ pub async fn handle_info_address(
         let vaddr = parse_addr(addr_str)?;
         let module_path = resolve_module_path(analyzer, sess, module_spec)?;
 
-        // Aggregate per-module info via existing helper
-        let ma = ModuleAddress::new(std::path::PathBuf::from(&module_path), vaddr);
-        let (modules, _first) = process_module_addresses_for_variables(
-            sess.process_analyzer.as_mut().unwrap(),
-            &[ma.clone()],
-            &format!("address 0x{vaddr:x}"),
-        );
-
-        // Derive source location if available
-        let source_location = sess
+        let address_info = sess
             .process_analyzer
             .as_mut()
             .unwrap()
-            .lookup_source_location(&ma);
+            .query_address(&module_path, vaddr)
+            .map_err(|e| {
+                format!("Failed to analyze address 0x{vaddr:x} in module '{module_path}': {e}")
+            })?;
 
         Ok(TargetDebugInfo {
             target: if let Some(ms) = module_spec {
@@ -430,10 +424,10 @@ pub async fn handle_info_address(
                 addr_str.trim().to_string()
             },
             target_type: TargetType::Address,
-            file_path: source_location.as_ref().map(|sl| sl.file_path.clone()),
-            line_number: source_location.as_ref().map(|sl| sl.line_number),
-            function_name: None,
-            modules,
+            file_path: address_info.source_file.clone(),
+            line_number: address_info.source_line,
+            function_name: address_info.function_name.clone(),
+            modules: group_module_debug_info(vec![address_info]),
         })
     })();
 
@@ -538,10 +532,17 @@ fn try_get_line_debug_info(
 
     // Probe candidates until we find addresses
     for cand in &candidates {
-        let addrs = process_analyzer.lookup_addresses_by_source_line(cand, line_number);
-        if !addrs.is_empty() {
+        let query_results = process_analyzer
+            .query_source_line_best_effort(cand, line_number)
+            .map_err(|e| format!("Failed to analyze {cand}:{line_number}: {e}"))?;
+        if !query_results.is_empty() {
             let cand_target = format!("{cand}:{line_number}");
-            return handle_source_location_target(process_analyzer, &cand_target);
+            return Ok(build_source_location_target_debug_info(
+                cand_target,
+                cand.to_string(),
+                line_number,
+                query_results,
+            ));
         }
     }
 
@@ -555,140 +556,164 @@ fn try_get_line_debug_info(
     handle_source_location_target(process_analyzer, &final_target)
 }
 
-/// Process module addresses and extract variable information
-fn process_module_addresses_for_variables(
-    process_analyzer: &mut ghostscope_dwarf::DwarfAnalyzer,
-    module_addresses: &[ModuleAddress],
-    target_description: &str, // e.g., "function 'main'" or "source line 'file.c:42'"
-) -> (Vec<ModuleDebugInfo>, Option<ModuleAddress>) {
-    use std::collections::HashMap;
+fn unique_module_count(addresses: &[AddressQueryResult]) -> usize {
+    use std::collections::HashSet;
 
-    let mut modules = Vec::new();
-    let mut first_module_address: Option<ModuleAddress> = None;
+    addresses
+        .iter()
+        .map(|address| address.module_path.as_path())
+        .collect::<HashSet<_>>()
+        .len()
+}
 
-    // Build ordered modules and per-module address lists preserving input order
-    let mut module_order: Vec<std::path::PathBuf> = Vec::new();
-    let mut grouped_by_module: HashMap<std::path::PathBuf, Vec<&ModuleAddress>> = HashMap::new();
-    for ma in module_addresses {
-        if !grouped_by_module.contains_key(&ma.module_path) {
-            module_order.push(ma.module_path.clone());
-        }
-        grouped_by_module
-            .entry(ma.module_path.clone())
-            .or_default()
-            .push(ma);
+fn variable_debug_info_from_query(
+    variable: ghostscope_dwarf::VariableWithEvaluation,
+) -> VariableDebugInfo {
+    let type_pretty = variable.dwarf_type.as_ref().map(|t| t.to_string());
+    let size = variable.dwarf_type.as_ref().map(|t| t.size());
 
-        if first_module_address.is_none() {
-            first_module_address = Some(ma.clone());
-        }
+    VariableDebugInfo {
+        name: variable.name,
+        type_name: variable.type_name,
+        type_pretty,
+        location_description: format!("{}", variable.evaluation_result),
+        size,
+        scope_start: None,
+        scope_end: None,
     }
+}
 
-    let mut global_index: usize = 1;
-    for module_path in module_order {
-        let module_addresses_in_module = grouped_by_module.get(&module_path).unwrap();
-        info!(
-            "Processing {} in module '{}' at {} addresses",
-            target_description,
-            module_path.display(),
-            module_addresses_in_module.len()
-        );
+fn group_module_debug_info(addresses: Vec<AddressQueryResult>) -> Vec<ModuleDebugInfo> {
+    let mut modules = Vec::new();
+    let mut current_binary_path: Option<String> = None;
+    let mut current_mappings = Vec::new();
 
-        let mut address_mappings = Vec::new();
-
-        for module_address in module_addresses_in_module {
-            info!(
-                "Analyzing variables at address 0x{:x} for {} in module '{}'",
-                module_address.address,
-                target_description,
-                module_address.module_display()
-            );
-
-            // Get enhanced variables at this address using the DWARF analyzer helper
-            info!(
-                "Using module '{}' for analysis at binary offset 0x{:x}",
-                module_address.module_display(),
-                module_address.address
-            );
-
-            // DWARF analyzer doesn't need EvaluationContext - just pass the module address directly
-            let enhanced_vars = match process_analyzer.get_all_variables_at_address(module_address)
-            {
-                Ok(vars) => vars,
-                Err(e) => {
-                    warn!(
-                        "Failed to get variables at address 0x{:x}: {}",
-                        module_address.address, e
-                    );
-                    Vec::new()
-                }
-            };
-
-            // Separate parameters and variables for this address
-            let mut parameters = Vec::new();
-            let mut variables = Vec::new();
-
-            for enhanced_var in enhanced_vars {
-                let location_description = format!("{}", enhanced_var.evaluation_result);
-
-                let var_info = VariableDebugInfo {
-                    name: enhanced_var.name.clone(),
-                    type_name: enhanced_var.type_name.clone(),
-                    type_pretty: enhanced_var.dwarf_type.as_ref().map(|t| t.to_string()),
-                    location_description,
-                    size: enhanced_var.dwarf_type.as_ref().map(|t| t.size()),
-                    scope_start: None, // VariableWithEvaluation doesn't have scope_ranges
-                    scope_end: None,   // VariableWithEvaluation doesn't have scope_ranges
-                };
-
-                // Use the is_parameter field from DWARF parsing (which is based on DW_TAG_formal_parameter)
-                let is_parameter = enhanced_var.is_parameter;
-
-                // Log using enhanced evaluation result
-                let log_location = format!("{:?}", enhanced_var.evaluation_result);
-
-                info!(
-                    "Address 0x{:x}: Variable '{}' location: {}, is_parameter: {} (from DWARF)",
-                    module_address.address, enhanced_var.name, log_location, is_parameter
-                );
-
-                if is_parameter {
-                    parameters.push(var_info);
-                } else {
-                    variables.push(var_info);
-                }
+    for (index, address) in addresses.into_iter().enumerate() {
+        let binary_path = address.module_path.to_string_lossy().to_string();
+        if current_binary_path.as_deref() != Some(binary_path.as_str()) {
+            if let Some(path) = current_binary_path.take() {
+                modules.push(ModuleDebugInfo {
+                    binary_path: path,
+                    address_mappings: current_mappings,
+                });
+                current_mappings = Vec::new();
             }
-
-            // Get function name by finding symbol at this address in the specific module
-            let function_name: Option<String> =
-                process_analyzer.find_symbol_by_module_address(module_address);
-
-            // Source location for this address (per mapping)
-            let src_loc = process_analyzer.lookup_source_location(module_address);
-            // Inline classification
-            let is_inline = process_analyzer.is_inline_at(module_address);
-
-            address_mappings.push(AddressMapping {
-                address: module_address.address,
-                binary_path: module_address.module_path.to_string_lossy().to_string(),
-                function_name,
-                variables,
-                parameters,
-                source_file: src_loc.as_ref().map(|sl| sl.file_path.clone()),
-                source_line: src_loc.as_ref().map(|sl| sl.line_number),
-                is_inline,
-                index: Some(global_index),
-            });
-            global_index += 1;
+            current_binary_path = Some(binary_path.clone());
         }
 
-        // Create ModuleDebugInfo for this module
-        modules.push(ModuleDebugInfo {
-            binary_path: module_path.to_string_lossy().to_string(),
-            address_mappings,
+        current_mappings.push(AddressMapping {
+            address: address.address,
+            binary_path,
+            function_name: address.function_name,
+            variables: address
+                .variables
+                .into_iter()
+                .map(variable_debug_info_from_query)
+                .collect(),
+            parameters: address
+                .parameters
+                .into_iter()
+                .map(variable_debug_info_from_query)
+                .collect(),
+            source_file: address.source_file,
+            source_line: address.source_line,
+            is_inline: address.is_inline,
+            index: Some(index + 1),
         });
     }
 
-    (modules, first_module_address)
+    if let Some(path) = current_binary_path {
+        modules.push(ModuleDebugInfo {
+            binary_path: path,
+            address_mappings: current_mappings,
+        });
+    }
+
+    modules
+}
+
+fn build_target_debug_info_from_query_results(
+    target: String,
+    target_type: TargetType,
+    addresses: Vec<AddressQueryResult>,
+    fallback_file_path: Option<String>,
+    fallback_line_number: Option<u32>,
+    function_name: Option<String>,
+) -> TargetDebugInfo {
+    let file_path = addresses
+        .first()
+        .and_then(|address| address.source_file.clone())
+        .or(fallback_file_path);
+    let line_number = addresses
+        .first()
+        .and_then(|address| address.source_line)
+        .or(fallback_line_number);
+    let resolved_function_name = function_name.or_else(|| {
+        addresses
+            .first()
+            .and_then(|address| address.function_name.clone())
+    });
+
+    TargetDebugInfo {
+        target,
+        target_type,
+        file_path,
+        line_number,
+        function_name: resolved_function_name,
+        modules: group_module_debug_info(addresses),
+    }
+}
+
+fn handle_function_query_result(
+    query_result: FunctionQueryResult,
+) -> Result<TargetDebugInfo, String> {
+    if query_result.addresses.is_empty() {
+        return Err(format!(
+            "Function '{}' not found in any loaded module",
+            query_result.function_name
+        ));
+    }
+
+    info!(
+        "Found function '{}' at {} address(es) across {} modules",
+        query_result.function_name,
+        query_result.addresses.len(),
+        unique_module_count(&query_result.addresses)
+    );
+
+    let function_name = query_result.function_name.clone();
+    Ok(build_target_debug_info_from_query_results(
+        function_name.clone(),
+        TargetType::Function,
+        query_result.addresses,
+        None,
+        None,
+        Some(function_name),
+    ))
+}
+
+fn build_source_location_target_debug_info(
+    target: String,
+    fallback_file_path: String,
+    line_number: u32,
+    query_results: Vec<AddressQueryResult>,
+) -> TargetDebugInfo {
+    info!(
+        "Found source line '{}:{}' at {} address(es) across {} modules",
+        fallback_file_path,
+        line_number,
+        query_results.len(),
+        unique_module_count(&query_results)
+    );
+
+    build_target_debug_info_from_query_results(
+        target,
+        TargetType::SourceLocation,
+        query_results,
+        Some(fallback_file_path),
+        Some(line_number),
+        None,
+    )
 }
 
 /// Handle function name target
@@ -696,57 +721,10 @@ fn handle_function_target(
     process_analyzer: &mut ghostscope_dwarf::DwarfAnalyzer,
     function_name: &str,
 ) -> Result<TargetDebugInfo, String> {
-    // Use DWARF information across all modules
-    let module_addresses = process_analyzer.lookup_function_addresses(function_name);
-
-    if module_addresses.is_empty() {
-        return Err(format!(
-            "Function '{function_name}' not found in any loaded module"
-        ));
-    }
-
-    let total_addresses: usize = module_addresses.len();
-    let unique_modules: std::collections::HashSet<_> =
-        module_addresses.iter().map(|ma| &ma.module_path).collect();
-    info!(
-        "Found function '{}' at {} address(es) across {} modules",
-        function_name,
-        total_addresses,
-        unique_modules.len()
-    );
-
-    // Process modules and extract variable information
-    let target_description = format!("function '{function_name}'");
-    let (mut modules, first_module_address) = process_module_addresses_for_variables(
-        process_analyzer,
-        &module_addresses,
-        &target_description,
-    );
-
-    // Update function_name in all address mappings since we know it's a function target
-    for module in &mut modules {
-        for mapping in &mut module.address_mappings {
-            if mapping.function_name.is_none() {
-                mapping.function_name = Some(function_name.to_string());
-            }
-        }
-    }
-
-    // Try to get source location for the first function address
-    let source_location = if let Some(module_address) = &first_module_address {
-        process_analyzer.lookup_source_location(module_address)
-    } else {
-        None
-    };
-
-    Ok(TargetDebugInfo {
-        target: function_name.to_string(),
-        target_type: TargetType::Function,
-        file_path: source_location.as_ref().map(|sl| sl.file_path.clone()),
-        line_number: source_location.as_ref().map(|sl| sl.line_number),
-        function_name: Some(function_name.to_string()),
-        modules,
-    })
+    let query_result = process_analyzer
+        .query_function_best_effort(function_name)
+        .map_err(|e| format!("Failed to analyze function '{function_name}': {e}"))?;
+    handle_function_query_result(query_result)
 }
 
 /// Handle source location target (file:line)
@@ -754,70 +732,27 @@ fn handle_source_location_target(
     process_analyzer: &mut ghostscope_dwarf::DwarfAnalyzer,
     target: &str,
 ) -> Result<TargetDebugInfo, String> {
-    // Parse file:line format
-    let parts: Vec<&str> = target.split(':').collect();
-    if parts.len() != 2 {
-        return Err(format!(
-            "Invalid target format '{target}'. Expected format: file:line"
-        ));
-    }
-
-    let file_path = parts[0];
-    let line_number = parts[1]
+    let (file_path, line_part) = target
+        .rsplit_once(':')
+        .ok_or_else(|| format!("Invalid target format '{target}'. Expected format: file:line"))?;
+    let line_number = line_part
         .parse::<u32>()
-        .map_err(|_| format!("Invalid line number '{}' in target '{target}'", parts[1]))?;
+        .map_err(|_| format!("Invalid line number '{line_part}' in target '{target}'"))?;
 
-    // Resolve source line to all addresses across all modules
-    let module_addresses = process_analyzer.lookup_addresses_by_source_line(file_path, line_number);
+    let query_results = process_analyzer
+        .query_source_line_best_effort(file_path, line_number)
+        .map_err(|e| format!("Failed to analyze {file_path}:{line_number}: {e}"))?;
 
-    if module_addresses.is_empty() {
+    if query_results.is_empty() {
         return Err(format!(
             "Cannot resolve any address for {file_path}:{line_number}"
         ));
     }
 
-    let total_addresses: usize = module_addresses.len();
-    let unique_modules: std::collections::HashSet<_> =
-        module_addresses.iter().map(|ma| &ma.module_path).collect();
-    info!(
-        "Found source line '{}:{}' at {} address(es) across {} modules",
-        file_path,
+    Ok(build_source_location_target_debug_info(
+        target.to_string(),
+        file_path.to_string(),
         line_number,
-        total_addresses,
-        unique_modules.len()
-    );
-
-    // Process modules and extract variable information
-    let target_description = format!("source line '{file_path}:{line_number}'");
-    let (modules, first_module_address) = process_module_addresses_for_variables(
-        process_analyzer,
-        &module_addresses,
-        &target_description,
-    );
-
-    // Get actual source location from first module that has addresses
-    let actual_source_location = if let Some(ref first_module_address) = first_module_address {
-        process_analyzer.lookup_source_location(first_module_address)
-    } else {
-        None
-    };
-    let complete_file_path = actual_source_location
-        .as_ref()
-        .map(|sl| sl.file_path.clone())
-        .unwrap_or_else(|| file_path.to_string()); // fallback to user input if no location found
-
-    // Try to get overall function name (from first module's first mapping or fallback)
-    let overall_function_name = modules
-        .first()
-        .and_then(|module| module.address_mappings.first())
-        .and_then(|mapping| mapping.function_name.clone());
-
-    Ok(TargetDebugInfo {
-        target: target.to_string(),
-        target_type: TargetType::SourceLocation,
-        file_path: Some(complete_file_path),
-        line_number: Some(line_number),
-        function_name: overall_function_name,
-        modules,
-    })
+        query_results,
+    ))
 }

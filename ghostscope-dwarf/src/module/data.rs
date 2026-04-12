@@ -1859,11 +1859,6 @@ impl ModuleData {
             .find_function_by_address(address, |entry| self.resolve_function_ranges(entry).ok())
     }
 
-    fn find_die_index_entry_by_address(&self, address: u64) -> Option<&crate::core::IndexEntry> {
-        self.lightweight_index
-            .find_die_at_address(address, |entry| self.resolve_function_ranges(entry).ok())
-    }
-
     /// Compute addresses for a function entry (deterministic ordering)
     ///
     /// Semantics
@@ -2496,13 +2491,9 @@ impl ModuleData {
         addresses
     }
 
-    /// Find symbol name by address (compatibility method)
-    pub(crate) fn find_symbol_by_address(&self, address: u64) -> Option<String> {
-        // Prefer optimized function lookup for readability; fallback to any DIE
-        if let Some(entry) = self.find_function_index_entry_by_address(address) {
-            return Some(entry.name.to_string());
-        }
-        self.find_die_index_entry_by_address(address)
+    /// Find containing function name by address.
+    pub(crate) fn find_function_name_by_address(&self, address: u64) -> Option<String> {
+        self.find_function_index_entry_by_address(address)
             .map(|entry| entry.name.to_string())
     }
 

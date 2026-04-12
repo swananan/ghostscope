@@ -51,6 +51,27 @@ pub struct ModuleLoadingStats {
     pub module_total_time_ms: u64,
 }
 
+/// Rich query result for a single address within a module.
+#[derive(Debug, Clone)]
+pub struct AddressQueryResult {
+    pub module_path: PathBuf,
+    pub address: u64,
+    pub source_file: Option<String>,
+    pub source_line: Option<u32>,
+    pub source_column: Option<u32>,
+    pub function_name: Option<String>,
+    pub is_inline: Option<bool>,
+    pub variables: Vec<crate::VariableWithEvaluation>,
+    pub parameters: Vec<crate::VariableWithEvaluation>,
+}
+
+/// Rich query result for a function lookup across modules.
+#[derive(Debug, Clone)]
+pub struct FunctionQueryResult {
+    pub function_name: String,
+    pub addresses: Vec<AddressQueryResult>,
+}
+
 /// DWARF analyzer - unified entry point for all DWARF analysis
 #[derive(Debug)]
 pub struct DwarfAnalyzer {
@@ -61,6 +82,102 @@ pub struct DwarfAnalyzer {
 }
 
 impl DwarfAnalyzer {
+    fn build_address_query_result(
+        &mut self,
+        module_address: &ModuleAddress,
+    ) -> Result<AddressQueryResult> {
+        let mut variables = Vec::new();
+        let mut parameters = Vec::new();
+
+        for variable in self.get_all_variables_at_address(module_address)? {
+            if variable.is_parameter {
+                parameters.push(variable);
+            } else {
+                variables.push(variable);
+            }
+        }
+
+        let source_location = self.lookup_source_location(module_address);
+        let function_name = self.find_function_name_by_module_address(module_address);
+        let is_inline = self.is_inline_at(module_address);
+
+        Ok(AddressQueryResult {
+            module_path: module_address.module_path.clone(),
+            address: module_address.address,
+            source_file: source_location.as_ref().map(|sl| sl.file_path.clone()),
+            source_line: source_location.as_ref().map(|sl| sl.line_number),
+            source_column: source_location.as_ref().and_then(|sl| sl.column),
+            function_name,
+            is_inline,
+            variables,
+            parameters,
+        })
+    }
+
+    fn query_module_addresses(
+        &mut self,
+        module_addresses: Vec<ModuleAddress>,
+    ) -> Result<Vec<AddressQueryResult>> {
+        module_addresses
+            .iter()
+            .map(|module_address| self.build_address_query_result(module_address))
+            .collect()
+    }
+
+    fn query_module_addresses_best_effort(
+        &mut self,
+        module_addresses: Vec<ModuleAddress>,
+        query_label: &str,
+    ) -> Result<Vec<AddressQueryResult>> {
+        let mut results = Vec::new();
+        let mut first_error: Option<(ModuleAddress, String)> = None;
+
+        for module_address in &module_addresses {
+            match self.build_address_query_result(module_address) {
+                Ok(result) => results.push(result),
+                Err(error) => {
+                    let error_string = error.to_string();
+                    tracing::warn!(
+                        "Skipping failed address query for {} at {}:0x{:x}: {}",
+                        query_label,
+                        module_address.module_display(),
+                        module_address.address,
+                        error_string
+                    );
+
+                    if first_error.is_none() {
+                        first_error = Some((module_address.clone(), error_string));
+                    }
+                }
+            }
+        }
+
+        if results.is_empty() {
+            if let Some((module_address, error)) = first_error {
+                return Err(anyhow::anyhow!(
+                    "Failed to analyze any address for {} (first failure at {}:0x{:x}: {})",
+                    query_label,
+                    module_address.module_display(),
+                    module_address.address,
+                    error
+                ));
+            }
+        }
+
+        Ok(results)
+    }
+
+    fn find_function_name_by_module_address(
+        &self,
+        module_address: &ModuleAddress,
+    ) -> Option<String> {
+        self.modules
+            .get(&module_address.module_path)
+            .and_then(|module_data| {
+                module_data.find_function_name_by_address(module_address.address)
+            })
+    }
+
     /// Create DWARF analyzer from PID (now uses parallel loading)
     pub async fn from_pid(pid: u32) -> Result<Self> {
         Self::from_pid_parallel(pid).await
@@ -389,6 +506,28 @@ impl DwarfAnalyzer {
             }
         });
         results
+    }
+
+    /// Query function debug information across all modules.
+    pub fn query_function(&mut self, name: &str) -> Result<FunctionQueryResult> {
+        let module_addresses = self.lookup_function_addresses(name);
+        let addresses = self.query_module_addresses(module_addresses)?;
+        Ok(FunctionQueryResult {
+            function_name: name.to_string(),
+            addresses,
+        })
+    }
+
+    /// Query function debug information across all modules, skipping addresses
+    /// that fail to resolve so callers can still display partial results.
+    pub fn query_function_best_effort(&mut self, name: &str) -> Result<FunctionQueryResult> {
+        let module_addresses = self.lookup_function_addresses(name);
+        let addresses = self
+            .query_module_addresses_best_effort(module_addresses, &format!("function '{name}'"))?;
+        Ok(FunctionQueryResult {
+            function_name: name.to_string(),
+            addresses,
+        })
     }
 
     /// Convert a module-relative virtual address (DWARF PC) to an ELF file offset
@@ -725,6 +864,41 @@ impl DwarfAnalyzer {
         results
     }
 
+    /// Query source-line debug information across all modules.
+    pub fn query_source_line(
+        &mut self,
+        file_path: &str,
+        line_number: u32,
+    ) -> Result<Vec<AddressQueryResult>> {
+        let module_addresses = self.lookup_addresses_by_source_line(file_path, line_number);
+        self.query_module_addresses(module_addresses)
+    }
+
+    /// Query source-line debug information across all modules, skipping
+    /// addresses that fail to resolve so callers can still display partial
+    /// results.
+    pub fn query_source_line_best_effort(
+        &mut self,
+        file_path: &str,
+        line_number: u32,
+    ) -> Result<Vec<AddressQueryResult>> {
+        let module_addresses = self.lookup_addresses_by_source_line(file_path, line_number);
+        self.query_module_addresses_best_effort(
+            module_addresses,
+            &format!("source line '{file_path}:{line_number}'"),
+        )
+    }
+
+    /// Query a specific address within a module.
+    pub fn query_address<P: AsRef<Path>>(
+        &mut self,
+        module_path: P,
+        address: u64,
+    ) -> Result<AddressQueryResult> {
+        let module_address = ModuleAddress::new(module_path.as_ref().to_path_buf(), address);
+        self.build_address_query_result(&module_address)
+    }
+
     /// Get all function names (cross-module)
     pub fn get_all_function_names(&self) -> Vec<String> {
         let mut all_names = std::collections::HashSet::new();
@@ -989,15 +1163,6 @@ impl DwarfAnalyzer {
         filename.contains(".so")
             || module_path.to_string_lossy().starts_with("/lib")
             || module_path.to_string_lossy().starts_with("/usr/lib")
-    }
-
-    /// Find symbol by module address
-    pub fn find_symbol_by_module_address(&self, module_address: &ModuleAddress) -> Option<String> {
-        if let Some(module_data) = self.modules.get(&module_address.module_path) {
-            module_data.find_symbol_by_address(module_address.address)
-        } else {
-            None
-        }
     }
 
     /// Get grouped file info by module (compatibility method)
