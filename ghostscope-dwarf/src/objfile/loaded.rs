@@ -1,4 +1,4 @@
-//! Single module DWARF data management (simplified and restructured)
+//! Loaded object file: complete DWARF data for a single binary
 
 /// Constants for intelligent file selection scoring
 mod file_selection_scoring {
@@ -46,9 +46,9 @@ use std::{
     time::Instant,
 };
 
-/// Complete DWARF data for a single module
+/// Complete DWARF data for a single loaded object file.
 #[derive(Debug)]
-pub(crate) struct ModuleData {
+pub(crate) struct LoadedObjfile {
     /// Module mapping info (from proc mapping)
     module_mapping: ModuleMapping,
     /// Lightweight index (startup time)
@@ -77,7 +77,7 @@ pub(crate) struct ModuleData {
     load_total_ms: u64,
 }
 
-impl ModuleData {
+impl LoadedObjfile {
     // Find the innermost inline node containing the PC
     fn find_innermost_inline_node(func: &FunctionBlocks, pc: u64) -> Option<usize> {
         let path = func.block_path_for_pc(pc);
@@ -694,7 +694,7 @@ impl ModuleData {
 
     /// Lookup function addresses by name
     pub(crate) fn lookup_function_addresses(&self, name: &str) -> Vec<u64> {
-        tracing::debug!("ModuleData: looking up function '{}'", name);
+        tracing::debug!("LoadedObjfile: looking up function '{}'", name);
 
         // Get function entries from lightweight index
         let entries = self.lightweight_index.find_dies_by_function_name(name);
@@ -705,7 +705,7 @@ impl ModuleData {
         }
 
         tracing::debug!(
-            "ModuleData: function '{}' resolved to {} addresses: {:?}",
+            "LoadedObjfile: function '{}' resolved to {} addresses: {:?}",
             name,
             addresses.len(),
             addresses
@@ -2626,7 +2626,7 @@ impl ModuleData {
 
 #[cfg(test)]
 mod tests {
-    use super::ModuleData;
+    use super::LoadedObjfile;
     use crate::binary::{dwarf_reader_from_arc, DwarfReader};
     use crate::core::{FunctionDieKind, IndexEntry, IndexFlags};
     use crate::index::LightweightIndex;
@@ -2936,7 +2936,7 @@ mod tests {
         let entry = subprogram_entry(&ranges, None);
 
         assert_eq!(
-            ModuleData::selected_non_inline_ranges(&entry, &ranges),
+            LoadedObjfile::selected_non_inline_ranges(&entry, &ranges),
             vec![(0x8e97c0, 0x8e9be0)],
         );
     }
@@ -2947,7 +2947,7 @@ mod tests {
         let entry = subprogram_entry(&ranges, None);
 
         assert_eq!(
-            ModuleData::selected_non_inline_ranges(&entry, &ranges),
+            LoadedObjfile::selected_non_inline_ranges(&entry, &ranges),
             vec![(0x8ea060, 0x8eb07b)],
         );
     }
@@ -2958,7 +2958,7 @@ mod tests {
         let entry = subprogram_entry(&ranges, Some(0x208));
 
         assert_eq!(
-            ModuleData::selected_non_inline_ranges(&entry, &ranges),
+            LoadedObjfile::selected_non_inline_ranges(&entry, &ranges),
             vec![(0x200, 0x220)],
         );
     }
@@ -2970,7 +2970,7 @@ mod tests {
         let entry = subprogram_entry(&ranges, None);
 
         assert_eq!(
-            ModuleData::selected_non_inline_ranges(&entry, &ranges),
+            LoadedObjfile::selected_non_inline_ranges(&entry, &ranges),
             vec![(0x100, 0x110)],
         );
     }
@@ -2987,11 +2987,11 @@ mod tests {
         // This locks in the clamp: a candidate outside [start, end) must fall
         // back to the function's own start, while an in-range candidate is kept.
         assert_eq!(
-            ModuleData::selected_non_inline_probe_address(0x1470, 0x147b, 0x14f2),
+            LoadedObjfile::selected_non_inline_probe_address(0x1470, 0x147b, 0x14f2),
             0x1470
         );
         assert_eq!(
-            ModuleData::selected_non_inline_probe_address(0x1470, 0x147b, 0x1474),
+            LoadedObjfile::selected_non_inline_probe_address(0x1470, 0x147b, 0x1474),
             0x1474
         );
     }
@@ -3016,7 +3016,7 @@ mod tests {
         );
 
         assert_eq!(
-            ModuleData::selected_inline_address(
+            LoadedObjfile::selected_inline_address(
                 &entry,
                 &[
                     (0x8eb12b, 0x8eb139),
@@ -3049,7 +3049,7 @@ mod tests {
         );
 
         assert_eq!(
-            ModuleData::selected_inline_address(
+            LoadedObjfile::selected_inline_address(
                 &entry,
                 &[
                     (0x8eb12b, 0x8eb139),
@@ -3077,7 +3077,7 @@ mod tests {
         let entry = inline_entry(&[(0x1289, 0x1293)], Some(0x1215));
 
         assert_eq!(
-            ModuleData::selected_inline_address(&entry, &[(0x1289, 0x1293)]),
+            LoadedObjfile::selected_inline_address(&entry, &[(0x1289, 0x1293)]),
             Some(0x1289)
         );
     }
@@ -3093,7 +3093,7 @@ mod tests {
         let entry = inline_entry(&[], Some(0x1289));
 
         assert_eq!(
-            ModuleData::selected_inline_address(&entry, &[]),
+            LoadedObjfile::selected_inline_address(&entry, &[]),
             Some(0x1289)
         );
     }
@@ -3117,12 +3117,12 @@ mod tests {
         let concrete = unit.entry(concrete_offset).unwrap();
 
         assert_eq!(
-            ModuleData::direct_formal_parameters_entry_value_state(&unit, &concrete).unwrap(),
+            LoadedObjfile::direct_formal_parameters_entry_value_state(&unit, &concrete).unwrap(),
             None,
             "concrete DIE should not expose direct parameter children in this fixture"
         );
         assert!(
-            ModuleData::subprogram_uses_entry_value(&dwarf, &unit, &concrete).unwrap(),
+            LoadedObjfile::subprogram_uses_entry_value(&dwarf, &unit, &concrete).unwrap(),
             "entry_value should be discovered through DW_AT_abstract_origin"
         );
     }
@@ -3139,12 +3139,12 @@ mod tests {
         let concrete = unit.entry(concrete_offset).unwrap();
 
         assert_eq!(
-            ModuleData::direct_formal_parameters_entry_value_state(&unit, &concrete).unwrap(),
+            LoadedObjfile::direct_formal_parameters_entry_value_state(&unit, &concrete).unwrap(),
             None,
             "concrete DIE should not expose direct parameter children in this fixture"
         );
         assert!(
-            ModuleData::subprogram_uses_entry_value(&dwarf, &unit, &concrete).unwrap(),
+            LoadedObjfile::subprogram_uses_entry_value(&dwarf, &unit, &concrete).unwrap(),
             "entry_value should be discovered through DW_AT_specification"
         );
     }
@@ -3168,12 +3168,12 @@ mod tests {
         let concrete = unit.entry(concrete_offset).unwrap();
 
         assert_eq!(
-            ModuleData::direct_formal_parameters_entry_value_state(&unit, &concrete).unwrap(),
+            LoadedObjfile::direct_formal_parameters_entry_value_state(&unit, &concrete).unwrap(),
             Some(false),
             "concrete DIE should treat its own parameter children as authoritative"
         );
         assert!(
-            !ModuleData::subprogram_uses_entry_value(&dwarf, &unit, &concrete).unwrap(),
+            !LoadedObjfile::subprogram_uses_entry_value(&dwarf, &unit, &concrete).unwrap(),
             "origin-level entry_value must not override concrete parameter locations"
         );
     }
@@ -3197,11 +3197,12 @@ mod tests {
         let concrete = unit.entry(concrete_offset).unwrap();
 
         assert!(
-            !ModuleData::subprogram_uses_entry_value_at(&dwarf, &unit, &concrete, 0x1474).unwrap(),
+            !LoadedObjfile::subprogram_uses_entry_value_at(&dwarf, &unit, &concrete, 0x1474).unwrap(),
             "entry_value should not force the true entry while the active location is still a direct register"
         );
         assert!(
-            ModuleData::subprogram_uses_entry_value_at(&dwarf, &unit, &concrete, 0x1478).unwrap(),
+            LoadedObjfile::subprogram_uses_entry_value_at(&dwarf, &unit, &concrete, 0x1478)
+                .unwrap(),
             "entry_value should still be detected once the active location range switches to it"
         );
     }
@@ -3221,7 +3222,8 @@ mod tests {
         let concrete = unit.entry(concrete_offset).unwrap();
 
         assert!(
-            !ModuleData::subprogram_uses_entry_value_at(&dwarf, &unit, &concrete, 0x1478).unwrap(),
+            !LoadedObjfile::subprogram_uses_entry_value_at(&dwarf, &unit, &concrete, 0x1478)
+                .unwrap(),
             "concrete parameter locations must remain authoritative at the selected probe PC"
         );
     }
@@ -3247,11 +3249,13 @@ mod tests {
         let concrete = unit.entry(concrete_offset).unwrap();
 
         assert!(
-            !ModuleData::subprogram_uses_entry_value_at(&dwarf, &unit, &concrete, 0x1474).unwrap(),
+            !LoadedObjfile::subprogram_uses_entry_value_at(&dwarf, &unit, &concrete, 0x1474)
+                .unwrap(),
             "the specific direct-register range should override the default-location entry_value"
         );
         assert!(
-            ModuleData::subprogram_uses_entry_value_at(&dwarf, &unit, &concrete, 0x1500).unwrap(),
+            LoadedObjfile::subprogram_uses_entry_value_at(&dwarf, &unit, &concrete, 0x1500)
+                .unwrap(),
             "outside the specific range, the default-location entry_value should still apply"
         );
     }
@@ -3289,8 +3293,10 @@ mod tests {
             ix.function_candidate_indices_by_fragment(&demangled),
             vec![0]
         );
-        assert!(ModuleData::candidate_matches_name(&demangled, None, entry));
-        assert!(ModuleData::candidate_matches_name(&leaf, None, entry));
+        assert!(LoadedObjfile::candidate_matches_name(
+            &demangled, None, entry
+        ));
+        assert!(LoadedObjfile::candidate_matches_name(&leaf, None, entry));
     }
 
     #[test]
@@ -3356,7 +3362,7 @@ mod tests {
             .function_candidate_indices_by_fragment(&demangled)
             .is_empty());
         assert_eq!(
-            ModuleData::scan_matching_candidate_indices(&ix, &demangled, |tag| matches!(
+            LoadedObjfile::scan_matching_candidate_indices(&ix, &demangled, |tag| matches!(
                 tag,
                 constants::DW_TAG_subprogram | constants::DW_TAG_inlined_subroutine
             )),

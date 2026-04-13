@@ -10,7 +10,7 @@ pub mod core;
 pub(crate) mod binary;
 pub(crate) mod index;
 pub(crate) mod loader;
-pub(crate) mod module;
+pub(crate) mod objfile;
 pub(crate) mod parser;
 pub(crate) mod planner;
 pub(crate) mod resolver;
