@@ -2,7 +2,7 @@
 
 use crate::{
     core::{mapping::ModuleMapping, GlobalVariableInfo, ModuleAddress, Result, SourceLocation},
-    module::ModuleData,
+    objfile::LoadedObjfile,
 };
 use object::{Object, ObjectSection};
 use std::collections::HashMap;
@@ -78,7 +78,7 @@ pub struct DwarfAnalyzer {
     /// Process ID
     pid: u32,
     /// Module path -> module data mapping
-    modules: HashMap<PathBuf, ModuleData>,
+    modules: HashMap<PathBuf, LoadedObjfile>,
 }
 
 impl DwarfAnalyzer {
@@ -409,8 +409,12 @@ impl DwarfAnalyzer {
 
         // Load the single module using parallel loading
         let start_time = std::time::Instant::now();
-        match ModuleData::load_parallel(module_mapping, debug_search_paths, allow_loose_debug_match)
-            .await
+        match LoadedObjfile::load_parallel(
+            module_mapping,
+            debug_search_paths,
+            allow_loose_debug_match,
+        )
+        .await
         {
             Ok(module_data) => {
                 let (functions, variables, types) = module_data.get_lightweight_index().get_stats();
@@ -456,7 +460,7 @@ impl DwarfAnalyzer {
     }
 
     /// Create analyzer from pre-loaded modules (for Builder pattern)
-    pub(crate) fn from_modules(pid: u32, modules: Vec<ModuleData>) -> Self {
+    pub(crate) fn from_modules(pid: u32, modules: Vec<LoadedObjfile>) -> Self {
         let mut analyzer = Self {
             pid,
             modules: HashMap::new(),

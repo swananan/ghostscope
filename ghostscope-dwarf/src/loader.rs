@@ -3,7 +3,7 @@
 use crate::{
     analyzer::{ModuleLoadingEvent, ModuleLoadingStats},
     core::{mapping::ModuleMapping, Result},
-    module::ModuleData,
+    objfile::LoadedObjfile,
 };
 use std::sync::Arc;
 use tokio::task;
@@ -74,7 +74,7 @@ impl ModuleLoader {
     }
 
     /// Load with progress callback - always parallel
-    pub async fn load_with_progress<F>(self, progress_callback: F) -> Result<Vec<ModuleData>>
+    pub async fn load_with_progress<F>(self, progress_callback: F) -> Result<Vec<LoadedObjfile>>
     where
         F: Fn(ModuleLoadingEvent) + Send + Sync + 'static,
     {
@@ -97,7 +97,7 @@ impl ModuleLoader {
     async fn load_modules_parallel_with_progress<F>(
         self,
         progress_callback: F,
-    ) -> Result<Vec<ModuleData>>
+    ) -> Result<Vec<LoadedObjfile>>
     where
         F: Fn(ModuleLoadingEvent) + Send + Sync + 'static,
     {
@@ -135,7 +135,8 @@ impl ModuleLoader {
                     let start_time = std::time::Instant::now();
 
                     let result =
-                        ModuleData::load_parallel(mapping, &debug_search_paths, allow_loose).await;
+                        LoadedObjfile::load_parallel(mapping, &debug_search_paths, allow_loose)
+                            .await;
 
                     let load_time_ms = start_time.elapsed().as_millis() as u64;
 
@@ -199,7 +200,7 @@ where
     F: Fn(ModuleLoadingEvent) + Send + Sync + 'static,
 {
     /// Load modules with attached progress callback
-    pub async fn load(self) -> Result<Vec<ModuleData>> {
+    pub async fn load(self) -> Result<Vec<LoadedObjfile>> {
         self.loader.load_with_progress(self.callback).await
     }
 }
