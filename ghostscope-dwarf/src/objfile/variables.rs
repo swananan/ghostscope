@@ -344,6 +344,15 @@ impl LoadedObjfile {
                     }
                 }
 
+                // Keep the parser's direct DWARF result for inline parameters as-is.
+                // We intentionally do not remap optimized inline params from nested
+                // call_site_parameter DIEs here: those describe the callee's argument
+                // locations/values, not the inline function's original parameters, and
+                // using them here caused false aliases like "original_x = RDI".
+                // TODO(inline_params): If we want to recover optimized inline params in
+                // these cases, it has to come from a complete DW_OP_entry_value path that
+                // evaluates caller-side call-site values, not from the inline body's own
+                // nested call-site subtree.
                 let mut seen_param_names: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
                 let mut filtered: Vec<crate::VariableWithEvaluation> =

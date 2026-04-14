@@ -6,7 +6,15 @@ use std::path::Path;
 use std::time::Duration;
 
 // Keep this on the first executable line after consume_pair() returns.
+// This is intentionally a negative regression point: at this PC the inline
+// parameters have already fallen out of their own location-list coverage, so
+// we only assert that GhostScope does not misreport them as consume_pair's
+// argument registers. We do not expect post-call value recovery to work until
+// full DW_OP_entry_value + caller-side call-site evaluation is implemented.
 const INLINE_AFTER_CALL_TRACE_LINE: u32 = 19;
+// TODO(positive_test): Add a companion positive test on a pre-call line where
+// original_x/original_y are still covered by their own location lists and can
+// be asserted with exact values without relying on entry_value support.
 
 async fn spawn_inline_call_value_program(
     binary_path: &Path,
