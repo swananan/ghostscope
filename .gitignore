@@ -59,6 +59,7 @@ e2e-tests/tests/fixtures/cpp_complex_program/cpp_complex_program
 e2e-tests/tests/fixtures/globals_program/globals_program
 e2e-tests/tests/fixtures/globals_program/libgvars.so
 e2e-tests/tests/fixtures/inline_callsite_program/inline_callsite_program
+e2e-tests/tests/fixtures/inline_call_value_program/inline_call_value_program
 e2e-tests/tests/fixtures/late_globals_program/late_globals_program
 e2e-tests/tests/fixtures/member_pointer_program/member_pointer_program
 e2e-tests/tests/fixtures/member_pointer_program/member_pointer_program_o*

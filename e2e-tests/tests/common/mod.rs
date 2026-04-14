@@ -28,6 +28,8 @@ lazy_static! {
         Mutex::new(None);
     static ref COMPILE_LATE_GLOBALS_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
     static ref COMPILE_INLINE_CALLSITE_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
+    static ref COMPILE_INLINE_CALL_VALUE_RESULT: Mutex<Option<anyhow::Result<()>>> =
+        Mutex::new(None);
     static ref COMPILE_PARTITIONED_RANGES_RESULT: Mutex<Option<anyhow::Result<()>>> =
         Mutex::new(None);
     static ref COMPILE_STATIC_SCOPE_DEFAULT_RESULT: Mutex<Option<anyhow::Result<()>>> =
@@ -51,6 +53,7 @@ enum RegisteredFixtureKind {
     LateGlobals,
     RustGlobal,
     InlineCallsite,
+    InlineCallValue,
     PartitionedRanges,
     CppComplex,
     StaticScope,
@@ -109,6 +112,12 @@ const REGISTERED_FIXTURES: &[RegisteredFixture] = &[
         directory: "inline_callsite_program",
         cleanup: CleanupCommand::Make,
         kind: RegisteredFixtureKind::InlineCallsite,
+    },
+    RegisteredFixture {
+        name: "inline_call_value_program",
+        directory: "inline_call_value_program",
+        cleanup: CleanupCommand::Make,
+        kind: RegisteredFixtureKind::InlineCallValue,
     },
     RegisteredFixture {
         name: "partitioned_ranges_program",
@@ -337,6 +346,10 @@ impl RegisteredFixture {
             RegisteredFixtureKind::InlineCallsite => {
                 ensure_inline_callsite_program_compiled()?;
                 Ok(dir.join("inline_callsite_program"))
+            }
+            RegisteredFixtureKind::InlineCallValue => {
+                ensure_inline_call_value_program_compiled()?;
+                Ok(dir.join("inline_call_value_program"))
             }
             RegisteredFixtureKind::PartitionedRanges => {
                 ensure_partitioned_ranges_program_compiled()?;
@@ -835,6 +848,7 @@ static COMPILE_GLOBALS: Once = Once::new();
 static COMPILE_LATE_GLOBALS: Once = Once::new();
 static COMPILE_RUST_GLOBAL: Once = Once::new();
 static COMPILE_INLINE_CALLSITE: Once = Once::new();
+static COMPILE_INLINE_CALL_VALUE: Once = Once::new();
 static COMPILE_PARTITIONED_RANGES: Once = Once::new();
 static COMPILE_CPP_COMPLEX: Once = Once::new();
 static COMPILE_STATIC_SCOPE_DEFAULT: Once = Once::new();
@@ -966,6 +980,39 @@ fn ensure_inline_callsite_program_compiled() -> anyhow::Result<()> {
     });
 
     match COMPILE_INLINE_CALLSITE_RESULT.lock().unwrap().as_ref() {
+        Some(Ok(())) => Ok(()),
+        Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
+        None => panic!("Compilation result should be set after call_once"),
+    }
+}
+
+fn ensure_inline_call_value_program_compiled() -> anyhow::Result<()> {
+    COMPILE_INLINE_CALL_VALUE.call_once(|| {
+        let compile_result = (|| -> anyhow::Result<()> {
+            let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/inline_call_value_program");
+            println!("Compiling inline_call_value_program (Optimized O3) in {base:?}");
+            let _ = Command::new("make")
+                .arg("clean")
+                .current_dir(base.clone())
+                .status()
+                .is_ok();
+            let out = Command::new("make").arg("all").current_dir(base).output()?;
+            if out.status.success() {
+                println!("✓ Successfully compiled inline_call_value_program");
+                Ok(())
+            } else {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                Err(anyhow::anyhow!(
+                    "Failed to compile inline_call_value_program: {}",
+                    stderr
+                ))
+            }
+        })();
+        *COMPILE_INLINE_CALL_VALUE_RESULT.lock().unwrap() = Some(compile_result);
+    });
+
+    match COMPILE_INLINE_CALL_VALUE_RESULT.lock().unwrap().as_ref() {
         Some(Ok(())) => Ok(()),
         Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
         None => panic!("Compilation result should be set after call_once"),
