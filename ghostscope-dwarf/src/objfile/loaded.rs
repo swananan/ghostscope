@@ -76,10 +76,6 @@ impl LoadedObjfile {
         &self.dwarf
     }
 
-    pub(crate) fn get_cache_stats(&self) -> (usize, usize) {
-        (0, self.detailed_parser.get_cache_stats())
-    }
-
     pub(crate) fn get_load_timing_ms(&self) -> (u64, u64, u64) {
         (self.load_parse_ms, self.load_index_ms, self.load_total_ms)
     }

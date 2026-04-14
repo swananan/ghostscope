@@ -82,6 +82,28 @@ pub struct DwarfAnalyzer {
 }
 
 impl DwarfAnalyzer {
+    fn resolve_type_shallow_by_name_in_module_with_tags<P: AsRef<Path>>(
+        &mut self,
+        module_path: P,
+        name: &str,
+        tags: &[gimli::DwTag],
+    ) -> Option<crate::TypeInfo> {
+        let path_buf = module_path.as_ref().to_path_buf();
+        self.modules
+            .get_mut(&path_buf)
+            .and_then(|module_data| module_data.resolve_type_shallow_by_name_with_tags(name, tags))
+    }
+
+    fn resolve_type_shallow_by_name_with_tags(
+        &mut self,
+        name: &str,
+        tags: &[gimli::DwTag],
+    ) -> Option<crate::TypeInfo> {
+        self.modules
+            .values_mut()
+            .find_map(|module_data| module_data.resolve_type_shallow_by_name_with_tags(name, tags))
+    }
+
     fn build_address_query_result(
         &mut self,
         module_address: &ModuleAddress,
@@ -200,21 +222,25 @@ impl DwarfAnalyzer {
         module_path: P,
         name: &str,
     ) -> Option<crate::TypeInfo> {
-        let path_buf = module_path.as_ref().to_path_buf();
-        if let Some(module_data) = self.modules.get_mut(&path_buf) {
-            return module_data.resolve_struct_type_shallow_by_name(name);
-        }
-        None
+        self.resolve_type_shallow_by_name_in_module_with_tags(
+            module_path,
+            name,
+            &[
+                gimli::constants::DW_TAG_structure_type,
+                gimli::constants::DW_TAG_class_type,
+            ],
+        )
     }
 
     /// Resolve struct/class by name (shallow) across modules (first match)
     pub fn resolve_struct_type_shallow_by_name(&mut self, name: &str) -> Option<crate::TypeInfo> {
-        for module_data in self.modules.values_mut() {
-            if let Some(t) = module_data.resolve_struct_type_shallow_by_name(name) {
-                return Some(t);
-            }
-        }
-        None
+        self.resolve_type_shallow_by_name_with_tags(
+            name,
+            &[
+                gimli::constants::DW_TAG_structure_type,
+                gimli::constants::DW_TAG_class_type,
+            ],
+        )
     }
 
     /// Resolve union by name (shallow) in a specific module
@@ -223,21 +249,16 @@ impl DwarfAnalyzer {
         module_path: P,
         name: &str,
     ) -> Option<crate::TypeInfo> {
-        let path_buf = module_path.as_ref().to_path_buf();
-        if let Some(module_data) = self.modules.get_mut(&path_buf) {
-            return module_data.resolve_union_type_shallow_by_name(name);
-        }
-        None
+        self.resolve_type_shallow_by_name_in_module_with_tags(
+            module_path,
+            name,
+            &[gimli::constants::DW_TAG_union_type],
+        )
     }
 
     /// Resolve union by name (shallow) across modules (first match)
     pub fn resolve_union_type_shallow_by_name(&mut self, name: &str) -> Option<crate::TypeInfo> {
-        for module_data in self.modules.values_mut() {
-            if let Some(t) = module_data.resolve_union_type_shallow_by_name(name) {
-                return Some(t);
-            }
-        }
-        None
+        self.resolve_type_shallow_by_name_with_tags(name, &[gimli::constants::DW_TAG_union_type])
     }
 
     /// Resolve enum by name (shallow) in a specific module
@@ -246,21 +267,19 @@ impl DwarfAnalyzer {
         module_path: P,
         name: &str,
     ) -> Option<crate::TypeInfo> {
-        let path_buf = module_path.as_ref().to_path_buf();
-        if let Some(module_data) = self.modules.get_mut(&path_buf) {
-            return module_data.resolve_enum_type_shallow_by_name(name);
-        }
-        None
+        self.resolve_type_shallow_by_name_in_module_with_tags(
+            module_path,
+            name,
+            &[gimli::constants::DW_TAG_enumeration_type],
+        )
     }
 
     /// Resolve enum by name (shallow) across modules (first match)
     pub fn resolve_enum_type_shallow_by_name(&mut self, name: &str) -> Option<crate::TypeInfo> {
-        for module_data in self.modules.values_mut() {
-            if let Some(t) = module_data.resolve_enum_type_shallow_by_name(name) {
-                return Some(t);
-            }
-        }
-        None
+        self.resolve_type_shallow_by_name_with_tags(
+            name,
+            &[gimli::constants::DW_TAG_enumeration_type],
+        )
     }
 
     /// Create DWARF analyzer from PID using parallel loading
@@ -919,14 +938,11 @@ impl DwarfAnalyzer {
         let mut total_functions = 0;
         let mut total_variables = 0;
         let mut total_line_headers = 0;
-        let mut total_cache_entries = 0;
 
         for module_data in self.modules.values() {
             total_functions += module_data.get_function_names().len();
             total_variables += module_data.get_variable_names().len();
             total_line_headers += module_data.get_line_header_count();
-            let (cache_entries, _) = module_data.get_cache_stats();
-            total_cache_entries += cache_entries;
         }
 
         AnalyzerStats {
@@ -935,7 +951,6 @@ impl DwarfAnalyzer {
             total_functions,
             total_variables,
             total_line_headers,
-            total_cache_entries,
         }
     }
 
@@ -1218,7 +1233,6 @@ pub struct AnalyzerStats {
     pub total_functions: usize,
     pub total_variables: usize,
     pub total_line_headers: usize,
-    pub total_cache_entries: usize,
 }
 
 /// Shared library information (compatible with ghostscope-ui)

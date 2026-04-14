@@ -339,7 +339,7 @@ impl LoadedObjfile {
             visited.insert(entry_abs);
         }
 
-        Self::subprogram_uses_entry_value_inner(dwarf, unit, entry, &mut visited)
+        Self::subprogram_uses_entry_value_with_pc(dwarf, unit, entry, None, &mut visited)
     }
 
     fn subprogram_uses_entry_value_at(
@@ -353,14 +353,14 @@ impl LoadedObjfile {
             visited.insert(entry_abs);
         }
 
-        Self::subprogram_uses_entry_value_at_inner(dwarf, unit, entry, pc, &mut visited)
+        Self::subprogram_uses_entry_value_with_pc(dwarf, unit, entry, Some(pc), &mut visited)
     }
 
-    #[cfg(test)]
-    fn subprogram_uses_entry_value_inner(
+    fn subprogram_uses_entry_value_with_pc(
         dwarf: &gimli::Dwarf<DwarfReader>,
         unit: &gimli::Unit<DwarfReader>,
         entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+        pc: Option<u64>,
         visited: &mut HashSet<gimli::DebugInfoOffset>,
     ) -> Result<bool> {
         if entry.tag() != gimli::constants::DW_TAG_subprogram {
@@ -368,7 +368,7 @@ impl LoadedObjfile {
         }
 
         if let Some(uses_entry_value) =
-            Self::direct_formal_parameters_entry_value_state(unit, entry)?
+            Self::direct_formal_parameters_entry_value_state_with_pc(dwarf, unit, entry, pc)?
         {
             return Ok(uses_entry_value);
         }
@@ -383,50 +383,7 @@ impl LoadedObjfile {
                         .map_err(|e| anyhow::anyhow!("origin resolution error: {}", e))?
                 {
                     if visited.insert(origin_abs)
-                        && Self::subprogram_uses_entry_value_inner(
-                            dwarf,
-                            &origin_unit,
-                            &origin_entry,
-                            visited,
-                        )?
-                    {
-                        return Ok(true);
-                    }
-                }
-            }
-        }
-
-        Ok(false)
-    }
-
-    fn subprogram_uses_entry_value_at_inner(
-        dwarf: &gimli::Dwarf<DwarfReader>,
-        unit: &gimli::Unit<DwarfReader>,
-        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
-        pc: u64,
-        visited: &mut HashSet<gimli::DebugInfoOffset>,
-    ) -> Result<bool> {
-        if entry.tag() != gimli::constants::DW_TAG_subprogram {
-            return Ok(false);
-        }
-
-        if let Some(uses_entry_value) =
-            Self::direct_formal_parameters_entry_value_state_at_pc(dwarf, unit, entry, pc)?
-        {
-            return Ok(uses_entry_value);
-        }
-
-        for origin_attr in [
-            gimli::constants::DW_AT_abstract_origin,
-            gimli::constants::DW_AT_specification,
-        ] {
-            if let Some(value) = entry.attr_value(origin_attr) {
-                if let Some((origin_abs, origin_unit, origin_entry)) =
-                    resolve_origin_entry(dwarf, unit, value)
-                        .map_err(|e| anyhow::anyhow!("origin resolution error: {}", e))?
-                {
-                    if visited.insert(origin_abs)
-                        && Self::subprogram_uses_entry_value_at_inner(
+                        && Self::subprogram_uses_entry_value_with_pc(
                             dwarf,
                             &origin_unit,
                             &origin_entry,
@@ -445,44 +402,18 @@ impl LoadedObjfile {
 
     #[cfg(test)]
     fn direct_formal_parameters_entry_value_state(
-        unit: &gimli::Unit<DwarfReader>,
-        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
-    ) -> Result<Option<bool>> {
-        let mut saw_parameter = false;
-
-        if let Ok(mut tree) = unit.entries_tree(Some(entry.offset())) {
-            if let Ok(root) = tree.root() {
-                let mut children = root.children();
-                while let Ok(Some(child)) = children.next() {
-                    let e = child.entry();
-                    if e.tag() != gimli::constants::DW_TAG_formal_parameter {
-                        continue;
-                    }
-                    saw_parameter = true;
-
-                    if let Ok(Some(gimli::AttributeValue::Exprloc(expr))) =
-                        resolve_attr_with_unit_origins(e, unit, gimli::constants::DW_AT_location)
-                    {
-                        if Self::expression_uses_entry_value(unit, gimli::Expression(expr.0)) {
-                            return Ok(Some(true));
-                        }
-                    }
-                }
-            }
-        }
-
-        if saw_parameter {
-            Ok(Some(false))
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn direct_formal_parameters_entry_value_state_at_pc(
         dwarf: &gimli::Dwarf<DwarfReader>,
         unit: &gimli::Unit<DwarfReader>,
         entry: &gimli::DebuggingInformationEntry<DwarfReader>,
-        pc: u64,
+    ) -> Result<Option<bool>> {
+        Self::direct_formal_parameters_entry_value_state_with_pc(dwarf, unit, entry, None)
+    }
+
+    fn direct_formal_parameters_entry_value_state_with_pc(
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+        pc: Option<u64>,
     ) -> Result<Option<bool>> {
         let mut saw_parameter = false;
 
@@ -499,7 +430,7 @@ impl LoadedObjfile {
                     if let Ok(Some(value)) =
                         resolve_attr_with_unit_origins(e, unit, gimli::constants::DW_AT_location)
                     {
-                        if Self::attribute_uses_entry_value_at_pc(dwarf, unit, value, pc)? {
+                        if Self::attribute_uses_entry_value(dwarf, unit, value, pc)? {
                             return Ok(Some(true));
                         }
                     }
@@ -514,31 +445,35 @@ impl LoadedObjfile {
         }
     }
 
-    fn attribute_uses_entry_value_at_pc(
+    fn attribute_uses_entry_value(
         dwarf: &gimli::Dwarf<DwarfReader>,
         unit: &gimli::Unit<DwarfReader>,
         value: gimli::AttributeValue<DwarfReader>,
-        pc: u64,
+        pc: Option<u64>,
     ) -> Result<bool> {
         match value {
             gimli::AttributeValue::Exprloc(expr) => Ok(Self::expression_uses_entry_value(
                 unit,
                 gimli::Expression(expr.0),
             )),
-            gimli::AttributeValue::LocationListsRef(offset) => {
-                Self::location_list_uses_entry_value_at_pc(
+            gimli::AttributeValue::LocationListsRef(offset) => match pc {
+                Some(pc) => Self::location_list_uses_entry_value_at_pc(
                     dwarf,
                     unit,
                     gimli::LocationListsOffset(offset.0),
                     pc,
-                )
-            }
-            gimli::AttributeValue::SecOffset(offset) => Self::location_list_uses_entry_value_at_pc(
-                dwarf,
-                unit,
-                gimli::LocationListsOffset(offset),
-                pc,
-            ),
+                ),
+                None => Ok(false),
+            },
+            gimli::AttributeValue::SecOffset(offset) => match pc {
+                Some(pc) => Self::location_list_uses_entry_value_at_pc(
+                    dwarf,
+                    unit,
+                    gimli::LocationListsOffset(offset),
+                    pc,
+                ),
+                None => Ok(false),
+            },
             _ => Ok(false),
         }
     }
@@ -1099,7 +1034,8 @@ mod tests {
         let concrete = unit.entry(concrete_offset).unwrap();
 
         assert_eq!(
-            LoadedObjfile::direct_formal_parameters_entry_value_state(&unit, &concrete).unwrap(),
+            LoadedObjfile::direct_formal_parameters_entry_value_state(&dwarf, &unit, &concrete)
+                .unwrap(),
             None,
             "concrete DIE should not expose direct parameter children in this fixture"
         );
@@ -1118,7 +1054,8 @@ mod tests {
         let concrete = unit.entry(concrete_offset).unwrap();
 
         assert_eq!(
-            LoadedObjfile::direct_formal_parameters_entry_value_state(&unit, &concrete).unwrap(),
+            LoadedObjfile::direct_formal_parameters_entry_value_state(&dwarf, &unit, &concrete)
+                .unwrap(),
             None,
             "concrete DIE should not expose direct parameter children in this fixture"
         );
@@ -1138,7 +1075,8 @@ mod tests {
         let concrete = unit.entry(concrete_offset).unwrap();
 
         assert_eq!(
-            LoadedObjfile::direct_formal_parameters_entry_value_state(&unit, &concrete).unwrap(),
+            LoadedObjfile::direct_formal_parameters_entry_value_state(&dwarf, &unit, &concrete)
+                .unwrap(),
             Some(false),
             "concrete DIE should treat its own parameter children as authoritative"
         );
