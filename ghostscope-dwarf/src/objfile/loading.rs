@@ -3,7 +3,7 @@ use crate::{
     binary::{empty_dwarf_reader, try_load_debug_file, DwarfData, MappedFile},
     core::{mapping::ModuleMapping, Result},
     index::{BlockIndex, CfiIndex, TypeNameIndex},
-    resolver::OnDemandResolver,
+    parser::DetailedParser,
 };
 use object::{Object, ObjectSection};
 use std::{sync::Arc, time::Instant};
@@ -170,12 +170,11 @@ impl LoadedObjfile {
             (lightweight_index, type_name_index)
         })
         .await?;
-        let type_index_arc = Arc::new(type_name_index.clone());
-
-        let resolver = OnDemandResolver::new_with_type_index(
-            Arc::try_unwrap(dwarf).map_err(|_| anyhow::anyhow!("Failed to unwrap DWARF Arc"))?,
-            type_index_arc,
-        );
+        let type_name_index = Arc::new(type_name_index);
+        let dwarf =
+            Arc::try_unwrap(dwarf).map_err(|_| anyhow::anyhow!("Failed to unwrap DWARF Arc"))?;
+        let mut detailed_parser = DetailedParser::new();
+        detailed_parser.set_type_name_index(Arc::clone(&type_name_index));
 
         let mut warnings = Vec::new();
         if cfi_index.is_none() {
@@ -207,7 +206,8 @@ impl LoadedObjfile {
             scoped_file_manager,
             compilation_units,
             cfi_index,
-            resolver,
+            dwarf,
+            detailed_parser,
             block_index: BlockIndex::new(),
             type_name_index,
             _dwarf_mapped_file: mapped_file,

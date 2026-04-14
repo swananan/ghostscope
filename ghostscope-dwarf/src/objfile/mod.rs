@@ -1,5 +1,6 @@
 //! Loaded object file: complete DWARF data for a single binary
 
+pub(crate) mod access_planner;
 pub(crate) mod function_lookup;
 pub(crate) mod globals;
 pub(crate) mod loaded;

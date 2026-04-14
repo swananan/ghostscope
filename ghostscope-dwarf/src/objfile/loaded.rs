@@ -1,17 +1,16 @@
 //! Loaded object file: complete DWARF data for a single binary
 
 use crate::{
-    binary::MappedFile,
+    binary::{DwarfReader, MappedFile},
     core::{mapping::ModuleMapping, Result},
     index::{
         BlockIndex, CfiIndex, LightweightIndex, LineMappingTable, ScopedFileIndexManager,
         TypeNameIndex,
     },
-    parser::CompilationUnit,
-    resolver::OnDemandResolver,
+    parser::{CompilationUnit, DetailedParser},
 };
 use object::{Object, ObjectSegment};
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 /// Complete DWARF data for a single loaded object file.
 #[derive(Debug)]
@@ -22,11 +21,12 @@ pub(crate) struct LoadedObjfile {
     pub(super) scoped_file_manager: ScopedFileIndexManager,
     pub(super) compilation_units: HashMap<String, CompilationUnit>,
     pub(super) cfi_index: Option<CfiIndex>,
-    pub(super) resolver: OnDemandResolver,
-    pub(super) _dwarf_mapped_file: std::sync::Arc<MappedFile>,
-    pub(super) _binary_mapped_file: std::sync::Arc<MappedFile>,
+    pub(super) dwarf: gimli::Dwarf<DwarfReader>,
+    pub(super) detailed_parser: DetailedParser,
+    pub(super) _dwarf_mapped_file: Arc<MappedFile>,
+    pub(super) _binary_mapped_file: Arc<MappedFile>,
     pub(super) block_index: BlockIndex,
-    pub(super) type_name_index: TypeNameIndex,
+    pub(super) type_name_index: Arc<TypeNameIndex>,
     pub(super) load_parse_ms: u64,
     pub(super) load_index_ms: u64,
     pub(super) load_total_ms: u64,
@@ -72,8 +72,12 @@ impl LoadedObjfile {
         }
     }
 
+    pub(super) fn dwarf(&self) -> &gimli::Dwarf<DwarfReader> {
+        &self.dwarf
+    }
+
     pub(crate) fn get_cache_stats(&self) -> (usize, usize) {
-        self.resolver.get_cache_stats()
+        (0, self.detailed_parser.get_cache_stats())
     }
 
     pub(crate) fn get_load_timing_ms(&self) -> (u64, u64, u64) {

@@ -12,8 +12,6 @@ pub(crate) mod index;
 pub(crate) mod loader;
 pub(crate) mod objfile;
 pub(crate) mod parser;
-pub(crate) mod planner;
-pub(crate) mod resolver;
 pub(crate) mod semantics;
 
 // Main entry point

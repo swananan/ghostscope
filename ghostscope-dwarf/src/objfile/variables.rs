@@ -1,13 +1,17 @@
-use super::LoadedObjfile;
+use super::{access_planner::AccessPlanner, LoadedObjfile};
 use crate::{
     core::Result,
     index::{BlockIndexBuilder, FunctionBlocks, VarRef},
-    parser::ExpressionEvaluator,
-    resolver::ChainSpec,
+    parser::{DetailedParser, ExpressionEvaluator},
     semantics::{resolve_attr_with_unit_origins, resolve_name_with_origins},
 };
 use gimli::Reader;
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
+
+pub(super) struct ChainSpec<'a> {
+    pub base: &'a str,
+    pub fields: &'a [String],
+}
 
 impl LoadedObjfile {
     fn find_innermost_inline_node(func: &FunctionBlocks, pc: u64) -> Option<usize> {
@@ -20,7 +24,7 @@ impl LoadedObjfile {
 
     pub(crate) fn is_inline_at(&mut self, address: u64) -> Option<bool> {
         if self.block_index.find_function_by_pc(address).is_none() {
-            let builder = BlockIndexBuilder::new(self.resolver.dwarf_ref());
+            let builder = BlockIndexBuilder::new(self.dwarf());
             if let Some(func_entry) = self.find_function_index_entry_by_address(address) {
                 if let Some(fb) =
                     builder.build_for_function(func_entry.unit_offset, func_entry.die_offset)
@@ -37,7 +41,7 @@ impl LoadedObjfile {
         let func = self.block_index.find_function_by_pc(address)?;
 
         if let Some(inline_idx) = Self::find_innermost_inline_node(func, address) {
-            let dwarf = self.resolver.dwarf_ref();
+            let dwarf = self.dwarf();
             if let Ok(header) = dwarf.unit_header(func.cu_offset) {
                 if let Ok(unit) = dwarf.unit(header) {
                     if let Some(off) = func.nodes[inline_idx].die_offset {
@@ -63,7 +67,7 @@ impl LoadedObjfile {
         _var_refs: &[VarRef],
         get_cfa: &dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>,
     ) {
-        let dwarf = self.resolver.dwarf_ref();
+        let dwarf = self.dwarf();
         let header = match dwarf.unit_header(func.cu_offset) {
             Ok(h) => h,
             Err(_) => return,
@@ -220,6 +224,160 @@ impl LoadedObjfile {
         }
     }
 
+    pub(super) fn plan_chain_access_from_var(
+        &mut self,
+        address: u64,
+        cu_offset: gimli::DebugInfoOffset,
+        subprogram_die: gimli::UnitOffset,
+        var_die: gimli::UnitOffset,
+        chain: ChainSpec<'_>,
+        get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
+    ) -> Result<Option<crate::parser::VariableWithEvaluation>> {
+        tracing::info!(
+            "DWARF:plan_from_var addr=0x{:x} cu_off={:?} subprogram={:?} var_die={:?} base='{}' chain_len={}",
+            address,
+            cu_offset,
+            subprogram_die,
+            var_die,
+            chain.base,
+            chain.fields.len()
+        );
+        let header = self.dwarf.unit_header(cu_offset)?;
+        let unit = self.dwarf.unit(header)?;
+        let var_entry = unit.entry(var_die)?;
+
+        let base_var = self.detailed_parser.parse_variable_entry_with_mode(
+            &var_entry,
+            &unit,
+            &self.dwarf,
+            address,
+            get_cfa,
+            0,
+        )?;
+        tracing::debug!("DWARF:plan_from_var done");
+        let Some(base_var) = base_var else {
+            return Ok(None);
+        };
+        let current_eval = base_var.evaluation_result.clone();
+
+        let planner =
+            AccessPlanner::new_with_index(self.dwarf(), Arc::clone(&self.type_name_index), true);
+        let mut final_eval = current_eval.clone();
+        let mut final_type_loc = None;
+        let mut parent_ctx = None;
+
+        if !chain.fields.is_empty() {
+            let t1 = std::time::Instant::now();
+            let type_loc = planner
+                .resolve_type_ref_with_origins_public(&var_entry, &unit)?
+                .ok_or_else(|| anyhow::anyhow!("variable has no DW_AT_type"))?;
+            tracing::info!(
+                "DWARF:plan_from_var resolve_type_ref_ms={}",
+                t1.elapsed().as_millis()
+            );
+
+            let t2 = std::time::Instant::now();
+            let (fe, ftl, pctx) = planner.plan_chain_from_known(
+                type_loc.cu_off,
+                type_loc.die_off,
+                current_eval,
+                chain.fields,
+            )?;
+            final_eval = fe;
+            final_type_loc = Some(ftl);
+            parent_ctx = pctx;
+            tracing::info!(
+                "DWARF:plan_from_var planner_ms={}",
+                t2.elapsed().as_millis()
+            );
+        }
+
+        let mut final_type = None;
+        if let Some(ftl) = final_type_loc {
+            let t3 = std::time::Instant::now();
+            let h = self.dwarf.unit_header(ftl.cu_off)?;
+            let u = self.dwarf.unit(h)?;
+            let mut shallow_final =
+                DetailedParser::resolve_type_shallow_at_offset(&self.dwarf, &u, ftl.die_off);
+            tracing::info!(
+                "DWARF:plan_from_var final_type_ms={}",
+                t3.elapsed().as_millis()
+            );
+
+            if let Some(ctx) = parent_ctx {
+                let h = self.dwarf.unit_header(ctx.parent_cu_off)?;
+                let u = self.dwarf.unit(h)?;
+                if let Some(
+                    crate::TypeInfo::StructType { members, .. }
+                    | crate::TypeInfo::UnionType { members, .. },
+                ) = DetailedParser::resolve_type_shallow_at_offset(
+                    &self.dwarf,
+                    &u,
+                    ctx.parent_die_off,
+                ) {
+                    if let Some(m) = members.iter().find(|m| m.name == ctx.member_name) {
+                        tracing::info!(
+                            "DWARF:parent_enrich member='{}' uses BitfieldType={}",
+                            ctx.member_name,
+                            matches!(m.member_type, crate::TypeInfo::BitfieldType { .. })
+                        );
+                        shallow_final = Some(m.member_type.clone());
+                    }
+                }
+            }
+
+            final_type = shallow_final;
+        }
+
+        let (type_name, dwarf_type) = if let Some(t) = final_type.clone() {
+            (t.type_name(), Some(t))
+        } else {
+            (base_var.type_name.clone(), None)
+        };
+
+        let name = if chain.fields.is_empty() {
+            chain.base.to_string()
+        } else {
+            format!("{base}.", base = chain.base) + &chain.fields.join(".")
+        };
+        let var = crate::parser::VariableWithEvaluation {
+            name,
+            type_name,
+            dwarf_type,
+            evaluation_result: final_eval,
+            scope_depth: 0,
+            is_parameter: base_var.is_parameter,
+            is_artificial: base_var.is_artificial,
+        };
+        tracing::debug!("DWARF:plan_from_var done");
+        Ok(Some(var))
+    }
+
+    fn resolve_variables_by_offsets_at_address_with_cfa(
+        &mut self,
+        address: u64,
+        items: &[(gimli::DebugInfoOffset, gimli::UnitOffset)],
+        get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
+    ) -> Result<Vec<crate::VariableWithEvaluation>> {
+        let mut vars = Vec::with_capacity(items.len());
+        for (cu_off, die_off) in items.iter().cloned() {
+            let header = self.dwarf.unit_header(cu_off)?;
+            let unit = self.dwarf.unit(header)?;
+            let entry = unit.entry(die_off)?;
+            if let Some(v) = self.detailed_parser.parse_variable_entry_with_mode(
+                &entry,
+                &unit,
+                &self.dwarf,
+                address,
+                get_cfa,
+                0,
+            )? {
+                vars.push(v);
+            }
+        }
+        Ok(vars)
+    }
+
     pub(crate) fn resolve_struct_type_shallow_by_name(
         &mut self,
         name: &str,
@@ -236,7 +394,7 @@ impl LoadedObjfile {
         }
 
         if let Some(td) = self.type_name_index.find_typedef(name) {
-            let dwarf = self.resolver.dwarf_ref();
+            let dwarf = self.dwarf();
             if let Ok(header) = dwarf.unit_header(td.cu_offset) {
                 if let Ok(unit) = dwarf.unit(header) {
                     if let Ok(entry) = unit.entry(td.die_offset) {
@@ -270,7 +428,7 @@ impl LoadedObjfile {
         }
 
         if let Some(td) = self.type_name_index.find_typedef(name) {
-            let dwarf = self.resolver.dwarf_ref();
+            let dwarf = self.dwarf();
             if let Ok(header) = dwarf.unit_header(td.cu_offset) {
                 if let Ok(unit) = dwarf.unit(header) {
                     if let Ok(entry) = unit.entry(td.die_offset) {
@@ -304,7 +462,7 @@ impl LoadedObjfile {
         }
 
         if let Some(td) = self.type_name_index.find_typedef(name) {
-            let dwarf = self.resolver.dwarf_ref();
+            let dwarf = self.dwarf();
             if let Ok(header) = dwarf.unit_header(td.cu_offset) {
                 if let Ok(unit) = dwarf.unit(header) {
                     if let Ok(entry) = unit.entry(td.die_offset) {
@@ -342,7 +500,7 @@ impl LoadedObjfile {
         if self.block_index.find_function_by_pc(address).is_none() {
             let b0 = Instant::now();
             if let Some(cu_off) = self.lightweight_index.find_cu_by_address(address) {
-                let builder = BlockIndexBuilder::new(self.resolver.dwarf_ref());
+                let builder = BlockIndexBuilder::new(self.dwarf());
                 if let Some(funcs) = builder.build_for_unit(cu_off) {
                     tracing::info!(
                         "BlockIndex: built {} functions for CU {:?}",
@@ -356,7 +514,7 @@ impl LoadedObjfile {
             build_ms = b0.elapsed().as_millis();
         }
 
-        if let Some(func) = self.block_index.find_function_by_pc(address) {
+        if let Some(func) = self.block_index.find_function_by_pc(address).cloned() {
             let vars_in_func = func.nodes.iter().map(|n| n.variables.len()).sum::<usize>();
             tracing::info!(
                 "DWARF:get_vars fast_path_hit addr=0x{:x} vars_in_func={} built_funcs={} build_ms={} total_ms={}",
@@ -366,7 +524,7 @@ impl LoadedObjfile {
                 build_ms,
                 t0.elapsed().as_millis()
             );
-            let fb_result = self.compute_frame_base_for_pc(func, address);
+            let fb_result = self.compute_frame_base_for_pc(&func, address);
             let cfa_result = if fb_result.is_none() {
                 if self.cfi_index.is_some() {
                     match self.get_cfa_result(address) {
@@ -394,20 +552,20 @@ impl LoadedObjfile {
                     .iter()
                     .map(|v| (v.cu_offset, v.die_offset))
                     .collect();
-                let mut vars = self.resolver.resolve_variables_by_offsets_at_address(
+                let mut vars = self.resolve_variables_by_offsets_at_address_with_cfa(
                     address,
                     &items,
                     Some(&get_cfa_closure),
                 )?;
 
-                let dwarf_ref = self.resolver.dwarf_ref();
+                let dwarf_ref = self.dwarf();
                 for (idx, var_out) in vars.iter_mut().enumerate() {
                     if var_out.dwarf_type.is_none() {
                         let vr = &var_refs[idx];
                         if let Ok(header) = dwarf_ref.unit_header(vr.cu_offset) {
                             if let Ok(unit) = dwarf_ref.unit(header) {
                                 if let Ok(entry) = unit.entry(vr.die_offset) {
-                                    let planner = crate::planner::AccessPlanner::new(dwarf_ref);
+                                    let planner = AccessPlanner::new(dwarf_ref);
                                     if let Ok(Some(type_loc)) =
                                         planner.resolve_type_ref_with_origins_public(&entry, &unit)
                                     {
@@ -425,9 +583,9 @@ impl LoadedObjfile {
                     }
                 }
 
-                if let Some(inline_idx) = Self::find_innermost_inline_node(func, address) {
+                if let Some(inline_idx) = Self::find_innermost_inline_node(&func, address) {
                     self.try_apply_call_site_mapping(
-                        func,
+                        &func,
                         inline_idx,
                         address,
                         &mut vars,
@@ -484,7 +642,7 @@ impl LoadedObjfile {
 
         if self.block_index.find_function_by_pc(address).is_none() {
             let b0 = Instant::now();
-            let builder = BlockIndexBuilder::new(self.resolver.dwarf_ref());
+            let builder = BlockIndexBuilder::new(self.dwarf());
             if let Some(func_entry) = self.find_function_index_entry_by_address(address) {
                 if let Some(fb) =
                     builder.build_for_function(func_entry.unit_offset, func_entry.die_offset)
@@ -501,7 +659,7 @@ impl LoadedObjfile {
             build_ms = b0.elapsed().as_millis();
         }
 
-        if let Some(func) = self.block_index.find_function_by_pc(address) {
+        if let Some(func) = self.block_index.find_function_by_pc(address).cloned() {
             let cfa_result = if self.cfi_index.is_some() {
                 match self.get_cfa_result(address) {
                     Ok(Some(cfa)) => Some(cfa),
@@ -518,7 +676,7 @@ impl LoadedObjfile {
                 }
             };
 
-            let dwarf = self.resolver.dwarf_ref();
+            let dwarf = self.dwarf();
             let header = dwarf.unit_header(func.cu_offset)?;
             let unit = dwarf.unit(header)?;
             let candidates = func.variables_at_pc(address);
@@ -545,7 +703,7 @@ impl LoadedObjfile {
                         if chain.is_empty() {
                             let one = vec![(func.cu_offset, v.die_offset)];
                             let t1 = Instant::now();
-                            let vars = self.resolver.resolve_variables_by_offsets_at_address(
+                            let vars = self.resolve_variables_by_offsets_at_address_with_cfa(
                                 address,
                                 &one,
                                 Some(&get_cfa_closure),
@@ -554,11 +712,11 @@ impl LoadedObjfile {
                             let mut type_ms = 0u128;
                             if let Some(ref mut var0) = var_opt {
                                 if var0.dwarf_type.is_none() {
-                                    let dwarf = self.resolver.dwarf_ref();
+                                    let dwarf = self.dwarf();
                                     let header = dwarf.unit_header(func.cu_offset)?;
                                     let unit = dwarf.unit(header)?;
                                     let e = unit.entry(v.die_offset)?;
-                                    let planner = crate::planner::AccessPlanner::new(dwarf);
+                                    let planner = AccessPlanner::new(dwarf);
                                     if let Some(type_loc) =
                                         planner.resolve_type_ref_with_origins_public(&e, &unit)?
                                     {
@@ -585,7 +743,7 @@ impl LoadedObjfile {
                         }
 
                         let t1 = Instant::now();
-                        let res = self.resolver.plan_chain_access_from_var(
+                        let res = self.plan_chain_access_from_var(
                             address,
                             func.cu_offset,
                             func.die_offset,
@@ -611,16 +769,15 @@ impl LoadedObjfile {
         let globals = self.find_global_variables_by_name(base_var);
         if !globals.is_empty() {
             for info in globals {
-                let spec = ChainSpec {
-                    base: base_var,
-                    fields: chain,
-                };
-                match self.resolver.plan_chain_access_from_var(
+                match self.plan_chain_access_from_var(
                     address,
                     info.unit_offset,
                     info.die_offset,
                     info.die_offset,
-                    spec,
+                    ChainSpec {
+                        base: base_var,
+                        fields: chain,
+                    },
                     None,
                 ) {
                     Ok(Some(v)) => {
@@ -665,7 +822,7 @@ impl LoadedObjfile {
         func: &FunctionBlocks,
         pc: u64,
     ) -> Option<crate::core::CfaResult> {
-        let dwarf = self.resolver.dwarf_ref();
+        let dwarf = self.dwarf();
         let header = dwarf.unit_header(func.cu_offset).ok()?;
         let unit = dwarf.unit(header).ok()?;
         let path = func.block_path_for_pc(pc);
@@ -775,7 +932,7 @@ impl LoadedObjfile {
         cu_off: gimli::DebugInfoOffset,
         die_off: gimli::UnitOffset,
     ) -> Option<crate::TypeInfo> {
-        let dwarf = self.resolver.dwarf_ref();
+        let dwarf = self.dwarf();
         let header = dwarf.unit_header(cu_off).ok()?;
         let unit = dwarf.unit(header).ok()?;
         crate::parser::DetailedParser::resolve_type_shallow_at_offset(dwarf, &unit, die_off)
@@ -786,11 +943,11 @@ impl LoadedObjfile {
         cu_off: gimli::DebugInfoOffset,
         die_off: gimli::UnitOffset,
     ) -> Option<crate::TypeInfo> {
-        let dwarf = self.resolver.dwarf_ref();
+        let dwarf = self.dwarf();
         let header = dwarf.unit_header(cu_off).ok()?;
         let unit = dwarf.unit(header).ok()?;
         let entry = unit.entry(die_off).ok()?;
-        let planner = crate::planner::AccessPlanner::new(dwarf);
+        let planner = AccessPlanner::new(dwarf);
         match planner.resolve_type_ref_with_origins_public(&entry, &unit) {
             Ok(Some(type_loc)) => self.detailed_shallow_type(type_loc.cu_off, type_loc.die_off),
             _ => None,
@@ -802,7 +959,6 @@ impl LoadedObjfile {
         address: u64,
         items: &[(gimli::DebugInfoOffset, gimli::UnitOffset)],
     ) -> Result<Vec<crate::VariableWithEvaluation>> {
-        self.resolver
-            .resolve_variables_by_offsets_at_address(address, items, None)
+        self.resolve_variables_by_offsets_at_address_with_cfa(address, items, None)
     }
 }

@@ -1,4 +1,4 @@
-use super::LoadedObjfile;
+use super::{variables::ChainSpec, LoadedObjfile};
 use crate::core::{GlobalVariableInfo, Result, SectionType};
 use object::{Object, ObjectSection};
 use std::collections::HashSet;
@@ -11,8 +11,64 @@ impl LoadedObjfile {
         link_address: u64,
         fields: &[String],
     ) -> Result<Option<(u64, crate::TypeInfo)>> {
-        self.resolver
-            .compute_member_offset_for_global(0, cu_off, var_die, link_address, fields)
+        let planned = self.plan_chain_access_from_var(
+            0,
+            cu_off,
+            var_die,
+            var_die,
+            ChainSpec {
+                base: "__global__",
+                fields,
+            },
+            None,
+        )?;
+        let Some(var) = planned else {
+            return Ok(None);
+        };
+
+        use crate::core::{ComputeStep, EvaluationResult, LocationResult};
+        let abs_addr_opt = match &var.evaluation_result {
+            EvaluationResult::MemoryLocation(LocationResult::Address(a)) => Some(*a),
+            EvaluationResult::MemoryLocation(LocationResult::ComputedLocation { steps }) => {
+                let mut st: Vec<i64> = Vec::new();
+                let mut foldable = true;
+                for s in steps {
+                    match s {
+                        ComputeStep::PushConstant(v) => st.push(*v),
+                        ComputeStep::Add => {
+                            if st.len() >= 2 {
+                                let b = st.pop().unwrap();
+                                let a = st.pop().unwrap();
+                                st.push(a.saturating_add(b));
+                            } else {
+                                foldable = false;
+                                break;
+                            }
+                        }
+                        _ => {
+                            foldable = false;
+                            break;
+                        }
+                    }
+                }
+                if foldable && st.len() == 1 {
+                    Some(st[0] as u64)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
+        if let Some(abs) = abs_addr_opt {
+            let off = abs.saturating_sub(link_address);
+            let final_ty = var
+                .dwarf_type
+                .unwrap_or(crate::TypeInfo::UnknownType { name: "".into() });
+            return Ok(Some((off, final_ty)));
+        }
+
+        Ok(None)
     }
 
     pub(crate) fn find_global_variables_by_name_any(&self, name: &str) -> Vec<GlobalVariableInfo> {
