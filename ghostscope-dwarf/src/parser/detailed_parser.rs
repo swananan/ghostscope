@@ -852,11 +852,6 @@ impl DetailedParser {
 
     // extract_name removed; call resolve_name_with_origins directly when needed
 
-    /// Get cache statistics from type resolver
-    pub fn get_cache_stats(&self) -> usize {
-        0
-    }
-
     fn resolve_name_with_origins(
         entry: &gimli::DebuggingInformationEntry<DwarfReader>,
         unit: &gimli::Unit<DwarfReader>,

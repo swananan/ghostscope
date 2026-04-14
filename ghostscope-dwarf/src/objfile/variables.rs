@@ -378,87 +378,15 @@ impl LoadedObjfile {
         Ok(vars)
     }
 
-    pub(crate) fn resolve_struct_type_shallow_by_name(
+    pub(crate) fn resolve_type_shallow_by_name_with_tags(
         &mut self,
         name: &str,
+        tags: &[gimli::DwTag],
     ) -> Option<crate::TypeInfo> {
-        if let Some(loc) = self
-            .type_name_index
-            .find_aggregate_definition(name, gimli::constants::DW_TAG_structure_type)
-            .or_else(|| {
-                self.type_name_index
-                    .find_aggregate_definition(name, gimli::constants::DW_TAG_class_type)
-            })
-        {
-            return self.detailed_shallow_type(loc.cu_offset, loc.die_offset);
-        }
-
-        if let Some(td) = self.type_name_index.find_typedef(name) {
-            let dwarf = self.dwarf();
-            if let Ok(header) = dwarf.unit_header(td.cu_offset) {
-                if let Ok(unit) = dwarf.unit(header) {
-                    if let Ok(entry) = unit.entry(td.die_offset) {
-                        if let Some(gimli::AttributeValue::UnitRef(under)) =
-                            entry.attr_value(gimli::DW_AT_type)
-                        {
-                            return self.detailed_shallow_type(td.cu_offset, under);
-                        }
-                        return crate::parser::DetailedParser::resolve_type_shallow_at_offset(
-                            dwarf,
-                            &unit,
-                            td.die_offset,
-                        );
-                    }
-                }
+        for &tag in tags {
+            if let Some(loc) = self.type_name_index.find_aggregate_definition(name, tag) {
+                return self.detailed_shallow_type(loc.cu_offset, loc.die_offset);
             }
-        }
-
-        None
-    }
-
-    pub(crate) fn resolve_union_type_shallow_by_name(
-        &mut self,
-        name: &str,
-    ) -> Option<crate::TypeInfo> {
-        if let Some(loc) = self
-            .type_name_index
-            .find_aggregate_definition(name, gimli::constants::DW_TAG_union_type)
-        {
-            return self.detailed_shallow_type(loc.cu_offset, loc.die_offset);
-        }
-
-        if let Some(td) = self.type_name_index.find_typedef(name) {
-            let dwarf = self.dwarf();
-            if let Ok(header) = dwarf.unit_header(td.cu_offset) {
-                if let Ok(unit) = dwarf.unit(header) {
-                    if let Ok(entry) = unit.entry(td.die_offset) {
-                        if let Some(gimli::AttributeValue::UnitRef(under)) =
-                            entry.attr_value(gimli::DW_AT_type)
-                        {
-                            return self.detailed_shallow_type(td.cu_offset, under);
-                        }
-                        return crate::parser::DetailedParser::resolve_type_shallow_at_offset(
-                            dwarf,
-                            &unit,
-                            td.die_offset,
-                        );
-                    }
-                }
-            }
-        }
-
-        None
-    }
-
-    pub(crate) fn resolve_enum_type_shallow_by_name(
-        &mut self,
-        name: &str,
-    ) -> Option<crate::TypeInfo> {
-        if let Some(loc) = self
-            .type_name_index
-            .find_aggregate_definition(name, gimli::constants::DW_TAG_enumeration_type)
-        {
-            return self.detailed_shallow_type(loc.cu_offset, loc.die_offset);
         }
 
         if let Some(td) = self.type_name_index.find_typedef(name) {
