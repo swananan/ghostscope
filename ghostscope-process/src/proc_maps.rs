@@ -112,7 +112,14 @@ impl ModuleIdentity {
 
     pub fn matches(&self, entry: &ProcMapEntry<'_>) -> bool {
         if let (Some(maj), Some(min), Some(ino)) = (self.dev_major, self.dev_minor, self.inode) {
-            return entry.dev_major == maj && entry.dev_minor == min && entry.inode == ino;
+            if entry.dev_major == maj && entry.dev_minor == min && entry.inode == ino {
+                return true;
+            }
+
+            // overlayfs compatibility: the same mapped file can keep the same inode while
+            // surfacing under a different device number across mount namespaces, so relax
+            // the match to inode+path before giving up.
+            return entry.inode == ino && entry.normalized_path() == Some(self.normalized_path());
         }
 
         entry.normalized_path() == Some(self.normalized_path())
@@ -226,6 +233,20 @@ fn take_field(input: &str) -> Option<(&str, &str)> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn dev_pair_differs_from(meta: &std::fs::Metadata, salt: u64) -> (u64, u64) {
+        let dev = meta.dev() as libc::dev_t;
+        let actual_major = libc::major(dev) as u64;
+        let actual_minor = libc::minor(dev) as u64;
+        let major = actual_major ^ (0x40 + salt);
+        let minor = actual_minor ^ (0x80 + salt);
+        if major == actual_major && minor == actual_minor {
+            (actual_major + 1, actual_minor)
+        } else {
+            (major, minor)
+        }
+    }
 
     #[test]
     fn parse_maps_line_handles_deleted_paths_and_spaces() {
@@ -264,6 +285,53 @@ mod tests {
         .unwrap();
 
         assert!(identity.matches(&entry));
+    }
+
+    #[test]
+    fn module_identity_falls_back_to_inode_and_path_when_dev_differs() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("ghostscope-overlayfs-{suffix}.so"));
+        std::fs::write(&path, b"current").unwrap();
+
+        let meta = std::fs::metadata(&path).unwrap();
+        let inode = meta.ino();
+        let path_str = path.to_string_lossy().to_string();
+        let identity = ModuleIdentity::from_path(&path);
+        let (dev_major, dev_minor) = dev_pair_differs_from(&meta, 1);
+        let line = format!(
+            "7f1234500000-7f1234510000 r-xp 00000000 {dev_major:02x}:{dev_minor:02x} {inode} {path_str}"
+        );
+        let entry = parse_maps_line(&line).unwrap();
+
+        assert!(identity.matches(&entry));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn module_identity_does_not_fallback_without_path_match() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("ghostscope-overlayfs-{suffix}.so"));
+        std::fs::write(&path, b"current").unwrap();
+
+        let meta = std::fs::metadata(&path).unwrap();
+        let inode = meta.ino();
+        let identity = ModuleIdentity::from_path(&path);
+        let (dev_major, dev_minor) = dev_pair_differs_from(&meta, 2);
+        let line = format!(
+            "7f1234500000-7f1234510000 r-xp 00000000 {dev_major:02x}:{dev_minor:02x} {inode} /tmp/other-{suffix}.so"
+        );
+        let entry = parse_maps_line(&line).unwrap();
+
+        assert!(!identity.matches(&entry));
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
