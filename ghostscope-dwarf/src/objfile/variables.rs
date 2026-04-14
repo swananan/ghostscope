@@ -1,7 +1,7 @@
 use super::{access_planner::AccessPlanner, LoadedObjfile};
 use crate::{
     core::Result,
-    index::{BlockIndexBuilder, FunctionBlocks, VarRef},
+    index::{BlockIndexBuilder, FunctionBlocks},
     parser::{DetailedParser, ExpressionEvaluator},
     semantics::{resolve_attr_with_unit_origins, resolve_name_with_origins},
 };
@@ -57,173 +57,6 @@ impl LoadedObjfile {
 
         Some(false)
     }
-
-    fn try_apply_call_site_mapping(
-        &self,
-        func: &FunctionBlocks,
-        inline_idx: usize,
-        address: u64,
-        vars: &mut [crate::VariableWithEvaluation],
-        _var_refs: &[VarRef],
-        get_cfa: &dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>,
-    ) {
-        let dwarf = self.dwarf();
-        let header = match dwarf.unit_header(func.cu_offset) {
-            Ok(h) => h,
-            Err(_) => return,
-        };
-        let unit = match dwarf.unit(header) {
-            Ok(u) => u,
-            Err(_) => return,
-        };
-        let node = &func.nodes[inline_idx];
-        let inline_die = match node.die_offset.and_then(|off| unit.entry(off).ok()) {
-            Some(e) => e,
-            None => return,
-        };
-        if inline_die.tag() != gimli::constants::DW_TAG_inlined_subroutine {
-            return;
-        }
-
-        let origin_off = match inline_die.attr_value(gimli::constants::DW_AT_abstract_origin) {
-            Some(gimli::AttributeValue::UnitRef(o)) => o,
-            _ => return,
-        };
-
-        let mut origin_param_names: Vec<String> = Vec::new();
-        if let Ok(mut it) = unit.entries_at_offset(origin_off) {
-            let _ = it.next_entry();
-            while let Ok(Some(e)) = it.next_dfs() {
-                if e.depth() <= 0 {
-                    break;
-                }
-                if e.depth() > 1 {
-                    continue;
-                }
-                if e.tag() == gimli::constants::DW_TAG_formal_parameter {
-                    if let Some(a) = e.attr(gimli::constants::DW_AT_name) {
-                        if let Ok(s) = dwarf.attr_string(&unit, a.value()) {
-                            if let Ok(ss) = s.to_string_lossy() {
-                                origin_param_names.push(ss.into_owned());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if origin_param_names.is_empty() {
-            return;
-        }
-
-        let mut param_values: Vec<Option<crate::core::EvaluationResult>> =
-            vec![None; origin_param_names.len()];
-        if let Ok(mut it) = unit.entries_at_offset(node.die_offset.unwrap()) {
-            let _ = it.next_entry();
-            while let Ok(Some(e)) = it.next_dfs() {
-                if e.depth() <= 0 {
-                    break;
-                }
-                if e.depth() > 1 {
-                    continue;
-                }
-                if e.tag() == gimli::constants::DW_TAG_call_site
-                    || e.tag() == gimli::constants::DW_TAG_GNU_call_site
-                {
-                    if let Ok(mut pit) = unit.entries_at_offset(e.offset()) {
-                        let _ = pit.next_entry();
-                        while let Ok(Some(pe)) = pit.next_dfs() {
-                            if pe.depth() <= 0 {
-                                break;
-                            }
-                            if pe.depth() > 1 {
-                                continue;
-                            }
-                            if pe.tag() == gimli::constants::DW_TAG_call_site_parameter
-                                || pe.tag() == gimli::constants::DW_TAG_GNU_call_site_parameter
-                            {
-                                let loc_attr = pe.attr_value(gimli::constants::DW_AT_location);
-                                if let Some(gimli::AttributeValue::Exprloc(expr)) = loc_attr {
-                                    if let Ok(ev) = ExpressionEvaluator::parse_expression_in_unit(
-                                        expr.0.to_slice().ok().as_deref().unwrap_or(&[]),
-                                        &unit,
-                                        dwarf,
-                                        address,
-                                        Some(get_cfa),
-                                    ) {
-                                        if let Some(slot) =
-                                            param_values.iter_mut().find(|v| v.is_none())
-                                        {
-                                            *slot = Some(ev);
-                                        }
-                                    }
-                                } else if let Some(cv) =
-                                    pe.attr_value(gimli::constants::DW_AT_const_value)
-                                {
-                                    use crate::core::DirectValueResult as DV;
-                                    use crate::core::EvaluationResult as ER;
-                                    let ev = match cv {
-                                        gimli::AttributeValue::Udata(u) => {
-                                            ER::DirectValue(DV::Constant(u as i64))
-                                        }
-                                        gimli::AttributeValue::Sdata(s) => {
-                                            ER::DirectValue(DV::Constant(s))
-                                        }
-                                        gimli::AttributeValue::Data1(d) => {
-                                            ER::DirectValue(DV::Constant(d as i64))
-                                        }
-                                        gimli::AttributeValue::Data2(d) => {
-                                            ER::DirectValue(DV::Constant(d as i64))
-                                        }
-                                        gimli::AttributeValue::Data4(d) => {
-                                            ER::DirectValue(DV::Constant(d as i64))
-                                        }
-                                        gimli::AttributeValue::Data8(d) => {
-                                            ER::DirectValue(DV::Constant(d as i64))
-                                        }
-                                        gimli::AttributeValue::Block(b) => match b.to_slice() {
-                                            Ok(bytes) => {
-                                                ER::DirectValue(DV::ImplicitValue(bytes.to_vec()))
-                                            }
-                                            Err(_) => ER::Optimized,
-                                        },
-                                        _ => ER::Optimized,
-                                    };
-                                    if let Some(slot) =
-                                        param_values.iter_mut().find(|v| v.is_none())
-                                    {
-                                        *slot = Some(ev);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if param_values.iter().all(|v| v.is_none()) {
-            return;
-        }
-
-        for v in vars.iter_mut() {
-            if !v.is_parameter {
-                continue;
-            }
-            if !matches!(
-                v.evaluation_result,
-                crate::core::EvaluationResult::Optimized
-            ) {
-                continue;
-            }
-            let name = v.name.as_str();
-            if let Some(pos) = origin_param_names.iter().position(|n| n == name) {
-                if let Some(Some(ev)) = param_values.get(pos) {
-                    v.evaluation_result = ev.clone();
-                }
-            }
-        }
-    }
-
     pub(super) fn plan_chain_access_from_var(
         &mut self,
         address: u64,
@@ -509,17 +342,6 @@ impl LoadedObjfile {
                             }
                         }
                     }
-                }
-
-                if let Some(inline_idx) = Self::find_innermost_inline_node(&func, address) {
-                    self.try_apply_call_site_mapping(
-                        &func,
-                        inline_idx,
-                        address,
-                        &mut vars,
-                        &var_refs,
-                        &get_cfa_closure,
-                    );
                 }
 
                 let mut seen_param_names: std::collections::HashSet<String> =

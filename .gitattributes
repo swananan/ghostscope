@@ -11,6 +11,8 @@ scripts/dwarf-perf/*.sh linguist-vendored
 scripts/dwarf-perf/corpus/** linguist-vendored
 # Exclude benchmark comparison helpers from language statistics
 scripts/compare/** linguist-vendored
+# Exclude non-Rust e2e fixtures from language statistics
+e2e-tests/tests/fixtures/** linguist-vendored
 # Exclude docs and agent metadata from language statistics
 *.md linguist-documentation
 .github/** linguist-vendored
