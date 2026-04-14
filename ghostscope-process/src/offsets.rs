@@ -125,12 +125,28 @@ impl ModulePathSummaries {
             .observe(entry);
     }
 
+    fn summary_for_inode(&self, inode: u64) -> Option<ModuleMapSummary> {
+        let mut matches = self
+            .by_identity
+            .iter()
+            .filter(|(key, _)| key.inode == inode)
+            .map(|(_, summary)| summary);
+        let mut merged = matches.next()?.clone();
+        for summary in matches {
+            merged.merge(summary);
+        }
+        Some(merged)
+    }
+
     fn summary_for_path(&self, module_path: &str) -> Option<ModuleMapSummary> {
         match fs::metadata(module_path) {
             Ok(meta) => self
                 .by_identity
                 .get(&ModuleMapIdentityKey::from_metadata(&meta))
-                .cloned(),
+                .cloned()
+                // overlayfs compatibility: within the same normalized path bucket, the mapped
+                // file can keep the same inode while reporting a different device number.
+                .or_else(|| self.summary_for_inode(meta.ino())),
             Err(_) => {
                 let mut merged = ModuleMapSummary::default();
                 for summary in self.by_identity.values() {
@@ -551,6 +567,19 @@ mod tests {
     use crate::proc_maps::parse_maps_line;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    fn dev_pair_differs_from(meta: &std::fs::Metadata, salt: u64) -> (u64, u64) {
+        let dev = meta.dev() as libc::dev_t;
+        let actual_major = libc::major(dev) as u64;
+        let actual_minor = libc::minor(dev) as u64;
+        let major = actual_major ^ (0x40 + salt);
+        let minor = actual_minor ^ (0x80 + salt);
+        if major == actual_major && minor == actual_minor {
+            (actual_major + 1, actual_minor)
+        } else {
+            (major, minor)
+        }
+    }
+
     #[test]
     fn forget_pid_clears_pid_caches_and_module_entries() {
         let mut mgr = ProcessManager::new();
@@ -655,5 +684,74 @@ mod tests {
         assert_eq!(summary.candidates, vec![(0, 0x1000), (0x2000, 0x3000)]);
         assert_eq!(summary.base(), 0x1000);
         assert_eq!(summary.size(), 0x4000);
+    }
+
+    #[test]
+    fn path_summaries_fallback_to_inode_when_device_differs() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("ghostscope-offsets-overlayfs-{suffix}.so"));
+        std::fs::write(&path, b"current").unwrap();
+
+        let meta = std::fs::metadata(&path).unwrap();
+        let inode = meta.ino();
+        let path_str = path.to_string_lossy().to_string();
+        let (dev_major, dev_minor) = dev_pair_differs_from(&meta, 1);
+
+        let overlay_entry: OwnedProcMapEntry = parse_maps_line(&format!(
+            "2000-3000 r-xp 00001000 {dev_major:02x}:{dev_minor:02x} {inode} {path_str}"
+        ))
+        .unwrap()
+        .into();
+
+        let mut summaries = ModulePathSummaries::default();
+        summaries.observe(&overlay_entry);
+
+        let summary = summaries.summary_for_path(&path_str).unwrap();
+        assert_eq!(summary.candidates, vec![(0x1000, 0x2000)]);
+        assert_eq!(summary.base(), 0x2000);
+        assert_eq!(summary.size(), 0x1000);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn path_summaries_merge_same_inode_groups_within_path_bucket() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("ghostscope-offsets-overlayfs-{suffix}.so"));
+        std::fs::write(&path, b"current").unwrap();
+
+        let meta = std::fs::metadata(&path).unwrap();
+        let inode = meta.ino();
+        let path_str = path.to_string_lossy().to_string();
+        let (lower_dev_major, lower_dev_minor) = dev_pair_differs_from(&meta, 2);
+        let (upper_dev_major, upper_dev_minor) = dev_pair_differs_from(&meta, 3);
+
+        let lower_entry: OwnedProcMapEntry = parse_maps_line(&format!(
+            "1000-2000 r-xp 00000000 {lower_dev_major:02x}:{lower_dev_minor:02x} {inode} {path_str}"
+        ))
+        .unwrap()
+        .into();
+        let upper_entry: OwnedProcMapEntry = parse_maps_line(&format!(
+            "3000-5000 r-xp 00002000 {upper_dev_major:02x}:{upper_dev_minor:02x} {inode} {path_str}"
+        ))
+        .unwrap()
+        .into();
+
+        let mut summaries = ModulePathSummaries::default();
+        summaries.observe(&lower_entry);
+        summaries.observe(&upper_entry);
+
+        let summary = summaries.summary_for_path(&path_str).unwrap();
+        assert_eq!(summary.candidates, vec![(0, 0x1000), (0x2000, 0x3000)]);
+        assert_eq!(summary.base(), 0x1000);
+        assert_eq!(summary.size(), 0x4000);
+
+        let _ = std::fs::remove_file(path);
     }
 }
