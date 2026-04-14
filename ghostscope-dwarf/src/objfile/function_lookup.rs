@@ -146,7 +146,7 @@ impl LoadedObjfile {
             return Ok(Vec::new());
         }
 
-        let dwarf = self.resolver.dwarf_ref();
+        let dwarf = self.dwarf();
         let header = dwarf
             .unit_header(entry.unit_offset)
             .map_err(|e| anyhow::anyhow!("unit header error: {}", e))?;
@@ -315,7 +315,7 @@ impl LoadedObjfile {
         idx_entry: &crate::core::IndexEntry,
         pc: u64,
     ) -> Result<bool> {
-        let dwarf = self.resolver.dwarf_ref();
+        let dwarf = self.dwarf();
         let header = dwarf
             .unit_header(idx_entry.unit_offset)
             .map_err(|e| anyhow::anyhow!("unit header error: {}", e))?;
