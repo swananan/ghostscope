@@ -202,8 +202,12 @@ impl ExpressionEvaluator {
                 debug!("Found DW_OP_stack_value - this is a computed value");
             }
             match &op {
-                // Support DW_OP_entry_value minimally for inline parameters:
-                // If inner expression is a single DW_OP_reg*, treat it as a direct value.
+                // TODO(entry_value): This is only a minimal fallback.
+                // For inline parameters, a correct DW_OP_entry_value implementation must
+                // walk back to the caller and evaluate the matching call_site_parameter's
+                // DW_AT_call_value / DW_AT_GNU_call_site_value. Merely stripping
+                // entry_value(reg) to a bare register only preserves the simplest cases
+                // where the parameter is still equivalent to the entry register.
                 Operation::EntryValue { expression } => {
                     let mut inner = *expression;
                     let mut inner_ops: Vec<Operation<_>> = Vec::new();

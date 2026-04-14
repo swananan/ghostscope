@@ -544,6 +544,7 @@ impl<'a> DwarfParser<'a> {
                     attrs.ranges_attr = Some(value);
                 }
                 gimli::constants::DW_AT_entry_pc => {
+                    // TODO(dwarf5): Also handle DebugAddrIndex-backed DW_AT_entry_pc.
                     if let gimli::AttributeValue::Addr(addr) = value {
                         attrs.entry_pc = Some(addr);
                     }

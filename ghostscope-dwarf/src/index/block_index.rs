@@ -282,6 +282,7 @@ impl<'a> BlockIndexBuilder<'a> {
                         bn.ranges = ranges;
                     }
                     if let Some(a) = e.attr(gimli::constants::DW_AT_entry_pc) {
+                        // TODO(dwarf5): Also handle DebugAddrIndex-backed DW_AT_entry_pc.
                         if let gimli::AttributeValue::Addr(addr) = a.value() {
                             bn.entry_pc = Some(addr);
                         }
