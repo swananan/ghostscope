@@ -624,7 +624,6 @@ mod tests {
     fn inline_entry(ranges: &[(u64, u64)], entry_pc: Option<u64>) -> IndexEntry {
         let mut entry = subprogram_entry(ranges, entry_pc);
         entry.tag = constants::DW_TAG_inlined_subroutine;
-        entry.flags.is_inline_instance = true;
         entry.function_kind = FunctionDieKind::InlineInstance;
         entry
     }

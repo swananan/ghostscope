@@ -191,7 +191,6 @@ impl<'a> DwarfParser<'a> {
                         let flags = crate::core::IndexFlags {
                             is_static,
                             is_main,
-                            is_inline_instance: function_kind == FunctionDieKind::InlineInstance,
                             has_inline_attribute: metadata.has_inline_attribute,
                             is_linkage: metadata.is_linkage_name,
                             ..Default::default()
@@ -231,7 +230,6 @@ impl<'a> DwarfParser<'a> {
                             .unwrap_or(false);
                         let flags = crate::core::IndexFlags {
                             is_static,
-                            is_inline_instance: function_kind == FunctionDieKind::InlineInstance,
                             has_inline_attribute: metadata.has_inline_attribute,
                             is_linkage: metadata.is_linkage_name,
                             ..Default::default()
