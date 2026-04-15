@@ -166,6 +166,17 @@ impl ExpressionEvaluator {
         )
     }
 
+    pub(crate) fn parse_expression_to_steps_in_unit(
+        expr_bytes: &[u8],
+        unit: &gimli::Unit<DwarfReader>,
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        address: u64,
+        get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
+    ) -> Result<Vec<ComputeStep>> {
+        let evaluation = Self::parse_expression_in_unit(expr_bytes, unit, dwarf, address, get_cfa)?;
+        Self::evaluation_result_to_steps(evaluation)
+    }
+
     fn parse_expression_with_context(
         expr_bytes: &[u8],
         encoding: gimli::Encoding,
@@ -180,6 +191,52 @@ impl ExpressionEvaluator {
 
         // Parse all expressions through unified handler
         Self::parse_full_expression(expr_bytes, encoding, dwarf, address, get_cfa, depth)
+    }
+
+    fn evaluation_result_to_steps(evaluation: EvaluationResult) -> Result<Vec<ComputeStep>> {
+        match evaluation {
+            EvaluationResult::DirectValue(DirectValueResult::RegisterValue(register)) => {
+                Ok(vec![ComputeStep::LoadRegister(register)])
+            }
+            EvaluationResult::DirectValue(DirectValueResult::Constant(value)) => {
+                Ok(vec![ComputeStep::PushConstant(value)])
+            }
+            EvaluationResult::DirectValue(DirectValueResult::AbsoluteAddress(address)) => {
+                Ok(vec![ComputeStep::PushConstant(address as i64)])
+            }
+            EvaluationResult::DirectValue(DirectValueResult::ComputedValue { steps, .. }) => {
+                Ok(steps)
+            }
+            EvaluationResult::MemoryLocation(LocationResult::RegisterAddress {
+                register,
+                offset,
+                ..
+            }) => Ok(Self::register_address_steps(register, offset)),
+            EvaluationResult::MemoryLocation(LocationResult::Address(address)) => {
+                Ok(vec![ComputeStep::PushConstant(address as i64)])
+            }
+            EvaluationResult::MemoryLocation(LocationResult::ComputedLocation { steps }) => {
+                Ok(steps)
+            }
+            EvaluationResult::DirectValue(DirectValueResult::ImplicitValue(_)) => Err(
+                anyhow::anyhow!("DWARF expression lowered to implicit bytes, not ComputeStep[]"),
+            ),
+            EvaluationResult::Optimized => Err(anyhow::anyhow!(
+                "DWARF expression optimized out, no ComputeStep[]"
+            )),
+            EvaluationResult::Composite(_) => Err(anyhow::anyhow!(
+                "composite DWARF expression cannot be represented as one ComputeStep[]"
+            )),
+        }
+    }
+
+    fn register_address_steps(register: u16, offset: Option<i64>) -> Vec<ComputeStep> {
+        let mut steps = vec![ComputeStep::LoadRegister(register)];
+        if let Some(offset) = offset.filter(|offset| *offset != 0) {
+            steps.push(ComputeStep::PushConstant(offset));
+            steps.push(ComputeStep::Add);
+        }
+        steps
     }
 
     /// Parse a full multi-operation DWARF expression
