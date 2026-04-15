@@ -282,9 +282,14 @@ impl<'a> BlockIndexBuilder<'a> {
                         bn.ranges = ranges;
                     }
                     if let Some(a) = e.attr(gimli::constants::DW_AT_entry_pc) {
-                        // TODO(dwarf5): Also handle DebugAddrIndex-backed DW_AT_entry_pc.
-                        if let gimli::AttributeValue::Addr(addr) = a.value() {
-                            bn.entry_pc = Some(addr);
+                        match a.value() {
+                            gimli::AttributeValue::Addr(addr) => bn.entry_pc = Some(addr),
+                            gimli::AttributeValue::DebugAddrIndex(index) => {
+                                if let Ok(addr) = self.dwarf.address(unit, index) {
+                                    bn.entry_pc = Some(addr);
+                                }
+                            }
+                            _ => {}
                         }
                     }
                     // Record this block's DIE offset for later attribute lookups (e.g., frame base)

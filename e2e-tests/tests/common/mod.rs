@@ -27,7 +27,10 @@ lazy_static! {
     static ref COMPILE_MEMBER_POINTER_OPTIMIZED_RESULT: Mutex<Option<anyhow::Result<()>>> =
         Mutex::new(None);
     static ref COMPILE_LATE_GLOBALS_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
-    static ref COMPILE_INLINE_CALLSITE_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
+    static ref COMPILE_INLINE_CALLSITE_DEFAULT_RESULT: Mutex<Option<anyhow::Result<()>>> =
+        Mutex::new(None);
+    static ref COMPILE_INLINE_CALLSITE_CLANG_DWARF5_RESULT: Mutex<Option<anyhow::Result<()>>> =
+        Mutex::new(None);
     static ref COMPILE_INLINE_CALL_VALUE_RESULT: Mutex<Option<anyhow::Result<()>>> =
         Mutex::new(None);
     static ref COMPILE_PARTITIONED_RANGES_RESULT: Mutex<Option<anyhow::Result<()>>> =
@@ -254,14 +257,14 @@ impl FixtureCompiler {
         }
     }
 
-    fn apply_to_c_make(&self, cmd: &mut Command, base: &str) {
+    fn apply_to_c_make(&self, cmd: &mut Command, base: &str, clang_dwarf5_cflags: &str) {
         cmd.arg("all")
             .arg(format!("BINARY={}", self.binary_name(base)))
             .arg(format!("OBJ={}", self.object_name(base)));
 
         if matches!(self, FixtureCompiler::ClangDwarf5) {
             cmd.arg("CC=clang")
-                .arg("CFLAGS=-Wall -Wextra -gdwarf-5 -O0");
+                .arg(format!("CFLAGS={clang_dwarf5_cflags}"));
         }
     }
 }
@@ -344,8 +347,8 @@ impl RegisteredFixture {
                     .join("rust_global_program"))
             }
             RegisteredFixtureKind::InlineCallsite => {
-                ensure_inline_callsite_program_compiled()?;
-                Ok(dir.join("inline_callsite_program"))
+                ensure_inline_callsite_program_compiled(FixtureCompiler::Default)?;
+                Ok(dir.join(FixtureCompiler::Default.binary_name(self.name)))
             }
             RegisteredFixtureKind::InlineCallValue => {
                 ensure_inline_call_value_program_compiled()?;
@@ -372,6 +375,12 @@ impl RegisteredFixture {
         compiler: FixtureCompiler,
     ) -> anyhow::Result<PathBuf> {
         match self.kind {
+            RegisteredFixtureKind::InlineCallsite => {
+                ensure_inline_callsite_program_compiled(compiler)?;
+                Ok(self
+                    .dir(fixtures_base)
+                    .join(compiler.binary_name(self.name)))
+            }
             RegisteredFixtureKind::StaticScope => {
                 ensure_static_scope_program_compiled(compiler)?;
                 Ok(self
@@ -847,7 +856,8 @@ pub mod termination;
 static COMPILE_GLOBALS: Once = Once::new();
 static COMPILE_LATE_GLOBALS: Once = Once::new();
 static COMPILE_RUST_GLOBAL: Once = Once::new();
-static COMPILE_INLINE_CALLSITE: Once = Once::new();
+static COMPILE_INLINE_CALLSITE_DEFAULT: Once = Once::new();
+static COMPILE_INLINE_CALLSITE_CLANG_DWARF5: Once = Once::new();
 static COMPILE_INLINE_CALL_VALUE: Once = Once::new();
 static COMPILE_PARTITIONED_RANGES: Once = Once::new();
 static COMPILE_CPP_COMPLEX: Once = Once::new();
@@ -953,33 +963,28 @@ fn ensure_rust_global_program_compiled() -> anyhow::Result<()> {
     result
 }
 
-fn ensure_inline_callsite_program_compiled() -> anyhow::Result<()> {
-    COMPILE_INLINE_CALLSITE.call_once(|| {
-        let compile_result = (|| -> anyhow::Result<()> {
-            let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/inline_callsite_program");
-            println!("Compiling inline_callsite_program (Optimized O3) in {base:?}");
-            let _ = Command::new("make")
-                .arg("clean")
-                .current_dir(base.clone())
-                .status()
-                .is_ok();
-            let out = Command::new("make").arg("all").current_dir(base).output()?;
-            if out.status.success() {
-                println!("✓ Successfully compiled inline_callsite_program");
-                Ok(())
-            } else {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                Err(anyhow::anyhow!(
-                    "Failed to compile inline_callsite_program: {}",
-                    stderr
-                ))
-            }
-        })();
-        *COMPILE_INLINE_CALLSITE_RESULT.lock().unwrap() = Some(compile_result);
+fn ensure_inline_callsite_program_compiled(compiler: FixtureCompiler) -> anyhow::Result<()> {
+    let (once, slot): (&Once, &Mutex<Option<anyhow::Result<()>>>) = match compiler {
+        FixtureCompiler::Default => (
+            &COMPILE_INLINE_CALLSITE_DEFAULT,
+            &*COMPILE_INLINE_CALLSITE_DEFAULT_RESULT,
+        ),
+        FixtureCompiler::ClangDwarf5 => (
+            &COMPILE_INLINE_CALLSITE_CLANG_DWARF5,
+            &*COMPILE_INLINE_CALLSITE_CLANG_DWARF5_RESULT,
+        ),
+    };
+
+    once.call_once(|| {
+        let compile_result = compile_c_make_fixture(
+            "inline_callsite_program",
+            compiler,
+            "-Wall -Wextra -gdwarf-5 -O3",
+        );
+        *slot.lock().unwrap() = Some(compile_result);
     });
 
-    match COMPILE_INLINE_CALLSITE_RESULT.lock().unwrap().as_ref() {
+    match slot.lock().unwrap().as_ref() {
         Some(Ok(())) => Ok(()),
         Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
         None => panic!("Compilation result should be set after call_once"),
@@ -1086,6 +1091,51 @@ fn ensure_cpp_complex_program_compiled() -> anyhow::Result<()> {
     result
 }
 
+fn compile_c_make_fixture(
+    fixture_name: &str,
+    compiler: FixtureCompiler,
+    clang_dwarf5_cflags: &str,
+) -> anyhow::Result<()> {
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(fixture_name);
+    println!(
+        "Compiling {fixture_name} {} in {base:?}",
+        compiler.description()
+    );
+
+    let _ = Command::new("make")
+        .arg("clean")
+        .current_dir(base.clone())
+        .status()
+        .is_ok();
+
+    let mut cmd = Command::new("make");
+    compiler.apply_to_c_make(&mut cmd, fixture_name, clang_dwarf5_cflags);
+    let output = cmd.current_dir(base).output().map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to run make for {fixture_name} {}: {}",
+            compiler.description(),
+            e
+        )
+    })?;
+
+    if output.status.success() {
+        println!(
+            "✓ Successfully compiled {fixture_name} {}",
+            compiler.description()
+        );
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(anyhow::anyhow!(
+            "Failed to compile {fixture_name} {}: {}",
+            compiler.description(),
+            stderr
+        ))
+    }
+}
+
 fn ensure_static_scope_program_compiled(compiler: FixtureCompiler) -> anyhow::Result<()> {
     let (once, slot): (&Once, &Mutex<Option<anyhow::Result<()>>>) = match compiler {
         FixtureCompiler::Default => (
@@ -1111,35 +1161,9 @@ fn ensure_static_scope_program_compiled(compiler: FixtureCompiler) -> anyhow::Re
 }
 
 fn compile_static_scope_program(compiler: FixtureCompiler) -> anyhow::Result<()> {
-    let base =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/static_scope_program");
-    println!(
-        "Compiling static_scope_program {} in {base:?}",
-        compiler.description()
-    );
-
-    let mut cmd = Command::new("make");
-    compiler.apply_to_c_make(&mut cmd, "static_scope_program");
-    let output = cmd.current_dir(base).output().map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to run make for static_scope_program {}: {}",
-            compiler.description(),
-            e
-        )
-    })?;
-
-    if output.status.success() {
-        println!(
-            "✓ Successfully compiled static_scope_program {}",
-            compiler.description()
-        );
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(anyhow::anyhow!(
-            "Failed to compile static_scope_program {}: {}",
-            compiler.description(),
-            stderr
-        ))
-    }
+    compile_c_make_fixture(
+        "static_scope_program",
+        compiler,
+        "-Wall -Wextra -gdwarf-5 -O0",
+    )
 }

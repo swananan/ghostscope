@@ -15,6 +15,9 @@ static inline __attribute__((always_inline)) int inline_after_call(
     int original_x,
     int original_y
 ) {
+    // Keep this on the first executable pre-call line so tests can assert the
+    // original inline parameters before consume_pair's call-site clobbers them.
+    asm volatile("" : "+r"(original_x), "+r"(original_y) :: "memory");
     int combined = consume_pair(original_x + original_y, original_x - original_y);
     int after_call = combined + 7;
     if (after_call & 1) {
