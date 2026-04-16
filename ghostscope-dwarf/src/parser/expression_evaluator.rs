@@ -86,6 +86,23 @@ impl ExpressionEvaluator {
                     depth,
                 )
             }
+            Some(gimli::AttributeValue::DebugLocListsIndex(index)) => {
+                let offset = dwarf.locations_offset(unit, index)?;
+                debug!(
+                    "Found DebugLocListsIndex {:?} -> offset 0x{:x}, parsing location list",
+                    index, offset.0
+                );
+                Self::parse_location_lists_with_depth(
+                    unit,
+                    dwarf,
+                    offset,
+                    address,
+                    get_cfa,
+                    function_context,
+                    cfi_index,
+                    depth,
+                )
+            }
             Some(gimli::AttributeValue::SecOffset(offset)) => {
                 // Older DWARF format location list
                 debug!(

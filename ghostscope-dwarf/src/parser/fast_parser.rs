@@ -848,6 +848,21 @@ impl<'a> DwarfParser<'a> {
                 }
                 Ok(None)
             }
+            gimli::AttributeValue::DebugLocListsIndex(index) => {
+                if let Ok(offset) = self.dwarf.locations_offset(unit, index) {
+                    if let Ok(mut locations) = self.dwarf.locations(unit, offset) {
+                        while let Ok(Some(loc)) = locations.next() {
+                            if let Some(address) = self.extract_absolute_storage_address_from_expr(
+                                unit,
+                                gimli::Expression(loc.data.0),
+                            ) {
+                                return Ok(Some(address));
+                            }
+                        }
+                    }
+                }
+                Ok(None)
+            }
             gimli::AttributeValue::SecOffset(off) => {
                 if let Ok(mut locations) =
                     self.dwarf.locations(unit, gimli::LocationListsOffset(off))
@@ -1700,8 +1715,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let out_dir =
-            std::env::temp_dir().join(format!("ghostscope-fast-parser-patched-{unique_suffix}"));
+        let fixture_dir = input_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", input_path.display()))?;
+        let out_dir = fixture_dir.join(format!(".ghostscope-fast-parser-patched-{unique_suffix}"));
         std::fs::create_dir_all(&out_dir)?;
         let output_path = out_dir.join("inline_callsite_program_entry_pc_addrx");
         std::fs::write(&output_path, &bytes)?;

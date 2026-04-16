@@ -649,6 +649,15 @@ impl LoadedObjfile {
                             )
                             .ok()
                         }
+                        gimli::AttributeValue::DebugLocListsIndex(index) => dwarf
+                            .locations_offset(&unit, index)
+                            .ok()
+                            .and_then(|offset| {
+                                ExpressionEvaluator::parse_location_lists(
+                                    &unit, dwarf, offset, pc, None, None, None,
+                                )
+                                .ok()
+                            }),
                         gimli::AttributeValue::SecOffset(offset) => {
                             ExpressionEvaluator::parse_location_lists(
                                 &unit,

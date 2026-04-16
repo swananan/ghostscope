@@ -512,6 +512,33 @@ impl<'a> BlockIndexBuilder<'a> {
             None,
         )
         .ok()
+        .or_else(|| Self::lower_entry_value_call_site_register(unit, &expr_bytes))
+    }
+
+    fn lower_entry_value_call_site_register(
+        unit: &gimli::Unit<DwarfReader>,
+        expr_bytes: &[u8],
+    ) -> Option<Vec<ComputeStep>> {
+        let mut expression =
+            gimli::Expression(gimli::EndianSlice::new(expr_bytes, gimli::LittleEndian));
+        let first = gimli::Operation::parse(&mut expression.0, unit.encoding()).ok()?;
+        if !expression.0.is_empty() {
+            return None;
+        }
+        let gimli::Operation::EntryValue { expression: inner } = first else {
+            return None;
+        };
+        let mut inner = inner;
+        let inner_op = gimli::Operation::parse(&mut inner, unit.encoding()).ok()?;
+        if !inner.is_empty() {
+            return None;
+        }
+        match inner_op {
+            gimli::Operation::Register { register } => {
+                Some(vec![ComputeStep::LoadRegister(register.0)])
+            }
+            _ => None,
+        }
     }
 
     fn resolve_address_attr(
@@ -706,6 +733,96 @@ mod tests {
                 ComputeStep::PushConstant(-1),
                 ComputeStep::Add,
             ]
+        );
+    }
+
+    #[test]
+    fn build_for_unit_indexes_entry_value_call_site_values_as_caller_register_loads() {
+        let version = 5;
+        let encoding = gimli::Encoding {
+            format: Format::Dwarf32,
+            version,
+            address_size: 8,
+        };
+
+        let mut dwarf = WriteDwarf::new();
+        let unit_id = dwarf.units.add(Unit::new(encoding, LineProgram::none()));
+        let unit = dwarf.units.get_mut(unit_id);
+        let root = unit.root();
+
+        let subprogram_id = unit.add(root, constants::DW_TAG_subprogram);
+        let subprogram = unit.get_mut(subprogram_id);
+        subprogram.set(
+            constants::DW_AT_name,
+            WriteAttributeValue::String(b"entry_value_call_site_fixture".to_vec()),
+        );
+        subprogram.set(
+            constants::DW_AT_low_pc,
+            WriteAttributeValue::Address(Address::Constant(0x1000)),
+        );
+        subprogram.set(constants::DW_AT_high_pc, WriteAttributeValue::Udata(0x40));
+
+        let call_site_id = unit.add(subprogram_id, constants::DW_TAG_call_site);
+        unit.get_mut(call_site_id).set(
+            constants::DW_AT_call_return_pc,
+            WriteAttributeValue::Address(Address::Constant(0x1018)),
+        );
+
+        let param_id = unit.add(call_site_id, constants::DW_TAG_call_site_parameter);
+        let param = unit.get_mut(param_id);
+        let mut location = WriteExpression::new();
+        location.op_reg(Register(4));
+        param.set(
+            constants::DW_AT_location,
+            WriteAttributeValue::Exprloc(location),
+        );
+        let mut inner = WriteExpression::new();
+        inner.op_reg(Register(4));
+        let mut value = WriteExpression::new();
+        value.op_entry_value(inner);
+        param.set(
+            constants::DW_AT_call_value,
+            WriteAttributeValue::Exprloc(value),
+        );
+
+        let mut sections = Sections::new(EndianVec::new(LittleEndian));
+        dwarf.write(&mut sections).unwrap();
+
+        let dwarf_sections: gimli::DwarfSections<Vec<u8>> = gimli::DwarfSections::load(|id| {
+            Ok::<_, gimli::Error>(
+                sections
+                    .get(id)
+                    .map(|section| section.slice().to_vec())
+                    .unwrap_or_default(),
+            )
+        })
+        .unwrap();
+
+        let read_dwarf = dwarf_sections
+            .borrow(|section| dwarf_reader_from_arc(Arc::<[u8]>::from(section.as_slice())));
+        let mut units = read_dwarf.units();
+        let header = units.next().unwrap().unwrap();
+        let cu_offset = header.debug_info_offset().unwrap();
+
+        let builder = BlockIndexBuilder::new(&read_dwarf);
+        let functions = builder
+            .build_for_unit(cu_offset)
+            .expect("fixture CU should build");
+        let function = functions
+            .first()
+            .expect("fixture should contain one function");
+
+        let records = function
+            .call_sites
+            .get(&0x1018)
+            .map(Vec::as_slice)
+            .expect("call-site return_pc should be indexed");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].parameters.len(), 1);
+        assert_eq!(records[0].parameters[0].callee_register, 4);
+        assert_eq!(
+            records[0].parameters[0].caller_value_steps,
+            vec![ComputeStep::LoadRegister(4)]
         );
     }
 

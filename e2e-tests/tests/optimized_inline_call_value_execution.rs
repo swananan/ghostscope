@@ -78,6 +78,84 @@ fn assert_not_internal_call_register_aliases(
     Ok(())
 }
 
+fn assert_parameters_are_live_in_registers(
+    parameters: &[ghostscope_dwarf::VariableWithEvaluation],
+    address: u64,
+) -> anyhow::Result<()> {
+    for parameter_name in ["original_x", "original_y"] {
+        let parameter = parameters
+            .iter()
+            .find(|param| param.name == parameter_name)
+            .ok_or_else(|| anyhow::anyhow!("missing {parameter_name} at 0x{address:x}"))?;
+
+        assert!(
+            !matches!(parameter.evaluation_result, EvaluationResult::Optimized),
+            "{parameter_name} should still be live before consume_pair() at 0x{address:x}: {parameters:?}"
+        );
+        assert!(
+            matches!(
+                parameter.evaluation_result,
+                EvaluationResult::DirectValue(DirectValueResult::RegisterValue(_))
+            ),
+            "{parameter_name} should resolve to a direct register value before consume_pair() at 0x{address:x}: {parameters:?}"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_optimized_inline_parameters_are_live_before_internal_call() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("inline_call_value_program")?;
+    let mut analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
+    let addrs = analyzer.lookup_addresses_by_source_line(
+        "inline_call_value_program.c",
+        INLINE_BEFORE_CALL_TRACE_LINE,
+    );
+    anyhow::ensure!(
+        !addrs.is_empty(),
+        "No DWARF addresses found for inline_call_value_program.c:{INLINE_BEFORE_CALL_TRACE_LINE}"
+    );
+    for module_address in &addrs {
+        anyhow::ensure!(
+            analyzer.is_inline_at(module_address) == Some(true),
+            "Expected inline address at 0x{:x}",
+            module_address.address
+        );
+    }
+
+    let query_results = analyzer.query_source_line_best_effort(
+        "inline_call_value_program.c",
+        INLINE_BEFORE_CALL_TRACE_LINE,
+    )?;
+    anyhow::ensure!(
+        !query_results.is_empty(),
+        "No query results for inline_call_value_program.c:{INLINE_BEFORE_CALL_TRACE_LINE}"
+    );
+    for result in &query_results {
+        assert_parameters_are_live_in_registers(&result.parameters, result.address)?;
+    }
+
+    let target = spawn_inline_call_value_program(&binary_path).await?;
+    let mut pid_analyzer = ghostscope_dwarf::DwarfAnalyzer::from_pid(target.host_pid()).await?;
+    let pid_results = pid_analyzer.query_source_line_best_effort(
+        "inline_call_value_program.c",
+        INLINE_BEFORE_CALL_TRACE_LINE,
+    )?;
+    anyhow::ensure!(
+        !pid_results.is_empty(),
+        "No PID-backed query results for inline_call_value_program.c:{INLINE_BEFORE_CALL_TRACE_LINE}"
+    );
+    for result in &pid_results {
+        assert_parameters_are_live_in_registers(&result.parameters, result.address)?;
+    }
+    target.terminate().await?;
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_optimized_inline_parameters_have_exact_values_before_internal_call(
 ) -> anyhow::Result<()> {

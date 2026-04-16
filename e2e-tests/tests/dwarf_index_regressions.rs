@@ -138,8 +138,11 @@ fn rewrite_inline_fixture_entry_pc_attr(input_path: &Path) -> anyhow::Result<Pat
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let out_dir = std::env::temp_dir().join(format!(
-        "ghostscope-inline-entry-pc-regression-{unique_suffix}"
+    let fixture_dir = input_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", input_path.display()))?;
+    let out_dir = fixture_dir.join(format!(
+        ".ghostscope-inline-entry-pc-regression-{unique_suffix}"
     ));
     std::fs::create_dir_all(&out_dir)?;
     let output_path = out_dir.join("inline_callsite_program_entry_pc_addrx");

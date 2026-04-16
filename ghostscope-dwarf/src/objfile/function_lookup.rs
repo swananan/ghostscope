@@ -465,6 +465,13 @@ impl LoadedObjfile {
                 ),
                 None => Ok(false),
             },
+            gimli::AttributeValue::DebugLocListsIndex(index) => match pc {
+                Some(pc) => {
+                    let offset = dwarf.locations_offset(unit, index)?;
+                    Self::location_list_uses_entry_value_at_pc(dwarf, unit, offset, pc)
+                }
+                None => Ok(false),
+            },
             gimli::AttributeValue::SecOffset(offset) => match pc {
                 Some(pc) => Self::location_list_uses_entry_value_at_pc(
                     dwarf,
