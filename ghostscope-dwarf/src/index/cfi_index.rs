@@ -10,13 +10,14 @@ use crate::{
 use anyhow::{anyhow, Context};
 use gimli::{
     BaseAddresses, CfaRule, CieOrFde, EhFrame, EhFrameHdr, FrameDescriptionEntry, ParsedEhFrameHdr,
-    UnwindContext, UnwindSection,
+    Register, RegisterRule, UnwindContext, UnwindSection,
 };
 use object::{Object, ObjectSection};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 /// CFI index for fast CFA rule lookup
+#[derive(Clone)]
 pub struct CfiIndex {
     /// Keep file data alive
     _file_data: Arc<MappedFile>,
@@ -128,22 +129,7 @@ impl CfiIndex {
     /// Get CFA rule for given PC (file offset) and convert to CfaResult
     pub fn get_cfa_result(&self, pc: u64) -> Result<CfaResult> {
         debug!("Looking up CFA rule for PC 0x{:x}", pc);
-
-        // 1. Find FDE for this address
-        let fde = self.find_fde_for_address(pc)?;
-
-        debug!(
-            "Found FDE for PC 0x{:x}: initial_address=0x{:x}, range={}",
-            pc,
-            fde.initial_address(),
-            fde.len()
-        );
-
-        // 2. Get unwind info for specific address
-        let mut ctx = UnwindContext::new();
-        let unwind_row = fde
-            .unwind_info_for_address(&self.eh_frame, &self.bases, &mut ctx, pc)
-            .context("Failed to get unwind info for address")?;
+        let unwind_row = self.unwind_row_for_pc(pc)?;
 
         // 3. Convert gimli CfaRule to our CfaResult
         let cfa = match unwind_row.cfa() {
@@ -167,6 +153,62 @@ impl CfiIndex {
         debug!("CFA result at PC 0x{:x}: {:?}", pc, cfa);
 
         Ok(cfa)
+    }
+
+    /// Recover a caller-frame register value as ComputeStep[] that can be
+    /// evaluated from the current frame state.
+    pub fn recover_caller_register_steps(
+        &self,
+        pc: u64,
+        register: u16,
+    ) -> Result<Option<Vec<ComputeStep>>> {
+        let unwind_row = self.unwind_row_for_pc(pc)?;
+        let cfa_steps = self.cfa_steps(unwind_row.cfa())?;
+
+        let rule = unwind_row
+            .register(Register(register))
+            .or_else(|| Self::default_register_rule(register));
+
+        match rule {
+            Some(RegisterRule::Undefined) => Ok(None),
+            Some(RegisterRule::SameValue) => Ok(Some(vec![ComputeStep::LoadRegister(register)])),
+            Some(RegisterRule::Register(other)) => {
+                Ok(Some(vec![ComputeStep::LoadRegister(other.0)]))
+            }
+            Some(RegisterRule::Offset(offset)) => {
+                let mut steps = cfa_steps;
+                if offset != 0 {
+                    steps.push(ComputeStep::PushConstant(offset));
+                    steps.push(ComputeStep::Add);
+                }
+                steps.push(ComputeStep::Dereference {
+                    size: crate::core::MemoryAccessSize::U64,
+                });
+                Ok(Some(steps))
+            }
+            Some(RegisterRule::ValOffset(offset)) => {
+                let mut steps = cfa_steps;
+                if offset != 0 {
+                    steps.push(ComputeStep::PushConstant(offset));
+                    steps.push(ComputeStep::Add);
+                }
+                Ok(Some(steps))
+            }
+            Some(RegisterRule::Expression(expr)) => {
+                let mut steps = self.parse_unwind_expression(expr)?;
+                steps.push(ComputeStep::Dereference {
+                    size: crate::core::MemoryAccessSize::U64,
+                });
+                Ok(Some(steps))
+            }
+            Some(RegisterRule::ValExpression(expr)) => {
+                Ok(Some(self.parse_unwind_expression(expr)?))
+            }
+            Some(RegisterRule::Constant(value)) => {
+                Ok(Some(vec![ComputeStep::PushConstant(value as i64)]))
+            }
+            Some(RegisterRule::Architectural) | None => Ok(None),
+        }
     }
 
     /// Find FDE for given address using eh_frame_hdr if available
@@ -219,6 +261,57 @@ impl CfiIndex {
             }
 
             Err(anyhow!("No FDE found for address 0x{:x}", address))
+        }
+    }
+
+    fn unwind_row_for_pc(&self, pc: u64) -> Result<gimli::UnwindTableRow<usize>> {
+        let fde = self.find_fde_for_address(pc)?;
+
+        debug!(
+            "Found FDE for PC 0x{:x}: initial_address=0x{:x}, range={}",
+            pc,
+            fde.initial_address(),
+            fde.len()
+        );
+
+        let mut ctx = UnwindContext::new();
+        fde.unwind_info_for_address(&self.eh_frame, &self.bases, &mut ctx, pc)
+            .context("Failed to get unwind info for address")
+            .cloned()
+    }
+
+    fn cfa_steps(&self, rule: &CfaRule<usize>) -> Result<Vec<ComputeStep>> {
+        match rule {
+            CfaRule::RegisterAndOffset { register, offset } => {
+                let mut steps = vec![ComputeStep::LoadRegister(register.0)];
+                if *offset != 0 {
+                    steps.push(ComputeStep::PushConstant(*offset));
+                    steps.push(ComputeStep::Add);
+                }
+                Ok(steps)
+            }
+            CfaRule::Expression(expr) => self.parse_unwind_expression(*expr),
+        }
+    }
+
+    fn parse_unwind_expression(
+        &self,
+        expr: gimli::UnwindExpression<usize>,
+    ) -> Result<Vec<ComputeStep>> {
+        use gimli::Reader;
+
+        let expression = expr.get(&self.eh_frame)?;
+        let temp = expression.0.to_slice().ok();
+        let expr_bytes = temp.as_deref().unwrap_or(&[]);
+        self.parse_dwarf_expression(expr_bytes)
+    }
+
+    fn default_register_rule(register: u16) -> Option<RegisterRule<usize>> {
+        match register {
+            // x86_64 callee-saved general-purpose registers remain valid in the
+            // current pt_regs snapshot when there is no explicit unwind rule.
+            3 | 6 | 12..=15 => Some(RegisterRule::SameValue),
+            _ => None,
         }
     }
 

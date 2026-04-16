@@ -182,7 +182,6 @@ async fn test_optimized_inline_parameters_survive_internal_call_sites() -> anyho
         "inline_call_value_program.c",
         INLINE_AFTER_CALL_TRACE_LINE,
     )?;
-    target.terminate().await?;
 
     anyhow::ensure!(
         !pid_results.is_empty(),
@@ -191,6 +190,7 @@ async fn test_optimized_inline_parameters_survive_internal_call_sites() -> anyho
     for result in &pid_results {
         assert_not_internal_call_register_aliases(&result.parameters, result.address)?;
     }
+    target.terminate().await?;
 
     Ok(())
 }

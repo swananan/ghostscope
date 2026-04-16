@@ -8,6 +8,7 @@
 use crate::{
     binary::DwarfReader,
     core::{attr_u64, EvaluationResult, Result},
+    index::{CfiIndex, FunctionBlocks},
     parser::ExpressionEvaluator,
     semantics::{
         eval_member_offset_expr, resolve_name_with_origins,
@@ -729,6 +730,7 @@ impl DetailedParser {
     // parse_variable_entry wrapper removed; use parse_variable_entry_with_mode
 
     /// Parse a variable and optionally skip full DWARF type resolution
+    #[allow(clippy::too_many_arguments)]
     pub fn parse_variable_entry_with_mode(
         &mut self,
         entry: &gimli::DebuggingInformationEntry<DwarfReader>,
@@ -736,6 +738,8 @@ impl DetailedParser {
         dwarf: &gimli::Dwarf<DwarfReader>,
         address: u64,
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
+        function_context: Option<&FunctionBlocks>,
+        cfi_index: Option<&CfiIndex>,
         scope_depth: usize,
     ) -> Result<Option<VariableWithEvaluation>> {
         // No traversal context retained in shallow mode
@@ -746,7 +750,15 @@ impl DetailedParser {
         };
         let is_parameter = entry.tag() == gimli::constants::DW_TAG_formal_parameter;
         let type_name = Self::resolve_type_name(entry, unit, dwarf)?;
-        let evaluation_result = self.parse_location(entry, unit, dwarf, address, get_cfa)?;
+        let evaluation_result = self.parse_location(
+            entry,
+            unit,
+            dwarf,
+            address,
+            get_cfa,
+            function_context,
+            cfi_index,
+        )?;
         // Full type resolution disabled in shallow mode
         let dwarf_type = None;
         Ok(Some(VariableWithEvaluation {
@@ -838,6 +850,7 @@ impl DetailedParser {
     }
 
     /// Parse location attribute
+    #[allow(clippy::too_many_arguments)]
     pub fn parse_location(
         &self,
         entry: &gimli::DebuggingInformationEntry<DwarfReader>,
@@ -845,9 +858,19 @@ impl DetailedParser {
         dwarf: &gimli::Dwarf<DwarfReader>,
         address: u64,
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
+        function_context: Option<&FunctionBlocks>,
+        cfi_index: Option<&CfiIndex>,
     ) -> Result<EvaluationResult> {
         // Use ExpressionEvaluator for unified logic
-        ExpressionEvaluator::evaluate_location(entry, unit, dwarf, address, get_cfa)
+        ExpressionEvaluator::evaluate_location(
+            entry,
+            unit,
+            dwarf,
+            address,
+            get_cfa,
+            function_context,
+            cfi_index,
+        )
     }
 
     // extract_name removed; call resolve_name_with_origins directly when needed

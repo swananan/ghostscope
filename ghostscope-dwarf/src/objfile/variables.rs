@@ -85,6 +85,8 @@ impl LoadedObjfile {
             &self.dwarf,
             address,
             get_cfa,
+            None,
+            self.cfi_index.as_ref(),
             0,
         )?;
         tracing::debug!("DWARF:plan_from_var done");
@@ -191,6 +193,8 @@ impl LoadedObjfile {
         address: u64,
         items: &[(gimli::DebugInfoOffset, gimli::UnitOffset)],
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
+        function_context: Option<&FunctionBlocks>,
+        cfi_index: Option<&crate::index::CfiIndex>,
     ) -> Result<Vec<crate::VariableWithEvaluation>> {
         let mut vars = Vec::with_capacity(items.len());
         for (cu_off, die_off) in items.iter().cloned() {
@@ -203,6 +207,8 @@ impl LoadedObjfile {
                 &self.dwarf,
                 address,
                 get_cfa,
+                function_context,
+                cfi_index,
                 0,
             )? {
                 vars.push(v);
@@ -313,10 +319,13 @@ impl LoadedObjfile {
                     .iter()
                     .map(|v| (v.cu_offset, v.die_offset))
                     .collect();
+                let cfi_index = self.cfi_index.clone();
                 let mut vars = self.resolve_variables_by_offsets_at_address_with_cfa(
                     address,
                     &items,
                     Some(&get_cfa_closure),
+                    Some(&func),
+                    cfi_index.as_ref(),
                 )?;
 
                 let dwarf_ref = self.dwarf();
@@ -462,10 +471,13 @@ impl LoadedObjfile {
                         if chain.is_empty() {
                             let one = vec![(func.cu_offset, v.die_offset)];
                             let t1 = Instant::now();
+                            let cfi_index = self.cfi_index.clone();
                             let vars = self.resolve_variables_by_offsets_at_address_with_cfa(
                                 address,
                                 &one,
                                 Some(&get_cfa_closure),
+                                Some(&func),
+                                cfi_index.as_ref(),
                             )?;
                             let mut var_opt = vars.into_iter().next();
                             let mut type_ms = 0u128;
@@ -609,6 +621,8 @@ impl LoadedObjfile {
                                 dwarf,
                                 pc,
                                 None,
+                                None,
+                                None,
                             )
                             .ok()
                         }
@@ -619,6 +633,8 @@ impl LoadedObjfile {
                                 gimli::LocationListsOffset(offset.0),
                                 pc,
                                 None,
+                                None,
+                                None,
                             )
                             .ok()
                         }
@@ -628,6 +644,8 @@ impl LoadedObjfile {
                                 dwarf,
                                 gimli::LocationListsOffset(offset),
                                 pc,
+                                None,
+                                None,
                                 None,
                             )
                             .ok()
@@ -718,6 +736,6 @@ impl LoadedObjfile {
         address: u64,
         items: &[(gimli::DebugInfoOffset, gimli::UnitOffset)],
     ) -> Result<Vec<crate::VariableWithEvaluation>> {
-        self.resolve_variables_by_offsets_at_address_with_cfa(address, items, None)
+        self.resolve_variables_by_offsets_at_address_with_cfa(address, items, None, None, None)
     }
 }
