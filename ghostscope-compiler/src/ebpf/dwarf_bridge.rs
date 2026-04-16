@@ -2389,4 +2389,31 @@ mod tests {
             "scalar reads should use per-invocation scratch, not shared temp globals"
         );
     }
+
+    #[test]
+    fn computed_location_supports_dereference_before_trailing_arithmetic() {
+        let llctx = LlvmContext::create();
+        let opts = crate::CompileOptions::default();
+        let mut ctx = EbpfContext::new(&llctx, "computed_addr", Some(0), &opts).expect("ctx");
+        ctx.create_basic_ebpf_function("f").expect("fn");
+        ctx.__test_ensure_proc_offsets_map().expect("map");
+        ctx.__test_alloc_pm_key().expect("pm_key");
+        ctx.set_compile_time_context(0, "/nonexistent/module".to_string());
+
+        let eval = EvaluationResult::MemoryLocation(LocationResult::ComputedLocation {
+            steps: vec![
+                ComputeStep::PushConstant(0x3000),
+                ComputeStep::Dereference {
+                    size: MemoryAccessSize::U64,
+                },
+                ComputeStep::PushConstant(16),
+                ComputeStep::Add,
+            ],
+        });
+
+        let addr = ctx
+            .evaluation_result_to_address_with_hint(&eval, None, None)
+            .expect("computed address with mid-stream dereference should compile");
+        assert_eq!(addr.get_type().get_bit_width(), 64);
+    }
 }

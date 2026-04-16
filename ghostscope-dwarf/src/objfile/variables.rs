@@ -13,6 +13,11 @@ pub(super) struct ChainSpec<'a> {
     pub fields: &'a [String],
 }
 
+pub(super) struct VariableEvalContext<'a> {
+    pub get_cfa: Option<&'a dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
+    pub function_context: Option<&'a FunctionBlocks>,
+}
+
 impl LoadedObjfile {
     fn find_innermost_inline_node(func: &FunctionBlocks, pc: u64) -> Option<usize> {
         let path = func.block_path_for_pc(pc);
@@ -64,7 +69,7 @@ impl LoadedObjfile {
         subprogram_die: gimli::UnitOffset,
         var_die: gimli::UnitOffset,
         chain: ChainSpec<'_>,
-        get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
+        eval_context: VariableEvalContext<'_>,
     ) -> Result<Option<crate::parser::VariableWithEvaluation>> {
         tracing::info!(
             "DWARF:plan_from_var addr=0x{:x} cu_off={:?} subprogram={:?} var_die={:?} base='{}' chain_len={}",
@@ -84,8 +89,8 @@ impl LoadedObjfile {
             &unit,
             &self.dwarf,
             address,
-            get_cfa,
-            None,
+            eval_context.get_cfa,
+            eval_context.function_context,
             self.cfi_index.as_ref(),
             0,
         )?;
@@ -523,7 +528,10 @@ impl LoadedObjfile {
                                 base: base_var,
                                 fields: chain,
                             },
-                            Some(&get_cfa_closure),
+                            VariableEvalContext {
+                                get_cfa: Some(&get_cfa_closure),
+                                function_context: Some(&func),
+                            },
                         )?;
                         tracing::info!(
                             "DWARF:plan_chain var_match='{}' plan_ms={} total_ms={}",
@@ -549,7 +557,10 @@ impl LoadedObjfile {
                         base: base_var,
                         fields: chain,
                     },
-                    None,
+                    VariableEvalContext {
+                        get_cfa: None,
+                        function_context: None,
+                    },
                 ) {
                     Ok(Some(v)) => {
                         tracing::info!(

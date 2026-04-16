@@ -20,7 +20,10 @@ impl LoadedObjfile {
                 base: "__global__",
                 fields,
             },
-            None,
+            super::variables::VariableEvalContext {
+                get_cfa: None,
+                function_context: None,
+            },
         )?;
         let Some(var) = planned else {
             return Ok(None);

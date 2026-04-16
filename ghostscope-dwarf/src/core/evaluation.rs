@@ -9,6 +9,7 @@
 //! 3. Clearly separate value semantics from location semantics
 //! 4. Make register dependencies explicit for eBPF verification
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 /// Result of evaluating a DWARF expression for eBPF code generation
@@ -85,6 +86,19 @@ pub enum CfaResult {
     },
     /// CFA computed by DWARF expression
     Expression { steps: Vec<ComputeStep> },
+}
+
+/// Caller-frame recovery rules materialized as ComputeStep[] for compiler/eBPF use.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallerFrameRecovery {
+    /// Steps that compute the current frame's CFA.
+    pub cfa_steps: Vec<ComputeStep>,
+    /// DWARF register number that holds the caller's return address.
+    pub return_address_register: u16,
+    /// Steps that recover the caller PC from the current frame.
+    pub caller_pc_steps: Vec<ComputeStep>,
+    /// Per-register recovery steps keyed by DWARF register number.
+    pub register_recovery_steps: BTreeMap<u16, Vec<ComputeStep>>,
 }
 
 /// Piece of a composite location

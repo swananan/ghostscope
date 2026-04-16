@@ -1,7 +1,10 @@
 //! Main DWARF analyzer - unified entry point for all DWARF operations
 
 use crate::{
-    core::{mapping::ModuleMapping, GlobalVariableInfo, ModuleAddress, Result, SourceLocation},
+    core::{
+        mapping::ModuleMapping, CallerFrameRecovery, GlobalVariableInfo, ModuleAddress, Result,
+        SourceLocation,
+    },
     objfile::LoadedObjfile,
 };
 use object::{Object, ObjectSection};
@@ -605,6 +608,19 @@ impl DwarfAnalyzer {
     ) -> Result<Option<crate::VariableWithEvaluation>> {
         if let Some(module_data) = self.modules.get_mut(&module_address.module_path) {
             module_data.plan_chain_access(module_address.address, base_var, chain)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Recover the direct caller frame at a module address as ComputeStep[].
+    pub fn recover_caller_frame(
+        &self,
+        module_address: &ModuleAddress,
+        registers: &[u16],
+    ) -> Result<Option<CallerFrameRecovery>> {
+        if let Some(module_data) = self.modules.get(&module_address.module_path) {
+            module_data.recover_caller_frame(module_address.address, registers)
         } else {
             Ok(None)
         }

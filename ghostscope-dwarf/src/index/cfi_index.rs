@@ -5,7 +5,7 @@
 
 use crate::{
     binary::{DwarfReader, MappedFile},
-    core::{CfaResult, ComputeStep, Result},
+    core::{CallerFrameRecovery, CfaResult, ComputeStep, Result},
 };
 use anyhow::{anyhow, Context};
 use gimli::{
@@ -13,7 +13,7 @@ use gimli::{
     Register, RegisterRule, UnwindContext, UnwindSection,
 };
 use object::{Object, ObjectSection};
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 use tracing::{debug, info, warn};
 
 /// CFI index for fast CFA rule lookup
@@ -162,53 +162,44 @@ impl CfiIndex {
         pc: u64,
         register: u16,
     ) -> Result<Option<Vec<ComputeStep>>> {
-        let unwind_row = self.unwind_row_for_pc(pc)?;
+        let recovery = self.recover_caller_frame(pc, &[register])?;
+        Ok(recovery.register_recovery_steps.get(&register).cloned())
+    }
+
+    /// Recover the direct caller frame at `pc` as ComputeStep[].
+    pub fn recover_caller_frame(&self, pc: u64, registers: &[u16]) -> Result<CallerFrameRecovery> {
+        let fde = self.find_fde_for_address(pc)?;
+        let mut ctx = UnwindContext::new();
+        let unwind_row = fde
+            .unwind_info_for_address(&self.eh_frame, &self.bases, &mut ctx, pc)
+            .context("Failed to get unwind info for address")?
+            .clone();
+
         let cfa_steps = self.cfa_steps(unwind_row.cfa())?;
+        let return_address_register = fde.cie().return_address_register().0;
+        let caller_pc_steps = self
+            .register_rule_steps(&unwind_row, return_address_register)?
+            .ok_or_else(|| {
+                anyhow!(
+                    "no caller PC recovery rule for DWARF register {} at 0x{:x}",
+                    return_address_register,
+                    pc
+                )
+            })?;
 
-        let rule = unwind_row
-            .register(Register(register))
-            .or_else(|| Self::default_register_rule(register));
-
-        match rule {
-            Some(RegisterRule::Undefined) => Ok(None),
-            Some(RegisterRule::SameValue) => Ok(Some(vec![ComputeStep::LoadRegister(register)])),
-            Some(RegisterRule::Register(other)) => {
-                Ok(Some(vec![ComputeStep::LoadRegister(other.0)]))
+        let mut register_recovery_steps = BTreeMap::new();
+        for &register in registers {
+            if let Some(steps) = self.register_rule_steps(&unwind_row, register)? {
+                register_recovery_steps.insert(register, steps);
             }
-            Some(RegisterRule::Offset(offset)) => {
-                let mut steps = cfa_steps;
-                if offset != 0 {
-                    steps.push(ComputeStep::PushConstant(offset));
-                    steps.push(ComputeStep::Add);
-                }
-                steps.push(ComputeStep::Dereference {
-                    size: crate::core::MemoryAccessSize::U64,
-                });
-                Ok(Some(steps))
-            }
-            Some(RegisterRule::ValOffset(offset)) => {
-                let mut steps = cfa_steps;
-                if offset != 0 {
-                    steps.push(ComputeStep::PushConstant(offset));
-                    steps.push(ComputeStep::Add);
-                }
-                Ok(Some(steps))
-            }
-            Some(RegisterRule::Expression(expr)) => {
-                let mut steps = self.parse_unwind_expression(expr)?;
-                steps.push(ComputeStep::Dereference {
-                    size: crate::core::MemoryAccessSize::U64,
-                });
-                Ok(Some(steps))
-            }
-            Some(RegisterRule::ValExpression(expr)) => {
-                Ok(Some(self.parse_unwind_expression(expr)?))
-            }
-            Some(RegisterRule::Constant(value)) => {
-                Ok(Some(vec![ComputeStep::PushConstant(value as i64)]))
-            }
-            Some(RegisterRule::Architectural) | None => Ok(None),
         }
+
+        Ok(CallerFrameRecovery {
+            cfa_steps,
+            return_address_register,
+            caller_pc_steps,
+            register_recovery_steps,
+        })
     }
 
     /// Find FDE for given address using eh_frame_hdr if available
@@ -291,6 +282,58 @@ impl CfiIndex {
                 Ok(steps)
             }
             CfaRule::Expression(expr) => self.parse_unwind_expression(*expr),
+        }
+    }
+
+    fn register_rule_steps(
+        &self,
+        unwind_row: &gimli::UnwindTableRow<usize>,
+        register: u16,
+    ) -> Result<Option<Vec<ComputeStep>>> {
+        let cfa_steps = self.cfa_steps(unwind_row.cfa())?;
+        let rule = unwind_row
+            .register(Register(register))
+            .or_else(|| Self::default_register_rule(register));
+
+        match rule {
+            Some(RegisterRule::Undefined) => Ok(None),
+            Some(RegisterRule::SameValue) => Ok(Some(vec![ComputeStep::LoadRegister(register)])),
+            Some(RegisterRule::Register(other)) => {
+                Ok(Some(vec![ComputeStep::LoadRegister(other.0)]))
+            }
+            Some(RegisterRule::Offset(offset)) => {
+                let mut steps = cfa_steps;
+                if offset != 0 {
+                    steps.push(ComputeStep::PushConstant(offset));
+                    steps.push(ComputeStep::Add);
+                }
+                steps.push(ComputeStep::Dereference {
+                    size: crate::core::MemoryAccessSize::U64,
+                });
+                Ok(Some(steps))
+            }
+            Some(RegisterRule::ValOffset(offset)) => {
+                let mut steps = cfa_steps;
+                if offset != 0 {
+                    steps.push(ComputeStep::PushConstant(offset));
+                    steps.push(ComputeStep::Add);
+                }
+                Ok(Some(steps))
+            }
+            Some(RegisterRule::Expression(expr)) => {
+                let mut steps = self.parse_unwind_expression(expr)?;
+                steps.push(ComputeStep::Dereference {
+                    size: crate::core::MemoryAccessSize::U64,
+                });
+                Ok(Some(steps))
+            }
+            Some(RegisterRule::ValExpression(expr)) => {
+                Ok(Some(self.parse_unwind_expression(expr)?))
+            }
+            Some(RegisterRule::Constant(value)) => {
+                Ok(Some(vec![ComputeStep::PushConstant(value as i64)]))
+            }
+            Some(RegisterRule::Architectural) | None => Ok(None),
         }
     }
 

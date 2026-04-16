@@ -87,6 +87,17 @@ impl LoadedObjfile {
         }
     }
 
+    pub(crate) fn recover_caller_frame(
+        &self,
+        pc: u64,
+        registers: &[u16],
+    ) -> Result<Option<crate::core::CallerFrameRecovery>> {
+        match &self.cfi_index {
+            Some(cfi) => Ok(Some(cfi.recover_caller_frame(pc, registers)?)),
+            None => Ok(None),
+        }
+    }
+
     pub(crate) fn vaddr_to_file_offset(&self, vaddr: u64) -> Option<u64> {
         if self._binary_mapped_file.data.is_empty() {
             return None;
