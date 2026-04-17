@@ -6,6 +6,7 @@ use crate::binary::DwarfReader;
 use crate::core::{
     ComputeStep, DirectValueResult, EvaluationResult, LocationResult, MemoryAccessSize, Result,
 };
+use crate::index::{CfiIndex, FunctionBlocks};
 use crate::semantics::{range_contains_pc, resolve_attr_with_unit_origins};
 use gimli::{read::RawLocListEntry, EndianSlice, Expression, LittleEndian, Operation, Reader};
 use tracing::{debug, trace, warn};
@@ -23,16 +24,30 @@ impl ExpressionEvaluator {
         dwarf: &gimli::Dwarf<DwarfReader>,
         address: u64,
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
+        function_context: Option<&FunctionBlocks>,
+        cfi_index: Option<&CfiIndex>,
     ) -> Result<EvaluationResult> {
-        Self::evaluate_location_with_depth(entry, unit, dwarf, address, get_cfa, 0)
+        Self::evaluate_location_with_depth(
+            entry,
+            unit,
+            dwarf,
+            address,
+            get_cfa,
+            function_context,
+            cfi_index,
+            0,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn evaluate_location_with_depth(
         entry: &gimli::DebuggingInformationEntry<DwarfReader>,
         unit: &gimli::Unit<DwarfReader>,
         dwarf: &gimli::Dwarf<DwarfReader>,
         address: u64,
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
+        function_context: Option<&FunctionBlocks>,
+        cfi_index: Option<&CfiIndex>,
         depth: usize,
     ) -> Result<EvaluationResult> {
         // Get DW_AT_location attribute (follow origins/specification for inlined/declared vars)
@@ -49,6 +64,8 @@ impl ExpressionEvaluator {
                     Some(dwarf),
                     address,
                     get_cfa,
+                    function_context,
+                    cfi_index,
                     depth,
                 )
             }
@@ -64,6 +81,25 @@ impl ExpressionEvaluator {
                     gimli::LocationListsOffset(offset.0),
                     address,
                     get_cfa,
+                    function_context,
+                    cfi_index,
+                    depth,
+                )
+            }
+            Some(gimli::AttributeValue::DebugLocListsIndex(index)) => {
+                let offset = dwarf.locations_offset(unit, index)?;
+                debug!(
+                    "Found DebugLocListsIndex {:?} -> offset 0x{:x}, parsing location list",
+                    index, offset.0
+                );
+                Self::parse_location_lists_with_depth(
+                    unit,
+                    dwarf,
+                    offset,
+                    address,
+                    get_cfa,
+                    function_context,
+                    cfi_index,
                     depth,
                 )
             }
@@ -79,6 +115,8 @@ impl ExpressionEvaluator {
                     gimli::LocationListsOffset(offset),
                     address,
                     get_cfa,
+                    function_context,
+                    cfi_index,
                     depth,
                 )
             }
@@ -116,6 +154,8 @@ impl ExpressionEvaluator {
                                 Some(dwarf),
                                 address,
                                 get_cfa,
+                                function_context,
+                                cfi_index,
                                 depth,
                             )? {
                                 EvaluationResult::DirectValue(v) => {
@@ -155,6 +195,8 @@ impl ExpressionEvaluator {
         dwarf: &gimli::Dwarf<DwarfReader>,
         address: u64,
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
+        function_context: Option<&FunctionBlocks>,
+        cfi_index: Option<&CfiIndex>,
     ) -> Result<EvaluationResult> {
         Self::parse_expression_with_context(
             expr_bytes,
@@ -162,16 +204,42 @@ impl ExpressionEvaluator {
             Some(dwarf),
             address,
             get_cfa,
+            function_context,
+            cfi_index,
             0,
         )
     }
 
+    pub(crate) fn parse_expression_to_steps_in_unit(
+        expr_bytes: &[u8],
+        unit: &gimli::Unit<DwarfReader>,
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        address: u64,
+        get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
+        function_context: Option<&FunctionBlocks>,
+        cfi_index: Option<&CfiIndex>,
+    ) -> Result<Vec<ComputeStep>> {
+        let evaluation = Self::parse_expression_in_unit(
+            expr_bytes,
+            unit,
+            dwarf,
+            address,
+            get_cfa,
+            function_context,
+            cfi_index,
+        )?;
+        Self::evaluation_result_to_steps(evaluation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn parse_expression_with_context(
         expr_bytes: &[u8],
         encoding: gimli::Encoding,
         dwarf: Option<&gimli::Dwarf<DwarfReader>>,
         address: u64,
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
+        function_context: Option<&FunctionBlocks>,
+        cfi_index: Option<&CfiIndex>,
         depth: usize,
     ) -> Result<EvaluationResult> {
         if expr_bytes.is_empty() {
@@ -179,20 +247,84 @@ impl ExpressionEvaluator {
         }
 
         // Parse all expressions through unified handler
-        Self::parse_full_expression(expr_bytes, encoding, dwarf, address, get_cfa, depth)
+        Self::parse_full_expression(
+            expr_bytes,
+            encoding,
+            dwarf,
+            address,
+            get_cfa,
+            function_context,
+            cfi_index,
+            depth,
+        )
+    }
+
+    fn evaluation_result_to_steps(evaluation: EvaluationResult) -> Result<Vec<ComputeStep>> {
+        match evaluation {
+            EvaluationResult::DirectValue(DirectValueResult::RegisterValue(register)) => {
+                Ok(vec![ComputeStep::LoadRegister(register)])
+            }
+            EvaluationResult::DirectValue(DirectValueResult::Constant(value)) => {
+                Ok(vec![ComputeStep::PushConstant(value)])
+            }
+            EvaluationResult::DirectValue(DirectValueResult::AbsoluteAddress(address)) => {
+                Ok(vec![ComputeStep::PushConstant(address as i64)])
+            }
+            EvaluationResult::DirectValue(DirectValueResult::ComputedValue { steps, .. }) => {
+                Ok(steps)
+            }
+            EvaluationResult::MemoryLocation(LocationResult::RegisterAddress {
+                register,
+                offset,
+                ..
+            }) => Ok(Self::register_address_steps(register, offset)),
+            EvaluationResult::MemoryLocation(LocationResult::Address(address)) => {
+                Ok(vec![ComputeStep::PushConstant(address as i64)])
+            }
+            EvaluationResult::MemoryLocation(LocationResult::ComputedLocation { steps }) => {
+                Ok(steps)
+            }
+            EvaluationResult::DirectValue(DirectValueResult::ImplicitValue(_)) => Err(
+                anyhow::anyhow!("DWARF expression lowered to implicit bytes, not ComputeStep[]"),
+            ),
+            EvaluationResult::Optimized => Err(anyhow::anyhow!(
+                "DWARF expression optimized out, no ComputeStep[]"
+            )),
+            EvaluationResult::Composite(_) => Err(anyhow::anyhow!(
+                "composite DWARF expression cannot be represented as one ComputeStep[]"
+            )),
+        }
+    }
+
+    fn register_address_steps(register: u16, offset: Option<i64>) -> Vec<ComputeStep> {
+        let mut steps = vec![ComputeStep::LoadRegister(register)];
+        if let Some(offset) = offset.filter(|offset| *offset != 0) {
+            steps.push(ComputeStep::PushConstant(offset));
+            steps.push(ComputeStep::Add);
+        }
+        steps
     }
 
     /// Parse a full multi-operation DWARF expression
+    #[allow(clippy::too_many_arguments)]
     fn parse_full_expression(
         expr_bytes: &[u8],
         encoding: gimli::Encoding,
         dwarf: Option<&gimli::Dwarf<DwarfReader>>,
         address: u64,
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
+        function_context: Option<&FunctionBlocks>,
+        cfi_index: Option<&CfiIndex>,
         depth: usize,
     ) -> Result<EvaluationResult> {
+        #[derive(Debug)]
+        enum ParsedOperation<R: Reader<Offset = usize>> {
+            Operation(Operation<R>),
+            PrecomputedSteps(Vec<ComputeStep>),
+        }
+
         let mut expression = Expression(EndianSlice::new(expr_bytes, LittleEndian));
-        let mut operations = Vec::new();
+        let mut operations: Vec<ParsedOperation<_>> = Vec::new();
         let mut has_stack_value = false;
 
         // Parse all operations in the expression
@@ -217,10 +349,26 @@ impl ExpressionEvaluator {
                     if inner_ops.len() == 1 {
                         match &inner_ops[0] {
                             Operation::Register { register } => {
-                                has_stack_value = true; // value semantics, not location
-                                operations.push(Operation::Register {
-                                    register: *register,
-                                });
+                                has_stack_value = true;
+                                match Self::resolve_entry_value_register(
+                                    address,
+                                    register.0,
+                                    function_context,
+                                    cfi_index,
+                                ) {
+                                    Ok(steps) => {
+                                        operations.push(ParsedOperation::PrecomputedSteps(steps));
+                                    }
+                                    Err(error) => {
+                                        debug!(
+                                            "DW_OP_entry_value register {} unresolved at 0x{:x}: {}",
+                                            register.0,
+                                            address,
+                                            error
+                                        );
+                                        return Ok(EvaluationResult::Optimized);
+                                    }
+                                }
                             }
                             _ => {
                                 debug!("Unsupported EntryValue inner op: {:?}", inner_ops[0]);
@@ -238,7 +386,7 @@ impl ExpressionEvaluator {
                         ));
                     }
                 }
-                _ => operations.push(op),
+                _ => operations.push(ParsedOperation::Operation(op)),
             }
         }
 
@@ -250,7 +398,9 @@ impl ExpressionEvaluator {
 
         // Fast path for single operations - avoid compute processing
         if operations.len() == 1 {
-            return Self::handle_single_operation(&operations[0], dwarf, address, get_cfa, depth);
+            if let ParsedOperation::Operation(op) = &operations[0] {
+                return Self::handle_single_operation(op, dwarf, address, get_cfa, depth);
+            }
         }
 
         // Build compute steps from operations
@@ -259,9 +409,14 @@ impl ExpressionEvaluator {
 
             for op in &operations {
                 match op {
-                    Operation::RegisterOffset {
-                        register, offset, ..
-                    } => {
+                    ParsedOperation::PrecomputedSteps(precomputed) => {
+                        steps.extend(precomputed.iter().cloned());
+                    }
+                    ParsedOperation::Operation(Operation::RegisterOffset {
+                        register,
+                        offset,
+                        ..
+                    }) => {
                         // Load register and add offset if non-zero
                         steps.push(ComputeStep::LoadRegister(register.0));
                         if *offset != 0 {
@@ -269,12 +424,12 @@ impl ExpressionEvaluator {
                             steps.push(ComputeStep::Add);
                         }
                     }
-                    Operation::Register { register } => {
+                    ParsedOperation::Operation(Operation::Register { register }) => {
                         // DW_OP_reg* means the value IS in the register (direct value)
                         // We'll handle this specially below
                         steps.push(ComputeStep::LoadRegister(register.0));
                     }
-                    Operation::FrameOffset { offset } => {
+                    ParsedOperation::Operation(Operation::FrameOffset { offset }) => {
                         let Some(get_cfa_fn) = get_cfa else {
                             return Err(anyhow::anyhow!(
                                 "DW_OP_fbreg but no CFA provider available"
@@ -310,41 +465,41 @@ impl ExpressionEvaluator {
                             }
                         }
                     }
-                    Operation::PlusConstant { value } => {
+                    ParsedOperation::Operation(Operation::PlusConstant { value }) => {
                         steps.push(ComputeStep::PushConstant(*value as i64));
                         steps.push(ComputeStep::Add);
                     }
-                    Operation::Plus => steps.push(ComputeStep::Add),
-                    Operation::Minus => steps.push(ComputeStep::Sub),
-                    Operation::Mul => steps.push(ComputeStep::Mul),
-                    Operation::Div => steps.push(ComputeStep::Div),
-                    Operation::Mod => steps.push(ComputeStep::Mod),
-                    Operation::And => steps.push(ComputeStep::And),
-                    Operation::Or => steps.push(ComputeStep::Or),
-                    Operation::Xor => steps.push(ComputeStep::Xor),
-                    Operation::Shl => steps.push(ComputeStep::Shl),
-                    Operation::Shr => steps.push(ComputeStep::Shr),
-                    Operation::Shra => steps.push(ComputeStep::Shra),
-                    Operation::Not => steps.push(ComputeStep::Not),
-                    Operation::Neg => steps.push(ComputeStep::Neg),
-                    Operation::Abs => steps.push(ComputeStep::Abs),
-                    Operation::Eq => steps.push(ComputeStep::Eq),
-                    Operation::Ne => steps.push(ComputeStep::Ne),
-                    Operation::Lt => steps.push(ComputeStep::Lt),
-                    Operation::Le => steps.push(ComputeStep::Le),
-                    Operation::Gt => steps.push(ComputeStep::Gt),
-                    Operation::Ge => steps.push(ComputeStep::Ge),
-                    Operation::UnsignedConstant { value } => {
+                    ParsedOperation::Operation(Operation::Plus) => steps.push(ComputeStep::Add),
+                    ParsedOperation::Operation(Operation::Minus) => steps.push(ComputeStep::Sub),
+                    ParsedOperation::Operation(Operation::Mul) => steps.push(ComputeStep::Mul),
+                    ParsedOperation::Operation(Operation::Div) => steps.push(ComputeStep::Div),
+                    ParsedOperation::Operation(Operation::Mod) => steps.push(ComputeStep::Mod),
+                    ParsedOperation::Operation(Operation::And) => steps.push(ComputeStep::And),
+                    ParsedOperation::Operation(Operation::Or) => steps.push(ComputeStep::Or),
+                    ParsedOperation::Operation(Operation::Xor) => steps.push(ComputeStep::Xor),
+                    ParsedOperation::Operation(Operation::Shl) => steps.push(ComputeStep::Shl),
+                    ParsedOperation::Operation(Operation::Shr) => steps.push(ComputeStep::Shr),
+                    ParsedOperation::Operation(Operation::Shra) => steps.push(ComputeStep::Shra),
+                    ParsedOperation::Operation(Operation::Not) => steps.push(ComputeStep::Not),
+                    ParsedOperation::Operation(Operation::Neg) => steps.push(ComputeStep::Neg),
+                    ParsedOperation::Operation(Operation::Abs) => steps.push(ComputeStep::Abs),
+                    ParsedOperation::Operation(Operation::Eq) => steps.push(ComputeStep::Eq),
+                    ParsedOperation::Operation(Operation::Ne) => steps.push(ComputeStep::Ne),
+                    ParsedOperation::Operation(Operation::Lt) => steps.push(ComputeStep::Lt),
+                    ParsedOperation::Operation(Operation::Le) => steps.push(ComputeStep::Le),
+                    ParsedOperation::Operation(Operation::Gt) => steps.push(ComputeStep::Gt),
+                    ParsedOperation::Operation(Operation::Ge) => steps.push(ComputeStep::Ge),
+                    ParsedOperation::Operation(Operation::UnsignedConstant { value }) => {
                         steps.push(ComputeStep::PushConstant(*value as i64));
                     }
-                    Operation::SignedConstant { value } => {
+                    ParsedOperation::Operation(Operation::SignedConstant { value }) => {
                         steps.push(ComputeStep::PushConstant(*value));
                     }
-                    Operation::StackValue => {
+                    ParsedOperation::Operation(Operation::StackValue) => {
                         // This marks the result as a computed value, not a memory location
                         // Already handled by has_stack_value flag
                     }
-                    Operation::Deref { size, .. } => {
+                    ParsedOperation::Operation(Operation::Deref { size, .. }) => {
                         let mem_size = match size {
                             1 => MemoryAccessSize::U8,
                             2 => MemoryAccessSize::U16,
@@ -630,6 +785,8 @@ impl ExpressionEvaluator {
             dwarf,
             address,
             get_cfa,
+            None,
+            None,
             depth + 1,
         )
         .map_err(|e| anyhow::anyhow!("DW_OP_implicit_pointer target evaluation failed: {e}"))?;
@@ -716,16 +873,30 @@ impl ExpressionEvaluator {
         offset: gimli::LocationListsOffset<usize>,
         address: u64,
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
+        function_context: Option<&FunctionBlocks>,
+        cfi_index: Option<&CfiIndex>,
     ) -> Result<EvaluationResult> {
-        Self::parse_location_lists_with_depth(unit, dwarf, offset, address, get_cfa, 0)
+        Self::parse_location_lists_with_depth(
+            unit,
+            dwarf,
+            offset,
+            address,
+            get_cfa,
+            function_context,
+            cfi_index,
+            0,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn parse_location_lists_with_depth(
         unit: &gimli::Unit<DwarfReader>,
         dwarf: &gimli::Dwarf<DwarfReader>,
         offset: gimli::LocationListsOffset<usize>,
         address: u64,
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
+        function_context: Option<&FunctionBlocks>,
+        cfi_index: Option<&CfiIndex>,
         depth: usize,
     ) -> Result<EvaluationResult> {
         debug!(
@@ -798,6 +969,8 @@ impl ExpressionEvaluator {
                         Some(dwarf),
                         address,
                         get_cfa,
+                        function_context,
+                        cfi_index,
                         depth,
                     )?;
 
@@ -870,6 +1043,8 @@ impl ExpressionEvaluator {
                                     Some(dwarf),
                                     address,
                                     get_cfa,
+                                    function_context,
+                                    cfi_index,
                                     depth,
                                 )?;
 
@@ -903,6 +1078,8 @@ impl ExpressionEvaluator {
                                     Some(dwarf),
                                     address,
                                     get_cfa,
+                                    function_context,
+                                    cfi_index,
                                     depth,
                                 )?;
 
@@ -939,6 +1116,8 @@ impl ExpressionEvaluator {
                                     Some(dwarf),
                                     address,
                                     get_cfa,
+                                    function_context,
+                                    cfi_index,
                                     depth,
                                 )?;
 
@@ -978,6 +1157,8 @@ impl ExpressionEvaluator {
                                         Some(dwarf),
                                         address,
                                         get_cfa,
+                                        function_context,
+                                        cfi_index,
                                         depth,
                                     )?;
 
@@ -1018,6 +1199,8 @@ impl ExpressionEvaluator {
                                         Some(dwarf),
                                         address,
                                         get_cfa,
+                                        function_context,
+                                        cfi_index,
                                         depth,
                                     )?;
 
@@ -1044,6 +1227,8 @@ impl ExpressionEvaluator {
                                 Some(dwarf),
                                 address,
                                 get_cfa,
+                                function_context,
+                                cfi_index,
                                 depth,
                             )?;
 
@@ -1066,12 +1251,67 @@ impl ExpressionEvaluator {
         );
         Ok(EvaluationResult::Optimized)
     }
+
+    fn resolve_entry_value_register(
+        current_pc: u64,
+        register: u16,
+        function_context: Option<&FunctionBlocks>,
+        cfi_index: Option<&CfiIndex>,
+    ) -> Result<Vec<ComputeStep>> {
+        let function_context = function_context.ok_or_else(|| {
+            anyhow::anyhow!("DW_OP_entry_value requires function call-site context")
+        })?;
+        let parameter = function_context
+            .entry_value_parameter_for_pc(current_pc, register)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no call-site parameter found for DW_OP_entry_value register {} at 0x{:x}",
+                    register,
+                    current_pc
+                )
+            })?;
+
+        Self::materialize_caller_value_steps(&parameter.caller_value_steps, current_pc, cfi_index)
+    }
+
+    fn materialize_caller_value_steps(
+        steps: &[ComputeStep],
+        current_pc: u64,
+        cfi_index: Option<&CfiIndex>,
+    ) -> Result<Vec<ComputeStep>> {
+        let mut materialized = Vec::new();
+        for step in steps {
+            match step {
+                ComputeStep::LoadRegister(register) => {
+                    let cfi_index = cfi_index.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "DW_OP_entry_value register recovery needs CFI at 0x{:x}",
+                            current_pc
+                        )
+                    })?;
+                    let recovered = cfi_index
+                        .recover_caller_register_steps(current_pc, *register)?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "no caller register recovery rule for DWARF register {} at 0x{:x}",
+                                register,
+                                current_pc
+                            )
+                        })?;
+                    materialized.extend(recovered);
+                }
+                other => materialized.push(other.clone()),
+            }
+        }
+        Ok(materialized)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::ExpressionEvaluator;
-    use crate::core::{DirectValueResult, EvaluationResult, LocationResult};
+    use crate::core::{ComputeStep, DirectValueResult, EvaluationResult, LocationResult};
+    use crate::index::{CallSiteParameter, CallSiteRecord, FunctionBlocks};
 
     #[test]
     fn implicit_pointer_to_static_storage_preserves_absolute_address_semantics() {
@@ -1085,5 +1325,44 @@ mod tests {
             result,
             EvaluationResult::DirectValue(DirectValueResult::AbsoluteAddress(0x1244))
         );
+    }
+
+    #[test]
+    fn entry_value_uses_nearest_call_site_parameter_steps() {
+        let mut function = FunctionBlocks {
+            cu_offset: gimli::DebugInfoOffset(0),
+            die_offset: gimli::UnitOffset(0),
+            ranges: vec![],
+            nodes: vec![],
+            block_addr_map: std::collections::BTreeMap::new(),
+            call_sites: std::collections::BTreeMap::new(),
+        };
+        function.call_sites.insert(
+            0x1018,
+            vec![CallSiteRecord {
+                die_offset: gimli::UnitOffset(1),
+                return_pc: 0x1018,
+                parameters: vec![CallSiteParameter {
+                    callee_register: 5,
+                    caller_value_steps: vec![ComputeStep::PushConstant(11)],
+                }],
+            }],
+        );
+        function.call_sites.insert(
+            0x1030,
+            vec![CallSiteRecord {
+                die_offset: gimli::UnitOffset(2),
+                return_pc: 0x1030,
+                parameters: vec![CallSiteParameter {
+                    callee_register: 5,
+                    caller_value_steps: vec![ComputeStep::PushConstant(22)],
+                }],
+            }],
+        );
+
+        let steps =
+            ExpressionEvaluator::resolve_entry_value_register(0x1034, 5, Some(&function), None)
+                .expect("entry_value should resolve to the nearest call site");
+        assert_eq!(steps, vec![ComputeStep::PushConstant(22)]);
     }
 }

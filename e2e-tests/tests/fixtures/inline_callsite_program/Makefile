@@ -1,16 +1,17 @@
-CC = gcc
-BASE_CFLAGS = -Wall -Wextra -g
-CFLAGS = $(BASE_CFLAGS) -O3
+CC ?= gcc
+CFLAGS ?= -Wall -Wextra -g -O3
+BINARY ?= inline_callsite_program
+OBJ ?= $(BINARY).o
 
-all: inline_callsite_program
+all: $(BINARY)
 
-inline_callsite_program: inline_callsite_program.o
-	$(CC) $(CFLAGS) -o $@ inline_callsite_program.o
+$(BINARY): $(OBJ)
+	$(CC) $(CFLAGS) -o $@ $^
 
-inline_callsite_program.o: inline_callsite_program.c
-	$(CC) $(CFLAGS) -c -o $@ inline_callsite_program.c
+$(OBJ): inline_callsite_program.c
+	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f *.o inline_callsite_program
+	rm -f *.o inline_callsite_program inline_callsite_program_clang_dwarf5
 
 .PHONY: clean all

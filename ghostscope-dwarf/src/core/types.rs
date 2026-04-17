@@ -90,29 +90,13 @@ pub struct IndexEntry {
     /// Optional raw DW_AT_entry_pc for inline/call site DIEs.
     /// Callers should prefer `validated_entry_pc(ranges)` when selecting probe PCs.
     pub entry_pc: Option<u64>,
-    /// Explicit function role for addressable function-like DIEs.
+    /// Explicit function role classification assigned during parse.
     pub function_kind: FunctionDieKind,
 }
 
 impl IndexEntry {
     pub fn function_kind(&self) -> FunctionDieKind {
-        if self.function_kind != FunctionDieKind::NotFunction {
-            return self.function_kind;
-        }
-
-        match self.tag {
-            gimli::constants::DW_TAG_inlined_subroutine => FunctionDieKind::InlineInstance,
-            gimli::constants::DW_TAG_subprogram => {
-                if self.flags.is_inline_instance {
-                    FunctionDieKind::InlineInstance
-                } else if self.representative_addr.is_some() || self.entry_pc.is_some() {
-                    FunctionDieKind::ConcreteSubprogram
-                } else {
-                    FunctionDieKind::AbstractSubprogram
-                }
-            }
-            _ => FunctionDieKind::NotFunction,
-        }
+        self.function_kind
     }
 
     /// True when this DIE is a concrete DW_TAG_inlined_subroutine instance.
@@ -163,8 +147,6 @@ pub struct IndexFlags {
     pub is_static: bool,
     /// True if this is the program's main function
     pub is_main: bool,
-    /// True if this DIE is a concrete DW_TAG_inlined_subroutine instance.
-    pub is_inline_instance: bool,
     /// True if this DIE carries DW_AT_inline (or inherits that declaration).
     pub has_inline_attribute: bool,
     /// True if this entry uses the linkage name

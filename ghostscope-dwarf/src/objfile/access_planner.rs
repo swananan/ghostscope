@@ -349,7 +349,12 @@ impl<'dwarf> AccessPlanner<'dwarf> {
                 }
                 EvaluationResult::MemoryLocation(LocationResult::Address(value))
             }
-            EvaluationResult::DirectValue(DirectValueResult::ComputedValue { steps, .. }) => {
+            EvaluationResult::DirectValue(DirectValueResult::ComputedValue {
+                mut steps, ..
+            }) => {
+                steps.push(ComputeStep::Dereference {
+                    size: crate::core::MemoryAccessSize::U64,
+                });
                 EvaluationResult::MemoryLocation(LocationResult::ComputedLocation { steps })
             }
             other => other,
@@ -717,6 +722,25 @@ mod tests {
         assert_eq!(resolved_die, empty_struct_off);
         assert_ne!(resolved_die, full_struct_off);
         assert_ne!(resolved_cu, Some(full_cu_off));
+    }
+
+    #[test]
+    fn pointer_deref_handles_entry_value_materialized_computed_values() {
+        let eval = EvaluationResult::DirectValue(crate::core::DirectValueResult::ComputedValue {
+            steps: vec![crate::core::ComputeStep::PushConstant(0x2000)],
+            result_size: crate::core::MemoryAccessSize::U64,
+        });
+        assert_eq!(
+            AccessPlanner::compute_pointer_deref(eval),
+            EvaluationResult::MemoryLocation(crate::core::LocationResult::ComputedLocation {
+                steps: vec![
+                    crate::core::ComputeStep::PushConstant(0x2000),
+                    crate::core::ComputeStep::Dereference {
+                        size: crate::core::MemoryAccessSize::U64,
+                    },
+                ],
+            })
+        );
     }
 
     #[test]

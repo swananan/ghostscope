@@ -191,7 +191,6 @@ impl<'a> DwarfParser<'a> {
                         let flags = crate::core::IndexFlags {
                             is_static,
                             is_main,
-                            is_inline_instance: function_kind == FunctionDieKind::InlineInstance,
                             has_inline_attribute: metadata.has_inline_attribute,
                             is_linkage: metadata.is_linkage_name,
                             ..Default::default()
@@ -231,7 +230,6 @@ impl<'a> DwarfParser<'a> {
                             .unwrap_or(false);
                         let flags = crate::core::IndexFlags {
                             is_static,
-                            is_inline_instance: function_kind == FunctionDieKind::InlineInstance,
                             has_inline_attribute: metadata.has_inline_attribute,
                             is_linkage: metadata.is_linkage_name,
                             ..Default::default()
@@ -531,11 +529,13 @@ impl<'a> DwarfParser<'a> {
                 gimli::constants::DW_AT_declaration => {
                     attrs.is_declaration = Self::flag_attr_value(value);
                 }
-                gimli::constants::DW_AT_low_pc => {
-                    if let gimli::AttributeValue::Addr(addr) = value {
-                        attrs.low_pc = Some(addr);
+                gimli::constants::DW_AT_low_pc => match value {
+                    gimli::AttributeValue::Addr(addr) => attrs.low_pc = Some(addr),
+                    gimli::AttributeValue::DebugAddrIndex(index) => {
+                        attrs.low_pc = self.dwarf.address(unit, index).ok();
                     }
-                }
+                    _ => {}
+                },
                 gimli::constants::DW_AT_high_pc => match value {
                     gimli::AttributeValue::Addr(addr) => attrs.high_pc = Some(addr),
                     _ => attrs.high_pc_offset = Self::high_pc_offset_value(value),
@@ -543,12 +543,13 @@ impl<'a> DwarfParser<'a> {
                 gimli::constants::DW_AT_ranges => {
                     attrs.ranges_attr = Some(value);
                 }
-                gimli::constants::DW_AT_entry_pc => {
-                    // TODO(dwarf5): Also handle DebugAddrIndex-backed DW_AT_entry_pc.
-                    if let gimli::AttributeValue::Addr(addr) = value {
-                        attrs.entry_pc = Some(addr);
+                gimli::constants::DW_AT_entry_pc => match value {
+                    gimli::AttributeValue::Addr(addr) => attrs.entry_pc = Some(addr),
+                    gimli::AttributeValue::DebugAddrIndex(index) => {
+                        attrs.entry_pc = self.dwarf.address(unit, index).ok();
                     }
-                }
+                    _ => {}
+                },
                 gimli::constants::DW_AT_location => {
                     attrs.location_attr = Some(value);
                 }
@@ -842,6 +843,21 @@ impl<'a> DwarfParser<'a> {
                             gimli::Expression(loc.data.0),
                         ) {
                             return Ok(Some(address));
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            gimli::AttributeValue::DebugLocListsIndex(index) => {
+                if let Ok(offset) = self.dwarf.locations_offset(unit, index) {
+                    if let Ok(mut locations) = self.dwarf.locations(unit, offset) {
+                        while let Ok(Some(loc)) = locations.next() {
+                            if let Some(address) = self.extract_absolute_storage_address_from_expr(
+                                unit,
+                                gimli::Expression(loc.data.0),
+                            ) {
+                                return Ok(Some(address));
+                            }
                         }
                     }
                 }
@@ -1296,7 +1312,12 @@ mod tests {
         Expression as WriteExpression, LineProgram, Sections, Unit,
     };
     use gimli::{Format, LittleEndian};
+    use object::{Object, ObjectSection};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn build_variable_index_fixture() -> gimli::Dwarf<DwarfReader> {
         let encoding = gimli::Encoding {
@@ -1541,6 +1562,192 @@ mod tests {
             .borrow(|section| dwarf_reader_from_arc(Arc::<[u8]>::from(section.as_slice())))
     }
 
+    fn clang_available() -> bool {
+        Command::new("clang")
+            .arg("--version")
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    fn compile_inline_callsite_fixture_with_clang_dwarf5() -> anyhow::Result<PathBuf> {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("ghostscope-dwarf has no workspace parent"))?
+            .to_path_buf();
+        let source = workspace_root
+            .join("e2e-tests/tests/fixtures/inline_callsite_program/inline_callsite_program.c");
+        let unique_suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let out_dir = std::env::temp_dir().join(format!("ghostscope-fast-parser-{unique_suffix}"));
+        std::fs::create_dir_all(&out_dir)?;
+        let binary_path = out_dir.join("inline_callsite_program_clang_dwarf5");
+
+        let output = Command::new("clang")
+            .args(["-Wall", "-Wextra", "-gdwarf-5", "-O3"])
+            .arg("-o")
+            .arg(&binary_path)
+            .arg(&source)
+            .output()
+            .map_err(|e| anyhow::anyhow!("Failed to run clang for {}: {}", source.display(), e))?;
+
+        if output.status.success() {
+            Ok(binary_path)
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(anyhow::anyhow!(
+                "Failed to compile {} with clang -gdwarf-5 -O3: {}",
+                source.display(),
+                stderr
+            ))
+        }
+    }
+
+    fn load_dwarf_from_binary(path: &Path) -> anyhow::Result<gimli::Dwarf<DwarfReader>> {
+        let bytes = std::fs::read(path)
+            .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", path.display(), e))?;
+        let object = object::File::parse(&*bytes)
+            .map_err(|e| anyhow::anyhow!("Failed to parse {}: {}", path.display(), e))?;
+        let dwarf = gimli::Dwarf::load(|id| {
+            let section_data = object
+                .section_by_name(id.name())
+                .and_then(|section| section.uncompressed_data().ok())
+                .map(|data| data.into_owned())
+                .unwrap_or_default();
+            Ok::<_, gimli::Error>(dwarf_reader_from_arc(Arc::<[u8]>::from(section_data)))
+        })?;
+        Ok(dwarf)
+    }
+
+    fn read_uleb128(input: &[u8], offset: &mut usize) -> anyhow::Result<u64> {
+        let mut value = 0_u64;
+        let mut shift = 0_u32;
+        loop {
+            let byte = *input
+                .get(*offset)
+                .ok_or_else(|| anyhow::anyhow!("Unexpected EOF while reading ULEB128"))?;
+            *offset += 1;
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return Ok(value);
+            }
+            shift += 7;
+        }
+    }
+
+    fn patch_inlined_subroutine_low_pc_to_entry_pc(abbrev: &mut [u8]) -> anyhow::Result<usize> {
+        let mut offset = 0;
+        let mut patched = 0;
+
+        while offset < abbrev.len() {
+            let code = read_uleb128(abbrev, &mut offset)?;
+            if code == 0 {
+                continue;
+            }
+
+            let tag = read_uleb128(abbrev, &mut offset)?;
+            let _has_children = *abbrev
+                .get(offset)
+                .ok_or_else(|| anyhow::anyhow!("Missing abbrev children byte"))?;
+            offset += 1;
+
+            loop {
+                let name_offset = offset;
+                let name = read_uleb128(abbrev, &mut offset)?;
+                let form = read_uleb128(abbrev, &mut offset)?;
+                if name == 0 && form == 0 {
+                    break;
+                }
+
+                let is_addrx_form = matches!(
+                    form,
+                    x if x == u64::from(gimli::constants::DW_FORM_addrx.0)
+                        || x == u64::from(gimli::constants::DW_FORM_addrx1.0)
+                        || x == u64::from(gimli::constants::DW_FORM_addrx2.0)
+                        || x == u64::from(gimli::constants::DW_FORM_addrx3.0)
+                        || x == u64::from(gimli::constants::DW_FORM_addrx4.0)
+                );
+                if tag == u64::from(gimli::constants::DW_TAG_inlined_subroutine.0)
+                    && name == u64::from(gimli::constants::DW_AT_low_pc.0)
+                    && is_addrx_form
+                {
+                    *abbrev
+                        .get_mut(name_offset)
+                        .ok_or_else(|| anyhow::anyhow!("Invalid abbrev attribute offset"))? =
+                        gimli::constants::DW_AT_entry_pc.0 as u8;
+                    patched += 1;
+                }
+            }
+        }
+
+        Ok(patched)
+    }
+
+    fn rewrite_inline_fixture_entry_pc_attr(input_path: &Path) -> anyhow::Result<PathBuf> {
+        let mut bytes = std::fs::read(input_path)
+            .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", input_path.display(), e))?;
+        let (abbrev_offset, abbrev_size) = {
+            let object = object::File::parse(&*bytes)
+                .map_err(|e| anyhow::anyhow!("Failed to parse {}: {}", input_path.display(), e))?;
+            let section = object.section_by_name(".debug_abbrev").ok_or_else(|| {
+                anyhow::anyhow!("{} is missing .debug_abbrev", input_path.display())
+            })?;
+            section.file_range().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} has no file range for .debug_abbrev",
+                    input_path.display()
+                )
+            })?
+        };
+
+        let patched = patch_inlined_subroutine_low_pc_to_entry_pc(
+            &mut bytes[abbrev_offset as usize..(abbrev_offset + abbrev_size) as usize],
+        )?;
+        anyhow::ensure!(
+            patched > 0,
+            "Expected to patch at least one inline low_pc abbrev in {}",
+            input_path.display()
+        );
+
+        let unique_suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let fixture_dir = input_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", input_path.display()))?;
+        let out_dir = fixture_dir.join(format!(".ghostscope-fast-parser-patched-{unique_suffix}"));
+        std::fs::create_dir_all(&out_dir)?;
+        let output_path = out_dir.join("inline_callsite_program_entry_pc_addrx");
+        std::fs::write(&output_path, &bytes)?;
+        let perms = std::fs::metadata(input_path)?.permissions().mode();
+        std::fs::set_permissions(&output_path, std::fs::Permissions::from_mode(perms))?;
+        Ok(output_path)
+    }
+
+    fn has_inline_entry_pc_debug_addr_index(dwarf: &gimli::Dwarf<DwarfReader>) -> bool {
+        let mut units = dwarf.units();
+        while let Ok(Some(header)) = units.next() {
+            let Ok(unit) = dwarf.unit(header) else {
+                continue;
+            };
+            let mut entries = unit.entries();
+            while let Ok(Some(entry)) = entries.next_dfs() {
+                if entry.tag() != gimli::constants::DW_TAG_inlined_subroutine {
+                    continue;
+                }
+                if let Some(attr) = entry.attr(gimli::constants::DW_AT_entry_pc) {
+                    if matches!(attr.value(), gimli::AttributeValue::DebugAddrIndex(_)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     #[test]
     fn parse_debug_info_skips_stack_value_address_locals_from_global_index() {
         let dwarf = build_variable_index_fixture();
@@ -1698,6 +1905,54 @@ mod tests {
             result.lightweight_index.find_cu_by_address(0x401020),
             Some(entry.unit_offset),
             "fallback CU map should cover addresses inside the function body, not just the representative address"
+        );
+    }
+
+    #[test]
+    fn parse_debug_info_resolves_debug_addr_index_entry_pc_for_inline_instances() {
+        if !clang_available() {
+            eprintln!("Skipping fast_parser DWARF5 entry_pc regression: clang is unavailable");
+            return;
+        }
+
+        let binary_path = compile_inline_callsite_fixture_with_clang_dwarf5()
+            .expect("clang dwarf5 inline fixture should compile");
+        let patched_binary_path = rewrite_inline_fixture_entry_pc_attr(&binary_path)
+            .expect("inline fixture abbrev should rewrite low_pc addrx into entry_pc addrx");
+        let dwarf = load_dwarf_from_binary(&patched_binary_path)
+            .expect("compiled inline fixture should load as DWARF");
+        assert!(
+            has_inline_entry_pc_debug_addr_index(&dwarf),
+            "patched inline fixture should expose an inlined_subroutine DW_AT_entry_pc via DW_FORM_addrx/.debug_addr"
+        );
+
+        let parser = DwarfParser { dwarf: &dwarf };
+        let result = parser
+            .parse_debug_info(patched_binary_path.to_string_lossy().as_ref())
+            .expect("fast parser should index patched clang dwarf5 inline fixture");
+
+        let inline_entries: Vec<_> = ["add3", "consume_state"]
+            .into_iter()
+            .flat_map(|name| {
+                result
+                    .lightweight_index
+                    .find_dies_by_function_name(name)
+                    .iter()
+                    .copied()
+                    .filter(|entry| {
+                        entry.function_kind() == crate::core::FunctionDieKind::InlineInstance
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        assert!(
+            !inline_entries.is_empty(),
+            "expected inline entries for clang dwarf5 inline fixture"
+        );
+        assert!(
+            inline_entries.iter().any(|entry| entry.entry_pc.is_some()),
+            "fast parser should resolve DW_FORM_addrx-backed DW_AT_entry_pc values for inline instances: {inline_entries:?}"
         );
     }
 }

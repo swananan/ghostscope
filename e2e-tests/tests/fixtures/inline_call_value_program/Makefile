@@ -1,14 +1,16 @@
-CC = gcc
+CC ?= gcc
 BASE_CFLAGS = -Wall -Wextra -g
-CFLAGS = $(BASE_CFLAGS) -O3 -fno-ipa-cp
+CFLAGS ?= $(BASE_CFLAGS) -O3 -fno-ipa-cp
+BINARY ?= inline_call_value_program
+OBJ ?= $(BINARY).o
 
-all: inline_call_value_program
+all: $(BINARY)
 
-inline_call_value_program: inline_call_value_program.o
-	$(CC) $(CFLAGS) -o $@ inline_call_value_program.o
+$(BINARY): $(OBJ)
+	$(CC) $(CFLAGS) -o $@ $^
 
-inline_call_value_program.o: inline_call_value_program.c
-	$(CC) $(CFLAGS) -c -o $@ inline_call_value_program.c
+$(OBJ): inline_call_value_program.c
+	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
 	rm -f *.o inline_call_value_program

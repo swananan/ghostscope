@@ -22,7 +22,7 @@ impl RangeExtractor {
         dwarf: &gimli::Dwarf<DwarfReader>,
     ) -> Result<Vec<(u64, u64)>> {
         // First try single range
-        if let Some(range) = Self::extract_single_range(entry)? {
+        if let Some(range) = Self::extract_single_range(entry, unit, dwarf)? {
             trace!("Found single range: 0x{:x}-0x{:x}", range.0, range.1);
             return Ok(vec![range]);
         }
@@ -41,6 +41,8 @@ impl RangeExtractor {
     /// Extract single address range from DW_AT_low_pc and DW_AT_high_pc
     pub fn extract_single_range(
         entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        dwarf: &gimli::Dwarf<DwarfReader>,
     ) -> Result<Option<(u64, u64)>> {
         let mut low_pc = None;
         let mut high_pc = None;
@@ -48,11 +50,15 @@ impl RangeExtractor {
 
         for attr in entry.attrs() {
             match attr.name() {
-                gimli::constants::DW_AT_low_pc => {
-                    if let gimli::AttributeValue::Addr(addr) = attr.value() {
-                        low_pc = Some(addr);
+                gimli::constants::DW_AT_low_pc => match attr.value() {
+                    gimli::AttributeValue::Addr(addr) => low_pc = Some(addr),
+                    gimli::AttributeValue::DebugAddrIndex(index) => {
+                        if let Ok(addr) = dwarf.address(unit, index) {
+                            low_pc = Some(addr);
+                        }
                     }
-                }
+                    _ => {}
+                },
                 gimli::constants::DW_AT_high_pc => match attr.value() {
                     gimli::AttributeValue::Addr(addr) => high_pc = Some(addr),
                     gimli::AttributeValue::Udata(offset) => high_pc_offset = Some(offset),
