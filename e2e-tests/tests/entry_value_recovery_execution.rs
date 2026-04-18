@@ -10,6 +10,7 @@ use ghostscope_dwarf::{ComputeStep, MemoryAccessSize};
 use regex::Regex;
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 use std::sync::OnceLock;
@@ -101,7 +102,7 @@ exec {binary} >>{stdout} 2>>{stderr}
         stdout = shell_quote(&stdout_log),
         stderr = shell_quote(&stderr_log),
     );
-    fs::write(&wrapper_path, wrapper)?;
+    write_wrapper_script(&wrapper_path, &wrapper)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -109,10 +110,7 @@ exec {binary} >>{stdout} 2>>{stderr}
         perms.set_mode(0o755);
         fs::set_permissions(&wrapper_path, perms)?;
     }
-    let target = TargetLauncher::binary(&wrapper_path)
-        .current_dir(base)
-        .spawn()
-        .await?;
+    let target = spawn_wrapper_target(&wrapper_path, base).await?;
     tokio::time::sleep(Duration::from_millis(500)).await;
     Ok(LoggedTarget {
         target,
@@ -127,6 +125,41 @@ fn create_runtime_log_dir(base: &Path) -> anyhow::Result<PathBuf> {
     let path = base.join(format!(".ghostscope-entry-value-runtime-{unique}"));
     fs::create_dir(&path)?;
     Ok(path)
+}
+
+fn write_wrapper_script(path: &Path, contents: &str) -> anyhow::Result<()> {
+    let mut file = fs::File::create(path)?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
+}
+
+async fn spawn_wrapper_target(wrapper_path: &Path, base: &Path) -> anyhow::Result<TargetHandle> {
+    let mut delay = Duration::from_millis(50);
+    for attempt in 0..3 {
+        match TargetLauncher::binary(wrapper_path)
+            .current_dir(base)
+            .spawn()
+            .await
+        {
+            Ok(target) => return Ok(target),
+            Err(err) if attempt < 2 && is_text_file_busy(&err) => {
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    unreachable!("spawn retry loop should return on success or the final error")
+}
+
+fn is_text_file_busy(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error)
+            == Some(libc::ETXTBSY)
+    })
 }
 
 fn read_log_file(path: &Path) -> anyhow::Result<String> {
