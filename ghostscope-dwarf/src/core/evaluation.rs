@@ -235,7 +235,7 @@ impl EvaluationResult {
                 // CFA gives us the frame base, add the frame_offset to get final location
                 EvaluationResult::MemoryLocation(LocationResult::RegisterAddress {
                     register,
-                    offset: Some(offset + frame_offset),
+                    offset: Some(offset.saturating_add(frame_offset)),
                     size: None,
                 })
             }
@@ -676,5 +676,30 @@ impl fmt::Display for ComputeStep {
                 write!(f, "entry_value_lookup[cases:{}]", cases.len())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CfaResult, EvaluationResult, LocationResult};
+
+    #[test]
+    fn merge_with_cfa_saturates_register_plus_offset() {
+        let merged = EvaluationResult::Optimized.merge_with_cfa(
+            CfaResult::RegisterPlusOffset {
+                register: 7,
+                offset: i64::MAX - 2,
+            },
+            10,
+        );
+
+        assert_eq!(
+            merged,
+            EvaluationResult::MemoryLocation(LocationResult::RegisterAddress {
+                register: 7,
+                offset: Some(i64::MAX),
+                size: None,
+            })
+        );
     }
 }
