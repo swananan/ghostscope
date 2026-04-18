@@ -628,6 +628,7 @@ impl LoadedObjfile {
                         gimli::AttributeValue::Exprloc(expr) => {
                             ExpressionEvaluator::parse_expression_in_unit(
                                 expr.0.to_slice().ok().as_deref().unwrap_or(&[]),
+                                expr.0.endian(),
                                 &unit,
                                 dwarf,
                                 pc,

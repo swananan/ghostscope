@@ -4,7 +4,7 @@
 //! by utilizing eh_frame_hdr's binary search table when available.
 
 use crate::{
-    binary::{DwarfReader, MappedFile},
+    binary::{dwarf_endian_from_object, DwarfReader, MappedFile},
     core::{CallerFrameRecovery, CfaResult, ComputeStep, Result},
 };
 use anyhow::{anyhow, Context};
@@ -46,6 +46,7 @@ impl CfiIndex {
         let object = file_data
             .parse_object()
             .context("Failed to parse object file")?;
+        let endian = dwarf_endian_from_object(&object);
 
         // Load eh_frame section (required)
         let eh_frame_section = object
@@ -56,9 +57,13 @@ impl CfiIndex {
         let (eh_frame_start, eh_frame_size) = eh_frame_section
             .file_range()
             .ok_or_else(|| anyhow!(".eh_frame section has no file range"))?;
-        let eh_frame_reader =
-            MappedFile::dwarf_reader_range(Arc::clone(&file_data), eh_frame_start, eh_frame_size)
-                .ok_or_else(|| anyhow!("Invalid .eh_frame range in mapped file"))?;
+        let eh_frame_reader = MappedFile::dwarf_reader_range(
+            Arc::clone(&file_data),
+            eh_frame_start,
+            eh_frame_size,
+            endian,
+        )
+        .ok_or_else(|| anyhow!("Invalid .eh_frame range in mapped file"))?;
         let eh_frame = EhFrame::from(eh_frame_reader);
 
         // Try to load eh_frame_hdr for fast lookup (optional)
@@ -67,9 +72,13 @@ impl CfiIndex {
                 let (hdr_start, hdr_size) = hdr_section_obj
                     .file_range()
                     .ok_or_else(|| anyhow!(".eh_frame_hdr section has no file range"))?;
-                let hdr_reader =
-                    MappedFile::dwarf_reader_range(Arc::clone(&file_data), hdr_start, hdr_size)
-                        .ok_or_else(|| anyhow!("Invalid .eh_frame_hdr range in mapped file"))?;
+                let hdr_reader = MappedFile::dwarf_reader_range(
+                    Arc::clone(&file_data),
+                    hdr_start,
+                    hdr_size,
+                    endian,
+                )
+                .ok_or_else(|| anyhow!("Invalid .eh_frame_hdr range in mapped file"))?;
                 let hdr_section = EhFrameHdr::from(hdr_reader);
 
                 // Parse with proper address_size
