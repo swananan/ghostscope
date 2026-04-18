@@ -554,14 +554,11 @@ impl<'a> BlockIndexBuilder<'a> {
         entry: &gimli::DebuggingInformationEntry<DwarfReader>,
     ) -> Option<u64> {
         let attr = entry.attr(gimli::constants::DW_AT_call_target)?;
-        let gimli::AttributeValue::Exprloc(expr) = attr.value() else {
+        let gimli::AttributeValue::Exprloc(mut expr) = attr.value() else {
             return None;
         };
-        let expr_bytes = expr.0.to_slice().ok()?;
-        let mut expression =
-            gimli::Expression(gimli::EndianSlice::new(&expr_bytes, gimli::LittleEndian));
-        let first = gimli::Operation::parse(&mut expression.0, unit.encoding()).ok()?;
-        if !expression.0.is_empty() {
+        let first = gimli::Operation::parse(&mut expr.0, unit.encoding()).ok()?;
+        if !expr.0.is_empty() {
             return None;
         }
         match first {
@@ -589,14 +586,11 @@ impl<'a> BlockIndexBuilder<'a> {
         entry: &gimli::DebuggingInformationEntry<DwarfReader>,
     ) -> Option<u16> {
         let attr = entry.attr(gimli::constants::DW_AT_location)?;
-        let gimli::AttributeValue::Exprloc(expr) = attr.value() else {
+        let gimli::AttributeValue::Exprloc(mut expr) = attr.value() else {
             return None;
         };
-        let expr_bytes = expr.0.to_slice().ok()?;
-        let mut expression =
-            gimli::Expression(gimli::EndianSlice::new(&expr_bytes, gimli::LittleEndian));
-        let first = gimli::Operation::parse(&mut expression.0, unit.encoding()).ok()?;
-        if !expression.0.is_empty() {
+        let first = gimli::Operation::parse(&mut expr.0, unit.encoding()).ok()?;
+        if !expr.0.is_empty() {
             return None;
         }
         match first {
@@ -623,9 +617,9 @@ impl<'a> BlockIndexBuilder<'a> {
                 _ => None,
             }
         })?;
-        let expr_bytes = expr.0.to_slice().ok()?;
         ExpressionEvaluator::parse_expression_to_steps_in_unit(
-            &expr_bytes,
+            expr.0.to_slice().ok().as_deref().unwrap_or(&[]),
+            expr.0.endian(),
             unit,
             self.dwarf,
             return_pc,
@@ -634,17 +628,15 @@ impl<'a> BlockIndexBuilder<'a> {
             None,
         )
         .ok()
-        .or_else(|| Self::lower_entry_value_call_site_register(unit, &expr_bytes))
+        .or_else(|| Self::lower_entry_value_call_site_register(unit, expr))
     }
 
     fn lower_entry_value_call_site_register(
         unit: &gimli::Unit<DwarfReader>,
-        expr_bytes: &[u8],
+        mut expr: gimli::Expression<DwarfReader>,
     ) -> Option<Vec<ComputeStep>> {
-        let mut expression =
-            gimli::Expression(gimli::EndianSlice::new(expr_bytes, gimli::LittleEndian));
-        let first = gimli::Operation::parse(&mut expression.0, unit.encoding()).ok()?;
-        if !expression.0.is_empty() {
+        let first = gimli::Operation::parse(&mut expr.0, unit.encoding()).ok()?;
+        if !expr.0.is_empty() {
             return None;
         }
         let gimli::Operation::EntryValue { expression: inner } = first else {
@@ -681,13 +673,13 @@ impl<'a> BlockIndexBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::binary::dwarf_reader_from_arc;
+    use crate::binary::{dwarf_reader_from_arc, dwarf_reader_from_arc_with_endian};
     use gimli::constants;
     use gimli::write::{
         Address, AttributeValue as WriteAttributeValue, Dwarf as WriteDwarf, EndianVec,
         Expression as WriteExpression, LineProgram, Sections, Unit,
     };
-    use gimli::{Format, LittleEndian, Register};
+    use gimli::{BigEndian, Format, LittleEndian, Register};
     use std::sync::Arc;
 
     fn build_call_site_fixture(
@@ -900,6 +892,95 @@ mod tests {
 
         let read_dwarf = dwarf_sections
             .borrow(|section| dwarf_reader_from_arc(Arc::<[u8]>::from(section.as_slice())));
+        let mut units = read_dwarf.units();
+        let header = units.next().unwrap().unwrap();
+        let cu_offset = header.debug_info_offset().unwrap();
+        (read_dwarf, cu_offset)
+    }
+
+    fn build_big_endian_call_target_expr_fixture(
+    ) -> (gimli::Dwarf<DwarfReader>, gimli::DebugInfoOffset) {
+        let encoding = gimli::Encoding {
+            format: Format::Dwarf32,
+            version: 5,
+            address_size: 8,
+        };
+
+        let mut dwarf = WriteDwarf::new();
+        let unit_id = dwarf.units.add(Unit::new(encoding, LineProgram::none()));
+        let unit = dwarf.units.get_mut(unit_id);
+        let root = unit.root();
+
+        let caller_id = unit.add(root, constants::DW_TAG_subprogram);
+        let caller = unit.get_mut(caller_id);
+        caller.set(
+            constants::DW_AT_name,
+            WriteAttributeValue::String(b"caller".to_vec()),
+        );
+        caller.set(
+            constants::DW_AT_low_pc,
+            WriteAttributeValue::Address(Address::Constant(0x1000)),
+        );
+        caller.set(constants::DW_AT_high_pc, WriteAttributeValue::Udata(0x40));
+
+        let callee_id = unit.add(root, constants::DW_TAG_subprogram);
+        let callee = unit.get_mut(callee_id);
+        callee.set(
+            constants::DW_AT_name,
+            WriteAttributeValue::String(b"callee".to_vec()),
+        );
+        callee.set(
+            constants::DW_AT_low_pc,
+            WriteAttributeValue::Address(Address::Constant(0x1200)),
+        );
+        callee.set(constants::DW_AT_high_pc, WriteAttributeValue::Udata(0x10));
+
+        let call_site_id = unit.add(caller_id, constants::DW_TAG_call_site);
+        let mut target_expr = WriteExpression::new();
+        target_expr.op_addr(Address::Constant(0x1200));
+        unit.get_mut(call_site_id).set(
+            constants::DW_AT_call_target,
+            WriteAttributeValue::Exprloc(target_expr),
+        );
+        unit.get_mut(call_site_id).set(
+            constants::DW_AT_call_return_pc,
+            WriteAttributeValue::Address(Address::Constant(0x1018)),
+        );
+
+        let param_id = unit.add(call_site_id, constants::DW_TAG_call_site_parameter);
+        let param = unit.get_mut(param_id);
+        let mut location = WriteExpression::new();
+        location.op_reg(Register(5));
+        param.set(
+            constants::DW_AT_location,
+            WriteAttributeValue::Exprloc(location),
+        );
+        let mut value = WriteExpression::new();
+        value.op_constu(42);
+        param.set(
+            constants::DW_AT_call_value,
+            WriteAttributeValue::Exprloc(value),
+        );
+
+        let mut sections = Sections::new(EndianVec::new(BigEndian));
+        dwarf.write(&mut sections).unwrap();
+
+        let dwarf_sections: gimli::DwarfSections<Vec<u8>> = gimli::DwarfSections::load(|id| {
+            Ok::<_, gimli::Error>(
+                sections
+                    .get(id)
+                    .map(|section| section.slice().to_vec())
+                    .unwrap_or_default(),
+            )
+        })
+        .unwrap();
+
+        let read_dwarf = dwarf_sections.borrow(|section| {
+            dwarf_reader_from_arc_with_endian(
+                Arc::<[u8]>::from(section.as_slice()),
+                gimli::RunTimeEndian::Big,
+            )
+        });
         let mut units = read_dwarf.units();
         let header = units.next().unwrap().unwrap();
         let cu_offset = header.debug_info_offset().unwrap();
@@ -1176,6 +1257,30 @@ mod tests {
             callee.incoming_call_sites.is_empty(),
             "call-site DW_AT_low_pc should not resolve a callee link"
         );
+    }
+
+    #[test]
+    fn add_functions_links_big_endian_incoming_call_sites_by_call_target_expr() {
+        let (dwarf, cu_offset) = build_big_endian_call_target_expr_fixture();
+        let builder = BlockIndexBuilder::new(&dwarf);
+        let functions = builder
+            .build_for_unit(cu_offset)
+            .expect("fixture CU should build");
+
+        let mut block_index = BlockIndex::new();
+        block_index.add_functions(functions);
+
+        let callee = block_index
+            .find_function_by_pc(0x1200)
+            .expect("callee function should be indexed");
+        let incoming = callee
+            .incoming_call_sites
+            .get(&0x1018)
+            .map(Vec::as_slice)
+            .expect("callee should have one incoming call site");
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].call_origin, None);
+        assert_eq!(incoming[0].call_target, Some(0x1200));
     }
 
     #[test]

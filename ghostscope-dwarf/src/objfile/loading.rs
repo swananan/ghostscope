@@ -1,6 +1,9 @@
 use super::LoadedObjfile;
 use crate::{
-    binary::{empty_dwarf_reader, try_load_debug_file, DwarfData, MappedFile},
+    binary::{
+        dwarf_endian_from_object, empty_dwarf_reader_with_endian, try_load_debug_file, DwarfData,
+        MappedFile,
+    },
     core::{mapping::ModuleMapping, Result},
     index::{BlockIndex, CfiIndex, TypeNameIndex},
     parser::DetailedParser,
@@ -239,18 +242,20 @@ impl LoadedObjfile {
 
     fn load_dwarf_sections(file_data: &Arc<MappedFile>) -> Result<DwarfData> {
         let object = file_data.parse_object()?;
+        let endian = dwarf_endian_from_object(&object);
 
         let load_section = |id: gimli::SectionId| -> Result<_> {
             if let Some(section) = object.section_by_name(id.name()) {
                 if let Some((start, size)) = section.file_range() {
-                    MappedFile::dwarf_reader_range(Arc::clone(file_data), start, size).ok_or_else(
-                        || anyhow::anyhow!("Invalid DWARF section range for {}", id.name()),
-                    )
+                    MappedFile::dwarf_reader_range(Arc::clone(file_data), start, size, endian)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Invalid DWARF section range for {}", id.name())
+                        })
                 } else {
-                    Ok(empty_dwarf_reader())
+                    Ok(empty_dwarf_reader_with_endian(endian))
                 }
             } else {
-                Ok(empty_dwarf_reader())
+                Ok(empty_dwarf_reader_with_endian(endian))
             }
         };
 

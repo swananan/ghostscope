@@ -2,6 +2,8 @@ use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use object::{Endianness, Object};
+
 /// Internal helper for mmap-backed file access and object parsing.
 #[derive(Debug)]
 pub(crate) struct MappedFile {
@@ -29,19 +31,24 @@ impl MappedFile {
     }
 
     /// Create a DWARF reader over the whole mapped file.
-    pub fn dwarf_reader(file: Arc<Self>) -> DwarfReader {
-        DwarfReader::new(DwarfBytes::Mapped(file), gimli::LittleEndian)
+    pub fn dwarf_reader(file: Arc<Self>, endian: DwarfEndian) -> DwarfReader {
+        DwarfReader::new(DwarfBytes::Mapped(file), endian)
     }
 
     /// Create a DWARF reader over a file range without copying the mapped data.
-    pub fn dwarf_reader_range(file: Arc<Self>, start: u64, size: u64) -> Option<DwarfReader> {
+    pub fn dwarf_reader_range(
+        file: Arc<Self>,
+        start: u64,
+        size: u64,
+        endian: DwarfEndian,
+    ) -> Option<DwarfReader> {
         let start = usize::try_from(start).ok()?;
         let size = usize::try_from(size).ok()?;
         let end = start.checked_add(size)?;
         if end > file.as_bytes().len() {
             return None;
         }
-        Some(Self::dwarf_reader(file).range(start..end))
+        Some(Self::dwarf_reader(file, endian).range(start..end))
     }
 }
 
@@ -66,13 +73,30 @@ impl Deref for DwarfBytes {
 unsafe impl gimli::StableDeref for DwarfBytes {}
 unsafe impl gimli::CloneStableDeref for DwarfBytes {}
 
-pub(crate) type DwarfReader = gimli::EndianReader<gimli::LittleEndian, DwarfBytes>;
+pub(crate) type DwarfEndian = gimli::RunTimeEndian;
+pub(crate) type DwarfReader = gimli::EndianReader<DwarfEndian, DwarfBytes>;
 pub(crate) type DwarfData = gimli::Dwarf<DwarfReader>;
 
+#[cfg(test)]
 pub(crate) fn dwarf_reader_from_arc(bytes: Arc<[u8]>) -> DwarfReader {
-    DwarfReader::new(DwarfBytes::Owned(bytes), gimli::LittleEndian)
+    dwarf_reader_from_arc_with_endian(bytes, gimli::RunTimeEndian::Little)
 }
 
-pub(crate) fn empty_dwarf_reader() -> DwarfReader {
-    dwarf_reader_from_arc(Arc::<[u8]>::from(&[][..]))
+#[cfg(test)]
+pub(crate) fn dwarf_reader_from_arc_with_endian(
+    bytes: Arc<[u8]>,
+    endian: DwarfEndian,
+) -> DwarfReader {
+    DwarfReader::new(DwarfBytes::Owned(bytes), endian)
+}
+
+pub(crate) fn empty_dwarf_reader_with_endian(endian: DwarfEndian) -> DwarfReader {
+    DwarfReader::new(DwarfBytes::Owned(Arc::<[u8]>::from(&[][..])), endian)
+}
+
+pub(crate) fn dwarf_endian_from_object(object: &object::File<'_>) -> DwarfEndian {
+    match object.endianness() {
+        Endianness::Little => gimli::RunTimeEndian::Little,
+        Endianness::Big => gimli::RunTimeEndian::Big,
+    }
 }

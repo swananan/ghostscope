@@ -2,14 +2,14 @@
 //!
 //! Converts DWARF location expressions to EvaluationResult for eBPF code generation
 
-use crate::binary::DwarfReader;
+use crate::binary::{DwarfEndian, DwarfReader};
 use crate::core::{
     ComputeStep, DirectValueResult, EntryValueCase, EvaluationResult, LocationResult,
     MemoryAccessSize, Result,
 };
 use crate::index::{CfiIndex, FunctionBlocks};
 use crate::semantics::{range_contains_pc, resolve_attr_with_unit_origins};
-use gimli::{read::RawLocListEntry, EndianSlice, Expression, LittleEndian, Operation, Reader};
+use gimli::{read::RawLocListEntry, EndianSlice, Expression, Operation, Reader};
 use tracing::{debug, trace, warn};
 
 /// DWARF expression evaluator
@@ -62,6 +62,7 @@ impl ExpressionEvaluator {
                 debug!("Found Exprloc, parsing DWARF expression");
                 Self::parse_expression_with_context(
                     expr.0.to_slice().ok().as_deref().unwrap_or(&[]),
+                    expr.0.endian(),
                     unit.encoding(),
                     Some(dwarf),
                     address,
@@ -152,6 +153,7 @@ impl ExpressionEvaluator {
                             // Some compilers may encode an implicit value via expression
                             match Self::parse_expression_with_context(
                                 expr.0.to_slice().ok().as_deref().unwrap_or(&[]),
+                                expr.0.endian(),
                                 unit.encoding(),
                                 Some(dwarf),
                                 address,
@@ -191,8 +193,10 @@ impl ExpressionEvaluator {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn parse_expression_in_unit(
         expr_bytes: &[u8],
+        endian: DwarfEndian,
         unit: &gimli::Unit<DwarfReader>,
         dwarf: &gimli::Dwarf<DwarfReader>,
         address: u64,
@@ -202,6 +206,7 @@ impl ExpressionEvaluator {
     ) -> Result<EvaluationResult> {
         Self::parse_expression_with_context(
             expr_bytes,
+            endian,
             unit.encoding(),
             Some(dwarf),
             address,
@@ -212,8 +217,10 @@ impl ExpressionEvaluator {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn parse_expression_to_steps_in_unit(
         expr_bytes: &[u8],
+        endian: DwarfEndian,
         unit: &gimli::Unit<DwarfReader>,
         dwarf: &gimli::Dwarf<DwarfReader>,
         address: u64,
@@ -223,6 +230,7 @@ impl ExpressionEvaluator {
     ) -> Result<Vec<ComputeStep>> {
         let evaluation = Self::parse_expression_in_unit(
             expr_bytes,
+            endian,
             unit,
             dwarf,
             address,
@@ -236,6 +244,7 @@ impl ExpressionEvaluator {
     #[allow(clippy::too_many_arguments)]
     fn parse_expression_with_context(
         expr_bytes: &[u8],
+        endian: DwarfEndian,
         encoding: gimli::Encoding,
         dwarf: Option<&gimli::Dwarf<DwarfReader>>,
         address: u64,
@@ -251,6 +260,7 @@ impl ExpressionEvaluator {
         // Parse all expressions through unified handler
         Self::parse_full_expression(
             expr_bytes,
+            endian,
             encoding,
             dwarf,
             address,
@@ -311,6 +321,7 @@ impl ExpressionEvaluator {
     #[allow(clippy::too_many_arguments)]
     fn parse_full_expression(
         expr_bytes: &[u8],
+        endian: DwarfEndian,
         encoding: gimli::Encoding,
         dwarf: Option<&gimli::Dwarf<DwarfReader>>,
         address: u64,
@@ -325,7 +336,7 @@ impl ExpressionEvaluator {
             PrecomputedSteps(Vec<ComputeStep>),
         }
 
-        let mut expression = Expression(EndianSlice::new(expr_bytes, LittleEndian));
+        let mut expression = Expression(EndianSlice::new(expr_bytes, endian));
         let mut operations: Vec<ParsedOperation<_>> = Vec::new();
         let mut has_stack_value = false;
 
@@ -967,6 +978,7 @@ impl ExpressionEvaluator {
                             .ok()
                             .as_deref()
                             .unwrap_or(&[]),
+                        location_list_entry.data.0.endian(),
                         unit.encoding(),
                         Some(dwarf),
                         address,
@@ -1041,6 +1053,7 @@ impl ExpressionEvaluator {
                             if contains {
                                 let location_expr = Self::parse_expression_with_context(
                                     data.0.to_slice().ok().as_deref().unwrap_or(&[]),
+                                    data.0.endian(),
                                     unit.encoding(),
                                     Some(dwarf),
                                     address,
@@ -1076,6 +1089,7 @@ impl ExpressionEvaluator {
                             if contains {
                                 let location_expr = Self::parse_expression_with_context(
                                     data.0.to_slice().ok().as_deref().unwrap_or(&[]),
+                                    data.0.endian(),
                                     unit.encoding(),
                                     Some(dwarf),
                                     address,
@@ -1114,6 +1128,7 @@ impl ExpressionEvaluator {
                             if contains {
                                 let location_expr = Self::parse_expression_with_context(
                                     data.0.to_slice().ok().as_deref().unwrap_or(&[]),
+                                    data.0.endian(),
                                     unit.encoding(),
                                     Some(dwarf),
                                     address,
@@ -1155,6 +1170,7 @@ impl ExpressionEvaluator {
                                 if contains {
                                     let location_expr = Self::parse_expression_with_context(
                                         data.0.to_slice().ok().as_deref().unwrap_or(&[]),
+                                        data.0.endian(),
                                         unit.encoding(),
                                         Some(dwarf),
                                         address,
@@ -1197,6 +1213,7 @@ impl ExpressionEvaluator {
                                 if contains {
                                     let location_expr = Self::parse_expression_with_context(
                                         data.0.to_slice().ok().as_deref().unwrap_or(&[]),
+                                        data.0.endian(),
                                         unit.encoding(),
                                         Some(dwarf),
                                         address,
@@ -1225,6 +1242,7 @@ impl ExpressionEvaluator {
                             debug!("  Raw fallback default location entry");
                             let location_expr = Self::parse_expression_with_context(
                                 data.0.to_slice().ok().as_deref().unwrap_or(&[]),
+                                data.0.endian(),
                                 unit.encoding(),
                                 Some(dwarf),
                                 address,
@@ -1527,6 +1545,33 @@ mod tests {
                     },
                 ],
             }]
+        );
+    }
+
+    #[test]
+    fn big_endian_dw_op_addr_preserves_absolute_address() {
+        let encoding = gimli::Encoding {
+            format: gimli::Format::Dwarf32,
+            version: 5,
+            address_size: 8,
+        };
+        let expr_bytes = [0x03, 0, 0, 0, 0, 0, 0, 0x12, 0x34];
+        let result = ExpressionEvaluator::parse_expression_with_context(
+            &expr_bytes,
+            gimli::RunTimeEndian::Big,
+            encoding,
+            None,
+            0,
+            None,
+            None,
+            None,
+            0,
+        )
+        .expect("big-endian DW_OP_addr should parse");
+
+        assert_eq!(
+            result,
+            EvaluationResult::MemoryLocation(LocationResult::Address(0x1234))
         );
     }
 }
