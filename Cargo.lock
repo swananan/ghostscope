@@ -783,6 +783,7 @@ dependencies = [
  "ghostscope-compiler",
  "ghostscope-dwarf",
  "ghostscope-process",
+ "gimli 0.33.0",
  "lazy_static",
  "libc",
  "object",

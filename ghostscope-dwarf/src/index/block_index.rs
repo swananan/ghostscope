@@ -208,6 +208,17 @@ impl FunctionBlocks {
         }
         out
     }
+
+    /// True when `pc` is inside an inlined-subroutine scope in this function.
+    pub fn is_inline_context_at(&self, pc: u64) -> bool {
+        if !self.function_contains_pc(pc) {
+            return false;
+        }
+        self.block_path_for_pc(pc)
+            .into_iter()
+            .skip(1)
+            .any(|idx| self.nodes[idx].entry_pc.is_some())
+    }
 }
 
 /// Global per-module block index
@@ -358,6 +369,71 @@ impl<'a> BlockIndexBuilder<'a> {
             }
         }
         Some(fb)
+    }
+
+    /// Scan DWARF directly for caller-side call-site parameters that target `callee`.
+    /// This is used as an on-demand fallback when the block index has not yet linked
+    /// all callers for a non-inline DW_OP_entry_value lookup.
+    pub fn collect_incoming_entry_value_parameters(
+        &self,
+        callee: &FunctionBlocks,
+        register: u16,
+    ) -> Vec<(u64, CallSiteParameter)> {
+        let mut out = Vec::new();
+        let mut units = self.dwarf.units();
+        while let Ok(Some(header)) = units.next() {
+            let Ok(unit) = self.dwarf.unit(header) else {
+                continue;
+            };
+            let mut entries = unit.entries();
+            while let Ok(Some(entry)) = entries.next_dfs() {
+                if !matches!(
+                    entry.tag(),
+                    gimli::constants::DW_TAG_call_site | gimli::constants::DW_TAG_GNU_call_site
+                ) {
+                    continue;
+                }
+
+                let Some(return_pc) =
+                    self.resolve_address_attr(&unit, entry, gimli::constants::DW_AT_call_return_pc)
+                else {
+                    continue;
+                };
+
+                let call_origin = Self::resolve_call_site_origin(self.dwarf, &unit, entry);
+                let call_target = self.resolve_call_site_target(&unit, entry);
+                if !Self::call_site_targets_function(callee, call_origin, call_target) {
+                    continue;
+                }
+
+                let Ok(mut tree) = unit.entries_tree(Some(entry.offset())) else {
+                    continue;
+                };
+                let Ok(root) = tree.root() else {
+                    continue;
+                };
+                let mut children = root.children();
+                while let Ok(Some(child)) = children.next() {
+                    let child_entry = child.entry();
+                    if !matches!(
+                        child_entry.tag(),
+                        gimli::constants::DW_TAG_call_site_parameter
+                            | gimli::constants::DW_TAG_GNU_call_site_parameter
+                    ) {
+                        continue;
+                    }
+                    let Some(parameter) =
+                        self.parse_call_site_parameter(&unit, child_entry, return_pc)
+                    else {
+                        continue;
+                    };
+                    if parameter.callee_register == register {
+                        out.push((return_pc, parameter));
+                    }
+                }
+            }
+        }
+        out
     }
 
     fn build_blocks_for_function(
@@ -667,6 +743,19 @@ impl<'a> BlockIndexBuilder<'a> {
             gimli::AttributeValue::DebugAddrIndex(index) => self.dwarf.address(unit, index).ok(),
             _ => None,
         }
+    }
+
+    fn call_site_targets_function(
+        callee: &FunctionBlocks,
+        call_origin: Option<gimli::DebugInfoOffset>,
+        call_target: Option<u64>,
+    ) -> bool {
+        if callee.abs_die_offset.is_some() && call_origin == callee.abs_die_offset {
+            return true;
+        }
+        call_target
+            .map(|target| callee.function_contains_pc(target))
+            .unwrap_or(false)
     }
 }
 
@@ -1229,6 +1318,35 @@ mod tests {
         assert_eq!(incoming.len(), 1);
         assert_eq!(incoming[0].call_origin, None);
         assert_eq!(incoming[0].call_target, Some(0x1200));
+    }
+
+    #[test]
+    fn collect_incoming_entry_value_parameters_scans_dwarf_without_preindexed_callers() {
+        let (dwarf, _cu_offset) =
+            build_incoming_call_site_fixture_with_target(IncomingCallSiteTarget::CallTargetExpr);
+        let builder = BlockIndexBuilder::new(&dwarf);
+        let callee = FunctionBlocks {
+            cu_offset: gimli::DebugInfoOffset(1),
+            die_offset: gimli::UnitOffset(0),
+            abs_die_offset: None,
+            ranges: vec![(0x1200, 0x1210)],
+            nodes: vec![],
+            block_addr_map: BTreeMap::new(),
+            call_sites: BTreeMap::new(),
+            incoming_call_sites: BTreeMap::new(),
+        };
+
+        let incoming = builder.collect_incoming_entry_value_parameters(&callee, 5);
+        assert_eq!(
+            incoming,
+            vec![(
+                0x1018,
+                CallSiteParameter {
+                    callee_register: 5,
+                    caller_value_steps: vec![ComputeStep::PushConstant(42)],
+                }
+            )]
+        );
     }
 
     #[test]

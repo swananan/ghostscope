@@ -7,7 +7,7 @@ use crate::core::{
     ComputeStep, DirectValueResult, EntryValueCase, EvaluationResult, LocationResult,
     MemoryAccessSize, Result,
 };
-use crate::index::{CfiIndex, FunctionBlocks};
+use crate::index::{BlockIndexBuilder, CfiIndex, FunctionBlocks};
 use crate::semantics::{range_contains_pc, resolve_attr_with_unit_origins};
 use gimli::{read::RawLocListEntry, EndianSlice, Expression, Operation, Reader};
 use tracing::{debug, trace, warn};
@@ -366,6 +366,7 @@ impl ExpressionEvaluator {
                                 match Self::resolve_entry_value_register(
                                     address,
                                     register.0,
+                                    dwarf,
                                     function_context,
                                     cfi_index,
                                 ) {
@@ -382,6 +383,20 @@ impl ExpressionEvaluator {
                                         return Ok(EvaluationResult::Optimized);
                                     }
                                 }
+                            }
+                            Operation::RegisterOffset {
+                                register, offset, ..
+                            } => {
+                                let steps = Self::resolve_entry_value_register_offset(
+                                    address,
+                                    register.0,
+                                    *offset,
+                                    encoding.address_size,
+                                    dwarf,
+                                    function_context,
+                                    cfi_index,
+                                )?;
+                                operations.push(ParsedOperation::PrecomputedSteps(steps));
                             }
                             _ => {
                                 debug!("Unsupported EntryValue inner op: {:?}", inner_ops[0]);
@@ -1275,27 +1290,51 @@ impl ExpressionEvaluator {
     fn resolve_entry_value_register(
         current_pc: u64,
         register: u16,
+        dwarf: Option<&gimli::Dwarf<DwarfReader>>,
         function_context: Option<&FunctionBlocks>,
         cfi_index: Option<&CfiIndex>,
     ) -> Result<Vec<ComputeStep>> {
         let function_context = function_context.ok_or_else(|| {
             anyhow::anyhow!("DW_OP_entry_value requires function call-site context")
         })?;
-        if let Some(parameter) = function_context.entry_value_parameter_for_pc(current_pc, register)
-        {
-            return Self::materialize_caller_value_steps(
-                &parameter.caller_value_steps,
-                current_pc,
-                cfi_index,
-            );
+        if function_context.is_inline_context_at(current_pc) {
+            if let Some(parameter) =
+                function_context.entry_value_parameter_for_pc(current_pc, register)
+            {
+                return Self::materialize_caller_value_steps(
+                    &parameter.caller_value_steps,
+                    current_pc,
+                    cfi_index,
+                );
+            }
         }
 
-        Self::build_incoming_entry_value_lookup(current_pc, register, function_context, cfi_index)
+        Self::build_incoming_entry_value_lookup(
+            current_pc,
+            register,
+            dwarf,
+            function_context,
+            cfi_index,
+        )
+        .or_else(|incoming_error| {
+            Self::recover_entry_register_from_cfi(current_pc, register, cfi_index).map_err(
+                |cfi_error| {
+                    anyhow::anyhow!(
+                        "failed to recover DW_OP_entry_value register {} at 0x{:x}: {}; fallback via CFI also failed: {}",
+                        register,
+                        current_pc,
+                        incoming_error,
+                        cfi_error
+                    )
+                },
+            )
+        })
     }
 
     fn build_incoming_entry_value_lookup(
         current_pc: u64,
         register: u16,
+        dwarf: Option<&gimli::Dwarf<DwarfReader>>,
         function_context: &FunctionBlocks,
         cfi_index: Option<&CfiIndex>,
     ) -> Result<Vec<ComputeStep>> {
@@ -1308,11 +1347,11 @@ impl ExpressionEvaluator {
         let recovery = cfi_index.recover_caller_frame(current_pc, &[])?;
 
         let mut cases_by_return_pc = std::collections::BTreeMap::<u64, Vec<ComputeStep>>::new();
-        for (caller_return_pc, parameter) in
-            function_context.incoming_entry_value_parameters(register)
-        {
+        let parameters =
+            Self::collect_incoming_entry_value_parameter_steps(register, dwarf, function_context);
+        for (caller_return_pc, caller_value_steps) in parameters {
             let value_steps = Self::materialize_caller_value_steps(
-                &parameter.caller_value_steps,
+                &caller_value_steps,
                 current_pc,
                 Some(cfi_index),
             )
@@ -1354,6 +1393,154 @@ impl ExpressionEvaluator {
             recovery.caller_pc_steps,
             cases_by_return_pc,
         ))
+    }
+
+    fn collect_incoming_entry_value_parameter_steps(
+        register: u16,
+        dwarf: Option<&gimli::Dwarf<DwarfReader>>,
+        function_context: &FunctionBlocks,
+    ) -> Vec<(u64, Vec<ComputeStep>)> {
+        let indexed_parameters: Vec<_> = function_context
+            .incoming_entry_value_parameters(register)
+            .into_iter()
+            .map(|(caller_return_pc, parameter)| {
+                (caller_return_pc, parameter.caller_value_steps.clone())
+            })
+            .collect();
+        if !indexed_parameters.is_empty() {
+            return indexed_parameters;
+        }
+
+        dwarf
+            .map(|dwarf| {
+                BlockIndexBuilder::new(dwarf)
+                    .collect_incoming_entry_value_parameters(function_context, register)
+                    .into_iter()
+                    .map(|(caller_return_pc, parameter)| {
+                        (caller_return_pc, parameter.caller_value_steps)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn resolve_entry_value_register_offset(
+        current_pc: u64,
+        register: u16,
+        offset: i64,
+        address_size: u8,
+        dwarf: Option<&gimli::Dwarf<DwarfReader>>,
+        function_context: Option<&FunctionBlocks>,
+        cfi_index: Option<&CfiIndex>,
+    ) -> Result<Vec<ComputeStep>> {
+        if Self::is_stack_pointer_register(register) {
+            return Self::recover_entry_stack_pointer_steps(
+                current_pc,
+                offset,
+                address_size,
+                cfi_index,
+            );
+        }
+
+        match Self::resolve_entry_value_register(
+            current_pc,
+            register,
+            dwarf,
+            function_context,
+            cfi_index,
+        ) {
+            Ok(mut steps) => {
+                Self::append_constant_offset(&mut steps, offset);
+                Ok(steps)
+            }
+            Err(entry_error) => {
+                let mut steps = Self::recover_entry_register_from_cfi(
+                    current_pc, register, cfi_index,
+                )
+                .map_err(|cfi_error| {
+                    anyhow::anyhow!(
+                        "failed to recover DW_OP_entry_value base register {} with offset {} at 0x{:x}: {}; fallback via CFI also failed: {}",
+                        register,
+                        offset,
+                        current_pc,
+                        entry_error,
+                        cfi_error
+                    )
+                })?;
+                Self::append_constant_offset(&mut steps, offset);
+                Ok(steps)
+            }
+        }
+    }
+
+    fn recover_entry_register_from_cfi(
+        current_pc: u64,
+        register: u16,
+        cfi_index: Option<&CfiIndex>,
+    ) -> Result<Vec<ComputeStep>> {
+        let cfi_index = cfi_index.ok_or_else(|| {
+            anyhow::anyhow!(
+                "DW_OP_entry_value register recovery needs CFI at 0x{:x}",
+                current_pc
+            )
+        })?;
+        cfi_index
+            .recover_caller_register_steps(current_pc, register)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no entry register recovery rule for DWARF register {} at 0x{:x}",
+                    register,
+                    current_pc
+                )
+            })
+    }
+
+    fn recover_entry_stack_pointer_steps(
+        current_pc: u64,
+        offset: i64,
+        address_size: u8,
+        cfi_index: Option<&CfiIndex>,
+    ) -> Result<Vec<ComputeStep>> {
+        let cfi_index = cfi_index.ok_or_else(|| {
+            anyhow::anyhow!(
+                "DW_OP_entry_value stack-pointer recovery needs CFI at 0x{:x}",
+                current_pc
+            )
+        })?;
+        let mut steps = Self::cfa_to_steps(cfi_index.get_cfa_result(current_pc)?);
+        // This assumes the common x86/x86_64 call-frame convention where the CFA
+        // observed after the call is `SP_entry + address_size` because the return
+        // address is stored on the stack. Targets such as AArch64 may define the
+        // CFA at call entry differently when LR is not pushed, so keep this
+        // adjustment centralized until entry-SP reconstruction becomes
+        // target-aware.
+        Self::append_constant_offset(&mut steps, offset - i64::from(address_size));
+        Ok(steps)
+    }
+
+    fn cfa_to_steps(cfa: crate::core::CfaResult) -> Vec<ComputeStep> {
+        match cfa {
+            crate::core::CfaResult::RegisterPlusOffset { register, offset } => {
+                let mut steps = vec![ComputeStep::LoadRegister(register)];
+                Self::append_constant_offset(&mut steps, offset);
+                steps
+            }
+            crate::core::CfaResult::Expression { steps } => steps,
+        }
+    }
+
+    fn append_constant_offset(steps: &mut Vec<ComputeStep>, offset: i64) {
+        if offset != 0 {
+            steps.push(ComputeStep::PushConstant(offset));
+            steps.push(ComputeStep::Add);
+        }
+    }
+
+    fn is_stack_pointer_register(register: u16) -> bool {
+        matches!(
+            ghostscope_platform::register_mapping::dwarf_reg_to_name(register),
+            Some("RSP" | "ESP" | "SP")
+        )
     }
 
     fn build_entry_value_lookup_steps(
@@ -1415,10 +1602,91 @@ impl ExpressionEvaluator {
 #[cfg(test)]
 mod tests {
     use super::ExpressionEvaluator;
+    use crate::binary::{dwarf_reader_from_arc, DwarfReader};
     use crate::core::{
         ComputeStep, DirectValueResult, EntryValueCase, EvaluationResult, LocationResult,
     };
-    use crate::index::{CallSiteParameter, CallSiteRecord, FunctionBlocks};
+    use crate::index::{BlockNode, CallSiteParameter, CallSiteRecord, FunctionBlocks};
+    use gimli::constants;
+    use gimli::write::{
+        Address, AttributeValue as WriteAttributeValue, Dwarf as WriteDwarf, EndianVec,
+        Expression as WriteExpression, LineProgram, Sections, Unit,
+    };
+    use gimli::{Format, LittleEndian, Register};
+    use std::sync::Arc;
+
+    fn build_scanned_incoming_entry_value_fixture(
+        register: u16,
+        caller_value: u64,
+    ) -> gimli::Dwarf<DwarfReader> {
+        let encoding = gimli::Encoding {
+            format: Format::Dwarf32,
+            version: 5,
+            address_size: 8,
+        };
+
+        let mut dwarf = WriteDwarf::new();
+        let unit_id = dwarf.units.add(Unit::new(encoding, LineProgram::none()));
+        let unit = dwarf.units.get_mut(unit_id);
+        let root = unit.root();
+
+        let caller_id = unit.add(root, constants::DW_TAG_subprogram);
+        let caller = unit.get_mut(caller_id);
+        caller.set(
+            constants::DW_AT_low_pc,
+            WriteAttributeValue::Address(Address::Constant(0x1000)),
+        );
+        caller.set(constants::DW_AT_high_pc, WriteAttributeValue::Udata(0x40));
+
+        let callee_id = unit.add(root, constants::DW_TAG_subprogram);
+        let callee = unit.get_mut(callee_id);
+        callee.set(
+            constants::DW_AT_low_pc,
+            WriteAttributeValue::Address(Address::Constant(0x1200)),
+        );
+        callee.set(constants::DW_AT_high_pc, WriteAttributeValue::Udata(0x10));
+
+        let call_site_id = unit.add(caller_id, constants::DW_TAG_call_site);
+        unit.get_mut(call_site_id).set(
+            constants::DW_AT_call_target,
+            WriteAttributeValue::Address(Address::Constant(0x1200)),
+        );
+        unit.get_mut(call_site_id).set(
+            constants::DW_AT_call_return_pc,
+            WriteAttributeValue::Address(Address::Constant(0x2018)),
+        );
+
+        let param_id = unit.add(call_site_id, constants::DW_TAG_call_site_parameter);
+        let param = unit.get_mut(param_id);
+        let mut location = WriteExpression::new();
+        location.op_reg(Register(register));
+        param.set(
+            constants::DW_AT_location,
+            WriteAttributeValue::Exprloc(location),
+        );
+        let mut value = WriteExpression::new();
+        value.op_constu(caller_value);
+        param.set(
+            constants::DW_AT_call_value,
+            WriteAttributeValue::Exprloc(value),
+        );
+
+        let mut sections = Sections::new(EndianVec::new(LittleEndian));
+        dwarf.write(&mut sections).unwrap();
+
+        let dwarf_sections: gimli::DwarfSections<Vec<u8>> = gimli::DwarfSections::load(|id| {
+            Ok::<_, gimli::Error>(
+                sections
+                    .get(id)
+                    .map(|section| section.slice().to_vec())
+                    .unwrap_or_default(),
+            )
+        })
+        .unwrap();
+
+        dwarf_sections
+            .borrow(|section| dwarf_reader_from_arc(Arc::<[u8]>::from(section.as_slice())))
+    }
 
     #[test]
     fn implicit_pointer_to_static_storage_preserves_absolute_address_semantics() {
@@ -1435,13 +1703,28 @@ mod tests {
     }
 
     #[test]
-    fn entry_value_uses_nearest_call_site_parameter_steps() {
+    fn entry_value_uses_nearest_call_site_parameter_steps_in_inline_context() {
         let mut function = FunctionBlocks {
             cu_offset: gimli::DebugInfoOffset(0),
             die_offset: gimli::UnitOffset(0),
             abs_die_offset: Some(gimli::DebugInfoOffset(0)),
-            ranges: vec![],
-            nodes: vec![],
+            ranges: vec![(0x1000, 0x1040)],
+            nodes: vec![
+                BlockNode {
+                    ranges: vec![],
+                    entry_pc: None,
+                    die_offset: Some(gimli::UnitOffset(0)),
+                    variables: vec![],
+                    children: vec![1],
+                },
+                BlockNode {
+                    ranges: vec![(0x1000, 0x1040)],
+                    entry_pc: Some(0x1000),
+                    die_offset: Some(gimli::UnitOffset(1)),
+                    variables: vec![],
+                    children: vec![],
+                },
+            ],
             block_addr_map: std::collections::BTreeMap::new(),
             call_sites: std::collections::BTreeMap::new(),
             incoming_call_sites: std::collections::BTreeMap::new(),
@@ -1475,10 +1758,64 @@ mod tests {
             }],
         );
 
-        let steps =
-            ExpressionEvaluator::resolve_entry_value_register(0x1034, 5, Some(&function), None)
-                .expect("entry_value should resolve to the nearest call site");
+        let steps = ExpressionEvaluator::resolve_entry_value_register(
+            0x1034,
+            5,
+            None,
+            Some(&function),
+            None,
+        )
+        .expect("entry_value should resolve to the nearest call site");
         assert_eq!(steps, vec![ComputeStep::PushConstant(22)]);
+    }
+
+    #[test]
+    fn entry_value_ignores_outgoing_call_sites_in_non_inline_context() {
+        let mut function = FunctionBlocks {
+            cu_offset: gimli::DebugInfoOffset(0),
+            die_offset: gimli::UnitOffset(0),
+            abs_die_offset: Some(gimli::DebugInfoOffset(0)),
+            ranges: vec![(0x1000, 0x1040)],
+            nodes: vec![BlockNode {
+                ranges: vec![],
+                entry_pc: None,
+                die_offset: Some(gimli::UnitOffset(0)),
+                variables: vec![],
+                children: vec![],
+            }],
+            block_addr_map: std::collections::BTreeMap::new(),
+            call_sites: std::collections::BTreeMap::new(),
+            incoming_call_sites: std::collections::BTreeMap::new(),
+        };
+        function.call_sites.insert(
+            0x1030,
+            vec![CallSiteRecord {
+                cu_offset: gimli::DebugInfoOffset(0),
+                die_offset: gimli::UnitOffset(2),
+                return_pc: 0x1030,
+                call_origin: None,
+                call_target: None,
+                parameters: vec![CallSiteParameter {
+                    callee_register: 5,
+                    caller_value_steps: vec![ComputeStep::PushConstant(22)],
+                }],
+            }],
+        );
+
+        let error = ExpressionEvaluator::resolve_entry_value_register(
+            0x1034,
+            5,
+            None,
+            Some(&function),
+            None,
+        )
+        .expect_err("non-inline entry_value must not reuse outgoing call-site bindings");
+        assert!(
+            error
+                .to_string()
+                .contains("DW_OP_entry_value register recovery needs CFI"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -1487,8 +1824,14 @@ mod tests {
             cu_offset: gimli::DebugInfoOffset(0),
             die_offset: gimli::UnitOffset(0),
             abs_die_offset: Some(gimli::DebugInfoOffset(0)),
-            ranges: vec![],
-            nodes: vec![],
+            ranges: vec![(0x1200, 0x1210)],
+            nodes: vec![BlockNode {
+                ranges: vec![],
+                entry_pc: None,
+                die_offset: Some(gimli::UnitOffset(0)),
+                variables: vec![],
+                children: vec![],
+            }],
             block_addr_map: std::collections::BTreeMap::new(),
             call_sites: std::collections::BTreeMap::new(),
             incoming_call_sites: std::collections::BTreeMap::new(),
@@ -1545,6 +1888,71 @@ mod tests {
                     },
                 ],
             }]
+        );
+    }
+
+    #[test]
+    fn entry_value_prefers_indexed_incoming_parameters_over_dwarf_scan() {
+        let mut function = FunctionBlocks {
+            cu_offset: gimli::DebugInfoOffset(0),
+            die_offset: gimli::UnitOffset(0),
+            abs_die_offset: Some(gimli::DebugInfoOffset(0)),
+            ranges: vec![(0x1200, 0x1210)],
+            nodes: vec![BlockNode {
+                ranges: vec![],
+                entry_pc: None,
+                die_offset: Some(gimli::UnitOffset(0)),
+                variables: vec![],
+                children: vec![],
+            }],
+            block_addr_map: std::collections::BTreeMap::new(),
+            call_sites: std::collections::BTreeMap::new(),
+            incoming_call_sites: std::collections::BTreeMap::new(),
+        };
+        function.incoming_call_sites.insert(
+            0x2018,
+            vec![CallSiteRecord {
+                cu_offset: gimli::DebugInfoOffset(1),
+                die_offset: gimli::UnitOffset(3),
+                return_pc: 0x2018,
+                call_origin: function.abs_die_offset,
+                call_target: Some(0x1200),
+                parameters: vec![CallSiteParameter {
+                    callee_register: 5,
+                    caller_value_steps: vec![ComputeStep::PushConstant(33)],
+                }],
+            }],
+        );
+        let dwarf = build_scanned_incoming_entry_value_fixture(5, 99);
+
+        let parameters = ExpressionEvaluator::collect_incoming_entry_value_parameter_steps(
+            5,
+            Some(&dwarf),
+            &function,
+        );
+
+        assert_eq!(
+            parameters,
+            vec![(0x2018, vec![ComputeStep::PushConstant(33)])]
+        );
+    }
+
+    #[test]
+    fn entry_value_stack_pointer_offsets_use_cfa_based_entry_sp() {
+        let mut entry_sp_steps =
+            ExpressionEvaluator::cfa_to_steps(crate::core::CfaResult::RegisterPlusOffset {
+                register: 7,
+                offset: 32,
+            });
+        ExpressionEvaluator::append_constant_offset(&mut entry_sp_steps, 8 - 8);
+
+        assert_eq!(
+            entry_sp_steps,
+            vec![
+                ComputeStep::LoadRegister(7),
+                ComputeStep::PushConstant(32),
+                ComputeStep::Add,
+            ]
         );
     }
 
