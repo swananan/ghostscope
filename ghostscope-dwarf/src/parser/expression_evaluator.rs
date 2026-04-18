@@ -685,7 +685,7 @@ impl ExpressionEvaluator {
                             } => Ok(EvaluationResult::MemoryLocation(
                                 LocationResult::RegisterAddress {
                                     register,
-                                    offset: Some(cfa_offset + offset),
+                                    offset: Some(cfa_offset.saturating_add(*offset)),
                                     size: None,
                                 },
                             )),
@@ -1604,7 +1604,7 @@ mod tests {
     use super::ExpressionEvaluator;
     use crate::binary::{dwarf_reader_from_arc, DwarfReader};
     use crate::core::{
-        ComputeStep, DirectValueResult, EntryValueCase, EvaluationResult, LocationResult,
+        CfaResult, ComputeStep, DirectValueResult, EntryValueCase, EvaluationResult, LocationResult,
     };
     use crate::index::{BlockNode, CallSiteParameter, CallSiteRecord, FunctionBlocks};
     use gimli::constants;
@@ -1612,7 +1612,7 @@ mod tests {
         Address, AttributeValue as WriteAttributeValue, Dwarf as WriteDwarf, EndianVec,
         Expression as WriteExpression, LineProgram, Sections, Unit,
     };
-    use gimli::{Format, LittleEndian, Register};
+    use gimli::{Format, LittleEndian, Register, RunTimeEndian};
     use std::sync::Arc;
 
     fn build_scanned_incoming_entry_value_fixture(
@@ -1953,6 +1953,43 @@ mod tests {
                 ComputeStep::PushConstant(32),
                 ComputeStep::Add,
             ]
+        );
+    }
+
+    #[test]
+    fn single_fbreg_fast_path_saturates_cfa_offset_addition() {
+        let encoding = gimli::Encoding {
+            format: gimli::Format::Dwarf32,
+            version: 5,
+            address_size: 8,
+        };
+        let get_cfa = |_address| {
+            Ok(Some(CfaResult::RegisterPlusOffset {
+                register: 7,
+                offset: i64::MAX - 3,
+            }))
+        };
+
+        let result = ExpressionEvaluator::parse_expression_with_context(
+            &[0x91, 0x0a],
+            RunTimeEndian::Little,
+            encoding,
+            None,
+            0,
+            Some(&get_cfa),
+            None,
+            None,
+            0,
+        )
+        .expect("single DW_OP_fbreg should parse");
+
+        assert_eq!(
+            result,
+            EvaluationResult::MemoryLocation(LocationResult::RegisterAddress {
+                register: 7,
+                offset: Some(i64::MAX),
+                size: None,
+            })
         );
     }
 
