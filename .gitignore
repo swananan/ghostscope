@@ -73,6 +73,8 @@ e2e-tests/tests/fixtures/sample_program/sample_program_stripped.debug
 e2e-tests/tests/fixtures/static_scope_program/static_scope_program
 e2e-tests/tests/fixtures/static_scope_program/static_scope_program_clang_dwarf5
 e2e-tests/tests/fixtures/entry_value_recovery_program/entry_value_recovery_program_clang_dwarf5
+e2e-tests/tests/fixtures/entry_value_breg_program/entry_value_breg_program_clang_debuglink
+e2e-tests/tests/fixtures/entry_value_breg_program/entry_value_breg_program_clang_debuglink.debug
 e2e-tests/tests/fixtures/**/.ghostscope-inline-entry-pc-regression-*/
 e2e-tests/tests/fixtures/**/.ghostscope-fast-parser-patched-*/
 e2e-tests/tests/fixtures/**/.ghostscope-entry-value-runtime-*/
