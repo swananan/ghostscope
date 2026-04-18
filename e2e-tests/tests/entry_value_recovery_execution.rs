@@ -17,6 +17,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const FIXTURE_NAME: &str = "entry_value_recovery_program";
 const FIXTURE_SOURCE: &str = "entry_value_recovery_program.c";
+const TOUCH_TRACE_LINE: u32 = 16;
 const POST_CALL_TRACE_LINE: u32 = 21;
 
 static CLANG_FIXTURE: OnceLock<Result<PathBuf, String>> = OnceLock::new();
@@ -139,6 +140,104 @@ fn read_log_file(path: &Path) -> anyhow::Result<String> {
 fn shell_quote(path: &Path) -> String {
     let raw = path.display().to_string();
     format!("'{}'", raw.replace('\'', "'\"'\"'"))
+}
+
+#[tokio::test]
+async fn test_non_inline_entry_value_recovers_touch_parameters_at_runtime() -> anyhow::Result<()> {
+    init();
+    if !fixture_compiler_available(FixtureCompiler::ClangDwarf5) {
+        eprintln!("Skipping non-inline entry_value runtime test because clang is unavailable");
+        return Ok(());
+    }
+
+    let binary_path = compile_entry_value_recovery_program_clang()?;
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
+    let addrs = analyzer.lookup_addresses_by_source_line(FIXTURE_SOURCE, TOUCH_TRACE_LINE);
+    anyhow::ensure!(
+        !addrs.is_empty(),
+        "No DWARF addresses found for {FIXTURE_SOURCE}:{TOUCH_TRACE_LINE}"
+    );
+
+    let target = spawn_logged_target(&binary_path).await?;
+    let script = format!(
+        "trace {FIXTURE_SOURCE}:{TOUCH_TRACE_LINE} {{
+    print \"TOUCH:{{}}:{{}}:{{}}\", x, state.total_bytes, state.stream_id;
+}}
+"
+    );
+    let (exit_code, ghostscope_stdout, ghostscope_stderr) = GhostscopeRunner::new()
+        .with_script(&script)
+        .attach_to(&target.target)
+        .timeout_secs(4)
+        .enable_sysmon_shared_lib(false)
+        .run()
+        .await?;
+    let (target_stdout, target_stderr) = target.terminate_and_collect().await?;
+
+    if should_skip_for_ebpf_env(exit_code, &ghostscope_stderr) {
+        return Ok(());
+    }
+
+    assert_eq!(
+        exit_code, 0,
+        "ghostscope stderr={ghostscope_stderr} ghostscope stdout={ghostscope_stdout} target stderr={target_stderr}"
+    );
+    assert!(
+        !ghostscope_stdout.contains("ExprError"),
+        "Expected exact non-inline entry_value recovery inside touch(). STDOUT: {ghostscope_stdout}\nSTDERR: {ghostscope_stderr}"
+    );
+    assert!(
+        !ghostscope_stdout.contains("<optimized out>"),
+        "touch() parameters should not be optimized out. STDOUT: {ghostscope_stdout}\nSTDERR: {ghostscope_stderr}"
+    );
+
+    let actual_re = Regex::new(r"ACTUAL:([0-9-]+):([0-9-]+):([0-9-]+):([0-9-]+)")?;
+    let mut actual_by_seed = HashMap::new();
+    for caps in actual_re.captures_iter(&target_stdout) {
+        actual_by_seed.insert(
+            caps[1].parse::<i64>()?,
+            (
+                caps[2].parse::<i64>()?,
+                caps[3].parse::<i64>()?,
+                caps[4].parse::<i64>()?,
+            ),
+        );
+    }
+    anyhow::ensure!(
+        !actual_by_seed.is_empty(),
+        "fixture stdout did not contain ACTUAL lines: {target_stdout}"
+    );
+
+    let trace_re = Regex::new(r"TOUCH:([0-9-]+):([0-9-]+):([0-9-]+)")?;
+    let mut seen = 0;
+    for caps in trace_re.captures_iter(&ghostscope_stdout) {
+        let seed = caps[1].parse::<i64>()?;
+        let total_bytes = caps[2].parse::<i64>()?;
+        let stream_id = caps[3].parse::<i64>()?;
+        let actual = actual_by_seed.get(&seed).ok_or_else(|| {
+            anyhow::anyhow!("missing ACTUAL record for seed={seed}; target stdout={target_stdout}")
+        })?;
+        let mut expected_result = total_bytes + (seed * 3);
+        if (expected_result & 1) != 0 {
+            expected_result += stream_id;
+        }
+        assert_eq!(
+            (total_bytes, stream_id),
+            (actual.0, actual.1),
+            "touch() recovered the wrong state for seed={seed}; ghostscope stdout={ghostscope_stdout}"
+        );
+        assert_eq!(
+            actual.2, expected_result,
+            "touch() recovered an inconsistent seed/result for seed={seed}; ghostscope stdout={ghostscope_stdout}"
+        );
+        seen += 1;
+    }
+
+    assert!(
+        seen >= 2,
+        "Expected multiple touch() trace events. GhostScope STDOUT: {ghostscope_stdout}\nTarget STDOUT: {target_stdout}"
+    );
+    Ok(())
 }
 
 #[tokio::test]

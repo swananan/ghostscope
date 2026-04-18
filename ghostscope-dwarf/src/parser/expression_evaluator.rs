@@ -4,7 +4,8 @@
 
 use crate::binary::DwarfReader;
 use crate::core::{
-    ComputeStep, DirectValueResult, EvaluationResult, LocationResult, MemoryAccessSize, Result,
+    ComputeStep, DirectValueResult, EntryValueCase, EvaluationResult, LocationResult,
+    MemoryAccessSize, Result,
 };
 use crate::index::{CfiIndex, FunctionBlocks};
 use crate::semantics::{range_contains_pc, resolve_attr_with_unit_origins};
@@ -16,6 +17,7 @@ pub struct ExpressionEvaluator;
 
 impl ExpressionEvaluator {
     const MAX_IMPLICIT_POINTER_DEPTH: usize = 8;
+    const ENTRY_VALUE_LOOKUP_WARN_CASES: usize = 16;
 
     /// Evaluate a variable's location from its DIE attributes
     pub fn evaluate_location(
@@ -1261,17 +1263,102 @@ impl ExpressionEvaluator {
         let function_context = function_context.ok_or_else(|| {
             anyhow::anyhow!("DW_OP_entry_value requires function call-site context")
         })?;
-        let parameter = function_context
-            .entry_value_parameter_for_pc(current_pc, register)
-            .ok_or_else(|| {
+        if let Some(parameter) = function_context.entry_value_parameter_for_pc(current_pc, register)
+        {
+            return Self::materialize_caller_value_steps(
+                &parameter.caller_value_steps,
+                current_pc,
+                cfi_index,
+            );
+        }
+
+        Self::build_incoming_entry_value_lookup(current_pc, register, function_context, cfi_index)
+    }
+
+    fn build_incoming_entry_value_lookup(
+        current_pc: u64,
+        register: u16,
+        function_context: &FunctionBlocks,
+        cfi_index: Option<&CfiIndex>,
+    ) -> Result<Vec<ComputeStep>> {
+        let cfi_index = cfi_index.ok_or_else(|| {
+            anyhow::anyhow!(
+                "DW_OP_entry_value register recovery needs CFI at 0x{:x}",
+                current_pc
+            )
+        })?;
+        let recovery = cfi_index.recover_caller_frame(current_pc, &[])?;
+
+        let mut cases_by_return_pc = std::collections::BTreeMap::<u64, Vec<ComputeStep>>::new();
+        for (caller_return_pc, parameter) in
+            function_context.incoming_entry_value_parameters(register)
+        {
+            let value_steps = Self::materialize_caller_value_steps(
+                &parameter.caller_value_steps,
+                current_pc,
+                Some(cfi_index),
+            )
+            .map_err(|error| {
                 anyhow::anyhow!(
-                    "no call-site parameter found for DW_OP_entry_value register {} at 0x{:x}",
+                    "failed to materialize incoming call-site parameter for DW_OP_entry_value register {} at 0x{:x} (caller return pc 0x{:x}): {}",
                     register,
-                    current_pc
+                    current_pc,
+                    caller_return_pc,
+                    error
                 )
             })?;
+            match cases_by_return_pc.entry(caller_return_pc) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(value_steps);
+                }
+                std::collections::btree_map::Entry::Occupied(entry) => {
+                    if entry.get() != &value_steps {
+                        return Err(anyhow::anyhow!(
+                            "ambiguous incoming call-site parameter for DW_OP_entry_value register {} at 0x{:x} (caller return pc 0x{:x})",
+                            register,
+                            current_pc,
+                            caller_return_pc
+                        ));
+                    }
+                }
+            }
+        }
 
-        Self::materialize_caller_value_steps(&parameter.caller_value_steps, current_pc, cfi_index)
+        if cases_by_return_pc.is_empty() {
+            return Err(anyhow::anyhow!(
+                "no call-site parameter found for DW_OP_entry_value register {} at 0x{:x}",
+                register,
+                current_pc
+            ));
+        }
+
+        Ok(Self::build_entry_value_lookup_steps(
+            recovery.caller_pc_steps,
+            cases_by_return_pc,
+        ))
+    }
+
+    fn build_entry_value_lookup_steps(
+        caller_pc_steps: Vec<ComputeStep>,
+        cases_by_return_pc: std::collections::BTreeMap<u64, Vec<ComputeStep>>,
+    ) -> Vec<ComputeStep> {
+        let cases: Vec<_> = cases_by_return_pc
+            .into_iter()
+            .map(|(caller_return_pc, value_steps)| EntryValueCase {
+                caller_return_pc,
+                value_steps,
+            })
+            .collect();
+        if cases.len() > Self::ENTRY_VALUE_LOOKUP_WARN_CASES {
+            warn!(
+                "DW_OP_entry_value lookup generated {} caller return-pc cases; large fan-in may exceed eBPF verifier limits",
+                cases.len()
+            );
+        }
+        vec![ComputeStep::EntryValueLookup {
+            caller_pc_steps,
+            cases,
+        }]
     }
 
     fn materialize_caller_value_steps(
@@ -1293,7 +1380,7 @@ impl ExpressionEvaluator {
                         .recover_caller_register_steps(current_pc, *register)?
                         .ok_or_else(|| {
                             anyhow::anyhow!(
-                                "no caller register recovery rule for DWARF register {} at 0x{:x}",
+                                "no caller register recovery rule for DWARF register {} at 0x{:x}; DW_OP_entry_value can only materialize caller values for registers with unwind recovery, and caller-saved argument registers are often unavailable after the call",
                                 register,
                                 current_pc
                             )
@@ -1310,7 +1397,9 @@ impl ExpressionEvaluator {
 #[cfg(test)]
 mod tests {
     use super::ExpressionEvaluator;
-    use crate::core::{ComputeStep, DirectValueResult, EvaluationResult, LocationResult};
+    use crate::core::{
+        ComputeStep, DirectValueResult, EntryValueCase, EvaluationResult, LocationResult,
+    };
     use crate::index::{CallSiteParameter, CallSiteRecord, FunctionBlocks};
 
     #[test]
@@ -1332,16 +1421,21 @@ mod tests {
         let mut function = FunctionBlocks {
             cu_offset: gimli::DebugInfoOffset(0),
             die_offset: gimli::UnitOffset(0),
+            abs_die_offset: Some(gimli::DebugInfoOffset(0)),
             ranges: vec![],
             nodes: vec![],
             block_addr_map: std::collections::BTreeMap::new(),
             call_sites: std::collections::BTreeMap::new(),
+            incoming_call_sites: std::collections::BTreeMap::new(),
         };
         function.call_sites.insert(
             0x1018,
             vec![CallSiteRecord {
+                cu_offset: gimli::DebugInfoOffset(0),
                 die_offset: gimli::UnitOffset(1),
                 return_pc: 0x1018,
+                call_origin: None,
+                call_target: None,
                 parameters: vec![CallSiteParameter {
                     callee_register: 5,
                     caller_value_steps: vec![ComputeStep::PushConstant(11)],
@@ -1351,8 +1445,11 @@ mod tests {
         function.call_sites.insert(
             0x1030,
             vec![CallSiteRecord {
+                cu_offset: gimli::DebugInfoOffset(0),
                 die_offset: gimli::UnitOffset(2),
                 return_pc: 0x1030,
+                call_origin: None,
+                call_target: None,
                 parameters: vec![CallSiteParameter {
                     callee_register: 5,
                     caller_value_steps: vec![ComputeStep::PushConstant(22)],
@@ -1364,5 +1461,72 @@ mod tests {
             ExpressionEvaluator::resolve_entry_value_register(0x1034, 5, Some(&function), None)
                 .expect("entry_value should resolve to the nearest call site");
         assert_eq!(steps, vec![ComputeStep::PushConstant(22)]);
+    }
+
+    #[test]
+    fn entry_value_uses_incoming_call_site_lookup_for_non_inline_functions() {
+        let mut function = FunctionBlocks {
+            cu_offset: gimli::DebugInfoOffset(0),
+            die_offset: gimli::UnitOffset(0),
+            abs_die_offset: Some(gimli::DebugInfoOffset(0)),
+            ranges: vec![],
+            nodes: vec![],
+            block_addr_map: std::collections::BTreeMap::new(),
+            call_sites: std::collections::BTreeMap::new(),
+            incoming_call_sites: std::collections::BTreeMap::new(),
+        };
+        function.incoming_call_sites.insert(
+            0x2018,
+            vec![CallSiteRecord {
+                cu_offset: gimli::DebugInfoOffset(1),
+                die_offset: gimli::UnitOffset(3),
+                return_pc: 0x2018,
+                call_origin: function.abs_die_offset,
+                call_target: Some(0x1200),
+                parameters: vec![CallSiteParameter {
+                    callee_register: 5,
+                    caller_value_steps: vec![ComputeStep::PushConstant(33)],
+                }],
+            }],
+        );
+        function.incoming_call_sites.insert(
+            0x2030,
+            vec![CallSiteRecord {
+                cu_offset: gimli::DebugInfoOffset(2),
+                die_offset: gimli::UnitOffset(4),
+                return_pc: 0x2030,
+                call_origin: function.abs_die_offset,
+                call_target: Some(0x1200),
+                parameters: vec![CallSiteParameter {
+                    callee_register: 5,
+                    caller_value_steps: vec![ComputeStep::PushConstant(44)],
+                }],
+            }],
+        );
+
+        let mut cases_by_return_pc = std::collections::BTreeMap::new();
+        for (caller_return_pc, parameter) in function.incoming_entry_value_parameters(5) {
+            cases_by_return_pc.insert(caller_return_pc, parameter.caller_value_steps.clone());
+        }
+        let steps = ExpressionEvaluator::build_entry_value_lookup_steps(
+            vec![ComputeStep::PushConstant(0xdeadbeef)],
+            cases_by_return_pc,
+        );
+        assert_eq!(
+            steps,
+            vec![ComputeStep::EntryValueLookup {
+                caller_pc_steps: vec![ComputeStep::PushConstant(0xdeadbeef)],
+                cases: vec![
+                    EntryValueCase {
+                        caller_return_pc: 0x2018,
+                        value_steps: vec![ComputeStep::PushConstant(33)],
+                    },
+                    EntryValueCase {
+                        caller_return_pc: 0x2030,
+                        value_steps: vec![ComputeStep::PushConstant(44)],
+                    },
+                ],
+            }]
+        );
     }
 }

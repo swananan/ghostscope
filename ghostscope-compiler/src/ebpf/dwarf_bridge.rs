@@ -994,6 +994,20 @@ impl<'ctx> EbpfContext<'ctx> {
                     }
                 }
 
+                ComputeStep::EntryValueLookup {
+                    caller_pc_steps,
+                    cases,
+                } => {
+                    let value = self.generate_entry_value_lookup(
+                        caller_pc_steps,
+                        cases,
+                        pt_regs_ptr,
+                        _result_size,
+                        status_ptr,
+                    )?;
+                    stack.push(value);
+                }
+
                 // Add catch-all for unimplemented operations
                 _ => {
                     warn!("Unimplemented ComputeStep: {:?}", step);
@@ -1012,6 +1026,154 @@ impl<'ctx> EbpfContext<'ctx> {
                 stack.len()
             )))
         }
+    }
+
+    fn generate_entry_value_lookup(
+        &mut self,
+        caller_pc_steps: &[ComputeStep],
+        cases: &[ghostscope_dwarf::core::EntryValueCase],
+        pt_regs_ptr: PointerValue<'ctx>,
+        result_size: Option<MemoryAccessSize>,
+        status_ptr: Option<PointerValue<'ctx>>,
+    ) -> Result<IntValue<'ctx>> {
+        if cases.is_empty() {
+            return Err(CodeGenError::LLVMError(
+                "EntryValueLookup requires at least one case".to_string(),
+            ));
+        }
+
+        let caller_pc = self
+            .generate_compute_steps(
+                caller_pc_steps,
+                pt_regs_ptr,
+                Some(MemoryAccessSize::U64),
+                status_ptr,
+                None,
+            )?
+            .into_int_value();
+
+        let current_block = self.builder.get_insert_block().ok_or_else(|| {
+            CodeGenError::LLVMError("No insertion block for EntryValueLookup".to_string())
+        })?;
+        let current_fn = current_block.get_parent().ok_or_else(|| {
+            CodeGenError::LLVMError("No parent function for EntryValueLookup".to_string())
+        })?;
+        let merge_bb = self
+            .context
+            .append_basic_block(current_fn, "entry_value_merge");
+        let default_bb = self
+            .context
+            .append_basic_block(current_fn, "entry_value_default");
+
+        let module_for_offsets = {
+            let ctx = self.get_compile_time_context()?;
+            self.current_resolved_var_module_path
+                .clone()
+                .unwrap_or_else(|| ctx.module_path.clone())
+        };
+        let module_cookie = self.cookie_for_module_or_fallback(&module_for_offsets);
+        let mut incoming_values = Vec::with_capacity(cases.len() + 1);
+        let mut any_missing_offsets = None;
+
+        for (index, case) in cases.iter().enumerate() {
+            let st_code = self.section_code_for_address(&module_for_offsets, case.caller_return_pc);
+            let link_pc = self
+                .context
+                .i64_type()
+                .const_int(case.caller_return_pc, false);
+            let (runtime_return_pc, found_flag) =
+                self.generate_runtime_address_from_offsets(link_pc, st_code, module_cookie)?;
+            let missing_offsets = self
+                .builder
+                .build_not(found_flag, &format!("entry_value_missing_{index}"))
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            any_missing_offsets = Some(match any_missing_offsets {
+                Some(prev) => self
+                    .builder
+                    .build_or(
+                        prev,
+                        missing_offsets,
+                        &format!("entry_value_missing_or_{index}"),
+                    )
+                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?,
+                None => missing_offsets,
+            });
+
+            let is_match = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::EQ,
+                    caller_pc,
+                    runtime_return_pc,
+                    &format!("entry_value_match_{index}"),
+                )
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            let case_bb = self
+                .context
+                .append_basic_block(current_fn, &format!("entry_value_case_{index}"));
+            let next_bb = if index + 1 == cases.len() {
+                default_bb
+            } else {
+                self.context
+                    .append_basic_block(current_fn, &format!("entry_value_check_{}", index + 1))
+            };
+            self.builder
+                .build_conditional_branch(is_match, case_bb, next_bb)
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+            self.builder.position_at_end(case_bb);
+            let case_value = self
+                .generate_compute_steps(
+                    &case.value_steps,
+                    pt_regs_ptr,
+                    result_size,
+                    status_ptr,
+                    None,
+                )?
+                .into_int_value();
+            let case_value_block = self.builder.get_insert_block().ok_or_else(|| {
+                CodeGenError::LLVMError(
+                    "No insertion block after EntryValueLookup case".to_string(),
+                )
+            })?;
+            self.builder
+                .build_unconditional_branch(merge_bb)
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            incoming_values.push((case_value, case_value_block));
+
+            self.builder.position_at_end(next_bb);
+        }
+
+        self.builder.position_at_end(default_bb);
+        if let Some(sp) = status_ptr {
+            self.store_variable_read_status(
+                sp,
+                self.context.bool_type().const_int(1, false),
+                any_missing_offsets.unwrap_or_else(|| self.context.bool_type().const_zero()),
+                "entry_value_default",
+            )?;
+        }
+        let default_value = self.context.i64_type().const_zero();
+        let default_value_block = self.builder.get_insert_block().ok_or_else(|| {
+            CodeGenError::LLVMError("No default block for EntryValueLookup".to_string())
+        })?;
+        self.builder
+            .build_unconditional_branch(merge_bb)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        incoming_values.push((default_value, default_value_block));
+
+        self.builder.position_at_end(merge_bb);
+        let phi = self
+            .builder
+            .build_phi(self.context.i64_type(), "entry_value_phi")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let incoming_refs: Vec<(&dyn inkwell::values::BasicValue<'ctx>, _)> = incoming_values
+            .iter()
+            .map(|(value, block)| (value as &dyn inkwell::values::BasicValue<'ctx>, *block))
+            .collect();
+        phi.add_incoming(&incoming_refs);
+
+        Ok(phi.as_basic_value().into_int_value())
     }
 
     /// Query DWARF for complex expression (supports member access, array access, etc.)

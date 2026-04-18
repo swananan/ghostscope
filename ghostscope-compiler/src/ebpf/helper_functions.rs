@@ -912,7 +912,7 @@ impl<'ctx> EbpfContext<'ctx> {
         Ok(())
     }
 
-    fn store_variable_read_status(
+    pub(crate) fn store_variable_read_status(
         &mut self,
         status_ptr: PointerValue<'ctx>,
         combined_fail: IntValue<'ctx>,
