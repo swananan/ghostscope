@@ -112,6 +112,15 @@ pub struct PieceResult {
     pub bit_offset: Option<u64>,
 }
 
+/// One caller-side case for recovering a callee's DW_OP_entry_value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntryValueCase {
+    /// Link-time caller return PC from DW_AT_call_return_pc.
+    pub caller_return_pc: u64,
+    /// Materialized ComputeStep[] that recover the original caller value.
+    pub value_steps: Vec<ComputeStep>,
+}
+
 /// Computation step for LLVM IR generation
 /// These map directly to LLVM IR operations that can be generated in eBPF
 #[derive(Debug, Clone, PartialEq)]
@@ -166,6 +175,13 @@ pub enum ComputeStep {
     If {
         then_branch: Vec<ComputeStep>,
         else_branch: Vec<ComputeStep>,
+    },
+
+    /// Recover a DW_OP_entry_value at runtime by matching the recovered caller
+    /// return PC against caller-side DW_AT_call_return_pc cases.
+    EntryValueLookup {
+        caller_pc_steps: Vec<ComputeStep>,
+        cases: Vec<EntryValueCase>,
     },
 }
 
@@ -461,6 +477,9 @@ impl DirectValueResult {
                     _ = then_branch;
                     _ = else_branch;
                 }
+                ComputeStep::EntryValueLookup { cases, .. } => {
+                    stack.push(format!("entry_value[{} cases]", cases.len()));
+                }
             }
         }
 
@@ -652,6 +671,9 @@ impl fmt::Display for ComputeStep {
                     then_branch.len(),
                     else_branch.len()
                 )
+            }
+            ComputeStep::EntryValueLookup { cases, .. } => {
+                write!(f, "entry_value_lookup[cases:{}]", cases.len())
             }
         }
     }

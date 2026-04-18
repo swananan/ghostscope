@@ -34,10 +34,16 @@ pub struct CallSiteParameter {
 /// A call-site record keyed by DW_AT_call_return_pc.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CallSiteRecord {
+    /// Compilation unit offset for the caller-side call-site DIE.
+    pub cu_offset: gimli::DebugInfoOffset,
     /// DIE offset for the call-site itself.
     pub die_offset: gimli::UnitOffset,
     /// Return PC immediately after the call instruction.
     pub return_pc: u64,
+    /// Target callee resolved from DW_AT_call_origin when available.
+    pub call_origin: Option<gimli::DebugInfoOffset>,
+    /// Target callee address from DW_AT_call_target when available.
+    pub call_target: Option<u64>,
     /// Callee parameter bindings available at this call site.
     pub parameters: Vec<CallSiteParameter>,
 }
@@ -84,6 +90,8 @@ impl BlockNode {
 pub struct FunctionBlocks {
     pub cu_offset: gimli::DebugInfoOffset,
     pub die_offset: gimli::UnitOffset,
+    /// Absolute DIE offset for this function in .debug_info.
+    pub abs_die_offset: Option<gimli::DebugInfoOffset>,
     /// Function ranges
     pub ranges: Vec<(u64, u64)>,
     /// Root node is index 0
@@ -92,6 +100,9 @@ pub struct FunctionBlocks {
     pub block_addr_map: BTreeMap<u64, usize>,
     /// Caller-side call-site records keyed by DW_AT_call_return_pc.
     pub call_sites: BTreeMap<u64, Vec<CallSiteRecord>>,
+    /// Incoming caller-side call-site records for this callee, keyed by the
+    /// caller's DW_AT_call_return_pc.
+    pub incoming_call_sites: BTreeMap<u64, Vec<CallSiteRecord>>,
 }
 
 impl FunctionBlocks {
@@ -102,10 +113,12 @@ impl FunctionBlocks {
         Self {
             cu_offset,
             die_offset,
+            abs_die_offset: None,
             ranges: Vec::new(),
             nodes,
             block_addr_map: BTreeMap::new(),
             call_sites: BTreeMap::new(),
+            incoming_call_sites: BTreeMap::new(),
         }
     }
 
@@ -179,6 +192,22 @@ impl FunctionBlocks {
         }
         None
     }
+
+    /// Collect all incoming caller-side call-site bindings for a callee
+    /// register. These are used for non-inline DW_OP_entry_value recovery.
+    pub fn incoming_entry_value_parameters(&self, register: u16) -> Vec<(u64, &CallSiteParameter)> {
+        let mut out = Vec::new();
+        for (return_pc, records) in &self.incoming_call_sites {
+            for record in records {
+                for parameter in &record.parameters {
+                    if parameter.callee_register == register {
+                        out.push((*return_pc, parameter));
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Global per-module block index
@@ -196,15 +225,8 @@ impl BlockIndex {
 
     /// Find a function containing PC via start-addr map and range verification
     pub fn find_function_by_pc(&self, pc: u64) -> Option<&FunctionBlocks> {
-        let mut cand: Option<&FunctionBlocks> = None;
-        for (_, &fi) in self.func_addr_map.range(..=pc).rev() {
-            let f = &self.functions[fi];
-            if f.function_contains_pc(pc) {
-                cand = Some(f);
-                break;
-            }
-        }
-        cand
+        self.find_function_index_by_pc(pc)
+            .map(|index| &self.functions[index])
     }
 
     /// Add built functions and update address map
@@ -215,6 +237,56 @@ impl BlockIndex {
                 self.func_addr_map.insert(*lo, idx);
             }
             self.functions.push(fb);
+        }
+        self.rebuild_incoming_call_site_links();
+    }
+
+    fn find_function_index_by_pc(&self, pc: u64) -> Option<usize> {
+        for (_, &fi) in self.func_addr_map.range(..=pc).rev() {
+            let f = &self.functions[fi];
+            if f.function_contains_pc(pc) {
+                return Some(fi);
+            }
+        }
+        None
+    }
+
+    fn rebuild_incoming_call_site_links(&mut self) {
+        for function in &mut self.functions {
+            function.incoming_call_sites.clear();
+        }
+
+        let mut functions_by_die = BTreeMap::new();
+        for (index, function) in self.functions.iter().enumerate() {
+            if let Some(abs_die_offset) = function.abs_die_offset {
+                functions_by_die.insert(abs_die_offset, index);
+            }
+        }
+
+        let incoming_links: Vec<(usize, CallSiteRecord)> = self
+            .functions
+            .iter()
+            .flat_map(|function| function.call_sites.values())
+            .flat_map(|records| records.iter())
+            .filter_map(|record| {
+                let callee_index = record
+                    .call_origin
+                    .and_then(|origin| functions_by_die.get(&origin).copied())
+                    .or_else(|| {
+                        record
+                            .call_target
+                            .and_then(|target| self.find_function_index_by_pc(target))
+                    })?;
+                Some((callee_index, record.clone()))
+            })
+            .collect();
+
+        for (callee_index, record) in incoming_links {
+            self.functions[callee_index]
+                .incoming_call_sites
+                .entry(record.return_pc)
+                .or_default()
+                .push(record);
         }
     }
 }
@@ -240,6 +312,7 @@ impl<'a> BlockIndexBuilder<'a> {
         while let Ok(Some(entry)) = entries.next_dfs() {
             if entry.tag() == gimli::constants::DW_TAG_subprogram {
                 let mut fb = FunctionBlocks::new(cu_offset, entry.offset());
+                fb.abs_die_offset = entry.offset().to_debug_info_offset(&unit.header);
                 if let Ok(ranges) = RangeExtractor::extract_all_ranges(entry, &unit, self.dwarf) {
                     fb.ranges = ranges;
                 }
@@ -271,6 +344,7 @@ impl<'a> BlockIndexBuilder<'a> {
             return None;
         }
         let mut fb = FunctionBlocks::new(cu_offset, die_offset);
+        fb.abs_die_offset = entry.offset().to_debug_info_offset(&unit.header);
         if let Ok(ranges) = RangeExtractor::extract_all_ranges(&entry, &unit, self.dwarf) {
             fb.ranges = ranges;
         }
@@ -424,8 +498,11 @@ impl<'a> BlockIndexBuilder<'a> {
         };
 
         let mut record = CallSiteRecord {
+            cu_offset: fb.cu_offset,
             die_offset: entry.offset(),
             return_pc,
+            call_origin: Self::resolve_call_site_origin(self.dwarf, unit, entry),
+            call_target: self.resolve_call_site_target(unit, entry),
             parameters: Vec::new(),
         };
 
@@ -446,6 +523,51 @@ impl<'a> BlockIndexBuilder<'a> {
         }
 
         fb.call_sites.entry(return_pc).or_default().push(record);
+    }
+
+    fn resolve_call_site_origin(
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+    ) -> Option<gimli::DebugInfoOffset> {
+        entry
+            .attr_value(gimli::constants::DW_AT_call_origin)
+            .and_then(|value| {
+                resolve_origin_entry(dwarf, unit, value)
+                    .ok()
+                    .flatten()
+                    .map(|(debug_info_offset, _, _)| debug_info_offset)
+            })
+    }
+
+    fn resolve_call_site_target(
+        &self,
+        unit: &gimli::Unit<DwarfReader>,
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+    ) -> Option<u64> {
+        self.resolve_address_attr(unit, entry, gimli::constants::DW_AT_call_target)
+            .or_else(|| Self::parse_call_target_expr_address(unit, entry))
+    }
+
+    fn parse_call_target_expr_address(
+        unit: &gimli::Unit<DwarfReader>,
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+    ) -> Option<u64> {
+        let attr = entry.attr(gimli::constants::DW_AT_call_target)?;
+        let gimli::AttributeValue::Exprloc(expr) = attr.value() else {
+            return None;
+        };
+        let expr_bytes = expr.0.to_slice().ok()?;
+        let mut expression =
+            gimli::Expression(gimli::EndianSlice::new(&expr_bytes, gimli::LittleEndian));
+        let first = gimli::Operation::parse(&mut expression.0, unit.encoding()).ok()?;
+        if !expression.0.is_empty() {
+            return None;
+        }
+        match first {
+            gimli::Operation::Address { address } => Some(address),
+            _ => None,
+        }
     }
 
     fn parse_call_site_parameter(
@@ -664,6 +786,126 @@ mod tests {
         (read_dwarf, cu_offset)
     }
 
+    fn build_incoming_call_site_fixture() -> (gimli::Dwarf<DwarfReader>, gimli::DebugInfoOffset) {
+        build_incoming_call_site_fixture_with_target(IncomingCallSiteTarget::CallOrigin)
+    }
+
+    #[derive(Clone, Copy)]
+    enum IncomingCallSiteTarget {
+        CallOrigin,
+        CallTargetAttr,
+        CallTargetExpr,
+        LowPcOnly,
+    }
+
+    fn build_incoming_call_site_fixture_with_target(
+        target_kind: IncomingCallSiteTarget,
+    ) -> (gimli::Dwarf<DwarfReader>, gimli::DebugInfoOffset) {
+        let encoding = gimli::Encoding {
+            format: Format::Dwarf32,
+            version: 5,
+            address_size: 8,
+        };
+
+        let mut dwarf = WriteDwarf::new();
+        let unit_id = dwarf.units.add(Unit::new(encoding, LineProgram::none()));
+        let unit = dwarf.units.get_mut(unit_id);
+        let root = unit.root();
+
+        let caller_id = unit.add(root, constants::DW_TAG_subprogram);
+        let caller = unit.get_mut(caller_id);
+        caller.set(
+            constants::DW_AT_name,
+            WriteAttributeValue::String(b"caller".to_vec()),
+        );
+        caller.set(
+            constants::DW_AT_low_pc,
+            WriteAttributeValue::Address(Address::Constant(0x1000)),
+        );
+        caller.set(constants::DW_AT_high_pc, WriteAttributeValue::Udata(0x40));
+
+        let callee_id = unit.add(root, constants::DW_TAG_subprogram);
+        let callee = unit.get_mut(callee_id);
+        callee.set(
+            constants::DW_AT_name,
+            WriteAttributeValue::String(b"callee".to_vec()),
+        );
+        callee.set(
+            constants::DW_AT_low_pc,
+            WriteAttributeValue::Address(Address::Constant(0x1200)),
+        );
+        callee.set(constants::DW_AT_high_pc, WriteAttributeValue::Udata(0x10));
+
+        let call_site_id = unit.add(caller_id, constants::DW_TAG_call_site);
+        match target_kind {
+            IncomingCallSiteTarget::CallOrigin => {
+                unit.get_mut(call_site_id).set(
+                    constants::DW_AT_call_origin,
+                    WriteAttributeValue::UnitRef(callee_id),
+                );
+            }
+            IncomingCallSiteTarget::CallTargetAttr => {
+                unit.get_mut(call_site_id).set(
+                    constants::DW_AT_call_target,
+                    WriteAttributeValue::Address(Address::Constant(0x1200)),
+                );
+            }
+            IncomingCallSiteTarget::CallTargetExpr => {
+                let mut target_expr = WriteExpression::new();
+                target_expr.op_addr(Address::Constant(0x1200));
+                unit.get_mut(call_site_id).set(
+                    constants::DW_AT_call_target,
+                    WriteAttributeValue::Exprloc(target_expr),
+                );
+            }
+            IncomingCallSiteTarget::LowPcOnly => {
+                unit.get_mut(call_site_id).set(
+                    constants::DW_AT_low_pc,
+                    WriteAttributeValue::Address(Address::Constant(0x1014)),
+                );
+            }
+        }
+        unit.get_mut(call_site_id).set(
+            constants::DW_AT_call_return_pc,
+            WriteAttributeValue::Address(Address::Constant(0x1018)),
+        );
+
+        let param_id = unit.add(call_site_id, constants::DW_TAG_call_site_parameter);
+        let param = unit.get_mut(param_id);
+        let mut location = WriteExpression::new();
+        location.op_reg(Register(5));
+        param.set(
+            constants::DW_AT_location,
+            WriteAttributeValue::Exprloc(location),
+        );
+        let mut value = WriteExpression::new();
+        value.op_constu(42);
+        param.set(
+            constants::DW_AT_call_value,
+            WriteAttributeValue::Exprloc(value),
+        );
+
+        let mut sections = Sections::new(EndianVec::new(LittleEndian));
+        dwarf.write(&mut sections).unwrap();
+
+        let dwarf_sections: gimli::DwarfSections<Vec<u8>> = gimli::DwarfSections::load(|id| {
+            Ok::<_, gimli::Error>(
+                sections
+                    .get(id)
+                    .map(|section| section.slice().to_vec())
+                    .unwrap_or_default(),
+            )
+        })
+        .unwrap();
+
+        let read_dwarf = dwarf_sections
+            .borrow(|section| dwarf_reader_from_arc(Arc::<[u8]>::from(section.as_slice())));
+        let mut units = read_dwarf.units();
+        let header = units.next().unwrap().unwrap();
+        let cu_offset = header.debug_info_offset().unwrap();
+        (read_dwarf, cu_offset)
+    }
+
     #[test]
     fn build_for_unit_indexes_standard_call_site_values() {
         let (dwarf, cu_offset) = build_call_site_fixture(
@@ -685,6 +927,7 @@ mod tests {
             .map(Vec::as_slice)
             .expect("call-site return_pc should be indexed");
         assert_eq!(records.len(), 1);
+        assert_eq!(records[0].cu_offset, cu_offset);
         assert_eq!(records[0].return_pc, 0x1018);
         assert_eq!(records[0].parameters.len(), 2);
         assert_eq!(records[0].parameters[0].callee_register, 5);
@@ -724,6 +967,7 @@ mod tests {
             .map(Vec::as_slice)
             .expect("GNU call-site return_pc should be indexed");
         assert_eq!(records.len(), 1);
+        assert_eq!(records[0].cu_offset, cu_offset);
         assert_eq!(records[0].parameters.len(), 2);
         assert_eq!(records[0].parameters[0].callee_register, 5);
         assert_eq!(
@@ -827,13 +1071,124 @@ mod tests {
     }
 
     #[test]
+    fn add_functions_links_incoming_call_sites_by_call_origin() {
+        let (dwarf, cu_offset) = build_incoming_call_site_fixture();
+        let builder = BlockIndexBuilder::new(&dwarf);
+        let functions = builder
+            .build_for_unit(cu_offset)
+            .expect("fixture CU should build");
+
+        let mut block_index = BlockIndex::new();
+        block_index.add_functions(functions);
+
+        let callee = block_index
+            .find_function_by_pc(0x1200)
+            .expect("callee function should be indexed");
+        let incoming = callee
+            .incoming_call_sites
+            .get(&0x1018)
+            .map(Vec::as_slice)
+            .expect("callee should have one incoming call site");
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].return_pc, 0x1018);
+        assert_eq!(incoming[0].parameters.len(), 1);
+        assert_eq!(incoming[0].parameters[0].callee_register, 5);
+        assert_eq!(
+            incoming[0].parameters[0].caller_value_steps,
+            vec![ComputeStep::PushConstant(42)]
+        );
+        assert_eq!(incoming[0].call_origin, callee.abs_die_offset);
+    }
+
+    #[test]
+    fn add_functions_links_incoming_call_sites_by_call_target_attr() {
+        let (dwarf, cu_offset) =
+            build_incoming_call_site_fixture_with_target(IncomingCallSiteTarget::CallTargetAttr);
+        let builder = BlockIndexBuilder::new(&dwarf);
+        let functions = builder
+            .build_for_unit(cu_offset)
+            .expect("fixture CU should build");
+
+        let mut block_index = BlockIndex::new();
+        block_index.add_functions(functions);
+
+        let callee = block_index
+            .find_function_by_pc(0x1200)
+            .expect("callee function should be indexed");
+        let incoming = callee
+            .incoming_call_sites
+            .get(&0x1018)
+            .map(Vec::as_slice)
+            .expect("callee should have one incoming call site");
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].call_origin, None);
+        assert_eq!(incoming[0].call_target, Some(0x1200));
+    }
+
+    #[test]
+    fn add_functions_links_incoming_call_sites_by_call_target_expr() {
+        let (dwarf, cu_offset) =
+            build_incoming_call_site_fixture_with_target(IncomingCallSiteTarget::CallTargetExpr);
+        let builder = BlockIndexBuilder::new(&dwarf);
+        let functions = builder
+            .build_for_unit(cu_offset)
+            .expect("fixture CU should build");
+
+        let mut block_index = BlockIndex::new();
+        block_index.add_functions(functions);
+
+        let callee = block_index
+            .find_function_by_pc(0x1200)
+            .expect("callee function should be indexed");
+        let incoming = callee
+            .incoming_call_sites
+            .get(&0x1018)
+            .map(Vec::as_slice)
+            .expect("callee should have one incoming call site");
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].call_origin, None);
+        assert_eq!(incoming[0].call_target, Some(0x1200));
+    }
+
+    #[test]
+    fn add_functions_does_not_treat_call_site_low_pc_as_callee_target() {
+        let (dwarf, cu_offset) =
+            build_incoming_call_site_fixture_with_target(IncomingCallSiteTarget::LowPcOnly);
+        let builder = BlockIndexBuilder::new(&dwarf);
+        let functions = builder
+            .build_for_unit(cu_offset)
+            .expect("fixture CU should build");
+
+        let mut block_index = BlockIndex::new();
+        block_index.add_functions(functions);
+
+        let caller = block_index
+            .find_function_by_pc(0x1000)
+            .expect("caller function should be indexed");
+        let callee = block_index
+            .find_function_by_pc(0x1200)
+            .expect("callee function should be indexed");
+        assert!(
+            caller.incoming_call_sites.is_empty(),
+            "call-site DW_AT_low_pc should not create a self-link"
+        );
+        assert!(
+            callee.incoming_call_sites.is_empty(),
+            "call-site DW_AT_low_pc should not resolve a callee link"
+        );
+    }
+
+    #[test]
     fn entry_value_parameter_lookup_uses_nearest_prior_return_pc() {
         let mut function = FunctionBlocks::new(gimli::DebugInfoOffset(0), gimli::UnitOffset(0));
         function.call_sites.insert(
             0x1018,
             vec![CallSiteRecord {
+                cu_offset: gimli::DebugInfoOffset(0),
                 die_offset: gimli::UnitOffset(1),
                 return_pc: 0x1018,
+                call_origin: None,
+                call_target: None,
                 parameters: vec![CallSiteParameter {
                     callee_register: 5,
                     caller_value_steps: vec![ComputeStep::PushConstant(11)],
@@ -843,8 +1198,11 @@ mod tests {
         function.call_sites.insert(
             0x1030,
             vec![CallSiteRecord {
+                cu_offset: gimli::DebugInfoOffset(0),
                 die_offset: gimli::UnitOffset(2),
                 return_pc: 0x1030,
+                call_origin: None,
+                call_target: None,
                 parameters: vec![CallSiteParameter {
                     callee_register: 5,
                     caller_value_steps: vec![ComputeStep::PushConstant(22)],
