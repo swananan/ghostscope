@@ -1,13 +1,15 @@
-CC = gcc
-BASE_CFLAGS = -Wall -Wextra -g
+CC ?= gcc
+BASE_CFLAGS ?= -Wall -Wextra -g
 
 # Default debug build (O0)
-CFLAGS = $(BASE_CFLAGS) -O0
+CFLAGS ?= $(BASE_CFLAGS) -O0
+BINARY ?= complex_types_program
+OBJ ?= $(BINARY).o
 
-complex_types_program: complex_types_program.o
-	$(CC) $(CFLAGS) -o complex_types_program complex_types_program.o
+$(BINARY): $(OBJ)
+	$(CC) $(CFLAGS) -o $@ $^
 
-complex_types_program.o: complex_types_program.c complex_types_program.h
+$(OBJ): complex_types_program.c complex_types_program.h
 	$(CC) $(CFLAGS) -c -o $@ complex_types_program.c
 
 # Optimized builds
@@ -29,7 +31,7 @@ complex_types_program_o2.o: complex_types_program.c complex_types_program.h
 complex_types_program_o3.o: complex_types_program.c complex_types_program.h
 	$(CC) $(BASE_CFLAGS) -O3 -DNDEBUG -c -o $@ complex_types_program.c
 
-all: complex_types_program complex_types_program_o1 complex_types_program_o2 complex_types_program_o3
+all: $(BINARY) complex_types_program_o1 complex_types_program_o2 complex_types_program_o3
 
 clean:
 	rm -f *.o complex_types_program complex_types_program_o* complex_types_program_nopie
@@ -42,4 +44,3 @@ complex_types_program_nopie: complex_types_program_nopie.o
 
 complex_types_program_nopie.o: complex_types_program.c complex_types_program.h
 	$(CC) $(BASE_CFLAGS) -O0 -fno-pie -c -o $@ complex_types_program.c
-

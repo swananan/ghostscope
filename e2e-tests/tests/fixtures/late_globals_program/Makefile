@@ -1,13 +1,15 @@
-CC = gcc
-BASE_CFLAGS = -Wall -Wextra -g
-CFLAGS = $(BASE_CFLAGS) -O0
+CC ?= gcc
+BASE_CFLAGS ?= -Wall -Wextra -g
+CFLAGS ?= $(BASE_CFLAGS) -O0
+BINARY ?= late_globals_program
+OBJ ?= $(BINARY).o
 
-all: late_globals_program
+all: $(BINARY)
 
-late_globals_program: late_globals_program.o
-	$(CC) $(CFLAGS) -o $@ late_globals_program.o
+$(BINARY): $(OBJ)
+	$(CC) $(CFLAGS) -o $@ $^
 
-late_globals_program.o: late_globals_program.c
+$(OBJ): late_globals_program.c
 	$(CC) $(CFLAGS) -c -o $@ late_globals_program.c
 
 clean:

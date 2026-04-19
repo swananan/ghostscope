@@ -1,16 +1,17 @@
-CXX = g++
-CXXFLAGS = -g -O0 -Wall -Wextra
+CXX ?= g++
+CXXFLAGS ?= -g -O0 -Wall -Wextra
+BINARY ?= cpp_complex_program
+OBJ ?= main.o
 
-all: cpp_complex_program
+all: $(BINARY)
 
-cpp_complex_program: main.o
+$(BINARY): $(OBJ)
 	$(CXX) $(CXXFLAGS) -o $@ $^
 
-main.o: main.cpp
+$(OBJ): main.cpp
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
 clean:
 	rm -f cpp_complex_program main.o
 
 .PHONY: all clean
-

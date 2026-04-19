@@ -50,6 +50,8 @@ test_*
 !ghostscope-process/ebpf/build_sysmon_bpf.sh
 # Keep project shell scripts tracked
 !scripts/**/*.sh
+# Keep fixture compiler entrypoint tracked
+!e2e-tests/compile-fixtures.sh
 # Keep other C files in test fixtures but exclude random C files in root
 /*.c
 e2e-tests/tests/fixtures/complex_types_program/complex_types_program
