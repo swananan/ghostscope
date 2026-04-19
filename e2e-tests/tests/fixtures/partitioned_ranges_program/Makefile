@@ -1,12 +1,14 @@
-CC = gcc
-BASE_CFLAGS = -Wall -Wextra -g -O3 -DNDEBUG -freorder-blocks-and-partition
+CC ?= gcc
+BASE_CFLAGS ?= -Wall -Wextra -g -O3 -DNDEBUG -freorder-blocks-and-partition
+BINARY ?= partitioned_ranges_program
+OBJ ?= $(BINARY).o
 
-all: partitioned_ranges_program
+all: $(BINARY)
 
-partitioned_ranges_program: partitioned_ranges_program.o
+$(BINARY): $(OBJ)
 	$(CC) $(BASE_CFLAGS) -o $@ $^
 
-partitioned_ranges_program.o: partitioned_ranges_program.c
+$(OBJ): partitioned_ranges_program.c
 	$(CC) $(BASE_CFLAGS) -c -o $@ $<
 
 clean:
