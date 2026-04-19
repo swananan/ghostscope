@@ -26,7 +26,9 @@ lazy_static! {
         Mutex::new(None);
     static ref COMPILE_MEMBER_POINTER_OPTIMIZED_RESULT: Mutex<Option<anyhow::Result<()>>> =
         Mutex::new(None);
+    static ref COMPILE_GLOBALS_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
     static ref COMPILE_LATE_GLOBALS_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
+    static ref COMPILE_RUST_GLOBAL_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
     static ref COMPILE_INLINE_CALLSITE_DEFAULT_RESULT: Mutex<Option<anyhow::Result<()>>> =
         Mutex::new(None);
     static ref COMPILE_INLINE_CALLSITE_CLANG_DWARF5_RESULT: Mutex<Option<anyhow::Result<()>>> =
@@ -35,9 +37,14 @@ lazy_static! {
         Mutex::new(None);
     static ref COMPILE_PARTITIONED_RANGES_RESULT: Mutex<Option<anyhow::Result<()>>> =
         Mutex::new(None);
+    static ref COMPILE_CPP_COMPLEX_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
     static ref COMPILE_STATIC_SCOPE_DEFAULT_RESULT: Mutex<Option<anyhow::Result<()>>> =
         Mutex::new(None);
     static ref COMPILE_STATIC_SCOPE_CLANG_DWARF5_RESULT: Mutex<Option<anyhow::Result<()>>> =
+        Mutex::new(None);
+    static ref COMPILE_ENTRY_VALUE_RECOVERY_DEFAULT_RESULT: Mutex<Option<anyhow::Result<()>>> =
+        Mutex::new(None);
+    static ref COMPILE_ENTRY_VALUE_RECOVERY_CLANG_DWARF5_RESULT: Mutex<Option<anyhow::Result<()>>> =
         Mutex::new(None);
 }
 
@@ -60,6 +67,7 @@ enum RegisteredFixtureKind {
     PartitionedRanges,
     CppComplex,
     StaticScope,
+    EntryValueRecovery,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -140,6 +148,12 @@ const REGISTERED_FIXTURES: &[RegisteredFixture] = &[
         cleanup: CleanupCommand::Make,
         kind: RegisteredFixtureKind::StaticScope,
     },
+    RegisteredFixture {
+        name: "entry_value_recovery_program",
+        directory: "entry_value_recovery_program",
+        cleanup: CleanupCommand::Make,
+        kind: RegisteredFixtureKind::EntryValueRecovery,
+    },
 ];
 
 fn registered_fixture(name: &str) -> Option<&'static RegisteredFixture> {
@@ -165,6 +179,10 @@ fn fixture_cargo_target_dir(fixture_dir: &std::path::Path) -> PathBuf {
 #[allow(dead_code)]
 pub(crate) fn host_pid_is_running(pid: u32) -> bool {
     PathBuf::from(format!("/proc/{pid}")).is_dir()
+}
+
+fn preserve_precompiled_fixtures() -> bool {
+    std::env::var_os("GHOSTSCOPE_PRESERVE_PRECOMPILED_FIXTURES").is_some()
 }
 
 /// Initialize logging for tests (call once per test)
@@ -209,6 +227,9 @@ pub fn init() {
     // Register an atexit cleanup to remove built fixtures after all tests
     REGISTER_CLEANUP.call_once(|| unsafe {
         extern "C" fn cleanup_fixtures() {
+            if preserve_precompiled_fixtures() {
+                return;
+            }
             // Best-effort cleanup; ignore errors
             let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
             for fixture in REGISTERED_FIXTURES {
@@ -263,7 +284,8 @@ impl FixtureCompiler {
             .arg(format!("OBJ={}", self.object_name(base)));
 
         if matches!(self, FixtureCompiler::ClangDwarf5) {
-            cmd.arg("CC=clang")
+            let clang = preferred_clang_binary().unwrap_or("clang");
+            cmd.arg(format!("CC={clang}"))
                 .arg(format!("CFLAGS={clang_dwarf5_cflags}"));
         }
     }
@@ -366,6 +388,10 @@ impl RegisteredFixture {
                 ensure_static_scope_program_compiled(FixtureCompiler::Default)?;
                 Ok(dir.join(FixtureCompiler::Default.binary_name(self.name)))
             }
+            RegisteredFixtureKind::EntryValueRecovery => {
+                ensure_entry_value_recovery_program_compiled(FixtureCompiler::Default)?;
+                Ok(dir.join(FixtureCompiler::Default.binary_name(self.name)))
+            }
         }
     }
 
@@ -387,6 +413,12 @@ impl RegisteredFixture {
                     .dir(fixtures_base)
                     .join(compiler.binary_name(self.name)))
             }
+            RegisteredFixtureKind::EntryValueRecovery => {
+                ensure_entry_value_recovery_program_compiled(compiler)?;
+                Ok(self
+                    .dir(fixtures_base)
+                    .join(compiler.binary_name(self.name)))
+            }
             _ if matches!(compiler, FixtureCompiler::Default) => {
                 self.binary_path_with_opt(fixtures_base, OptimizationLevel::Debug)
             }
@@ -402,11 +434,66 @@ impl RegisteredFixture {
 pub(crate) fn fixture_compiler_available(compiler: FixtureCompiler) -> bool {
     match compiler {
         FixtureCompiler::Default => true,
-        FixtureCompiler::ClangDwarf5 => Command::new("clang")
-            .arg("--version")
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false),
+        FixtureCompiler::ClangDwarf5 => {
+            preferred_clang_binary().is_some()
+                || precompiled_outputs_available(&[
+                    fixture_binary_path(
+                        "inline_callsite_program",
+                        &FixtureCompiler::ClangDwarf5.binary_name("inline_callsite_program"),
+                    ),
+                    fixture_binary_path(
+                        "static_scope_program",
+                        &FixtureCompiler::ClangDwarf5.binary_name("static_scope_program"),
+                    ),
+                    fixture_binary_path(
+                        "entry_value_recovery_program",
+                        &FixtureCompiler::ClangDwarf5.binary_name("entry_value_recovery_program"),
+                    ),
+                ])
+        }
+    }
+}
+
+fn command_available(name: &str) -> bool {
+    Command::new(name)
+        .arg("--version")
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn preferred_clang_binary() -> Option<&'static str> {
+    if command_available("clang-18") {
+        Some("clang-18")
+    } else if command_available("clang") {
+        Some("clang")
+    } else {
+        None
+    }
+}
+
+fn fixture_binary_path(fixture_name: &str, binary_name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(fixture_name)
+        .join(binary_name)
+}
+
+fn precompiled_outputs_available(outputs: &[PathBuf]) -> bool {
+    outputs.iter().all(|path| path.exists())
+}
+
+fn use_precompiled_outputs(label: &str, outputs: &[PathBuf]) -> Option<anyhow::Result<()>> {
+    if precompiled_outputs_available(outputs) {
+        let rendered = outputs
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("Using precompiled {label}: {rendered}");
+        Some(Ok(()))
+    } else {
+        None
     }
 }
 
@@ -484,6 +571,13 @@ pub fn ensure_test_program_compiled_with_opt(opt_level: OptimizationLevel) -> an
 fn compile_sample_program(opt_level: OptimizationLevel) -> anyhow::Result<()> {
     let fixtures_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     let sample_program_dir = fixtures_path.join("sample_program");
+    let mut outputs = vec![sample_program_dir.join(opt_level.as_binary_name())];
+    if matches!(opt_level, OptimizationLevel::Stripped) {
+        outputs.push(sample_program_dir.join("sample_program_stripped.debug"));
+    }
+    if let Some(result) = use_precompiled_outputs("sample_program", &outputs) {
+        return result;
+    }
 
     println!(
         "Compiling sample_program {} in {sample_program_dir:?}",
@@ -570,6 +664,11 @@ fn compile_complex_program(opt_level: OptimizationLevel) -> anyhow::Result<()> {
             anyhow::bail!("Stripped optimization level not supported for complex_types_program")
         }
     };
+    if let Some(result) =
+        use_precompiled_outputs("complex_types_program", &[program_dir.join(target)])
+    {
+        return result;
+    }
 
     let output = Command::new("make")
         .arg(target)
@@ -654,6 +753,11 @@ fn compile_member_pointer_program(opt_level: OptimizationLevel) -> anyhow::Resul
             anyhow::bail!("Stripped optimization level not supported for member_pointer_program")
         }
     };
+    if let Some(result) =
+        use_precompiled_outputs("member_pointer_program", &[program_dir.join(target)])
+    {
+        return result;
+    }
 
     let output = Command::new("make")
         .arg(target)
@@ -686,6 +790,23 @@ fn compile_member_pointer_program(opt_level: OptimizationLevel) -> anyhow::Resul
 fn compile_member_pointer_program_variants(opt_levels: &[OptimizationLevel]) -> anyhow::Result<()> {
     let fixtures_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     let program_dir = fixtures_path.join("member_pointer_program");
+    let outputs = opt_levels
+        .iter()
+        .map(|opt_level| {
+            program_dir.join(match opt_level {
+                OptimizationLevel::Debug => "member_pointer_program",
+                OptimizationLevel::O1 => "member_pointer_program_o1",
+                OptimizationLevel::O2 => "member_pointer_program_o2",
+                OptimizationLevel::O3 => "member_pointer_program_o3",
+                OptimizationLevel::Stripped => {
+                    unreachable!("member_pointer_program does not support stripped output")
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    if let Some(result) = use_precompiled_outputs("member_pointer_program variants", &outputs) {
+        return result;
+    }
 
     let requested = opt_levels
         .iter()
@@ -797,6 +918,12 @@ impl TestFixtures {
     /// Build and return the non-PIE variant of complex_types_program
     pub fn get_test_binary_complex_nopie(&self) -> anyhow::Result<PathBuf> {
         let program_dir = self.base_path.join("complex_types_program");
+        let bin_path = program_dir.join("complex_types_program_nopie");
+
+        if bin_path.exists() {
+            println!("Using precompiled complex_types_program Non-PIE: {bin_path:?}");
+            return Ok(bin_path);
+        }
 
         COMPILE_COMPLEX_NOPIE.call_once(|| {
             let compile_result = (|| -> anyhow::Result<()> {
@@ -835,7 +962,6 @@ impl TestFixtures {
             None => panic!("Compilation result should be set after call_once"),
         }
 
-        let bin_path = program_dir.join("complex_types_program_nopie");
         if !bin_path.exists() {
             anyhow::bail!("Non-PIE binary not found: {}", bin_path.display());
         }
@@ -863,38 +989,46 @@ static COMPILE_PARTITIONED_RANGES: Once = Once::new();
 static COMPILE_CPP_COMPLEX: Once = Once::new();
 static COMPILE_STATIC_SCOPE_DEFAULT: Once = Once::new();
 static COMPILE_STATIC_SCOPE_CLANG_DWARF5: Once = Once::new();
+static COMPILE_ENTRY_VALUE_RECOVERY_DEFAULT: Once = Once::new();
+static COMPILE_ENTRY_VALUE_RECOVERY_CLANG_DWARF5: Once = Once::new();
 
 fn ensure_globals_program_compiled() -> anyhow::Result<()> {
-    let mut result = Ok(());
     COMPILE_GLOBALS.call_once(|| {
-        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/globals_program");
-        println!("Compiling globals_program (Debug) in {base:?}");
-        let _ = Command::new("make")
-            .arg("clean")
-            .current_dir(base.clone())
-            .status()
-            .is_ok();
-        match Command::new("make").arg("all").current_dir(base).output() {
-            Ok(out) => {
-                if out.status.success() {
-                    println!("✓ Successfully compiled globals_program and libgvars.so");
-                } else {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    result = Err(anyhow::anyhow!(
-                        "Failed to compile globals_program: {}",
-                        stderr
-                    ));
-                }
+        let compile_result = (|| -> anyhow::Result<()> {
+            let base =
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/globals_program");
+            if let Some(result) = use_precompiled_outputs(
+                "globals_program",
+                &[base.join("globals_program"), base.join("libgvars.so")],
+            ) {
+                return result;
             }
-            Err(e) => {
-                result = Err(anyhow::anyhow!(
-                    "Failed to run make for globals_program: {}",
-                    e
-                ));
+
+            println!("Compiling globals_program (Debug) in {base:?}");
+            let _ = Command::new("make")
+                .arg("clean")
+                .current_dir(base.clone())
+                .status()
+                .is_ok();
+            let out = Command::new("make").arg("all").current_dir(base).output()?;
+            if out.status.success() {
+                println!("✓ Successfully compiled globals_program and libgvars.so");
+                Ok(())
+            } else {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                Err(anyhow::anyhow!(
+                    "Failed to compile globals_program: {}",
+                    stderr
+                ))
             }
-        }
+        })();
+        *COMPILE_GLOBALS_RESULT.lock().unwrap() = Some(compile_result);
     });
-    result
+    match COMPILE_GLOBALS_RESULT.lock().unwrap().as_ref() {
+        Some(Ok(())) => Ok(()),
+        Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
+        None => panic!("Compilation result should be set after call_once"),
+    }
 }
 
 fn ensure_late_globals_program_compiled() -> anyhow::Result<()> {
@@ -902,6 +1036,12 @@ fn ensure_late_globals_program_compiled() -> anyhow::Result<()> {
         let compile_result = (|| -> anyhow::Result<()> {
             let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/fixtures/late_globals_program");
+            if let Some(result) = use_precompiled_outputs(
+                "late_globals_program",
+                &[base.join("late_globals_program")],
+            ) {
+                return result;
+            }
             println!("Compiling late_globals_program (Debug) in {base:?}");
             let _ = Command::new("make")
                 .arg("clean")
@@ -931,36 +1071,41 @@ fn ensure_late_globals_program_compiled() -> anyhow::Result<()> {
 }
 
 fn ensure_rust_global_program_compiled() -> anyhow::Result<()> {
-    let mut result = Ok(());
     COMPILE_RUST_GLOBAL.call_once(|| {
-        let base =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rust_global_program");
-        println!("Compiling rust_global_program (Debug) in {base:?}");
-        match Command::new("cargo")
-            .arg("build")
-            .current_dir(base)
-            .output()
-        {
-            Ok(out) => {
-                if out.status.success() {
-                    println!("✓ Successfully compiled rust_global_program");
-                } else {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    result = Err(anyhow::anyhow!(
-                        "Failed to compile rust_global_program: {}",
-                        stderr
-                    ));
-                }
+        let compile_result = (|| -> anyhow::Result<()> {
+            let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/rust_global_program");
+            let binary = fixture_cargo_target_dir(&base)
+                .join("debug")
+                .join("rust_global_program");
+            if let Some(result) = use_precompiled_outputs("rust_global_program", &[binary]) {
+                return result;
             }
-            Err(e) => {
-                result = Err(anyhow::anyhow!(
-                    "Failed to run make for rust_global_program: {}",
-                    e
-                ));
+
+            println!("Compiling rust_global_program (Debug) in {base:?}");
+            let out = Command::new("cargo")
+                .arg("build")
+                .arg("--locked")
+                .current_dir(base)
+                .output()?;
+            if out.status.success() {
+                println!("✓ Successfully compiled rust_global_program");
+                Ok(())
+            } else {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                Err(anyhow::anyhow!(
+                    "Failed to compile rust_global_program: {}",
+                    stderr
+                ))
             }
-        }
+        })();
+        *COMPILE_RUST_GLOBAL_RESULT.lock().unwrap() = Some(compile_result);
     });
-    result
+    match COMPILE_RUST_GLOBAL_RESULT.lock().unwrap().as_ref() {
+        Some(Ok(())) => Ok(()),
+        Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
+        None => panic!("Compilation result should be set after call_once"),
+    }
 }
 
 fn ensure_inline_callsite_program_compiled(compiler: FixtureCompiler) -> anyhow::Result<()> {
@@ -996,6 +1141,12 @@ fn ensure_inline_call_value_program_compiled() -> anyhow::Result<()> {
         let compile_result = (|| -> anyhow::Result<()> {
             let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/fixtures/inline_call_value_program");
+            if let Some(result) = use_precompiled_outputs(
+                "inline_call_value_program",
+                &[base.join("inline_call_value_program")],
+            ) {
+                return result;
+            }
             println!("Compiling inline_call_value_program (Optimized O3) in {base:?}");
             let _ = Command::new("make")
                 .arg("clean")
@@ -1029,6 +1180,12 @@ fn ensure_partitioned_ranges_program_compiled() -> anyhow::Result<()> {
         let compile_result = (|| -> anyhow::Result<()> {
             let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/fixtures/partitioned_ranges_program");
+            if let Some(result) = use_precompiled_outputs(
+                "partitioned_ranges_program",
+                &[base.join("partitioned_ranges_program")],
+            ) {
+                return result;
+            }
             println!("Compiling partitioned_ranges_program (Optimized O3) in {base:?}");
             let _ = Command::new("make")
                 .arg("clean")
@@ -1058,37 +1215,41 @@ fn ensure_partitioned_ranges_program_compiled() -> anyhow::Result<()> {
 }
 
 fn ensure_cpp_complex_program_compiled() -> anyhow::Result<()> {
-    let mut result = Ok(());
     COMPILE_CPP_COMPLEX.call_once(|| {
-        let base =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cpp_complex_program");
-        println!("Compiling cpp_complex_program (Debug) in {base:?}");
-        let _ = Command::new("make")
-            .arg("clean")
-            .current_dir(base.clone())
-            .status()
-            .is_ok();
-        match Command::new("make").arg("all").current_dir(base).output() {
-            Ok(out) => {
-                if out.status.success() {
-                    println!("✓ Successfully compiled cpp_complex_program");
-                } else {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    result = Err(anyhow::anyhow!(
-                        "Failed to compile cpp_complex_program: {}",
-                        stderr
-                    ));
-                }
+        let compile_result = (|| -> anyhow::Result<()> {
+            let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/cpp_complex_program");
+            if let Some(result) =
+                use_precompiled_outputs("cpp_complex_program", &[base.join("cpp_complex_program")])
+            {
+                return result;
             }
-            Err(e) => {
-                result = Err(anyhow::anyhow!(
-                    "Failed to run make for cpp_complex_program: {}",
-                    e
-                ));
+
+            println!("Compiling cpp_complex_program (Debug) in {base:?}");
+            let _ = Command::new("make")
+                .arg("clean")
+                .current_dir(base.clone())
+                .status()
+                .is_ok();
+            let out = Command::new("make").arg("all").current_dir(base).output()?;
+            if out.status.success() {
+                println!("✓ Successfully compiled cpp_complex_program");
+                Ok(())
+            } else {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                Err(anyhow::anyhow!(
+                    "Failed to compile cpp_complex_program: {}",
+                    stderr
+                ))
             }
-        }
+        })();
+        *COMPILE_CPP_COMPLEX_RESULT.lock().unwrap() = Some(compile_result);
     });
-    result
+    match COMPILE_CPP_COMPLEX_RESULT.lock().unwrap().as_ref() {
+        Some(Ok(())) => Ok(()),
+        Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
+        None => panic!("Compilation result should be set after call_once"),
+    }
 }
 
 pub(crate) fn compile_c_make_fixture(
@@ -1099,6 +1260,13 @@ pub(crate) fn compile_c_make_fixture(
     let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join(fixture_name);
+    let output_binary = base.join(compiler.binary_name(fixture_name));
+    if let Some(result) = use_precompiled_outputs(
+        &format!("{fixture_name} {}", compiler.description()),
+        &[output_binary],
+    ) {
+        return result;
+    }
     println!(
         "Compiling {fixture_name} {} in {base:?}",
         compiler.description()
@@ -1160,4 +1328,32 @@ fn compile_static_scope_program(compiler: FixtureCompiler) -> anyhow::Result<()>
         compiler,
         "-Wall -Wextra -gdwarf-5 -O0",
     )
+}
+
+fn ensure_entry_value_recovery_program_compiled(compiler: FixtureCompiler) -> anyhow::Result<()> {
+    let (once, slot): (&Once, &Mutex<Option<anyhow::Result<()>>>) = match compiler {
+        FixtureCompiler::Default => (
+            &COMPILE_ENTRY_VALUE_RECOVERY_DEFAULT,
+            &*COMPILE_ENTRY_VALUE_RECOVERY_DEFAULT_RESULT,
+        ),
+        FixtureCompiler::ClangDwarf5 => (
+            &COMPILE_ENTRY_VALUE_RECOVERY_CLANG_DWARF5,
+            &*COMPILE_ENTRY_VALUE_RECOVERY_CLANG_DWARF5_RESULT,
+        ),
+    };
+
+    once.call_once(|| {
+        let compile_result = compile_c_make_fixture(
+            "entry_value_recovery_program",
+            compiler,
+            "-Wall -Wextra -gdwarf-5 -O3",
+        );
+        *slot.lock().unwrap() = Some(compile_result);
+    });
+
+    match slot.lock().unwrap().as_ref() {
+        Some(Ok(())) => Ok(()),
+        Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
+        None => panic!("Compilation result should be set after call_once"),
+    }
 }

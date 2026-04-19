@@ -5,7 +5,7 @@ use common::{
     fixture_compiler_available, init,
     runner::GhostscopeRunner,
     targets::{TargetHandle, TargetLauncher},
-    FixtureCompiler,
+    FixtureCompiler, FIXTURES,
 };
 use ghostscope_dwarf::{ComputeStep, MemoryAccessSize};
 use gimli::constants;
@@ -33,7 +33,6 @@ const BREG_FIXTURE_SOURCE: &str = "entry_value_breg_program.c";
 const BREG_FUNCTION_NAME: &str = "stack_entry_target";
 const BREG_ANCHOR_NAME: &str = "entry_value_breg_anchor";
 
-static CLANG_FIXTURE: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 static BREG_CLANG_FIXTURE: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 
 struct LoggedTarget {
@@ -60,48 +59,22 @@ fn should_skip_for_ebpf_env(exit_code: i32, stderr: &str) -> bool {
             || stderr.contains("cap_bpf"))
 }
 
-fn compile_entry_value_recovery_program_clang() -> anyhow::Result<PathBuf> {
-    let result = CLANG_FIXTURE.get_or_init(|| {
-        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures")
-            .join(FIXTURE_NAME);
-        let binary = base.join("entry_value_recovery_program_clang_dwarf5");
-        let output = StdCommand::new("make")
-            .arg("clean")
-            .current_dir(&base)
-            .output();
-        if let Err(e) = output {
-            return Err(format!("failed to run make clean for {FIXTURE_NAME}: {e}"));
-        }
-
-        let output = std::process::Command::new("make")
-            .arg("all")
-            .arg("CC=clang")
-            .arg("CFLAGS=-Wall -Wextra -gdwarf-5 -O3")
-            .arg("BINARY=entry_value_recovery_program_clang_dwarf5")
-            .arg("OBJ=entry_value_recovery_program_clang_dwarf5.o")
-            .current_dir(&base)
-            .output();
-
-        match output {
-            Ok(output) if output.status.success() => Ok(binary),
-            Ok(output) => Err(format!(
-                "failed to compile {FIXTURE_NAME} clang fixture: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )),
-            Err(e) => Err(format!("failed to run make for {FIXTURE_NAME}: {e}")),
-        }
-    });
-
-    result.clone().map_err(|e| anyhow::anyhow!(e))
-}
-
 fn command_available(name: &str) -> bool {
     StdCommand::new(name)
         .arg("--version")
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)
+}
+
+fn preferred_clang_binary() -> Option<&'static str> {
+    if command_available("clang-18") {
+        Some("clang-18")
+    } else if command_available("clang") {
+        Some("clang")
+    } else {
+        None
+    }
 }
 
 fn compile_entry_value_breg_program_clang() -> anyhow::Result<PathBuf> {
@@ -116,11 +89,12 @@ fn compile_entry_value_breg_program_clang() -> anyhow::Result<PathBuf> {
         if !command_available("objcopy") {
             return Err("objcopy is unavailable".to_string());
         }
+        let clang = preferred_clang_binary().ok_or_else(|| "clang is unavailable".to_string())?;
 
         let _ = fs::remove_file(&binary);
         let _ = fs::remove_file(&debug_file);
 
-        let output = StdCommand::new("clang")
+        let output = StdCommand::new(clang)
             .arg("-Wall")
             .arg("-Wextra")
             .arg("-gdwarf-4")
@@ -469,7 +443,8 @@ async fn test_non_inline_entry_value_recovers_touch_parameters_at_runtime() -> a
         return Ok(());
     }
 
-    let binary_path = compile_entry_value_recovery_program_clang()?;
+    let binary_path =
+        FIXTURES.get_test_binary_with_compiler(FIXTURE_NAME, FixtureCompiler::ClangDwarf5)?;
     let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
     let addrs = analyzer.lookup_addresses_by_source_line(FIXTURE_SOURCE, TOUCH_TRACE_LINE);
     anyhow::ensure!(
@@ -567,7 +542,8 @@ async fn test_post_call_entry_value_recovers_state_members_at_runtime() -> anyho
         return Ok(());
     }
 
-    let binary_path = compile_entry_value_recovery_program_clang()?;
+    let binary_path =
+        FIXTURES.get_test_binary_with_compiler(FIXTURE_NAME, FixtureCompiler::ClangDwarf5)?;
     let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
     let addrs = analyzer.lookup_addresses_by_source_line(FIXTURE_SOURCE, POST_CALL_TRACE_LINE);
     anyhow::ensure!(
@@ -652,7 +628,7 @@ Target STDOUT: {target_stdout}"
 #[tokio::test]
 async fn test_entry_value_breg_stack_parameter_recovers_at_runtime() -> anyhow::Result<()> {
     init();
-    if !fixture_compiler_available(FixtureCompiler::ClangDwarf5) {
+    if preferred_clang_binary().is_none() {
         eprintln!("Skipping entry_value(breg) runtime test because clang is unavailable");
         return Ok(());
     }
@@ -739,7 +715,8 @@ async fn test_recover_caller_frame_exposes_pc_and_callee_saved_steps() -> anyhow
         return Ok(());
     }
 
-    let binary_path = compile_entry_value_recovery_program_clang()?;
+    let binary_path =
+        FIXTURES.get_test_binary_with_compiler(FIXTURE_NAME, FixtureCompiler::ClangDwarf5)?;
     let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
     let addrs = analyzer.lookup_addresses_by_source_line(FIXTURE_SOURCE, POST_CALL_TRACE_LINE);
     anyhow::ensure!(
