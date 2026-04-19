@@ -779,7 +779,6 @@ impl<'a> DwarfParser<'a> {
             _ => return Ok(None),
         };
 
-        let base_address = unit.low_pc;
         let mut ranges_iter = self.dwarf.ranges(unit, ranges_offset)?;
         while let Some(range) = ranges_iter.next()? {
             let begin = range.begin;
@@ -788,12 +787,7 @@ impl<'a> DwarfParser<'a> {
                 continue;
             }
 
-            let mut adjusted_begin = begin;
-            if begin == 0 && base_address != 0 {
-                adjusted_begin = base_address + begin;
-            }
-
-            return Ok(Some(adjusted_begin));
+            return Ok(Some(begin));
         }
 
         Ok(None)

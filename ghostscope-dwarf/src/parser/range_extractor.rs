@@ -103,9 +103,6 @@ impl RangeExtractor {
             }
         };
 
-        // Get base address for the compilation unit
-        let base_address = unit.low_pc;
-
         // Parse the range list
         let mut ranges_iter = dwarf.ranges(unit, ranges_offset)?;
         let mut ranges = Vec::new();
@@ -118,18 +115,8 @@ impl RangeExtractor {
                 continue;
             }
 
-            let (mut adjusted_begin, mut adjusted_end) = (begin, end);
-
-            if begin == 0 && base_address != 0 {
-                adjusted_begin = base_address + begin;
-                adjusted_end = base_address + end;
-            }
-
-            ranges.push((adjusted_begin, adjusted_end));
-            debug!(
-                "Range: 0x{:x}-0x{:x} (base: 0x{:x})",
-                adjusted_begin, adjusted_end, base_address
-            );
+            ranges.push((begin, end));
+            debug!("Range: 0x{:x}-0x{:x}", begin, end);
         }
 
         if ranges.is_empty() {
