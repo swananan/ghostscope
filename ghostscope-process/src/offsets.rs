@@ -748,7 +748,9 @@ mod tests {
         summaries.observe(&upper_entry);
 
         let summary = summaries.summary_for_path(&path_str).unwrap();
-        assert_eq!(summary.candidates, vec![(0, 0x1000), (0x2000, 0x3000)]);
+        let mut candidates = summary.candidates.clone();
+        candidates.sort();
+        assert_eq!(candidates, vec![(0, 0x1000), (0x2000, 0x3000)]);
         assert_eq!(summary.base(), 0x1000);
         assert_eq!(summary.size(), 0x4000);
 
