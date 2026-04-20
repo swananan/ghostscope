@@ -8,8 +8,8 @@ use crate::{
     index::{BlockIndex, CfiIndex, TypeNameIndex},
     parser::DetailedParser,
 };
-use object::{Object, ObjectSection};
-use std::{sync::Arc, time::Instant};
+use object::{Object, ObjectSection, ObjectSymbol, SymbolKind};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 impl LoadedObjfile {
     /// Parallel loading: debug_info || debug_line || CFI simultaneously
@@ -178,6 +178,7 @@ impl LoadedObjfile {
             Arc::try_unwrap(dwarf).map_err(|_| anyhow::anyhow!("Failed to unwrap DWARF Arc"))?;
         let mut detailed_parser = DetailedParser::new();
         detailed_parser.set_type_name_index(Arc::clone(&type_name_index));
+        let text_symbol_starts_by_name = Self::collect_text_symbol_starts(&binary_mapped);
 
         let mut warnings = Vec::new();
         if cfi_index.is_none() {
@@ -215,6 +216,7 @@ impl LoadedObjfile {
             type_name_index,
             _dwarf_mapped_file: mapped_file,
             _binary_mapped_file: binary_mapped,
+            text_symbol_starts_by_name,
             load_parse_ms: parse_elapsed_ms as u64,
             load_index_ms: index_elapsed_ms as u64,
             load_total_ms,
@@ -238,6 +240,42 @@ impl LoadedObjfile {
 
     fn has_debug_info(dwarf: &DwarfData) -> bool {
         matches!(dwarf.units().next(), Ok(Some(_)))
+    }
+
+    fn collect_text_symbol_starts(binary_mapped: &MappedFile) -> HashMap<String, Vec<u64>> {
+        let object = match binary_mapped.parse_object() {
+            Ok(object) => object,
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to parse object while building text symbol cache for {}: {}",
+                    binary_mapped.path.display(),
+                    err
+                );
+                return HashMap::new();
+            }
+        };
+
+        let mut by_name: HashMap<String, Vec<u64>> = HashMap::new();
+        for symbol in object.symbols() {
+            if symbol.kind() != SymbolKind::Text {
+                continue;
+            }
+
+            let Ok(name) = symbol.name() else {
+                continue;
+            };
+            by_name
+                .entry(name.to_string())
+                .or_default()
+                .push(symbol.address());
+        }
+
+        for starts in by_name.values_mut() {
+            starts.sort_unstable();
+            starts.dedup();
+        }
+
+        by_name
     }
 
     fn load_dwarf_sections(file_data: &Arc<MappedFile>) -> Result<DwarfData> {

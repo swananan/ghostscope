@@ -35,7 +35,11 @@ lazy_static! {
         Mutex::new(None);
     static ref COMPILE_INLINE_CALL_VALUE_RESULT: Mutex<Option<anyhow::Result<()>>> =
         Mutex::new(None);
-    static ref COMPILE_PARTITIONED_RANGES_RESULT: Mutex<Option<anyhow::Result<()>>> =
+    static ref COMPILE_PARTITIONED_RANGES_DEFAULT_RESULT: Mutex<Option<anyhow::Result<()>>> =
+        Mutex::new(None);
+    static ref COMPILE_PARTITIONED_RANGES_GCC_DWARF5_FUNCTION_SECTIONS_RESULT: Mutex<Option<anyhow::Result<()>>> =
+        Mutex::new(None);
+    static ref COMPILE_PARTITIONED_RANGES_CLANG_DWARF5_RNGLISTX_RESULT: Mutex<Option<anyhow::Result<()>>> =
         Mutex::new(None);
     static ref COMPILE_CPP_COMPLEX_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
     static ref COMPILE_STATIC_SCOPE_DEFAULT_RESULT: Mutex<Option<anyhow::Result<()>>> =
@@ -211,6 +215,8 @@ pub fn init() {
         let _ = OptimizationLevel::Stripped;
         let _ = FixtureCompiler::Default;
         let _ = FixtureCompiler::ClangDwarf5;
+        let _ = FixtureCompiler::GccDwarf5FunctionSections;
+        let _ = FixtureCompiler::ClangDwarf5Rnglistx;
 
         // Exercise runner builder methods so they are referenced in all bins.
         let _ = runner::GhostscopeRunner::new()
@@ -257,6 +263,8 @@ pub enum OptimizationLevel {
 pub enum FixtureCompiler {
     Default,
     ClangDwarf5,
+    GccDwarf5FunctionSections,
+    ClangDwarf5Rnglistx,
 }
 
 impl FixtureCompiler {
@@ -264,6 +272,8 @@ impl FixtureCompiler {
         match self {
             FixtureCompiler::Default => base.to_string(),
             FixtureCompiler::ClangDwarf5 => format!("{base}_clang_dwarf5"),
+            FixtureCompiler::GccDwarf5FunctionSections => format!("{base}_gcc_dwarf5_sections"),
+            FixtureCompiler::ClangDwarf5Rnglistx => format!("{base}_clang_dwarf5_rnglistx"),
         }
     }
 
@@ -275,18 +285,30 @@ impl FixtureCompiler {
         match self {
             FixtureCompiler::Default => "default toolchain",
             FixtureCompiler::ClangDwarf5 => "clang -gdwarf-5",
+            FixtureCompiler::GccDwarf5FunctionSections => "gcc -gdwarf-5 -ffunction-sections",
+            FixtureCompiler::ClangDwarf5Rnglistx => {
+                "clang -gdwarf-5 -ffunction-sections -fbasic-block-sections=all"
+            }
         }
     }
 
-    fn apply_to_c_make(&self, cmd: &mut Command, base: &str, clang_dwarf5_cflags: &str) {
+    fn apply_to_c_make(&self, cmd: &mut Command, base: &str, compiler_cflags: &str) {
         cmd.arg("all")
             .arg(format!("BINARY={}", self.binary_name(base)))
             .arg(format!("OBJ={}", self.object_name(base)));
 
-        if matches!(self, FixtureCompiler::ClangDwarf5) {
-            let clang = preferred_clang_binary().unwrap_or("clang");
-            cmd.arg(format!("CC={clang}"))
-                .arg(format!("CFLAGS={clang_dwarf5_cflags}"));
+        match self {
+            FixtureCompiler::Default => {}
+            FixtureCompiler::ClangDwarf5 | FixtureCompiler::ClangDwarf5Rnglistx => {
+                let clang = preferred_clang_binary().unwrap_or_else(|| "clang".to_string());
+                cmd.arg(format!("CC={clang}"))
+                    .arg(format!("CFLAGS={compiler_cflags}"));
+            }
+            FixtureCompiler::GccDwarf5FunctionSections => {
+                let gcc = preferred_gcc_binary().unwrap_or_else(|| "gcc".to_string());
+                cmd.arg(format!("CC={gcc}"))
+                    .arg(format!("CFLAGS={compiler_cflags}"));
+            }
         }
     }
 }
@@ -377,8 +399,8 @@ impl RegisteredFixture {
                 Ok(dir.join("inline_call_value_program"))
             }
             RegisteredFixtureKind::PartitionedRanges => {
-                ensure_partitioned_ranges_program_compiled()?;
-                Ok(dir.join("partitioned_ranges_program"))
+                ensure_partitioned_ranges_program_compiled(FixtureCompiler::Default)?;
+                Ok(dir.join(FixtureCompiler::Default.binary_name(self.name)))
             }
             RegisteredFixtureKind::CppComplex => {
                 ensure_cpp_complex_program_compiled()?;
@@ -409,6 +431,12 @@ impl RegisteredFixture {
             }
             RegisteredFixtureKind::StaticScope => {
                 ensure_static_scope_program_compiled(compiler)?;
+                Ok(self
+                    .dir(fixtures_base)
+                    .join(compiler.binary_name(self.name)))
+            }
+            RegisteredFixtureKind::PartitionedRanges => {
+                ensure_partitioned_ranges_program_compiled(compiler)?;
                 Ok(self
                     .dir(fixtures_base)
                     .join(compiler.binary_name(self.name)))
@@ -451,6 +479,21 @@ pub(crate) fn fixture_compiler_available(compiler: FixtureCompiler) -> bool {
                     ),
                 ])
         }
+        FixtureCompiler::GccDwarf5FunctionSections => {
+            preferred_gcc_binary().is_some()
+                || precompiled_outputs_available(&[fixture_binary_path(
+                    "partitioned_ranges_program",
+                    &FixtureCompiler::GccDwarf5FunctionSections
+                        .binary_name("partitioned_ranges_program"),
+                )])
+        }
+        FixtureCompiler::ClangDwarf5Rnglistx => {
+            preferred_clang_binary().is_some()
+                || precompiled_outputs_available(&[fixture_binary_path(
+                    "partitioned_ranges_program",
+                    &FixtureCompiler::ClangDwarf5Rnglistx.binary_name("partitioned_ranges_program"),
+                )])
+        }
     }
 }
 
@@ -462,14 +505,27 @@ fn command_available(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn preferred_clang_binary() -> Option<&'static str> {
-    if command_available("clang-18") {
-        Some("clang-18")
-    } else if command_available("clang") {
-        Some("clang")
-    } else {
-        None
+fn preferred_clang_binary() -> Option<String> {
+    preferred_compiler_binary("CLANG_BIN", &["clang-18", "clang"])
+}
+
+fn preferred_gcc_binary() -> Option<String> {
+    preferred_compiler_binary("GCC_BIN", &["gcc"])
+}
+
+fn preferred_compiler_binary(env_var: &str, candidates: &[&str]) -> Option<String> {
+    if let Some(override_bin) = std::env::var_os(env_var) {
+        let override_bin = override_bin.to_string_lossy().trim().to_string();
+        if !override_bin.is_empty() {
+            return command_available(&override_bin).then_some(override_bin);
+        }
     }
+
+    candidates
+        .iter()
+        .copied()
+        .find(|name| command_available(name))
+        .map(str::to_string)
 }
 
 fn fixture_binary_path(fixture_name: &str, binary_name: &str) -> PathBuf {
@@ -985,7 +1041,9 @@ static COMPILE_RUST_GLOBAL: Once = Once::new();
 static COMPILE_INLINE_CALLSITE_DEFAULT: Once = Once::new();
 static COMPILE_INLINE_CALLSITE_CLANG_DWARF5: Once = Once::new();
 static COMPILE_INLINE_CALL_VALUE: Once = Once::new();
-static COMPILE_PARTITIONED_RANGES: Once = Once::new();
+static COMPILE_PARTITIONED_RANGES_DEFAULT: Once = Once::new();
+static COMPILE_PARTITIONED_RANGES_GCC_DWARF5_FUNCTION_SECTIONS: Once = Once::new();
+static COMPILE_PARTITIONED_RANGES_CLANG_DWARF5_RNGLISTX: Once = Once::new();
 static COMPILE_CPP_COMPLEX: Once = Once::new();
 static COMPILE_STATIC_SCOPE_DEFAULT: Once = Once::new();
 static COMPILE_STATIC_SCOPE_CLANG_DWARF5: Once = Once::new();
@@ -1118,6 +1176,12 @@ fn ensure_inline_callsite_program_compiled(compiler: FixtureCompiler) -> anyhow:
             &COMPILE_INLINE_CALLSITE_CLANG_DWARF5,
             &*COMPILE_INLINE_CALLSITE_CLANG_DWARF5_RESULT,
         ),
+        _ => {
+            anyhow::bail!(
+                "Compiler override {} is not wired for inline_callsite_program",
+                compiler.description()
+            )
+        }
     };
 
     once.call_once(|| {
@@ -1175,9 +1239,43 @@ fn ensure_inline_call_value_program_compiled() -> anyhow::Result<()> {
     }
 }
 
-fn ensure_partitioned_ranges_program_compiled() -> anyhow::Result<()> {
-    COMPILE_PARTITIONED_RANGES.call_once(|| {
-        let compile_result = (|| -> anyhow::Result<()> {
+fn ensure_partitioned_ranges_program_compiled(compiler: FixtureCompiler) -> anyhow::Result<()> {
+    let (once, slot): (&Once, &Mutex<Option<anyhow::Result<()>>>) = match compiler {
+        FixtureCompiler::Default => (
+            &COMPILE_PARTITIONED_RANGES_DEFAULT,
+            &*COMPILE_PARTITIONED_RANGES_DEFAULT_RESULT,
+        ),
+        FixtureCompiler::GccDwarf5FunctionSections => (
+            &COMPILE_PARTITIONED_RANGES_GCC_DWARF5_FUNCTION_SECTIONS,
+            &*COMPILE_PARTITIONED_RANGES_GCC_DWARF5_FUNCTION_SECTIONS_RESULT,
+        ),
+        FixtureCompiler::ClangDwarf5Rnglistx => (
+            &COMPILE_PARTITIONED_RANGES_CLANG_DWARF5_RNGLISTX,
+            &*COMPILE_PARTITIONED_RANGES_CLANG_DWARF5_RNGLISTX_RESULT,
+        ),
+        _ => {
+            anyhow::bail!(
+                "Compiler override {} is not wired for partitioned_ranges_program",
+                compiler.description()
+            )
+        }
+    };
+
+    once.call_once(|| {
+        let compile_result = compile_partitioned_ranges_program(compiler);
+        *slot.lock().unwrap() = Some(compile_result);
+    });
+
+    match slot.lock().unwrap().as_ref() {
+        Some(Ok(())) => Ok(()),
+        Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
+        None => panic!("Compilation result should be set after call_once"),
+    }
+}
+
+fn compile_partitioned_ranges_program(compiler: FixtureCompiler) -> anyhow::Result<()> {
+    match compiler {
+        FixtureCompiler::Default => {
             let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/fixtures/partitioned_ranges_program");
             if let Some(result) = use_precompiled_outputs(
@@ -1187,11 +1285,6 @@ fn ensure_partitioned_ranges_program_compiled() -> anyhow::Result<()> {
                 return result;
             }
             println!("Compiling partitioned_ranges_program (Optimized O3) in {base:?}");
-            let _ = Command::new("make")
-                .arg("clean")
-                .current_dir(base.clone())
-                .status()
-                .is_ok();
             let out = Command::new("make").arg("all").current_dir(base).output()?;
             if out.status.success() {
                 println!("✓ Successfully compiled partitioned_ranges_program");
@@ -1203,14 +1296,21 @@ fn ensure_partitioned_ranges_program_compiled() -> anyhow::Result<()> {
                     stderr
                 ))
             }
-        })();
-        *COMPILE_PARTITIONED_RANGES_RESULT.lock().unwrap() = Some(compile_result);
-    });
-
-    match COMPILE_PARTITIONED_RANGES_RESULT.lock().unwrap().as_ref() {
-        Some(Ok(())) => Ok(()),
-        Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
-        None => panic!("Compilation result should be set after call_once"),
+        }
+        FixtureCompiler::GccDwarf5FunctionSections => compile_c_make_fixture(
+            "partitioned_ranges_program",
+            compiler,
+            "-Wall -Wextra -gdwarf-5 -O3 -DNDEBUG -ffunction-sections -freorder-blocks-and-partition",
+        ),
+        FixtureCompiler::ClangDwarf5Rnglistx => compile_c_make_fixture(
+            "partitioned_ranges_program",
+            compiler,
+            "-Wall -Wextra -gdwarf-5 -O3 -DNDEBUG -ffunction-sections -fbasic-block-sections=all",
+        ),
+        _ => anyhow::bail!(
+            "Compiler override {} is not wired for partitioned_ranges_program",
+            compiler.description()
+        ),
     }
 }
 
@@ -1255,7 +1355,7 @@ fn ensure_cpp_complex_program_compiled() -> anyhow::Result<()> {
 pub(crate) fn compile_c_make_fixture(
     fixture_name: &str,
     compiler: FixtureCompiler,
-    clang_dwarf5_cflags: &str,
+    compiler_cflags: &str,
 ) -> anyhow::Result<()> {
     let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
@@ -1273,7 +1373,7 @@ pub(crate) fn compile_c_make_fixture(
     );
 
     let mut cmd = Command::new("make");
-    compiler.apply_to_c_make(&mut cmd, fixture_name, clang_dwarf5_cflags);
+    compiler.apply_to_c_make(&mut cmd, fixture_name, compiler_cflags);
     let output = cmd.current_dir(base).output().map_err(|e| {
         anyhow::anyhow!(
             "Failed to run make for {fixture_name} {}: {}",
@@ -1308,6 +1408,12 @@ fn ensure_static_scope_program_compiled(compiler: FixtureCompiler) -> anyhow::Re
             &COMPILE_STATIC_SCOPE_CLANG_DWARF5,
             &*COMPILE_STATIC_SCOPE_CLANG_DWARF5_RESULT,
         ),
+        _ => {
+            anyhow::bail!(
+                "Compiler override {} is not wired for static_scope_program",
+                compiler.description()
+            )
+        }
     };
 
     once.call_once(|| {
@@ -1340,6 +1446,12 @@ fn ensure_entry_value_recovery_program_compiled(compiler: FixtureCompiler) -> an
             &COMPILE_ENTRY_VALUE_RECOVERY_CLANG_DWARF5,
             &*COMPILE_ENTRY_VALUE_RECOVERY_CLANG_DWARF5_RESULT,
         ),
+        _ => {
+            anyhow::bail!(
+                "Compiler override {} is not wired for entry_value_recovery_program",
+                compiler.description()
+            )
+        }
     };
 
     once.call_once(|| {

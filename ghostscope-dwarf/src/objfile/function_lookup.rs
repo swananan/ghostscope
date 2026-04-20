@@ -224,7 +224,8 @@ impl LoadedObjfile {
                 }
             }
             crate::core::FunctionDieKind::ConcreteSubprogram => {
-                let nranges = Self::selected_non_inline_ranges(entry, &ranges);
+                let preferred_start = self.preferred_non_inline_symbol_start(entry, &ranges);
+                let nranges = Self::selected_non_inline_ranges(entry, &ranges, preferred_start);
                 for (start, end) in &nranges {
                     let candidate = {
                         let first_exec = self.line_mapping.find_first_executable_address(*start);
@@ -266,6 +267,27 @@ impl LoadedObjfile {
         out
     }
 
+    fn preferred_non_inline_symbol_start(
+        &self,
+        entry: &crate::core::IndexEntry,
+        ranges: &[(u64, u64)],
+    ) -> Option<u64> {
+        if entry.entry_pc.is_some() || ranges.len() <= 1 {
+            return None;
+        }
+
+        self.text_symbol_starts_by_name
+            .get(entry.name.as_ref())?
+            .iter()
+            .copied()
+            .filter(|address| {
+                ranges
+                    .iter()
+                    .any(|(start, end)| *start <= *address && *address < *end)
+            })
+            .min()
+    }
+
     fn selected_inline_address(
         entry: &crate::core::IndexEntry,
         ranges: &[(u64, u64)],
@@ -283,6 +305,7 @@ impl LoadedObjfile {
     fn selected_non_inline_ranges(
         entry: &crate::core::IndexEntry,
         ranges: &[(u64, u64)],
+        preferred_start: Option<u64>,
     ) -> Vec<(u64, u64)> {
         let ranges = ranges.to_vec();
         if ranges.len() <= 1 {
@@ -294,6 +317,16 @@ impl LoadedObjfile {
                 .iter()
                 .copied()
                 .find(|(start, end)| *start <= entry_pc && entry_pc < *end)
+            {
+                return vec![range];
+            }
+        }
+
+        if let Some(preferred_start) = preferred_start {
+            if let Some(range) = ranges
+                .iter()
+                .copied()
+                .find(|(start, end)| *start <= preferred_start && preferred_start < *end)
             {
                 return vec![range];
             }
@@ -910,7 +943,7 @@ mod tests {
         let entry = subprogram_entry(&ranges, None);
 
         assert_eq!(
-            LoadedObjfile::selected_non_inline_ranges(&entry, &ranges),
+            LoadedObjfile::selected_non_inline_ranges(&entry, &ranges, None),
             vec![(0x8e97c0, 0x8e9be0)],
         );
     }
@@ -921,7 +954,7 @@ mod tests {
         let entry = subprogram_entry(&ranges, None);
 
         assert_eq!(
-            LoadedObjfile::selected_non_inline_ranges(&entry, &ranges),
+            LoadedObjfile::selected_non_inline_ranges(&entry, &ranges, None),
             vec![(0x8ea060, 0x8eb07b)],
         );
     }
@@ -932,7 +965,7 @@ mod tests {
         let entry = subprogram_entry(&ranges, Some(0x208));
 
         assert_eq!(
-            LoadedObjfile::selected_non_inline_ranges(&entry, &ranges),
+            LoadedObjfile::selected_non_inline_ranges(&entry, &ranges, None),
             vec![(0x200, 0x220)],
         );
     }
@@ -944,8 +977,19 @@ mod tests {
         let entry = subprogram_entry(&ranges, None);
 
         assert_eq!(
-            LoadedObjfile::selected_non_inline_ranges(&entry, &ranges),
+            LoadedObjfile::selected_non_inline_ranges(&entry, &ranges, None),
             vec![(0x100, 0x110)],
+        );
+    }
+
+    #[test]
+    fn selected_non_inline_ranges_prefers_range_containing_symbol_start_when_entry_pc_missing() {
+        let ranges = [(0x1162, 0x116d), (0x116d, 0x127c), (0x1150, 0x1162)];
+        let entry = subprogram_entry(&ranges, None);
+
+        assert_eq!(
+            LoadedObjfile::selected_non_inline_ranges(&entry, &ranges, Some(0x1150)),
+            vec![(0x1150, 0x1162)],
         );
     }
 

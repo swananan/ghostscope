@@ -770,6 +770,7 @@ dependencies = [
  "object",
  "rayon",
  "rustc-demangle",
+ "tempfile",
  "thiserror 2.0.12",
  "tokio",
  "tracing",

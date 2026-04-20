@@ -1,17 +1,17 @@
 CC ?= gcc
-BASE_CFLAGS ?= -Wall -Wextra -g -O3 -DNDEBUG -freorder-blocks-and-partition
+CFLAGS ?= -Wall -Wextra -g -O3 -DNDEBUG -freorder-blocks-and-partition
 BINARY ?= partitioned_ranges_program
 OBJ ?= $(BINARY).o
 
 all: $(BINARY)
 
 $(BINARY): $(OBJ)
-	$(CC) $(BASE_CFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) -o $@ $^
 
 $(OBJ): partitioned_ranges_program.c
-	$(CC) $(BASE_CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f *.o partitioned_ranges_program
+	rm -f *.o partitioned_ranges_program partitioned_ranges_program_*
 
 .PHONY: clean all

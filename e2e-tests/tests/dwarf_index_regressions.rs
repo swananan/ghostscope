@@ -1,14 +1,25 @@
 mod common;
 
 use common::{fixture_compiler_available, init, FixtureCompiler, FIXTURES};
+use gimli::Reader;
 use object::{Object, ObjectSection, ObjectSymbol};
 use std::collections::HashSet;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
+use tempfile::TempPath;
 
 // Keep these on the executable inline-body lines in inline_callsite_program.c.
 const INLINE_TRACE_LINE: u32 = 43;
+
+type TestReader = gimli::EndianArcSlice<gimli::RunTimeEndian>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RangesAttrEncoding {
+    Offset,
+    Index,
+}
 
 fn find_symbol_address(binary_path: &std::path::Path, symbol_name: &str) -> anyhow::Result<u64> {
     let bytes = std::fs::read(binary_path)
@@ -52,12 +63,28 @@ fn read_uleb128(input: &[u8], offset: &mut usize) -> anyhow::Result<u64> {
             .get(*offset)
             .ok_or_else(|| anyhow::anyhow!("Unexpected EOF while reading ULEB128"))?;
         *offset += 1;
-        value |= u64::from(byte & 0x7f) << shift;
+        let low_bits = u64::from(byte & 0x7f);
+        anyhow::ensure!(
+            shift < 64 && !(shift == 63 && low_bits > 1),
+            "ULEB128 value exceeds u64"
+        );
+        value |= low_bits << shift;
         if byte & 0x80 == 0 {
             return Ok(value);
         }
         shift += 7;
     }
+}
+
+#[test]
+fn test_read_uleb128_rejects_values_that_overflow_u64() {
+    let overflow = [0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02];
+    let mut offset = 0;
+    let err = read_uleb128(&overflow, &mut offset).expect_err("overflow should be rejected");
+    assert!(
+        err.to_string().contains("exceeds u64"),
+        "unexpected overflow error: {err}"
+    );
 }
 
 fn patch_inlined_subroutine_low_pc_to_entry_pc(abbrev: &mut [u8]) -> anyhow::Result<usize> {
@@ -84,14 +111,11 @@ fn patch_inlined_subroutine_low_pc_to_entry_pc(abbrev: &mut [u8]) -> anyhow::Res
                 break;
             }
 
-            let is_addrx_form = matches!(
-                form,
-                x if x == u64::from(ghostscope_dwarf::constants::DW_FORM_addrx.0)
-                    || x == u64::from(ghostscope_dwarf::constants::DW_FORM_addrx1.0)
-                    || x == u64::from(ghostscope_dwarf::constants::DW_FORM_addrx2.0)
-                    || x == u64::from(ghostscope_dwarf::constants::DW_FORM_addrx3.0)
-                    || x == u64::from(ghostscope_dwarf::constants::DW_FORM_addrx4.0)
-            );
+            let is_addrx_form = form == u64::from(ghostscope_dwarf::constants::DW_FORM_addrx.0)
+                || form == u64::from(ghostscope_dwarf::constants::DW_FORM_addrx1.0)
+                || form == u64::from(ghostscope_dwarf::constants::DW_FORM_addrx2.0)
+                || form == u64::from(ghostscope_dwarf::constants::DW_FORM_addrx3.0)
+                || form == u64::from(ghostscope_dwarf::constants::DW_FORM_addrx4.0);
             if tag == u64::from(ghostscope_dwarf::constants::DW_TAG_inlined_subroutine.0)
                 && name == u64::from(ghostscope_dwarf::constants::DW_AT_low_pc.0)
                 && is_addrx_form
@@ -108,7 +132,7 @@ fn patch_inlined_subroutine_low_pc_to_entry_pc(abbrev: &mut [u8]) -> anyhow::Res
     Ok(patched)
 }
 
-fn rewrite_inline_fixture_entry_pc_attr(input_path: &Path) -> anyhow::Result<PathBuf> {
+fn rewrite_inline_fixture_entry_pc_attr(input_path: &Path) -> anyhow::Result<TempPath> {
     let mut bytes = std::fs::read(input_path)
         .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", input_path.display(), e))?;
     let (abbrev_offset, abbrev_size) = {
@@ -134,22 +158,143 @@ fn rewrite_inline_fixture_entry_pc_attr(input_path: &Path) -> anyhow::Result<Pat
         input_path.display()
     );
 
-    let unique_suffix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
     let fixture_dir = input_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", input_path.display()))?;
-    let out_dir = fixture_dir.join(format!(
-        ".ghostscope-inline-entry-pc-regression-{unique_suffix}"
-    ));
-    std::fs::create_dir_all(&out_dir)?;
-    let output_path = out_dir.join("inline_callsite_program_entry_pc_addrx");
-    std::fs::write(&output_path, &bytes)?;
+    let output = tempfile::Builder::new()
+        .prefix(".ghostscope-inline-entry-pc-regression-")
+        .tempfile_in(fixture_dir)?
+        .into_temp_path();
+    std::fs::write(&output, &bytes)?;
     let perms = std::fs::metadata(input_path)?.permissions().mode();
-    std::fs::set_permissions(&output_path, std::fs::Permissions::from_mode(perms))?;
-    Ok(output_path)
+    std::fs::set_permissions(&output, std::fs::Permissions::from_mode(perms))?;
+    Ok(output)
+}
+
+fn load_dwarf_from_binary(path: &Path) -> anyhow::Result<gimli::Dwarf<TestReader>> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| anyhow::anyhow!("Failed to read {}: {e}", path.display()))?;
+    let object = object::File::parse(&*bytes)
+        .map_err(|e| anyhow::anyhow!("Failed to parse {}: {e}", path.display()))?;
+    let endian = match object.endianness() {
+        object::Endianness::Little => gimli::RunTimeEndian::Little,
+        object::Endianness::Big => gimli::RunTimeEndian::Big,
+    };
+
+    let dwarf = gimli::Dwarf::load(|id| {
+        let section_data = object
+            .section_by_name(id.name())
+            .and_then(|section| section.uncompressed_data().ok())
+            .map(|data| data.into_owned())
+            .unwrap_or_default();
+        Ok::<_, gimli::Error>(gimli::EndianArcSlice::new(
+            Arc::<[u8]>::from(section_data),
+            endian,
+        ))
+    })?;
+
+    Ok(dwarf)
+}
+
+fn partitioned_target_ranges_attr_encoding(
+    binary_path: &Path,
+) -> anyhow::Result<RangesAttrEncoding> {
+    let dwarf = load_dwarf_from_binary(binary_path)?;
+    let mut units = dwarf.units();
+
+    while let Some(header) = units.next()? {
+        let unit = dwarf.unit(header)?;
+        let mut entries = unit.entries();
+
+        while let Some(entry) = entries.next_dfs()? {
+            if entry.tag() != gimli::constants::DW_TAG_subprogram {
+                continue;
+            }
+
+            let Some(name_attr) = entry.attr(gimli::constants::DW_AT_name) else {
+                continue;
+            };
+            let Ok(name) = dwarf.attr_string(&unit, name_attr.value()) else {
+                continue;
+            };
+            let Ok(name) = name.to_string_lossy() else {
+                continue;
+            };
+            if name.as_ref() != "partitioned_target" {
+                continue;
+            }
+
+            let Some(ranges_attr) = entry.attr(gimli::constants::DW_AT_ranges) else {
+                continue;
+            };
+            return match ranges_attr.value() {
+                gimli::AttributeValue::DebugRngListsIndex(_) => Ok(RangesAttrEncoding::Index),
+                gimli::AttributeValue::RangeListsRef(_) | gimli::AttributeValue::SecOffset(_) => {
+                    Ok(RangesAttrEncoding::Offset)
+                }
+                other => anyhow::bail!(
+                    "Unexpected DW_AT_ranges encoding for partitioned_target in {}: {:?}",
+                    binary_path.display(),
+                    other
+                ),
+            };
+        }
+    }
+
+    anyhow::bail!(
+        "Failed to find partitioned_target with DW_AT_ranges in {}",
+        binary_path.display()
+    )
+}
+
+async fn assert_partitioned_ranges_lookup_resolves_primary_entry(
+    binary_path: PathBuf,
+    scenario: &str,
+) -> anyhow::Result<()> {
+    let hot_addr = find_symbol_address(&binary_path, "partitioned_target")?;
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
+    let addrs = analyzer.lookup_function_addresses("partitioned_target");
+
+    assert_eq!(
+        addrs.len(),
+        1,
+        "Expected a single resolved address for partitioned_target in {scenario}. Results: {addrs:?}"
+    );
+    assert_eq!(
+        addrs[0].module_path, binary_path,
+        "Resolved module should point at the partitioned fixture for {scenario}"
+    );
+    assert_eq!(
+        addrs[0].address, hot_addr,
+        "lookup_function_addresses should resolve to the primary entry address for {scenario}"
+    );
+
+    Ok(())
+}
+
+async fn assert_partitioned_ranges_source_line_query_recovers_function_scope(
+    binary_path: PathBuf,
+    scenario: &str,
+) -> anyhow::Result<()> {
+    let mut analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
+    let query_results = analyzer
+        .query_source_line_best_effort("partitioned_ranges_program.c", 18)
+        .map_err(|e| anyhow::anyhow!("Failed source-line query for {scenario}: {e}"))?;
+
+    anyhow::ensure!(
+        !query_results.is_empty(),
+        "No source-line query results for {scenario}"
+    );
+    assert!(
+        query_results.iter().any(|result| {
+            result.module_path == binary_path
+                && result.function_name.as_deref() == Some("partitioned_target")
+                && result.parameters.iter().any(|param| param.name == "x")
+        }),
+        "Expected partitioned_target scope recovery with parameter x for {scenario}. Results: {query_results:?}"
+    );
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -357,6 +502,89 @@ async fn test_partitioned_ranges_lookup_prefers_hot_entry_over_cold_partition() 
 }
 
 #[tokio::test]
+async fn test_partitioned_ranges_gcc_dwarf5_function_sections_preserve_offset_ranges(
+) -> anyhow::Result<()> {
+    init();
+
+    if !fixture_compiler_available(FixtureCompiler::GccDwarf5FunctionSections) {
+        eprintln!("Skipping gcc DWARF5 partitioned-ranges regression: gcc is unavailable");
+        return Ok(());
+    }
+
+    let binary_path = FIXTURES.get_test_binary_with_compiler(
+        "partitioned_ranges_program",
+        FixtureCompiler::GccDwarf5FunctionSections,
+    )?;
+    assert_eq!(
+        partitioned_target_ranges_attr_encoding(&binary_path)?,
+        RangesAttrEncoding::Offset,
+        "gcc DWARF5 partitioned_ranges_program should keep offset-backed DW_AT_ranges"
+    );
+    assert_partitioned_ranges_lookup_resolves_primary_entry(
+        binary_path.clone(),
+        "gcc -gdwarf-5 -ffunction-sections partitioned_ranges_program",
+    )
+    .await?;
+    assert_partitioned_ranges_source_line_query_recovers_function_scope(
+        binary_path,
+        "gcc -gdwarf-5 -ffunction-sections partitioned_ranges_program",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn test_partitioned_ranges_clang_dwarf5_rnglistx_lookup_resolves_primary_entry(
+) -> anyhow::Result<()> {
+    init();
+
+    if !fixture_compiler_available(FixtureCompiler::ClangDwarf5Rnglistx) {
+        eprintln!("Skipping clang rnglistx partitioned-ranges regression: clang is unavailable");
+        return Ok(());
+    }
+
+    let binary_path = FIXTURES.get_test_binary_with_compiler(
+        "partitioned_ranges_program",
+        FixtureCompiler::ClangDwarf5Rnglistx,
+    )?;
+    assert_eq!(
+        partitioned_target_ranges_attr_encoding(&binary_path)?,
+        RangesAttrEncoding::Index,
+        "clang rnglistx partitioned_ranges_program should expose indexed DW_AT_ranges"
+    );
+    assert_partitioned_ranges_lookup_resolves_primary_entry(
+        binary_path,
+        "clang -gdwarf-5 -ffunction-sections -fbasic-block-sections=all partitioned_ranges_program",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn test_partitioned_ranges_clang_dwarf5_rnglistx_source_line_query_recovers_scope(
+) -> anyhow::Result<()> {
+    init();
+
+    if !fixture_compiler_available(FixtureCompiler::ClangDwarf5Rnglistx) {
+        eprintln!("Skipping clang rnglistx partitioned-ranges regression: clang is unavailable");
+        return Ok(());
+    }
+
+    let binary_path = FIXTURES.get_test_binary_with_compiler(
+        "partitioned_ranges_program",
+        FixtureCompiler::ClangDwarf5Rnglistx,
+    )?;
+    assert_eq!(
+        partitioned_target_ranges_attr_encoding(&binary_path)?,
+        RangesAttrEncoding::Index,
+        "clang rnglistx partitioned_ranges_program should expose indexed DW_AT_ranges"
+    );
+    assert_partitioned_ranges_source_line_query_recovers_function_scope(
+        binary_path,
+        "clang -gdwarf-5 -ffunction-sections -fbasic-block-sections=all partitioned_ranges_program",
+    )
+    .await
+}
+
+#[tokio::test]
 async fn test_inline_callsite_clang_dwarf5_resolves_debug_addr_entry_pc() -> anyhow::Result<()> {
     init();
 
@@ -367,11 +595,12 @@ async fn test_inline_callsite_clang_dwarf5_resolves_debug_addr_entry_pc() -> any
 
     let compiled_binary_path = FIXTURES
         .get_test_binary_with_compiler("inline_callsite_program", FixtureCompiler::ClangDwarf5)?;
-    let binary_path = rewrite_inline_fixture_entry_pc_attr(&compiled_binary_path)?;
+    let binary = rewrite_inline_fixture_entry_pc_attr(&compiled_binary_path)?;
+    let binary_path: &Path = binary.as_ref();
 
     // Clang/DWARF5 can encode inline DW_AT_entry_pc via .debug_addr (DW_FORM_addrx).
     // We need both exec-path lookup and PID-backed scope recovery to keep working.
-    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path)
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(binary_path)
         .await
         .map_err(|e| {
             anyhow::anyhow!("Failed to load DWARF for clang dwarf5 inline fixture: {e}")
@@ -383,7 +612,7 @@ async fn test_inline_callsite_clang_dwarf5_resolves_debug_addr_entry_pc() -> any
         !inline_addrs.is_empty(),
         "No DWARF addresses found for inline_callsite_program.c:{INLINE_TRACE_LINE}"
     );
-    let target = spawn_inline_callsite_program(&binary_path).await?;
+    let target = spawn_inline_callsite_program(binary_path).await?;
     let query_result: anyhow::Result<()> = async {
         let mut pid_analyzer = ghostscope_dwarf::DwarfAnalyzer::from_pid(target.host_pid()).await?;
         let query_results =
@@ -394,7 +623,9 @@ async fn test_inline_callsite_clang_dwarf5_resolves_debug_addr_entry_pc() -> any
         );
         let inline_results: Vec<_> = query_results
             .iter()
-            .filter(|result| result.module_path == binary_path && result.is_inline == Some(true))
+            .filter(|result| {
+                result.module_path.as_path() == binary_path && result.is_inline == Some(true)
+            })
             .collect();
         anyhow::ensure!(
             !inline_results.is_empty(),
