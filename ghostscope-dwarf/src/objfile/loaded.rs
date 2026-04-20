@@ -25,6 +25,7 @@ pub(crate) struct LoadedObjfile {
     pub(super) detailed_parser: DetailedParser,
     pub(super) _dwarf_mapped_file: Arc<MappedFile>,
     pub(super) _binary_mapped_file: Arc<MappedFile>,
+    pub(super) text_symbol_starts_by_name: HashMap<String, Vec<u64>>,
     pub(super) block_index: BlockIndex,
     pub(super) type_name_index: Arc<TypeNameIndex>,
     pub(super) load_parse_ms: u64,

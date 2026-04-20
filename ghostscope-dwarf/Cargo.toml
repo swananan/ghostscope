@@ -40,3 +40,6 @@ crc32fast = "1.4"
 
 # For home directory expansion in debug search paths
 dirs = "5.0"
+
+[dev-dependencies]
+tempfile = { workspace = true }

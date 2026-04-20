@@ -774,7 +774,12 @@ impl<'a> DwarfParser<'a> {
         };
 
         let ranges_offset = match ranges_attr {
-            gimli::AttributeValue::RangeListsRef(offset) => gimli::RangeListsOffset(offset.0),
+            gimli::AttributeValue::RangeListsRef(offset) => {
+                self.dwarf.ranges_offset_from_raw(unit, offset)
+            }
+            gimli::AttributeValue::DebugRngListsIndex(index) => {
+                self.dwarf.ranges_offset(unit, index)?
+            }
             gimli::AttributeValue::SecOffset(offset) => gimli::RangeListsOffset(offset),
             _ => return Ok(None),
         };
@@ -1311,7 +1316,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::Arc;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use tempfile::TempPath;
 
     fn build_variable_index_fixture() -> gimli::Dwarf<DwarfReader> {
         let encoding = gimli::Encoding {
@@ -1564,22 +1569,20 @@ mod tests {
             .unwrap_or(false)
     }
 
-    fn compile_inline_callsite_fixture_with_clang_dwarf5() -> anyhow::Result<PathBuf> {
+    fn compile_inline_callsite_fixture_with_clang_dwarf5() -> anyhow::Result<TempPath> {
         let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .ok_or_else(|| anyhow::anyhow!("ghostscope-dwarf has no workspace parent"))?
             .to_path_buf();
         let source = workspace_root
             .join("e2e-tests/tests/fixtures/inline_callsite_program/inline_callsite_program.c");
-        let unique_suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let out_dir = std::env::temp_dir().join(format!("ghostscope-fast-parser-{unique_suffix}"));
-        std::fs::create_dir_all(&out_dir)?;
-        let binary_path = out_dir.join("inline_callsite_program_clang_dwarf5");
+        let binary = tempfile::Builder::new()
+            .prefix("ghostscope-fast-parser-")
+            .tempfile()?
+            .into_temp_path();
+        let binary_path = binary.to_path_buf();
 
-        let output = Command::new("clang")
+        let compile_output = Command::new("clang")
             .args(["-Wall", "-Wextra", "-gdwarf-5", "-O3"])
             .arg("-o")
             .arg(&binary_path)
@@ -1587,10 +1590,10 @@ mod tests {
             .output()
             .map_err(|e| anyhow::anyhow!("Failed to run clang for {}: {}", source.display(), e))?;
 
-        if output.status.success() {
-            Ok(binary_path)
+        if compile_output.status.success() {
+            Ok(binary)
         } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = String::from_utf8_lossy(&compile_output.stderr);
             Err(anyhow::anyhow!(
                 "Failed to compile {} with clang -gdwarf-5 -O3: {}",
                 source.display(),
@@ -1623,12 +1626,28 @@ mod tests {
                 .get(*offset)
                 .ok_or_else(|| anyhow::anyhow!("Unexpected EOF while reading ULEB128"))?;
             *offset += 1;
-            value |= u64::from(byte & 0x7f) << shift;
+            let low_bits = u64::from(byte & 0x7f);
+            anyhow::ensure!(
+                shift < 64 && !(shift == 63 && low_bits > 1),
+                "ULEB128 value exceeds u64"
+            );
+            value |= low_bits << shift;
             if byte & 0x80 == 0 {
                 return Ok(value);
             }
             shift += 7;
         }
+    }
+
+    #[test]
+    fn read_uleb128_rejects_values_that_overflow_u64() {
+        let overflow = [0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02];
+        let mut offset = 0;
+        let err = read_uleb128(&overflow, &mut offset).expect_err("overflow should be rejected");
+        assert!(
+            err.to_string().contains("exceeds u64"),
+            "unexpected overflow error: {err}"
+        );
     }
 
     fn patch_inlined_subroutine_low_pc_to_entry_pc(abbrev: &mut [u8]) -> anyhow::Result<usize> {
@@ -1655,14 +1674,11 @@ mod tests {
                     break;
                 }
 
-                let is_addrx_form = matches!(
-                    form,
-                    x if x == u64::from(gimli::constants::DW_FORM_addrx.0)
-                        || x == u64::from(gimli::constants::DW_FORM_addrx1.0)
-                        || x == u64::from(gimli::constants::DW_FORM_addrx2.0)
-                        || x == u64::from(gimli::constants::DW_FORM_addrx3.0)
-                        || x == u64::from(gimli::constants::DW_FORM_addrx4.0)
-                );
+                let is_addrx_form = form == u64::from(gimli::constants::DW_FORM_addrx.0)
+                    || form == u64::from(gimli::constants::DW_FORM_addrx1.0)
+                    || form == u64::from(gimli::constants::DW_FORM_addrx2.0)
+                    || form == u64::from(gimli::constants::DW_FORM_addrx3.0)
+                    || form == u64::from(gimli::constants::DW_FORM_addrx4.0);
                 if tag == u64::from(gimli::constants::DW_TAG_inlined_subroutine.0)
                     && name == u64::from(gimli::constants::DW_AT_low_pc.0)
                     && is_addrx_form
@@ -1679,7 +1695,7 @@ mod tests {
         Ok(patched)
     }
 
-    fn rewrite_inline_fixture_entry_pc_attr(input_path: &Path) -> anyhow::Result<PathBuf> {
+    fn rewrite_inline_fixture_entry_pc_attr(input_path: &Path) -> anyhow::Result<TempPath> {
         let mut bytes = std::fs::read(input_path)
             .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", input_path.display(), e))?;
         let (abbrev_offset, abbrev_size) = {
@@ -1705,20 +1721,14 @@ mod tests {
             input_path.display()
         );
 
-        let unique_suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let fixture_dir = input_path
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", input_path.display()))?;
-        let out_dir = fixture_dir.join(format!(".ghostscope-fast-parser-patched-{unique_suffix}"));
-        std::fs::create_dir_all(&out_dir)?;
-        let output_path = out_dir.join("inline_callsite_program_entry_pc_addrx");
-        std::fs::write(&output_path, &bytes)?;
+        let output = tempfile::Builder::new()
+            .prefix(".ghostscope-fast-parser-patched-")
+            .tempfile()?
+            .into_temp_path();
+        std::fs::write(&output, &bytes)?;
         let perms = std::fs::metadata(input_path)?.permissions().mode();
-        std::fs::set_permissions(&output_path, std::fs::Permissions::from_mode(perms))?;
-        Ok(output_path)
+        std::fs::set_permissions(&output, std::fs::Permissions::from_mode(perms))?;
+        Ok(output)
     }
 
     fn has_inline_entry_pc_debug_addr_index(dwarf: &gimli::Dwarf<DwarfReader>) -> bool {
@@ -1909,11 +1919,13 @@ mod tests {
             return;
         }
 
-        let binary_path = compile_inline_callsite_fixture_with_clang_dwarf5()
-            .expect("clang dwarf5 inline fixture should compile");
-        let patched_binary_path = rewrite_inline_fixture_entry_pc_attr(&binary_path)
-            .expect("inline fixture abbrev should rewrite low_pc addrx into entry_pc addrx");
-        let dwarf = load_dwarf_from_binary(&patched_binary_path)
+        let patched_binary = {
+            let binary = compile_inline_callsite_fixture_with_clang_dwarf5()
+                .expect("clang dwarf5 inline fixture should compile");
+            rewrite_inline_fixture_entry_pc_attr(binary.as_ref())
+                .expect("inline fixture abbrev should rewrite low_pc addrx into entry_pc addrx")
+        };
+        let dwarf = load_dwarf_from_binary(patched_binary.as_ref())
             .expect("compiled inline fixture should load as DWARF");
         assert!(
             has_inline_entry_pc_debug_addr_index(&dwarf),
@@ -1922,7 +1934,7 @@ mod tests {
 
         let parser = DwarfParser { dwarf: &dwarf };
         let result = parser
-            .parse_debug_info(patched_binary_path.to_string_lossy().as_ref())
+            .parse_debug_info(patched_binary.to_string_lossy().as_ref())
             .expect("fast parser should index patched clang dwarf5 inline fixture");
 
         let inline_entries: Vec<_> = ["add3", "consume_state"]

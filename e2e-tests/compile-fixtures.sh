@@ -13,6 +13,12 @@ else
     CLANG_BIN="clang"
 fi
 
+if [[ -n "${GCC_BIN:-}" ]]; then
+    GCC_BIN="$GCC_BIN"
+else
+    GCC_BIN="gcc"
+fi
+
 log() {
     printf '==> %s\n' "$*"
 }
@@ -69,6 +75,18 @@ run_make_fixture inline_call_value_program all
 
 run_make_fixture partitioned_ranges_program clean
 run_make_fixture partitioned_ranges_program all
+run_make_fixture partitioned_ranges_program \
+    all \
+    "CC=${GCC_BIN}" \
+    "CFLAGS=-Wall -Wextra -gdwarf-5 -O3 -DNDEBUG -ffunction-sections -freorder-blocks-and-partition" \
+    "BINARY=partitioned_ranges_program_gcc_dwarf5_sections" \
+    "OBJ=partitioned_ranges_program_gcc_dwarf5_sections.o"
+run_make_fixture partitioned_ranges_program \
+    all \
+    "CC=${CLANG_BIN}" \
+    "CFLAGS=-Wall -Wextra -gdwarf-5 -O3 -DNDEBUG -ffunction-sections -fbasic-block-sections=all" \
+    "BINARY=partitioned_ranges_program_clang_dwarf5_rnglistx" \
+    "OBJ=partitioned_ranges_program_clang_dwarf5_rnglistx.o"
 
 run_make_fixture cpp_complex_program clean
 run_make_fixture cpp_complex_program all

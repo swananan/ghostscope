@@ -95,7 +95,10 @@ impl RangeExtractor {
 
         // Convert attribute value to RangeListsOffset
         let ranges_offset = match ranges_attr.value() {
-            gimli::AttributeValue::RangeListsRef(offset) => gimli::RangeListsOffset(offset.0),
+            gimli::AttributeValue::RangeListsRef(offset) => {
+                dwarf.ranges_offset_from_raw(unit, offset)
+            }
+            gimli::AttributeValue::DebugRngListsIndex(index) => dwarf.ranges_offset(unit, index)?,
             gimli::AttributeValue::SecOffset(offset) => gimli::RangeListsOffset(offset),
             _ => {
                 warn!("Unexpected DW_AT_ranges attribute value type");
