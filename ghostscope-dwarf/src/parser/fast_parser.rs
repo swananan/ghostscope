@@ -10,12 +10,15 @@ use crate::{
 };
 use gimli::Reader;
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use tracing::debug;
 
 #[derive(Clone, Default)]
 struct FunctionMetadata {
-    name: Option<String>,
+    name: Option<Arc<str>>,
     has_inline_attribute: bool,
     is_linkage_name: bool,
     is_external: Option<bool>,
@@ -35,8 +38,8 @@ struct FunctionEntrySeed {
 
 #[derive(Clone, Default)]
 struct RawDieAttrs {
-    name: Option<String>,
-    linkage_name: Option<String>,
+    name: Option<Arc<str>>,
+    linkage_name: Option<Arc<str>>,
     has_inline_attribute: bool,
     is_external: Option<bool>,
     is_declaration: Option<bool>,
@@ -177,13 +180,13 @@ impl<'a> DwarfParser<'a> {
                         &mut metadata_cache,
                         &mut visited,
                     )?;
-                    if let Some(name) = metadata.name.clone() {
+                    if let Some(name) = metadata.name.as_ref() {
                         let representative_addr =
                             self.extract_representative_address_from_raw(unit, &raw_attrs)?;
                         let entry_pc_cached = raw_attrs.entry_pc;
                         let function_kind =
                             Self::classify_function_kind(tag, representative_addr, entry_pc_cached);
-                        let is_main = Self::is_main_function_from_raw(&raw_attrs, &name);
+                        let is_main = Self::is_main_function_from_raw(&raw_attrs, name.as_ref());
                         let is_static = metadata
                             .is_external
                             .map(|external| !external)
@@ -195,7 +198,7 @@ impl<'a> DwarfParser<'a> {
                             is_linkage: metadata.is_linkage_name,
                             ..Default::default()
                         };
-                        let linkage_name = raw_attrs.linkage_name.clone();
+                        let linkage_name = raw_attrs.linkage_name.as_ref().map(Arc::clone);
                         let seed = FunctionEntrySeed {
                             die_offset: entry_offset,
                             tag,
@@ -206,7 +209,12 @@ impl<'a> DwarfParser<'a> {
                             entry_pc: entry_pc_cached,
                             function_kind,
                         };
-                        Self::push_function_entries(&mut shard, &name, linkage_name, &seed);
+                        Self::push_function_entries(
+                            &mut shard,
+                            Arc::clone(name),
+                            linkage_name,
+                            &seed,
+                        );
                     }
                 }
                 gimli::constants::DW_TAG_inlined_subroutine => {
@@ -218,7 +226,7 @@ impl<'a> DwarfParser<'a> {
                         &mut metadata_cache,
                         &mut visited,
                     )?;
-                    if let Some(name) = metadata.name.clone() {
+                    if let Some(name) = metadata.name.as_ref() {
                         let representative_addr =
                             self.extract_representative_address_from_raw(unit, &raw_attrs)?;
                         let entry_pc_cached = raw_attrs.entry_pc;
@@ -234,7 +242,7 @@ impl<'a> DwarfParser<'a> {
                             is_linkage: metadata.is_linkage_name,
                             ..Default::default()
                         };
-                        let linkage_name = raw_attrs.linkage_name.clone();
+                        let linkage_name = raw_attrs.linkage_name.as_ref().map(Arc::clone);
                         let seed = FunctionEntrySeed {
                             die_offset: entry_offset,
                             tag,
@@ -245,7 +253,12 @@ impl<'a> DwarfParser<'a> {
                             entry_pc: entry_pc_cached,
                             function_kind,
                         };
-                        Self::push_function_entries(&mut shard, &name, linkage_name, &seed);
+                        Self::push_function_entries(
+                            &mut shard,
+                            Arc::clone(name),
+                            linkage_name,
+                            &seed,
+                        );
                     }
                 }
                 gimli::constants::DW_TAG_variable => {
@@ -289,14 +302,14 @@ impl<'a> DwarfParser<'a> {
                         tag_stack.push(tag);
                         continue;
                     }
-                    let mut collected_names: Vec<(String, bool)> = Vec::new();
-                    let mut push_unique_name = |candidate: String, is_linkage_alias: bool| {
+                    let mut collected_names: Vec<(Arc<str>, bool)> = Vec::new();
+                    let mut push_unique_name = |candidate: Arc<str>, is_linkage_alias: bool| {
                         if candidate.is_empty() {
                             return;
                         }
                         if collected_names
                             .iter()
-                            .any(|(existing, _)| existing == &candidate)
+                            .any(|(existing, _)| existing.as_ref() == candidate.as_ref())
                         {
                             return;
                         }
@@ -310,8 +323,8 @@ impl<'a> DwarfParser<'a> {
                         push_unique_name(name, false);
                     }
 
-                    if let Some(linkage_name) = raw_attrs.linkage_name.clone() {
-                        push_unique_name(linkage_name, true);
+                    if let Some(linkage_name) = raw_attrs.linkage_name.as_ref() {
+                        push_unique_name(Arc::clone(linkage_name), true);
                     }
 
                     if collected_names.is_empty() {
@@ -333,7 +346,7 @@ impl<'a> DwarfParser<'a> {
                         let mut entry_flags = flags;
                         entry_flags.is_linkage = is_linkage_alias;
                         let index_entry = IndexEntry {
-                            name: std::sync::Arc::from(name.as_str()),
+                            name: Arc::clone(&name),
                             die_offset: entry_offset,
                             unit_offset,
                             tag,
@@ -350,7 +363,7 @@ impl<'a> DwarfParser<'a> {
                             cu_language,
                             entry_offset
                         );
-                        shard.push_variable_entry(name.clone(), index_entry);
+                        shard.push_variable_entry(name.to_string(), index_entry);
                     }
                 }
                 gimli::constants::DW_TAG_structure_type
@@ -368,7 +381,7 @@ impl<'a> DwarfParser<'a> {
                             ..Default::default()
                         };
                         let index_entry = IndexEntry {
-                            name: std::sync::Arc::from(name.as_str()),
+                            name: Arc::clone(&name),
                             die_offset: entry_offset,
                             unit_offset,
                             tag,
@@ -378,7 +391,7 @@ impl<'a> DwarfParser<'a> {
                             entry_pc: None,
                             function_kind: FunctionDieKind::NotFunction,
                         };
-                        shard.push_type_entry(name, index_entry);
+                        shard.push_type_entry(name.to_string(), index_entry);
                     }
                 }
                 _ => {}
@@ -409,9 +422,9 @@ impl<'a> DwarfParser<'a> {
         }
     }
 
-    fn build_function_index_entry(name: &str, seed: &FunctionEntrySeed) -> IndexEntry {
+    fn build_function_index_entry(name: Arc<str>, seed: &FunctionEntrySeed) -> IndexEntry {
         IndexEntry {
-            name: std::sync::Arc::from(name),
+            name,
             die_offset: seed.die_offset,
             unit_offset: seed.unit_offset,
             tag: seed.tag,
@@ -425,23 +438,25 @@ impl<'a> DwarfParser<'a> {
 
     fn push_function_entries(
         shard: &mut InfoShard,
-        name: &str,
-        linkage_name: Option<String>,
+        name: Arc<str>,
+        linkage_name: Option<Arc<str>>,
         seed: &FunctionEntrySeed,
     ) {
         shard.push_function_entry(
-            name.to_owned(),
-            Self::build_function_index_entry(name, seed),
+            name.to_string(),
+            Self::build_function_index_entry(Arc::clone(&name), seed),
         );
 
-        if let Some(linkage_name) = linkage_name.filter(|linkage_name| linkage_name != name) {
+        if let Some(linkage_name) =
+            linkage_name.filter(|linkage_name| linkage_name.as_ref() != name.as_ref())
+        {
             let mut alias_seed = seed.clone();
             let mut alias_flags = alias_seed.flags;
             alias_flags.is_linkage = true;
             alias_seed.flags = alias_flags;
             shard.push_function_entry(
-                linkage_name.clone(),
-                Self::build_function_index_entry(&linkage_name, &alias_seed),
+                linkage_name.to_string(),
+                Self::build_function_index_entry(linkage_name, &alias_seed),
             );
         }
     }
@@ -450,10 +465,10 @@ impl<'a> DwarfParser<'a> {
         dwarf: &gimli::Dwarf<DwarfReader>,
         unit: &gimli::Unit<DwarfReader>,
         attr_value: gimli::AttributeValue<DwarfReader>,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<Arc<str>>> {
         if let Ok(string) = dwarf.attr_string(unit, attr_value) {
             if let Ok(s_str) = string.to_string_lossy() {
-                return Ok(Some(s_str.into_owned()));
+                return Ok(Some(Arc::<str>::from(s_str.into_owned())));
             }
         }
         Ok(None)
@@ -586,9 +601,9 @@ impl<'a> DwarfParser<'a> {
         entry_offset: gimli::UnitOffset,
         attrs: &RawDieAttrs,
         visited: &mut HashSet<gimli::UnitOffset>,
-    ) -> Result<Option<String>> {
-        if let Some(name) = attrs.name.clone() {
-            return Ok(Some(name));
+    ) -> Result<Option<Arc<str>>> {
+        if let Some(name) = attrs.name.as_ref() {
+            return Ok(Some(Arc::clone(name)));
         }
 
         if !visited.insert(entry_offset) {
@@ -639,8 +654,8 @@ impl<'a> DwarfParser<'a> {
             self.resolve_name_from_raw(unit, entry_offset, attrs, &mut name_visited)?
         {
             metadata.name = Some(name);
-        } else if let Some(name) = attrs.linkage_name.clone() {
-            metadata.name = Some(name);
+        } else if let Some(name) = attrs.linkage_name.as_ref() {
+            metadata.name = Some(Arc::clone(name));
             metadata.is_linkage_name = true;
         }
 
@@ -666,7 +681,7 @@ impl<'a> DwarfParser<'a> {
             };
 
             if metadata.name.is_none() {
-                metadata.name = origin_metadata.name.clone();
+                metadata.name = origin_metadata.name.as_ref().map(Arc::clone);
             }
             if metadata.is_external.is_none() {
                 metadata.is_external = origin_metadata.is_external;
