@@ -4,6 +4,24 @@ mod common;
 
 use common::{init, FIXTURES};
 
+const CPP_NESTED_MEMBER_TRACE_LINE: u32 = 44;
+
+async fn compile_cpp_complex_script(
+    script: &str,
+) -> anyhow::Result<ghostscope_compiler::CompilationResult> {
+    let binary_path = FIXTURES.get_test_binary("cpp_complex_program")?;
+    let mut analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to load DWARF for cpp_complex_program: {e}"))?;
+    let compile_options = ghostscope_compiler::CompileOptions {
+        binary_path_hint: Some(binary_path.to_string_lossy().into_owned()),
+        ..Default::default()
+    };
+
+    ghostscope_compiler::compile_script(script, &mut analyzer, None, Some(1), &compile_options)
+        .map_err(|e| anyhow::anyhow!("compile_script failed: {e}"))
+}
+
 async fn run_ghostscope_with_script_for_target(
     script_content: &str,
     timeout_secs: u64,
@@ -29,6 +47,56 @@ async fn spawn_cpp_complex_program() -> anyhow::Result<common::targets::TargetHa
         .await?;
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
     Ok(target)
+}
+
+#[tokio::test]
+async fn test_cpp_nested_type_direct_child_member_access_is_not_recursive() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("cpp_complex_program")?;
+    let source_path = binary_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("cpp_complex_program has no parent directory"))?
+        .join("main.cpp");
+
+    let valid_script = format!(
+        r#"
+trace {}:{CPP_NESTED_MEMBER_TRACE_LINE} {{
+    print o.nested.shadow;
+}}
+"#,
+        source_path.display()
+    );
+    let valid = compile_cpp_complex_script(&valid_script).await?;
+    assert!(
+        !valid.uprobe_configs.is_empty(),
+        "expected valid o.nested.shadow to compile; target_info={} failed_targets={:?}",
+        valid.target_info,
+        valid.failed_targets
+    );
+
+    let invalid_script = format!(
+        r#"
+trace {}:{CPP_NESTED_MEMBER_TRACE_LINE} {{
+    print o.shadow;
+}}
+"#,
+        source_path.display()
+    );
+    if let Ok(invalid) = compile_cpp_complex_script(&invalid_script).await {
+        assert!(
+            invalid.uprobe_configs.is_empty(),
+            "expected o.shadow to be rejected because shadow is only a member of o.nested; target_info={} failed_targets={:?}",
+            invalid.target_info,
+            invalid.failed_targets
+        );
+        assert!(
+            !invalid.failed_targets.is_empty(),
+            "expected at least one failed target for invalid o.shadow access"
+        );
+    }
+
+    Ok(())
 }
 
 #[tokio::test]
