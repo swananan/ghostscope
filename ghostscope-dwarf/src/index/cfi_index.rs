@@ -154,7 +154,7 @@ impl CfiIndex {
                 use gimli::Reader;
                 let temp = expression.0.to_slice().ok();
                 let expr_bytes = temp.as_deref().unwrap_or(&[]);
-                let steps = self.parse_dwarf_expression(expr_bytes)?;
+                let steps = Self::parse_dwarf_expression(expr_bytes)?;
                 CfaResult::Expression { steps }
             }
         };
@@ -355,7 +355,7 @@ impl CfiIndex {
         let expression = expr.get(&self.eh_frame)?;
         let temp = expression.0.to_slice().ok();
         let expr_bytes = temp.as_deref().unwrap_or(&[]);
-        self.parse_dwarf_expression(expr_bytes)
+        Self::parse_dwarf_expression(expr_bytes)
     }
 
     fn default_register_rule(register: u16) -> Option<RegisterRule<usize>> {
@@ -368,7 +368,7 @@ impl CfiIndex {
     }
 
     /// Parse DWARF expression bytes into ComputeStep sequence
-    fn parse_dwarf_expression(&self, expr_bytes: &[u8]) -> Result<Vec<ComputeStep>> {
+    fn parse_dwarf_expression(expr_bytes: &[u8]) -> Result<Vec<ComputeStep>> {
         let mut steps = Vec::new();
         let mut pc = 0;
 
@@ -381,7 +381,7 @@ impl CfiIndex {
                 0x70..=0x8f => {
                     let register = (opcode - 0x70) as u16;
                     // Read SLEB128 offset
-                    let (offset, bytes_read) = self.read_sleb128(&expr_bytes[pc..])?;
+                    let (offset, bytes_read) = Self::read_sleb128(&expr_bytes[pc..])?;
                     pc += bytes_read;
 
                     steps.push(ComputeStep::LoadRegister(register));
@@ -392,7 +392,7 @@ impl CfiIndex {
                 }
                 // DW_OP_plus_uconst
                 0x23 => {
-                    let (value, bytes_read) = self.read_uleb128(&expr_bytes[pc..])?;
+                    let (value, bytes_read) = Self::read_uleb128(&expr_bytes[pc..])?;
                     pc += bytes_read;
                     steps.push(ComputeStep::PushConstant(value as i64));
                     steps.push(ComputeStep::Add);
@@ -414,10 +414,15 @@ impl CfiIndex {
                 0x21 => steps.push(ComputeStep::Or),
                 // DW_OP_xor
                 0x27 => steps.push(ComputeStep::Xor),
+                // DW_OP_nop
+                0x96 => {}
 
                 _ => {
-                    debug!("Unhandled DWARF opcode 0x{:02x} in CFA expression", opcode);
-                    // For now, skip unknown opcodes
+                    return Err(anyhow!(
+                        "unsupported DWARF opcode 0x{:02x} in CFA expression at byte offset {}",
+                        opcode,
+                        pc - 1
+                    ));
                 }
             }
         }
@@ -426,7 +431,7 @@ impl CfiIndex {
     }
 
     /// Read ULEB128 from byte slice
-    fn read_uleb128(&self, data: &[u8]) -> Result<(u64, usize)> {
+    fn read_uleb128(data: &[u8]) -> Result<(u64, usize)> {
         let mut result = 0u64;
         let mut shift = 0;
         let mut bytes_read = 0;
@@ -444,7 +449,7 @@ impl CfiIndex {
     }
 
     /// Read SLEB128 from byte slice
-    fn read_sleb128(&self, data: &[u8]) -> Result<(i64, usize)> {
+    fn read_sleb128(data: &[u8]) -> Result<(i64, usize)> {
         let mut result = 0i64;
         let mut shift = 0;
         let mut bytes_read = 0;
@@ -491,9 +496,22 @@ pub struct CfiStats {
 
 #[cfg(test)]
 mod tests {
+    use super::CfiIndex;
+
     #[test]
     fn test_cfi_index_creation() {
         // This would need a real ELF file for testing
         // For now, just ensure the module compiles
+    }
+
+    #[test]
+    fn cfa_expression_rejects_unknown_opcode_after_valid_prefix() {
+        let error = CfiIndex::parse_dwarf_expression(&[0x70, 0x00, 0xff])
+            .expect_err("unknown CFI expression opcode must not be skipped");
+
+        assert!(
+            error.to_string().contains("unsupported"),
+            "unexpected error: {error}"
+        );
     }
 }

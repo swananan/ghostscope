@@ -341,7 +341,15 @@ impl ExpressionEvaluator {
         let mut has_stack_value = false;
 
         // Parse all operations in the expression
-        while let Ok(op) = Operation::parse(&mut expression.0, encoding) {
+        while !expression.0.is_empty() {
+            let offset = expr_bytes.len() - expression.0.len();
+            let op = Operation::parse(&mut expression.0, encoding).map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to parse DWARF expression operation at byte offset {}: {}",
+                    offset,
+                    error
+                )
+            })?;
             if matches!(op, Operation::StackValue) {
                 has_stack_value = true;
                 debug!("Found DW_OP_stack_value - this is a computed value");
@@ -353,7 +361,16 @@ impl ExpressionEvaluator {
                 Operation::EntryValue { expression } => {
                     let mut inner = *expression;
                     let mut inner_ops: Vec<Operation<_>> = Vec::new();
-                    while let Ok(iop) = Operation::parse(&mut inner, encoding) {
+                    let inner_len = inner.len();
+                    while !inner.is_empty() {
+                        let offset = inner_len - inner.len();
+                        let iop = Operation::parse(&mut inner, encoding).map_err(|error| {
+                            anyhow::anyhow!(
+                                "failed to parse DW_OP_entry_value inner expression operation at byte offset {}: {}",
+                                offset,
+                                error
+                            )
+                        })?;
                         inner_ops.push(iop);
                     }
                     if inner_ops.len() == 1 {
@@ -524,18 +541,34 @@ impl ExpressionEvaluator {
                         // This marks the result as a computed value, not a memory location
                         // Already handled by has_stack_value flag
                     }
-                    ParsedOperation::Operation(Operation::Deref { size, .. }) => {
+                    ParsedOperation::Operation(Operation::Deref { size, space, .. }) => {
+                        if *space {
+                            return Err(anyhow::anyhow!(
+                                "unsupported DWARF expression operation: {:?}",
+                                op
+                            ));
+                        }
                         let mem_size = match size {
                             1 => MemoryAccessSize::U8,
                             2 => MemoryAccessSize::U16,
                             4 => MemoryAccessSize::U32,
                             8 => MemoryAccessSize::U64,
-                            _ => MemoryAccessSize::U64, // Default
+                            _ => {
+                                return Err(anyhow::anyhow!(
+                                    "unsupported DWARF dereference size {} in operation: {:?}",
+                                    size,
+                                    op
+                                ))
+                            }
                         };
                         steps.push(ComputeStep::Dereference { size: mem_size });
                     }
+                    ParsedOperation::Operation(Operation::Nop) => {}
                     _ => {
-                        debug!("Unhandled operation in expression: {:?}", op);
+                        return Err(anyhow::anyhow!(
+                            "unsupported DWARF expression operation: {:?}",
+                            op
+                        ));
                     }
                 }
             }
@@ -1600,6 +1633,14 @@ mod tests {
     use gimli::{Format, LittleEndian, Register, RunTimeEndian};
     use std::sync::Arc;
 
+    fn test_encoding() -> gimli::Encoding {
+        gimli::Encoding {
+            format: gimli::Format::Dwarf32,
+            version: 5,
+            address_size: 8,
+        }
+    }
+
     fn build_scanned_incoming_entry_value_fixture(
         register: u16,
         caller_value: u64,
@@ -1947,12 +1988,61 @@ mod tests {
     }
 
     #[test]
+    fn multi_op_expression_rejects_invalid_opcode_after_valid_prefix() {
+        let expr_bytes = [
+            constants::DW_OP_lit1.0,
+            0xff,
+            constants::DW_OP_stack_value.0,
+        ];
+
+        let error = ExpressionEvaluator::parse_expression_with_context(
+            &expr_bytes,
+            RunTimeEndian::Little,
+            test_encoding(),
+            None,
+            0,
+            None,
+            None,
+            None,
+            0,
+        )
+        .expect_err("invalid opcode after a valid prefix must not return a value");
+
+        assert!(
+            error.to_string().contains("DWARF expression"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn multi_op_expression_rejects_unsupported_operation_after_valid_prefix() {
+        let expr_bytes = [
+            constants::DW_OP_lit1.0,
+            constants::DW_OP_drop.0,
+            constants::DW_OP_stack_value.0,
+        ];
+
+        let error = ExpressionEvaluator::parse_expression_with_context(
+            &expr_bytes,
+            RunTimeEndian::Little,
+            test_encoding(),
+            None,
+            0,
+            None,
+            None,
+            None,
+            0,
+        )
+        .expect_err("unsupported operation after a valid prefix must not return a value");
+
+        assert!(
+            error.to_string().contains("unsupported"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn single_fbreg_fast_path_saturates_cfa_offset_addition() {
-        let encoding = gimli::Encoding {
-            format: gimli::Format::Dwarf32,
-            version: 5,
-            address_size: 8,
-        };
         let get_cfa = |_address| {
             Ok(Some(CfaResult::RegisterPlusOffset {
                 register: 7,
@@ -1963,7 +2053,7 @@ mod tests {
         let result = ExpressionEvaluator::parse_expression_with_context(
             &[0x91, 0x0a],
             RunTimeEndian::Little,
-            encoding,
+            test_encoding(),
             None,
             0,
             Some(&get_cfa),
@@ -1985,16 +2075,11 @@ mod tests {
 
     #[test]
     fn big_endian_dw_op_addr_preserves_absolute_address() {
-        let encoding = gimli::Encoding {
-            format: gimli::Format::Dwarf32,
-            version: 5,
-            address_size: 8,
-        };
         let expr_bytes = [0x03, 0, 0, 0, 0, 0, 0, 0x12, 0x34];
         let result = ExpressionEvaluator::parse_expression_with_context(
             &expr_bytes,
             gimli::RunTimeEndian::Big,
-            encoding,
+            test_encoding(),
             None,
             0,
             None,
