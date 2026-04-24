@@ -159,11 +159,15 @@ impl<'dwarf> AccessPlanner<'dwarf> {
                     let header_now2 = self.dwarf.unit_header(current_cu_off)?;
                     let unit_now2 = self.dwarf.unit(header_now2)?;
                     let def_die = unit_now2.entry(def_off)?;
-                    // Scan members for the field
-                    let mut entries = unit_now2.entries_at_offset(def_die.offset())?;
-                    let _ = entries.next_entry()?; // self
+                    // Only direct DW_TAG_member children belong to this aggregate.
+                    // Nested class/struct DIEs may appear under a C++ aggregate, but
+                    // their members are not direct members of the parent type.
+                    let mut tree = unit_now2.entries_tree(Some(def_die.offset()))?;
+                    let root = tree.root()?;
+                    let mut children = root.children();
                     let mut found_member = false;
-                    while let Some(e) = entries.next_dfs()? {
+                    while let Some(child) = children.next()? {
+                        let e = child.entry();
                         if e.tag() == gimli::DW_TAG_member {
                             if let Some(attr) = e.attr(gimli::DW_AT_name) {
                                 if let Ok(s) = self.dwarf.attr_string(&unit_now2, attr.value()) {
