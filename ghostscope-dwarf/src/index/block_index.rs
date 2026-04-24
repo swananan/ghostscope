@@ -172,29 +172,9 @@ impl FunctionBlocks {
         out
     }
 
-    /// Find the nearest caller-side call-site parameter binding whose return_pc
-    /// is at or before `pc` and whose callee entry register matches `register`.
-    pub fn entry_value_parameter_for_pc(
-        &self,
-        pc: u64,
-        register: u16,
-    ) -> Option<&CallSiteParameter> {
-        for (_, records) in self.call_sites.range(..=pc).rev() {
-            for record in records.iter().rev() {
-                if let Some(parameter) = record
-                    .parameters
-                    .iter()
-                    .find(|parameter| parameter.callee_register == register)
-                {
-                    return Some(parameter);
-                }
-            }
-        }
-        None
-    }
-
     /// Collect all incoming caller-side call-site bindings for a callee
-    /// register. These are used for non-inline DW_OP_entry_value recovery.
+    /// register. These drive DW_OP_entry_value recovery without consulting
+    /// nested outgoing call sites inside the current function body.
     pub fn incoming_entry_value_parameters(&self, register: u16) -> Vec<(u64, &CallSiteParameter)> {
         let mut out = Vec::new();
         for (return_pc, records) in &self.incoming_call_sites {
@@ -207,17 +187,6 @@ impl FunctionBlocks {
             }
         }
         out
-    }
-
-    /// True when `pc` is inside an inlined-subroutine scope in this function.
-    pub fn is_inline_context_at(&self, pc: u64) -> bool {
-        if !self.function_contains_pc(pc) {
-            return false;
-        }
-        self.block_path_for_pc(pc)
-            .into_iter()
-            .skip(1)
-            .any(|idx| self.nodes[idx].entry_pc.is_some())
     }
 }
 
@@ -1399,59 +1368,5 @@ mod tests {
         assert_eq!(incoming.len(), 1);
         assert_eq!(incoming[0].call_origin, None);
         assert_eq!(incoming[0].call_target, Some(0x1200));
-    }
-
-    #[test]
-    fn entry_value_parameter_lookup_uses_nearest_prior_return_pc() {
-        let mut function = FunctionBlocks::new(gimli::DebugInfoOffset(0), gimli::UnitOffset(0));
-        function.call_sites.insert(
-            0x1018,
-            vec![CallSiteRecord {
-                cu_offset: gimli::DebugInfoOffset(0),
-                die_offset: gimli::UnitOffset(1),
-                return_pc: 0x1018,
-                call_origin: None,
-                call_target: None,
-                parameters: vec![CallSiteParameter {
-                    callee_register: 5,
-                    caller_value_steps: vec![ComputeStep::PushConstant(11)],
-                }],
-            }],
-        );
-        function.call_sites.insert(
-            0x1030,
-            vec![CallSiteRecord {
-                cu_offset: gimli::DebugInfoOffset(0),
-                die_offset: gimli::UnitOffset(2),
-                return_pc: 0x1030,
-                call_origin: None,
-                call_target: None,
-                parameters: vec![CallSiteParameter {
-                    callee_register: 5,
-                    caller_value_steps: vec![ComputeStep::PushConstant(22)],
-                }],
-            }],
-        );
-
-        let parameter = function
-            .entry_value_parameter_for_pc(0x1034, 5)
-            .expect("nearest call-site parameter should be found");
-        assert_eq!(
-            parameter.caller_value_steps,
-            vec![ComputeStep::PushConstant(22)]
-        );
-
-        let earlier = function
-            .entry_value_parameter_for_pc(0x1019, 5)
-            .expect("earlier call-site parameter should be found");
-        assert_eq!(
-            earlier.caller_value_steps,
-            vec![ComputeStep::PushConstant(11)]
-        );
-
-        assert!(
-            function.entry_value_parameter_for_pc(0x1017, 5).is_none(),
-            "call sites after the current PC must not match"
-        );
     }
 }

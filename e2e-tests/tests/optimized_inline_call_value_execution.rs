@@ -9,11 +9,6 @@ use std::time::Duration;
 // Keep this on the first executable line before consume_pair() is called.
 const INLINE_BEFORE_CALL_TRACE_LINE: u32 = 20;
 // Keep this on the first executable line after consume_pair() returns.
-// This is intentionally a negative regression point: at this PC the inline
-// parameters have already fallen out of their own location-list coverage, so
-// we only assert that GhostScope does not misreport them as consume_pair's
-// argument registers. We do not expect post-call value recovery to work until
-// full DW_OP_entry_value + caller-side call-site evaluation is implemented.
 const INLINE_AFTER_CALL_TRACE_LINE: u32 = 22;
 
 async fn spawn_inline_call_value_program(
@@ -270,5 +265,73 @@ async fn test_optimized_inline_parameters_survive_internal_call_sites() -> anyho
     }
     target.terminate().await?;
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_entry_value_recovers_outer_parameter_inside_optimized_inline_after_internal_call(
+) -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("inline_call_value_program")?;
+    let mut analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
+    let addrs = analyzer.lookup_addresses_by_source_line(
+        "inline_call_value_program.c",
+        INLINE_AFTER_CALL_TRACE_LINE,
+    );
+    anyhow::ensure!(
+        !addrs.is_empty(),
+        "No DWARF addresses found for inline_call_value_program.c:{INLINE_AFTER_CALL_TRACE_LINE}"
+    );
+    for module_address in &addrs {
+        anyhow::ensure!(
+            analyzer.is_inline_at(module_address) == Some(true),
+            "Expected inline address at 0x{:x}",
+            module_address.address
+        );
+    }
+
+    let target = spawn_inline_call_value_program(&binary_path).await?;
+    let script = format!(
+        "trace inline_call_value_program.c:{INLINE_AFTER_CALL_TRACE_LINE} {{\n    print \"POSTCALL:{{}}:{{}}\", seed, after_call;\n}}\n"
+    );
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(&script, 4, &target).await?;
+    target.terminate().await?;
+
+    if should_skip_for_ebpf_env(exit_code, &stderr) {
+        return Ok(());
+    }
+
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(
+        !stdout.contains("ExprError"),
+        "Expected exact entry_value recovery inside the inline body. STDOUT: {stdout}\nSTDERR: {stderr}"
+    );
+    assert!(
+        !stdout.contains("<optimized_out>"),
+        "Inline post-call entry_value should not be optimized out. STDOUT: {stdout}\nSTDERR: {stderr}"
+    );
+
+    let re = Regex::new(r"POSTCALL:([0-9-]+):([0-9-]+)")?;
+    let mut seen = 0;
+    for caps in re.captures_iter(&stdout) {
+        let seed: i64 = caps[1].parse()?;
+        let after_call: i64 = caps[2].parse()?;
+        let original_x = seed * 7;
+        let original_y = seed + 11;
+        let combined = (original_x + original_y) * (original_x - original_y);
+        assert_eq!(
+            after_call,
+            combined + 7,
+            "Expected seed/after_call to match wrapper(seed) on the first post-call line. STDOUT: {stdout}"
+        );
+        seen += 1;
+    }
+
+    assert!(
+        seen >= 2,
+        "Expected multiple post-call entry_value events. STDOUT: {stdout}\nSTDERR: {stderr}"
+    );
     Ok(())
 }
