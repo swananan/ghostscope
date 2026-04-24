@@ -2,9 +2,7 @@
 //! requiring full TypeInfo expansion.
 
 pub(crate) use crate::semantics::TypeLoc;
-use crate::semantics::{
-    eval_member_offset_expr, resolve_type_ref_with_origins, strip_typedef_qualified,
-};
+use crate::semantics::{resolve_type_ref_with_origins, strip_typedef_qualified};
 use crate::{
     binary::DwarfReader,
     core::{attr_u64, EvaluationResult, Result},
@@ -180,7 +178,11 @@ impl<'dwarf> AccessPlanner<'dwarf> {
                                             {
                                                 match a.value() {
                                                     gimli::AttributeValue::Exprloc(expr) => {
-                                                        off = eval_member_offset_expr(&expr)
+                                                        off =
+                                                            crate::dwarf_expr::const_eval::eval_const_offset(
+                                                                &expr,
+                                                                unit_now2.encoding(),
+                                                            )?;
                                                     }
                                                     value => off = attr_u64(value),
                                                 }

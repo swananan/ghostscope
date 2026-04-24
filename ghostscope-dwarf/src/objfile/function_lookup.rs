@@ -598,15 +598,9 @@ impl LoadedObjfile {
 
     fn expression_uses_entry_value(
         unit: &gimli::Unit<DwarfReader>,
-        mut expression: gimli::Expression<DwarfReader>,
+        expression: gimli::Expression<DwarfReader>,
     ) -> bool {
-        while let Ok(op) = gimli::Operation::parse(&mut expression.0, unit.encoding()) {
-            if matches!(op, gimli::Operation::EntryValue { .. }) {
-                return true;
-            }
-        }
-
-        false
+        crate::dwarf_expr::scan::contains_entry_value(expression, unit.encoding()).unwrap_or(false)
     }
 
     pub(crate) fn lookup_function_addresses_any(&self, name: &str) -> Vec<u64> {

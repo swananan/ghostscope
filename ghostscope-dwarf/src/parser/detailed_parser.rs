@@ -10,10 +10,7 @@ use crate::{
     core::{attr_u64, EvaluationResult, Result},
     index::{CfiIndex, FunctionBlocks},
     parser::ExpressionEvaluator,
-    semantics::{
-        eval_member_offset_expr, resolve_name_with_origins,
-        resolve_type_ref_in_same_unit_with_origins,
-    },
+    semantics::{resolve_name_with_origins, resolve_type_ref_in_same_unit_with_origins},
     TypeInfo,
 };
 use gimli::Reader;
@@ -315,8 +312,14 @@ impl DetailedParser {
                                     if let Some(ml) = ce.attr(gimli::DW_AT_data_member_location) {
                                         match ml.value() {
                                             gimli::AttributeValue::Exprloc(expr) => {
-                                                // Try to eval simple DW_OP_constu / plus_uconst
-                                                if let Some(v) = eval_member_offset_expr(&expr) {
+                                                if let Some(v) =
+                                                    crate::dwarf_expr::const_eval::eval_const_offset(
+                                                        &expr,
+                                                        unit.encoding(),
+                                                    )
+                                                    .ok()
+                                                    .flatten()
+                                                {
                                                     m_offset = v;
                                                 }
                                             }

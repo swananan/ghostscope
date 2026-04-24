@@ -8,6 +8,7 @@ pub mod core;
 
 // Internal implementation modules
 pub(crate) mod binary;
+pub(crate) mod dwarf_expr;
 pub(crate) mod index;
 pub(crate) mod loader;
 pub(crate) mod objfile;

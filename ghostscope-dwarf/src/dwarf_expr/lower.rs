@@ -9,7 +9,7 @@ use crate::core::{
 };
 use crate::index::{BlockIndexBuilder, CfiIndex, FunctionBlocks};
 use crate::semantics::{range_contains_pc, resolve_attr_with_unit_origins};
-use gimli::{read::RawLocListEntry, EndianSlice, Expression, Operation, Reader};
+use gimli::{read::RawLocListEntry, EndianSlice, Operation, Reader};
 use tracing::{debug, trace, warn};
 
 /// DWARF expression evaluator
@@ -336,20 +336,15 @@ impl ExpressionEvaluator {
             PrecomputedSteps(Vec<ComputeStep>),
         }
 
-        let mut expression = Expression(EndianSlice::new(expr_bytes, endian));
         let mut operations: Vec<ParsedOperation<_>> = Vec::new();
         let mut has_stack_value = false;
 
         // Parse all operations in the expression
-        while !expression.0.is_empty() {
-            let offset = expr_bytes.len() - expression.0.len();
-            let op = Operation::parse(&mut expression.0, encoding).map_err(|error| {
-                anyhow::anyhow!(
-                    "failed to parse DWARF expression operation at byte offset {}: {}",
-                    offset,
-                    error
-                )
-            })?;
+        for op in crate::dwarf_expr::ops::parse_ops(
+            EndianSlice::new(expr_bytes, endian),
+            encoding,
+            "DWARF expression",
+        )? {
             if matches!(op, Operation::StackValue) {
                 has_stack_value = true;
                 debug!("Found DW_OP_stack_value - this is a computed value");
@@ -359,20 +354,11 @@ impl ExpressionEvaluator {
                 // call-site metadata. This keeps optimized parameters usable
                 // after their entry registers have been clobbered.
                 Operation::EntryValue { expression } => {
-                    let mut inner = *expression;
-                    let mut inner_ops: Vec<Operation<_>> = Vec::new();
-                    let inner_len = inner.len();
-                    while !inner.is_empty() {
-                        let offset = inner_len - inner.len();
-                        let iop = Operation::parse(&mut inner, encoding).map_err(|error| {
-                            anyhow::anyhow!(
-                                "failed to parse DW_OP_entry_value inner expression operation at byte offset {}: {}",
-                                offset,
-                                error
-                            )
-                        })?;
-                        inner_ops.push(iop);
-                    }
+                    let inner_ops = crate::dwarf_expr::ops::parse_ops(
+                        *expression,
+                        encoding,
+                        "DW_OP_entry_value inner expression",
+                    )?;
                     if inner_ops.len() == 1 {
                         match &inner_ops[0] {
                             Operation::Register { register } => {

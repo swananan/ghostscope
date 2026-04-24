@@ -9,7 +9,8 @@
 use crate::{
     binary::DwarfReader,
     core::ComputeStep,
-    parser::{ExpressionEvaluator, RangeExtractor},
+    dwarf_expr::ExpressionEvaluator,
+    parser::RangeExtractor,
     semantics::{ranges_contain_pc, resolve_origin_entry},
 };
 use gimli::Reader;
@@ -599,13 +600,15 @@ impl<'a> BlockIndexBuilder<'a> {
         entry: &gimli::DebuggingInformationEntry<DwarfReader>,
     ) -> Option<u64> {
         let attr = entry.attr(gimli::constants::DW_AT_call_target)?;
-        let gimli::AttributeValue::Exprloc(mut expr) = attr.value() else {
+        let gimli::AttributeValue::Exprloc(expr) = attr.value() else {
             return None;
         };
-        let first = gimli::Operation::parse(&mut expr.0, unit.encoding()).ok()?;
-        if !expr.0.is_empty() {
-            return None;
-        }
+        let first = crate::dwarf_expr::ops::parse_single_op(
+            expr.0,
+            unit.encoding(),
+            "DW_AT_call_target expression",
+        )
+        .ok()??;
         match first {
             gimli::Operation::Address { address } => Some(address),
             _ => None,
@@ -631,13 +634,15 @@ impl<'a> BlockIndexBuilder<'a> {
         entry: &gimli::DebuggingInformationEntry<DwarfReader>,
     ) -> Option<u16> {
         let attr = entry.attr(gimli::constants::DW_AT_location)?;
-        let gimli::AttributeValue::Exprloc(mut expr) = attr.value() else {
+        let gimli::AttributeValue::Exprloc(expr) = attr.value() else {
             return None;
         };
-        let first = gimli::Operation::parse(&mut expr.0, unit.encoding()).ok()?;
-        if !expr.0.is_empty() {
-            return None;
-        }
+        let first = crate::dwarf_expr::ops::parse_single_op(
+            expr.0,
+            unit.encoding(),
+            "DW_AT_location call-site parameter expression",
+        )
+        .ok()??;
         match first {
             gimli::Operation::Register { register } => Some(register.0),
             _ => None,
@@ -678,20 +683,23 @@ impl<'a> BlockIndexBuilder<'a> {
 
     fn lower_entry_value_call_site_register(
         unit: &gimli::Unit<DwarfReader>,
-        mut expr: gimli::Expression<DwarfReader>,
+        expr: gimli::Expression<DwarfReader>,
     ) -> Option<Vec<ComputeStep>> {
-        let first = gimli::Operation::parse(&mut expr.0, unit.encoding()).ok()?;
-        if !expr.0.is_empty() {
-            return None;
-        }
+        let first = crate::dwarf_expr::ops::parse_single_op(
+            expr.0,
+            unit.encoding(),
+            "DW_AT_call_value fallback expression",
+        )
+        .ok()??;
         let gimli::Operation::EntryValue { expression: inner } = first else {
             return None;
         };
-        let mut inner = inner;
-        let inner_op = gimli::Operation::parse(&mut inner, unit.encoding()).ok()?;
-        if !inner.is_empty() {
-            return None;
-        }
+        let inner_op = crate::dwarf_expr::ops::parse_single_op(
+            inner,
+            unit.encoding(),
+            "DW_AT_call_value fallback entry_value inner expression",
+        )
+        .ok()??;
         match inner_op {
             gimli::Operation::Register { register } => {
                 Some(vec![ComputeStep::LoadRegister(register.0)])
