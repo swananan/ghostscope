@@ -5,12 +5,12 @@
 
 use crate::{
     binary::{dwarf_endian_from_object, DwarfReader, MappedFile},
-    core::{CallerFrameRecovery, CfaResult, ComputeStep, Result},
+    core::{CallerFrameRecovery, CfaResult, ComputeStep, MemoryAccessSize, Result},
 };
 use anyhow::{anyhow, Context};
 use gimli::{
     BaseAddresses, CfaRule, CieOrFde, EhFrame, EhFrameHdr, FrameDescriptionEntry, ParsedEhFrameHdr,
-    Register, RegisterRule, UnwindContext, UnwindSection,
+    Reader, Register, RegisterRule, UnwindContext, UnwindSection,
 };
 use object::{Object, ObjectSection};
 use std::{collections::BTreeMap, sync::Arc};
@@ -27,6 +27,8 @@ pub struct CfiIndex {
     eh_frame_hdr: Option<ParsedEhFrameHdr<DwarfReader>>,
     /// Base addresses for DWARF sections
     bases: BaseAddresses,
+    /// Encoding used when parsing CFI DWARF expressions.
+    encoding: gimli::Encoding,
     /// Whether we have eh_frame_hdr for fast lookup
     has_fast_lookup: bool,
 }
@@ -47,6 +49,12 @@ impl CfiIndex {
             .parse_object()
             .context("Failed to parse object file")?;
         let endian = dwarf_endian_from_object(&object);
+        let address_size = if object.is_64() { 8 } else { 4 };
+        let encoding = gimli::Encoding {
+            format: gimli::Format::Dwarf32,
+            version: 4,
+            address_size,
+        };
 
         // Load eh_frame section (required)
         let eh_frame_section = object
@@ -81,8 +89,6 @@ impl CfiIndex {
                 .ok_or_else(|| anyhow!("Invalid .eh_frame_hdr range in mapped file"))?;
                 let hdr_section = EhFrameHdr::from(hdr_reader);
 
-                // Parse with proper address_size
-                let address_size = if object.is_64() { 8 } else { 4 };
                 let mut bases = BaseAddresses::default();
 
                 // Set eh_frame_hdr section base
@@ -131,6 +137,7 @@ impl CfiIndex {
             eh_frame,
             eh_frame_hdr,
             bases,
+            encoding,
             has_fast_lookup,
         })
     }
@@ -147,14 +154,8 @@ impl CfiIndex {
                 offset: *offset,
             },
             CfaRule::Expression(expr) => {
-                // Get the expression bytes from the section
                 let expression = expr.get(&self.eh_frame)?;
-                // Parse DWARF expression to compute steps
-                // expression.0 is EndianSlice, get the underlying bytes
-                use gimli::Reader;
-                let temp = expression.0.to_slice().ok();
-                let expr_bytes = temp.as_deref().unwrap_or(&[]);
-                let steps = Self::parse_dwarf_expression(expr_bytes)?;
+                let steps = Self::parse_dwarf_expression(expression.0, self.encoding)?;
                 CfaResult::Expression { steps }
             }
         };
@@ -350,12 +351,8 @@ impl CfiIndex {
         &self,
         expr: gimli::UnwindExpression<usize>,
     ) -> Result<Vec<ComputeStep>> {
-        use gimli::Reader;
-
         let expression = expr.get(&self.eh_frame)?;
-        let temp = expression.0.to_slice().ok();
-        let expr_bytes = temp.as_deref().unwrap_or(&[]);
-        Self::parse_dwarf_expression(expr_bytes)
+        Self::parse_dwarf_expression(expression.0, self.encoding)
     }
 
     fn default_register_rule(register: u16) -> Option<RegisterRule<usize>> {
@@ -367,110 +364,70 @@ impl CfiIndex {
         }
     }
 
-    /// Parse DWARF expression bytes into ComputeStep sequence
-    fn parse_dwarf_expression(expr_bytes: &[u8]) -> Result<Vec<ComputeStep>> {
+    /// Parse DWARF expression operations into ComputeStep sequence.
+    fn parse_dwarf_expression<R>(reader: R, encoding: gimli::Encoding) -> Result<Vec<ComputeStep>>
+    where
+        R: Reader<Offset = usize>,
+    {
         let mut steps = Vec::new();
-        let mut pc = 0;
 
-        while pc < expr_bytes.len() {
-            let opcode = expr_bytes[pc];
-            pc += 1;
-
-            match opcode {
-                // DW_OP_breg0..DW_OP_breg31
-                0x70..=0x8f => {
-                    let register = (opcode - 0x70) as u16;
-                    // Read SLEB128 offset
-                    let (offset, bytes_read) = Self::read_sleb128(&expr_bytes[pc..])?;
-                    pc += bytes_read;
-
-                    steps.push(ComputeStep::LoadRegister(register));
+        for op in crate::dwarf_expr::ops::parse_ops(reader, encoding, "CFA expression")? {
+            match op {
+                gimli::Operation::Register { register } => {
+                    steps.push(ComputeStep::LoadRegister(register.0));
+                }
+                gimli::Operation::RegisterOffset {
+                    register, offset, ..
+                } => {
+                    steps.push(ComputeStep::LoadRegister(register.0));
                     if offset != 0 {
                         steps.push(ComputeStep::PushConstant(offset));
                         steps.push(ComputeStep::Add);
                     }
                 }
-                // DW_OP_plus_uconst
-                0x23 => {
-                    let (value, bytes_read) = Self::read_uleb128(&expr_bytes[pc..])?;
-                    pc += bytes_read;
+                gimli::Operation::PlusConstant { value } => {
                     steps.push(ComputeStep::PushConstant(value as i64));
                     steps.push(ComputeStep::Add);
                 }
-                // DW_OP_lit0..DW_OP_lit31
-                0x30..=0x4f => {
-                    let value = (opcode - 0x30) as i64;
+                gimli::Operation::UnsignedConstant { value } => {
+                    steps.push(ComputeStep::PushConstant(value as i64));
+                }
+                gimli::Operation::SignedConstant { value } => {
                     steps.push(ComputeStep::PushConstant(value));
                 }
-                // DW_OP_plus
-                0x22 => steps.push(ComputeStep::Add),
-                // DW_OP_minus
-                0x1c => steps.push(ComputeStep::Sub),
-                // DW_OP_mul
-                0x1e => steps.push(ComputeStep::Mul),
-                // DW_OP_and
-                0x1a => steps.push(ComputeStep::And),
-                // DW_OP_or
-                0x21 => steps.push(ComputeStep::Or),
-                // DW_OP_xor
-                0x27 => steps.push(ComputeStep::Xor),
-                // DW_OP_nop
-                0x96 => {}
-
+                gimli::Operation::Deref { size, space, .. } => {
+                    if space {
+                        return Err(anyhow!("unsupported CFA expression operation: {:?}", op));
+                    }
+                    let size = match size {
+                        1 => MemoryAccessSize::U8,
+                        2 => MemoryAccessSize::U16,
+                        4 => MemoryAccessSize::U32,
+                        8 => MemoryAccessSize::U64,
+                        _ => {
+                            return Err(anyhow!(
+                                "unsupported CFA expression dereference size {} in operation: {:?}",
+                                size,
+                                op
+                            ))
+                        }
+                    };
+                    steps.push(ComputeStep::Dereference { size });
+                }
+                gimli::Operation::Plus => steps.push(ComputeStep::Add),
+                gimli::Operation::Minus => steps.push(ComputeStep::Sub),
+                gimli::Operation::Mul => steps.push(ComputeStep::Mul),
+                gimli::Operation::And => steps.push(ComputeStep::And),
+                gimli::Operation::Or => steps.push(ComputeStep::Or),
+                gimli::Operation::Xor => steps.push(ComputeStep::Xor),
+                gimli::Operation::Nop => {}
                 _ => {
-                    return Err(anyhow!(
-                        "unsupported DWARF opcode 0x{:02x} in CFA expression at byte offset {}",
-                        opcode,
-                        pc - 1
-                    ));
+                    return Err(anyhow!("unsupported CFA expression operation: {:?}", op));
                 }
             }
         }
 
         Ok(steps)
-    }
-
-    /// Read ULEB128 from byte slice
-    fn read_uleb128(data: &[u8]) -> Result<(u64, usize)> {
-        let mut result = 0u64;
-        let mut shift = 0;
-        let mut bytes_read = 0;
-
-        for &byte in data {
-            bytes_read += 1;
-            result |= ((byte & 0x7f) as u64) << shift;
-            if byte & 0x80 == 0 {
-                return Ok((result, bytes_read));
-            }
-            shift += 7;
-        }
-
-        Err(anyhow!("Invalid ULEB128 encoding"))
-    }
-
-    /// Read SLEB128 from byte slice
-    fn read_sleb128(data: &[u8]) -> Result<(i64, usize)> {
-        let mut result = 0i64;
-        let mut shift = 0;
-        let mut bytes_read = 0;
-        let mut byte = 0u8;
-
-        for &b in data {
-            byte = b;
-            bytes_read += 1;
-            result |= ((byte & 0x7f) as i64) << shift;
-            shift += 7;
-            if byte & 0x80 == 0 {
-                break;
-            }
-        }
-
-        // Sign extend
-        if shift < 64 && (byte & 0x40) != 0 {
-            result |= -(1i64 << shift);
-        }
-
-        Ok((result, bytes_read))
     }
 
     /// Check if fast lookup is available
@@ -497,6 +454,8 @@ pub struct CfiStats {
 #[cfg(test)]
 mod tests {
     use super::CfiIndex;
+    use crate::core::{ComputeStep, MemoryAccessSize};
+    use gimli::{EndianSlice, RunTimeEndian};
 
     #[test]
     fn test_cfi_index_creation() {
@@ -504,13 +463,54 @@ mod tests {
         // For now, just ensure the module compiles
     }
 
+    fn test_encoding() -> gimli::Encoding {
+        gimli::Encoding {
+            format: gimli::Format::Dwarf32,
+            version: 4,
+            address_size: 8,
+        }
+    }
+
+    fn parse_test_expr(bytes: &[u8]) -> crate::core::Result<Vec<ComputeStep>> {
+        CfiIndex::parse_dwarf_expression(
+            EndianSlice::new(bytes, RunTimeEndian::Little),
+            test_encoding(),
+        )
+    }
+
+    #[test]
+    fn cfa_expression_parses_unsigned_constant() {
+        let steps = parse_test_expr(&[0x10, 0x2a]).expect("DW_OP_constu should parse");
+        assert_eq!(steps, vec![ComputeStep::PushConstant(42)]);
+    }
+
+    #[test]
+    fn cfa_expression_parses_signed_constant() {
+        let steps = parse_test_expr(&[0x11, 0x7f]).expect("DW_OP_consts should parse");
+        assert_eq!(steps, vec![ComputeStep::PushConstant(-1)]);
+    }
+
+    #[test]
+    fn cfa_expression_parses_dereference() {
+        let steps = parse_test_expr(&[0x70, 0x00, 0x06]).expect("DW_OP_deref should parse");
+        assert_eq!(
+            steps,
+            vec![
+                ComputeStep::LoadRegister(0),
+                ComputeStep::Dereference {
+                    size: MemoryAccessSize::U64,
+                },
+            ]
+        );
+    }
+
     #[test]
     fn cfa_expression_rejects_unknown_opcode_after_valid_prefix() {
-        let error = CfiIndex::parse_dwarf_expression(&[0x70, 0x00, 0xff])
+        let error = parse_test_expr(&[0x70, 0x00, 0xff])
             .expect_err("unknown CFI expression opcode must not be skipped");
 
         assert!(
-            error.to_string().contains("unsupported"),
+            error.to_string().contains("failed to parse"),
             "unexpected error: {error}"
         );
     }

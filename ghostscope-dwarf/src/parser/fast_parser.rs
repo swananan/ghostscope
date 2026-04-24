@@ -899,12 +899,14 @@ impl<'a> DwarfParser<'a> {
     fn extract_absolute_storage_address_from_expr(
         &self,
         unit: &gimli::Unit<DwarfReader>,
-        mut expr: gimli::Expression<DwarfReader>,
+        expr: gimli::Expression<DwarfReader>,
     ) -> Option<u64> {
-        let mut operations = Vec::new();
-        while let Ok(op) = gimli::Operation::parse(&mut expr.0, unit.encoding()) {
-            operations.push(op);
-        }
+        let operations = crate::dwarf_expr::ops::parse_ops(
+            expr.0,
+            unit.encoding(),
+            "absolute storage address expression",
+        )
+        .ok()?;
 
         match operations.as_slice() {
             [gimli::Operation::Address { address }] => Some(*address),
