@@ -347,12 +347,9 @@ impl ExpressionEvaluator {
                 debug!("Found DW_OP_stack_value - this is a computed value");
             }
             match &op {
-                // TODO(entry_value): This is only a minimal fallback.
-                // For inline parameters, a correct DW_OP_entry_value implementation must
-                // walk back to the caller and evaluate the matching call_site_parameter's
-                // DW_AT_call_value / DW_AT_GNU_call_site_value. Merely stripping
-                // entry_value(reg) to a bare register only preserves the simplest cases
-                // where the parameter is still equivalent to the entry register.
+                // Lower supported DW_OP_entry_value forms through caller-side
+                // call-site metadata. This keeps optimized parameters usable
+                // after their entry registers have been clobbered.
                 Operation::EntryValue { expression } => {
                     let mut inner = *expression;
                     let mut inner_ops: Vec<Operation<_>> = Vec::new();
@@ -1297,18 +1294,6 @@ impl ExpressionEvaluator {
         let function_context = function_context.ok_or_else(|| {
             anyhow::anyhow!("DW_OP_entry_value requires function call-site context")
         })?;
-        if function_context.is_inline_context_at(current_pc) {
-            if let Some(parameter) =
-                function_context.entry_value_parameter_for_pc(current_pc, register)
-            {
-                return Self::materialize_caller_value_steps(
-                    &parameter.caller_value_steps,
-                    current_pc,
-                    cfi_index,
-                );
-            }
-        }
-
         Self::build_incoming_entry_value_lookup(
             current_pc,
             register,
@@ -1703,7 +1688,7 @@ mod tests {
     }
 
     #[test]
-    fn entry_value_uses_nearest_call_site_parameter_steps_in_inline_context() {
+    fn entry_value_ignores_outgoing_call_sites_in_inline_context() {
         let mut function = FunctionBlocks {
             cu_offset: gimli::DebugInfoOffset(0),
             die_offset: gimli::UnitOffset(0),
@@ -1758,15 +1743,20 @@ mod tests {
             }],
         );
 
-        let steps = ExpressionEvaluator::resolve_entry_value_register(
+        let error = ExpressionEvaluator::resolve_entry_value_register(
             0x1034,
             5,
             None,
             Some(&function),
             None,
         )
-        .expect("entry_value should resolve to the nearest call site");
-        assert_eq!(steps, vec![ComputeStep::PushConstant(22)]);
+        .expect_err("inline entry_value must not reuse nested outgoing call-site bindings");
+        assert!(
+            error
+                .to_string()
+                .contains("DW_OP_entry_value register recovery needs CFI"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
