@@ -56,7 +56,7 @@ pub enum CodeGenError {
 pub type Result<T> = std::result::Result<T, CodeGenError>;
 
 /// eBPF LLVM code generation context
-pub struct EbpfContext<'ctx> {
+pub struct EbpfContext<'ctx, 'dw> {
     pub context: &'ctx Context,
     pub module: Module<'ctx>,
     pub builder: Builder<'ctx>,
@@ -80,7 +80,7 @@ pub struct EbpfContext<'ctx> {
     pub optimized_out_vars: HashMap<String, bool>,      // Optimized out variables
     pub var_pc_addresses: HashMap<String, u64>,         // Variable -> PC address
     pub variable_context: Option<VariableContext>,      // Scope validation context
-    pub process_analyzer: Option<*mut DwarfAnalyzer>,   // Multi-module DWARF analyzer
+    pub process_analyzer: Option<&'dw mut DwarfAnalyzer>, // Multi-module DWARF analyzer
     pub current_trace_id: Option<u32>,                  // Current trace_id being compiled
     pub current_compile_time_context: Option<CompileTimeContext>, // PC address and module for DWARF queries
 
@@ -122,9 +122,9 @@ pub struct EbpfContext<'ctx> {
 }
 
 // Temporary alias for backward compatibility during refactoring
-pub type NewCodeGen<'ctx> = EbpfContext<'ctx>;
+pub type NewCodeGen<'ctx, 'dw> = EbpfContext<'ctx, 'dw>;
 
-impl<'ctx> EbpfContext<'ctx> {
+impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     /// Create a new eBPF code generation context
     pub fn new(
         context: &'ctx Context,
@@ -287,12 +287,12 @@ impl<'ctx> EbpfContext<'ctx> {
     pub fn new_with_process_analyzer(
         context: &'ctx Context,
         module_name: &str,
-        process_analyzer: Option<&mut DwarfAnalyzer>,
+        process_analyzer: Option<&'dw mut DwarfAnalyzer>,
         trace_id: Option<u32>,
         compile_options: &crate::CompileOptions,
     ) -> Result<Self> {
         let mut codegen = Self::new(context, module_name, trace_id, compile_options)?;
-        codegen.process_analyzer = process_analyzer.map(|pa| pa as *const _ as *mut _);
+        codegen.process_analyzer = process_analyzer;
         Ok(codegen)
     }
 

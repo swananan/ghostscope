@@ -9,7 +9,7 @@ use inkwell::values::BasicValueEnum;
 use inkwell::AddressSpace;
 use tracing::{debug, info};
 
-impl<'ctx> EbpfContext<'ctx> {
+impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     /// Register a DWARF alias variable. The value expression is stored and resolved at use time.
     pub fn set_alias_variable(&mut self, name: &str, expr: crate::script::Expr) {
         self.alias_vars.insert(name.to_string(), expr);

@@ -15,7 +15,7 @@ const fn split_pid_tgid(pid_tgid: u64) -> (u32, u32) {
     ((pid_tgid >> 32) as u32, pid_tgid as u32)
 }
 
-impl<'ctx> EbpfContext<'ctx> {
+impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     /// Reserve `size` bytes in the per-CPU accumulation buffer and return a pointer to the
     /// beginning of the reserved region. On overflow, resets the event offset and returns
     /// from the eBPF program early (mirrors existing control-flow style used elsewhere).

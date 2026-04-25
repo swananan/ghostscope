@@ -154,7 +154,7 @@ fn allocate_dynamic_payload_reservations(max_lens: &[usize], available: usize) -
     reservations
 }
 
-impl<'ctx> EbpfContext<'ctx> {
+impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     const UNKNOWN_CHAR_ARRAY_READ_FALLBACK: usize = 256;
 
     fn build_errno_i32(&self, ret: IntValue<'ctx>, name: &str) -> Result<IntValue<'ctx>> {

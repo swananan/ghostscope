@@ -22,7 +22,7 @@ struct ProbeReadResult<'ctx> {
     not_found: IntValue<'ctx>,
 }
 
-impl<'ctx> EbpfContext<'ctx> {
+impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     fn get_probe_read_scratch_buffer(
         &mut self,
         result_size: usize,
@@ -603,7 +603,7 @@ impl<'ctx> EbpfContext<'ctx> {
             .build_pointer_cast(val_ptr, i64_ptr_ty, "val_u64_ptr")
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         let load_field = |idx: u64,
-                          ctx: &mut EbpfContext<'ctx>,
+                          ctx: &mut EbpfContext<'ctx, 'dw>,
                           base: PointerValue<'ctx>|
          -> Result<IntValue<'ctx>> {
             // GEP in i64 element space

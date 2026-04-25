@@ -727,6 +727,8 @@ impl<'a> AstCompiler<'a> {
 
         // Generate unified eBPF function name using the assigned trace_id
         let ebpf_function_name = self.generate_unified_function_name(target, assigned_trace_id);
+        let compile_options = self.compile_options.clone();
+        let binary_path_hint = self.binary_path_hint.clone();
 
         info!(
             "Generating eBPF code for '{}' (function: {})",
@@ -792,8 +794,14 @@ impl<'a> AstCompiler<'a> {
         let module = codegen_new.get_module();
 
         // Generate eBPF bytecode from LLVM module
-        let ebpf_bytecode =
-            self.generate_ebpf_bytecode(module, &ebpf_function_name, target, assigned_trace_id)?;
+        let ebpf_bytecode = Self::generate_ebpf_bytecode(
+            module,
+            &ebpf_function_name,
+            target,
+            assigned_trace_id,
+            &compile_options,
+            binary_path_hint.as_deref(),
+        )?;
 
         // Use the TraceContext returned from compile_program (no need to get it again)
 
@@ -891,13 +899,37 @@ impl<'a> AstCompiler<'a> {
         format!("gs_{module_hash}_{address_hex}_trace{trace_id}.{extension}")
     }
 
+    fn generate_filename_with_hint(
+        target: &ResolvedTarget,
+        trace_id: u32,
+        extension: &str,
+        binary_path_hint: Option<&str>,
+    ) -> String {
+        let effective_path = if target.binary_path.is_empty() {
+            binary_path_hint.unwrap_or("unknown")
+        } else {
+            target.binary_path.as_str()
+        };
+        let mut hasher = DefaultHasher::new();
+        effective_path.hash(&mut hasher);
+        let module_hash = format!("{:08x}", (hasher.finish() & 0xFFFF_FFFF) as u32);
+        let address_hex = if let Some(addr) = target.function_address {
+            format!("{addr:x}")
+        } else {
+            "unknown".to_string()
+        };
+
+        format!("gs_{module_hash}_{address_hex}_trace{trace_id}.{extension}")
+    }
+
     /// Generate eBPF bytecode from LLVM module
     fn generate_ebpf_bytecode(
-        &mut self,
         module: &inkwell::module::Module,
         function_name: &str,
         target: &ResolvedTarget,
         assigned_trace_id: u32,
+        compile_options: &crate::CompileOptions,
+        binary_path_hint: Option<&str>,
     ) -> Result<Vec<u8>, CompileError> {
         use inkwell::targets::{FileType, Target, TargetTriple};
         use inkwell::OptimizationLevel;
@@ -912,14 +944,17 @@ impl<'a> AstCompiler<'a> {
         );
 
         // Save LLVM IR file if requested
-        if let Some(compile_options) = self.get_compile_options() {
-            if compile_options.save_llvm_ir {
-                let filename = self.generate_filename(target, assigned_trace_id, "ll");
-                if let Err(e) = std::fs::write(&filename, &llvm_ir) {
-                    warn!("Failed to save LLVM IR to {}: {}", filename, e);
-                } else {
-                    info!("Saved LLVM IR to: {}", filename);
-                }
+        if compile_options.save_llvm_ir {
+            let filename = Self::generate_filename_with_hint(
+                target,
+                assigned_trace_id,
+                "ll",
+                binary_path_hint,
+            );
+            if let Err(e) = std::fs::write(&filename, &llvm_ir) {
+                warn!("Failed to save LLVM IR to {}: {}", filename, e);
+            } else {
+                info!("Saved LLVM IR to: {}", filename);
             }
         }
 
@@ -1009,19 +1044,17 @@ impl<'a> AstCompiler<'a> {
         let bytecode = object_code.as_slice().to_vec();
 
         // Save eBPF object file and AST if requested
-        if let Some(compile_options) = self.get_compile_options() {
-            if compile_options.save_ebpf {
-                let filename = self.generate_filename(target, assigned_trace_id, "o");
-                if let Err(e) = std::fs::write(&filename, &bytecode) {
-                    warn!("Failed to save eBPF object to {}: {}", filename, e);
-                } else {
-                    info!("Saved eBPF object to: {}", filename);
-                }
+        if compile_options.save_ebpf {
+            let filename =
+                Self::generate_filename_with_hint(target, assigned_trace_id, "o", binary_path_hint);
+            if let Err(e) = std::fs::write(&filename, &bytecode) {
+                warn!("Failed to save eBPF object to {}: {}", filename, e);
+            } else {
+                info!("Saved eBPF object to: {}", filename);
             }
-
-            // AST has already been saved earlier in generate_ebpf_for_target
         }
 
+        // AST has already been saved earlier in generate_ebpf_for_target
         Ok(bytecode)
     }
 
