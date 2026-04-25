@@ -101,39 +101,6 @@ where
     }
 }
 
-pub(crate) fn lower_call_site_register_fallback(
-    expr: gimli::Expression<DwarfReader>,
-    encoding: gimli::Encoding,
-) -> Result<Option<Vec<ComputeStep>>> {
-    let Some(first) = expr_errors::soft_optional(
-        DwarfExprMode::CallSiteValue,
-        crate::dwarf_expr::ops::parse_single_op(
-            expr.0,
-            encoding,
-            "DW_AT_call_value fallback expression",
-        ),
-    ) else {
-        return Ok(None);
-    };
-    let Operation::EntryValue { expression: inner } = first else {
-        return Ok(None);
-    };
-    let Some(inner_op) = expr_errors::soft_optional(
-        DwarfExprMode::CallSiteValue,
-        crate::dwarf_expr::ops::parse_single_op(
-            inner,
-            encoding,
-            "DW_AT_call_value fallback entry_value inner expression",
-        ),
-    ) else {
-        return Ok(None);
-    };
-    match inner_op {
-        Operation::Register { register } => Ok(Some(vec![ComputeStep::LoadRegister(register.0)])),
-        _ => Ok(None),
-    }
-}
-
 pub(crate) fn resolve_register(
     current_pc: u64,
     register: u16,

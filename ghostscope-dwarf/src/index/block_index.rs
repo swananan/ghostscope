@@ -9,11 +9,10 @@
 use crate::{
     binary::DwarfReader,
     core::ComputeStep,
-    dwarf_expr::{errors as expr_errors, modes::DwarfExprMode, ExpressionEvaluator},
+    dwarf_expr::call_site,
     parser::RangeExtractor,
     semantics::{ranges_contain_pc, resolve_origin_entry},
 };
-use gimli::Reader;
 use std::collections::BTreeMap;
 
 /// Reference to a variable DIE within a unit (minimal info)
@@ -591,30 +590,7 @@ impl<'a> BlockIndexBuilder<'a> {
         unit: &gimli::Unit<DwarfReader>,
         entry: &gimli::DebuggingInformationEntry<DwarfReader>,
     ) -> Option<u64> {
-        self.resolve_address_attr(unit, entry, gimli::constants::DW_AT_call_target)
-            .or_else(|| Self::parse_call_target_expr_address(unit, entry))
-    }
-
-    fn parse_call_target_expr_address(
-        unit: &gimli::Unit<DwarfReader>,
-        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
-    ) -> Option<u64> {
-        let attr = entry.attr(gimli::constants::DW_AT_call_target)?;
-        let gimli::AttributeValue::Exprloc(expr) = attr.value() else {
-            return None;
-        };
-        let first = expr_errors::soft_optional(
-            DwarfExprMode::CallSiteValue,
-            crate::dwarf_expr::ops::parse_single_op(
-                expr.0,
-                unit.encoding(),
-                "DW_AT_call_target expression",
-            ),
-        )?;
-        match first {
-            gimli::Operation::Address { address } => Some(address),
-            _ => None,
-        }
+        call_site::target_address(self.dwarf, unit, entry)
     }
 
     fn parse_call_site_parameter(
@@ -623,75 +599,10 @@ impl<'a> BlockIndexBuilder<'a> {
         entry: &gimli::DebuggingInformationEntry<DwarfReader>,
         return_pc: u64,
     ) -> Option<CallSiteParameter> {
-        let callee_register = Self::parse_call_site_target_register(unit, entry)?;
-        let caller_value_steps = self.parse_call_site_value_steps(unit, entry, return_pc)?;
+        let parsed = call_site::parameter(self.dwarf, unit, entry, return_pc)?;
         Some(CallSiteParameter {
-            callee_register,
-            caller_value_steps,
-        })
-    }
-
-    fn parse_call_site_target_register(
-        unit: &gimli::Unit<DwarfReader>,
-        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
-    ) -> Option<u16> {
-        let attr = entry.attr(gimli::constants::DW_AT_location)?;
-        let gimli::AttributeValue::Exprloc(expr) = attr.value() else {
-            return None;
-        };
-        let first = expr_errors::soft_optional(
-            DwarfExprMode::CallSiteValue,
-            crate::dwarf_expr::ops::parse_single_op(
-                expr.0,
-                unit.encoding(),
-                "DW_AT_location call-site parameter expression",
-            ),
-        )?;
-        match first {
-            gimli::Operation::Register { register } => Some(register.0),
-            _ => None,
-        }
-    }
-
-    fn parse_call_site_value_steps(
-        &self,
-        unit: &gimli::Unit<DwarfReader>,
-        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
-        return_pc: u64,
-    ) -> Option<Vec<ComputeStep>> {
-        let expr = [
-            gimli::constants::DW_AT_call_value,
-            gimli::constants::DW_AT_GNU_call_site_value,
-        ]
-        .into_iter()
-        .find_map(|attr_name| {
-            let attr = entry.attr(attr_name)?;
-            match attr.value() {
-                gimli::AttributeValue::Exprloc(expr) => Some(expr),
-                _ => None,
-            }
-        })?;
-        expr_errors::soft_value(
-            DwarfExprMode::CallSiteValue,
-            ExpressionEvaluator::parse_expression_to_steps_in_unit(
-                expr.0.to_slice().ok().as_deref().unwrap_or(&[]),
-                expr.0.endian(),
-                unit,
-                self.dwarf,
-                return_pc,
-                None,
-                None,
-                None,
-            ),
-        )
-        .or_else(|| {
-            expr_errors::soft_optional(
-                DwarfExprMode::CallSiteValue,
-                crate::dwarf_expr::entry_value::lower_call_site_register_fallback(
-                    expr,
-                    unit.encoding(),
-                ),
-            )
+            callee_register: parsed.callee_register,
+            caller_value_steps: parsed.caller_value_steps,
         })
     }
 
