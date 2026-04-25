@@ -678,34 +678,11 @@ impl<'a> BlockIndexBuilder<'a> {
             None,
         )
         .ok()
-        .or_else(|| Self::lower_entry_value_call_site_register(unit, expr))
-    }
-
-    fn lower_entry_value_call_site_register(
-        unit: &gimli::Unit<DwarfReader>,
-        expr: gimli::Expression<DwarfReader>,
-    ) -> Option<Vec<ComputeStep>> {
-        let first = crate::dwarf_expr::ops::parse_single_op(
-            expr.0,
-            unit.encoding(),
-            "DW_AT_call_value fallback expression",
-        )
-        .ok()??;
-        let gimli::Operation::EntryValue { expression: inner } = first else {
-            return None;
-        };
-        let inner_op = crate::dwarf_expr::ops::parse_single_op(
-            inner,
-            unit.encoding(),
-            "DW_AT_call_value fallback entry_value inner expression",
-        )
-        .ok()??;
-        match inner_op {
-            gimli::Operation::Register { register } => {
-                Some(vec![ComputeStep::LoadRegister(register.0)])
-            }
-            _ => None,
-        }
+        .or_else(|| {
+            crate::dwarf_expr::entry_value::lower_call_site_register_fallback(expr, unit.encoding())
+                .ok()
+                .flatten()
+        })
     }
 
     fn resolve_address_attr(
