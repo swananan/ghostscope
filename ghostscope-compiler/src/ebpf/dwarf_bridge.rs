@@ -12,7 +12,7 @@ use ghostscope_process::module_probe;
 use inkwell::values::{BasicValueEnum, IntValue, PointerValue};
 use tracing::{debug, warn};
 
-impl<'ctx> EbpfContext<'ctx> {
+impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     /// Compute a stable cookie for a module when per-PID offsets are unavailable (via coordinator).
     fn fallback_cookie_from_module_path(&self, module_path: &str) -> u64 {
         module_probe::cookie_for_path(module_path)
@@ -20,8 +20,7 @@ impl<'ctx> EbpfContext<'ctx> {
 
     /// Compute section code for an address within a module (text=0, rodata=1, data=2, bss=3).
     fn section_code_for_address(&mut self, module_path: &str, link_addr: u64) -> u8 {
-        if let Some(analyzer_ptr) = self.process_analyzer {
-            let analyzer = unsafe { &mut *analyzer_ptr };
+        if let Some(analyzer) = self.process_analyzer.as_deref_mut() {
             if let Some(st) = analyzer.classify_section_for_address(module_path, link_addr) {
                 return match st {
                     ghostscope_dwarf::core::SectionType::Text => 0,
@@ -1187,7 +1186,7 @@ impl<'ctx> EbpfContext<'ctx> {
         // DWARF resolvers see the actual DWARF-based expression tree.
         // Guard against self-referential or cyclic aliases.
         fn expand_aliases(
-            ctx: &crate::ebpf::context::EbpfContext<'_>,
+            ctx: &crate::ebpf::context::EbpfContext<'_, '_>,
             e: &crate::script::Expr,
             visited: &mut std::collections::HashSet<String>,
             depth: usize,
@@ -1310,30 +1309,26 @@ impl<'ctx> EbpfContext<'ctx> {
         &mut self,
         var_name: &str,
     ) -> Result<Option<VariableWithEvaluation>> {
-        if self.process_analyzer.is_none() {
-            return Err(CodeGenError::DwarfError(
-                "No DWARF analyzer available".to_string(),
-            ));
-        }
-
         let context = self.get_compile_time_context()?;
         let pc_address = context.pc_address;
-        let module_path = &context.module_path;
+        let module_path = context.module_path.clone();
 
         debug!(
             "Querying DWARF for variable '{}' at PC 0x{:x} in module '{}'",
             var_name, pc_address, module_path
         );
 
-        // Query DWARF analyzer for variable
-        let analyzer = unsafe { &mut *(self.process_analyzer.unwrap()) };
+        let analyzer = self
+            .process_analyzer
+            .as_deref_mut()
+            .ok_or_else(|| CodeGenError::DwarfError("No DWARF analyzer available".to_string()))?;
 
         let module_address = ghostscope_dwarf::ModuleAddress::new(
             std::path::PathBuf::from(module_path.clone()),
             pc_address,
         );
 
-        let module_path_owned = module_path.clone();
+        let module_path_owned = module_path;
         let lookup_globals = |analyzer: &mut ghostscope_dwarf::DwarfAnalyzer| -> Result<
             Option<(std::path::PathBuf, VariableWithEvaluation)>,
         > {
@@ -1649,16 +1644,15 @@ impl<'ctx> EbpfContext<'ctx> {
         }
         // Support simple variable base and fall back to global/static lowering
         if let crate::script::Expr::Variable(base_name) = obj_expr {
-            let Some(analyzer_ptr) = self.process_analyzer else {
-                return Err(CodeGenError::DwarfError(
-                    "No DWARF analyzer available".to_string(),
-                ));
-            };
-            let analyzer = unsafe { &mut *analyzer_ptr };
             let ctx = self.get_compile_time_context()?;
+            let module_path = ctx.module_path.clone();
+            let pc_address = ctx.pc_address;
+            let analyzer = self.process_analyzer.as_deref_mut().ok_or_else(|| {
+                CodeGenError::DwarfError("No DWARF analyzer available".to_string())
+            })?;
             let module_address = ghostscope_dwarf::ModuleAddress::new(
-                std::path::PathBuf::from(ctx.module_path.clone()),
-                ctx.pc_address,
+                std::path::PathBuf::from(module_path.clone()),
+                pc_address,
             );
             // Try current module at PC first
             match analyzer.plan_chain_access(&module_address, base_name, &[field_name.to_string()])
@@ -1673,7 +1667,7 @@ impl<'ctx> EbpfContext<'ctx> {
             // Strict cross-module chain planning via analyzer API
             match analyzer
                 .plan_global_chain_access(
-                    &std::path::PathBuf::from(ctx.module_path.clone()),
+                    &std::path::PathBuf::from(module_path.clone()),
                     base_name,
                     &[field_name.to_string()],
                 )
@@ -1696,7 +1690,7 @@ impl<'ctx> EbpfContext<'ctx> {
                             ghostscope_dwarf::core::GlobalVariableInfo,
                         )> = matches
                             .iter()
-                            .filter(|(p, _)| p.to_string_lossy() == ctx.module_path.as_str())
+                            .filter(|(p, _)| p.to_string_lossy() == module_path.as_str())
                             .cloned()
                             .collect();
                         let chosen = if preferred.len() == 1 {
@@ -1804,16 +1798,15 @@ impl<'ctx> EbpfContext<'ctx> {
             }
             let mut segs: Vec<&str> = Vec::new();
             if flatten_chain(array_expr, &mut segs) && !segs.is_empty() {
-                let Some(analyzer_ptr) = self.process_analyzer else {
-                    return Err(CodeGenError::DwarfError(
-                        "No DWARF analyzer available".to_string(),
-                    ));
-                };
-                let analyzer = unsafe { &mut *analyzer_ptr };
                 let ctx = self.get_compile_time_context()?;
+                let module_path = ctx.module_path.clone();
+                let pc_address = ctx.pc_address;
+                let analyzer = self.process_analyzer.as_deref_mut().ok_or_else(|| {
+                    CodeGenError::DwarfError("No DWARF analyzer available".to_string())
+                })?;
                 let module_address = ghostscope_dwarf::ModuleAddress::new(
-                    std::path::PathBuf::from(ctx.module_path.clone()),
-                    ctx.pc_address,
+                    std::path::PathBuf::from(module_path),
+                    pc_address,
                 );
                 let base = segs[0].to_string();
                 let rest: Vec<String> = segs[1..].iter().map(|s| s.to_string()).collect();
@@ -1929,17 +1922,17 @@ impl<'ctx> EbpfContext<'ctx> {
             return self.query_dwarf_for_variable(&chain[0]);
         }
         // Planner path only; do not fallback. If planning fails, surface an error.
-        let Some(analyzer_ptr) = self.process_analyzer else {
-            return Err(CodeGenError::DwarfError(
-                "No DWARF analyzer available".to_string(),
-            ));
-        };
-        let analyzer = unsafe { &mut *analyzer_ptr };
         let ctx = self.get_compile_time_context()?;
+        let module_path = ctx.module_path.clone();
+        let pc_address = ctx.pc_address;
+        let analyzer = self
+            .process_analyzer
+            .as_deref_mut()
+            .ok_or_else(|| CodeGenError::DwarfError("No DWARF analyzer available".to_string()))?;
         // First attempt: current module at current PC (locals/params)
         let module_address = ghostscope_dwarf::ModuleAddress::new(
-            std::path::PathBuf::from(ctx.module_path.clone()),
-            ctx.pc_address,
+            std::path::PathBuf::from(module_path.clone()),
+            pc_address,
         );
         match analyzer.plan_chain_access(&module_address, &chain[0], &chain[1..]) {
             Ok(Some(var)) => return Ok(Some(var)),
@@ -1953,11 +1946,7 @@ impl<'ctx> EbpfContext<'ctx> {
         let base = &chain[0];
         let rest = &chain[1..];
         match analyzer
-            .plan_global_chain_access(
-                &std::path::PathBuf::from(ctx.module_path.clone()),
-                base,
-                rest,
-            )
+            .plan_global_chain_access(&std::path::PathBuf::from(module_path.clone()), base, rest)
             .map_err(|e| CodeGenError::DwarfError(e.to_string()))?
         {
             Some((mpath, v)) => {
@@ -1975,7 +1964,7 @@ impl<'ctx> EbpfContext<'ctx> {
                             ghostscope_dwarf::core::GlobalVariableInfo,
                         )> = matches
                             .iter()
-                            .filter(|(p, _)| p.to_string_lossy() == ctx.module_path.as_str())
+                            .filter(|(p, _)| p.to_string_lossy() == module_path.as_str())
                             .cloned()
                             .collect();
                         let chosen = if preferred.len() == 1 {
@@ -2104,9 +2093,9 @@ impl<'ctx> EbpfContext<'ctx> {
                     }
                 }
             }
-            if let Some(analyzer_ptr) = self.process_analyzer {
-                let analyzer = unsafe { &mut *analyzer_ptr };
-                let ctx = self.get_compile_time_context()?;
+            let ctx = self.get_compile_time_context()?;
+            let module_path = ctx.module_path.clone();
+            if let Some(analyzer) = self.process_analyzer.as_deref_mut() {
                 let mut alias_used: Option<String> = None;
                 for n in candidate_names {
                     // Prefer cross-module definitions first to avoid forward decls with size=0 in current CU
@@ -2118,8 +2107,8 @@ impl<'ctx> EbpfContext<'ctx> {
                         }
                     }
                     if upgraded.is_none() {
-                        if let Some(ti) = analyzer
-                            .resolve_struct_type_shallow_by_name_in_module(&ctx.module_path, &n)
+                        if let Some(ti) =
+                            analyzer.resolve_struct_type_shallow_by_name_in_module(&module_path, &n)
                         {
                             if ti.size() > 0 {
                                 upgraded = Some(ti);
@@ -2135,8 +2124,8 @@ impl<'ctx> EbpfContext<'ctx> {
                         }
                     }
                     if upgraded.is_none() {
-                        if let Some(ti) = analyzer
-                            .resolve_union_type_shallow_by_name_in_module(&ctx.module_path, &n)
+                        if let Some(ti) =
+                            analyzer.resolve_union_type_shallow_by_name_in_module(&module_path, &n)
                         {
                             if ti.size() > 0 {
                                 upgraded = Some(ti);
@@ -2152,8 +2141,8 @@ impl<'ctx> EbpfContext<'ctx> {
                         }
                     }
                     if upgraded.is_none() {
-                        if let Some(ti) = analyzer
-                            .resolve_enum_type_shallow_by_name_in_module(&ctx.module_path, &n)
+                        if let Some(ti) =
+                            analyzer.resolve_enum_type_shallow_by_name_in_module(&module_path, &n)
                         {
                             if ti.size() > 0 {
                                 upgraded = Some(ti);

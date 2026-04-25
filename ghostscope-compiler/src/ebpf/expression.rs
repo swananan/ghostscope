@@ -12,7 +12,7 @@ use tracing::debug;
 
 // compare cap is provided via compile_options.compare_cap (config: ebpf.compare_cap)
 
-impl<'ctx> EbpfContext<'ctx> {
+impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     pub(crate) fn get_host_pid_tid_values(&mut self) -> Result<(IntValue<'ctx>, IntValue<'ctx>)> {
         let i32_type = self.context.i32_type();
         let i64_type = self.context.i64_type();
@@ -1361,8 +1361,8 @@ impl<'ctx> EbpfContext<'ctx> {
                         }
                     };
                     // Accept string on either side: string literal or script string variable
-                    fn extract_script_string<'a>(
-                        this: &mut EbpfContext<'a>,
+                    fn extract_script_string(
+                        this: &mut EbpfContext<'_, '_>,
                         e: &Expr,
                     ) -> Option<String> {
                         match e {
@@ -1404,8 +1404,8 @@ impl<'ctx> EbpfContext<'ctx> {
                         ));
                     }
                     // Accept string on either side (literal or script string var)
-                    fn extract_script_string<'a>(
-                        this: &mut EbpfContext<'a>,
+                    fn extract_script_string(
+                        this: &mut EbpfContext<'_, '_>,
                         e: &Expr,
                     ) -> Option<String> {
                         match e {
@@ -2222,7 +2222,7 @@ impl<'ctx> EbpfContext<'ctx> {
     }
 }
 
-impl<'ctx> EbpfContext<'ctx> {
+impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     /// Compile comparison between a DWARF-side expression and a script string literal.
     /// Supports char* and char[N] according to design in string_comparison.md.
     fn compile_string_comparison(
