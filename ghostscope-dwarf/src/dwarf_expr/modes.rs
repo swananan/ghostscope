@@ -13,6 +13,8 @@ pub(crate) enum DwarfExprMode {
     Cfa,
     /// Constant-only expressions used for member offsets.
     ConstOffset,
+    /// Optional global/static storage-address discovery while indexing.
+    StorageAddress,
 }
 
 /// How parse/lowering errors should be surfaced for a mode.
@@ -30,7 +32,7 @@ impl DwarfExprMode {
     pub(crate) const fn error_policy(self) -> ErrorPolicy {
         match self {
             Self::Location | Self::Cfa | Self::ConstOffset => ErrorPolicy::Hard,
-            Self::CallSiteValue => ErrorPolicy::SoftWithFallback,
+            Self::CallSiteValue | Self::StorageAddress => ErrorPolicy::SoftWithFallback,
             Self::ScanOnly => ErrorPolicy::SilentFalse,
         }
     }
@@ -42,6 +44,7 @@ impl DwarfExprMode {
             Self::ScanOnly => "scan-only",
             Self::Cfa => "CFA",
             Self::ConstOffset => "const offset",
+            Self::StorageAddress => "storage address",
         }
     }
 }
@@ -57,6 +60,10 @@ mod tests {
         assert_eq!(DwarfExprMode::ConstOffset.error_policy(), ErrorPolicy::Hard);
         assert_eq!(
             DwarfExprMode::CallSiteValue.error_policy(),
+            ErrorPolicy::SoftWithFallback
+        );
+        assert_eq!(
+            DwarfExprMode::StorageAddress.error_policy(),
             ErrorPolicy::SoftWithFallback
         );
         assert_eq!(
