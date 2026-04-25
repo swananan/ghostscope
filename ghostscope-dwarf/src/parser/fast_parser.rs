@@ -3,6 +3,7 @@
 use crate::{
     binary::DwarfReader,
     core::{FunctionDieKind, IndexEntry, Result},
+    dwarf_expr::{errors as expr_errors, modes::DwarfExprMode},
     index::{
         directory_from_index, resolve_file_path, LightweightFileIndex, LightweightIndex,
         LightweightIndexShard, LineMappingTable, ScopedFileIndexManager,
@@ -901,12 +902,15 @@ impl<'a> DwarfParser<'a> {
         unit: &gimli::Unit<DwarfReader>,
         expr: gimli::Expression<DwarfReader>,
     ) -> Option<u64> {
-        let operations = crate::dwarf_expr::ops::parse_ops(
-            expr.0,
-            unit.encoding(),
-            "absolute storage address expression",
-        )
-        .ok()?;
+        let operations = expr_errors::downgrade_to_none(
+            DwarfExprMode::Location,
+            crate::dwarf_expr::ops::parse_ops(
+                expr.0,
+                unit.encoding(),
+                "absolute storage address expression",
+            ),
+            "absolute storage address fast path",
+        )?;
 
         match operations.as_slice() {
             [gimli::Operation::Address { address }] => Some(*address),

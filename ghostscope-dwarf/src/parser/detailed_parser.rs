@@ -8,6 +8,7 @@
 use crate::{
     binary::DwarfReader,
     core::{attr_u64, EvaluationResult, Result},
+    dwarf_expr::{errors as expr_errors, modes::DwarfExprMode},
     index::{CfiIndex, FunctionBlocks},
     parser::ExpressionEvaluator,
     semantics::{resolve_name_with_origins, resolve_type_ref_in_same_unit_with_origins},
@@ -312,14 +313,14 @@ impl DetailedParser {
                                     if let Some(ml) = ce.attr(gimli::DW_AT_data_member_location) {
                                         match ml.value() {
                                             gimli::AttributeValue::Exprloc(expr) => {
-                                                if let Some(v) =
+                                                if let Some(v) = expr_errors::downgrade_optional_to_none(
+                                                    DwarfExprMode::ConstOffset,
                                                     crate::dwarf_expr::const_eval::eval_const_offset(
                                                         &expr,
                                                         unit.encoding(),
-                                                    )
-                                                    .ok()
-                                                    .flatten()
-                                                {
+                                                    ),
+                                                    "shallow member type display",
+                                                ) {
                                                     m_offset = v;
                                                 }
                                             }

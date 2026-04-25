@@ -6,6 +6,7 @@
 use crate::{
     binary::{dwarf_endian_from_object, DwarfReader, MappedFile},
     core::{CallerFrameRecovery, CfaResult, ComputeStep, MemoryAccessSize, Result},
+    dwarf_expr::{errors as expr_errors, modes::DwarfExprMode},
 };
 use anyhow::{anyhow, Context};
 use gimli::{
@@ -371,7 +372,10 @@ impl CfiIndex {
     {
         let mut steps = Vec::new();
 
-        for op in crate::dwarf_expr::ops::parse_ops(reader, encoding, "CFA expression")? {
+        for op in expr_errors::hard(
+            DwarfExprMode::Cfa,
+            crate::dwarf_expr::ops::parse_ops(reader, encoding, "CFA expression"),
+        )? {
             match op {
                 gimli::Operation::Register { register } => {
                     steps.push(ComputeStep::LoadRegister(register.0));

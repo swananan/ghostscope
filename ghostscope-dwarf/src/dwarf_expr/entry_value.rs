@@ -3,6 +3,7 @@
 use crate::{
     binary::DwarfReader,
     core::{ComputeStep, EntryValueCase, Result},
+    dwarf_expr::{errors as expr_errors, modes::DwarfExprMode},
     index::{BlockIndexBuilder, CfiIndex, FunctionBlocks},
 };
 use gimli::{Operation, Reader};
@@ -35,10 +36,13 @@ pub(crate) fn lower_location_entry_value<R>(
 where
     R: Reader<Offset = usize>,
 {
-    let inner_ops = crate::dwarf_expr::ops::parse_ops(
-        expression,
-        encoding,
-        "DW_OP_entry_value inner expression",
+    let inner_ops = expr_errors::hard(
+        DwarfExprMode::Location,
+        crate::dwarf_expr::ops::parse_ops(
+            expression,
+            encoding,
+            "DW_OP_entry_value inner expression",
+        ),
     )?;
     if inner_ops.len() != 1 {
         debug!("Unsupported EntryValue with {} inner ops", inner_ops.len());
@@ -101,23 +105,27 @@ pub(crate) fn lower_call_site_register_fallback(
     expr: gimli::Expression<DwarfReader>,
     encoding: gimli::Encoding,
 ) -> Result<Option<Vec<ComputeStep>>> {
-    let Some(first) = crate::dwarf_expr::ops::parse_single_op(
-        expr.0,
-        encoding,
-        "DW_AT_call_value fallback expression",
-    )?
-    else {
+    let Some(first) = expr_errors::soft_optional(
+        DwarfExprMode::CallSiteValue,
+        crate::dwarf_expr::ops::parse_single_op(
+            expr.0,
+            encoding,
+            "DW_AT_call_value fallback expression",
+        ),
+    ) else {
         return Ok(None);
     };
     let Operation::EntryValue { expression: inner } = first else {
         return Ok(None);
     };
-    let Some(inner_op) = crate::dwarf_expr::ops::parse_single_op(
-        inner,
-        encoding,
-        "DW_AT_call_value fallback entry_value inner expression",
-    )?
-    else {
+    let Some(inner_op) = expr_errors::soft_optional(
+        DwarfExprMode::CallSiteValue,
+        crate::dwarf_expr::ops::parse_single_op(
+            inner,
+            encoding,
+            "DW_AT_call_value fallback entry_value inner expression",
+        ),
+    ) else {
         return Ok(None);
     };
     match inner_op {
