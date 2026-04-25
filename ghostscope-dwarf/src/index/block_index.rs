@@ -9,7 +9,7 @@
 use crate::{
     binary::DwarfReader,
     core::ComputeStep,
-    dwarf_expr::ExpressionEvaluator,
+    dwarf_expr::{errors as expr_errors, modes::DwarfExprMode, ExpressionEvaluator},
     parser::RangeExtractor,
     semantics::{ranges_contain_pc, resolve_origin_entry},
 };
@@ -603,12 +603,14 @@ impl<'a> BlockIndexBuilder<'a> {
         let gimli::AttributeValue::Exprloc(expr) = attr.value() else {
             return None;
         };
-        let first = crate::dwarf_expr::ops::parse_single_op(
-            expr.0,
-            unit.encoding(),
-            "DW_AT_call_target expression",
-        )
-        .ok()??;
+        let first = expr_errors::soft_optional(
+            DwarfExprMode::CallSiteValue,
+            crate::dwarf_expr::ops::parse_single_op(
+                expr.0,
+                unit.encoding(),
+                "DW_AT_call_target expression",
+            ),
+        )?;
         match first {
             gimli::Operation::Address { address } => Some(address),
             _ => None,
@@ -637,12 +639,14 @@ impl<'a> BlockIndexBuilder<'a> {
         let gimli::AttributeValue::Exprloc(expr) = attr.value() else {
             return None;
         };
-        let first = crate::dwarf_expr::ops::parse_single_op(
-            expr.0,
-            unit.encoding(),
-            "DW_AT_location call-site parameter expression",
-        )
-        .ok()??;
+        let first = expr_errors::soft_optional(
+            DwarfExprMode::CallSiteValue,
+            crate::dwarf_expr::ops::parse_single_op(
+                expr.0,
+                unit.encoding(),
+                "DW_AT_location call-site parameter expression",
+            ),
+        )?;
         match first {
             gimli::Operation::Register { register } => Some(register.0),
             _ => None,
@@ -667,21 +671,27 @@ impl<'a> BlockIndexBuilder<'a> {
                 _ => None,
             }
         })?;
-        ExpressionEvaluator::parse_expression_to_steps_in_unit(
-            expr.0.to_slice().ok().as_deref().unwrap_or(&[]),
-            expr.0.endian(),
-            unit,
-            self.dwarf,
-            return_pc,
-            None,
-            None,
-            None,
+        expr_errors::soft_value(
+            DwarfExprMode::CallSiteValue,
+            ExpressionEvaluator::parse_expression_to_steps_in_unit(
+                expr.0.to_slice().ok().as_deref().unwrap_or(&[]),
+                expr.0.endian(),
+                unit,
+                self.dwarf,
+                return_pc,
+                None,
+                None,
+                None,
+            ),
         )
-        .ok()
         .or_else(|| {
-            crate::dwarf_expr::entry_value::lower_call_site_register_fallback(expr, unit.encoding())
-                .ok()
-                .flatten()
+            expr_errors::soft_optional(
+                DwarfExprMode::CallSiteValue,
+                crate::dwarf_expr::entry_value::lower_call_site_register_fallback(
+                    expr,
+                    unit.encoding(),
+                ),
+            )
         })
     }
 

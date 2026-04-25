@@ -6,6 +6,7 @@ use crate::semantics::{resolve_type_ref_with_origins, strip_typedef_qualified};
 use crate::{
     binary::DwarfReader,
     core::{attr_u64, EvaluationResult, Result},
+    dwarf_expr::{errors as expr_errors, modes::DwarfExprMode},
 };
 use gimli::Reader;
 
@@ -178,11 +179,13 @@ impl<'dwarf> AccessPlanner<'dwarf> {
                                             {
                                                 match a.value() {
                                                     gimli::AttributeValue::Exprloc(expr) => {
-                                                        off =
+                                                        off = expr_errors::hard(
+                                                            DwarfExprMode::ConstOffset,
                                                             crate::dwarf_expr::const_eval::eval_const_offset(
                                                                 &expr,
                                                                 unit_now2.encoding(),
-                                                            )?;
+                                                            ),
+                                                        )?;
                                                     }
                                                     value => off = attr_u64(value),
                                                 }

@@ -2,6 +2,7 @@ use super::LoadedObjfile;
 use crate::{
     binary::DwarfReader,
     core::{demangled_name, normalize_demangled_signature, symbol_name_matches_query, Result},
+    dwarf_expr::{errors as expr_errors, modes::DwarfExprMode},
     index::LightweightIndex,
     parser::RangeExtractor,
     semantics::{range_contains_pc, resolve_attr_with_unit_origins, resolve_origin_entry},
@@ -600,7 +601,10 @@ impl LoadedObjfile {
         unit: &gimli::Unit<DwarfReader>,
         expression: gimli::Expression<DwarfReader>,
     ) -> bool {
-        crate::dwarf_expr::scan::contains_entry_value(expression, unit.encoding()).unwrap_or(false)
+        expr_errors::silent_false(
+            DwarfExprMode::ScanOnly,
+            crate::dwarf_expr::scan::contains_entry_value(expression, unit.encoding()),
+        )
     }
 
     pub(crate) fn lookup_function_addresses_any(&self, name: &str) -> Vec<u64> {

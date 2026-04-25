@@ -6,6 +6,7 @@ use crate::binary::{DwarfEndian, DwarfReader};
 use crate::core::{
     ComputeStep, DirectValueResult, EvaluationResult, LocationResult, MemoryAccessSize, Result,
 };
+use crate::dwarf_expr::{errors as expr_errors, modes::DwarfExprMode};
 use crate::index::{CfiIndex, FunctionBlocks};
 use crate::semantics::{range_contains_pc, resolve_attr_with_unit_origins};
 use gimli::{read::RawLocListEntry, EndianSlice, Operation, Reader};
@@ -338,10 +339,13 @@ impl ExpressionEvaluator {
         let mut has_stack_value = false;
 
         // Parse all operations in the expression
-        for op in crate::dwarf_expr::ops::parse_ops(
-            EndianSlice::new(expr_bytes, endian),
-            encoding,
-            "DWARF expression",
+        for op in expr_errors::hard(
+            DwarfExprMode::Location,
+            crate::dwarf_expr::ops::parse_ops(
+                EndianSlice::new(expr_bytes, endian),
+                encoding,
+                "DWARF expression",
+            ),
         )? {
             if matches!(op, Operation::StackValue) {
                 has_stack_value = true;
