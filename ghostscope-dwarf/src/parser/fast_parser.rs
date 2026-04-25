@@ -3,7 +3,6 @@
 use crate::{
     binary::DwarfReader,
     core::{FunctionDieKind, IndexEntry, Result},
-    dwarf_expr::{errors as expr_errors, modes::DwarfExprMode},
     index::{
         directory_from_index, resolve_file_path, LightweightFileIndex, LightweightIndex,
         LightweightIndexShard, LineMappingTable, ScopedFileIndexManager,
@@ -902,29 +901,7 @@ impl<'a> DwarfParser<'a> {
         unit: &gimli::Unit<DwarfReader>,
         expr: gimli::Expression<DwarfReader>,
     ) -> Option<u64> {
-        let operations = expr_errors::downgrade_to_none(
-            DwarfExprMode::Location,
-            crate::dwarf_expr::ops::parse_ops(
-                expr.0,
-                unit.encoding(),
-                "absolute storage address expression",
-            ),
-            "absolute storage address fast path",
-        )?;
-
-        match operations.as_slice() {
-            [gimli::Operation::Address { address }] => Some(*address),
-            // clang/LLVM commonly encodes function-scoped statics in DWARF5 as a
-            // single `DW_OP_addrx` op. This is still a true storage location, just
-            // indirected through `.debug_addr`.
-            [gimli::Operation::AddressIndex { index }] => self.dwarf.address(unit, *index).ok(),
-            [gimli::Operation::UnsignedConstant { value }] => Some(*value),
-            // Anything more complex may be a computed value or a composite
-            // location. In particular, `DW_OP_stack_value` means the expression
-            // yields a value, not a storage address, so treating it as global
-            // storage would misindex optimized locals.
-            _ => None,
-        }
+        crate::dwarf_expr::storage::absolute_address(self.dwarf, unit, expr)
     }
 
     // Additional helper methods for GDB-style cooked index
