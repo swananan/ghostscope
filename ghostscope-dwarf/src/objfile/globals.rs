@@ -5,7 +5,7 @@ use std::collections::HashSet;
 
 impl LoadedObjfile {
     pub(crate) fn compute_global_member_static_offset(
-        &mut self,
+        &self,
         cu_off: gimli::DebugInfoOffset,
         var_die: gimli::UnitOffset,
         link_address: u64,

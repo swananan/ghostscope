@@ -1061,7 +1061,7 @@ async fn run_source_line_benchmark(
     let (file_path, line_number) = parse_source_line(source)?;
 
     let load_start = Instant::now();
-    let (mut analyzer, load_breakdown) = load_analyzer_with_breakdown(pid, target_path).await?;
+    let (analyzer, load_breakdown) = load_analyzer_with_breakdown(pid, target_path).await?;
     let loading_time = load_start.elapsed();
 
     let mut query_times = Vec::with_capacity(runs);

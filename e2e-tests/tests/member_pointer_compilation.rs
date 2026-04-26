@@ -9,7 +9,7 @@ async fn compile_member_pointer_script(
     opt_level: OptimizationLevel,
 ) -> anyhow::Result<ghostscope_compiler::CompilationResult> {
     let binary_path = FIXTURES.get_test_binary_with_opt("member_pointer_program", opt_level)?;
-    let mut analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path)
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path)
         .await
         .map_err(|e| anyhow::anyhow!("failed to load DWARF for member_pointer_program: {e}"))?;
     let compile_options = ghostscope_compiler::CompileOptions {
@@ -17,7 +17,7 @@ async fn compile_member_pointer_script(
         ..Default::default()
     };
 
-    ghostscope_compiler::compile_script(script, &mut analyzer, None, Some(1), &compile_options)
+    ghostscope_compiler::compile_script(script, &analyzer, None, Some(1), &compile_options)
         .map_err(|e| anyhow::anyhow!("compile_script failed: {e}"))
 }
 
@@ -27,7 +27,7 @@ async fn test_member_pointer_planner_resolves_o2_chain_accesses() -> anyhow::Res
 
     let binary_path =
         FIXTURES.get_test_binary_with_opt("member_pointer_program", OptimizationLevel::O2)?;
-    let mut analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path)
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path)
         .await
         .map_err(|e| anyhow::anyhow!("failed to load DWARF for member_pointer_program: {e}"))?;
     let addrs = analyzer.lookup_addresses_by_source_line("member_pointer_program.c", TRACE_LINE);
@@ -201,7 +201,7 @@ async fn test_complex_bitfield_chain_planner_resolves_member_offsets() -> anyhow
 
     let binary_path =
         FIXTURES.get_test_binary_with_opt("complex_types_program", OptimizationLevel::Debug)?;
-    let mut analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path)
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path)
         .await
         .map_err(|e| anyhow::anyhow!("failed to load DWARF for complex_types_program: {e}"))?;
     let addrs = analyzer.lookup_addresses_by_source_line("complex_types_program.c", 15);

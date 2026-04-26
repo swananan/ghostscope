@@ -276,7 +276,7 @@ async fn assert_partitioned_ranges_source_line_query_recovers_function_scope(
     binary_path: PathBuf,
     scenario: &str,
 ) -> anyhow::Result<()> {
-    let mut analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
     let query_results = analyzer
         .query_source_line_best_effort("partitioned_ranges_program.c", 18)
         .map_err(|e| anyhow::anyhow!("Failed source-line query for {scenario}: {e}"))?;
@@ -614,7 +614,7 @@ async fn test_inline_callsite_clang_dwarf5_resolves_debug_addr_entry_pc() -> any
     );
     let target = spawn_inline_callsite_program(binary_path).await?;
     let query_result: anyhow::Result<()> = async {
-        let mut pid_analyzer = ghostscope_dwarf::DwarfAnalyzer::from_pid(target.host_pid()).await?;
+        let pid_analyzer = ghostscope_dwarf::DwarfAnalyzer::from_pid(target.host_pid()).await?;
         let query_results =
             pid_analyzer.query_source_line_best_effort("inline_callsite_program.c", INLINE_TRACE_LINE)?;
         anyhow::ensure!(

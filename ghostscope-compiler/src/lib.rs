@@ -123,7 +123,7 @@ impl Default for CompileOptions {
 /// to perform compilation across main executable and dynamic libraries
 pub fn compile_script(
     script_source: &str,
-    process_analyzer: &mut ghostscope_dwarf::DwarfAnalyzer,
+    process_analyzer: &ghostscope_dwarf::DwarfAnalyzer,
     pid: Option<u32>,
     trace_id: Option<u32>,
     compile_options: &CompileOptions,

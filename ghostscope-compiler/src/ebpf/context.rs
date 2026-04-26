@@ -80,7 +80,7 @@ pub struct EbpfContext<'ctx, 'dw> {
     pub optimized_out_vars: HashMap<String, bool>,      // Optimized out variables
     pub var_pc_addresses: HashMap<String, u64>,         // Variable -> PC address
     pub variable_context: Option<VariableContext>,      // Scope validation context
-    pub process_analyzer: Option<&'dw mut DwarfAnalyzer>, // Multi-module DWARF analyzer
+    pub(super) process_analyzer: Option<&'dw DwarfAnalyzer>, // Multi-module DWARF analyzer
     pub current_trace_id: Option<u32>,                  // Current trace_id being compiled
     pub current_compile_time_context: Option<CompileTimeContext>, // PC address and module for DWARF queries
 
@@ -287,7 +287,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     pub fn new_with_process_analyzer(
         context: &'ctx Context,
         module_name: &str,
-        process_analyzer: Option<&'dw mut DwarfAnalyzer>,
+        process_analyzer: Option<&'dw DwarfAnalyzer>,
         trace_id: Option<u32>,
         compile_options: &crate::CompileOptions,
     ) -> Result<Self> {
