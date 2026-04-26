@@ -20,7 +20,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
     /// Compute section code for an address within a module (text=0, rodata=1, data=2, bss=3).
     fn section_code_for_address(&mut self, module_path: &str, link_addr: u64) -> u8 {
-        if let Some(analyzer) = self.process_analyzer.as_deref_mut() {
+        if let Some(analyzer) = self.process_analyzer {
             if let Some(st) = analyzer.classify_section_for_address(module_path, link_addr) {
                 return match st {
                     ghostscope_dwarf::core::SectionType::Text => 0,
@@ -1320,7 +1320,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         let analyzer = self
             .process_analyzer
-            .as_deref_mut()
             .ok_or_else(|| CodeGenError::DwarfError("No DWARF analyzer available".to_string()))?;
 
         let module_address = ghostscope_dwarf::ModuleAddress::new(
@@ -1329,7 +1328,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         );
 
         let module_path_owned = module_path;
-        let lookup_globals = |analyzer: &mut ghostscope_dwarf::DwarfAnalyzer| -> Result<
+        let lookup_globals = |analyzer: &ghostscope_dwarf::DwarfAnalyzer| -> Result<
             Option<(std::path::PathBuf, VariableWithEvaluation)>,
         > {
             debug!(
@@ -1647,7 +1646,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             let ctx = self.get_compile_time_context()?;
             let module_path = ctx.module_path.clone();
             let pc_address = ctx.pc_address;
-            let analyzer = self.process_analyzer.as_deref_mut().ok_or_else(|| {
+            let analyzer = self.process_analyzer.ok_or_else(|| {
                 CodeGenError::DwarfError("No DWARF analyzer available".to_string())
             })?;
             let module_address = ghostscope_dwarf::ModuleAddress::new(
@@ -1801,7 +1800,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 let ctx = self.get_compile_time_context()?;
                 let module_path = ctx.module_path.clone();
                 let pc_address = ctx.pc_address;
-                let analyzer = self.process_analyzer.as_deref_mut().ok_or_else(|| {
+                let analyzer = self.process_analyzer.ok_or_else(|| {
                     CodeGenError::DwarfError("No DWARF analyzer available".to_string())
                 })?;
                 let module_address = ghostscope_dwarf::ModuleAddress::new(
@@ -1927,7 +1926,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let pc_address = ctx.pc_address;
         let analyzer = self
             .process_analyzer
-            .as_deref_mut()
             .ok_or_else(|| CodeGenError::DwarfError("No DWARF analyzer available".to_string()))?;
         // First attempt: current module at current PC (locals/params)
         let module_address = ghostscope_dwarf::ModuleAddress::new(
@@ -2095,7 +2093,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             }
             let ctx = self.get_compile_time_context()?;
             let module_path = ctx.module_path.clone();
-            if let Some(analyzer) = self.process_analyzer.as_deref_mut() {
+            if let Some(analyzer) = self.process_analyzer {
                 let mut alias_used: Option<String> = None;
                 for n in candidate_names {
                     // Prefer cross-module definitions first to avoid forward decls with size=0 in current CU

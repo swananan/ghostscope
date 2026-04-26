@@ -420,7 +420,7 @@ async fn test_capture_len_uses_scalar_script_var_from_dwarf_expr() -> anyhow::Re
     init();
 
     let binary_path = FIXTURES.get_test_binary("sample_program")?;
-    let mut analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path)
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path)
         .await
         .map_err(|e| anyhow::anyhow!("failed to load DWARF for sample_program: {e}"))?;
     let script_content = r#"
@@ -436,7 +436,7 @@ trace sample_lib.c:45 {
     };
     let result = ghostscope_compiler::compile_script(
         script_content,
-        &mut analyzer,
+        &analyzer,
         None,
         Some(1),
         &compile_options,

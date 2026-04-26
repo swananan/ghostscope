@@ -27,25 +27,55 @@ impl LoadedObjfile {
             .copied()
     }
 
-    pub(crate) fn is_inline_at(&mut self, address: u64) -> Option<bool> {
-        if self.block_index.find_function_by_pc(address).is_none() {
-            let builder = BlockIndexBuilder::new(self.dwarf());
-            if let Some(func_entry) = self.find_function_index_entry_by_address(address) {
-                if let Some(fb) =
-                    builder.build_for_function(func_entry.unit_offset, func_entry.die_offset)
-                {
-                    self.block_index.add_functions(vec![fb]);
-                }
-            } else if let Some(cu_off) = self.lightweight_index.find_cu_by_address(address) {
-                if let Some(funcs) = builder.build_for_unit(cu_off) {
-                    self.block_index.add_functions(funcs);
-                }
-            }
+    fn ensure_block_index_for_address(&self, address: u64) {
+        if self
+            .block_index
+            .read()
+            .expect("block index lock poisoned")
+            .find_function_by_pc(address)
+            .is_some()
+        {
+            return;
         }
 
-        let func = self.block_index.find_function_by_pc(address)?;
+        let builder = BlockIndexBuilder::new(self.dwarf());
+        if let Some(func_entry) = self.find_function_index_entry_by_address(address) {
+            if let Some(fb) =
+                builder.build_for_function(func_entry.unit_offset, func_entry.die_offset)
+            {
+                self.add_block_index_functions_if_missing(address, vec![fb]);
+            }
+        } else if let Some(cu_off) = self.lightweight_index.find_cu_by_address(address) {
+            if let Some(funcs) = builder.build_for_unit(cu_off) {
+                self.add_block_index_functions_if_missing(address, funcs);
+            }
+        }
+    }
 
-        if let Some(inline_idx) = Self::find_innermost_inline_node(func, address) {
+    fn add_block_index_functions_if_missing(
+        &self,
+        address: u64,
+        funcs: Vec<FunctionBlocks>,
+    ) -> bool {
+        let mut block_index = self.block_index.write().expect("block index lock poisoned");
+        if block_index.find_function_by_pc(address).is_some() {
+            return false;
+        }
+        block_index.add_functions(funcs);
+        true
+    }
+
+    pub(crate) fn is_inline_at(&self, address: u64) -> Option<bool> {
+        self.ensure_block_index_for_address(address);
+
+        let func = self
+            .block_index
+            .read()
+            .expect("block index lock poisoned")
+            .find_function_by_pc(address)
+            .cloned()?;
+
+        if let Some(inline_idx) = Self::find_innermost_inline_node(&func, address) {
             let dwarf = self.dwarf();
             if let Ok(header) = dwarf.unit_header(func.cu_offset) {
                 if let Ok(unit) = dwarf.unit(header) {
@@ -63,7 +93,7 @@ impl LoadedObjfile {
         Some(false)
     }
     pub(super) fn plan_chain_access_from_var(
-        &mut self,
+        &self,
         address: u64,
         cu_offset: gimli::DebugInfoOffset,
         subprogram_die: gimli::UnitOffset,
@@ -194,7 +224,7 @@ impl LoadedObjfile {
     }
 
     fn resolve_variables_by_offsets_at_address_with_cfa(
-        &mut self,
+        &self,
         address: u64,
         items: &[(gimli::DebugInfoOffset, gimli::UnitOffset)],
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
@@ -223,7 +253,7 @@ impl LoadedObjfile {
     }
 
     pub(crate) fn resolve_type_shallow_by_name_with_tags(
-        &mut self,
+        &self,
         name: &str,
         tags: &[gimli::DwTag],
     ) -> Option<crate::TypeInfo> {
@@ -257,7 +287,7 @@ impl LoadedObjfile {
     }
 
     pub(crate) fn get_all_variables_at_address(
-        &mut self,
+        &self,
         address: u64,
     ) -> Result<Vec<crate::VariableWithEvaluation>> {
         let t0 = Instant::now();
@@ -269,7 +299,13 @@ impl LoadedObjfile {
             address
         );
 
-        if self.block_index.find_function_by_pc(address).is_none() {
+        if self
+            .block_index
+            .read()
+            .expect("block index lock poisoned")
+            .find_function_by_pc(address)
+            .is_none()
+        {
             let b0 = Instant::now();
             if let Some(cu_off) = self.lightweight_index.find_cu_by_address(address) {
                 let builder = BlockIndexBuilder::new(self.dwarf());
@@ -279,14 +315,22 @@ impl LoadedObjfile {
                         funcs.len(),
                         cu_off
                     );
-                    built_funcs += funcs.len();
-                    self.block_index.add_functions(funcs);
+                    let funcs_len = funcs.len();
+                    if self.add_block_index_functions_if_missing(address, funcs) {
+                        built_funcs += funcs_len;
+                    }
                 }
             }
             build_ms = b0.elapsed().as_millis();
         }
 
-        if let Some(func) = self.block_index.find_function_by_pc(address).cloned() {
+        if let Some(func) = self
+            .block_index
+            .read()
+            .expect("block index lock poisoned")
+            .find_function_by_pc(address)
+            .cloned()
+        {
             let vars_in_func = func.nodes.iter().map(|n| n.variables.len()).sum::<usize>();
             tracing::info!(
                 "DWARF:get_vars fast_path_hit addr=0x{:x} vars_in_func={} built_funcs={} build_ms={} total_ms={}",
@@ -397,7 +441,7 @@ impl LoadedObjfile {
     }
 
     pub(crate) fn plan_chain_access(
-        &mut self,
+        &self,
         address: u64,
         base_var: &str,
         chain: &[String],
@@ -413,26 +457,41 @@ impl LoadedObjfile {
             chain.len()
         );
 
-        if self.block_index.find_function_by_pc(address).is_none() {
+        if self
+            .block_index
+            .read()
+            .expect("block index lock poisoned")
+            .find_function_by_pc(address)
+            .is_none()
+        {
             let b0 = Instant::now();
             let builder = BlockIndexBuilder::new(self.dwarf());
             if let Some(func_entry) = self.find_function_index_entry_by_address(address) {
                 if let Some(fb) =
                     builder.build_for_function(func_entry.unit_offset, func_entry.die_offset)
                 {
-                    self.block_index.add_functions(vec![fb]);
-                    built_funcs += 1;
+                    if self.add_block_index_functions_if_missing(address, vec![fb]) {
+                        built_funcs += 1;
+                    }
                 }
             } else if let Some(cu_off) = self.lightweight_index.find_cu_by_address(address) {
                 if let Some(funcs) = builder.build_for_unit(cu_off) {
-                    built_funcs += funcs.len();
-                    self.block_index.add_functions(funcs);
+                    let funcs_len = funcs.len();
+                    if self.add_block_index_functions_if_missing(address, funcs) {
+                        built_funcs += funcs_len;
+                    }
                 }
             }
             build_ms = b0.elapsed().as_millis();
         }
 
-        if let Some(func) = self.block_index.find_function_by_pc(address).cloned() {
+        if let Some(func) = self
+            .block_index
+            .read()
+            .expect("block index lock poisoned")
+            .find_function_by_pc(address)
+            .cloned()
+        {
             let cfa_result = if self.cfi_index.is_some() {
                 match self.get_cfa_result(address) {
                     Ok(Some(cfa)) => Some(cfa),
@@ -753,7 +812,7 @@ impl LoadedObjfile {
     }
 
     pub(crate) fn resolve_variables_by_offsets_at_address(
-        &mut self,
+        &self,
         address: u64,
         items: &[(gimli::DebugInfoOffset, gimli::UnitOffset)],
     ) -> Result<Vec<crate::VariableWithEvaluation>> {

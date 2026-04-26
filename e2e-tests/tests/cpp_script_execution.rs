@@ -10,7 +10,7 @@ async fn compile_cpp_complex_script(
     script: &str,
 ) -> anyhow::Result<ghostscope_compiler::CompilationResult> {
     let binary_path = FIXTURES.get_test_binary("cpp_complex_program")?;
-    let mut analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path)
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path)
         .await
         .map_err(|e| anyhow::anyhow!("failed to load DWARF for cpp_complex_program: {e}"))?;
     let compile_options = ghostscope_compiler::CompileOptions {
@@ -18,7 +18,7 @@ async fn compile_cpp_complex_script(
         ..Default::default()
     };
 
-    ghostscope_compiler::compile_script(script, &mut analyzer, None, Some(1), &compile_options)
+    ghostscope_compiler::compile_script(script, &analyzer, None, Some(1), &compile_options)
         .map_err(|e| anyhow::anyhow!("compile_script failed: {e}"))
 }
 

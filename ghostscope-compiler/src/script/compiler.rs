@@ -75,7 +75,7 @@ pub struct FailedTarget {
 
 /// Unified AST compiler that performs DWARF queries and code generation in single pass
 pub struct AstCompiler<'a> {
-    process_analyzer: Option<&'a mut ghostscope_dwarf::DwarfAnalyzer>,
+    process_analyzer: Option<&'a ghostscope_dwarf::DwarfAnalyzer>,
     uprobe_configs: Vec<UProbeConfig>,
     failed_targets: Vec<FailedTarget>, // Track failed compilation attempts
     binary_path_hint: Option<String>,
@@ -85,7 +85,7 @@ pub struct AstCompiler<'a> {
 
 impl<'a> AstCompiler<'a> {
     pub fn new(
-        process_analyzer: Option<&'a mut ghostscope_dwarf::DwarfAnalyzer>,
+        process_analyzer: Option<&'a ghostscope_dwarf::DwarfAnalyzer>,
         binary_path_hint: Option<String>,
         starting_trace_id: u32,
         compile_options: crate::CompileOptions,
@@ -223,7 +223,7 @@ impl<'a> AstCompiler<'a> {
         let default_msg =
             format!("No addresses resolved for source line {file_path}:{line_number}");
 
-        let analyzer = match &mut self.process_analyzer {
+        let analyzer = match self.process_analyzer {
             Some(a) => a,
             None => return default_msg,
         };
@@ -329,7 +329,7 @@ impl<'a> AstCompiler<'a> {
                 line_number,
             } => {
                 // Obtain addresses first in a separate scope to avoid holding a mutable borrow of self
-                let module_addresses = if let Some(analyzer) = &mut self.process_analyzer {
+                let module_addresses = if let Some(analyzer) = self.process_analyzer {
                     analyzer.lookup_addresses_by_source_line(file_path, *line_number)
                 } else {
                     Vec::new()
@@ -590,7 +590,7 @@ impl<'a> AstCompiler<'a> {
             }
             TracePattern::FunctionName(func_name) => {
                 // Resolve all addresses for the function name and generate per-PC programs
-                let module_addresses = if let Some(analyzer) = &mut self.process_analyzer {
+                let module_addresses = if let Some(analyzer) = self.process_analyzer {
                     analyzer.lookup_function_addresses(func_name)
                 } else {
                     Vec::new()
@@ -756,7 +756,7 @@ impl<'a> AstCompiler<'a> {
         let mut codegen_new = crate::ebpf::context::NewCodeGen::new_with_process_analyzer(
             &context,
             &ebpf_function_name,
-            self.process_analyzer.as_deref_mut(),
+            self.process_analyzer,
             Some(assigned_trace_id),
             &self.compile_options,
         )

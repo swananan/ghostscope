@@ -86,29 +86,29 @@ pub struct DwarfAnalyzer {
 
 impl DwarfAnalyzer {
     fn resolve_type_shallow_by_name_in_module_with_tags<P: AsRef<Path>>(
-        &mut self,
+        &self,
         module_path: P,
         name: &str,
         tags: &[gimli::DwTag],
     ) -> Option<crate::TypeInfo> {
         let path_buf = module_path.as_ref().to_path_buf();
         self.modules
-            .get_mut(&path_buf)
+            .get(&path_buf)
             .and_then(|module_data| module_data.resolve_type_shallow_by_name_with_tags(name, tags))
     }
 
     fn resolve_type_shallow_by_name_with_tags(
-        &mut self,
+        &self,
         name: &str,
         tags: &[gimli::DwTag],
     ) -> Option<crate::TypeInfo> {
         self.modules
-            .values_mut()
+            .values()
             .find_map(|module_data| module_data.resolve_type_shallow_by_name_with_tags(name, tags))
     }
 
     fn build_address_query_result(
-        &mut self,
+        &self,
         module_address: &ModuleAddress,
     ) -> Result<AddressQueryResult> {
         let mut variables = Vec::new();
@@ -140,7 +140,7 @@ impl DwarfAnalyzer {
     }
 
     fn query_module_addresses(
-        &mut self,
+        &self,
         module_addresses: Vec<ModuleAddress>,
     ) -> Result<Vec<AddressQueryResult>> {
         module_addresses
@@ -150,7 +150,7 @@ impl DwarfAnalyzer {
     }
 
     fn query_module_addresses_best_effort(
-        &mut self,
+        &self,
         module_addresses: Vec<ModuleAddress>,
         query_label: &str,
     ) -> Result<Vec<AddressQueryResult>> {
@@ -211,8 +211,8 @@ impl DwarfAnalyzer {
     /// Classify whether an address is inside an inlined subroutine instance
     /// Returns Some(true) if inline, Some(false) if a normal (non-inline) context,
     /// or None if the module/address cannot be resolved.
-    pub fn is_inline_at(&mut self, module_address: &ModuleAddress) -> Option<bool> {
-        if let Some(module_data) = self.modules.get_mut(&module_address.module_path) {
+    pub fn is_inline_at(&self, module_address: &ModuleAddress) -> Option<bool> {
+        if let Some(module_data) = self.modules.get(&module_address.module_path) {
             module_data.is_inline_at(module_address.address)
         } else {
             None
@@ -221,7 +221,7 @@ impl DwarfAnalyzer {
 
     /// Resolve struct/class by name (shallow) in a specific module using only indexes
     pub fn resolve_struct_type_shallow_by_name_in_module<P: AsRef<Path>>(
-        &mut self,
+        &self,
         module_path: P,
         name: &str,
     ) -> Option<crate::TypeInfo> {
@@ -236,7 +236,7 @@ impl DwarfAnalyzer {
     }
 
     /// Resolve struct/class by name (shallow) across modules (first match)
-    pub fn resolve_struct_type_shallow_by_name(&mut self, name: &str) -> Option<crate::TypeInfo> {
+    pub fn resolve_struct_type_shallow_by_name(&self, name: &str) -> Option<crate::TypeInfo> {
         self.resolve_type_shallow_by_name_with_tags(
             name,
             &[
@@ -248,7 +248,7 @@ impl DwarfAnalyzer {
 
     /// Resolve union by name (shallow) in a specific module
     pub fn resolve_union_type_shallow_by_name_in_module<P: AsRef<Path>>(
-        &mut self,
+        &self,
         module_path: P,
         name: &str,
     ) -> Option<crate::TypeInfo> {
@@ -260,13 +260,13 @@ impl DwarfAnalyzer {
     }
 
     /// Resolve union by name (shallow) across modules (first match)
-    pub fn resolve_union_type_shallow_by_name(&mut self, name: &str) -> Option<crate::TypeInfo> {
+    pub fn resolve_union_type_shallow_by_name(&self, name: &str) -> Option<crate::TypeInfo> {
         self.resolve_type_shallow_by_name_with_tags(name, &[gimli::constants::DW_TAG_union_type])
     }
 
     /// Resolve enum by name (shallow) in a specific module
     pub fn resolve_enum_type_shallow_by_name_in_module<P: AsRef<Path>>(
-        &mut self,
+        &self,
         module_path: P,
         name: &str,
     ) -> Option<crate::TypeInfo> {
@@ -278,7 +278,7 @@ impl DwarfAnalyzer {
     }
 
     /// Resolve enum by name (shallow) across modules (first match)
-    pub fn resolve_enum_type_shallow_by_name(&mut self, name: &str) -> Option<crate::TypeInfo> {
+    pub fn resolve_enum_type_shallow_by_name(&self, name: &str) -> Option<crate::TypeInfo> {
         self.resolve_type_shallow_by_name_with_tags(
             name,
             &[gimli::constants::DW_TAG_enumeration_type],
@@ -535,7 +535,7 @@ impl DwarfAnalyzer {
     }
 
     /// Query function debug information across all modules.
-    pub fn query_function(&mut self, name: &str) -> Result<FunctionQueryResult> {
+    pub fn query_function(&self, name: &str) -> Result<FunctionQueryResult> {
         let module_addresses = self.lookup_function_addresses(name);
         let addresses = self.query_module_addresses(module_addresses)?;
         Ok(FunctionQueryResult {
@@ -546,7 +546,7 @@ impl DwarfAnalyzer {
 
     /// Query function debug information across all modules, skipping addresses
     /// that fail to resolve so callers can still display partial results.
-    pub fn query_function_best_effort(&mut self, name: &str) -> Result<FunctionQueryResult> {
+    pub fn query_function_best_effort(&self, name: &str) -> Result<FunctionQueryResult> {
         let module_addresses = self.lookup_function_addresses(name);
         let addresses = self
             .query_module_addresses_best_effort(module_addresses, &format!("function '{name}'"))?;
@@ -576,7 +576,7 @@ impl DwarfAnalyzer {
     /// # Arguments
     /// * `module_address` - Module address containing both module path and address offset
     pub fn get_all_variables_at_address(
-        &mut self,
+        &self,
         module_address: &ModuleAddress,
     ) -> Result<Vec<crate::VariableWithEvaluation>> {
         tracing::info!(
@@ -585,7 +585,7 @@ impl DwarfAnalyzer {
             module_address.module_display()
         );
 
-        if let Some(module_data) = self.modules.get_mut(&module_address.module_path) {
+        if let Some(module_data) = self.modules.get(&module_address.module_path) {
             module_data.get_all_variables_at_address(module_address.address)
         } else {
             tracing::warn!(
@@ -601,12 +601,12 @@ impl DwarfAnalyzer {
 
     /// Plan a chain access (e.g., r.headers_in) and synthesize a VariableWithEvaluation
     pub fn plan_chain_access(
-        &mut self,
+        &self,
         module_address: &ModuleAddress,
         base_var: &str,
         chain: &[String],
     ) -> Result<Option<crate::VariableWithEvaluation>> {
-        if let Some(module_data) = self.modules.get_mut(&module_address.module_path) {
+        if let Some(module_data) = self.modules.get(&module_address.module_path) {
             module_data.plan_chain_access(module_address.address, base_var, chain)
         } else {
             Ok(None)
@@ -666,7 +666,7 @@ impl DwarfAnalyzer {
     ///
     ///    Returns None if unresolved; never falls back to unrelated globals.
     pub fn plan_global_chain_access(
-        &mut self,
+        &self,
         prefer_module: &PathBuf,
         base: &str,
         fields: &[String],
@@ -753,13 +753,13 @@ impl DwarfAnalyzer {
 
     /// Resolve a variable by CU/DIE offsets in a specific module at an arbitrary address context (for globals)
     pub fn resolve_variable_by_offsets_in_module<P: AsRef<Path>>(
-        &mut self,
+        &self,
         module_path: P,
         cu_off: gimli::DebugInfoOffset,
         die_off: gimli::UnitOffset,
     ) -> Result<crate::VariableWithEvaluation> {
         let path_buf = module_path.as_ref().to_path_buf();
-        if let Some(module_data) = self.modules.get_mut(&path_buf) {
+        if let Some(module_data) = self.modules.get(&path_buf) {
             let items = vec![(cu_off, die_off)];
             let vars = module_data.resolve_variables_by_offsets_at_address(0, &items)?;
             let mut var = vars.into_iter().next().ok_or_else(|| {
@@ -812,7 +812,7 @@ impl DwarfAnalyzer {
 
     /// Compute static offset for a global variable member chain
     pub fn compute_global_member_static_offset<P: AsRef<Path>>(
-        &mut self,
+        &self,
         module_path: P,
         link_address: u64,
         cu_off: gimli::DebugInfoOffset,
@@ -820,7 +820,7 @@ impl DwarfAnalyzer {
         fields: &[String],
     ) -> Result<Option<(u64, crate::TypeInfo)>> {
         let path_buf = module_path.as_ref().to_path_buf();
-        if let Some(module_data) = self.modules.get_mut(&path_buf) {
+        if let Some(module_data) = self.modules.get(&path_buf) {
             module_data.compute_global_member_static_offset(cu_off, var_die, link_address, fields)
         } else {
             Err(anyhow::anyhow!(
@@ -851,11 +851,8 @@ impl DwarfAnalyzer {
 
     /// Lookup source location by module address
     /// Returns source location for the given module address
-    pub fn lookup_source_location(
-        &mut self,
-        module_address: &ModuleAddress,
-    ) -> Option<SourceLocation> {
-        if let Some(module_data) = self.modules.get_mut(&module_address.module_path) {
+    pub fn lookup_source_location(&self, module_address: &ModuleAddress) -> Option<SourceLocation> {
+        if let Some(module_data) = self.modules.get(&module_address.module_path) {
             module_data.lookup_source_location(module_address.address)
         } else {
             tracing::warn!("Module {} not found", module_address.module_display());
@@ -905,7 +902,7 @@ impl DwarfAnalyzer {
 
     /// Query source-line debug information across all modules.
     pub fn query_source_line(
-        &mut self,
+        &self,
         file_path: &str,
         line_number: u32,
     ) -> Result<Vec<AddressQueryResult>> {
@@ -917,7 +914,7 @@ impl DwarfAnalyzer {
     /// addresses that fail to resolve so callers can still display partial
     /// results.
     pub fn query_source_line_best_effort(
-        &mut self,
+        &self,
         file_path: &str,
         line_number: u32,
     ) -> Result<Vec<AddressQueryResult>> {
@@ -930,7 +927,7 @@ impl DwarfAnalyzer {
 
     /// Query a specific address within a module.
     pub fn query_address<P: AsRef<Path>>(
-        &mut self,
+        &self,
         module_path: P,
         address: u64,
     ) -> Result<AddressQueryResult> {

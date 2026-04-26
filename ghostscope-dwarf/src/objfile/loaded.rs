@@ -10,7 +10,11 @@ use crate::{
     parser::{CompilationUnit, DetailedParser},
 };
 use object::{Object, ObjectSegment};
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, RwLock},
+};
 
 /// Complete DWARF data for a single loaded object file.
 #[derive(Debug)]
@@ -26,7 +30,7 @@ pub(crate) struct LoadedObjfile {
     pub(super) _dwarf_mapped_file: Arc<MappedFile>,
     pub(super) _binary_mapped_file: Arc<MappedFile>,
     pub(super) text_symbol_starts_by_name: HashMap<String, Vec<u64>>,
-    pub(super) block_index: BlockIndex,
+    pub(super) block_index: RwLock<BlockIndex>,
     pub(super) type_name_index: Arc<TypeNameIndex>,
     pub(super) load_parse_ms: u64,
     pub(super) load_index_ms: u64,

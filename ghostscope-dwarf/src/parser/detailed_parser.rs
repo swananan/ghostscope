@@ -736,7 +736,7 @@ impl DetailedParser {
     /// Parse a variable and optionally skip full DWARF type resolution
     #[allow(clippy::too_many_arguments)]
     pub fn parse_variable_entry_with_mode(
-        &mut self,
+        &self,
         entry: &gimli::DebuggingInformationEntry<DwarfReader>,
         unit: &gimli::Unit<DwarfReader>,
         dwarf: &gimli::Dwarf<DwarfReader>,

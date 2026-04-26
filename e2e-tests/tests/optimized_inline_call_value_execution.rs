@@ -104,7 +104,7 @@ async fn test_optimized_inline_parameters_are_live_before_internal_call() -> any
     init();
 
     let binary_path = FIXTURES.get_test_binary("inline_call_value_program")?;
-    let mut analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
     let addrs = analyzer.lookup_addresses_by_source_line(
         "inline_call_value_program.c",
         INLINE_BEFORE_CALL_TRACE_LINE,
@@ -134,7 +134,7 @@ async fn test_optimized_inline_parameters_are_live_before_internal_call() -> any
     }
 
     let target = spawn_inline_call_value_program(&binary_path).await?;
-    let mut pid_analyzer = ghostscope_dwarf::DwarfAnalyzer::from_pid(target.host_pid()).await?;
+    let pid_analyzer = ghostscope_dwarf::DwarfAnalyzer::from_pid(target.host_pid()).await?;
     let pid_results = pid_analyzer.query_source_line_best_effort(
         "inline_call_value_program.c",
         INLINE_BEFORE_CALL_TRACE_LINE,
@@ -157,7 +157,7 @@ async fn test_optimized_inline_parameters_have_exact_values_before_internal_call
     init();
 
     let binary_path = FIXTURES.get_test_binary("inline_call_value_program")?;
-    let mut analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
     let addrs = analyzer.lookup_addresses_by_source_line(
         "inline_call_value_program.c",
         INLINE_BEFORE_CALL_TRACE_LINE,
@@ -221,7 +221,7 @@ async fn test_optimized_inline_parameters_survive_internal_call_sites() -> anyho
     init();
 
     let binary_path = FIXTURES.get_test_binary("inline_call_value_program")?;
-    let mut analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
     let addrs = analyzer.lookup_addresses_by_source_line(
         "inline_call_value_program.c",
         INLINE_AFTER_CALL_TRACE_LINE,
@@ -250,7 +250,7 @@ async fn test_optimized_inline_parameters_survive_internal_call_sites() -> anyho
     }
 
     let target = spawn_inline_call_value_program(&binary_path).await?;
-    let mut pid_analyzer = ghostscope_dwarf::DwarfAnalyzer::from_pid(target.host_pid()).await?;
+    let pid_analyzer = ghostscope_dwarf::DwarfAnalyzer::from_pid(target.host_pid()).await?;
     let pid_results = pid_analyzer.query_source_line_best_effort(
         "inline_call_value_program.c",
         INLINE_AFTER_CALL_TRACE_LINE,
@@ -274,7 +274,7 @@ async fn test_entry_value_recovers_outer_parameter_inside_optimized_inline_after
     init();
 
     let binary_path = FIXTURES.get_test_binary("inline_call_value_program")?;
-    let mut analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
     let addrs = analyzer.lookup_addresses_by_source_line(
         "inline_call_value_program.c",
         INLINE_AFTER_CALL_TRACE_LINE,

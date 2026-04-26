@@ -160,7 +160,7 @@ async fn test_optimized_inline_struct_member_access_resolves_inline_parameter_na
     init();
 
     let binary_path = FIXTURES.get_test_binary("inline_callsite_program")?;
-    let mut analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path)
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to load DWARF for inline_callsite_program: {}", e))?;
     let addrs = analyzer
@@ -190,7 +190,7 @@ async fn test_optimized_inline_struct_member_access_resolves_inline_parameter_na
     // The analyzer runs in the host test process, so it must inspect the host PID.
     // `visible_pid_from(observer)` is only correct for processes that actually run
     // inside the observer sandbox, such as GhostScope itself.
-    let mut pid_analyzer = ghostscope_dwarf::DwarfAnalyzer::from_pid(target.host_pid()).await?;
+    let pid_analyzer = ghostscope_dwarf::DwarfAnalyzer::from_pid(target.host_pid()).await?;
     let pid_addrs = pid_analyzer
         .lookup_addresses_by_source_line("inline_callsite_program.c", INLINE_STATE_TRACE_LINE);
     anyhow::ensure!(

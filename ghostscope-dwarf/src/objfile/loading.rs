@@ -212,7 +212,7 @@ impl LoadedObjfile {
             cfi_index,
             dwarf,
             detailed_parser,
-            block_index: BlockIndex::new(),
+            block_index: std::sync::RwLock::new(BlockIndex::new()),
             type_name_index,
             _dwarf_mapped_file: mapped_file,
             _binary_mapped_file: binary_mapped,
