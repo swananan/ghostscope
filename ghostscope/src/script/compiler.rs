@@ -238,6 +238,9 @@ async fn create_and_attach_loader(
     }
 
     apply_pid_alias_for_session(session, compile_options);
+    // Populate PID-mode module offsets before attaching. Once the uprobe is
+    // attached, a running target can hit it immediately.
+    apply_cached_offsets_for_session_pid(session, compile_options);
 
     if let Some(uprobe_offset) = config.uprobe_offset {
         if let Some(ref function_name) = config.function_name {
@@ -450,9 +453,6 @@ pub async fn compile_and_load_script_for_tui(
                 .await
             {
                 Ok(loader) => {
-                    // Apply cached offsets for PID-mode lookups (if available).
-                    apply_cached_offsets_for_session_pid(session, compile_options);
-
                     info!(
                         "✓ Successfully attached uprobe for trace_id {}",
                         config.assigned_trace_id
@@ -707,9 +707,6 @@ pub async fn compile_and_load_script_for_cli(
         match create_and_attach_loader(config, session.attach_pid(), session, compile_options).await
         {
             Ok(loader) => {
-                // Apply cached offsets for PID-mode lookups (if available).
-                apply_cached_offsets_for_session_pid(session, compile_options);
-
                 info!(
                     "✓ Successfully attached uprobe for trace_id {}",
                     config.assigned_trace_id
