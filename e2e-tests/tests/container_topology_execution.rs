@@ -6,12 +6,65 @@ use common::sandbox::{DockerSpec, SandboxHandle};
 use common::targets::{TargetHandle, TargetLauncher};
 use serial_test::serial;
 
+const ENV_RUN_CONTAINER_TOPOLOGY: &str = "E2E_RUN_CONTAINER_TOPOLOGY";
+const ENV_GHOSTSCOPE_SANDBOX: &str = "E2E_GHOSTSCOPE_SANDBOX";
+const ENV_TARGET_SANDBOX: &str = "E2E_TARGET_SANDBOX";
+const ENV_TARGET_MODE: &str = "E2E_TARGET_MODE";
+
 fn pid_filter_script() -> &'static str {
     r#"
 trace calculate_something {
     print "FILTERED: a={} b={}", a, b;
 }
 "#
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name).ok().is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn env_value_is_container_sandbox(name: &str) -> bool {
+    std::env::var(name).ok().is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "docker-private"
+                | "private"
+                | "container-private"
+                | "docker-host"
+                | "host-pid"
+                | "docker-host-pid"
+                | "container-host"
+        )
+    })
+}
+
+fn explicit_container_topology_requested() -> bool {
+    env_flag_enabled(ENV_RUN_CONTAINER_TOPOLOGY)
+        || env_value_is_container_sandbox(ENV_GHOSTSCOPE_SANDBOX)
+        || env_value_is_container_sandbox(ENV_TARGET_SANDBOX)
+        || std::env::var(ENV_TARGET_MODE).ok().is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "child-container" | "child" | "nested" | "descendant"
+            )
+        })
+}
+
+fn skip_if_container_topology_not_requested() -> bool {
+    if explicit_container_topology_requested() {
+        false
+    } else {
+        eprintln!(
+            "skipping explicit container-topology test: set {ENV_RUN_CONTAINER_TOPOLOGY}=1 \
+             or run with docker-backed E2E_GHOSTSCOPE_SANDBOX/E2E_TARGET_SANDBOX"
+        );
+        true
+    }
 }
 
 fn skip_if_docker_unavailable() -> bool {
@@ -69,6 +122,9 @@ fn target_diagnostics(target: &TargetHandle) -> String {
 #[serial]
 async fn test_attach_from_host_to_private_container_target() -> anyhow::Result<()> {
     init();
+    if skip_if_container_topology_not_requested() {
+        return Ok(());
+    }
     if skip_if_docker_unavailable() {
         return Ok(());
     }
@@ -108,6 +164,9 @@ async fn test_attach_from_host_to_private_container_target() -> anyhow::Result<(
 #[serial]
 async fn test_attach_from_host_pid_container_to_host_target() -> anyhow::Result<()> {
     init();
+    if skip_if_container_topology_not_requested() {
+        return Ok(());
+    }
     if skip_if_docker_unavailable() {
         return Ok(());
     }
@@ -148,6 +207,9 @@ async fn test_attach_from_host_pid_container_to_host_target() -> anyhow::Result<
 async fn test_attach_from_private_container_to_host_target_fails_when_pid_invisible(
 ) -> anyhow::Result<()> {
     init();
+    if skip_if_container_topology_not_requested() {
+        return Ok(());
+    }
     if skip_if_docker_unavailable() {
         return Ok(());
     }
@@ -183,6 +245,9 @@ async fn test_attach_from_private_container_to_host_target_fails_when_pid_invisi
 #[serial]
 async fn test_child_container_runtime_reuses_single_nested_container() -> anyhow::Result<()> {
     init();
+    if skip_if_container_topology_not_requested() {
+        return Ok(());
+    }
     if skip_if_docker_unavailable() {
         return Ok(());
     }
@@ -238,6 +303,9 @@ async fn test_child_container_runtime_reuses_single_nested_container() -> anyhow
 #[serial]
 async fn test_attach_from_private_container_to_child_container_target() -> anyhow::Result<()> {
     init();
+    if skip_if_container_topology_not_requested() {
+        return Ok(());
+    }
     if skip_if_docker_unavailable() {
         return Ok(());
     }
