@@ -209,6 +209,8 @@ Test-framework environment variables:
 - `E2E_TARGET_MODE=same|child-container`
   Refines how the target is launched inside the selected target sandbox. Default: `same`.
   `child-container` currently means "launch the target in a nested child container inside the outer `docker-private` sandbox".
+- `E2E_RUN_CONTAINER_TOPOLOGY=1`
+  Enables the explicit `container_topology_execution` tests. These tests are skipped in routine host-host e2e runs unless this flag is set or a docker-backed `E2E_GHOSTSCOPE_SANDBOX`/`E2E_TARGET_SANDBOX`/`E2E_TARGET_MODE` is requested.
 - `E2E_CHILD_CONTAINER_IMAGE=<image-ref>`
   Overrides the image used for nested `child-container` targets. By default it inherits `E2E_CONTAINER_IMAGE`, so the outer sandbox and nested child container use the same runtime image unless you explicitly split them.
 - `E2E_GHOSTSCOPE_LOG_LEVEL=error|warn|info|debug|trace`
@@ -293,7 +295,7 @@ Notes:
 
 - These commands keep the Rust test harness on the host and move GhostScope plus the traced target into the requested container sandbox topology.
 - When GhostScope and target use the same sandbox kind, the topology-aware e2e helper automatically reuses the same sandbox instance.
-- The main `CI` workflow runs the full `ghostscope-e2e-tests` suite under the default host-host environment, including `container_topology_execution`.
+- Routine host-host e2e, including the main `CI` workflow, skips the explicit `container_topology_execution` cases by default.
 - `host -> docker-private`, `docker-private -> same docker-private`, and `docker-private -> child-container` are the explicit topology scenarios that currently run the full e2e suite in the dedicated `Container E2E` workflow.
 - `docker-private -> child-container` uses `E2E_TARGET_MODE=child-container` and launches the target in a nested Docker child container inside the outer private sandbox. The full suite now runs in CI for that topology, while nested child-container `-t` cases still follow the existing explicit skip path inside the Rust tests.
 - `docker-host -> same docker-host` remains a smoke run because it is close to the default host PID view.

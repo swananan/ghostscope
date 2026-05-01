@@ -127,6 +127,7 @@ jobs:
         env:
           E2E_CONTAINER_IMAGE: ghcr.io/swananan/ghostscope-e2e-runtime@sha256:d5df1b977c38f7a51bbf28b878f2246705a05b83ac6df7cb6be8f8a4de4105f4
           E2E_CHILD_CONTAINER_IMAGE: ghcr.io/swananan/ghostscope-e2e-runtime@sha256:d5df1b977c38f7a51bbf28b878f2246705a05b83ac6df7cb6be8f8a4de4105f4
+          E2E_RUN_CONTAINER_TOPOLOGY: 1
           E2E_SANDBOX_SESSION: container-e2e-${{ github.run_id }}-${{ github.job }}-${{ matrix.name }}
           E2E_GHOSTSCOPE_SANDBOX: ${{ matrix.ghostscope_sandbox }}
           E2E_TARGET_SANDBOX: ${{ matrix.target_sandbox }}
@@ -136,6 +137,7 @@ jobs:
           sudo -E env \
             E2E_CONTAINER_IMAGE="$E2E_CONTAINER_IMAGE" \
             E2E_CHILD_CONTAINER_IMAGE="$E2E_CHILD_CONTAINER_IMAGE" \
+            E2E_RUN_CONTAINER_TOPOLOGY="$E2E_RUN_CONTAINER_TOPOLOGY" \
             E2E_SANDBOX_SESSION="$E2E_SANDBOX_SESSION" \
             E2E_GHOSTSCOPE_SANDBOX="$E2E_GHOSTSCOPE_SANDBOX" \
             E2E_TARGET_SANDBOX="$E2E_TARGET_SANDBOX" \

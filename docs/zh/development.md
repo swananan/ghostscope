@@ -210,6 +210,8 @@ curl -sS -X POST http://127.0.0.1:8788/runs \
 - `E2E_TARGET_MODE=same|child-container`
   进一步描述目标进程在所选 target sandbox 里的启动方式。默认：`same`。
   目前 `child-container` 专指“在外层 `docker-private` sandbox 里再起一个子容器来运行目标进程”。
+- `E2E_RUN_CONTAINER_TOPOLOGY=1`
+  启用显式的 `container_topology_execution` 测试。常规 host-host e2e 默认跳过这些用例；只有设置该变量，或显式请求 docker-backed `E2E_GHOSTSCOPE_SANDBOX`/`E2E_TARGET_SANDBOX`/`E2E_TARGET_MODE` 时才会运行。
 - `E2E_CHILD_CONTAINER_IMAGE=<image-ref>`
   覆盖 nested `child-container` 目标使用的镜像。默认会继承 `E2E_CONTAINER_IMAGE`，也就是外层 sandbox 和子容器默认共用同一张 runtime 镜像，除非你显式指定不同镜像。
 - `E2E_GHOSTSCOPE_LOG_LEVEL=error|warn|info|debug|trace`
@@ -294,7 +296,7 @@ done
 
 - Rust 测试 harness 仍运行在宿主机上，GhostScope 和目标进程会按指定拓扑进入对应容器 sandbox。
 - 当 GhostScope 和目标使用同一种 sandbox 类型时，topology-aware e2e helper 会自动复用同一个 sandbox 实例。
-- 主 `CI` workflow 会在默认 host-host 环境下跑完整的 `ghostscope-e2e-tests` 套件，其中也包括 `container_topology_execution`。
+- 常规 host-host e2e，包括主 `CI` workflow，默认跳过显式的 `container_topology_execution` 用例。
 - `host -> docker-private`、`docker-private -> same docker-private` 和 `docker-private -> child-container` 是当前在独立 `Container E2E` workflow 中按显式 topology 跑全量 e2e 的容器场景。
 - `docker-private -> child-container` 通过 `E2E_TARGET_MODE=child-container` 启用，表示目标进程运行在外层 private sandbox 里再启动的子容器中。这个拓扑现在已经进入 full-CI 矩阵，但 nested child-container 的 `-t` 用例在 Rust 测试内部仍然沿用现有的显式跳过路径。
 - `docker-host -> same docker-host` 仍保留为 smoke，因为它更接近默认的 host PID 视角。

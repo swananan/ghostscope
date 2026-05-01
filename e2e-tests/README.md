@@ -13,3 +13,7 @@ Typical local flow:
 cargo build -p ghostscope -p dwarf-tool --all-features
 sudo cargo test -p ghostscope-e2e-tests --tests --all-features -- --nocapture
 ```
+
+Routine host-host e2e skips the explicit container-topology cases. Run them by
+setting `E2E_RUN_CONTAINER_TOPOLOGY=1` or by using one of the docker-backed
+`E2E_GHOSTSCOPE_SANDBOX`/`E2E_TARGET_SANDBOX` topology settings.
