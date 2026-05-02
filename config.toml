@@ -24,8 +24,12 @@ log_file = "ghostscope.log"
 default_tui_mode = true
 
 # Enable/disable logging (overridden by --log/--no-log)
-# Default: true
-enable_logging = true
+# Default: false
+enable_logging = false
+
+# Enable/disable console stderr logging (overridden by --log-console/--no-log-console)
+# Default: false
+enable_console_logging = false
 
 # Log level filter (overridden by --log-level)
 # Options: "error", "warn", "info", "debug", "trace"
@@ -34,10 +38,9 @@ log_level = "warn"
 
 [script]
 # Stdout rendering mode for non-TUI script execution
-# Options: "pretty", "plain", "quiet"
+# Options: "pretty", "plain"
 # - pretty: TUI-like header with timestamp/PID/TID plus indented payload lines
 # - plain: only print script payload lines
-# - quiet: suppress event output on stdout
 # Default: "pretty"
 output = "pretty"
 
@@ -137,7 +140,7 @@ show_source_panel = true
 # These are relative ratios, e.g., [4, 3, 3] means Source gets 40%, others get 30% each
 # Must be an array of 3 positive numbers
 # Default: [4, 3, 3]
-panel_ratios = [3, 3, 3]
+panel_ratios = [4, 3, 3]
 
 # Two-panel ratios [EbpfInfo, InteractiveCommand] used when source panel is hidden
 # If not set, falls back to the last two values of panel_ratios (e.g., 4:3:3 -> 3:3)
@@ -202,13 +205,13 @@ proc_module_offsets_max_entries = 4096
 # PerfEventArray page count (number of pages per CPU for perf buffer)
 # This is only used when PerfEventArray is selected (kernel < 5.8 or when force_perf_event_array=true)
 # Must be power of 2. Each page is 4KB on most systems.
-# Valid range: 1 to 512 pages
+# Valid range: 8 to 1024 pages
 # Recommended values:
-#   - Low-frequency tracing: 8 pages (32KB per CPU)
-#   - Medium-frequency tracing: 32 pages (128KB per CPU)
-#   - High-frequency tracing: 64 pages (256KB per CPU)
-# Default: 32 (128KB per CPU)
-perf_page_count = 32
+#   - Low-frequency tracing: 32 pages (~128KB per CPU)
+#   - Medium-frequency tracing: 64 pages (~256KB per CPU)
+#   - High-frequency tracing: 128-256 pages (512KB-1MB per CPU)
+# Default: 64 (256KB per CPU)
+perf_page_count = 64
 
 # Per-argument memory dump cap for extended format specifiers ({:x}/{:s}).
 # Requests beyond this cap are truncated. Increase it to dump more bytes per argument.

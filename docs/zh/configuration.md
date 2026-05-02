@@ -45,8 +45,12 @@ ghostscope --target <PATH>
 # 两者可以一起使用进行 PID 过滤
 ghostscope -t /usr/bin/myapp -p 1234
 
-# 启动新进程并传递参数
-ghostscope --args /path/to/program arg1 arg2
+# 启动新进程
+ghostscope /path/to/program
+ghostscope /path/to/program arg1 arg2
+
+# 当目标程序参数可能被误认为 GhostScope 选项时，使用 --args 分隔
+ghostscope --script-file trace.gs --args /path/to/program --target-flag value
 # --args 后的所有内容都会传递给目标程序
 ```
 
@@ -54,8 +58,8 @@ ghostscope --args /path/to/program arg1 arg2
 
 ```bash
 # 运行内联脚本
-ghostscope -s 'trace("main:entry") { print "Started"; }'
-ghostscope --script 'trace("main:entry") { print "Started"; }'
+ghostscope -s 'trace main { print "Started"; }'
+ghostscope --script 'trace main { print "Started"; }'
 
 # 从文件运行脚本
 ghostscope --script-file trace.gs
@@ -242,7 +246,8 @@ ghostscope bpffs prune --dry-run --json
 | `--config <PATH>` | | 自定义配置文件 | 自动检测 |
 | `--force-perf-event-array` | | 强制 PerfEventArray（测试） | 关 |
 | `--enable-sysmon-shared-lib` | | -t 目标为共享库时，支持全局变量探测 | 关 |
-| `--args <PROGRAM> [ARGS...]` | | 启动程序并传递参数 | 无 |
+| `[BINARY] [ARGS...]` | | 启动目标程序并传递位置参数 | 无 |
+| `--args <PROGRAM> [ARGS...]` | | 分隔 GhostScope 选项和目标程序参数 | 无 |
 
 子命令：
 
@@ -424,9 +429,9 @@ compare_cap = 64
 max_trace_event_size = 32768
 
 # 推荐值：
-#   - 单进程：1024
-#   - 多进程：4096
-#   - 系统级跟踪：8192 或 16384
+#   - 简单打印：16384
+#   - 通用场景：32768
+#   - 大格式化输出：65536
 
 # 强制使用 PerfEventArray 而非 RingBuf（仅用于测试）
 # 警告：这仅用于测试目的。设为 true 会强制使用 PerfEventArray
@@ -500,6 +505,7 @@ max_entries = 10000
 ringbuf_size = 1048576  # 1MB 缓冲区用于高事件率
 mem_dump_cap = 4096     # 单参数转储上限更高
 compare_cap = 64        # 内置比较最大比较字节数（strncmp/memcmp）
+max_trace_event_size = 65536  # 大格式化输出需要更大的事件大小
 proc_module_offsets_max_entries = 8192  # 支持更多模块
 
 [general]
@@ -515,6 +521,7 @@ enable_console_logging = false
 ringbuf_size = 131072  # 128KB 最小缓冲区
 mem_dump_cap = 512
 compare_cap = 32       # 降低内置比较上限以减小开销
+max_trace_event_size = 16384
 proc_module_offsets_max_entries = 1024  # 仅单进程
 
 [general]
@@ -611,8 +618,9 @@ GhostScope 在启动时验证配置：
    - **ebpf_max_messages**：必须至少为 100
 8. **eBPF 配置**：
    - **ringbuf_size**：必须是 2 的幂，范围 4096-16777216 字节
-   - **mem_dump_cap**：单参数内存转储上限（字节），例如 256/512/1024/4096
+   - **perf_page_count**：必须是 2 的幂，范围 8-1024 页
    - **proc_module_offsets_max_entries**：必须在 64-65536 范围内
+   - **mem_dump_cap**、**compare_cap** 和 **max_trace_event_size** 是运行时上限；`max_trace_event_size` 可能会根据实际事件传输方式被 clamp。
 
 无效配置将产生清晰的错误消息和修复建议。
 
@@ -624,6 +632,8 @@ GhostScope 在启动时验证配置：
 - **"Invalid log level"**：使用以下之一：error, warn, info, debug, trace。
 - **"ringbuf_size must be a power of 2"**：使用 2 的幂值，如 131072、262144、524288 等。
 - **"ringbuf_size X is out of reasonable range"**：必须在 4KB 到 16MB 之间。
+- **"perf_page_count must be a power of 2"**：使用 32、64、128、256 等 2 的幂值。
+- **"perf_page_count X is out of reasonable range"**：必须在 8 到 1024 页之间。
 - **"proc_module_offsets_max_entries X is out of reasonable range"**：必须在 64 到 65536 之间。
 - **"ebpf_max_messages X is too small"**：必须至少为 100。在配置文件中增加该值。
 

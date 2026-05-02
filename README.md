@@ -117,7 +117,7 @@ The demo below follows exactly that path on a DWARF-enabled nginx worker: locate
 
 Imagine navigating a vast, uncharted forest of binary data — memory addresses, register values, stack frames — all meaningless numbers without context. **DWARF debug information is our map**: it tells us that stack address `RSP-0x18` stores local variable `count`, heap address `0x5621a8c0` is a `user` object with string pointer `user.name` at offset `+0x20`; it tracks where each variable lives throughout program execution — parameter `x` is in register `RDI` now but will move to stack offset `RSP-0x10` later.
 
-With this map in hand, GhostScope leverages **eBPF and uprobe** technology to safely extract binary data from any instruction point in your running program. The combination is powerful: DWARF reveals the meaning of every byte in the process's virtual address space, while eBPF safely retrieves exactly what we need. The result? You can print variable values (local or global), function arguments, complex data structures, even stack backtraces from any point in your program — all without stopping or modifying it.
+With this map in hand, GhostScope leverages **eBPF and uprobe** technology to safely extract binary data from instruction points in your running program. The combination is powerful: DWARF reveals the meaning of bytes in the process's virtual address space, while eBPF safely retrieves exactly what we need. The result? You can print variable values (local or global), function arguments, and complex data structures without stopping or modifying the program.
 
 ## ✨ Highlights
 
@@ -127,7 +127,7 @@ With this map in hand, GhostScope leverages **eBPF and uprobe** technology to sa
       <td align="center" width="25%">
         <img src="https://raw.githubusercontent.com/swananan/ghostscope/main/assets/icons/performance.svg" width="60" alt="Performance"/>
         <br />
-        <strong>Zero Overhead</strong>
+        <strong>Low Overhead</strong>
         <br />
         <sub>One context switch + eBPF execution</sub>
       </td>

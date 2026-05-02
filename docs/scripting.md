@@ -34,7 +34,7 @@ GhostScope uses a domain‑specific language to define trace points and actions.
 GhostScope supports the following statements:
 - `trace` — define trace points and their actions
 - `print` — output formatted text
-- `backtrace` / `bt` — print call stack (in progress)
+- `backtrace` / `bt` — reserved syntax for future stack unwinding
 - `if` / `else` — conditional execution
 - `let` — script variable declaration
 - Expression statements
@@ -379,7 +379,7 @@ let neg = -0x10;       // unary minus is parsed as 0 - 16
 Examples:
 
 ```ghostscope
-trace main:entry {
+trace main {
     if a > 10 && b == 0 {
         print "AND";
     } else if a < 100 || p == 0 {
@@ -614,13 +614,12 @@ trace main {
 }
 ```
 
-### Conditional Trace & Backtrace
+### Conditional Trace
 
 ```ghostscope
 trace malloc {
     if size > 1_048_576 {  // 1 MB
         print "Large allocation: {} bytes", size;
-        backtrace;          // (in progress)
     }
 }
 ```

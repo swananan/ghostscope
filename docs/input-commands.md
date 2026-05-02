@@ -803,7 +803,7 @@ GhostScope automatically saves command history for quick reuse and search:
 - **Auto-save**: Commands automatically saved to `.ghostscope_history` file
 - **Cross-session**: History shared across different GhostScope sessions
 - **Deduplication**: Consecutive duplicate commands not recorded
-- **Capacity Limit**: Stores up to 1000 recent commands by default
+- **Capacity Limit**: Stores up to 5000 recent commands by default
 
 #### History Management
 
@@ -815,18 +815,14 @@ gs > clear          # Clear command history
 
 **Note**: Clearing history deletes all records in `.ghostscope_history` file.
 
-### Completion Configuration
+### History Configuration
 
-History and completion behavior can be adjusted in config file (see [Configuration](configuration.md)):
+History behavior can be adjusted in config file (see [Configuration](configuration.md)):
 
 ```toml
-[history]
+[ui.history]
 enabled = true          # Enable history recording
-max_entries = 1000     # Maximum history entries
-
-[auto_suggestion]
-enabled = true         # Enable auto-suggestion
-min_chars = 3         # Minimum chars to trigger suggestion
+max_entries = 5000     # Maximum history entries
 ```
 
 ---
