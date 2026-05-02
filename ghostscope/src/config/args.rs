@@ -204,6 +204,10 @@ pub struct Args {
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub tui: bool,
 
+    /// Treat following tokens as the target program and its arguments
+    #[arg(long = "args", action = clap::ArgAction::SetTrue)]
+    pub args_separator: bool,
+
     /// Script-mode event stdout formatting: pretty or plain
     #[arg(long, value_name = "MODE", value_enum)]
     pub script_output: Option<ScriptOutputMode>,
@@ -271,7 +275,7 @@ pub struct Args {
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub no_source_panel: bool,
 
-    /// Remaining arguments (when using --args)
+    /// Remaining positional arguments passed to the target binary
     pub remaining: Vec<String>,
 }
 
@@ -378,7 +382,8 @@ impl Args {
             // Normal parsing without --args
             let parsed = Args::try_parse_from(&args).unwrap_or_else(|e| e.exit());
             let binary_path = parsed.binary.clone();
-            Self::parsed_trace_args_from_clap(parsed, binary_path, Vec::new())
+            let binary_args = parsed.remaining.clone();
+            Self::parsed_trace_args_from_clap(parsed, binary_path, binary_args)
         }
     }
 
@@ -387,8 +392,7 @@ impl Args {
         let (before_args, after_args) = args.split_at(args_pos);
 
         // Parse options before --args
-        let mut modified_args = before_args.to_vec();
-        modified_args.push("--args".to_string()); // Keep the flag for clap
+        let modified_args = before_args.to_vec();
 
         let parsed = Args::try_parse_from(&modified_args).unwrap_or_else(|e| e.exit());
 
@@ -422,8 +426,9 @@ impl Args {
             return Ok(ParsedCommand::ScriptHelp);
         }
         let binary_path = parsed.binary.clone();
+        let binary_args = parsed.remaining.clone();
         Ok(ParsedCommand::Trace(Box::new(
-            Self::parsed_trace_args_from_clap(parsed, binary_path, Vec::new()),
+            Self::parsed_trace_args_from_clap(parsed, binary_path, binary_args),
         )))
     }
 
@@ -693,6 +698,49 @@ mod tests {
         let help = Args::command_with_bpffs().render_long_help().to_string();
         assert!(help.contains("bpffs"));
         assert!(help.contains("--script-help"));
+        assert!(help.contains("--args"));
+    }
+
+    #[test]
+    fn parses_positional_target_args() {
+        let parsed = Args::parse_args_from(vec![
+            "ghostscope".to_string(),
+            "--script-file".to_string(),
+            "trace.gs".to_string(),
+            "/bin/echo".to_string(),
+            "hello".to_string(),
+            "world".to_string(),
+        ]);
+
+        match parsed {
+            ParsedCommand::Trace(args) => {
+                assert_eq!(args.binary_path.as_deref(), Some("/bin/echo"));
+                assert_eq!(args.binary_args, vec!["hello", "world"]);
+                assert_eq!(args.script_file, Some(PathBuf::from("trace.gs")));
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_args_separator_target_args() {
+        let parsed = Args::parse_args_from(vec![
+            "ghostscope".to_string(),
+            "--script-file".to_string(),
+            "trace.gs".to_string(),
+            "--args".to_string(),
+            "/bin/echo".to_string(),
+            "--help".to_string(),
+        ]);
+
+        match parsed {
+            ParsedCommand::Trace(args) => {
+                assert_eq!(args.binary_path.as_deref(), Some("/bin/echo"));
+                assert_eq!(args.binary_args, vec!["--help"]);
+                assert_eq!(args.script_file, Some(PathBuf::from("trace.gs")));
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
     }
 
     #[test]
