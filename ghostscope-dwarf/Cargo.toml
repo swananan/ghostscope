@@ -20,9 +20,9 @@ memmap2 = "0.9"
 anyhow.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
-ghostscope-platform = { version = "0.1.3", path = "../ghostscope-platform" }
-ghostscope-protocol = { version = "0.1.3", path = "../ghostscope-protocol" }
-ghostscope-process = { version = "0.1.3", path = "../ghostscope-process" }
+ghostscope-platform = { version = "0.1.4", path = "../ghostscope-platform" }
+ghostscope-protocol = { version = "0.1.4", path = "../ghostscope-protocol" }
+ghostscope-process = { version = "0.1.4", path = "../ghostscope-process" }
 rustc-demangle = "0.1"
 cpp_demangle = "0.4"
 rayon = "1.10"

@@ -19,8 +19,8 @@ name = "dwarf-tool"
 path = "src/main.rs"
 
 [dependencies]
-ghostscope-dwarf = { version = "0.1.3", path = "../../ghostscope-dwarf" }
-ghostscope-process = { version = "0.1.3", path = "../../ghostscope-process" }
+ghostscope-dwarf = { version = "0.1.4", path = "../../ghostscope-dwarf" }
+ghostscope-process = { version = "0.1.4", path = "../../ghostscope-process" }
 
 # Command line parsing
 clap.workspace = true
