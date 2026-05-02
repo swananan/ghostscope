@@ -14,7 +14,7 @@ categories.workspace = true
 description = "Terminal user interface that streams GhostScope traces with async input handling."
 
 [dependencies]
-ghostscope-protocol = { version = "0.1.3", path = "../ghostscope-protocol" }
+ghostscope-protocol = { version = "0.1.4", path = "../ghostscope-protocol" }
 ratatui = "0.28"
 crossterm = { workspace = true }
 futures-util = { workspace = true }
