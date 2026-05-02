@@ -850,7 +850,7 @@ GhostScope 自动保存命令历史，支持快速重用和搜索：
 - **自动保存**：命令自动保存到 `.ghostscope_history` 文件
 - **跨会话**：历史在不同 GhostScope 会话间共享
 - **去重机制**：连续重复的命令不会重复记录
-- **容量限制**：默认保存最近 1000 条命令
+- **容量限制**：默认保存最近 5000 条命令
 
 #### 历史管理
 
@@ -862,18 +862,14 @@ gs > clear          # 清除命令历史
 
 **注意**：清除历史会删除 `.ghostscope_history` 文件中的所有记录。
 
-### 补全配置
+### 历史配置
 
-可在配置文件中调整历史和补全行为（参见 [配置文档](configuration.md)）：
+可在配置文件中调整历史行为（参见 [配置文档](configuration.md)）：
 
 ```toml
-[history]
+[ui.history]
 enabled = true          # 启用历史记录
-max_entries = 1000     # 最大历史条数
-
-[auto_suggestion]
-enabled = true         # 启用自动建议
-min_chars = 3         # 触发建议的最小字符数
+max_entries = 5000     # 最大历史条数
 ```
 
 ## 技巧与最佳实践

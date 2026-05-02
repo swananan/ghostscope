@@ -34,7 +34,7 @@ GhostScope 使用专门的领域特定语言来定义追踪点和操作。脚本
 GhostScope 支持以下语句类型：
 - `trace` - 定义追踪点及其操作
 - `print` - 输出格式化文本
-- `backtrace` / `bt` - 打印调用栈（实现中）
+- `backtrace` / `bt` - 为后续栈回溯预留的语法
 - `if`/`else` - 条件执行
 - `let` - 变量声明
 - 表达式语句
@@ -401,7 +401,7 @@ let neg = -0x10;       // 一元负号作用于字面量（解析为 0 - 16）
 示例
 
 ```ghostscope
-trace main:entry {
+trace main {
     if a > 10 && b == 0 {
         print "AND";
     } else if a < 100 || p == 0 {
@@ -636,7 +636,7 @@ trace foo {
 
 ## 栈回溯语句（还没有实现）
 
-打印当前调用栈：
+`backtrace;` 和 `bt;` 是为后续栈回溯功能预留的语法，目前不会输出真实调用栈。
 
 ```ghostscope
 // 完整形式
@@ -659,13 +659,12 @@ trace main {
 }
 ```
 
-### 条件追踪与回溯
+### 条件追踪
 
 ```ghostscope
 trace malloc {
     if size > 1_048_576 {  // 1 MB
         print "大内存分配: {} 字节", size;
-        backtrace;          // 打印调用栈（实现中）
     }
 }
 ```

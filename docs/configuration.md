@@ -44,8 +44,12 @@ ghostscope --target <PATH>
 # Both can be used together for PID filtering
 ghostscope -t /usr/bin/myapp -p 1234
 
-# Launch a new process with arguments
-ghostscope --args /path/to/program arg1 arg2
+# Launch a new process
+ghostscope /path/to/program
+ghostscope /path/to/program arg1 arg2
+
+# Use --args when target arguments may look like GhostScope options
+ghostscope --script-file trace.gs --args /path/to/program --target-flag value
 # Everything after --args is passed to the target program
 ```
 
@@ -53,8 +57,8 @@ ghostscope --args /path/to/program arg1 arg2
 
 ```bash
 # Run inline script
-ghostscope -s 'trace("main:entry") { print "Started"; }'
-ghostscope --script 'trace("main:entry") { print "Started"; }'
+ghostscope -s 'trace main { print "Started"; }'
+ghostscope --script 'trace main { print "Started"; }'
 
 # Run script from file
 ghostscope --script-file trace.gs
@@ -241,7 +245,8 @@ Behavior:
 | `--config <PATH>` | | Custom config file | Auto-detect |
 | `--force-perf-event-array` | | Force PerfEventArray (testing) | Off |
 | `--enable-sysmon-shared-lib` | | Start sysmon for -t shared library, so global variables can be traced | Off |
-| `--args <PROGRAM> [ARGS...]` | | Launch program with args | None |
+| `[BINARY] [ARGS...]` | | Launch target program with positional arguments | None |
+| `--args <PROGRAM> [ARGS...]` | | Separate GhostScope options from target program arguments | None |
 
 Subcommands:
 
@@ -428,9 +433,9 @@ compare_cap = 64
 max_trace_event_size = 32768
 
 # Recommended values:
-#   - Single process: 1024
-#   - Multi-process: 4096
-#   - System-wide tracing: 8192 or 16384
+#   - Simple prints: 16384
+#   - General use: 32768
+#   - Large formatted prints: 65536
 
 # Force use of PerfEventArray instead of RingBuf (TESTING ONLY)
 # WARNING: This is for testing purposes only. Set to true to force PerfEventArray
@@ -620,9 +625,8 @@ GhostScope validates configuration at startup:
 8. **eBPF Configuration**:
    - **ringbuf_size**: Must be power of 2, range 4096-16777216 bytes
    - **perf_page_count**: Must be power of 2, range 8-1024 pages
-   - **mem_dump_cap**: Per-argument memory dump cap (bytes), e.g., 256/512/1024/4096
-   - **max_trace_event_size**: Max bytes per trace event (PerfEventArray accumulation buffer)
    - **proc_module_offsets_max_entries**: Must be in range 64-65536
+   - **mem_dump_cap**, **compare_cap**, and **max_trace_event_size** are runtime caps; `max_trace_event_size` may be clamped by the selected event transport.
 
 Invalid configuration will produce clear error messages with suggestions for fixes.
 
