@@ -1,12 +1,12 @@
 //! DWARF debugging information bridge
 //!
 //! This module handles integration with DWARF debug information for
-//! variable type resolution and evaluation result processing.
+//! variable type resolution and read-plan lowering.
 
 use super::context::{CodeGenError, EbpfContext, Result};
 use ghostscope_dwarf::{
-    ComputeStep, DirectValueResult, EvaluationResult, LocationResult, MemoryAccessSize, TypeInfo,
-    VariableWithEvaluation,
+    AddressExpr, Availability, ComputeStep, EntryValueCase, MemoryAccessSize, SectionType,
+    TypeInfo, VariableAccessPath, VariableAccessSegment, VariableLocation, VariableReadPlan,
 };
 use ghostscope_process::module_probe;
 use inkwell::values::{BasicValueEnum, IntValue, PointerValue};
@@ -23,10 +23,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         if let Some(analyzer) = self.process_analyzer {
             if let Some(st) = analyzer.classify_section_for_address(module_path, link_addr) {
                 return match st {
-                    ghostscope_dwarf::core::SectionType::Text => 0,
-                    ghostscope_dwarf::core::SectionType::Rodata => 1,
-                    ghostscope_dwarf::core::SectionType::Data => 2,
-                    ghostscope_dwarf::core::SectionType::Bss => 3,
+                    SectionType::Text => 0,
+                    SectionType::Rodata => 1,
+                    SectionType::Data => 2,
+                    SectionType::Bss => 3,
                     _ => 2,
                 };
             }
@@ -61,46 +61,83 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             TypeInfo::StructType { .. } | TypeInfo::UnionType { .. } | TypeInfo::ArrayType { .. }
         )
     }
-    /// Convert EvaluationResult to LLVM value
-    pub fn evaluate_result_to_llvm_value(
+    /// Lower a semantic DWARF variable location to an LLVM value.
+    pub fn variable_location_to_llvm_value(
         &mut self,
-        evaluation_result: &EvaluationResult,
+        location: &VariableLocation,
         dwarf_type: &TypeInfo,
         var_name: &str,
         pc_address: u64,
         status_ptr: Option<PointerValue<'ctx>>,
     ) -> Result<BasicValueEnum<'ctx>> {
         debug!(
-            "Converting EvaluationResult to LLVM value for variable: {}",
+            "Converting VariableLocation to LLVM value for variable: {}",
             var_name
         );
         debug!("Evaluation context PC address: 0x{:x}", pc_address);
 
-        // Get pt_regs parameter
         let pt_regs_ptr = self.get_pt_regs_parameter()?;
+        let result_size = MemoryAccessSize::from_size(Self::get_dwarf_type_size(dwarf_type));
 
-        match evaluation_result {
-            EvaluationResult::DirectValue(direct) => {
-                self.generate_direct_value(direct, pt_regs_ptr)
+        match location {
+            VariableLocation::RegisterValue { dwarf_reg } => {
+                debug!("Generating register value: {dwarf_reg}");
+                self.load_register_value(*dwarf_reg, pt_regs_ptr)
             }
-            EvaluationResult::MemoryLocation(location) => {
-                self.generate_memory_location(location, pt_regs_ptr, dwarf_type, status_ptr)
+            VariableLocation::ComputedValue(steps) => {
+                debug!("Generating computed value: {} steps", steps.len());
+                let runtime_status_ptr = if self.condition_context_active {
+                    Some(self.get_or_create_cond_error_global())
+                } else {
+                    status_ptr
+                };
+                self.generate_compute_steps(
+                    steps,
+                    pt_regs_ptr,
+                    Some(result_size),
+                    runtime_status_ptr,
+                    None,
+                )
             }
-            EvaluationResult::Optimized => {
+            VariableLocation::ImplicitValue(bytes) => {
+                debug!("Generating implicit value: {} bytes", bytes.len());
+                let mut value: u64 = 0;
+                for (i, &byte) in bytes.iter().enumerate().take(8) {
+                    value |= (byte as u64) << (i * 8);
+                }
+                Ok(self.context.i64_type().const_int(value, false).into())
+            }
+            VariableLocation::AbsoluteAddressValue(_) => {
+                let runtime_status_ptr = if self.condition_context_active {
+                    Some(self.get_or_create_cond_error_global())
+                } else {
+                    status_ptr
+                };
+                self.variable_location_to_address_with_hint(location, runtime_status_ptr, None)
+                    .map(Into::into)
+            }
+            VariableLocation::Address(_)
+            | VariableLocation::RegisterAddress { .. }
+            | VariableLocation::ComputedAddress(_) => {
+                self.generate_memory_location(location, dwarf_type, status_ptr)
+            }
+            VariableLocation::OptimizedOut => {
                 debug!("Variable {} is optimized out", var_name);
-                // Return a placeholder value for optimized out variables
-                Ok(self.context.i64_type().const_zero().into())
-            }
-            EvaluationResult::Composite(members) => {
-                debug!(
-                    "Variable {} is composite with {} members",
+                Err(Self::dwarf_expression_unavailable_error(
                     var_name,
-                    members.len()
+                    &Availability::OptimizedOut,
+                    pc_address,
+                ))
+            }
+            VariableLocation::Pieces(pieces) => {
+                debug!(
+                    "Variable {} is composite with {} pieces",
+                    var_name,
+                    pieces.len()
                 );
-                // For now, just return the first member if available
-                if let Some(first_member) = members.first() {
-                    self.evaluate_result_to_llvm_value(
-                        &first_member.location,
+                if let Some(first_piece) = pieces.first() {
+                    self.variable_location_to_llvm_value(
+                        &first_piece.location,
                         dwarf_type,
                         var_name,
                         pc_address,
@@ -110,13 +147,19 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     Ok(self.context.i64_type().const_zero().into())
                 }
             }
+            VariableLocation::FrameBaseRelative { .. } => Err(CodeGenError::DwarfError(
+                "Frame-base-relative variable plan requires resolved frame base".to_string(),
+            )),
+            VariableLocation::Unknown => Err(CodeGenError::DwarfError(
+                "Variable read plan has unknown location".to_string(),
+            )),
         }
     }
 
     /// Variant that allows passing an explicit module hint for offsets lookup
-    pub fn evaluation_result_to_address_with_hint(
+    pub fn variable_location_to_address_with_hint(
         &mut self,
-        evaluation_result: &EvaluationResult,
+        location: &VariableLocation,
         status_ptr: Option<PointerValue<'ctx>>,
         module_hint: Option<&str>,
     ) -> Result<IntValue<'ctx>> {
@@ -125,83 +168,41 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         //   always rebased using per-module section offsets (ASLR) to get a runtime address.
         // - Runtime-derived addresses (register/stack-relative or computed via dereference)
         //   are used as-is and are NOT rebased.
-        // The caller signals which path we are on by providing the original evaluation_result.
+        // The caller signals which path we are on by providing the semantic location shape.
         let pt_regs_ptr = self.get_pt_regs_parameter()?;
-        // Default assumption: offsets are available unless a lookup proves otherwise.
         self.store_offsets_found_const(true)?;
 
-        match evaluation_result {
-            EvaluationResult::MemoryLocation(LocationResult::Address(addr)) => {
-                // Unified: always attempt runtime rebasing via proc_module_offsets
-                let ctx = self.get_compile_time_context()?;
-                let module_for_offsets = module_hint
-                    .map(|s| s.to_string())
-                    .or_else(|| self.current_resolved_var_module_path.clone())
-                    .unwrap_or_else(|| ctx.module_path.clone());
-                let st_code = self.section_code_for_address(&module_for_offsets, *addr);
-                let cookie = self.cookie_for_module_or_fallback(&module_for_offsets);
-                let link_val = self.context.i64_type().const_int(*addr, false);
-                let (rt_addr, found_flag) =
-                    self.generate_runtime_address_from_offsets(link_val, st_code, cookie)?;
-                if let Some(sp) = status_ptr {
-                    let is_miss = self
-                        .builder
-                        .build_int_compare(
-                            inkwell::IntPredicate::EQ,
-                            found_flag,
-                            self.context.bool_type().const_zero(),
-                            "is_off_miss",
-                        )
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    let cur_status = self
-                        .builder
-                        .build_load(self.context.i8_type(), sp, "cur_status")
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    let is_ok = self
-                        .builder
-                        .build_int_compare(
-                            inkwell::IntPredicate::EQ,
-                            cur_status.into_int_value(),
-                            self.context.i8_type().const_zero(),
-                            "status_is_ok",
-                        )
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    let should_store = self
-                        .builder
-                        .build_and(is_miss, is_ok, "store_offsets_unavail")
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    let new_status = self
-                        .builder
-                        .build_select(
-                            should_store,
-                            self.context
-                                .i8_type()
-                                .const_int(
-                                    ghostscope_protocol::VariableStatus::OffsetsUnavailable as u64,
-                                    false,
-                                )
-                                .into(),
-                            cur_status,
-                            "new_status",
-                        )
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    self.builder
-                        .build_store(sp, new_status)
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                }
-                self.store_offsets_found_flag(found_flag)?;
-                self.current_resolved_var_module_path = None;
-                Ok(rt_addr)
+        match location {
+            VariableLocation::OptimizedOut => {
+                let pc_address = self
+                    .current_compile_time_context
+                    .as_ref()
+                    .map(|ctx| ctx.pc_address)
+                    .unwrap_or(0);
+                Err(Self::dwarf_expression_unavailable_error(
+                    "DWARF address expression",
+                    &Availability::OptimizedOut,
+                    pc_address,
+                ))
             }
-            EvaluationResult::MemoryLocation(LocationResult::RegisterAddress {
-                register,
-                offset,
-                ..
-            }) => {
-                let reg_val = self.load_register_value(*register, pt_regs_ptr)?;
+            VariableLocation::Address(expr) => self.address_steps_to_address_with_hint(
+                &expr.steps,
+                pt_regs_ptr,
+                status_ptr,
+                module_hint,
+            ),
+            VariableLocation::AbsoluteAddressValue(expr) => self
+                .address_steps_to_address_with_hint(
+                    &expr.steps,
+                    pt_regs_ptr,
+                    status_ptr,
+                    module_hint,
+                ),
+            VariableLocation::RegisterAddress { dwarf_reg, offset } => {
+                let reg_val = self.load_register_value(*dwarf_reg, pt_regs_ptr)?;
                 if let BasicValueEnum::IntValue(reg_i) = reg_val {
-                    if let Some(ofs) = offset {
-                        let ofs_val = self.context.i64_type().const_int(*ofs as u64, true);
+                    if *offset != 0 {
+                        let ofs_val = self.context.i64_type().const_int(*offset as u64, true);
                         let sum = self
                             .builder
                             .build_int_add(reg_i, ofs_val, "addr_with_offset")
@@ -216,213 +217,173 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     ))
                 }
             }
-            EvaluationResult::MemoryLocation(LocationResult::ComputedLocation { steps }) => {
-                // Try to fold constant-only address expressions (e.g., global + const offset)
-                // If foldable, treat as link-time address and apply ASLR offsets via map.
-                let mut const_stack: Vec<i64> = Vec::new();
-                let mut foldable = true;
-                for s in steps.iter() {
-                    match s {
-                        ComputeStep::PushConstant(v) => const_stack.push(*v),
-                        ComputeStep::Add => {
-                            if const_stack.len() >= 2 {
-                                let b = const_stack.pop().unwrap();
-                                let a = const_stack.pop().unwrap();
-                                const_stack.push(a.saturating_add(b));
-                            } else {
-                                foldable = false;
-                                break;
-                            }
-                        }
-                        // Any register load or deref means runtime-derived address; not foldable
-                        ComputeStep::LoadRegister(_) | ComputeStep::Dereference { .. } => {
-                            foldable = false;
-                            break;
-                        }
-                        _ => {
-                            // Unknown/non-add op: treat as non-foldable
-                            foldable = false;
-                            break;
-                        }
-                    }
-                }
-
-                if foldable && const_stack.len() == 1 {
-                    let link_addr_u = const_stack[0] as u64;
-                    let ctx = self.get_compile_time_context()?;
-                    let module_for_offsets = module_hint
-                        .map(|s| s.to_string())
-                        .or_else(|| self.current_resolved_var_module_path.clone())
-                        .unwrap_or_else(|| ctx.module_path.clone());
-                    let st_code = self.section_code_for_address(&module_for_offsets, link_addr_u);
-                    let cookie = self.cookie_for_module_or_fallback(&module_for_offsets);
-                    let link_val = self.context.i64_type().const_int(link_addr_u, false);
-                    let (rt_addr, found_flag) =
-                        self.generate_runtime_address_from_offsets(link_val, st_code, cookie)?;
-                    if let Some(sp) = status_ptr {
-                        let is_miss = self
-                            .builder
-                            .build_int_compare(
-                                inkwell::IntPredicate::EQ,
-                                found_flag,
-                                self.context.bool_type().const_zero(),
-                                "is_off_miss",
-                            )
-                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                        let cur_status = self
-                            .builder
-                            .build_load(self.context.i8_type(), sp, "cur_status")
-                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                        let is_ok = self
-                            .builder
-                            .build_int_compare(
-                                inkwell::IntPredicate::EQ,
-                                cur_status.into_int_value(),
-                                self.context.i8_type().const_zero(),
-                                "status_is_ok",
-                            )
-                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                        let should_store = self
-                            .builder
-                            .build_and(is_miss, is_ok, "store_offsets_unavail")
-                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                        let new_status = self
-                            .builder
-                            .build_select(
-                                should_store,
-                                self.context
-                                    .i8_type()
-                                    .const_int(
-                                        ghostscope_protocol::VariableStatus::OffsetsUnavailable
-                                            as u64,
-                                        false,
-                                    )
-                                    .into(),
-                                cur_status,
-                                "new_status",
-                            )
-                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                        self.builder
-                            .build_store(sp, new_status)
-                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    }
-                    self.current_resolved_var_module_path = None;
-                    return Ok(rt_addr);
-                }
-
-                // Attempt: if steps start with PushConstant(base) and first dynamic op is Dereference
-                // (with no LoadRegister before it), apply ASLR offsets to base and continue
-                if let Some(ComputeStep::PushConstant(base_const)) = steps.first() {
-                    // Scan until first Dereference or LoadRegister
-                    let mut saw_reg = false;
-                    let mut saw_deref = false;
-                    for s in &steps[1..] {
-                        match s {
-                            ComputeStep::LoadRegister(_) => {
-                                saw_reg = true;
-                                break;
-                            }
-                            ComputeStep::Dereference { .. } => {
-                                saw_deref = true;
-                                break;
-                            }
-                            _ => {}
-                        }
-                    }
-                    if saw_deref && !saw_reg {
-                        let link_addr_u = *base_const as u64;
-                        let ctx = self.get_compile_time_context()?;
-                        let module_for_offsets = module_hint
-                            .map(|s| s.to_string())
-                            .or_else(|| self.current_resolved_var_module_path.clone())
-                            .unwrap_or_else(|| ctx.module_path.clone());
-                        let st_code =
-                            self.section_code_for_address(&module_for_offsets, link_addr_u);
-                        let cookie = self.cookie_for_module_or_fallback(&module_for_offsets);
-                        let link_val = self.context.i64_type().const_int(link_addr_u, false);
-                        let (rt, found_flag) =
-                            self.generate_runtime_address_from_offsets(link_val, st_code, cookie)?;
-                        if let Some(sp) = status_ptr {
-                            let is_miss = self
-                                .builder
-                                .build_int_compare(
-                                    inkwell::IntPredicate::EQ,
-                                    found_flag,
-                                    self.context.bool_type().const_zero(),
-                                    "is_off_miss",
-                                )
-                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                            let cur_status = self
-                                .builder
-                                .build_load(self.context.i8_type(), sp, "cur_status")
-                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                            let is_ok = self
-                                .builder
-                                .build_int_compare(
-                                    inkwell::IntPredicate::EQ,
-                                    cur_status.into_int_value(),
-                                    self.context.i8_type().const_zero(),
-                                    "status_is_ok",
-                                )
-                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                            let should_store = self
-                                .builder
-                                .build_and(is_miss, is_ok, "store_offsets_unavail")
-                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                            let new_status = self
-                                .builder
-                                .build_select(
-                                    should_store,
-                                    self.context
-                                        .i8_type()
-                                        .const_int(
-                                            ghostscope_protocol::VariableStatus::OffsetsUnavailable
-                                                as u64,
-                                            false,
-                                        )
-                                        .into(),
-                                    cur_status,
-                                    "new_status",
-                                )
-                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                            self.builder
-                                .build_store(sp, new_status)
-                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                        }
-                        // Execute remaining steps with rt pre-pushed as base
-                        let rest = &steps[1..];
-                        let val = self.generate_compute_steps(
-                            rest,
-                            pt_regs_ptr,
-                            None,
-                            status_ptr,
-                            Some(rt),
-                        )?;
-                        if let BasicValueEnum::IntValue(i) = val {
-                            return Ok(i);
-                        } else {
-                            return Err(CodeGenError::LLVMError(
-                                "Computed location did not produce integer".to_string(),
-                            ));
-                        }
-                    }
-                }
-
-                // Fallback: execute steps at runtime and use the result directly (no offsets)
-                let val =
-                    self.generate_compute_steps(steps, pt_regs_ptr, None, status_ptr, None)?;
-                if let BasicValueEnum::IntValue(i) = val {
-                    Ok(i)
-                } else {
-                    Err(CodeGenError::LLVMError(
-                        "Computed location did not produce integer".to_string(),
-                    ))
-                }
+            VariableLocation::ComputedAddress(steps) => {
+                self.address_steps_to_address_with_hint(steps, pt_regs_ptr, status_ptr, module_hint)
             }
             _ => Err(CodeGenError::NotImplemented(
-                "Unable to compute address from evaluation result".to_string(),
+                "Unable to compute address from variable location".to_string(),
             )),
         }
+    }
+
+    fn address_steps_to_address_with_hint(
+        &mut self,
+        steps: &[ComputeStep],
+        pt_regs_ptr: PointerValue<'ctx>,
+        status_ptr: Option<PointerValue<'ctx>>,
+        module_hint: Option<&str>,
+    ) -> Result<IntValue<'ctx>> {
+        if let Some(link_addr) = Self::fold_constant_address_steps(steps) {
+            return self.runtime_address_from_link_time_address(link_addr, status_ptr, module_hint);
+        }
+
+        // If a static base is dereferenced before any register dependency, rebase
+        // the base first and then execute the remaining runtime expression.
+        if let Some(ComputeStep::PushConstant(base_const)) = steps.first() {
+            let mut saw_reg = false;
+            let mut saw_deref = false;
+            for step in &steps[1..] {
+                match step {
+                    ComputeStep::LoadRegister(_) => {
+                        saw_reg = true;
+                        break;
+                    }
+                    ComputeStep::Dereference { .. } => {
+                        saw_deref = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+
+            if saw_deref && !saw_reg {
+                let rt = self.runtime_address_from_link_time_address(
+                    *base_const as u64,
+                    status_ptr,
+                    module_hint,
+                )?;
+                let val = self.generate_compute_steps(
+                    &steps[1..],
+                    pt_regs_ptr,
+                    None,
+                    status_ptr,
+                    Some(rt),
+                )?;
+                return match val {
+                    BasicValueEnum::IntValue(value) => Ok(value),
+                    _ => Err(CodeGenError::LLVMError(
+                        "Computed location did not produce integer".to_string(),
+                    )),
+                };
+            }
+        }
+
+        let val = self.generate_compute_steps(steps, pt_regs_ptr, None, status_ptr, None)?;
+        match val {
+            BasicValueEnum::IntValue(value) => Ok(value),
+            _ => Err(CodeGenError::LLVMError(
+                "Computed location did not produce integer".to_string(),
+            )),
+        }
+    }
+
+    fn fold_constant_address_steps(steps: &[ComputeStep]) -> Option<u64> {
+        let mut const_stack: Vec<i64> = Vec::new();
+        for step in steps {
+            match step {
+                ComputeStep::PushConstant(value) => const_stack.push(*value),
+                ComputeStep::Add => {
+                    let b = const_stack.pop()?;
+                    let a = const_stack.pop()?;
+                    const_stack.push(a.saturating_add(b));
+                }
+                _ => return None,
+            }
+        }
+
+        if const_stack.len() == 1 && const_stack[0] >= 0 {
+            Some(const_stack[0] as u64)
+        } else {
+            None
+        }
+    }
+
+    fn runtime_address_from_link_time_address(
+        &mut self,
+        link_addr: u64,
+        status_ptr: Option<PointerValue<'ctx>>,
+        module_hint: Option<&str>,
+    ) -> Result<IntValue<'ctx>> {
+        let ctx = self.get_compile_time_context()?;
+        let module_for_offsets = module_hint
+            .map(|s| s.to_string())
+            .or_else(|| self.current_resolved_var_module_path.clone())
+            .unwrap_or_else(|| ctx.module_path.clone());
+        let st_code = self.section_code_for_address(&module_for_offsets, link_addr);
+        let cookie = self.cookie_for_module_or_fallback(&module_for_offsets);
+        let link_val = self.context.i64_type().const_int(link_addr, false);
+        let (rt_addr, found_flag) =
+            self.generate_runtime_address_from_offsets(link_val, st_code, cookie)?;
+        self.store_offsets_unavailable_status(status_ptr, found_flag)?;
+        self.store_offsets_found_flag(found_flag)?;
+        self.current_resolved_var_module_path = None;
+        Ok(rt_addr)
+    }
+
+    fn store_offsets_unavailable_status(
+        &self,
+        status_ptr: Option<PointerValue<'ctx>>,
+        found_flag: IntValue<'ctx>,
+    ) -> Result<()> {
+        let Some(sp) = status_ptr else {
+            return Ok(());
+        };
+
+        let is_miss = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                found_flag,
+                self.context.bool_type().const_zero(),
+                "is_off_miss",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let cur_status = self
+            .builder
+            .build_load(self.context.i8_type(), sp, "cur_status")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let is_ok = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                cur_status.into_int_value(),
+                self.context.i8_type().const_zero(),
+                "status_is_ok",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let should_store = self
+            .builder
+            .build_and(is_miss, is_ok, "store_offsets_unavail")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let new_status = self
+            .builder
+            .build_select(
+                should_store,
+                self.context
+                    .i8_type()
+                    .const_int(
+                        ghostscope_protocol::VariableStatus::OffsetsUnavailable as u64,
+                        false,
+                    )
+                    .into(),
+                cur_status,
+                "new_status",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder
+            .build_store(sp, new_status)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        Ok(())
     }
 
     /// Convert DWARF type size to MemoryAccessSize
@@ -437,224 +398,68 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         }
     }
 
-    /// Generate LLVM IR for direct value result
-    fn generate_direct_value(
-        &mut self,
-        direct: &DirectValueResult,
-        pt_regs_ptr: PointerValue<'ctx>,
-    ) -> Result<BasicValueEnum<'ctx>> {
-        match direct {
-            DirectValueResult::Constant(value) => {
-                debug!("Generating constant: {}", value);
-                Ok(self
-                    .context
-                    .i64_type()
-                    .const_int(*value as u64, true)
-                    .into())
-            }
-
-            DirectValueResult::AbsoluteAddress(value) => {
-                debug!("Generating rebased absolute address: 0x{value:x}");
-                let module_hint = self.current_resolved_var_module_path.clone();
-                let status_ptr = if self.condition_context_active {
-                    Some(self.get_or_create_cond_error_global())
-                } else {
-                    None
-                };
-                let eval = ghostscope_dwarf::EvaluationResult::MemoryLocation(
-                    ghostscope_dwarf::LocationResult::Address(*value),
-                );
-                self.evaluation_result_to_address_with_hint(
-                    &eval,
-                    status_ptr,
-                    module_hint.as_deref(),
-                )
-                .map(Into::into)
-            }
-
-            DirectValueResult::ImplicitValue(bytes) => {
-                debug!("Generating implicit value: {} bytes", bytes.len());
-                // Convert bytes to integer value (little-endian)
-                let mut value: u64 = 0;
-                for (i, &byte) in bytes.iter().enumerate().take(8) {
-                    value |= (byte as u64) << (i * 8);
-                }
-                Ok(self.context.i64_type().const_int(value, false).into())
-            }
-
-            DirectValueResult::RegisterValue(reg_num) => {
-                debug!("Generating register value: {}", reg_num);
-                let reg_value = self.load_register_value(*reg_num, pt_regs_ptr)?;
-                Ok(reg_value)
-            }
-
-            DirectValueResult::ComputedValue { steps, result_size } => {
-                debug!("Generating computed value: {} steps", steps.len());
-                let status_ptr = if self.condition_context_active {
-                    Some(self.get_or_create_cond_error_global())
-                } else {
-                    None
-                };
-                self.generate_compute_steps(
-                    steps,
-                    pt_regs_ptr,
-                    Some(*result_size),
-                    status_ptr,
-                    None,
-                )
-            }
+    pub(super) fn variable_read_plan_to_runtime_read_parts(
+        &self,
+        plan: VariableReadPlan,
+        pc_address: u64,
+    ) -> Result<(String, TypeInfo, VariableLocation)> {
+        let lowering = plan.bpf_lowering_plan(&self.compile_options.runtime_capabilities);
+        if !lowering.availability.is_available()
+            && lowering.availability != Availability::OptimizedOut
+        {
+            return Err(Self::dwarf_expression_unavailable_error(
+                &plan.name,
+                &lowering.availability,
+                pc_address,
+            ));
         }
+
+        let dwarf_type = if lowering.availability == Availability::OptimizedOut {
+            TypeInfo::OptimizedOut {
+                name: plan.name.clone(),
+            }
+        } else {
+            plan.dwarf_type.clone().ok_or_else(|| {
+                CodeGenError::DwarfError("Expression has no DWARF type information".to_string())
+            })?
+        };
+
+        Ok((plan.name, dwarf_type, plan.location))
     }
 
-    /// Generate LLVM IR for memory location result
+    /// Generate LLVM IR for memory-backed variable locations.
     fn generate_memory_location(
         &mut self,
-        location: &LocationResult,
-        pt_regs_ptr: PointerValue<'ctx>,
+        location: &VariableLocation,
         dwarf_type: &TypeInfo,
         status_ptr: Option<PointerValue<'ctx>>,
     ) -> Result<BasicValueEnum<'ctx>> {
-        match location {
-            // Policy note:
-            // We decide ASLR rebasing based on the DWARF evaluation RESULT SHAPE, not a
-            // "global variable" tag. Whenever DWARF yields a link-time address
-            // (LocationResult::Address) — including file-scope globals, static locals,
-            // rodata/data/bss, or any constant-folded address — we MUST apply per-module
-            // section offsets (.text/.rodata/.data/.bss) to obtain the runtime address.
-            // Conversely, for runtime-derived addresses (RegisterAddress or computed from
-            // registers/dereferences), we DO NOT rebase.
-            LocationResult::Address(addr) => {
-                debug!("Generating absolute address: 0x{:x}", addr);
-                // Convert link-time address to runtime address using ASLR offsets when available
-                let module_hint = self.current_resolved_var_module_path.clone();
-                let runtime_status_ptr = if self.condition_context_active {
-                    Some(self.get_or_create_cond_error_global())
-                } else {
-                    status_ptr
-                };
-                let eval = ghostscope_dwarf::EvaluationResult::MemoryLocation(
-                    ghostscope_dwarf::LocationResult::Address(*addr),
-                );
-                let rt_addr = self.evaluation_result_to_address_with_hint(
-                    &eval,
-                    runtime_status_ptr,
-                    module_hint.as_deref(),
-                )?;
-                // Aggregate types (struct/union/array) are represented as pointers in expressions
-                if self.is_aggregate_type(dwarf_type) {
-                    let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
-                    let as_ptr = self
-                        .builder
-                        .build_int_to_ptr(rt_addr, ptr_ty, "aggregate_addr_as_ptr")
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    return Ok(as_ptr.into());
-                }
-                // Use DWARF type size for memory access
-                let access_size = self.dwarf_type_to_memory_access_size(dwarf_type);
-                if self.condition_context_active {
-                    self.generate_memory_read_with_status(rt_addr, access_size)
-                } else {
-                    self.generate_memory_read(rt_addr, access_size, status_ptr)
-                }
-            }
+        let module_hint = self.current_resolved_var_module_path.clone();
+        let runtime_status_ptr = if self.condition_context_active {
+            Some(self.get_or_create_cond_error_global())
+        } else {
+            status_ptr
+        };
+        let addr = self.variable_location_to_address_with_hint(
+            location,
+            runtime_status_ptr,
+            module_hint.as_deref(),
+        )?;
 
-            LocationResult::RegisterAddress {
-                register,
-                offset,
-                size,
-            } => {
-                debug!(
-                    "Generating register address: reg{} {:+}",
-                    register,
-                    offset.unwrap_or(0)
-                );
+        if self.is_aggregate_type(dwarf_type) {
+            let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+            let as_ptr = self
+                .builder
+                .build_int_to_ptr(addr, ptr_ty, "aggregate_addr_as_ptr")
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            return Ok(as_ptr.into());
+        }
 
-                // Load register value
-                let reg_value = self.load_register_value(*register, pt_regs_ptr)?;
-
-                // Add offset if present
-                let final_addr = if let Some(offset) = offset {
-                    let offset_value = self.context.i64_type().const_int(*offset as u64, true);
-                    if let BasicValueEnum::IntValue(reg_int) = reg_value {
-                        self.builder
-                            .build_int_add(reg_int, offset_value, "addr_with_offset")
-                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-                    } else {
-                        return Err(CodeGenError::RegisterMappingError(
-                            "Register value is not integer".to_string(),
-                        ));
-                    }
-                } else if let BasicValueEnum::IntValue(reg_int) = reg_value {
-                    reg_int
-                } else {
-                    return Err(CodeGenError::RegisterMappingError(
-                        "Register value is not integer".to_string(),
-                    ));
-                };
-                // Aggregate types: return pointer instead of reading as scalar
-                if self.is_aggregate_type(dwarf_type) {
-                    let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
-                    let as_ptr = self
-                        .builder
-                        .build_int_to_ptr(final_addr, ptr_ty, "aggregate_addr_as_ptr")
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    return Ok(as_ptr.into());
-                }
-                // Determine memory access size - prefer LocationResult size if available, otherwise use DWARF type
-                let access_size = size
-                    .map(|s| match s {
-                        1 => MemoryAccessSize::U8,
-                        2 => MemoryAccessSize::U16,
-                        4 => MemoryAccessSize::U32,
-                        _ => MemoryAccessSize::U64,
-                    })
-                    .unwrap_or_else(|| self.dwarf_type_to_memory_access_size(dwarf_type));
-
-                if self.condition_context_active {
-                    self.generate_memory_read_with_status(final_addr, access_size)
-                } else {
-                    self.generate_memory_read(final_addr, access_size, status_ptr)
-                }
-            }
-
-            LocationResult::ComputedLocation { steps } => {
-                debug!("Generating computed location: {} steps", steps.len());
-                // Execute steps to compute the address
-                let runtime_status_ptr = if self.condition_context_active {
-                    Some(self.get_or_create_cond_error_global())
-                } else {
-                    status_ptr
-                };
-                let addr_value = self.generate_compute_steps(
-                    steps,
-                    pt_regs_ptr,
-                    None,
-                    runtime_status_ptr,
-                    None,
-                )?;
-                if let BasicValueEnum::IntValue(addr) = addr_value {
-                    // For aggregate types, return pointer to address instead of loading a value
-                    if self.is_aggregate_type(dwarf_type) {
-                        let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
-                        let as_ptr = self
-                            .builder
-                            .build_int_to_ptr(addr, ptr_ty, "aggregate_addr_as_ptr")
-                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                        return Ok(as_ptr.into());
-                    }
-                    // Use DWARF type size for memory access
-                    let access_size = self.dwarf_type_to_memory_access_size(dwarf_type);
-                    if self.condition_context_active {
-                        self.generate_memory_read_with_status(addr, access_size)
-                    } else {
-                        self.generate_memory_read(addr, access_size, status_ptr)
-                    }
-                } else {
-                    Err(CodeGenError::LLVMError(
-                        "Address computation must return integer".to_string(),
-                    ))
-                }
-            }
+        let access_size = self.dwarf_type_to_memory_access_size(dwarf_type);
+        if self.condition_context_active {
+            self.generate_memory_read_with_status(addr, access_size)
+        } else {
+            self.generate_memory_read(addr, access_size, status_ptr)
         }
     }
 
@@ -1030,7 +835,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     fn generate_entry_value_lookup(
         &mut self,
         caller_pc_steps: &[ComputeStep],
-        cases: &[ghostscope_dwarf::core::EntryValueCase],
+        cases: &[EntryValueCase],
         pt_regs_ptr: PointerValue<'ctx>,
         result_size: Option<MemoryAccessSize>,
         status_ptr: Option<PointerValue<'ctx>>,
@@ -1175,16 +980,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         Ok(phi.as_basic_value().into_int_value())
     }
 
-    /// Query DWARF for complex expression (supports member access, array access, etc.)
-    pub fn query_dwarf_for_complex_expr(
-        &mut self,
-        expr: &crate::script::Expr,
-    ) -> Result<Option<VariableWithEvaluation>> {
-        use crate::script::Expr;
-
-        // Expand script alias variables inside the expression so downstream
-        // DWARF resolvers see the actual DWARF-based expression tree.
-        // Guard against self-referential or cyclic aliases.
+    fn expand_dwarf_aliases(&self, expr: &crate::script::Expr) -> Result<crate::script::Expr> {
         fn expand_aliases(
             ctx: &crate::ebpf::context::EbpfContext<'_, '_>,
             e: &crate::script::Expr,
@@ -1246,7 +1042,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             )));
                         }
                         if let Some(alias_expr) = ctx.get_alias_variable(head) {
-                            // Expand the alias head, then append member segments
                             let mut acc = expand_aliases(ctx, &alias_expr, visited, depth + 1)?;
                             for seg in &chain[1..] {
                                 acc = E::MemberAccess(Box::new(acc), seg.clone());
@@ -1277,203 +1072,256 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         }
 
         let mut visited = std::collections::HashSet::new();
-        let expanded = expand_aliases(self, expr, &mut visited, 0)?;
+        expand_aliases(self, expr, &mut visited, 0)
+    }
 
+    pub(super) fn query_dwarf_for_complex_expr_plan(
+        &mut self,
+        expr: &crate::script::Expr,
+    ) -> Result<Option<VariableReadPlan>> {
+        use crate::script::Expr;
+
+        let expanded = self.expand_dwarf_aliases(expr)?;
         match &expanded {
-            // Simple variable lookup
-            Expr::Variable(var_name) => self.query_dwarf_for_variable(var_name),
-
-            // Member access: obj.field
-            Expr::MemberAccess(obj_expr, field_name) => {
-                self.query_dwarf_for_member_access(obj_expr, field_name)
+            Expr::Variable(var_name) => self.query_dwarf_for_variable_plan(var_name),
+            Expr::MemberAccess(_, _)
+            | Expr::ArrayAccess(_, _)
+            | Expr::ChainAccess(_)
+            | Expr::PointerDeref(_) => {
+                if let Some((base, access_path)) = Self::access_path_from_expr(&expanded)? {
+                    self.query_dwarf_for_pc_access_plan(&base, &access_path)
+                } else {
+                    Ok(None)
+                }
             }
-
-            // Array access: arr[index]
-            Expr::ArrayAccess(array_expr, index_expr) => {
-                self.query_dwarf_for_array_access(array_expr, index_expr)
-            }
-
-            // Chain access: person.name.first
-            Expr::ChainAccess(chain) => self.query_dwarf_for_chain_access(chain),
-
-            // Pointer dereference: *ptr
-            Expr::PointerDeref(expr) => self.query_dwarf_for_pointer_deref(expr),
-
-            // Other expression types are not supported for DWARF queries
             _ => Ok(None),
         }
     }
 
-    /// Query DWARF for variable information
-    pub fn query_dwarf_for_variable(
+    /// Query DWARF for complex expression (supports member access, array access, etc.)
+    pub fn query_dwarf_for_complex_expr(
+        &mut self,
+        expr: &crate::script::Expr,
+    ) -> Result<Option<VariableReadPlan>> {
+        self.query_dwarf_for_complex_expr_plan(expr)
+    }
+
+    /// Query DWARF for a PC-sensitive local variable read plan.
+    fn query_dwarf_for_variable_plan(
         &mut self,
         var_name: &str,
-    ) -> Result<Option<VariableWithEvaluation>> {
+    ) -> Result<Option<VariableReadPlan>> {
         let context = self.get_compile_time_context()?;
         let pc_address = context.pc_address;
         let module_path = context.module_path.clone();
 
         debug!(
-            "Querying DWARF for variable '{}' at PC 0x{:x} in module '{}'",
+            "Querying DWARF variable plan for '{}' at PC 0x{:x} in module '{}'",
             var_name, pc_address, module_path
         );
 
         let analyzer = self
             .process_analyzer
             .ok_or_else(|| CodeGenError::DwarfError("No DWARF analyzer available".to_string()))?;
+        let prefer_module = std::path::PathBuf::from(module_path);
+        let module_address =
+            ghostscope_dwarf::ModuleAddress::new(prefer_module.clone(), pc_address);
 
-        let module_address = ghostscope_dwarf::ModuleAddress::new(
-            std::path::PathBuf::from(module_path.clone()),
-            pc_address,
-        );
-
-        let module_path_owned = module_path;
-        let lookup_globals = |analyzer: &ghostscope_dwarf::DwarfAnalyzer| -> Result<
-            Option<(std::path::PathBuf, VariableWithEvaluation)>,
-        > {
-            debug!(
-                "Variable '{}' not found in locals; attempting global lookup",
-                var_name
-            );
-            let matches = analyzer.find_global_variables_by_name(var_name);
-            if matches.is_empty() {
-                return Ok(None);
-            }
-
-            // Candidate ranking:
-            // 1) current module + link address
-            // 2) any module + link address
-            // 3) current module
-            // 4) all matches
-            let preferred: Vec<(
-                std::path::PathBuf,
-                ghostscope_dwarf::core::GlobalVariableInfo,
-            )> = matches
-                .iter()
-                .filter(|(p, _)| p.to_string_lossy() == module_path_owned.as_str())
-                .cloned()
-                .collect();
-            let preferred_with_addr: Vec<(
-                std::path::PathBuf,
-                ghostscope_dwarf::core::GlobalVariableInfo,
-            )> = preferred
-                .iter()
-                .filter(|(_, info)| info.link_address.is_some())
-                .cloned()
-                .collect();
-            let with_addr: Vec<(
-                std::path::PathBuf,
-                ghostscope_dwarf::core::GlobalVariableInfo,
-            )> = matches
-                .iter()
-                .filter(|(_, info)| info.link_address.is_some())
-                .cloned()
-                .collect();
-
-            let candidates: Vec<(
-                std::path::PathBuf,
-                ghostscope_dwarf::core::GlobalVariableInfo,
-            )> = if !preferred_with_addr.is_empty() {
-                preferred_with_addr
-            } else if !with_addr.is_empty() {
-                with_addr
-            } else if !preferred.is_empty() {
-                preferred
-            } else {
-                matches
-            };
-
-            if candidates.len() == 1 {
-                let (mpath, info) = &candidates[0];
-                let gv = analyzer
-                    .resolve_variable_by_offsets_in_module(
-                        mpath,
-                        info.unit_offset,
-                        info.die_offset,
-                    )
-                    .map_err(|err| CodeGenError::DwarfError(err.to_string()))?;
-                return Ok(Some((mpath.clone(), gv)));
-            }
-
-            // Ambiguous candidates: resolve each candidate and prefer the one with a concrete type size.
-            let mut resolved: Vec<(std::path::PathBuf, VariableWithEvaluation)> = Vec::new();
-            let mut resolved_with_size: Vec<(std::path::PathBuf, VariableWithEvaluation)> =
-                Vec::new();
-            for (mpath, info) in candidates.iter() {
-                let gv = match analyzer.resolve_variable_by_offsets_in_module(
-                    mpath,
-                    info.unit_offset,
-                    info.die_offset,
-                ) {
-                    Ok(v) => v,
-                    Err(err) => {
-                        debug!(
-                            "Skipping unresolved global candidate '{}' in '{}': {}",
-                            var_name,
-                            mpath.display(),
-                            err
-                        );
-                        continue;
+        let pc_plan = match analyzer.resolve_pc(&module_address) {
+            Ok(pc_context) => match analyzer.plan_variable_by_name(&pc_context, var_name) {
+                Ok(Some(plan)) => {
+                    debug!("Found DWARF variable '{}' via PC variable plan", var_name);
+                    Some(plan)
+                }
+                Ok(None) => {
+                    debug!(
+                        "Variable '{}' not found in PC variable plan; trying global read plan",
+                        var_name
+                    );
+                    None
+                }
+                Err(err) => {
+                    let message = err.to_string();
+                    if message.starts_with("Ambiguous variable")
+                        || message.starts_with("Unavailable variable")
+                    {
+                        return Err(CodeGenError::DwarfError(message));
                     }
-                };
-                let ty_size = gv.dwarf_type.as_ref().map(|t| t.size()).unwrap_or(0);
-                if ty_size > 0 {
-                    resolved_with_size.push((mpath.clone(), gv.clone()));
+                    debug!(
+                        "PC variable plan lookup error for '{}': {message}; trying global read plan",
+                        var_name
+                    );
+                    None
                 }
-                resolved.push((mpath.clone(), gv));
-            }
-
-            if resolved_with_size.len() == 1 {
-                return Ok(resolved_with_size.into_iter().next());
-            }
-
-            if resolved.len() == 1 {
-                return Ok(resolved.into_iter().next());
-            }
-
-            let ambiguous_count = if resolved_with_size.len() > 1 {
-                resolved_with_size.len()
-            } else if !resolved.is_empty() {
-                resolved.len()
-            } else {
-                candidates.len()
-            };
-            debug!("Global '{var_name}' is ambiguous across modules ({ambiguous_count} candidates)");
-            Err(CodeGenError::DwarfError(format!(
-                "Ambiguous global '{var_name}': {ambiguous_count} matches"
-            )))
-        };
-
-        match analyzer.get_all_variables_at_address(&module_address) {
-            Ok(vars) => {
-                if let Some(var_result) = vars.iter().find(|v| v.name == var_name).or_else(|| {
-                    let prefix = format!("{var_name}@");
-                    vars.iter().find(|v| v.name.starts_with(&prefix))
-                }) {
-                    debug!("Found DWARF variable '{}' in locals/params", var_name);
-                    Ok(Some(var_result.clone()))
-                } else if let Some((mpath, gv)) = lookup_globals(analyzer)? {
-                    self.current_resolved_var_module_path =
-                        Some(mpath.to_string_lossy().to_string());
-                    Ok(Some(gv))
-                } else {
-                    Ok(None)
-                }
-            }
-            Err(e) => {
+            },
+            Err(err) => {
                 debug!(
-                    "DWARF local lookup error for '{}': {e}; falling back to globals",
+                    "PC context resolution failed for '{}': {err}; trying global read plan",
                     var_name
                 );
-                if let Some((mpath, gv)) = lookup_globals(analyzer)? {
-                    self.current_resolved_var_module_path =
-                        Some(mpath.to_string_lossy().to_string());
-                    Ok(Some(gv))
-                } else {
-                    Ok(None)
+                None
+            }
+        };
+
+        if pc_plan.is_some() {
+            return Ok(pc_plan);
+        }
+
+        if let Some((global_module, plan)) = analyzer
+            .plan_global_chain_access_read_plan(&prefer_module, var_name, &[])
+            .map_err(|err| CodeGenError::DwarfError(err.to_string()))?
+        {
+            debug!("Found DWARF global '{}' via variable read plan", var_name);
+            self.current_resolved_var_module_path =
+                Some(global_module.to_string_lossy().to_string());
+            return Ok(Some(plan));
+        }
+
+        debug!("Variable '{var_name}' not found in read plans");
+        Ok(None)
+    }
+
+    /// Query DWARF for variable information
+    pub fn query_dwarf_for_variable(&mut self, var_name: &str) -> Result<Option<VariableReadPlan>> {
+        let context = self.get_compile_time_context()?;
+        let pc_address = context.pc_address;
+
+        debug!(
+            "Querying DWARF for variable '{}' at PC 0x{:x} in module '{}'",
+            var_name, pc_address, context.module_path
+        );
+
+        self.query_dwarf_for_variable_plan(var_name)
+    }
+
+    fn query_dwarf_for_pc_access_plan(
+        &mut self,
+        base_name: &str,
+        access_path: &VariableAccessPath,
+    ) -> Result<Option<VariableReadPlan>> {
+        if access_path.segments.is_empty() {
+            return self.query_dwarf_for_variable_plan(base_name);
+        }
+
+        let path_text = Self::access_path_to_string(base_name, access_path);
+        let context = self.get_compile_time_context()?;
+        let pc_address = context.pc_address;
+        let module_path = context.module_path.clone();
+        let prefer_module = std::path::PathBuf::from(module_path.clone());
+        let analyzer = self
+            .process_analyzer
+            .ok_or_else(|| CodeGenError::DwarfError("No DWARF analyzer available".to_string()))?;
+        let module_address =
+            ghostscope_dwarf::ModuleAddress::new(prefer_module.clone(), pc_address);
+
+        match analyzer.resolve_pc(&module_address) {
+            Ok(pc_context) => {
+                match analyzer.plan_variable_access_by_name(&pc_context, base_name, access_path) {
+                    Ok(Some(plan)) => {
+                        debug!("Found DWARF access '{path_text}' via PC variable access plan");
+                        return Ok(Some(plan));
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        let message = err.to_string();
+                        debug!(
+                            "PC variable access plan lookup failed for '{path_text}': {message}"
+                        );
+                        return Err(CodeGenError::DwarfError(message));
+                    }
+                }
+            }
+            Err(err) => {
+                debug!(
+                    "PC context resolution failed for '{path_text}': {err}; trying global read plan"
+                );
+            }
+        }
+
+        if let Some((module_path, plan)) = analyzer
+            .plan_global_access_read_plan(&prefer_module, base_name, access_path)
+            .map_err(|err| CodeGenError::DwarfError(err.to_string()))?
+        {
+            debug!("Found DWARF global access '{path_text}' via variable read plan");
+            self.current_resolved_var_module_path = Some(module_path.to_string_lossy().to_string());
+            return Ok(Some(plan));
+        }
+
+        Ok(None)
+    }
+
+    fn access_path_to_string(base_name: &str, access_path: &VariableAccessPath) -> String {
+        let mut out = base_name.to_string();
+        for segment in &access_path.segments {
+            match segment {
+                VariableAccessSegment::Field(field) => {
+                    out.push('.');
+                    out.push_str(field);
+                }
+                VariableAccessSegment::ArrayIndex(index) => {
+                    out.push('[');
+                    out.push_str(&index.to_string());
+                    out.push(']');
+                }
+                VariableAccessSegment::Dereference => {
+                    out.push_str(".*");
                 }
             }
         }
+        out
+    }
+
+    fn access_path_from_expr(
+        expr: &crate::script::Expr,
+    ) -> Result<Option<(String, VariableAccessPath)>> {
+        fn append_segments(
+            expr: &crate::script::Expr,
+            segments: &mut Vec<VariableAccessSegment>,
+        ) -> Result<Option<String>> {
+            match expr {
+                crate::script::Expr::Variable(name) => Ok(Some(name.clone())),
+                crate::script::Expr::ChainAccess(chain) => {
+                    let Some(base) = chain.first() else {
+                        return Ok(None);
+                    };
+                    segments.extend(chain[1..].iter().cloned().map(VariableAccessSegment::Field));
+                    Ok(Some(base.clone()))
+                }
+                crate::script::Expr::MemberAccess(obj, field) => {
+                    let Some(base) = append_segments(obj, segments)? else {
+                        return Ok(None);
+                    };
+                    segments.push(VariableAccessSegment::Field(field.clone()));
+                    Ok(Some(base))
+                }
+                crate::script::Expr::ArrayAccess(array, index) => {
+                    let Some(base) = append_segments(array, segments)? else {
+                        return Ok(None);
+                    };
+                    let crate::script::Expr::Int(index) = index.as_ref() else {
+                        return Err(CodeGenError::NotImplemented(
+                            "Only literal integer array indices are supported (TODO)".to_string(),
+                        ));
+                    };
+                    segments.push(VariableAccessSegment::ArrayIndex(*index));
+                    Ok(Some(base))
+                }
+                crate::script::Expr::PointerDeref(inner) => {
+                    let Some(base) = append_segments(inner, segments)? else {
+                        return Ok(None);
+                    };
+                    segments.push(VariableAccessSegment::Dereference);
+                    Ok(Some(base))
+                }
+                _ => Ok(None),
+            }
+        }
+
+        let mut segments = Vec::new();
+        let Some(base) = append_segments(expr, &mut segments)? else {
+            return Ok(None);
+        };
+        Ok(Some((base, VariableAccessPath::new(segments))))
     }
 
     /// Get DWARF type size in bytes
@@ -1503,744 +1351,39 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         }
     }
 
-    /// Query DWARF for member access (obj.field)
-    pub fn query_dwarf_for_member_access(
-        &mut self,
-        obj_expr: &crate::script::Expr,
-        field_name: &str,
-    ) -> Result<Option<VariableWithEvaluation>> {
-        // Generic path: try to resolve the base expression first and add constant member offset
-        if !matches!(obj_expr, crate::script::Expr::Variable(_)) {
-            if let Some(base_var) = self.query_dwarf_for_complex_expr(obj_expr)? {
-                if let Some(base_ty) = base_var.dwarf_type.as_ref() {
-                    fn find_member_offset_and_type(
-                        t: &ghostscope_dwarf::TypeInfo,
-                        field: &str,
-                    ) -> Option<(u64, ghostscope_dwarf::TypeInfo)> {
-                        match t {
-                            ghostscope_dwarf::TypeInfo::StructType { members, .. }
-                            | ghostscope_dwarf::TypeInfo::UnionType { members, .. } => {
-                                for m in members {
-                                    if m.name == field {
-                                        return Some((m.offset, m.member_type.clone()));
-                                    }
-                                }
-                                None
-                            }
-                            ghostscope_dwarf::TypeInfo::TypedefType {
-                                underlying_type, ..
-                            }
-                            | ghostscope_dwarf::TypeInfo::QualifiedType {
-                                underlying_type, ..
-                            } => find_member_offset_and_type(underlying_type, field),
-                            _ => None,
-                        }
-                    }
-                    // Optional auto-deref for pointer-to-aggregate
-                    let mut effective_ty = base_ty.clone();
-                    let mut effective_eval = base_var.evaluation_result.clone();
-                    // unwrap typedef/qualifier for pointer detection
-                    fn unwrap_typedef(
-                        mut t: &ghostscope_dwarf::TypeInfo,
-                    ) -> &ghostscope_dwarf::TypeInfo {
-                        while let ghostscope_dwarf::TypeInfo::TypedefType {
-                            underlying_type, ..
-                        }
-                        | ghostscope_dwarf::TypeInfo::QualifiedType {
-                            underlying_type,
-                            ..
-                        } = t
-                        {
-                            t = underlying_type.as_ref();
-                        }
-                        t
-                    }
-                    let unwrapped = unwrap_typedef(&effective_ty);
-                    if let ghostscope_dwarf::TypeInfo::PointerType { target_type, .. } = unwrapped {
-                        // Insert a dereference step into evaluation
-                        effective_eval = self.compute_pointer_dereference(&effective_eval)?;
-                        effective_ty = *target_type.clone();
-                    }
-
-                    if let Some((member_off, member_ty)) =
-                        find_member_offset_and_type(&effective_ty, field_name)
-                    {
-                        use ghostscope_dwarf::{
-                            ComputeStep as CS, EvaluationResult as ER, LocationResult as LR,
-                        };
-                        let new_eval = match &effective_eval {
-                            ER::MemoryLocation(LR::Address(a)) => {
-                                ER::MemoryLocation(LR::Address(a + member_off))
-                            }
-                            ER::MemoryLocation(LR::ComputedLocation { steps }) => {
-                                let mut s = steps.clone();
-                                s.push(CS::PushConstant(member_off as i64));
-                                s.push(CS::Add);
-                                ER::MemoryLocation(LR::ComputedLocation { steps: s })
-                            }
-                            ER::MemoryLocation(LR::RegisterAddress {
-                                register,
-                                offset,
-                                size,
-                            }) => {
-                                let new_off = offset.unwrap_or(0).saturating_add(member_off as i64);
-                                ER::MemoryLocation(LR::RegisterAddress {
-                                    register: *register,
-                                    offset: Some(new_off),
-                                    size: *size,
-                                })
-                            }
-                            _ => {
-                                return Err(CodeGenError::NotImplemented(
-                                    "Member access on non-addressable expression".to_string(),
-                                ))
-                            }
-                        };
-                        let name = format!("{}.{}", base_var.name, field_name);
-                        let v = VariableWithEvaluation {
-                            name,
-                            type_name: member_ty.type_name(),
-                            dwarf_type: Some(member_ty),
-                            evaluation_result: new_eval,
-                            scope_depth: base_var.scope_depth,
-                            is_parameter: base_var.is_parameter,
-                            is_artificial: base_var.is_artificial,
-                        };
-                        return Ok(Some(v));
-                    }
-                }
-            }
-            // Try a planner-based chain if generic path missed and base is a pure identifier chain
-            {
-                fn flatten_ident_chain<'a>(
-                    e: &'a crate::script::Expr,
-                    out: &mut Vec<&'a str>,
-                ) -> bool {
-                    match e {
-                        crate::script::Expr::Variable(name) => {
-                            out.push(name.as_str());
-                            true
-                        }
-                        crate::script::Expr::MemberAccess(obj, field) => {
-                            if flatten_ident_chain(obj, out) {
-                                out.push(field.as_str());
-                                true
-                            } else {
-                                false
-                            }
-                        }
-                        _ => false,
-                    }
-                }
-                let mut segs: Vec<&str> = Vec::new();
-                if flatten_ident_chain(obj_expr, &mut segs) && !segs.is_empty() {
-                    let mut chain: Vec<String> = segs.into_iter().map(|s| s.to_string()).collect();
-                    chain.push(field_name.to_string());
-                    return self.query_dwarf_for_chain_access(&chain);
-                }
-            }
-            // fall through to legacy variable-only behavior
-        }
-        // Support simple variable base and fall back to global/static lowering
-        if let crate::script::Expr::Variable(base_name) = obj_expr {
-            let ctx = self.get_compile_time_context()?;
-            let module_path = ctx.module_path.clone();
-            let pc_address = ctx.pc_address;
-            let analyzer = self.process_analyzer.ok_or_else(|| {
-                CodeGenError::DwarfError("No DWARF analyzer available".to_string())
-            })?;
-            let module_address = ghostscope_dwarf::ModuleAddress::new(
-                std::path::PathBuf::from(module_path.clone()),
-                pc_address,
-            );
-            // Try current module at PC first
-            match analyzer.plan_chain_access(&module_address, base_name, &[field_name.to_string()])
-            {
-                Ok(Some(var)) => return Ok(Some(var)),
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::debug!("member planner miss at current module: {}", e);
-                }
-            }
-
-            // Strict cross-module chain planning via analyzer API
-            match analyzer
-                .plan_global_chain_access(
-                    &std::path::PathBuf::from(module_path.clone()),
-                    base_name,
-                    &[field_name.to_string()],
-                )
-                .map_err(|e| CodeGenError::DwarfError(e.to_string()))?
-            {
-                Some((mpath, v)) => {
-                    self.current_resolved_var_module_path =
-                        Some(mpath.to_string_lossy().to_string());
-                    Ok(Some(v))
-                }
-                None => {
-                    // Friendly unknown-member message for globals: try to resolve the base's type
-                    // and list available members.
-                    // We only attempt this for globals to avoid scanning locals aggressively.
-                    let mut matches = analyzer.find_global_variables_by_name(base_name);
-                    if !matches.is_empty() {
-                        // Prefer current module
-                        let preferred: Vec<(
-                            std::path::PathBuf,
-                            ghostscope_dwarf::core::GlobalVariableInfo,
-                        )> = matches
-                            .iter()
-                            .filter(|(p, _)| p.to_string_lossy() == module_path.as_str())
-                            .cloned()
-                            .collect();
-                        let chosen = if preferred.len() == 1 {
-                            Some(preferred[0].clone())
-                        } else if preferred.is_empty() && matches.len() == 1 {
-                            Some(matches.remove(0))
-                        } else {
-                            None
-                        };
-                        if let Some((mp, info)) = chosen {
-                            if let Ok(var) = analyzer.resolve_variable_by_offsets_in_module(
-                                &mp,
-                                info.unit_offset,
-                                info.die_offset,
-                            ) {
-                                if let Some(ty) = var.dwarf_type.as_ref() {
-                                    // Unwrap aliases
-                                    let mut t = ty;
-                                    loop {
-                                        match t {
-                                            ghostscope_dwarf::TypeInfo::TypedefType {
-                                                underlying_type,
-                                                ..
-                                            } => t = underlying_type.as_ref(),
-                                            ghostscope_dwarf::TypeInfo::QualifiedType {
-                                                underlying_type,
-                                                ..
-                                            } => t = underlying_type.as_ref(),
-                                            _ => break,
-                                        }
-                                    }
-                                    let mut kind: Option<&'static str> = None;
-                                    let mut member_names: Vec<String> = Vec::new();
-                                    match t {
-                                        ghostscope_dwarf::TypeInfo::StructType {
-                                            members, ..
-                                        } => {
-                                            kind = Some("struct");
-                                            member_names =
-                                                members.iter().map(|m| m.name.clone()).collect();
-                                        }
-                                        ghostscope_dwarf::TypeInfo::UnionType {
-                                            members, ..
-                                        } => {
-                                            kind = Some("union");
-                                            member_names =
-                                                members.iter().map(|m| m.name.clone()).collect();
-                                        }
-                                        _ => {}
-                                    }
-                                    if let Some(k) = kind {
-                                        // Form friendly message consistent with tests
-                                        // Example: Unknown member 'no_such_member' in struct 'G_STATE'. Known members: a, b, c
-                                        member_names.sort();
-                                        member_names.dedup();
-                                        let list = if member_names.is_empty() {
-                                            "<none>".to_string()
-                                        } else {
-                                            member_names.join(", ")
-                                        };
-                                        let msg = format!(
-                                            "Unknown member '{field_name}' in {k} '{base_name}' (known members: {list})"
-                                        );
-                                        return Err(CodeGenError::TypeError(msg));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Ok(None)
-                }
-            }
-        } else {
-            Err(CodeGenError::NotImplemented(
-                "MemberAccess base must be a simple variable (use chain access)".to_string(),
-            ))
-        }
-    }
-
-    /// Query DWARF for array access (arr[index])
-    pub fn query_dwarf_for_array_access(
-        &mut self,
-        array_expr: &crate::script::Expr,
-        index_expr: &crate::script::Expr,
-    ) -> Result<Option<VariableWithEvaluation>> {
-        // Prefer planner for simple identifier chains like a.b.c as array base to avoid nested member lookups
-        if let crate::script::Expr::MemberAccess(_, _) = array_expr {
-            // Try to flatten to a chain of identifiers
-            fn flatten_chain<'a>(e: &'a crate::script::Expr, out: &mut Vec<&'a str>) -> bool {
-                match e {
-                    crate::script::Expr::Variable(name) => {
-                        out.push(name.as_str());
-                        true
-                    }
-                    crate::script::Expr::MemberAccess(obj, field) => {
-                        if flatten_chain(obj, out) {
-                            out.push(field.as_str());
-                            true
-                        } else {
-                            false
-                        }
-                    }
-                    _ => false,
-                }
-            }
-            let mut segs: Vec<&str> = Vec::new();
-            if flatten_chain(array_expr, &mut segs) && !segs.is_empty() {
-                let ctx = self.get_compile_time_context()?;
-                let module_path = ctx.module_path.clone();
-                let pc_address = ctx.pc_address;
-                let analyzer = self.process_analyzer.ok_or_else(|| {
-                    CodeGenError::DwarfError("No DWARF analyzer available".to_string())
-                })?;
-                let module_address = ghostscope_dwarf::ModuleAddress::new(
-                    std::path::PathBuf::from(module_path),
-                    pc_address,
-                );
-                let base = segs[0].to_string();
-                let rest: Vec<String> = segs[1..].iter().map(|s| s.to_string()).collect();
-                if let Ok(Some(var)) = analyzer.plan_chain_access(&module_address, &base, &rest) {
-                    // Use planner result as array base
-                    let base_var = var;
-                    return self.finish_array_access_from_base(base_var, index_expr);
-                }
-            }
-        }
-
-        // Fallback: resolve the base array via generic complex expr path
-        let base_var = match self.query_dwarf_for_complex_expr(array_expr)? {
-            Some(var) => var,
-            None => return Ok(None),
-        };
-
-        self.finish_array_access_from_base(base_var, index_expr)
-    }
-
-    fn finish_array_access_from_base(
-        &mut self,
-        base_var: VariableWithEvaluation,
-        index_expr: &crate::script::Expr,
-    ) -> Result<Option<VariableWithEvaluation>> {
-        // Get the array's type
-        let array_type = match &base_var.dwarf_type {
-            Some(type_info) => type_info,
-            None => return Ok(None),
-        };
-
-        // Extract element type from array type
-        let element_type = match array_type {
-            TypeInfo::ArrayType { element_type, .. } => element_type.as_ref().clone(),
-            _ => return Ok(None), // Not an array type
-        };
-
-        // Calculate element size for address computation
-        let element_size = element_type.size();
-
-        // For indexing, create a computed location representing: base + (index * element_size)
-        // Only literal integer indices are supported at this stage
-        let index_value: i64 = match index_expr {
-            crate::script::Expr::Int(v) => *v,
-            _ => {
-                return Err(CodeGenError::NotImplemented(
-                    "Only literal integer array indices are supported (TODO)".to_string(),
-                ))
-            }
-        };
-        let element_evaluation_result = match &base_var.evaluation_result {
-            EvaluationResult::DirectValue(_) => {
-                // If base is a value, we can't do array indexing
-                return Ok(None);
-            }
-            EvaluationResult::MemoryLocation(location) => {
-                match location {
-                    // Address(base): perform Address arithmetic so ASLR logic applies uniformly
-                    LocationResult::Address(addr) => {
-                        let offs = (index_value as i128) * (element_size as i128);
-                        let new_addr = (*addr as i128).saturating_add(offs);
-                        if new_addr < 0 {
-                            return Err(CodeGenError::LLVMError(
-                                "negative address after indexing".to_string(),
-                            ));
-                        }
-                        EvaluationResult::MemoryLocation(LocationResult::Address(new_addr as u64))
-                    }
-                    // Register/Computed: build compute steps at runtime
-                    _ => {
-                        let array_access_steps =
-                            self.create_array_access_steps(location, element_size, index_value);
-                        EvaluationResult::MemoryLocation(LocationResult::ComputedLocation {
-                            steps: array_access_steps,
-                        })
-                    }
-                }
-            }
-            EvaluationResult::Optimized => {
-                return Ok(None);
-            }
-            EvaluationResult::Composite(_) => {
-                // Array access on composite locations is complex, skip for now
-                return Ok(None);
-            }
-        };
-
-        // Build readable element name: base_name[index]
-        let elem_name = format!("{}[{}]", base_var.name, index_value);
-        let element_var = VariableWithEvaluation {
-            name: elem_name,
-            type_name: Self::type_info_to_name(&element_type),
-            dwarf_type: Some(element_type),
-            evaluation_result: element_evaluation_result,
-            scope_depth: base_var.scope_depth,
-            is_parameter: false,
-            is_artificial: false,
-        };
-
-        Ok(Some(element_var))
-    }
-
-    /// Query DWARF for chain access (person.name.first)
-    pub fn query_dwarf_for_chain_access(
-        &mut self,
-        chain: &[String],
-    ) -> Result<Option<VariableWithEvaluation>> {
-        if chain.is_empty() {
-            return Ok(None);
-        }
-        // If chain has only one element, treat it as a simple variable and reuse variable lookup.
-        if chain.len() == 1 {
-            return self.query_dwarf_for_variable(&chain[0]);
-        }
-        // Planner path only; do not fallback. If planning fails, surface an error.
-        let ctx = self.get_compile_time_context()?;
-        let module_path = ctx.module_path.clone();
-        let pc_address = ctx.pc_address;
-        let analyzer = self
-            .process_analyzer
-            .ok_or_else(|| CodeGenError::DwarfError("No DWARF analyzer available".to_string()))?;
-        // First attempt: current module at current PC (locals/params)
-        let module_address = ghostscope_dwarf::ModuleAddress::new(
-            std::path::PathBuf::from(module_path.clone()),
-            pc_address,
-        );
-        match analyzer.plan_chain_access(&module_address, &chain[0], &chain[1..]) {
-            Ok(Some(var)) => return Ok(Some(var)),
-            Ok(None) => {}
-            Err(e) => {
-                // Treat planner errors as a miss and continue to global fallback
-                tracing::debug!("chain planner miss at current module: {}", e);
-            }
-        }
-
-        let base = &chain[0];
-        let rest = &chain[1..];
-        match analyzer
-            .plan_global_chain_access(&std::path::PathBuf::from(module_path.clone()), base, rest)
-            .map_err(|e| CodeGenError::DwarfError(e.to_string()))?
-        {
-            Some((mpath, v)) => {
-                self.current_resolved_var_module_path = Some(mpath.to_string_lossy().to_string());
-                Ok(Some(v))
-            }
-            None => {
-                // Friendly message for unknown member on global in simple two-segment chains
-                if chain.len() == 2 {
-                    let field_name = &chain[1];
-                    let mut matches = analyzer.find_global_variables_by_name(base);
-                    if !matches.is_empty() {
-                        let preferred: Vec<(
-                            std::path::PathBuf,
-                            ghostscope_dwarf::core::GlobalVariableInfo,
-                        )> = matches
-                            .iter()
-                            .filter(|(p, _)| p.to_string_lossy() == module_path.as_str())
-                            .cloned()
-                            .collect();
-                        let chosen = if preferred.len() == 1 {
-                            Some(preferred[0].clone())
-                        } else if preferred.is_empty() && matches.len() == 1 {
-                            Some(matches.remove(0))
-                        } else {
-                            None
-                        };
-                        if let Some((mp, info)) = chosen {
-                            if let Ok(var) = analyzer.resolve_variable_by_offsets_in_module(
-                                &mp,
-                                info.unit_offset,
-                                info.die_offset,
-                            ) {
-                                if let Some(ty) = var.dwarf_type.as_ref() {
-                                    // Unwrap typedef/qualified
-                                    let mut t = ty;
-                                    loop {
-                                        match t {
-                                            ghostscope_dwarf::TypeInfo::TypedefType {
-                                                underlying_type,
-                                                ..
-                                            } => t = underlying_type.as_ref(),
-                                            ghostscope_dwarf::TypeInfo::QualifiedType {
-                                                underlying_type,
-                                                ..
-                                            } => t = underlying_type.as_ref(),
-                                            _ => break,
-                                        }
-                                    }
-                                    let mut kind: Option<&'static str> = None;
-                                    let mut member_names: Vec<String> = Vec::new();
-                                    match t {
-                                        ghostscope_dwarf::TypeInfo::StructType {
-                                            members, ..
-                                        } => {
-                                            kind = Some("struct");
-                                            member_names =
-                                                members.iter().map(|m| m.name.clone()).collect();
-                                        }
-                                        ghostscope_dwarf::TypeInfo::UnionType {
-                                            members, ..
-                                        } => {
-                                            kind = Some("union");
-                                            member_names =
-                                                members.iter().map(|m| m.name.clone()).collect();
-                                        }
-                                        _ => {}
-                                    }
-                                    if let Some(k) = kind {
-                                        member_names.sort();
-                                        member_names.dedup();
-                                        let list = if member_names.is_empty() {
-                                            "<none>".to_string()
-                                        } else {
-                                            member_names.join(", ")
-                                        };
-                                        let msg = format!(
-                                            "Unknown member '{field_name}' in {k} '{base}' (known members: {list})"
-                                        );
-                                        return Err(CodeGenError::TypeError(msg));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok(None)
-            }
-        }
-        // unreachable
-    }
-
-    /// Query DWARF for pointer dereference (*ptr)
-    pub fn query_dwarf_for_pointer_deref(
-        &mut self,
-        expr: &crate::script::Expr,
-    ) -> Result<Option<VariableWithEvaluation>> {
-        // First, resolve the pointer expression
-        let ptr_var = match self.query_dwarf_for_complex_expr(expr)? {
-            Some(var) => var,
-            None => return Ok(None),
-        };
-
-        // Get the pointer's type
-        let ptr_type = match &ptr_var.dwarf_type {
-            Some(type_info) => type_info,
-            None => return Ok(None),
-        };
-
-        // Extract pointed-to type from pointer type
-        let mut pointed_type = match ptr_type {
-            TypeInfo::PointerType { target_type, .. } => target_type.as_ref().clone(),
-            _ => return Ok(None), // Not a pointer type
-        };
-
-        // Upgrade UnknownType(target_name) using analyzer/type index to get a shallow type.
-        // 1) Struct/union/class/enum: try analyzer shallow lookup by name (module-scoped first)
-        // 2) Do not guess builtin type sizes — rely only on DWARF base type entries
-        if let TypeInfo::UnknownType { name } = &pointed_type {
-            let mut candidate_names: Vec<String> = Vec::new();
-            if !name.is_empty() && name != "void" {
-                candidate_names.push(name.clone());
-            }
-            // Fallback: derive from pointer variable's pretty type name, e.g., "GlobalState*" => "GlobalState"
-            if candidate_names.is_empty() {
-                let tn = ptr_var.type_name.trim().to_string();
-                if let Some(idx) = tn.find('*') {
-                    let mut base = tn[..idx].trim().to_string();
-                    // Strip common qualifiers and tags
-                    for prefix in [
-                        "const ",
-                        "volatile ",
-                        "restrict ",
-                        "struct ",
-                        "class ",
-                        "union ",
-                    ] {
-                        if base.starts_with(prefix) {
-                            base = base[prefix.len()..].trim().to_string();
-                        }
-                    }
-                    if !base.is_empty() && base != "void" {
-                        candidate_names.push(base);
-                    }
-                }
-            }
-            let ctx = self.get_compile_time_context()?;
-            let module_path = ctx.module_path.clone();
-            if let Some(analyzer) = self.process_analyzer {
-                let mut alias_used: Option<String> = None;
-                for n in candidate_names {
-                    // Prefer cross-module definitions first to avoid forward decls with size=0 in current CU
-                    let mut upgraded: Option<TypeInfo> = None;
-                    // struct/class
-                    if let Some(ti) = analyzer.resolve_struct_type_shallow_by_name(&n) {
-                        if ti.size() > 0 {
-                            upgraded = Some(ti);
-                        }
-                    }
-                    if upgraded.is_none() {
-                        if let Some(ti) =
-                            analyzer.resolve_struct_type_shallow_by_name_in_module(&module_path, &n)
-                        {
-                            if ti.size() > 0 {
-                                upgraded = Some(ti);
-                            }
-                        }
-                    }
-                    // union
-                    if upgraded.is_none() {
-                        if let Some(ti) = analyzer.resolve_union_type_shallow_by_name(&n) {
-                            if ti.size() > 0 {
-                                upgraded = Some(ti);
-                            }
-                        }
-                    }
-                    if upgraded.is_none() {
-                        if let Some(ti) =
-                            analyzer.resolve_union_type_shallow_by_name_in_module(&module_path, &n)
-                        {
-                            if ti.size() > 0 {
-                                upgraded = Some(ti);
-                            }
-                        }
-                    }
-                    // enum
-                    if upgraded.is_none() {
-                        if let Some(ti) = analyzer.resolve_enum_type_shallow_by_name(&n) {
-                            if ti.size() > 0 {
-                                upgraded = Some(ti);
-                            }
-                        }
-                    }
-                    if upgraded.is_none() {
-                        if let Some(ti) =
-                            analyzer.resolve_enum_type_shallow_by_name_in_module(&module_path, &n)
-                        {
-                            if ti.size() > 0 {
-                                upgraded = Some(ti);
-                            }
-                        }
-                    }
-                    if let Some(ti) = upgraded {
-                        pointed_type = ti;
-                        alias_used = Some(n.clone());
-                        break;
-                    }
-                }
-
-                // If we upgraded to an aggregate and have an alias name, wrap it as a typedef
-                if let Some(alias) = alias_used {
-                    match &pointed_type {
-                        TypeInfo::StructType { .. }
-                        | TypeInfo::UnionType { .. }
-                        | TypeInfo::EnumType { .. } => {
-                            pointed_type = TypeInfo::TypedefType {
-                                name: alias,
-                                underlying_type: Box::new(pointed_type.clone()),
-                            };
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-
-        // Create dereferenced variable
-        let deref_var = VariableWithEvaluation {
-            name: format!("*{}", Self::expr_to_string(expr)),
-            type_name: Self::type_info_to_name(&pointed_type),
-            dwarf_type: Some(pointed_type),
-            evaluation_result: self.compute_pointer_dereference(&ptr_var.evaluation_result)?,
-            scope_depth: ptr_var.scope_depth,
-            is_parameter: false,
-            is_artificial: false,
-        };
-
-        Ok(Some(deref_var))
-    }
-
     /// Helper: Compute pointer dereference
     fn compute_pointer_dereference(
         &self,
-        ptr_result: &EvaluationResult,
-    ) -> Result<EvaluationResult> {
-        use ghostscope_dwarf::{ComputeStep, LocationResult, MemoryAccessSize};
-
-        match ptr_result {
-            // If the pointer is a memory location, we need to read that location first,
-            // then use the result as an address for another read
-            EvaluationResult::MemoryLocation(location) => {
-                let steps = [
-                    self.location_to_compute_steps(location),
-                    // Then dereference the pointer (read from the computed address)
-                    vec![ComputeStep::Dereference {
-                        size: MemoryAccessSize::U64,
-                    }],
-                ]
-                .concat();
-
-                Ok(EvaluationResult::MemoryLocation(
-                    LocationResult::ComputedLocation { steps },
-                ))
+        ptr_location: &VariableLocation,
+    ) -> Result<VariableLocation> {
+        match ptr_location {
+            VariableLocation::AbsoluteAddressValue(expr) => {
+                Ok(VariableLocation::Address(expr.clone()))
             }
-            // If the pointer value is held directly (common for function parameters)
-            // interpret the value as an address to the pointed-to object.
-            EvaluationResult::DirectValue(dv) => {
-                use ghostscope_dwarf::DirectValueResult as DV;
-                match dv {
-                    DV::RegisterValue(reg) => Ok(EvaluationResult::MemoryLocation(
-                        LocationResult::RegisterAddress {
-                            register: *reg,
-                            offset: None,
-                            size: None,
-                        },
-                    )),
-                    DV::Constant(val) => Ok(EvaluationResult::MemoryLocation(
-                        LocationResult::Address(*val as u64),
-                    )),
-                    DV::AbsoluteAddress(val) => Ok(EvaluationResult::MemoryLocation(
-                        LocationResult::Address(*val),
-                    )),
-                    DV::ImplicitValue(bytes) => {
-                        // Assemble up to 8 bytes little-endian into u64
-                        let mut v: u64 = 0;
-                        for (i, b) in bytes.iter().take(8).enumerate() {
-                            v |= (*b as u64) << (8 * i);
-                        }
-                        Ok(EvaluationResult::MemoryLocation(LocationResult::Address(v)))
-                    }
-                    DV::ComputedValue { steps, .. } => Ok(EvaluationResult::MemoryLocation(
-                        LocationResult::ComputedLocation {
-                            steps: steps.clone(),
-                        },
-                    )),
+            VariableLocation::Address(_)
+            | VariableLocation::RegisterAddress { .. }
+            | VariableLocation::ComputedAddress(_) => {
+                let mut steps = self.variable_location_to_compute_steps(ptr_location)?;
+                steps.push(ComputeStep::Dereference {
+                    size: MemoryAccessSize::U64,
+                });
+                Ok(VariableLocation::ComputedAddress(steps))
+            }
+            VariableLocation::RegisterValue { dwarf_reg } => {
+                Ok(VariableLocation::RegisterAddress {
+                    dwarf_reg: *dwarf_reg,
+                    offset: 0,
+                })
+            }
+            VariableLocation::ComputedValue(steps) => {
+                Ok(VariableLocation::ComputedAddress(steps.clone()))
+            }
+            VariableLocation::ImplicitValue(bytes) => {
+                let mut value: u64 = 0;
+                for (i, byte) in bytes.iter().take(8).enumerate() {
+                    value |= (*byte as u64) << (8 * i);
                 }
+                Ok(VariableLocation::Address(AddressExpr::constant(value)))
             }
             _ => Err(CodeGenError::NotImplemented(
                 "Unsupported pointer dereference scenario".to_string(),
@@ -2249,134 +1392,91 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     }
 
     /// Helper: Convert location to compute steps
-    fn location_to_compute_steps(&self, location: &LocationResult) -> Vec<ComputeStep> {
-        use ghostscope_dwarf::{ComputeStep, LocationResult};
-
+    fn variable_location_to_compute_steps(
+        &self,
+        location: &VariableLocation,
+    ) -> Result<Vec<ComputeStep>> {
         match location {
-            LocationResult::Address(addr) => {
-                vec![ComputeStep::PushConstant(*addr as i64)]
-            }
-            LocationResult::RegisterAddress {
-                register, offset, ..
-            } => {
-                let mut steps = vec![ComputeStep::LoadRegister(*register)];
-                if let Some(offset) = offset {
+            VariableLocation::Address(expr) => Ok(expr.steps.clone()),
+            VariableLocation::AbsoluteAddressValue(expr) => Ok(expr.steps.clone()),
+            VariableLocation::RegisterAddress { dwarf_reg, offset } => {
+                let mut steps = vec![ComputeStep::LoadRegister(*dwarf_reg)];
+                if *offset != 0 {
                     steps.push(ComputeStep::PushConstant(*offset));
                     steps.push(ComputeStep::Add);
                 }
-                steps
+                Ok(steps)
             }
-            LocationResult::ComputedLocation { steps } => steps.clone(),
-        }
-    }
-
-    /// Helper: Convert expression to string for debugging
-    fn expr_to_string(expr: &crate::script::Expr) -> String {
-        use crate::script::Expr;
-
-        match expr {
-            Expr::Variable(name) => name.clone(),
-            Expr::MemberAccess(obj, field) => format!("{}.{}", Self::expr_to_string(obj), field),
-            Expr::ArrayAccess(arr, _) => format!("{}[index]", Self::expr_to_string(arr)),
-            Expr::ChainAccess(chain) => chain.join("."),
-            Expr::PointerDeref(expr) => format!("*{}", Self::expr_to_string(expr)),
-            _ => "expr".to_string(),
-        }
-    }
-
-    /// Helper: Extract readable name from TypeInfo
-    fn type_info_to_name(type_info: &TypeInfo) -> String {
-        match type_info {
-            TypeInfo::BaseType { name, .. } => name.clone(),
-            TypeInfo::PointerType { target_type, .. } => {
-                format!("{}*", Self::type_info_to_name(target_type))
+            VariableLocation::ComputedAddress(steps) | VariableLocation::ComputedValue(steps) => {
+                Ok(steps.clone())
             }
-            TypeInfo::ArrayType {
-                element_type,
-                element_count,
-                ..
-            } => {
-                if let Some(count) = element_count {
-                    format!("{}[{}]", Self::type_info_to_name(element_type), count)
-                } else {
-                    format!("{}[]", Self::type_info_to_name(element_type))
+            VariableLocation::RegisterValue { dwarf_reg } => {
+                Ok(vec![ComputeStep::LoadRegister(*dwarf_reg)])
+            }
+            VariableLocation::ImplicitValue(bytes) => {
+                let mut value: u64 = 0;
+                for (i, byte) in bytes.iter().take(8).enumerate() {
+                    value |= (*byte as u64) << (8 * i);
                 }
+                Ok(vec![ComputeStep::PushConstant(value as i64)])
             }
-            TypeInfo::StructType { name, .. } => format!("struct {name}"),
-            TypeInfo::UnionType { name, .. } => format!("union {name}"),
-            TypeInfo::EnumType { name, .. } => format!("enum {name}"),
-            TypeInfo::BitfieldType {
-                underlying_type,
-                bit_offset,
-                bit_size,
-            } => {
-                format!(
-                    "bitfield<{}:{}> {}",
-                    bit_offset,
-                    bit_size,
-                    Self::type_info_to_name(underlying_type)
-                )
-            }
-            TypeInfo::TypedefType { name, .. } => name.clone(),
-            TypeInfo::QualifiedType {
-                underlying_type, ..
-            } => Self::type_info_to_name(underlying_type),
-            TypeInfo::FunctionType { .. } => "function".to_string(),
-            TypeInfo::UnknownType { name } => name.clone(),
-            TypeInfo::OptimizedOut { name } => format!("<optimized_out> {name}"),
+            _ => Err(CodeGenError::NotImplemented(
+                "Unable to convert variable location to compute steps".to_string(),
+            )),
         }
     }
 
-    /// Create computation steps for array access: base_address + (index * element_size)
-    fn create_array_access_steps(
+    fn add_variable_location_offset(
         &self,
-        base_location: &LocationResult,
-        element_size: u64,
-        index: i64,
-    ) -> Vec<ComputeStep> {
-        let mut steps = Vec::new();
-
-        // First, get the base address computation steps
-        match base_location {
-            LocationResult::Address(addr) => {
-                steps.push(ComputeStep::PushConstant(*addr as i64));
-            }
-            LocationResult::RegisterAddress {
-                register, offset, ..
-            } => {
-                steps.push(ComputeStep::LoadRegister(*register));
-                if let Some(offset) = offset {
-                    if *offset != 0 {
-                        steps.push(ComputeStep::PushConstant(*offset));
-                        steps.push(ComputeStep::Add);
-                    }
-                }
-            }
-            LocationResult::ComputedLocation { steps: base_steps } => {
-                steps.extend(base_steps.clone());
-            }
+        location: VariableLocation,
+        offset: i64,
+    ) -> Result<VariableLocation> {
+        if offset == 0 {
+            return Ok(location);
         }
 
-        // Now add array indexing computation: current_address + (index * element_size)
-        steps.push(ComputeStep::PushConstant(index)); // literal index
-        steps.push(ComputeStep::PushConstant(element_size as i64)); // element_size
-        steps.push(ComputeStep::Mul); // index * element_size
-        steps.push(ComputeStep::Add); // base_address + (index * element_size)
-
-        steps
+        match location {
+            VariableLocation::RegisterAddress {
+                dwarf_reg,
+                offset: base_offset,
+            } => Ok(VariableLocation::RegisterAddress {
+                dwarf_reg,
+                offset: base_offset.saturating_add(offset),
+            }),
+            VariableLocation::Address(expr) => {
+                let mut steps = expr.steps;
+                steps.push(ComputeStep::PushConstant(offset));
+                steps.push(ComputeStep::Add);
+                Ok(VariableLocation::ComputedAddress(steps))
+            }
+            VariableLocation::AbsoluteAddressValue(expr) => {
+                let mut steps = expr.steps;
+                steps.push(ComputeStep::PushConstant(offset));
+                steps.push(ComputeStep::Add);
+                Ok(VariableLocation::AbsoluteAddressValue(AddressExpr {
+                    steps,
+                }))
+            }
+            VariableLocation::ComputedAddress(mut steps) => {
+                steps.push(ComputeStep::PushConstant(offset));
+                steps.push(ComputeStep::Add);
+                Ok(VariableLocation::ComputedAddress(steps))
+            }
+            _ => Err(CodeGenError::NotImplemented(
+                "Unable to apply pointer arithmetic to variable location".to_string(),
+            )),
+        }
     }
 
     /// Compute a typed pointed-to location for expressions like `ptr +/- K` where K is an element index.
-    /// Returns a computed location EvaluationResult along with the pointed-to DWARF type.
+    /// Returns a computed location along with the pointed-to DWARF type.
     /// The offset is scaled by the element size of the pointer/array target type.
     pub fn compute_pointed_location_with_index(
         &mut self,
         ptr_expr: &crate::script::Expr,
         index: i64,
-    ) -> Result<(EvaluationResult, TypeInfo)> {
-        use ghostscope_dwarf::{
-            ComputeStep, EvaluationResult as ER, LocationResult as LR, TypeInfo,
-        };
+    ) -> Result<(VariableLocation, TypeInfo)> {
+        use ghostscope_dwarf::TypeInfo;
 
         // Resolve the pointer expression via DWARF
         let ptr_var = self
@@ -2427,36 +1527,95 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             }
         };
 
-        // First compute the base pointed-to location for `*ptr_expr`
-        let base_loc_eval = self.compute_pointer_dereference(&ptr_var.evaluation_result)?;
-        let base_loc = match &base_loc_eval {
-            ER::MemoryLocation(loc) => loc,
-            _ => {
-                return Err(CodeGenError::DwarfError(
-                    "Failed to compute base location for pointer arithmetic".to_string(),
-                ))
-            }
-        };
+        let base_location = self.compute_pointer_dereference(&ptr_var.location)?;
+        let byte_offset = index.saturating_mul(elem_size as i64);
+        let location = self.add_variable_location_offset(base_location, byte_offset)?;
 
-        // Build compute steps: base_address + index * elem_size
-        let steps = {
-            let mut s = self.location_to_compute_steps(base_loc);
-            // scale index by element size (can be negative)
-            s.push(ComputeStep::PushConstant(index));
-            s.push(ComputeStep::PushConstant(elem_size as i64));
-            s.push(ComputeStep::Mul);
-            s.push(ComputeStep::Add);
-            s
-        };
-
-        Ok((ER::MemoryLocation(LR::ComputedLocation { steps }), elem_ty))
+        Ok((location, elem_ty))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::script::Expr;
+    use ghostscope_dwarf::Provenance;
     use inkwell::context::Context as LlvmContext;
+
+    #[test]
+    fn access_path_from_expr_flattens_member_array_member_paths() {
+        let expr = Expr::MemberAccess(
+            Box::new(Expr::ArrayAccess(
+                Box::new(Expr::MemberAccess(
+                    Box::new(Expr::Variable("request".to_string())),
+                    "headers".to_string(),
+                )),
+                Box::new(Expr::Int(2)),
+            )),
+            "len".to_string(),
+        );
+
+        let (base, path) = EbpfContext::<'static, 'static>::access_path_from_expr(&expr)
+            .expect("access path should parse")
+            .expect("expression should be flattenable");
+
+        assert_eq!(base, "request");
+        assert_eq!(
+            path.segments,
+            vec![
+                VariableAccessSegment::Field("headers".to_string()),
+                VariableAccessSegment::ArrayIndex(2),
+                VariableAccessSegment::Field("len".to_string()),
+            ]
+        );
+        assert_eq!(
+            EbpfContext::<'static, 'static>::access_path_to_string(&base, &path),
+            "request.headers[2].len"
+        );
+    }
+
+    #[test]
+    fn access_path_from_expr_rejects_dynamic_array_index() {
+        let expr = Expr::ArrayAccess(
+            Box::new(Expr::Variable("items".to_string())),
+            Box::new(Expr::Variable("idx".to_string())),
+        );
+
+        let err = EbpfContext::<'static, 'static>::access_path_from_expr(&expr)
+            .expect_err("dynamic array index should be rejected");
+
+        assert!(matches!(err, CodeGenError::NotImplemented(_)));
+        assert!(err.to_string().contains("literal integer array indices"));
+    }
+
+    #[test]
+    fn access_path_from_expr_flattens_pointer_deref_segments() {
+        let expr = Expr::MemberAccess(
+            Box::new(Expr::PointerDeref(Box::new(Expr::MemberAccess(
+                Box::new(Expr::Variable("request".to_string())),
+                "current".to_string(),
+            )))),
+            "state".to_string(),
+        );
+
+        let (base, path) = EbpfContext::<'static, 'static>::access_path_from_expr(&expr)
+            .expect("access path should parse")
+            .expect("expression should be flattenable");
+
+        assert_eq!(base, "request");
+        assert_eq!(
+            path.segments,
+            vec![
+                VariableAccessSegment::Field("current".to_string()),
+                VariableAccessSegment::Dereference,
+                VariableAccessSegment::Field("state".to_string()),
+            ]
+        );
+        assert_eq!(
+            EbpfContext::<'static, 'static>::access_path_to_string(&base, &path),
+            "request.current.*.state"
+        );
+    }
 
     #[test]
     fn aggregate_address_returns_pointer_for_struct_and_array() {
@@ -2478,9 +1637,9 @@ mod tests {
             size: 80,
             members: vec![],
         };
-        let eval = EvaluationResult::MemoryLocation(LocationResult::Address(0x1000));
+        let location = VariableLocation::Address(AddressExpr::constant(0x1000));
         let v = ctx
-            .evaluate_result_to_llvm_value(&eval, &st, "S", 0, None)
+            .variable_location_to_llvm_value(&location, &st, "S", 0, None)
             .expect("eval");
         match v {
             BasicValueEnum::PointerValue(_) => {}
@@ -2498,7 +1657,7 @@ mod tests {
             total_size: Some(16),
         };
         let v2 = ctx
-            .evaluate_result_to_llvm_value(&eval, &arr, "A", 0, None)
+            .variable_location_to_llvm_value(&location, &arr, "A", 0, None)
             .expect("eval2");
         match v2 {
             BasicValueEnum::PointerValue(_) => {}
@@ -2525,9 +1684,9 @@ mod tests {
             size: 4,
             encoding: ghostscope_dwarf::constants::DW_ATE_signed.0 as u16,
         };
-        let eval = EvaluationResult::MemoryLocation(LocationResult::Address(0x2000));
+        let location = VariableLocation::Address(AddressExpr::constant(0x2000));
         let v = ctx
-            .evaluate_result_to_llvm_value(&eval, &bt, "x", 0, None)
+            .variable_location_to_llvm_value(&location, &bt, "x", 0, None)
             .expect("eval");
         match v {
             BasicValueEnum::IntValue(_) => {}
@@ -2536,6 +1695,175 @@ mod tests {
         assert!(
             ctx.module.get_global("_temp_read_buffer_4").is_none(),
             "scalar reads should use per-invocation scratch, not shared temp globals"
+        );
+    }
+
+    #[test]
+    fn absolute_address_value_lowers_as_rebased_direct_value() {
+        let llctx = LlvmContext::create();
+        let opts = crate::CompileOptions::default();
+        let mut ctx = EbpfContext::new(&llctx, "abs_addr_value", Some(0), &opts).expect("ctx");
+        ctx.create_basic_ebpf_function("f").expect("fn");
+        ctx.__test_ensure_proc_offsets_map().expect("map");
+        ctx.__test_alloc_pm_key().expect("pm_key");
+        ctx.set_compile_time_context(0, "/nonexistent/module".to_string());
+
+        let ptr_ty = ghostscope_protocol::TypeInfo::PointerType {
+            target_type: Box::new(ghostscope_protocol::TypeInfo::BaseType {
+                name: "int".to_string(),
+                size: 4,
+                encoding: ghostscope_dwarf::constants::DW_ATE_signed.0 as u16,
+            }),
+            size: 8,
+        };
+        let location = VariableLocation::AbsoluteAddressValue(AddressExpr::constant(0x2000));
+
+        let value = ctx
+            .variable_location_to_llvm_value(&location, &ptr_ty, "ptr", 0, None)
+            .expect("absolute address value should lower");
+        assert!(matches!(value, BasicValueEnum::IntValue(_)));
+
+        let pointee = ctx
+            .compute_pointer_dereference(&location)
+            .expect("absolute address value should dereference to memory");
+        assert_eq!(
+            pointee,
+            VariableLocation::Address(AddressExpr::constant(0x2000))
+        );
+    }
+
+    #[test]
+    fn optimized_result_is_rejected_as_unavailable_value() {
+        let llctx = LlvmContext::create();
+        let opts = crate::CompileOptions::default();
+        let mut ctx = EbpfContext::new(&llctx, "optimized_value", Some(0), &opts).expect("ctx");
+        ctx.create_basic_ebpf_function("f").expect("fn");
+
+        let ty = ghostscope_protocol::TypeInfo::BaseType {
+            name: "int".to_string(),
+            size: 4,
+            encoding: ghostscope_dwarf::constants::DW_ATE_signed.0 as u16,
+        };
+
+        let err = ctx
+            .variable_location_to_llvm_value(
+                &VariableLocation::OptimizedOut,
+                &ty,
+                "x",
+                0x1234,
+                None,
+            )
+            .expect_err("optimized value should not lower to a placeholder");
+
+        assert!(
+            matches!(err, CodeGenError::VariableUnavailable(_)),
+            "unexpected error: {err:?}"
+        );
+        assert!(err.to_string().contains("optimized out"));
+        assert!(err.to_string().contains("0x1234"));
+    }
+
+    #[test]
+    fn unavailable_error_formats_structured_dwarf_reason() {
+        let err = EbpfContext::dwarf_expression_unavailable_error(
+            "x",
+            &Availability::Unsupported(ghostscope_dwarf::UnsupportedReason::ExpressionShape {
+                detail: "estimated BPF stack use 64 bytes exceeds capability limit 16".to_string(),
+            }),
+            0xbeef,
+        );
+        let message = err.to_string();
+
+        assert!(matches!(err, CodeGenError::VariableUnavailable(_)));
+        assert!(message.contains("unsupported DWARF expression shape"));
+        assert!(message.contains("estimated BPF stack use 64 bytes"));
+        assert!(!message.contains("ExpressionShape"));
+    }
+
+    #[test]
+    fn unavailable_error_formats_runtime_requirement() {
+        let err = EbpfContext::dwarf_expression_unavailable_error(
+            "ptr",
+            &Availability::Requires(ghostscope_dwarf::RuntimeRequirement::UserMemoryRead),
+            0xcafe,
+        );
+        let message = err.to_string();
+
+        assert!(matches!(err, CodeGenError::VariableUnavailable(_)));
+        assert!(message.contains("user-memory read support"));
+        assert!(!message.contains("UserMemoryRead"));
+    }
+
+    #[test]
+    fn read_plan_lowering_uses_compile_option_runtime_capabilities() {
+        let llctx = LlvmContext::create();
+        let mut opts = crate::CompileOptions::default();
+        opts.runtime_capabilities.max_bpf_stack_bytes = 0;
+        let ctx = EbpfContext::new(&llctx, "runtime_caps", Some(0), &opts).expect("ctx");
+        let dwarf_type = ghostscope_protocol::TypeInfo::BaseType {
+            name: "int".to_string(),
+            size: 4,
+            encoding: ghostscope_dwarf::constants::DW_ATE_signed.0 as u16,
+        };
+        let plan = VariableReadPlan {
+            name: "x".to_string(),
+            type_name: "int".to_string(),
+            dwarf_type: Some(dwarf_type),
+            declaration: None,
+            type_id: None,
+            location: VariableLocation::Address(AddressExpr::constant(0x1000)),
+            availability: Availability::Available,
+            scope_depth: 0,
+            is_parameter: false,
+            is_artificial: false,
+            pc_range: None,
+            inline_context: None,
+            provenance: Provenance::DirectDie,
+        };
+
+        let err = ctx
+            .variable_read_plan_to_runtime_read_parts(plan, 0x1234)
+            .expect_err("zero stack capability should reject the read plan");
+
+        assert!(matches!(err, CodeGenError::VariableUnavailable(_)));
+        assert!(err.to_string().contains("capability limit 0"));
+    }
+
+    #[test]
+    fn optimized_out_read_plan_preserves_marker_conversion() {
+        let llctx = LlvmContext::create();
+        let opts = crate::CompileOptions::default();
+        let ctx = EbpfContext::new(&llctx, "optimized_marker", Some(0), &opts).expect("ctx");
+        let dwarf_type = ghostscope_protocol::TypeInfo::BaseType {
+            name: "int".to_string(),
+            size: 4,
+            encoding: ghostscope_dwarf::constants::DW_ATE_signed.0 as u16,
+        };
+        let plan = VariableReadPlan {
+            name: "x".to_string(),
+            type_name: "int".to_string(),
+            dwarf_type: Some(dwarf_type),
+            declaration: None,
+            type_id: None,
+            location: VariableLocation::OptimizedOut,
+            availability: Availability::OptimizedOut,
+            scope_depth: 0,
+            is_parameter: false,
+            is_artificial: false,
+            pc_range: None,
+            inline_context: None,
+            provenance: Provenance::DirectDie,
+        };
+
+        let (_, marker_type, location) = ctx
+            .variable_read_plan_to_runtime_read_parts(plan, 0x1234)
+            .expect("optimized-out runtime metadata should remain printable");
+        assert_eq!(location, VariableLocation::OptimizedOut);
+        assert_eq!(
+            marker_type,
+            TypeInfo::OptimizedOut {
+                name: "x".to_string()
+            }
         );
     }
 
@@ -2549,19 +1877,17 @@ mod tests {
         ctx.__test_alloc_pm_key().expect("pm_key");
         ctx.set_compile_time_context(0, "/nonexistent/module".to_string());
 
-        let eval = EvaluationResult::MemoryLocation(LocationResult::ComputedLocation {
-            steps: vec![
-                ComputeStep::PushConstant(0x3000),
-                ComputeStep::Dereference {
-                    size: MemoryAccessSize::U64,
-                },
-                ComputeStep::PushConstant(16),
-                ComputeStep::Add,
-            ],
-        });
+        let location = VariableLocation::ComputedAddress(vec![
+            ComputeStep::PushConstant(0x3000),
+            ComputeStep::Dereference {
+                size: MemoryAccessSize::U64,
+            },
+            ComputeStep::PushConstant(16),
+            ComputeStep::Add,
+        ]);
 
         let addr = ctx
-            .evaluation_result_to_address_with_hint(&eval, None, None)
+            .variable_location_to_address_with_hint(&location, None, None)
             .expect("computed address with mid-stream dereference should compile");
         assert_eq!(addr.get_type().get_bit_width(), 64);
     }

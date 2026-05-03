@@ -114,27 +114,3 @@ pub(crate) fn resolve_type_ref_in_same_unit_with_origins(
         .filter(|loc| loc.cu_off == unit_cu_off)
         .map(|loc| loc.die_off))
 }
-
-pub(crate) fn strip_typedef_qualified(
-    dwarf: &gimli::Dwarf<DwarfReader>,
-    mut type_loc: TypeLoc,
-) -> crate::core::Result<TypeLoc> {
-    loop {
-        let header = dwarf.unit_header(type_loc.cu_off)?;
-        let unit = dwarf.unit(header)?;
-        let die = unit.entry(type_loc.die_off)?;
-        match die.tag() {
-            gimli::DW_TAG_typedef
-            | gimli::DW_TAG_const_type
-            | gimli::DW_TAG_volatile_type
-            | gimli::DW_TAG_restrict_type => {
-                if let Some(next) = resolve_type_ref_with_origins(dwarf, &die, &unit)? {
-                    type_loc = next;
-                    continue;
-                }
-            }
-            _ => {}
-        }
-        return Ok(type_loc);
-    }
-}

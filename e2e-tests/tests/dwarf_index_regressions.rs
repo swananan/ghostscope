@@ -612,6 +612,32 @@ async fn test_inline_callsite_clang_dwarf5_resolves_debug_addr_entry_pc() -> any
         !inline_addrs.is_empty(),
         "No DWARF addresses found for inline_callsite_program.c:{INLINE_TRACE_LINE}"
     );
+    let ctx = analyzer.resolve_pc(&inline_addrs[0])?;
+    assert_eq!(
+        ctx.is_inline,
+        Some(true),
+        "expected inline PC context for {INLINE_TRACE_LINE}: {ctx:?}"
+    );
+    assert!(
+        !ctx.inline_chain.is_empty(),
+        "expected inline chain for {INLINE_TRACE_LINE}: {ctx:?}"
+    );
+    assert!(
+        ctx.inline_chain
+            .iter()
+            .any(|frame| frame.context.is_some() && frame.function_name.as_deref() == Some("add3")),
+        "expected add3 inline frame with context id: {ctx:?}"
+    );
+    assert!(
+        ctx.inline_chain.iter().any(|frame| {
+            frame.function_name.as_deref() == Some("add3")
+                && frame
+                    .call_site
+                    .as_ref()
+                    .is_some_and(|call_site| call_site.line_number > 0)
+        }),
+        "expected add3 inline frame with call-site line info: {ctx:?}"
+    );
     let target = spawn_inline_callsite_program(binary_path).await?;
     let query_result: anyhow::Result<()> = async {
         let pid_analyzer = ghostscope_dwarf::DwarfAnalyzer::from_pid(target.host_pid()).await?;

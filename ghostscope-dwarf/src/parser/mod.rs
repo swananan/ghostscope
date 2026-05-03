@@ -5,8 +5,8 @@ pub(crate) mod fast_parser;
 pub(crate) mod range_extractor;
 // Full type resolver removed; shallow resolver lives in detailed_parser
 
-// Re-export what's needed externally
-pub use detailed_parser::VariableWithEvaluation;
+// Internal parser output consumed by the semantic planning layer.
+pub(crate) use detailed_parser::VariableWithEvaluation;
 
 // Internal re-exports for crate use
 pub(crate) use crate::dwarf_expr::ExpressionEvaluator;

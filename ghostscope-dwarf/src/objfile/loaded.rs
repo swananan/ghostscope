@@ -103,6 +103,26 @@ impl LoadedObjfile {
         }
     }
 
+    pub(crate) fn compact_unwind_table(
+        &self,
+        module: crate::ModuleId,
+    ) -> Result<Option<crate::CompactUnwindTable>> {
+        match &self.cfi_index {
+            Some(cfi) => Ok(Some(cfi.compact_unwind_table(module)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) fn compact_unwind_row(
+        &self,
+        module: crate::ModuleId,
+        pc: u64,
+    ) -> Result<Option<crate::CompactUnwindRow>> {
+        Ok(self
+            .compact_unwind_table(module)?
+            .and_then(|table| table.row_for_pc(pc).cloned()))
+    }
+
     pub(crate) fn vaddr_to_file_offset(&self, vaddr: u64) -> Option<u64> {
         if self._binary_mapped_file.data.is_empty() {
             return None;

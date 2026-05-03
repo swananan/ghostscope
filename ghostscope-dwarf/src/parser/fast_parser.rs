@@ -1015,8 +1015,6 @@ impl<'a> DwarfParser<'a> {
                                 column,
                                 is_stmt: line_row.is_stmt(),
                                 prologue_end: line_row.prologue_end(),
-                                epilogue_begin: line_row.epilogue_begin(),
-                                end_sequence: line_row.end_sequence(),
                             });
                         }
                     }

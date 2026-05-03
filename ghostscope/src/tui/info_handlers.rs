@@ -567,7 +567,7 @@ fn unique_module_count(addresses: &[AddressQueryResult]) -> usize {
 }
 
 fn variable_debug_info_from_query(
-    variable: ghostscope_dwarf::VariableWithEvaluation,
+    variable: ghostscope_dwarf::VisibleVariable,
 ) -> VariableDebugInfo {
     let type_pretty = variable.dwarf_type.as_ref().map(|t| t.to_string());
     let size = variable.dwarf_type.as_ref().map(|t| t.size());
@@ -576,7 +576,7 @@ fn variable_debug_info_from_query(
         name: variable.name,
         type_name: variable.type_name,
         type_pretty,
-        location_description: format!("{}", variable.evaluation_result),
+        location_description: format!("{}", variable.location),
         size,
         scope_start: None,
         scope_end: None,

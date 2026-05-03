@@ -171,17 +171,17 @@ async fn test_optimized_inline_struct_member_access_resolves_inline_parameter_na
     );
     for module_address in &addrs {
         let planned = analyzer
-            .plan_chain_access(module_address, "state", &["total_bytes".to_string()])
+            .plan_chain_access_read_plan(module_address, "state", &["total_bytes".to_string()])
             .map_err(|e| {
                 anyhow::anyhow!(
-                    "exec-path plan_chain_access failed for 0x{:x}: {}",
+                    "exec-path plan_chain_access_read_plan failed for 0x{:x}: {}",
                     module_address.address,
                     e
                 )
             })?;
         anyhow::ensure!(
             planned.is_some(),
-            "exec-path plan_chain_access returned None for 0x{:x}",
+            "exec-path plan_chain_access_read_plan returned None for 0x{:x}",
             module_address.address
         );
     }
@@ -199,17 +199,17 @@ async fn test_optimized_inline_struct_member_access_resolves_inline_parameter_na
     );
     for module_address in &pid_addrs {
         let planned = pid_analyzer
-            .plan_chain_access(module_address, "state", &["total_bytes".to_string()])
+            .plan_chain_access_read_plan(module_address, "state", &["total_bytes".to_string()])
             .map_err(|e| {
                 anyhow::anyhow!(
-                    "pid-backed plan_chain_access failed for 0x{:x}: {}",
+                    "pid-backed plan_chain_access_read_plan failed for 0x{:x}: {}",
                     module_address.address,
                     e
                 )
             })?;
         anyhow::ensure!(
             planned.is_some(),
-            "pid-backed plan_chain_access returned None for 0x{:x}",
+            "pid-backed plan_chain_access_read_plan returned None for 0x{:x}",
             module_address.address
         );
     }

@@ -29,7 +29,7 @@ struct PrintVarRuntimeMeta {
 #[derive(Debug, Clone)]
 enum ComplexArgSource<'ctx> {
     RuntimeRead {
-        eval_result: ghostscope_dwarf::EvaluationResult,
+        location: ghostscope_dwarf::VariableLocation,
         dwarf_type: ghostscope_dwarf::TypeInfo,
         module_for_offsets: Option<String>,
     },
@@ -48,7 +48,7 @@ enum ComplexArgSource<'ctx> {
         bytes: Vec<u8>,
     },
     AddressValue {
-        eval_result: ghostscope_dwarf::EvaluationResult,
+        location: ghostscope_dwarf::VariableLocation,
         module_for_offsets: Option<String>,
     },
     // Newly added: a value computed in LLVM at runtime (e.g., expression result)
@@ -340,7 +340,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     access_path: Vec::new(),
                     data_len: 8,
                     source: ComplexArgSource::AddressValue {
-                        eval_result: var.evaluation_result.clone(),
+                        location: var.location.clone(),
                         module_for_offsets: module_hint,
                     },
                 })
@@ -351,13 +351,46 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             | E::ArrayAccess(_, _)
             | E::PointerDeref(_)
             | E::ChainAccess(_)) => {
+                if let Some(plan) = self.query_dwarf_for_complex_expr_plan(expr)? {
+                    let pc_address = self.get_compile_time_context()?.pc_address;
+                    let (var_name, dwarf_type, location) =
+                        self.variable_read_plan_to_runtime_read_parts(plan, pc_address)?;
+                    let display_name = if matches!(expr, E::PointerDeref(_)) {
+                        self.expr_to_name(expr)
+                    } else {
+                        var_name
+                    };
+                    if matches!(location, ghostscope_dwarf::VariableLocation::OptimizedOut) {
+                        return Ok(ComplexArg {
+                            var_name_index: self.trace_context.add_variable_name(display_name),
+                            type_index: self.trace_context.add_type(dwarf_type),
+                            access_path: Vec::new(),
+                            data_len: 0,
+                            source: ComplexArgSource::ImmediateBytes { bytes: Vec::new() },
+                        });
+                    }
+                    let data_len = Self::compute_read_size_for_type(&dwarf_type);
+                    if data_len == 0 {
+                        return Err(CodeGenError::TypeSizeNotAvailable(display_name));
+                    }
+                    let module_hint = self.take_module_hint();
+                    return Ok(ComplexArg {
+                        var_name_index: self.trace_context.add_variable_name(display_name),
+                        type_index: self.trace_context.add_type(dwarf_type.clone()),
+                        access_path: Vec::new(),
+                        data_len,
+                        source: ComplexArgSource::RuntimeRead {
+                            location,
+                            dwarf_type,
+                            module_for_offsets: module_hint,
+                        },
+                    });
+                }
+
                 let var = self
                     .query_dwarf_for_complex_expr(expr)?
                     .ok_or_else(|| CodeGenError::VariableNotFound(format!("{expr:?}")))?;
-                if matches!(
-                    var.evaluation_result,
-                    ghostscope_dwarf::EvaluationResult::Optimized
-                ) {
+                if var.availability == ghostscope_dwarf::Availability::OptimizedOut {
                     let ti = ghostscope_protocol::type_info::TypeInfo::OptimizedOut {
                         name: var.name.clone(),
                     };
@@ -385,7 +418,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     access_path: Vec::new(),
                     data_len,
                     source: ComplexArgSource::RuntimeRead {
-                        eval_result: var.evaluation_result.clone(),
+                        location: var.location.clone(),
                         dwarf_type: dwarf_type.clone(),
                         module_for_offsets: module_hint,
                     },
@@ -397,10 +430,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 if let Some(v) = self.query_dwarf_for_variable(name)? {
                     if let Some(ref t) = v.dwarf_type {
                         // If DWARF reports optimized-out at this PC, emit OptimizedOut type with no data
-                        if matches!(
-                            v.evaluation_result,
-                            ghostscope_dwarf::EvaluationResult::Optimized
-                        ) {
+                        if v.availability == ghostscope_dwarf::Availability::OptimizedOut {
                             let ti = ghostscope_protocol::type_info::TypeInfo::OptimizedOut {
                                 name: v.name.clone(),
                             };
@@ -414,12 +444,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                 source: ComplexArgSource::ImmediateBytes { bytes: Vec::new() },
                             });
                         }
-                        let is_link_addr = matches!(
-                            v.evaluation_result,
-                            ghostscope_dwarf::EvaluationResult::MemoryLocation(
-                                ghostscope_dwarf::LocationResult::Address(_)
-                            )
-                        );
+                        let is_link_addr =
+                            matches!(v.location, ghostscope_dwarf::VariableLocation::Address(_));
                         if Self::is_simple_typeinfo(t) && !is_link_addr {
                             // Prefer computed value to avoid runtime reads
                             let compiled = self.compile_expr(expr)?;
@@ -493,7 +519,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                         access_path: Vec::new(),
                                         data_len,
                                         source: ComplexArgSource::RuntimeRead {
-                                            eval_result: v.evaluation_result.clone(),
+                                            location: v.location.clone(),
                                             dwarf_type: t.clone(),
                                             module_for_offsets: module_hint,
                                         },
@@ -516,7 +542,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                 access_path: Vec::new(),
                                 data_len,
                                 source: ComplexArgSource::RuntimeRead {
-                                    eval_result: v.evaluation_result.clone(),
+                                    location: v.location.clone(),
                                     dwarf_type: t.clone(),
                                     module_for_offsets: module_hint,
                                 },
@@ -583,7 +609,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     if var.dwarf_type.is_some() {
                         // Determine pointed-to/element type and compute location with scaled offset
                         let index = sign * int_side;
-                        let (eval_result, elem_ty) =
+                        let (location, elem_ty) =
                             self.compute_pointed_location_with_index(ptr_side, index)?;
                         let data_len = Self::compute_read_size_for_type(&elem_ty);
                         let module_hint = self.take_module_hint();
@@ -601,7 +627,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                 access_path: Vec::new(),
                                 data_len: 8,
                                 source: ComplexArgSource::AddressValue {
-                                    eval_result,
+                                    location,
                                     module_for_offsets: module_hint,
                                 },
                             });
@@ -614,7 +640,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             access_path: Vec::new(),
                             data_len,
                             source: ComplexArgSource::RuntimeRead {
-                                eval_result,
+                                location,
                                 dwarf_type: elem_ty,
                                 module_for_offsets: module_hint,
                             },
@@ -706,7 +732,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 Ok(1)
             }
             ComplexArgSource::RuntimeRead {
-                eval_result,
+                location,
                 ref dwarf_type,
                 module_for_offsets,
             } => {
@@ -718,7 +744,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 };
                 self.generate_print_complex_variable_runtime(
                     meta,
-                    &eval_result,
+                    &location,
                     dwarf_type,
                     module_for_offsets.as_deref(),
                 )?;
@@ -1930,8 +1956,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                         CodeGenError::VariableNotFound(format!("{expr:?}"))
                                     })?;
                                 let mod_hint = self.take_module_hint();
-                                self.evaluation_result_to_address_with_hint(
-                                    &var.evaluation_result,
+                                self.variable_location_to_address_with_hint(
+                                    &var.location,
                                     None,
                                     mod_hint.as_deref(),
                                 )?
@@ -2026,8 +2052,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                     || CodeGenError::VariableNotFound(format!("{val_expr:?}")),
                                 )?;
                                 let mod_hint = self.take_module_hint();
-                                self.evaluation_result_to_address_with_hint(
-                                    &var.evaluation_result,
+                                self.variable_location_to_address_with_hint(
+                                    &var.location,
                                     None,
                                     mod_hint.as_deref(),
                                 )?
@@ -2136,8 +2162,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                     || CodeGenError::VariableNotFound(format!("{val_expr:?}")),
                                 )?;
                                 let mod_hint = self.take_module_hint();
-                                self.evaluation_result_to_address_with_hint(
-                                    &var.evaluation_result,
+                                self.variable_location_to_address_with_hint(
+                                    &var.location,
                                     None,
                                     mod_hint.as_deref(),
                                 )?
@@ -2213,7 +2239,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         );
 
         let compile_context = self.get_compile_time_context()?.clone();
-        let variable_with_eval = match self.query_dwarf_for_variable(var_name)? {
+        let read_plan = match self.query_dwarf_for_variable(var_name)? {
             Some(var) => var,
             None => {
                 return Err(CodeGenError::VariableNotFound(format!(
@@ -2224,7 +2250,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         };
 
         // Convert DWARF type information to TypeKind using existing method
-        let dwarf_type = variable_with_eval.dwarf_type.as_ref().ok_or_else(|| {
+        let dwarf_type = read_plan.dwarf_type.as_ref().ok_or_else(|| {
             CodeGenError::DwarfError("Variable has no DWARF type information".to_string())
         })?;
         let type_encoding = TypeKind::from(dwarf_type);
@@ -3276,7 +3302,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     }
                 }
                 ComplexArgSource::RuntimeRead {
-                    eval_result,
+                    location,
                     dwarf_type,
                     module_for_offsets,
                 } => {
@@ -3290,8 +3316,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
                     let size_val = i32_type.const_int(a.data_len as u64, false);
                     // Compute source address; if link-time address, apply ASLR offsets via map
-                    let src_addr = self.evaluation_result_to_address_with_hint(
-                        eval_result,
+                    let src_addr = self.variable_location_to_address_with_hint(
+                        location,
                         Some(apl_ptr),
                         module_for_offsets.as_deref(),
                     )?;
@@ -3453,12 +3479,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     self.builder.position_at_end(cont2_block);
                 }
                 ComplexArgSource::AddressValue {
-                    eval_result,
+                    location,
                     module_for_offsets,
                 } => {
                     // Compute address (apply ASLR if link-time address) and store as 8 bytes
-                    let addr = self.evaluation_result_to_address_with_hint(
-                        eval_result,
+                    let addr = self.variable_location_to_address_with_hint(
+                        location,
                         Some(apl_ptr),
                         module_for_offsets.as_deref(),
                     )?;
@@ -4329,7 +4355,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             Some(var_info) => {
                 info!(
                     "Found DWARF variable: {} = {:?}",
-                    var_name, var_info.evaluation_result
+                    var_name, var_info.location
                 );
 
                 // Require DWARF type information
@@ -4340,8 +4366,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 })?;
 
                 let compile_context = self.get_compile_time_context()?;
-                self.evaluate_result_to_llvm_value(
-                    &var_info.evaluation_result,
+                self.variable_location_to_llvm_value(
+                    &var_info.location,
                     dwarf_type,
                     var_name,
                     compile_context.pc_address,
@@ -4363,7 +4389,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     fn generate_print_complex_variable_runtime(
         &mut self,
         meta: PrintVarRuntimeMeta,
-        eval_result: &ghostscope_dwarf::EvaluationResult,
+        location: &ghostscope_dwarf::VariableLocation,
         dwarf_type: &ghostscope_dwarf::TypeInfo,
         module_hint: Option<&str>,
     ) -> Result<()> {
@@ -4373,7 +4399,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             access_path = %meta.access_path,
             type_size = dwarf_type.size(),
             data_len_limit = meta.data_len_limit,
-            eval = ?eval_result,
+            location = ?location,
             "generate_print_complex_variable_runtime: begin"
         );
         // Compute sizes first, then reserve instruction region directly in accumulation buffer
@@ -4689,11 +4715,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         // Compute source address with ASLR-aware helper, honoring module hint
         // Prefer a previously recorded module path for offsets; fall back handled in helper
-        let src_addr = self.evaluation_result_to_address_with_hint(
-            eval_result,
-            Some(status_ptr),
-            module_hint,
-        )?;
+        let src_addr =
+            self.variable_location_to_address_with_hint(location, Some(status_ptr), module_hint)?;
         tracing::trace!(src_addr = %{src_addr}, "generate_print_complex_variable_runtime: computed src_addr");
 
         // Setup common types and casts

@@ -7,7 +7,7 @@ use common::{
     targets::{TargetHandle, TargetLauncher},
     FixtureCompiler, FIXTURES,
 };
-use ghostscope_dwarf::{ComputeStep, MemoryAccessSize};
+use ghostscope_dwarf::{CfaRulePlan, ComputeStep, MemoryAccessSize, RegisterRecoveryPlan};
 use gimli::constants;
 use gimli::write::{
     Address, AttributeValue as WriteAttributeValue, Dwarf as WriteDwarf, EndianVec,
@@ -724,9 +724,15 @@ async fn test_recover_caller_frame_exposes_pc_and_callee_saved_steps() -> anyhow
         "No DWARF addresses found for {FIXTURE_SOURCE}:{POST_CALL_TRACE_LINE}"
     );
 
-    let recovery = analyzer
+    let recovery_by_address = analyzer
         .recover_caller_frame(&addrs[0], &[3, 16])?
         .ok_or_else(|| anyhow::anyhow!("no caller-frame recovery returned"))?;
+    let ctx = analyzer.resolve_pc(&addrs[0])?;
+    let recovery = analyzer
+        .recover_caller_frame_for_context(&ctx, &[3, 16])?
+        .ok_or_else(|| anyhow::anyhow!("no caller-frame recovery returned from PC context"))?;
+
+    assert_eq!(recovery, recovery_by_address);
 
     assert_eq!(recovery.return_address_register, 16);
     assert!(
@@ -759,6 +765,72 @@ async fn test_recover_caller_frame_exposes_pc_and_callee_saved_steps() -> anyhow
             }
         )),
         "rbx should recover from the caller stack slot at the post-call PC: {rbx_steps:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_compact_unwind_table_exposes_pc_row() -> anyhow::Result<()> {
+    init();
+    if !fixture_compiler_available(FixtureCompiler::ClangDwarf5) {
+        eprintln!("Skipping compact unwind table test because clang is unavailable");
+        return Ok(());
+    }
+
+    let binary_path =
+        FIXTURES.get_test_binary_with_compiler(FIXTURE_NAME, FixtureCompiler::ClangDwarf5)?;
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
+    let addrs = analyzer.lookup_addresses_by_source_line(FIXTURE_SOURCE, POST_CALL_TRACE_LINE);
+    anyhow::ensure!(
+        !addrs.is_empty(),
+        "No DWARF addresses found for {FIXTURE_SOURCE}:{POST_CALL_TRACE_LINE}"
+    );
+
+    let ctx = analyzer.resolve_pc(&addrs[0])?;
+    let table_by_context = analyzer
+        .compact_unwind_table_for_context(&ctx)?
+        .ok_or_else(|| anyhow::anyhow!("no compact unwind table returned from PC context"))?;
+    let table_by_module = analyzer
+        .compact_unwind_table_for_module(ctx.module)?
+        .ok_or_else(|| anyhow::anyhow!("no compact unwind table returned for module"))?;
+
+    assert_eq!(table_by_context, table_by_module);
+
+    let stats = table_by_context.stats();
+    assert!(stats.row_count > 0, "compact unwind table is empty");
+    assert!(
+        stats.bpf_supported_rows > 0,
+        "expected at least one BPF-fast-path unwind row: {stats:?}"
+    );
+    assert!(
+        table_by_context
+            .rows
+            .windows(2)
+            .all(|pair| (pair[0].pc_start, pair[0].pc_end) <= (pair[1].pc_start, pair[1].pc_end)),
+        "compact unwind rows should be sorted by PC"
+    );
+
+    let row = table_by_context
+        .row_for_pc(ctx.normalized_pc)
+        .ok_or_else(|| anyhow::anyhow!("no compact unwind row for PC context"))?;
+    let row_by_context = analyzer
+        .compact_unwind_row_for_context(&ctx)?
+        .ok_or_else(|| anyhow::anyhow!("no direct compact unwind row for PC context"))?;
+    assert_eq!(&row_by_context, row);
+    assert_eq!(row.module, ctx.module);
+    assert_eq!(row.return_address_register, 16);
+    assert!(matches!(
+        row.cfa,
+        CfaRulePlan::RegPlusOffset { .. } | CfaRulePlan::Expression { .. }
+    ));
+    assert!(
+        !matches!(
+            row.return_address,
+            RegisterRecoveryPlan::Undefined | RegisterRecoveryPlan::Unsupported { .. }
+        ),
+        "return address recovery should be materialized: {:?}",
+        row.return_address
     );
 
     Ok(())
