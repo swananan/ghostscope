@@ -5,7 +5,10 @@
 use super::context::{CodeGenError, EbpfContext, Result};
 use crate::script::{BinaryOp, Expr};
 use aya_ebpf_bindings::bindings::bpf_func_id::BPF_FUNC_probe_read_user;
-use ghostscope_dwarf::TypeInfo as DwarfType;
+use ghostscope_dwarf::{
+    AmbiguityReason, Availability, RuntimeRequirement, TypeInfo as DwarfType, UnsupportedReason,
+    VariableReadPlan,
+};
 use inkwell::values::{BasicValueEnum, IntValue};
 use inkwell::AddressSpace;
 use tracing::debug;
@@ -342,8 +345,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             } else {
                                 None
                             };
-                            return self.evaluation_result_to_address_with_hint(
-                                &var.evaluation_result,
+                            return self.variable_location_to_address_with_hint(
+                                &var.location,
                                 status_ptr,
                                 module_hint.as_deref(),
                             );
@@ -371,8 +374,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 } else {
                     None
                 };
-                return self.evaluation_result_to_address_with_hint(
-                    &var.evaluation_result,
+                return self.variable_location_to_address_with_hint(
+                    &var.location,
                     status_ptr,
                     module_hint.as_deref(),
                 );
@@ -435,8 +438,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 }
                 match dty {
                     DwarfType::PointerType { .. } => {
-                        let val_any = self.evaluate_result_to_llvm_value(
-                            &var.evaluation_result,
+                        let val_any = self.variable_location_to_llvm_value(
+                            &var.location,
                             dty,
                             &var.name,
                             self.get_compile_time_context()?.pc_address,
@@ -461,8 +464,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         } else {
                             None
                         };
-                        self.evaluation_result_to_address_with_hint(
-                            &var.evaluation_result,
+                        self.variable_location_to_address_with_hint(
+                            &var.location,
                             status_ptr,
                             module_hint.as_deref(),
                         )
@@ -478,8 +481,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 } else {
                     None
                 };
-                self.evaluation_result_to_address_with_hint(
-                    &var.evaluation_result,
+                self.variable_location_to_address_with_hint(
+                    &var.location,
                     status_ptr,
                     module_hint.as_deref(),
                 )
@@ -1071,8 +1074,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     }
                     match ty {
                         DwarfType::PointerType { .. } => {
-                            let val_any = self.evaluate_result_to_llvm_value(
-                                &var.evaluation_result,
+                            let val_any = self.variable_location_to_llvm_value(
+                                &var.location,
                                 ty,
                                 &var.name,
                                 self.get_compile_time_context()?.pc_address,
@@ -1098,8 +1101,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             } else {
                                 None
                             };
-                            self.evaluation_result_to_address_with_hint(
-                                &var.evaluation_result,
+                            self.variable_location_to_address_with_hint(
+                                &var.location,
                                 status_ptr,
                                 module_hint.as_deref(),
                             )?
@@ -1692,8 +1695,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                     )
                                 })?;
                         let module_hint = self.current_resolved_var_module_path.clone();
-                        match self.evaluation_result_to_address_with_hint(
-                            &var.evaluation_result,
+                        match self.variable_location_to_address_with_hint(
+                            &var.location,
                             None,
                             module_hint.as_deref(),
                         ) {
@@ -1727,8 +1730,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     })?;
                 // Use current resolved hint if available (set during DWARF resolution)
                 let module_hint = self.current_resolved_var_module_path.clone();
-                match self.evaluation_result_to_address_with_hint(
-                    &var.evaluation_result,
+                match self.variable_location_to_address_with_hint(
+                    &var.location,
                     None,
                     module_hint.as_deref(),
                 ) {
@@ -2178,7 +2181,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         // Query DWARF for the complex expression
         let compile_context = self.get_compile_time_context()?.clone();
-        let variable_with_eval = match self.query_dwarf_for_complex_expr(expr)? {
+        let variable_plan = match self.query_dwarf_for_complex_expr(expr)? {
             Some(var) => var,
             None => {
                 let expr_str = Self::expr_to_debug_string(expr);
@@ -2186,23 +2189,118 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             }
         };
 
-        let dwarf_type = variable_with_eval.dwarf_type.as_ref().ok_or_else(|| {
+        let dwarf_type = variable_plan.dwarf_type.as_ref().ok_or_else(|| {
             CodeGenError::DwarfError("Expression has no DWARF type information".to_string())
         })?;
+        Self::ensure_dwarf_value_available(&variable_plan, compile_context.pc_address)?;
 
         debug!(
             "compile_dwarf_expression: Found DWARF info for expression '{}' with type: {:?}",
-            variable_with_eval.name, dwarf_type
+            variable_plan.name, dwarf_type
         );
 
         // Use the unified evaluation logic to generate LLVM IR
-        self.evaluate_result_to_llvm_value(
-            &variable_with_eval.evaluation_result,
+        self.variable_location_to_llvm_value(
+            &variable_plan.location,
             dwarf_type,
-            &variable_with_eval.name,
+            &variable_plan.name,
             compile_context.pc_address,
             None,
         )
+    }
+
+    pub(crate) fn dwarf_expression_unavailable_error(
+        name: &str,
+        availability: &Availability,
+        pc_address: u64,
+    ) -> CodeGenError {
+        let reason = Self::format_availability_reason(availability);
+        CodeGenError::VariableUnavailable(format!(
+            "'{name}' is {reason}; cannot use it as a value expression at PC 0x{pc_address:x}"
+        ))
+    }
+
+    fn format_availability_reason(availability: &Availability) -> String {
+        match availability {
+            Availability::OptimizedOut => "optimized out at the selected probe PC".to_string(),
+            Availability::NotInScope => "not in scope at the selected probe PC".to_string(),
+            Availability::Unsupported(reason) => {
+                format!(
+                    "unsupported DWARF semantic shape: {}",
+                    Self::format_unsupported_reason(reason)
+                )
+            }
+            Availability::Requires(requirement) => {
+                format!(
+                    "requires unavailable runtime support: {}",
+                    Self::format_runtime_requirement(requirement)
+                )
+            }
+            Availability::Ambiguous(reason) => {
+                format!(
+                    "ambiguous DWARF semantic result: {}",
+                    Self::format_ambiguity_reason(reason)
+                )
+            }
+            Availability::Available | Availability::PartiallyAvailable => "available".to_string(),
+        }
+    }
+
+    fn format_unsupported_reason(reason: &UnsupportedReason) -> String {
+        match reason {
+            UnsupportedReason::DwarfOp { op } => format!("unsupported DWARF op {op}"),
+            UnsupportedReason::ExpressionShape { detail } => {
+                format!("unsupported DWARF expression shape: {detail}")
+            }
+            UnsupportedReason::TypeLayout { detail } => {
+                format!("unsupported type layout: {detail}")
+            }
+            UnsupportedReason::AddressClass { detail } => {
+                format!("unsupported address class: {detail}")
+            }
+            UnsupportedReason::RegisterMapping { dwarf_reg } => {
+                format!("unsupported DWARF register mapping for register {dwarf_reg}")
+            }
+        }
+    }
+
+    fn format_runtime_requirement(requirement: &RuntimeRequirement) -> &'static str {
+        match requirement {
+            RuntimeRequirement::CallerFrame => "caller-frame recovery",
+            RuntimeRequirement::SleepableUprobe => "sleepable uprobe support",
+            RuntimeRequirement::UserMemoryRead => "user-memory read support",
+            RuntimeRequirement::DwarfCfiRecovery => "DWARF CFI recovery",
+        }
+    }
+
+    fn format_ambiguity_reason(reason: &AmbiguityReason) -> String {
+        match reason {
+            AmbiguityReason::InlineContext { detail } => {
+                format!("ambiguous inline context: {detail}")
+            }
+            AmbiguityReason::VariableDeclaration { detail } => {
+                format!("ambiguous variable declaration: {detail}")
+            }
+            AmbiguityReason::TypeResolution { detail } => {
+                format!("ambiguous type resolution: {detail}")
+            }
+        }
+    }
+
+    pub(crate) fn ensure_dwarf_value_available(
+        variable: &VariableReadPlan,
+        pc_address: u64,
+    ) -> Result<()> {
+        let availability = variable.availability.clone();
+        if availability.is_available() {
+            Ok(())
+        } else {
+            Err(Self::dwarf_expression_unavailable_error(
+                &variable.name,
+                &availability,
+                pc_address,
+            ))
+        }
     }
 
     /// Helper: Convert expression to string for debugging
@@ -2300,8 +2398,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         } else {
             None
         };
-        let addr = self.evaluation_result_to_address_with_hint(
-            &var.evaluation_result,
+        let addr = self.variable_location_to_address_with_hint(
+            &var.location,
             status_ptr,
             module_hint.as_deref(),
         )?;
@@ -2325,8 +2423,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 }
 
                 // Evaluate expression to pointer value and read up to L+1 bytes
-                let val_any = self.evaluate_result_to_llvm_value(
-                    &var.evaluation_result,
+                let val_any = self.variable_location_to_llvm_value(
+                    &var.location,
                     var.dwarf_type.as_ref().unwrap(),
                     &var.name,
                     self.get_compile_time_context()?.pc_address,

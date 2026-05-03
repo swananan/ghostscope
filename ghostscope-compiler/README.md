@@ -1,6 +1,13 @@
 # ghostscope-compiler
 
-`ghostscope-compiler` turns GhostScope trace definitions into DWARF-aware eBPF programs. It parses the DSL, performs DWARF resolution, and emits IR that targets LLVM's BPF backend.
+`ghostscope-compiler` turns GhostScope trace definitions into DWARF-aware eBPF
+programs. It parses the DSL, asks `ghostscope-dwarf` for PC-context read plans,
+and lowers those plans into IR that targets LLVM's BPF backend.
+
+The compiler should not reinterpret raw DWARF location expressions itself. DWARF
+visibility, optimized-out state, ASLR-sensitive address handling, and semantic
+diagnostics belong in `ghostscope-dwarf`; this crate consumes the resulting plan
+and focuses on safe code generation.
 
 ## Build Requirements
 - LLVM 18.x with `llvm-config` available on `PATH` (or set `LLVM_CONFIG_PATH`)

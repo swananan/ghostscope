@@ -413,6 +413,11 @@ mod tests {
                 config_file_path: None,
             },
             runtime: RuntimeContext::default(),
+            kernel_capabilities: ghostscope_loader::KernelCapabilities {
+                supports_ringbuf: true,
+                supports_perf_event_array: true,
+                supports_ns_current_pid_tgid_helper: false,
+            },
         }
     }
 

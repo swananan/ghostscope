@@ -4,6 +4,7 @@ use crate::CompileError;
 use inkwell::context::Context;
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
+use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use tracing::{debug, error, info, warn};
@@ -133,7 +134,7 @@ impl<'a> AstCompiler<'a> {
                         }
                         Err(e) => {
                             failed_trace_points += 1;
-                            let error_msg = e.to_string();
+                            let error_msg = e.user_message().into_owned();
                             error!(
                                 "❌ Failed to process trace point {}: {:?} - Error: {}",
                                 index, pattern, error_msg
@@ -154,6 +155,14 @@ impl<'a> AstCompiler<'a> {
                                         file_path,
                                         line_number,
                                     } => ft.target_name == format!("{file_path}:{line_number}"),
+                                    TracePattern::Address(addr) => {
+                                        ft.target_name == format!("0x{addr:x}")
+                                            && ft.pc_address == *addr
+                                    }
+                                    TracePattern::AddressInModule { module, address } => {
+                                        ft.target_name == format!("{module}:0x{address:x}")
+                                            && ft.pc_address == *address
+                                    }
                                     _ => false,
                                 });
 
@@ -164,12 +173,21 @@ impl<'a> AstCompiler<'a> {
                                         file_path,
                                         line_number,
                                     } => format!("{file_path}:{line_number}"),
+                                    TracePattern::Address(addr) => format!("0x{addr:x}"),
+                                    TracePattern::AddressInModule { module, address } => {
+                                        format!("{module}:0x{address:x}")
+                                    }
                                     _ => format!("trace_point_{index}"),
+                                };
+                                let pc_address = match pattern {
+                                    TracePattern::Address(addr) => *addr,
+                                    TracePattern::AddressInModule { address, .. } => *address,
+                                    _ => 0,
                                 };
 
                                 self.failed_targets.push(FailedTarget {
                                     target_name,
-                                    pc_address: 0,
+                                    pc_address,
                                     error_message: error_msg,
                                 });
                             }
@@ -197,7 +215,7 @@ impl<'a> AstCompiler<'a> {
             // All trace points failed - return error with first failure reason
             error!("All {} trace points failed to process", failed_trace_points);
             return Err(CompileError::Other(
-                first_error.unwrap_or_else(|| "All trace points failed".to_string()),
+                self.format_all_trace_points_failed_error(first_error),
             ));
         }
 
@@ -209,13 +227,32 @@ impl<'a> AstCompiler<'a> {
             self.uprobe_configs.len()
         );
 
+        let trace_count = self.uprobe_configs.len();
         Ok(CompilationResult {
             uprobe_configs: std::mem::take(&mut self.uprobe_configs),
             failed_targets: std::mem::take(&mut self.failed_targets),
-            trace_count: self.uprobe_configs.len(),
+            trace_count,
             target_info,
             next_available_trace_id: self.current_trace_id,
         })
+    }
+
+    fn format_all_trace_points_failed_error(&self, first_error: Option<String>) -> String {
+        let mut message = first_error.unwrap_or_else(|| "All trace points failed".to_string());
+        if self.failed_targets.is_empty() {
+            return message;
+        }
+
+        message.push_str("\n\nFailed targets:\n");
+        for failed in &self.failed_targets {
+            let _ = writeln!(
+                message,
+                "  - {} at 0x{:x}: {}",
+                failed.target_name, failed.pc_address, failed.error_message
+            );
+        }
+        message.push_str("\nTip: fix the reported compile-time errors above.");
+        message
     }
 
     /// Build a detailed error message for SourceLine resolution failures
@@ -411,7 +448,7 @@ impl<'a> AstCompiler<'a> {
                             self.failed_targets.push(FailedTarget {
                                 target_name: format!("{file_path}:{line_number}"),
                                 pc_address: module_address.address,
-                                error_message: e.to_string(),
+                                error_message: e.user_message().into_owned(),
                             });
 
                             // Continue processing other addresses
@@ -494,13 +531,17 @@ impl<'a> AstCompiler<'a> {
                         Ok(())
                     }
                     Err(e) => {
-                        let error_msg = e.to_string();
+                        let error_msg = e.user_message().into_owned();
+                        error!(
+                            "❌ Failed to generate eBPF for address 0x{:x}: {}",
+                            addr, error_msg
+                        );
                         self.failed_targets.push(FailedTarget {
                             target_name: format!("0x{addr:x}"),
                             pc_address: *addr,
-                            error_message: error_msg.clone(),
+                            error_message: error_msg,
                         });
-                        Err(CompileError::Other(error_msg))
+                        Err(e)
                     }
                 }
             }
@@ -578,13 +619,17 @@ impl<'a> AstCompiler<'a> {
                         Ok(())
                     }
                     Err(e) => {
-                        let error_msg = e.to_string();
+                        let error_msg = e.user_message().into_owned();
+                        error!(
+                            "❌ Failed to generate eBPF for module-qualified address {}:0x{:x}: {}",
+                            module, address, error_msg
+                        );
                         self.failed_targets.push(FailedTarget {
                             target_name: format!("{module}:0x{address:x}"),
                             pc_address: *address,
-                            error_message: error_msg.clone(),
+                            error_message: error_msg,
                         });
-                        Err(CompileError::Other(error_msg))
+                        Err(e)
                     }
                 }
             }
@@ -674,7 +719,7 @@ impl<'a> AstCompiler<'a> {
                             self.failed_targets.push(FailedTarget {
                                 target_name: func_name.clone(),
                                 pc_address: module_address.address,
-                                error_message: e.to_string(),
+                                error_message: e.user_message().into_owned(),
                             });
 
                             // Continue processing other addresses
@@ -752,8 +797,8 @@ impl<'a> AstCompiler<'a> {
             }
         }
 
-        // Use new codegen implementation with full AST compilation
-        let mut codegen_new = crate::ebpf::context::NewCodeGen::new_with_process_analyzer(
+        // Use the eBPF context implementation with full AST compilation.
+        let mut codegen = crate::ebpf::context::EbpfContext::new_with_process_analyzer(
             &context,
             &ebpf_function_name,
             self.process_analyzer,
@@ -764,7 +809,7 @@ impl<'a> AstCompiler<'a> {
 
         // Set compile-time context for DWARF queries
         if let Some(function_address) = target.function_address {
-            codegen_new.set_compile_time_context(function_address, target.binary_path.clone());
+            codegen.set_compile_time_context(function_address, target.binary_path.clone());
         }
 
         info!(
@@ -773,7 +818,7 @@ impl<'a> AstCompiler<'a> {
         );
 
         // Use full AST compilation
-        let (_main_function, trace_context) = codegen_new
+        let (_main_function, trace_context) = codegen
             .compile_program(
                 &crate::script::ast::Program { statements: vec![] }, // Empty program - statements passed separately
                 &ebpf_function_name,
@@ -782,7 +827,7 @@ impl<'a> AstCompiler<'a> {
                 target.function_address,
                 Some(&target.binary_path),
             )
-            .map_err(|e| CompileError::LLVM(format!("Failed to compile AST program: {e}")))?;
+            .map_err(CompileError::CodeGen)?;
 
         info!(
             "Generated TraceContext for '{}' with {} strings and {} variables",
@@ -791,7 +836,7 @@ impl<'a> AstCompiler<'a> {
             trace_context.variable_name_count()
         );
 
-        let module = codegen_new.get_module();
+        let module = codegen.get_module();
 
         // Generate eBPF bytecode from LLVM module
         let ebpf_bytecode = Self::generate_ebpf_bytecode(

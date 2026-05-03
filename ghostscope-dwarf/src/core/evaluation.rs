@@ -1,18 +1,18 @@
-//! DWARF expression evaluation results for LLVM/eBPF code generation
+//! DWARF expression evaluation results
 //!
-//! This module defines the simplified representation of DWARF expressions
-//! that can be directly converted to LLVM IR for eBPF code generation.
+//! This module defines the internal representation produced while evaluating
+//! raw DWARF expressions. The semantic planning layer converts these results
+//! into public read plans before compiler code generation consumes them.
 //!
 //! Design principles:
-//! 1. Optimize for eBPF constraints (read registers from pt_regs, read memory via bpf_probe_read_user)
+//! 1. Preserve whether an expression describes a value or a location
 //! 2. Pre-compute as much as possible at compile time
-//! 3. Clearly separate value semantics from location semantics
-//! 4. Make register dependencies explicit for eBPF verification
+//! 3. Keep register and memory dependencies explicit for later lowering
 
 use std::collections::BTreeMap;
 use std::fmt;
 
-/// Result of evaluating a DWARF expression for eBPF code generation
+/// Internal result of evaluating a DWARF expression
 #[derive(Debug, Clone, PartialEq)]
 pub enum EvaluationResult {
     /// Direct value - expression result is the variable value (no memory read needed)
@@ -121,8 +121,10 @@ pub struct EntryValueCase {
     pub value_steps: Vec<ComputeStep>,
 }
 
-/// Computation step for LLVM IR generation
-/// These map directly to LLVM IR operations that can be generated in eBPF
+/// Stack-machine computation step preserved for later runtime lowering.
+///
+/// The compiler currently lowers these steps to LLVM IR for eBPF, but the DWARF
+/// crate treats them as target-independent semantic operations.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ComputeStep {
     /// Load register value from pt_regs

@@ -57,7 +57,7 @@ GhostScope uses Cargo workspace for modular design:
 |-------|---------|
 | **ghostscope** | Main binary and runtime coordinator - orchestrates all components via async event loop |
 | **ghostscope-compiler** | Script compilation pipeline - transforms user scripts into verified eBPF bytecode via LLVM |
-| **ghostscope-dwarf** | Debug information analyzer - provides cross-module symbol resolution and type information |
+| **ghostscope-dwarf** | PC-context DWARF semantic engine - resolves source locations, visible variables, type layouts, address mappings, and compiler read plans |
 | **ghostscope-loader** | eBPF program lifecycle manager - handles uprobe attachment and ring buffer management via Aya |
 | **ghostscope-ui** | Terminal user interface - implements interactive TUI with TEA (The Elm Architecture) pattern |
 | **ghostscope-protocol** | Communication protocol - defines message format for eBPF-userspace data exchange |
@@ -88,9 +88,10 @@ GhostScope uses Cargo workspace for modular design:
 
 **Key feature**: Progressive loading with callbacks for UI progress updates.
 
-### 3. DWARF Analyzer
+### 3. DWARF Semantic Engine
 
-**Role**: High-performance multi-module debug information system.
+**Role**: High-performance multi-module debug information system and
+PC-context semantic planner.
 
 **Core Optimizations**:
 
@@ -115,6 +116,12 @@ GhostScope uses Cargo workspace for modular design:
    - Virtual address to file offset conversion
    - Runtime address mapping for process-specific traces
 
+5. **PC-Context Read Planning**
+   - Resolves locals, parameters, globals, and inline scopes at a specific probe PC
+   - Produces typed read plans for the compiler instead of exposing raw DWARF locations
+   - Preserves semantic distinctions such as optimized-out values, rebased absolute addresses, and value-backed aggregates
+   - Reports compile-time diagnostics when a variable is visible but cannot be safely lowered
+
 TODO: Still slow, need to research how GDB optimizes DWARF parsing performance.
 
 ### 4. Compilation Pipeline
@@ -135,9 +142,9 @@ Multi-stage pipeline with type safety at each level:
 ┌──────────────────────────────────────────────────────────┐
 │ Stage 2: LLVM IR Generation                              │
 │                                                          │
-│   AST + DWARF Info                                       │
+│   AST + PC Context + DWARF Read Plans                    │
 │         ↓                                                │
-│   Symbol Resolution (variables, types, locations)        │
+│   Plan Lowering (variables, types, availability)         │
 │         ↓                                                │
 │   LLVM IR (type-safe intermediate representation)        │
 └──────────────────────────────────────────────────────────┘

@@ -68,17 +68,17 @@ We now ship a reproducible single-thread benchmark for one narrow question: "wha
 
 | Aspect | GhostScope | perf probe / perf uprobes |
 |---|---|---|
-| Positioning | Purpose-built userspace tracer with runtime DWARF evaluation, a small DSL, and a TUI/session workflow | Declarative probe-definition frontend plus the broader perf recording and reporting pipeline |
+| Positioning | Purpose-built userspace tracer with PC-context DWARF planning, a small DSL, and a TUI/session workflow | Declarative probe-definition frontend plus the broader perf recording and reporting pipeline |
 | Programmability and safety model | eBPF-backed collection logic with programmable filtering and formatting; flexibility is constrained by the verifier | Narrower, more declarative capability surface: define probe points and fetchargs, but not an eBPF-style "run custom logic on each hit" programming model |
 | Source-level frontend | Function, source-line, and instruction-oriented tracing are core workflows | Strong native support for functions, source lines, locals, and inline-related probe discovery inside `perf probe` |
-| Variable access style | Runtime DWARF evaluation for locals, parameters, and globals; typed rendering in the tracer UI | Declarative fetchargs for locals, parameters, registers, symbols, arrays, and return values |
+| Variable access style | Compile/load-time DWARF read planning for locals, parameters, and globals, followed by eBPF runtime reads and typed rendering | Declarative fetchargs for locals, parameters, registers, symbols, arrays, and return values |
 | Inline and discovery workflow | Good source-driven attachment, but within GhostScope's tracer model | Mature discovery workflow for lines, functions, and inline-related probe search such as `--line`, `--vars`, and `--no-inlines` |
 | What happens after a hit | Structured data can be filtered, sampled, and shaped before delivery to userspace | Mostly fixed event-field extraction, then hand off to the perf recording and reporting toolchain |
 | Output and consumption | RingBuf or PerfEventArray to a custom realtime reader/TUI | Common path is `perf probe` -> `perf record` -> `perf.data` -> `perf report` or `perf script` |
 | Best at | Production-oriented live userspace diagnosis with structured output and a dedicated runtime workflow | Quick one-off probes and reuse of the existing perf ecosystem |
 | Tradeoff | More opinionated; not meant to be the general perf toolkit | Less programmable than eBPF-based tracers and less centered on custom realtime processing |
 
-Choose GhostScope when you want a purpose-built online tracer with runtime DWARF semantics, programmable filtering, and a friendlier live diagnosis workflow. Choose perf when you want to quickly place a function, source-line, or local-variable probe and stay inside the perf ecosystem.
+Choose GhostScope when you want a purpose-built online tracer with PC-context DWARF semantics, programmable filtering, and a friendlier live diagnosis workflow. Choose perf when you want to quickly place a function, source-line, or local-variable probe and stay inside the perf ecosystem.
 
 Background: a practical shorthand is `perf probe` = more fixed-semantics and ready-to-use, not "zero configurability"; GhostScope's eBPF-backed tracer model trades that simplicity for more programmable hit handling and a richer live workflow.
 
@@ -87,10 +87,10 @@ Background: a practical shorthand is `perf probe` = more fixed-semantics and rea
 | Aspect | GhostScope | bpftrace |
 |---|---|---|
 | Positioning | DWARF-aware userspace observation; restores source-level semantics | General-purpose eBPF dynamic tracer; event observation and aggregation |
-| DWARF usage | Evaluates DWARF expressions at runtime; reads params, locals, and globals | Parses args and structs; not centered on runtime evaluation of location expressions |
+| DWARF usage | Plans variable reads from DWARF at compile/load time, then emits eBPF reads for params, locals, and globals | Parses args and structs; not centered on PC-context variable read planning |
 | Attachment granularity and symbols | Line-table-driven source-line and instruction attachment, plus function-oriented tracing | Entry/return, in-function offsets, absolute locations, and event probes; no built-in line-to-address workflow |
 | Observable data | Supports locals, parameters, and globals; renders values with real types | Strong for arguments, structs, and event streams; less focused on recovering arbitrary live userspace state |
-| ASLR impact | Runtime DWARF computation naturally adapts to ASLR and PIE | `uaddr()`-style global reads become awkward or unavailable under ASLR and PIE |
+| ASLR impact | DWARF read plans preserve rebasing requirements for PIE, shared libraries, and absolute-address values | `uaddr()`-style global reads become awkward or unavailable under ASLR and PIE |
 | Interaction experience | TUI-friendly, observe without interruption | Script-style output and aggregation; less interactive |
 | Best at | Recovering real userspace state from live code paths | Correlating many event sources quickly |
 | Tradeoff | Narrower scope | Less focused on source-level userspace diagnosis |
@@ -105,8 +105,8 @@ Background: one motivation for GhostScope was that newer bpftrace versions no lo
 |---|---|---|
 | Position and scope | DWARF-aware userspace observation aimed at production printf-style debugging with an interactive workflow | Broad tracing framework with kernel and userspace coverage, including an eBPF backend |
 | Source line and statement probes | Supported; line-level attachment is a core path | Supported; statement probes can be resolved and attached |
-| Variable access (params, locals, globals) | Supported. Evaluate DWARF at runtime with gimli; render by real types; naturally ASLR and PIE friendly | Supported. DWARF location expressions are lowered through SystemTap's pipeline into eBPF-compatible logic, with verifier and stack constraints |
-| DWARF expression handling | Evaluate DWARF in userspace and collect values via eBPF programs | Translate DWARF operations into internal representations and lower them into eBPF instruction sequences |
+| Variable access (params, locals, globals) | Supported. Build PC-context read plans with gimli-backed DWARF data; render by real types; naturally ASLR and PIE friendly | Supported. DWARF location expressions are lowered through SystemTap's pipeline into eBPF-compatible logic, with verifier and stack constraints |
+| DWARF expression handling | Convert DWARF locations into semantic read plans and lower supported plans into eBPF runtime reads | Translate DWARF operations into internal representations and lower them into eBPF instruction sequences |
 | Stack unwinding (CFI) | Not supported yet; planned via `.eh_frame` unwinding | Not supported in the eBPF backend |
 | Event transport and formatting | RingBuf (on newer kernels) or PerfEventArray; configurable pages and event size; built-in dump helpers such as `{:x.N}`, `{:s.N}`, and `{:p}` | PERF_EVENT_ARRAY plus userspace formatting/interpreter flow; formatting and string handling are more constrained |
 | BTF, CO-RE, linkage | Aya ecosystem, prefer RingBuf; not centered on BTF or CO-RE | No BTF or CO-RE focus; minimal libbpf-style backend |

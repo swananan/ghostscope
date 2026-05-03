@@ -1,7 +1,7 @@
 mod common;
 
 use common::{init, FIXTURES};
-use ghostscope_dwarf::{DirectValueResult, EvaluationResult};
+use ghostscope_dwarf::VariableLocation;
 use regex::Regex;
 use std::path::Path;
 use std::time::Duration;
@@ -47,7 +47,7 @@ async fn run_ghostscope_with_script_for_target(
 }
 
 fn assert_not_internal_call_register_aliases(
-    parameters: &[ghostscope_dwarf::VariableWithEvaluation],
+    parameters: &[ghostscope_dwarf::VisibleVariable],
     address: u64,
 ) -> anyhow::Result<()> {
     let original_x = parameters
@@ -60,13 +60,13 @@ fn assert_not_internal_call_register_aliases(
         .ok_or_else(|| anyhow::anyhow!("missing original_y at 0x{:x}", address))?;
 
     assert_ne!(
-        original_x.evaluation_result,
-        EvaluationResult::DirectValue(DirectValueResult::RegisterValue(5)),
+        original_x.location,
+        VariableLocation::RegisterValue { dwarf_reg: 5 },
         "original_x aliased consume_pair's first argument register at 0x{address:x}: {parameters:?}"
     );
     assert_ne!(
-        original_y.evaluation_result,
-        EvaluationResult::DirectValue(DirectValueResult::RegisterValue(4)),
+        original_y.location,
+        VariableLocation::RegisterValue { dwarf_reg: 4 },
         "original_y aliased consume_pair's second argument register at 0x{address:x}: {parameters:?}"
     );
 
@@ -74,7 +74,7 @@ fn assert_not_internal_call_register_aliases(
 }
 
 fn assert_parameters_are_live_in_registers(
-    parameters: &[ghostscope_dwarf::VariableWithEvaluation],
+    parameters: &[ghostscope_dwarf::VisibleVariable],
     address: u64,
 ) -> anyhow::Result<()> {
     for parameter_name in ["original_x", "original_y"] {
@@ -84,14 +84,11 @@ fn assert_parameters_are_live_in_registers(
             .ok_or_else(|| anyhow::anyhow!("missing {parameter_name} at 0x{address:x}"))?;
 
         assert!(
-            !matches!(parameter.evaluation_result, EvaluationResult::Optimized),
+            !matches!(parameter.location, VariableLocation::OptimizedOut),
             "{parameter_name} should still be live before consume_pair() at 0x{address:x}: {parameters:?}"
         );
         assert!(
-            matches!(
-                parameter.evaluation_result,
-                EvaluationResult::DirectValue(DirectValueResult::RegisterValue(_))
-            ),
+            matches!(parameter.location, VariableLocation::RegisterValue { .. }),
             "{parameter_name} should resolve to a direct register value before consume_pair() at 0x{address:x}: {parameters:?}"
         );
     }

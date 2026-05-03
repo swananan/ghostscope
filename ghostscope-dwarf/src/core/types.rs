@@ -55,14 +55,6 @@ pub struct FunctionInfo {
     pub line_number: Option<u32>,
 }
 
-/// Line information from debug_line (address-based)
-#[derive(Debug, Clone)]
-pub struct LineInfo {
-    pub line_number: u32,
-    pub file_path: String,
-    pub address: u64,
-}
-
 /// Cooked index entry - inspired by GDB's cooked_index_entry
 /// Extremely lightweight startup index, minimal memory footprint
 #[derive(Debug, Clone)]
@@ -102,11 +94,6 @@ impl IndexEntry {
     /// True when this DIE is a concrete DW_TAG_inlined_subroutine instance.
     pub fn is_inline_instance(&self) -> bool {
         self.function_kind() == FunctionDieKind::InlineInstance
-    }
-
-    /// True when this DIE is a concrete, addressable subprogram body.
-    pub fn is_concrete_subprogram(&self) -> bool {
-        self.function_kind() == FunctionDieKind::ConcreteSubprogram
     }
 
     /// Return entry_pc when it is usable as this DIE's own entry address.
@@ -168,8 +155,6 @@ pub struct LineEntry {
     pub column: u64,
     pub is_stmt: bool,
     pub prologue_end: bool,
-    pub epilogue_begin: bool,
-    pub end_sequence: bool,
 }
 
 /// Program section classification for global/static variables
@@ -194,6 +179,3 @@ pub struct GlobalVariableInfo {
     pub die_offset: gimli::UnitOffset,
     pub unit_offset: gimli::DebugInfoOffset,
 }
-
-/// Re-export SectionOffsets from coordinator to keep a single definition/source of truth
-pub use ghostscope_process::SectionOffsets;

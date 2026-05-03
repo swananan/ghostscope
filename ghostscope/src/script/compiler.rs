@@ -5,12 +5,7 @@ use ghostscope_ui::events::{ExecutionStatus, ScriptCompilationDetails, ScriptExe
 use tracing::{error, info, warn};
 
 fn map_compile_error_message(e: &ghostscope_compiler::CompileError) -> String {
-    match e {
-        ghostscope_compiler::CompileError::CodeGen(
-            ghostscope_compiler::ebpf::context::CodeGenError::VariableNotInScope(name),
-        ) => format!("Use of variable '{name}' outside of its scope"),
-        _ => e.to_string(),
-    }
+    e.user_message().into_owned()
 }
 
 fn pid_alias_runtime_pid(

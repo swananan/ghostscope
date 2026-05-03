@@ -5,7 +5,11 @@
 
 use crate::{
     binary::{dwarf_endian_from_object, DwarfReader, MappedFile},
-    core::{CallerFrameRecovery, CfaResult, ComputeStep, Result},
+    core::{CallerFrameRecovery, CfaResult, ComputeStep, ModuleId, Result},
+    semantics::{
+        CfaRulePlan, CompactUnwindRow, CompactUnwindTable, RegisterRecoveryPlan, UnwindDiagnostic,
+        UnwindDiagnosticKind,
+    },
 };
 use anyhow::{anyhow, Context};
 use gimli::{
@@ -212,6 +216,32 @@ impl CfiIndex {
         })
     }
 
+    /// Compile all FDE rows into a compact unwind table for userspace/BPF planning.
+    pub fn compact_unwind_table(&self, module: ModuleId) -> Result<CompactUnwindTable> {
+        let mut rows = Vec::new();
+        let mut diagnostics = Vec::new();
+        let mut entries = self.eh_frame.entries(&self.bases);
+
+        while let Some(entry) = entries.next().context("Failed to iterate FDE entries")? {
+            match entry {
+                CieOrFde::Fde(partial_fde) => {
+                    let fde = partial_fde
+                        .parse(|_, bases, offset| self.eh_frame.cie_from_offset(bases, offset))
+                        .context("Failed to parse FDE")?;
+                    self.append_compact_rows(module, &fde, &mut rows, &mut diagnostics)?;
+                }
+                CieOrFde::Cie(_) => {}
+            }
+        }
+
+        rows.sort_by_key(|row| (row.pc_start, row.pc_end));
+        Ok(CompactUnwindTable {
+            module,
+            rows,
+            diagnostics,
+        })
+    }
+
     /// Find FDE for given address using eh_frame_hdr if available
     fn find_fde_for_address(
         &self,
@@ -279,6 +309,237 @@ impl CfiIndex {
         fde.unwind_info_for_address(&self.eh_frame, &self.bases, &mut ctx, pc)
             .context("Failed to get unwind info for address")
             .cloned()
+    }
+
+    fn append_compact_rows(
+        &self,
+        module: ModuleId,
+        fde: &FrameDescriptionEntry<DwarfReader, usize>,
+        rows: &mut Vec<CompactUnwindRow>,
+        diagnostics: &mut Vec<UnwindDiagnostic>,
+    ) -> Result<()> {
+        let return_address_register = fde.cie().return_address_register().0;
+        let mut ctx = UnwindContext::new();
+        let mut table = fde
+            .rows(&self.eh_frame, &self.bases, &mut ctx)
+            .context("Failed to build unwind rows")?;
+
+        while let Some(row) = table.next_row().context("Failed to evaluate unwind row")? {
+            let pc_start = row.start_address();
+            let pc_end = row.end_address();
+            if pc_start >= pc_end {
+                continue;
+            }
+
+            let cfa = self.compact_cfa_rule(row.cfa(), pc_start, pc_end, diagnostics);
+            let return_address = self.compact_register_rule(
+                row.register(Register(return_address_register)),
+                return_address_register,
+                pc_start,
+                pc_end,
+                true,
+                diagnostics,
+            );
+            let sp = self.compact_optional_register_rule(
+                row.register(Register(7)),
+                7,
+                pc_start,
+                pc_end,
+                diagnostics,
+            );
+            let rbp = self.compact_optional_register_rule(
+                row.register(Register(6))
+                    .or_else(|| Self::default_register_rule(6)),
+                6,
+                pc_start,
+                pc_end,
+                diagnostics,
+            );
+            let bpf_supported = cfa.is_bpf_fast_path_supported()
+                && return_address.is_bpf_fast_path_supported()
+                && sp
+                    .as_ref()
+                    .is_none_or(RegisterRecoveryPlan::is_bpf_fast_path_supported)
+                && rbp
+                    .as_ref()
+                    .is_none_or(RegisterRecoveryPlan::is_bpf_fast_path_supported);
+
+            rows.push(CompactUnwindRow {
+                module,
+                pc_start,
+                pc_end,
+                cfa,
+                return_address_register,
+                return_address,
+                sp,
+                rbp,
+                bpf_supported,
+            });
+        }
+
+        Ok(())
+    }
+
+    fn compact_cfa_rule(
+        &self,
+        rule: &CfaRule<usize>,
+        pc_start: u64,
+        pc_end: u64,
+        diagnostics: &mut Vec<UnwindDiagnostic>,
+    ) -> CfaRulePlan {
+        match rule {
+            CfaRule::RegisterAndOffset { register, offset } => CfaRulePlan::RegPlusOffset {
+                register: register.0,
+                offset: *offset,
+            },
+            CfaRule::Expression(expr) => match self.parse_unwind_expression(*expr) {
+                Ok(steps) => {
+                    diagnostics.push(UnwindDiagnostic {
+                        pc_start,
+                        pc_end,
+                        kind: UnwindDiagnosticKind::UnsupportedCfaRule {
+                            reason: "CFA expression requires an expression template".to_string(),
+                        },
+                    });
+                    CfaRulePlan::Expression { steps }
+                }
+                Err(error) => {
+                    let reason = format!("failed to parse CFA expression: {error}");
+                    diagnostics.push(UnwindDiagnostic {
+                        pc_start,
+                        pc_end,
+                        kind: UnwindDiagnosticKind::UnsupportedCfaRule {
+                            reason: reason.clone(),
+                        },
+                    });
+                    CfaRulePlan::Unsupported { reason }
+                }
+            },
+        }
+    }
+
+    fn compact_optional_register_rule(
+        &self,
+        rule: Option<RegisterRule<usize>>,
+        register: u16,
+        pc_start: u64,
+        pc_end: u64,
+        diagnostics: &mut Vec<UnwindDiagnostic>,
+    ) -> Option<RegisterRecoveryPlan> {
+        let plan = self.compact_register_rule(rule, register, pc_start, pc_end, false, diagnostics);
+        if matches!(plan, RegisterRecoveryPlan::Undefined) {
+            None
+        } else {
+            Some(plan)
+        }
+    }
+
+    fn compact_register_rule(
+        &self,
+        rule: Option<RegisterRule<usize>>,
+        register: u16,
+        pc_start: u64,
+        pc_end: u64,
+        required: bool,
+        diagnostics: &mut Vec<UnwindDiagnostic>,
+    ) -> RegisterRecoveryPlan {
+        match rule {
+            Some(RegisterRule::Undefined) | None => {
+                if required {
+                    diagnostics.push(UnwindDiagnostic {
+                        pc_start,
+                        pc_end,
+                        kind: UnwindDiagnosticKind::MissingReturnAddressRule { register },
+                    });
+                }
+                RegisterRecoveryPlan::Undefined
+            }
+            Some(RegisterRule::SameValue) => RegisterRecoveryPlan::SameValue { register },
+            Some(RegisterRule::Register(other)) => {
+                RegisterRecoveryPlan::Register { register: other.0 }
+            }
+            Some(RegisterRule::Offset(offset)) => RegisterRecoveryPlan::AtCfaOffset { offset },
+            Some(RegisterRule::ValOffset(offset)) => RegisterRecoveryPlan::ValCfaOffset { offset },
+            Some(RegisterRule::Constant(value)) => {
+                self.push_unsupported_register_diagnostic(
+                    register,
+                    pc_start,
+                    pc_end,
+                    "constant register recovery is outside the BPF fast path",
+                    diagnostics,
+                );
+                RegisterRecoveryPlan::Constant { value }
+            }
+            Some(RegisterRule::Expression(expr)) => {
+                self.expression_register_plan(register, pc_start, pc_end, expr, true, diagnostics)
+            }
+            Some(RegisterRule::ValExpression(expr)) => {
+                self.expression_register_plan(register, pc_start, pc_end, expr, false, diagnostics)
+            }
+            Some(RegisterRule::Architectural) => {
+                let reason = "architectural register recovery is unsupported".to_string();
+                self.push_unsupported_register_diagnostic(
+                    register,
+                    pc_start,
+                    pc_end,
+                    &reason,
+                    diagnostics,
+                );
+                RegisterRecoveryPlan::Unsupported { reason }
+            }
+        }
+    }
+
+    fn expression_register_plan(
+        &self,
+        register: u16,
+        pc_start: u64,
+        pc_end: u64,
+        expr: gimli::UnwindExpression<usize>,
+        dereference: bool,
+        diagnostics: &mut Vec<UnwindDiagnostic>,
+    ) -> RegisterRecoveryPlan {
+        match self.parse_unwind_expression(expr) {
+            Ok(steps) => {
+                self.push_unsupported_register_diagnostic(
+                    register,
+                    pc_start,
+                    pc_end,
+                    "register expression requires an expression template",
+                    diagnostics,
+                );
+                RegisterRecoveryPlan::Expression { steps, dereference }
+            }
+            Err(error) => {
+                let reason = format!("failed to parse register expression: {error}");
+                self.push_unsupported_register_diagnostic(
+                    register,
+                    pc_start,
+                    pc_end,
+                    &reason,
+                    diagnostics,
+                );
+                RegisterRecoveryPlan::Unsupported { reason }
+            }
+        }
+    }
+
+    fn push_unsupported_register_diagnostic(
+        &self,
+        register: u16,
+        pc_start: u64,
+        pc_end: u64,
+        reason: &str,
+        diagnostics: &mut Vec<UnwindDiagnostic>,
+    ) {
+        diagnostics.push(UnwindDiagnostic {
+            pc_start,
+            pc_end,
+            kind: UnwindDiagnosticKind::UnsupportedRegisterRule {
+                register,
+                reason: reason.to_string(),
+            },
+        });
     }
 
     fn cfa_steps(&self, rule: &CfaRule<usize>) -> Result<Vec<ComputeStep>> {

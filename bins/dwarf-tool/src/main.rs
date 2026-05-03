@@ -4,9 +4,9 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use ghostscope_dwarf::core::SectionType;
 use ghostscope_dwarf::{
     AddressQueryResult, DwarfAnalyzer, FunctionQueryResult, ModuleLoadingEvent, ModuleLoadingStats,
+    SectionType,
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -629,7 +629,7 @@ async fn analyze_source_location(
 
 fn iter_address_query_variables<'a>(
     address: &'a AddressQueryResult,
-) -> impl Iterator<Item = &'a ghostscope_dwarf::VariableWithEvaluation> + 'a {
+) -> impl Iterator<Item = &'a ghostscope_dwarf::VisibleVariable> + 'a {
     address.parameters.iter().chain(address.variables.iter())
 }
 
@@ -641,11 +641,11 @@ fn total_variables_in_query_results(addresses: &[AddressQueryResult]) -> usize {
     addresses.iter().map(query_address_variable_count).sum()
 }
 
-fn variable_info_from_query(variable: &ghostscope_dwarf::VariableWithEvaluation) -> VariableInfo {
+fn variable_info_from_query(variable: &ghostscope_dwarf::VisibleVariable) -> VariableInfo {
     VariableInfo {
         name: variable.name.clone(),
         type_name: variable.type_name.clone(),
-        location: format!("{}", variable.evaluation_result),
+        location: format!("{}", variable.location),
         is_parameter: variable.is_parameter,
         scope_depth: variable.scope_depth as u32,
     }
@@ -750,7 +750,7 @@ async fn analyze_function(
                         format!("{} (no DWARF info)", var.type_name)
                     };
 
-                    println!("{}: {} = {}", var.name, type_str, var.evaluation_result);
+                    println!("{}: {} = {}", var.name, type_str, var.location);
                 }
             } else {
                 println!("  Address: 0x{:x}", address.address);
@@ -796,10 +796,7 @@ async fn analyze_module_address(
                 );
             } else if options.quiet() {
                 for var in iter_address_query_variables(&address_info) {
-                    println!(
-                        "{}: {} = {}",
-                        var.name, var.type_name, var.evaluation_result
-                    );
+                    println!("{}: {} = {}", var.name, var.type_name, var.location);
                 }
             } else {
                 println!("\n=== {module_path} @ 0x{address:x} ===");
@@ -1175,7 +1172,7 @@ fn percentile_nearest_rank(sorted_samples_ms: &[f64], percentile: f64) -> f64 {
 }
 
 fn print_variables_with_style<'a>(
-    variables: impl IntoIterator<Item = &'a ghostscope_dwarf::VariableWithEvaluation>,
+    variables: impl IntoIterator<Item = &'a ghostscope_dwarf::VisibleVariable>,
     options: &Commands,
 ) {
     for (i, var) in variables.into_iter().enumerate() {
@@ -1194,7 +1191,7 @@ fn print_variables_with_style<'a>(
             println!("  Scope Depth:   {}", var.scope_depth);
             println!("  Is Parameter:  {}", var.is_parameter);
             println!("  Is Artificial: {}", var.is_artificial);
-            println!("  Location:      {}", var.evaluation_result);
+            println!("  Location:      {}", var.location);
             println!();
         } else {
             let param_marker = if var.is_parameter { " (param)" } else { "" };
@@ -1213,14 +1210,14 @@ fn print_variables_with_style<'a>(
 
             println!(
                 "  ├─ {}: {} = {}{}{}",
-                var.name, type_str, var.evaluation_result, param_marker, artificial_marker
+                var.name, type_str, var.location, param_marker, artificial_marker
             );
         }
     }
 }
 
 fn print_variables_with_indent<'a>(
-    variables: impl IntoIterator<Item = &'a ghostscope_dwarf::VariableWithEvaluation>,
+    variables: impl IntoIterator<Item = &'a ghostscope_dwarf::VisibleVariable>,
     indent: &str,
 ) {
     for var in variables {
@@ -1240,7 +1237,7 @@ fn print_variables_with_indent<'a>(
 
         println!(
             "{}├─ {}: {} = {}{}{}",
-            indent, var.name, type_str, var.evaluation_result, param_marker, artificial_marker
+            indent, var.name, type_str, var.location, param_marker, artificial_marker
         );
     }
 }

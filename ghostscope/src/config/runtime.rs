@@ -165,12 +165,17 @@ impl RuntimeContext {
 pub struct ResolvedConfig {
     pub user: UserConfig,
     pub runtime: RuntimeContext,
+    pub kernel_capabilities: KernelCapabilities,
 }
 
 impl ResolvedConfig {
     pub fn resolve(user: UserConfig, kernel_caps: &KernelCapabilities) -> Result<Self> {
         let runtime = RuntimeContext::resolve(&user, kernel_caps)?;
-        Ok(Self { user, runtime })
+        Ok(Self {
+            user,
+            runtime,
+            kernel_capabilities: *kernel_caps,
+        })
     }
 
     pub fn get_ui_config(&self) -> ghostscope_ui::UiConfig {
@@ -209,7 +214,7 @@ impl ResolvedConfig {
                 "⚠️  TESTING MODE: force_perf_event_array=true in config - using PerfEventArray"
             );
             ghostscope_compiler::EventMapType::PerfEventArray
-        } else if KernelCapabilities::ringbuf_supported() {
+        } else if self.kernel_capabilities.supports_ringbuf {
             ghostscope_compiler::EventMapType::RingBuf
         } else {
             ghostscope_compiler::EventMapType::PerfEventArray
@@ -260,7 +265,17 @@ impl ResolvedConfig {
             special_pid_ns: self.runtime.special_pid_ns,
             proc_offsets_pid_ns: self.runtime.proc_offsets_pid_ns,
             input_pid: self.input_pid,
+            runtime_capabilities: dwarf_runtime_capabilities_from_kernel(&self.kernel_capabilities),
         }
+    }
+}
+
+fn dwarf_runtime_capabilities_from_kernel(
+    kernel_caps: &KernelCapabilities,
+) -> ghostscope_compiler::RuntimeCapabilities {
+    ghostscope_compiler::RuntimeCapabilities {
+        regular_uprobe: kernel_caps.supports_ringbuf || kernel_caps.supports_perf_event_array,
+        ..Default::default()
     }
 }
 

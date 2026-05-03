@@ -38,11 +38,13 @@ pub enum CodeGenError {
     #[error("Builder error: {0}")]
     Builder(String),
 
-    // === Legacy variable management errors ===
+    // === Variable lookup and availability errors ===
     #[error("Variable not found: {0}")]
     VariableNotFound(String),
     #[error("Variable not in scope: {0}")]
     VariableNotInScope(String),
+    #[error("Variable unavailable: {0}")]
+    VariableUnavailable(String),
     #[error("Type error: {0}")]
     TypeError(String),
     #[error("Not implemented: {0}")]
@@ -120,9 +122,6 @@ pub struct EbpfContext<'ctx, 'dw> {
     // Each scope frame records names declared in that scope.
     pub scope_stack: Vec<std::collections::HashSet<String>>,
 }
-
-// Temporary alias for backward compatibility during refactoring
-pub type NewCodeGen<'ctx, 'dw> = EbpfContext<'ctx, 'dw>;
 
 impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     /// Create a new eBPF code generation context

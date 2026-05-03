@@ -202,6 +202,27 @@ mod tests {
         }
     }
 
+    fn sample_expr_error_event() -> ParsedTraceEvent {
+        ParsedTraceEvent {
+            trace_id: 8,
+            timestamp: 2_000_000_000,
+            pid: 5001,
+            tid: 5002,
+            instructions: vec![
+                ParsedInstruction::ExprError {
+                    expr: "memcmp(buf, hex(\"41\"), 1)".to_string(),
+                    error_code: 2,
+                    flags: 0x01,
+                    failing_addr: 0x1234,
+                },
+                ParsedInstruction::EndInstruction {
+                    total_instructions: 1,
+                    execution_status: 1,
+                },
+            ],
+        }
+    }
+
     fn render_with_renderer(event: &ParsedTraceEvent, options: ScriptOutputOptions) -> Vec<String> {
         let mut renderer = ScriptOutputRenderer::new(options);
         renderer.render_event_lines(event)
@@ -240,6 +261,47 @@ mod tests {
         );
 
         assert_eq!(lines, vec!["hello".to_string(), "value = 42".to_string()]);
+    }
+
+    #[test]
+    fn plain_output_preserves_runtime_expr_errors() {
+        let lines = render_with_renderer(
+            &sample_expr_error_event(),
+            ScriptOutputOptions {
+                mode: ScriptOutputMode::Plain,
+                timestamp: ScriptTimestampFormat::None,
+                color_enabled: false,
+            },
+        );
+
+        assert_eq!(
+            lines,
+            vec![
+                "ExprError: memcmp(buf, hex(\"41\"), 1) (read error at 0x0000000000001234, flags: first-arg read-fail)"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn pretty_output_preserves_runtime_expr_errors_with_metadata() {
+        let lines = render_with_renderer(
+            &sample_expr_error_event(),
+            ScriptOutputOptions {
+                mode: ScriptOutputMode::Pretty,
+                timestamp: ScriptTimestampFormat::None,
+                color_enabled: false,
+            },
+        );
+
+        assert_eq!(
+            lines,
+            vec![
+                "TraceID:8 PID:5001 TID:5002".to_string(),
+                "  ExprError: memcmp(buf, hex(\"41\"), 1) (read error at 0x0000000000001234, flags: first-arg read-fail)"
+                    .to_string(),
+            ]
+        );
     }
 
     #[test]

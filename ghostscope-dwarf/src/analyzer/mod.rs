@@ -2,14 +2,25 @@
 
 use crate::{
     core::{
-        mapping::ModuleMapping, CallerFrameRecovery, GlobalVariableInfo, ModuleAddress, Result,
+        mapping::ModuleMapping, CallerFrameRecovery, ModuleAddress, Result, SectionType,
         SourceLocation,
     },
     objfile::LoadedObjfile,
+    semantics::{CompactUnwindRow, CompactUnwindTable, PcContext, VisibleVariable},
 };
 use object::{Object, ObjectSection};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+mod plan_global;
+mod plan_pc;
+mod type_lookup;
+
+#[cfg(test)]
+use crate::{
+    core::{AddressExpr, Availability, Provenance, VariableLocation},
+    semantics::VariableReadPlan,
+};
 
 /// Events emitted during module loading process
 #[derive(Debug, Clone)]
@@ -64,8 +75,8 @@ pub struct AddressQueryResult {
     pub source_column: Option<u32>,
     pub function_name: Option<String>,
     pub is_inline: Option<bool>,
-    pub variables: Vec<crate::VariableWithEvaluation>,
-    pub parameters: Vec<crate::VariableWithEvaluation>,
+    pub variables: Vec<VisibleVariable>,
+    pub parameters: Vec<VisibleVariable>,
 }
 
 /// Rich query result for a function lookup across modules.
@@ -85,28 +96,6 @@ pub struct DwarfAnalyzer {
 }
 
 impl DwarfAnalyzer {
-    fn resolve_type_shallow_by_name_in_module_with_tags<P: AsRef<Path>>(
-        &self,
-        module_path: P,
-        name: &str,
-        tags: &[gimli::DwTag],
-    ) -> Option<crate::TypeInfo> {
-        let path_buf = module_path.as_ref().to_path_buf();
-        self.modules
-            .get(&path_buf)
-            .and_then(|module_data| module_data.resolve_type_shallow_by_name_with_tags(name, tags))
-    }
-
-    fn resolve_type_shallow_by_name_with_tags(
-        &self,
-        name: &str,
-        tags: &[gimli::DwTag],
-    ) -> Option<crate::TypeInfo> {
-        self.modules
-            .values()
-            .find_map(|module_data| module_data.resolve_type_shallow_by_name_with_tags(name, tags))
-    }
-
     fn build_address_query_result(
         &self,
         module_address: &ModuleAddress,
@@ -203,6 +192,28 @@ impl DwarfAnalyzer {
             })
     }
 
+    fn sorted_module_paths(&self) -> Vec<&PathBuf> {
+        let mut paths: Vec<&PathBuf> = self.modules.keys().collect();
+        paths.sort();
+        paths
+    }
+
+    /// Return the deterministic per-analyzer module id for a loaded module path.
+    pub fn module_id_for_path<P: AsRef<Path>>(&self, module_path: P) -> Option<crate::ModuleId> {
+        let module_path = module_path.as_ref();
+        self.sorted_module_paths()
+            .into_iter()
+            .position(|path| path.as_path() == module_path)
+            .map(|index| crate::ModuleId(index as u32))
+    }
+
+    /// Resolve a semantic module id back to its loaded module path.
+    pub fn module_path_for_id(&self, module: crate::ModuleId) -> Option<&Path> {
+        self.sorted_module_paths()
+            .get(module.0 as usize)
+            .map(|path| path.as_path())
+    }
+
     /// Create DWARF analyzer from PID (now uses parallel loading)
     pub async fn from_pid(pid: u32) -> Result<Self> {
         Self::from_pid_parallel(pid).await
@@ -217,72 +228,6 @@ impl DwarfAnalyzer {
         } else {
             None
         }
-    }
-
-    /// Resolve struct/class by name (shallow) in a specific module using only indexes
-    pub fn resolve_struct_type_shallow_by_name_in_module<P: AsRef<Path>>(
-        &self,
-        module_path: P,
-        name: &str,
-    ) -> Option<crate::TypeInfo> {
-        self.resolve_type_shallow_by_name_in_module_with_tags(
-            module_path,
-            name,
-            &[
-                gimli::constants::DW_TAG_structure_type,
-                gimli::constants::DW_TAG_class_type,
-            ],
-        )
-    }
-
-    /// Resolve struct/class by name (shallow) across modules (first match)
-    pub fn resolve_struct_type_shallow_by_name(&self, name: &str) -> Option<crate::TypeInfo> {
-        self.resolve_type_shallow_by_name_with_tags(
-            name,
-            &[
-                gimli::constants::DW_TAG_structure_type,
-                gimli::constants::DW_TAG_class_type,
-            ],
-        )
-    }
-
-    /// Resolve union by name (shallow) in a specific module
-    pub fn resolve_union_type_shallow_by_name_in_module<P: AsRef<Path>>(
-        &self,
-        module_path: P,
-        name: &str,
-    ) -> Option<crate::TypeInfo> {
-        self.resolve_type_shallow_by_name_in_module_with_tags(
-            module_path,
-            name,
-            &[gimli::constants::DW_TAG_union_type],
-        )
-    }
-
-    /// Resolve union by name (shallow) across modules (first match)
-    pub fn resolve_union_type_shallow_by_name(&self, name: &str) -> Option<crate::TypeInfo> {
-        self.resolve_type_shallow_by_name_with_tags(name, &[gimli::constants::DW_TAG_union_type])
-    }
-
-    /// Resolve enum by name (shallow) in a specific module
-    pub fn resolve_enum_type_shallow_by_name_in_module<P: AsRef<Path>>(
-        &self,
-        module_path: P,
-        name: &str,
-    ) -> Option<crate::TypeInfo> {
-        self.resolve_type_shallow_by_name_in_module_with_tags(
-            module_path,
-            name,
-            &[gimli::constants::DW_TAG_enumeration_type],
-        )
-    }
-
-    /// Resolve enum by name (shallow) across modules (first match)
-    pub fn resolve_enum_type_shallow_by_name(&self, name: &str) -> Option<crate::TypeInfo> {
-        self.resolve_type_shallow_by_name_with_tags(
-            name,
-            &[gimli::constants::DW_TAG_enumeration_type],
-        )
     }
 
     /// Create DWARF analyzer from PID using parallel loading
@@ -571,48 +516,6 @@ impl DwarfAnalyzer {
         }
     }
 
-    /// Get all variables visible at the given module address with EvaluationResult
-    ///
-    /// # Arguments
-    /// * `module_address` - Module address containing both module path and address offset
-    pub fn get_all_variables_at_address(
-        &self,
-        module_address: &ModuleAddress,
-    ) -> Result<Vec<crate::VariableWithEvaluation>> {
-        tracing::info!(
-            "Looking up variables at address 0x{:x} in module {}",
-            module_address.address,
-            module_address.module_display()
-        );
-
-        if let Some(module_data) = self.modules.get(&module_address.module_path) {
-            module_data.get_all_variables_at_address(module_address.address)
-        } else {
-            tracing::warn!(
-                "Module {} not found in loaded modules",
-                module_address.module_display()
-            );
-            Err(anyhow::anyhow!(
-                "Module {} not loaded",
-                module_address.module_display()
-            ))
-        }
-    }
-
-    /// Plan a chain access (e.g., r.headers_in) and synthesize a VariableWithEvaluation
-    pub fn plan_chain_access(
-        &self,
-        module_address: &ModuleAddress,
-        base_var: &str,
-        chain: &[String],
-    ) -> Result<Option<crate::VariableWithEvaluation>> {
-        if let Some(module_data) = self.modules.get(&module_address.module_path) {
-            module_data.plan_chain_access(module_address.address, base_var, chain)
-        } else {
-            Ok(None)
-        }
-    }
-
     /// Recover the direct caller frame at a module address as ComputeStep[].
     pub fn recover_caller_frame(
         &self,
@@ -626,174 +529,61 @@ impl DwarfAnalyzer {
         }
     }
 
+    /// Recover the direct caller frame at a previously resolved PC context.
+    pub fn recover_caller_frame_for_context(
+        &self,
+        ctx: &PcContext,
+        registers: &[u16],
+    ) -> Result<Option<CallerFrameRecovery>> {
+        let module_address = self.module_address_for_context(ctx)?;
+        self.recover_caller_frame(&module_address, registers)
+    }
+
+    /// Build compact unwind rows for the module referenced by a PC context.
+    pub fn compact_unwind_table_for_context(
+        &self,
+        ctx: &PcContext,
+    ) -> Result<Option<CompactUnwindTable>> {
+        let module_path = self
+            .module_path_for_id(ctx.module)
+            .ok_or_else(|| anyhow::anyhow!("Semantic module id {:?} is not loaded", ctx.module))?;
+        self.modules
+            .get(module_path)
+            .ok_or_else(|| anyhow::anyhow!("Module {} not loaded", module_path.display()))?
+            .compact_unwind_table(ctx.module)
+    }
+
+    /// Resolve the compact unwind row that covers a previously resolved PC context.
+    pub fn compact_unwind_row_for_context(
+        &self,
+        ctx: &PcContext,
+    ) -> Result<Option<CompactUnwindRow>> {
+        let module_path = self
+            .module_path_for_id(ctx.module)
+            .ok_or_else(|| anyhow::anyhow!("Semantic module id {:?} is not loaded", ctx.module))?;
+        self.modules
+            .get(module_path)
+            .ok_or_else(|| anyhow::anyhow!("Module {} not loaded", module_path.display()))?
+            .compact_unwind_row(ctx.module, ctx.normalized_pc)
+    }
+
+    /// Build compact unwind rows for a loaded semantic module id.
+    pub fn compact_unwind_table_for_module(
+        &self,
+        module: crate::ModuleId,
+    ) -> Result<Option<CompactUnwindTable>> {
+        let module_path = self
+            .module_path_for_id(module)
+            .ok_or_else(|| anyhow::anyhow!("Semantic module id {:?} is not loaded", module))?;
+        self.modules
+            .get(module_path)
+            .ok_or_else(|| anyhow::anyhow!("Module {} not loaded", module_path.display()))?
+            .compact_unwind_table(module)
+    }
+
     /// Get all loaded module paths
     pub fn get_loaded_modules(&self) -> Vec<&PathBuf> {
         self.modules.keys().collect()
-    }
-
-    /// Find global/static variables by name across all loaded modules
-    pub fn find_global_variables_by_name(&self, name: &str) -> Vec<(PathBuf, GlobalVariableInfo)> {
-        let mut results = Vec::new();
-        for (module_path, module_data) in &self.modules {
-            let vars = module_data.find_global_variables_by_name_any(name);
-            for v in vars {
-                results.push((module_path.clone(), v));
-            }
-        }
-        if !results.is_empty() {
-            return results;
-        }
-
-        // Fallback: scan all globals in each module and match by exact or leaf name
-        for (module_path, module_data) in &self.modules {
-            let all = module_data.list_all_global_variables();
-            for v in all {
-                let leaf = v.name.rsplit("::").next().unwrap_or(&v.name).to_string();
-                if v.name == name || leaf == name {
-                    results.push((module_path.clone(), v));
-                }
-            }
-        }
-
-        results
-    }
-
-    /// Plan a member/chain access across modules focusing on global/static variables.
-    /// Strict policy and order:
-    /// 1) Query globals index by base name (prefer current module first).
-    /// 2) For each candidate: try static-offset lowering when link-time address exists.
-    /// 3) Fallback to per-module planner at addr=0.
-    ///
-    ///    Returns None if unresolved; never falls back to unrelated globals.
-    pub fn plan_global_chain_access(
-        &self,
-        prefer_module: &PathBuf,
-        base: &str,
-        fields: &[String],
-    ) -> Result<Option<(PathBuf, crate::VariableWithEvaluation)>> {
-        // 1) Globals across modules (strict)
-        let matches = self.find_global_variables_by_name(base);
-        if matches.is_empty() {
-            // Strict policy: if no global/base by name exists anywhere, stop here
-            return Ok(None);
-        }
-
-        // Build preferred order: prefer current module first
-        let mut ordered: Vec<(PathBuf, GlobalVariableInfo)> = Vec::new();
-        for (mpath, info) in matches.iter() {
-            if *mpath == *prefer_module {
-                ordered.push((mpath.clone(), info.clone()));
-            }
-        }
-        for (mpath, info) in matches.into_iter() {
-            if mpath != *prefer_module {
-                ordered.push((mpath, info));
-            }
-        }
-
-        for (mpath, info) in ordered.into_iter() {
-            // 2a) Static-offset lowering when link-time address is available
-            if let Some(link) = info.link_address {
-                if let Ok(Some((off, final_ty))) = self.compute_global_member_static_offset(
-                    &mpath,
-                    link,
-                    info.unit_offset,
-                    info.die_offset,
-                    fields,
-                ) {
-                    let name = if fields.is_empty() {
-                        base.to_string()
-                    } else {
-                        format!("{base}.{}", fields.join("."))
-                    };
-                    let var = crate::VariableWithEvaluation {
-                        name,
-                        type_name: final_ty.type_name(),
-                        dwarf_type: Some(final_ty),
-                        evaluation_result: crate::core::EvaluationResult::MemoryLocation(
-                            crate::core::LocationResult::Address(link + off),
-                        ),
-                        scope_depth: 0,
-                        is_parameter: false,
-                        is_artificial: false,
-                    };
-                    tracing::info!(
-                        "plan_global_chain_access: resolved '{}' in module '{}' via static-offset",
-                        base,
-                        mpath.display()
-                    );
-                    return Ok(Some((mpath, var)));
-                }
-            }
-
-            // 2b) Module planner fallback at addr=0
-            let ma = ModuleAddress::new(mpath.clone(), 0);
-            match self.plan_chain_access(&ma, base, fields) {
-                Ok(Some(v)) => {
-                    tracing::info!(
-                        "plan_global_chain_access: resolved '{}' in module '{}' via planner",
-                        base,
-                        ma.module_display()
-                    );
-                    return Ok(Some((mpath, v)));
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::debug!(
-                        "plan_global_chain_access: planner miss in module '{}': {}",
-                        ma.module_display(),
-                        e
-                    );
-                }
-            }
-        }
-
-        Ok(None)
-    }
-
-    /// Resolve a variable by CU/DIE offsets in a specific module at an arbitrary address context (for globals)
-    pub fn resolve_variable_by_offsets_in_module<P: AsRef<Path>>(
-        &self,
-        module_path: P,
-        cu_off: gimli::DebugInfoOffset,
-        die_off: gimli::UnitOffset,
-    ) -> Result<crate::VariableWithEvaluation> {
-        let path_buf = module_path.as_ref().to_path_buf();
-        if let Some(module_data) = self.modules.get(&path_buf) {
-            let items = vec![(cu_off, die_off)];
-            let vars = module_data.resolve_variables_by_offsets_at_address(0, &items)?;
-            let mut var = vars.into_iter().next().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Failed to resolve variable at offsets {:?}/{:?} in module {}",
-                    cu_off,
-                    die_off,
-                    path_buf.display()
-                )
-            })?;
-            if var.dwarf_type.is_none() {
-                if let Some(ti) = module_data.shallow_type_for_variable_offsets(cu_off, die_off) {
-                    var.type_name = ti.type_name();
-                    var.dwarf_type = Some(ti);
-                }
-            }
-            Ok(var)
-        } else {
-            Err(anyhow::anyhow!(
-                "Module {} not loaded",
-                module_path.as_ref().display()
-            ))
-        }
-    }
-
-    /// List all global/static variables with usable addresses across all loaded modules
-    pub fn list_all_global_variables(&self) -> Vec<(PathBuf, GlobalVariableInfo)> {
-        let mut results = Vec::new();
-        for (module_path, module_data) in &self.modules {
-            for v in module_data.list_all_global_variables() {
-                results.push((module_path.clone(), v));
-            }
-        }
-        results
     }
 
     /// Classify the section type for a link-time virtual address in a specific module
@@ -801,32 +591,12 @@ impl DwarfAnalyzer {
         &self,
         module_path: P,
         vaddr: u64,
-    ) -> Option<crate::core::SectionType> {
+    ) -> Option<SectionType> {
         let path = module_path.as_ref();
         if let Some(module_data) = self.modules.get(path) {
             module_data.classify_section_for_vaddr(vaddr)
         } else {
             None
-        }
-    }
-
-    /// Compute static offset for a global variable member chain
-    pub fn compute_global_member_static_offset<P: AsRef<Path>>(
-        &self,
-        module_path: P,
-        link_address: u64,
-        cu_off: gimli::DebugInfoOffset,
-        var_die: gimli::UnitOffset,
-        fields: &[String],
-    ) -> Result<Option<(u64, crate::TypeInfo)>> {
-        let path_buf = module_path.as_ref().to_path_buf();
-        if let Some(module_data) = self.modules.get(&path_buf) {
-            module_data.compute_global_member_static_offset(cu_off, var_die, link_address, fields)
-        } else {
-            Err(anyhow::anyhow!(
-                "Module {} not loaded",
-                module_path.as_ref().display()
-            ))
         }
     }
 
@@ -1288,4 +1058,164 @@ pub struct SimpleFileInfo {
     pub full_path: String,
     pub basename: String,
     pub directory: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn global_plan(name: &str, address: u64) -> VariableReadPlan {
+        VariableReadPlan {
+            name: name.to_string(),
+            type_name: "int".to_string(),
+            dwarf_type: Some(crate::TypeInfo::BaseType {
+                name: "int".to_string(),
+                size: 4,
+                encoding: gimli::constants::DW_ATE_signed.0 as u16,
+            }),
+            declaration: None,
+            type_id: None,
+            location: VariableLocation::Address(AddressExpr::constant(address)),
+            availability: Availability::Available,
+            scope_depth: 0,
+            is_parameter: false,
+            is_artificial: false,
+            pc_range: None,
+            inline_context: None,
+            provenance: Provenance::Synthesized {
+                detail: "test".to_string(),
+            },
+        }
+    }
+
+    fn visible_var(name: &str, scope_depth: usize) -> VisibleVariable {
+        VisibleVariable {
+            name: name.to_string(),
+            type_name: "int".to_string(),
+            dwarf_type: Some(crate::TypeInfo::BaseType {
+                name: "int".to_string(),
+                size: 4,
+                encoding: gimli::constants::DW_ATE_signed.0 as u16,
+            }),
+            declaration: None,
+            type_id: None,
+            location: VariableLocation::RegisterValue { dwarf_reg: 0 },
+            availability: Availability::Available,
+            scope_depth,
+            is_parameter: false,
+            is_artificial: false,
+        }
+    }
+
+    fn diagnostic(
+        name: &str,
+        scope_depth: usize,
+        detail: &str,
+    ) -> crate::semantics::VariableQueryDiagnostic {
+        crate::semantics::VariableQueryDiagnostic {
+            pc: 0x1234,
+            name: Some(name.to_string()),
+            scope_depth,
+            availability: Availability::Unsupported(crate::UnsupportedReason::ExpressionShape {
+                detail: detail.to_string(),
+            }),
+            detail: detail.to_string(),
+        }
+    }
+
+    #[test]
+    fn variable_selection_rejects_inner_diagnostic_over_outer_match() {
+        let err = DwarfAnalyzer::select_visible_variable_by_name(
+            0x1234,
+            "state",
+            vec![visible_var("state", 1)],
+            &[diagnostic("state", 2, "DW_OP_bad is unsupported")],
+        )
+        .expect_err("inner unavailable variable should block outer fallback");
+
+        assert!(err.to_string().contains("Unavailable variable 'state'"));
+        assert!(err.to_string().contains("DW_OP_bad is unsupported"));
+    }
+
+    #[test]
+    fn variable_selection_keeps_inner_match_over_outer_diagnostic() {
+        let selected = DwarfAnalyzer::select_visible_variable_by_name(
+            0x1234,
+            "state",
+            vec![visible_var("state", 2)],
+            &[diagnostic("state", 1, "outer variable is unavailable")],
+        )
+        .expect("outer diagnostic should not block inner match")
+        .expect("inner match should be returned");
+
+        assert_eq!(selected.name, "state");
+        assert_eq!(selected.scope_depth, 2);
+    }
+
+    #[test]
+    fn global_plan_selection_rejects_ambiguous_matches() {
+        let err = DwarfAnalyzer::select_unambiguous_global_plan(
+            "state",
+            vec![
+                (PathBuf::from("/tmp/a"), global_plan("state", 0x1000)),
+                (PathBuf::from("/tmp/b"), global_plan("state", 0x2000)),
+            ],
+        )
+        .expect_err("multiple global candidates should be ambiguous");
+
+        assert!(err.to_string().contains("Ambiguous global 'state'"));
+        assert!(err.to_string().contains("2 matches"));
+    }
+
+    #[test]
+    fn global_plan_selection_accepts_single_match() {
+        let selected = DwarfAnalyzer::select_unambiguous_global_plan(
+            "state",
+            vec![(PathBuf::from("/tmp/a"), global_plan("state", 0x1000))],
+        )
+        .expect("single global candidate should be accepted")
+        .expect("single global candidate should be returned");
+
+        assert_eq!(selected.0, PathBuf::from("/tmp/a"));
+        assert_eq!(selected.1.name, "state");
+    }
+
+    #[test]
+    fn global_plan_selection_prefers_current_module_match() {
+        let selected = DwarfAnalyzer::select_global_plan_with_preferred_module(
+            "state",
+            Path::new("/tmp/current"),
+            vec![
+                (PathBuf::from("/tmp/other"), global_plan("state", 0x2000)),
+                (PathBuf::from("/tmp/current"), global_plan("state", 0x1000)),
+            ],
+        )
+        .expect("current module candidate should be accepted")
+        .expect("current module candidate should be returned");
+
+        assert_eq!(selected.0, PathBuf::from("/tmp/current"));
+        assert_eq!(
+            selected.1.location,
+            VariableLocation::Address(AddressExpr::constant(0x1000))
+        );
+    }
+
+    #[test]
+    fn global_plan_selection_rejects_ambiguous_current_module_matches() {
+        let err = DwarfAnalyzer::select_global_plan_with_preferred_module(
+            "state",
+            Path::new("/tmp/current"),
+            vec![
+                (PathBuf::from("/tmp/current"), global_plan("state", 0x1000)),
+                (PathBuf::from("/tmp/current"), global_plan("state", 0x1004)),
+                (PathBuf::from("/tmp/other"), global_plan("state", 0x2000)),
+            ],
+        )
+        .expect_err("duplicate current-module candidates should be ambiguous");
+
+        assert!(err.to_string().contains("Ambiguous global 'state'"));
+        assert!(err.to_string().contains("2 matches"));
+        assert!(err.to_string().contains("/tmp/current"));
+        assert!(!err.to_string().contains("/tmp/other"));
+    }
 }

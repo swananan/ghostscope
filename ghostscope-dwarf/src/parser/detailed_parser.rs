@@ -7,11 +7,13 @@
 
 use crate::{
     binary::DwarfReader,
-    core::{attr_u64, EvaluationResult, Result},
+    core::{attr_u64, Availability, EvaluationResult, Result, VariableLocation},
     dwarf_expr::{errors as expr_errors, modes::DwarfExprMode},
     index::{CfiIndex, FunctionBlocks},
     parser::ExpressionEvaluator,
-    semantics::{resolve_name_with_origins, resolve_type_ref_in_same_unit_with_origins},
+    semantics::{
+        resolve_name_with_origins, resolve_type_ref_in_same_unit_with_origins, VisibleVariable,
+    },
     TypeInfo,
 };
 use gimli::Reader;
@@ -29,16 +31,43 @@ use gimli::constants::{
 use std::collections::HashSet;
 // no tracing imports needed here
 
-/// Variable with complete information including EvaluationResult
+/// Internal variable record produced before semantic planning.
 #[derive(Debug, Clone)]
 pub struct VariableWithEvaluation {
     pub name: String,
     pub type_name: String,
     pub dwarf_type: Option<TypeInfo>,
+    pub declaration: Option<crate::core::DieRef>,
+    pub type_id: Option<crate::core::TypeId>,
     pub evaluation_result: EvaluationResult,
     pub scope_depth: usize,
     pub is_parameter: bool,
     pub is_artificial: bool,
+}
+
+impl VariableWithEvaluation {
+    pub fn semantic_location(&self) -> VariableLocation {
+        VariableLocation::from(&self.evaluation_result)
+    }
+
+    pub fn availability(&self) -> Availability {
+        Availability::from(&self.evaluation_result)
+    }
+
+    pub fn visible_variable(&self) -> VisibleVariable {
+        VisibleVariable {
+            name: self.name.clone(),
+            type_name: self.type_name.clone(),
+            dwarf_type: self.dwarf_type.clone(),
+            declaration: self.declaration,
+            type_id: self.type_id,
+            location: self.semantic_location(),
+            availability: self.availability(),
+            scope_depth: self.scope_depth,
+            is_parameter: self.is_parameter,
+            is_artificial: self.is_artificial,
+        }
+    }
 }
 
 // Removed full traversal request/context types in shallow mode
@@ -769,6 +798,8 @@ impl DetailedParser {
             name,
             type_name,
             dwarf_type,
+            declaration: None,
+            type_id: None,
             evaluation_result,
             scope_depth,
             is_parameter,
@@ -902,5 +933,53 @@ impl DetailedParser {
 impl Default for DetailedParser {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{Availability, DirectValueResult, VariableLocation};
+
+    #[test]
+    fn variable_reports_register_value_location() {
+        let variable = VariableWithEvaluation {
+            name: "arg".to_string(),
+            type_name: "int".to_string(),
+            dwarf_type: None,
+            declaration: None,
+            type_id: None,
+            evaluation_result: EvaluationResult::DirectValue(DirectValueResult::RegisterValue(5)),
+            scope_depth: 1,
+            is_parameter: true,
+            is_artificial: false,
+        };
+
+        assert_eq!(variable.name, "arg");
+        assert_eq!(variable.availability(), Availability::Available);
+        assert_eq!(
+            variable.semantic_location(),
+            VariableLocation::RegisterValue { dwarf_reg: 5 }
+        );
+        assert!(variable.is_parameter);
+        assert!(!variable.is_artificial);
+    }
+
+    #[test]
+    fn variable_reports_optimized_out_location() {
+        let variable = VariableWithEvaluation {
+            name: "local".to_string(),
+            type_name: "int".to_string(),
+            dwarf_type: None,
+            declaration: None,
+            type_id: None,
+            evaluation_result: EvaluationResult::Optimized,
+            scope_depth: 2,
+            is_parameter: false,
+            is_artificial: false,
+        };
+
+        assert_eq!(variable.availability(), Availability::OptimizedOut);
+        assert_eq!(variable.semantic_location(), VariableLocation::OptimizedOut);
     }
 }

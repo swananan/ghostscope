@@ -1,16 +1,14 @@
 // Keep library clippy-clean without allow attributes
 
-// New modular organization
 pub mod ebpf;
-pub mod script; // New instruction generator
-                // Legacy codegen - kept for reference, not compiled
-                // pub mod codegen_legacy;
-                // pub mod codegen_new;
+pub mod script;
 
 use crate::script::compiler::AstCompiler;
 use ebpf::context::CodeGenError;
+pub use ghostscope_dwarf::RuntimeCapabilities;
 pub use ghostscope_process::{PidFilterSpec, PidNamespaceId};
 use script::parser::ParseError;
+use std::borrow::Cow;
 use tracing::info;
 
 pub fn hello() -> &'static str {
@@ -37,6 +35,31 @@ pub type Result<T> = std::result::Result<T, CompileError>;
 impl From<ParseError> for CompileError {
     fn from(err: ParseError) -> Self {
         CompileError::Parse(Box::new(err))
+    }
+}
+
+impl CompileError {
+    pub fn user_message(&self) -> Cow<'_, str> {
+        match self {
+            CompileError::Parse(err) => Cow::Owned(format!("Parse error: {err}")),
+            CompileError::CodeGen(err) => err.user_message(),
+            CompileError::LLVM(message) | CompileError::Other(message) => Cow::Borrowed(message),
+        }
+    }
+}
+
+impl CodeGenError {
+    pub fn user_message(&self) -> Cow<'_, str> {
+        match self {
+            CodeGenError::VariableNotInScope(name) => {
+                Cow::Owned(format!("Use of variable '{name}' outside of its scope"))
+            }
+            CodeGenError::VariableUnavailable(message) => Cow::Borrowed(message),
+            CodeGenError::TypeSizeNotAvailable(name) => Cow::Owned(format!(
+                "Variable '{name}' has no concrete DWARF size at this probe PC"
+            )),
+            _ => Cow::Owned(self.to_string()),
+        }
     }
 }
 
@@ -92,6 +115,8 @@ pub struct CompileOptions {
     /// Optional original `-p` input PID for `$input_pid`.
     /// This is only available in `-p` mode.
     pub input_pid: Option<u32>,
+    /// Runtime/backend capabilities used to validate DWARF variable read plans.
+    pub runtime_capabilities: RuntimeCapabilities,
 }
 
 impl Default for CompileOptions {
@@ -113,6 +138,7 @@ impl Default for CompileOptions {
             special_pid_ns: None,
             proc_offsets_pid_ns: None,
             input_pid: None,
+            runtime_capabilities: RuntimeCapabilities::default(),
         }
     }
 }
@@ -222,4 +248,31 @@ pub fn generate_file_name_for_ast(pid: Option<u32>, binary_path: Option<&str>) -
         .unwrap_or("unknown");
 
     format!("gs_{pid_part}_{exec_part}_ast")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_message_strips_codegen_prefix_for_unavailable_variable() {
+        let err = CompileError::CodeGen(CodeGenError::VariableUnavailable(
+            "'x' is optimized out at the selected probe PC".to_string(),
+        ));
+
+        assert_eq!(
+            err.user_message().as_ref(),
+            "'x' is optimized out at the selected probe PC"
+        );
+    }
+
+    #[test]
+    fn user_message_formats_scope_errors_for_users() {
+        let err = CompileError::CodeGen(CodeGenError::VariableNotInScope("x".to_string()));
+
+        assert_eq!(
+            err.user_message().as_ref(),
+            "Use of variable 'x' outside of its scope"
+        );
+    }
 }

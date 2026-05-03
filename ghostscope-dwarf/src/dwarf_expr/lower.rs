@@ -1,6 +1,7 @@
 //! DWARF expression evaluator
 //!
-//! Converts DWARF location expressions to EvaluationResult for eBPF code generation
+//! Converts raw DWARF location expressions into the crate's internal evaluator
+//! representation before semantic planning lowers them into read plans.
 
 use crate::binary::{DwarfEndian, DwarfReader};
 use crate::core::{
@@ -494,11 +495,11 @@ impl ExpressionEvaluator {
                         // This marks the result as a computed value, not a memory location
                         // Already handled by has_stack_value flag
                     }
-                    ParsedOperation::Operation(Operation::Deref { size, space, .. }) => {
+                    ParsedOperation::Operation(op @ Operation::Deref { size, space, .. }) => {
                         if *space {
-                            return Err(anyhow::anyhow!(
-                                "unsupported DWARF expression operation: {:?}",
-                                op
+                            return Err(crate::dwarf_expr::ops::unsupported_operation_error(
+                                "DWARF expression",
+                                op,
                             ));
                         }
                         let mem_size = match size {
@@ -517,10 +518,10 @@ impl ExpressionEvaluator {
                         steps.push(ComputeStep::Dereference { size: mem_size });
                     }
                     ParsedOperation::Operation(Operation::Nop) => {}
-                    _ => {
-                        return Err(anyhow::anyhow!(
-                            "unsupported DWARF expression operation: {:?}",
-                            op
+                    ParsedOperation::Operation(op) => {
+                        return Err(crate::dwarf_expr::ops::unsupported_operation_error(
+                            "DWARF expression",
+                            op,
                         ));
                     }
                 }
@@ -737,15 +738,23 @@ impl ExpressionEvaluator {
             }
 
             // These operations don't make sense as single operations
-            Operation::StackValue => Err(anyhow::anyhow!(
-                "unsupported single operation: DW_OP_stack_value"
-            )),
-            Operation::PlusConstant { .. } => Err(anyhow::anyhow!(
-                "unsupported single operation: DW_OP_plus_uconst without base"
-            )),
-            _ => Err(anyhow::anyhow!(
-                "unsupported single operation in fast path: {:?}",
-                op
+            Operation::StackValue => Err(
+                crate::dwarf_expr::ops::unsupported_operation_error_with_detail(
+                    "single DWARF expression",
+                    op,
+                    "DW_OP_stack_value cannot be a standalone location expression",
+                ),
+            ),
+            Operation::PlusConstant { .. } => Err(
+                crate::dwarf_expr::ops::unsupported_operation_error_with_detail(
+                    "single DWARF expression",
+                    op,
+                    "DW_OP_plus_uconst requires a base value",
+                ),
+            ),
+            _ => Err(crate::dwarf_expr::ops::unsupported_operation_error(
+                "single DWARF expression",
+                op,
             )),
         }
     }
@@ -1274,7 +1283,10 @@ impl ExpressionEvaluator {
 #[cfg(test)]
 mod tests {
     use super::ExpressionEvaluator;
-    use crate::core::{CfaResult, DirectValueResult, EvaluationResult, LocationResult};
+    use crate::core::{
+        CfaResult, ComputeStep, DirectValueResult, EvaluationResult, LocationResult,
+        MemoryAccessSize,
+    };
     use gimli::constants;
     use gimli::RunTimeEndian;
 
@@ -1283,6 +1295,261 @@ mod tests {
             format: gimli::Format::Dwarf32,
             version: 5,
             address_size: 8,
+        }
+    }
+
+    fn encode_uleb(mut value: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
+        out
+    }
+
+    fn encode_sleb(mut value: i64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let mut byte = (value as u8) & 0x7f;
+            value >>= 7;
+            let sign_bit_set = (byte & 0x40) != 0;
+            let done = (value == 0 && !sign_bit_set) || (value == -1 && sign_bit_set);
+            if !done {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if done {
+                break;
+            }
+        }
+        out
+    }
+
+    fn parse_test_expr(bytes: &[u8]) -> anyhow::Result<EvaluationResult> {
+        ExpressionEvaluator::parse_expression_with_context(
+            bytes,
+            RunTimeEndian::Little,
+            test_encoding(),
+            None,
+            0,
+            None,
+            None,
+            None,
+            0,
+        )
+    }
+
+    fn addr_expr(address: u64) -> Vec<u8> {
+        let mut bytes = vec![constants::DW_OP_addr.0];
+        bytes.extend(address.to_le_bytes());
+        bytes
+    }
+
+    fn regx_expr(register: u64) -> Vec<u8> {
+        let mut bytes = vec![constants::DW_OP_regx.0];
+        bytes.extend(encode_uleb(register));
+        bytes
+    }
+
+    fn bregx_expr(register: u64, offset: i64) -> Vec<u8> {
+        let mut bytes = vec![constants::DW_OP_bregx.0];
+        bytes.extend(encode_uleb(register));
+        bytes.extend(encode_sleb(offset));
+        bytes
+    }
+
+    #[test]
+    fn dwarf_op_supported_coverage_matrix() {
+        let cases = vec![
+            (
+                "DW_OP_regN",
+                vec![constants::DW_OP_reg5.0],
+                EvaluationResult::DirectValue(DirectValueResult::RegisterValue(5)),
+            ),
+            (
+                "DW_OP_regx",
+                regx_expr(33),
+                EvaluationResult::DirectValue(DirectValueResult::RegisterValue(33)),
+            ),
+            (
+                "DW_OP_bregN",
+                {
+                    let mut bytes = vec![constants::DW_OP_breg7.0];
+                    bytes.extend(encode_sleb(8));
+                    bytes
+                },
+                EvaluationResult::MemoryLocation(LocationResult::RegisterAddress {
+                    register: 7,
+                    offset: Some(8),
+                    size: None,
+                }),
+            ),
+            (
+                "DW_OP_bregx",
+                bregx_expr(33, -2),
+                EvaluationResult::MemoryLocation(LocationResult::RegisterAddress {
+                    register: 33,
+                    offset: Some(-2),
+                    size: None,
+                }),
+            ),
+            (
+                "DW_OP_addr",
+                addr_expr(0x1234),
+                EvaluationResult::MemoryLocation(LocationResult::Address(0x1234)),
+            ),
+            (
+                "DW_OP_stack_value",
+                vec![constants::DW_OP_lit1.0, constants::DW_OP_stack_value.0],
+                EvaluationResult::DirectValue(DirectValueResult::Constant(1)),
+            ),
+            (
+                "arithmetic stack value subset",
+                vec![
+                    constants::DW_OP_lit1.0,
+                    constants::DW_OP_lit2.0,
+                    constants::DW_OP_plus.0,
+                    constants::DW_OP_stack_value.0,
+                ],
+                EvaluationResult::DirectValue(DirectValueResult::ComputedValue {
+                    steps: vec![
+                        ComputeStep::PushConstant(1),
+                        ComputeStep::PushConstant(2),
+                        ComputeStep::Add,
+                    ],
+                    result_size: MemoryAccessSize::U64,
+                }),
+            ),
+            (
+                "DW_OP_implicit_value",
+                vec![constants::DW_OP_implicit_value.0, 3, 0xaa, 0xbb, 0xcc],
+                EvaluationResult::DirectValue(DirectValueResult::ImplicitValue(vec![
+                    0xaa, 0xbb, 0xcc,
+                ])),
+            ),
+        ];
+
+        for (name, bytes, expected) in cases {
+            let result = parse_test_expr(&bytes).unwrap_or_else(|error| {
+                panic!("{name} should parse successfully, bytes={bytes:?}: {error}")
+            });
+            assert_eq!(result, expected, "{name} lowered incorrectly");
+        }
+    }
+
+    #[test]
+    fn dwarf_op_fbreg_coverage_uses_cfa_provider() {
+        let get_cfa = |_address| {
+            Ok(Some(CfaResult::RegisterPlusOffset {
+                register: 7,
+                offset: 16,
+            }))
+        };
+        let mut expr = vec![constants::DW_OP_fbreg.0];
+        expr.extend(encode_sleb(4));
+
+        let result = ExpressionEvaluator::parse_expression_with_context(
+            &expr,
+            RunTimeEndian::Little,
+            test_encoding(),
+            None,
+            0,
+            Some(&get_cfa),
+            None,
+            None,
+            0,
+        )
+        .expect("DW_OP_fbreg should parse with a CFA provider");
+
+        assert_eq!(
+            result,
+            EvaluationResult::MemoryLocation(LocationResult::RegisterAddress {
+                register: 7,
+                offset: Some(20),
+                size: None,
+            })
+        );
+    }
+
+    #[test]
+    fn dwarf_op_unsupported_diagnostic_matrix_names_ops() {
+        let cases = vec![
+            (
+                "DW_OP_drop",
+                vec![
+                    constants::DW_OP_lit1.0,
+                    constants::DW_OP_drop.0,
+                    constants::DW_OP_stack_value.0,
+                ],
+                "DW_OP_drop",
+            ),
+            (
+                "DW_OP_piece",
+                {
+                    let mut bytes = vec![constants::DW_OP_lit1.0, constants::DW_OP_piece.0];
+                    bytes.extend(encode_uleb(1));
+                    bytes
+                },
+                "DW_OP_piece",
+            ),
+            (
+                "DW_OP_bit_piece",
+                {
+                    let mut bytes = vec![constants::DW_OP_lit1.0, constants::DW_OP_bit_piece.0];
+                    bytes.extend(encode_uleb(8));
+                    bytes.extend(encode_uleb(0));
+                    bytes
+                },
+                "DW_OP_bit_piece",
+            ),
+            (
+                "DW_OP_addrx",
+                {
+                    let mut bytes = vec![constants::DW_OP_addrx.0];
+                    bytes.extend(encode_uleb(0));
+                    bytes
+                },
+                "DW_OP_addrx",
+            ),
+            (
+                "DW_OP_bra",
+                vec![
+                    constants::DW_OP_lit1.0,
+                    constants::DW_OP_bra.0,
+                    0,
+                    0,
+                    constants::DW_OP_stack_value.0,
+                ],
+                "DW_OP_bra",
+            ),
+        ];
+
+        for (name, bytes, expected_op) in cases {
+            let error = match parse_test_expr(&bytes) {
+                Ok(result) => panic!("{name} should be unsupported, got {result:?}"),
+                Err(error) => error,
+            };
+            let message = error.to_string();
+            assert!(
+                message.contains(expected_op),
+                "{name} diagnostic should mention {expected_op}, got: {message}"
+            );
+            assert!(
+                message.contains("unsupported"),
+                "{name} diagnostic should be explicit, got: {message}"
+            );
+            assert_eq!(
+                crate::dwarf_expr::ops::unsupported_op_from_error(&error),
+                Some(expected_op),
+                "{name} diagnostic should carry a typed unsupported-op cause"
+            );
         }
     }
 

@@ -514,6 +514,55 @@ trace calculate_something {
 }
 
 #[tokio::test]
+async fn test_address_trace_compile_failure_uses_failed_target_banner() -> anyhow::Result<()> {
+    init();
+    ensure_global_cleanup_registered();
+
+    let binary_path = FIXTURES.get_test_binary("sample_program")?;
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to load DWARF for sample_program: {e}"))?;
+    let addrs = analyzer.lookup_function_addresses("calculate_something");
+    anyhow::ensure!(
+        !addrs.is_empty(),
+        "No DWARF addresses found for calculate_something"
+    );
+    let pc = addrs[0].address;
+
+    let script_content = format!(
+        r#"
+trace 0x{pc:x} {{
+    let p = "A";
+    if memcmp(p, hex("41"), 1) {{ print "OK"; }} else {{ print "NO"; }}
+}}
+"#
+    );
+
+    let (exit_code, _stdout, stderr) = run_ghostscope_with_script(&script_content, 2).await?;
+    assert!(
+        exit_code != 0,
+        "expected non-zero exit due to compile error; stderr={stderr}"
+    );
+
+    let has_banner = stderr.contains("No uprobe configurations created")
+        || stderr.contains("Script compilation failed");
+    assert!(
+        has_banner && stderr.contains("Failed targets:"),
+        "Expected failed-targets banner for address trace. stderr={stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("0x{pc:x}"))
+            && stderr.contains("expression is not a pointer/address"),
+        "Expected address target and pointer/address reason. stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("Code generation error:"),
+        "User-facing stderr should not expose CodeGen wrapper. stderr={stderr}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_pointer_ordered_comparison_is_rejected_e2e() -> anyhow::Result<()> {
     init();
     ensure_global_cleanup_registered();
@@ -1021,12 +1070,19 @@ trace sample_program.c:16 {
         let has_func = stdout.contains("FUNC:");
         let has_line16 = stdout.contains("LINE16:");
 
-        assert!(
-            has_func,
-            "Expected function-level trace output for {} but none was captured. STDOUT: {}",
-            opt_level.description(),
-            stdout
-        );
+        if *opt_level == OptimizationLevel::Debug {
+            assert!(
+                has_func,
+                "Expected function-level trace output for {} but none was captured. STDOUT: {}",
+                opt_level.description(),
+                stdout
+            );
+        } else if !has_func {
+            println!(
+                "Function-level trace did not fire for {}; calculate_something may be inlined",
+                opt_level.description()
+            );
+        }
         assert!(
             has_line16,
             "Expected line-level trace output for {} but none was captured. STDOUT: {}",
@@ -1112,13 +1168,14 @@ trace sample_program.c:16 {
                 );
             }
         } else {
-            // In optimized builds, allow optimized-out markers in place of numeric validations,
-            // but ensure we never emit placeholder zeros.
+            // In optimized builds, the function body may be fully inlined into
+            // its caller. If a function-level trace fires, validate it, but do
+            // not require a hit from an out-of-line symbol that is not called.
             assert!(
-                    !func_has_placeholder_zero,
-                    "Should not emit placeholder optimized-out values in optimized builds. STDOUT: {stdout}"
-                );
-            if func_validations == 0 && !func_has_optimized_marker {
+                !func_has_placeholder_zero,
+                "Should not emit placeholder optimized-out values in optimized builds. STDOUT: {stdout}"
+            );
+            if has_func && func_validations == 0 && !func_has_optimized_marker {
                 panic!(
                     "❌ Expected function-level traces to be either numerically valid or marked as optimized-out. STDOUT: {stdout}"
                 );

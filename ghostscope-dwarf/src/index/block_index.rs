@@ -159,15 +159,21 @@ impl FunctionBlocks {
         best_path
     }
 
-    /// Enumerate all VarRefs visible at PC (root + blocks on path)
-    pub fn variables_at_pc(&self, pc: u64) -> Vec<VarRef> {
+    /// Enumerate all VarRefs visible at PC with their lexical path depth.
+    pub fn variables_at_pc_with_scope_depth(&self, pc: u64) -> Vec<(VarRef, usize)> {
         if !self.function_contains_pc(pc) {
             return Vec::new();
         }
         let path = self.block_path_for_pc(pc);
         let mut out = Vec::new();
-        for idx in path {
-            out.extend(self.nodes[idx].variables.iter().cloned());
+        for (scope_depth, idx) in path.into_iter().enumerate() {
+            out.extend(
+                self.nodes[idx]
+                    .variables
+                    .iter()
+                    .cloned()
+                    .map(|variable| (variable, scope_depth)),
+            );
         }
         out
     }
