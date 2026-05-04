@@ -69,8 +69,16 @@ pub enum AddressOrigin {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlannedAddress {
-    pub location: VariableLocation,
+    pub kind: PlannedAddressKind,
     pub origin: AddressOrigin,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlannedAddressKind {
+    Constant { address: u64 },
+    RegisterOffset { dwarf_reg: u16, offset: i64 },
+    FrameBaseRelative { offset: i64 },
+    Computed { steps: Vec<ComputeStep> },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -492,13 +500,23 @@ impl PlannedValue {
 
 impl PlannedAddress {
     pub fn from_location(location: VariableLocation) -> Option<Self> {
-        let origin = match &location {
+        let (kind, origin) = match location {
             VariableLocation::Address(expr) | VariableLocation::AbsoluteAddressValue(expr) => {
-                address_origin_for_steps(&expr.steps)
+                let origin = address_origin_for_steps(&expr.steps);
+                (PlannedAddressKind::from_steps(expr.steps), origin)
             }
-            VariableLocation::RegisterAddress { .. }
-            | VariableLocation::FrameBaseRelative { .. } => AddressOrigin::RuntimeDerived,
-            VariableLocation::ComputedAddress(steps) => address_origin_for_steps(steps),
+            VariableLocation::RegisterAddress { dwarf_reg, offset } => (
+                PlannedAddressKind::RegisterOffset { dwarf_reg, offset },
+                AddressOrigin::RuntimeDerived,
+            ),
+            VariableLocation::FrameBaseRelative { offset } => (
+                PlannedAddressKind::FrameBaseRelative { offset },
+                AddressOrigin::RuntimeDerived,
+            ),
+            VariableLocation::ComputedAddress(steps) => {
+                let origin = address_origin_for_steps(&steps);
+                (PlannedAddressKind::from_steps(steps), origin)
+            }
             VariableLocation::RegisterValue { .. }
             | VariableLocation::ComputedValue(_)
             | VariableLocation::ImplicitValue(_)
@@ -507,16 +525,13 @@ impl PlannedAddress {
             | VariableLocation::Unknown => return None,
         };
 
-        Some(Self { location, origin })
+        Some(Self { kind, origin })
     }
 
     pub fn constant_link_time_address(&self) -> Option<u64> {
-        match (&self.origin, &self.location) {
-            (AddressOrigin::LinkTime, VariableLocation::Address(expr))
-            | (AddressOrigin::LinkTime, VariableLocation::AbsoluteAddressValue(expr)) => {
-                fold_constant_steps(&expr.steps)
-            }
-            (AddressOrigin::LinkTime, VariableLocation::ComputedAddress(steps)) => {
+        match (&self.origin, &self.kind) {
+            (AddressOrigin::LinkTime, PlannedAddressKind::Constant { address }) => Some(*address),
+            (AddressOrigin::LinkTime, PlannedAddressKind::Computed { steps }) => {
                 fold_constant_steps(steps)
             }
             _ => None,
@@ -528,12 +543,18 @@ impl PlannedAddress {
             return None;
         }
 
-        match &self.location {
-            VariableLocation::Address(expr) | VariableLocation::AbsoluteAddressValue(expr) => {
-                link_time_base_and_runtime_tail(&expr.steps)
-            }
-            VariableLocation::ComputedAddress(steps) => link_time_base_and_runtime_tail(steps),
+        match &self.kind {
+            PlannedAddressKind::Computed { steps } => link_time_base_and_runtime_tail(steps),
             _ => None,
+        }
+    }
+}
+
+impl PlannedAddressKind {
+    fn from_steps(steps: Vec<ComputeStep>) -> Self {
+        match fold_constant_steps(&steps) {
+            Some(address) => Self::Constant { address },
+            None => Self::Computed { steps },
         }
     }
 }
@@ -895,7 +916,8 @@ fn unknown_member_error(
     .into()
 }
 
-fn add_location_offset(location: VariableLocation, offset: i64) -> Result<VariableLocation> {
+/// Apply a byte offset to an address-backed source variable location.
+pub fn add_location_offset(location: VariableLocation, offset: i64) -> Result<VariableLocation> {
     match location {
         VariableLocation::Address(expr) => {
             Ok(VariableLocation::Address(offset_address_expr(expr, offset)))
@@ -944,7 +966,8 @@ fn push_add_offset(steps: &mut Vec<ComputeStep>, offset: i64) {
     }
 }
 
-fn dereference_location(location: &VariableLocation) -> Result<VariableLocation> {
+/// Turn a pointer-valued source variable location into its pointee location.
+pub fn dereference_location(location: &VariableLocation) -> Result<VariableLocation> {
     match location {
         VariableLocation::AbsoluteAddressValue(expr) => Ok(VariableLocation::Address(expr.clone())),
         VariableLocation::RegisterValue { dwarf_reg } => {
@@ -1100,6 +1123,33 @@ mod tests {
             VariableMaterialization::UserMemoryRead { address } => {
                 assert_eq!(address.origin, AddressOrigin::LinkTime);
                 assert_eq!(address.constant_link_time_address(), Some(0x1000));
+                assert_eq!(
+                    address.kind,
+                    PlannedAddressKind::Constant { address: 0x1000 }
+                );
+            }
+            other => panic!("unexpected materialization: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn materialization_plan_converts_register_address_to_address_kind() {
+        let plan = read_plan(VariableLocation::RegisterAddress {
+            dwarf_reg: 6,
+            offset: -16,
+        });
+        let materialized = plan.materialization_plan(&capabilities(true));
+
+        match materialized.materialization {
+            VariableMaterialization::UserMemoryRead { address } => {
+                assert_eq!(address.origin, AddressOrigin::RuntimeDerived);
+                assert_eq!(
+                    address.kind,
+                    PlannedAddressKind::RegisterOffset {
+                        dwarf_reg: 6,
+                        offset: -16
+                    }
+                );
             }
             other => panic!("unexpected materialization: {other:?}"),
         }
@@ -1178,6 +1228,7 @@ mod tests {
                         address:
                             PlannedAddress {
                                 origin: AddressOrigin::LinkTime,
+                                kind: PlannedAddressKind::Constant { address: 0x2000 },
                                 ..
                             },
                     },
