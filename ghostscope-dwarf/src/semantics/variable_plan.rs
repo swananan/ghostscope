@@ -83,11 +83,23 @@ pub enum PlannedAddressKind {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlannedValue {
-    Constant(i64),
-    RegisterValue { dwarf_reg: u16 },
-    ComputedValue { steps: Vec<ComputeStep> },
+    Constant {
+        value: i64,
+        size: MemoryAccessSize,
+    },
+    RegisterValue {
+        dwarf_reg: u16,
+        size: MemoryAccessSize,
+    },
+    ComputedValue {
+        steps: Vec<ComputeStep>,
+        result_size: MemoryAccessSize,
+    },
     ImplicitBytes(Vec<u8>),
-    AddressValue { address: PlannedAddress },
+    AddressValue {
+        address: PlannedAddress,
+        size: MemoryAccessSize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -297,7 +309,8 @@ impl VariableReadPlan {
         } else {
             match lowering.kind {
                 VariableLoweringKind::DirectValue => {
-                    match PlannedValue::from_location(self.location.clone()) {
+                    let size = planned_value_size(self.dwarf_type.as_ref());
+                    match PlannedValue::from_location(self.location.clone(), size) {
                         Some(value) => VariableMaterialization::DirectValue { value },
                         None => VariableMaterialization::Unavailable {
                             availability: Availability::Unsupported(
@@ -470,22 +483,28 @@ impl VariableReadPlan {
 }
 
 impl PlannedValue {
-    pub fn from_location(location: VariableLocation) -> Option<Self> {
+    pub fn from_location(location: VariableLocation, size: MemoryAccessSize) -> Option<Self> {
         match location {
             VariableLocation::RegisterValue { dwarf_reg } => {
-                Some(Self::RegisterValue { dwarf_reg })
+                Some(Self::RegisterValue { dwarf_reg, size })
             }
             VariableLocation::ComputedValue(steps) => {
                 if let [ComputeStep::PushConstant(value)] = steps.as_slice() {
-                    Some(Self::Constant(*value))
+                    Some(Self::Constant {
+                        value: *value,
+                        size,
+                    })
                 } else {
-                    Some(Self::ComputedValue { steps })
+                    Some(Self::ComputedValue {
+                        steps,
+                        result_size: size,
+                    })
                 }
             }
             VariableLocation::ImplicitValue(bytes) => Some(Self::ImplicitBytes(bytes)),
             VariableLocation::AbsoluteAddressValue(expr) => {
                 PlannedAddress::from_location(VariableLocation::AbsoluteAddressValue(expr))
-                    .map(|address| Self::AddressValue { address })
+                    .map(|address| Self::AddressValue { address, size })
             }
             VariableLocation::Address(_)
             | VariableLocation::RegisterAddress { .. }
@@ -571,6 +590,12 @@ impl RuntimeCapabilities {
             }
         }
     }
+}
+
+fn planned_value_size(dwarf_type: Option<&TypeInfo>) -> MemoryAccessSize {
+    dwarf_type
+        .map(|ty| MemoryAccessSize::from_size(ty.size()))
+        .unwrap_or(MemoryAccessSize::U64)
 }
 
 fn address_origin_for_steps(steps: &[ComputeStep]) -> AddressOrigin {
@@ -1231,6 +1256,7 @@ mod tests {
                                 kind: PlannedAddressKind::Constant { address: 0x2000 },
                                 ..
                             },
+                        size: MemoryAccessSize::U64,
                     },
             } => {}
             VariableMaterialization::DirectValue { value } => {
@@ -1249,7 +1275,40 @@ mod tests {
 
         match materialized.materialization {
             VariableMaterialization::DirectValue {
-                value: PlannedValue::Constant(42),
+                value:
+                    PlannedValue::Constant {
+                        value: 42,
+                        size: MemoryAccessSize::U64,
+                    },
+            } => {}
+            other => panic!("unexpected materialization: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn materialization_plan_records_direct_value_size_from_type() {
+        let byte_type = TypeInfo::BaseType {
+            name: "uint8_t".to_string(),
+            size: 1,
+            encoding: gimli::constants::DW_ATE_unsigned.0 as u16,
+        };
+        let plan = typed_read_plan(
+            VariableLocation::ComputedValue(vec![
+                ComputeStep::LoadRegister(0),
+                ComputeStep::PushConstant(1),
+                ComputeStep::Add,
+            ]),
+            byte_type,
+        );
+        let materialized = plan.materialization_plan(&capabilities(false));
+
+        match materialized.materialization {
+            VariableMaterialization::DirectValue {
+                value:
+                    PlannedValue::ComputedValue {
+                        result_size: MemoryAccessSize::U8,
+                        ..
+                    },
             } => {}
             other => panic!("unexpected materialization: {other:?}"),
         }
@@ -1262,7 +1321,11 @@ mod tests {
 
         match materialized.materialization {
             VariableMaterialization::DirectValue {
-                value: PlannedValue::RegisterValue { dwarf_reg: 6 },
+                value:
+                    PlannedValue::RegisterValue {
+                        dwarf_reg: 6,
+                        size: MemoryAccessSize::U64,
+                    },
             } => {}
             other => panic!("unexpected materialization: {other:?}"),
         }

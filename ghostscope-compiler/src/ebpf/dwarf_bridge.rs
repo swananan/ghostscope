@@ -66,24 +66,21 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     fn planned_value_to_llvm_value(
         &mut self,
         value: &ghostscope_dwarf::PlannedValue,
-        dwarf_type: &TypeInfo,
         var_name: &str,
-        _pc_address: u64,
         status_ptr: Option<PointerValue<'ctx>>,
     ) -> Result<BasicValueEnum<'ctx>> {
         let pt_regs_ptr = self.get_pt_regs_parameter()?;
-        let result_size = MemoryAccessSize::from_size(Self::get_dwarf_type_size(dwarf_type));
         match value {
-            ghostscope_dwarf::PlannedValue::Constant(value) => Ok(self
+            ghostscope_dwarf::PlannedValue::Constant { value, .. } => Ok(self
                 .context
                 .i64_type()
                 .const_int(*value as u64, true)
                 .into()),
-            ghostscope_dwarf::PlannedValue::RegisterValue { dwarf_reg } => {
+            ghostscope_dwarf::PlannedValue::RegisterValue { dwarf_reg, .. } => {
                 debug!("Generating register value: {dwarf_reg}");
                 self.load_register_value(*dwarf_reg, pt_regs_ptr)
             }
-            ghostscope_dwarf::PlannedValue::ComputedValue { steps } => {
+            ghostscope_dwarf::PlannedValue::ComputedValue { steps, result_size } => {
                 debug!("Generating computed value: {} steps", steps.len());
                 let runtime_status_ptr = if self.condition_context_active {
                     Some(self.get_or_create_cond_error_global())
@@ -93,7 +90,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 self.generate_compute_steps(
                     steps,
                     pt_regs_ptr,
-                    Some(result_size),
+                    Some(*result_size),
                     runtime_status_ptr,
                     None,
                 )
@@ -106,7 +103,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 }
                 Ok(self.context.i64_type().const_int(value, false).into())
             }
-            ghostscope_dwarf::PlannedValue::AddressValue { address } => {
+            ghostscope_dwarf::PlannedValue::AddressValue { address, .. } => {
                 debug!("Generating address direct value for variable: {var_name}");
                 let runtime_status_ptr = if self.condition_context_active {
                     Some(self.get_or_create_cond_error_global())
@@ -302,14 +299,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
     /// Convert DWARF type size to MemoryAccessSize
     fn dwarf_type_to_memory_access_size(&self, dwarf_type: &TypeInfo) -> MemoryAccessSize {
-        let size = Self::get_dwarf_type_size(dwarf_type);
-        match size {
-            1 => MemoryAccessSize::U8,
-            2 => MemoryAccessSize::U16,
-            4 => MemoryAccessSize::U32,
-            8 => MemoryAccessSize::U64,
-            _ => MemoryAccessSize::U64, // Default to U64 for unknown sizes
-        }
+        MemoryAccessSize::from_size(dwarf_type.size())
     }
 
     fn is_signed_integer_type(dwarf_type: &TypeInfo) -> bool {
@@ -377,7 +367,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             ));
         }
 
-        if materialization.availability != Availability::OptimizedOut {
+        if materialization.availability != Availability::OptimizedOut
+            && matches!(
+                materialization.materialization,
+                ghostscope_dwarf::VariableMaterialization::UserMemoryRead { .. }
+            )
+        {
             materialization.dwarf_type.as_ref().ok_or_else(|| {
                 CodeGenError::DwarfError("Expression has no DWARF type information".to_string())
             })?;
@@ -394,18 +389,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     ) -> Result<BasicValueEnum<'ctx>> {
         match &materialization.materialization {
             ghostscope_dwarf::VariableMaterialization::DirectValue { value } => {
-                let dwarf_type = materialization.dwarf_type.as_ref().ok_or_else(|| {
-                    CodeGenError::DwarfError(
-                        "Expression has no DWARF type information".to_string(),
-                    )
-                })?;
-                self.planned_value_to_llvm_value(
-                    value,
-                    dwarf_type,
-                    &materialization.name,
-                    pc_address,
-                    status_ptr,
-                )
+                self.planned_value_to_llvm_value(value, &materialization.name, status_ptr)
             }
             ghostscope_dwarf::VariableMaterialization::UserMemoryRead { address } => {
                 let dwarf_type = materialization.dwarf_type.as_ref().ok_or_else(|| {
@@ -1397,33 +1381,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             return Ok(None);
         };
         Ok(Some((base, VariableAccessPath::new(segments))))
-    }
-
-    /// Get DWARF type size in bytes
-    pub fn get_dwarf_type_size(dwarf_type: &TypeInfo) -> u64 {
-        match dwarf_type {
-            TypeInfo::BaseType { size, .. } => *size,
-            TypeInfo::PointerType { size, .. } => *size,
-            TypeInfo::ArrayType { total_size, .. } => total_size.unwrap_or(0),
-            TypeInfo::StructType { size, .. } => *size,
-            TypeInfo::UnionType { size, .. } => *size,
-            TypeInfo::EnumType { size, .. } => *size,
-            TypeInfo::BitfieldType {
-                underlying_type, ..
-            } => {
-                // Read size equals the storage type size
-                Self::get_dwarf_type_size(underlying_type)
-            }
-            TypeInfo::TypedefType {
-                underlying_type, ..
-            } => Self::get_dwarf_type_size(underlying_type),
-            TypeInfo::QualifiedType {
-                underlying_type, ..
-            } => Self::get_dwarf_type_size(underlying_type),
-            TypeInfo::FunctionType { .. } => 8, // Function pointer size
-            TypeInfo::UnknownType { .. } => 0,
-            TypeInfo::OptimizedOut { .. } => 0, // Optimized out has no size
-        }
     }
 
     /// Compute a typed pointed-to location for expressions like `ptr +/- K` where K is an element index.
