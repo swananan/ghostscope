@@ -398,6 +398,55 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         }
     }
 
+    fn is_signed_integer_type(dwarf_type: &TypeInfo) -> bool {
+        match dwarf_type {
+            TypeInfo::BaseType { encoding, .. } => {
+                *encoding == ghostscope_dwarf::constants::DW_ATE_signed.0 as u16
+                    || *encoding == ghostscope_dwarf::constants::DW_ATE_signed_char.0 as u16
+            }
+            TypeInfo::EnumType { base_type, .. } => Self::is_signed_integer_type(base_type),
+            TypeInfo::BitfieldType {
+                underlying_type, ..
+            } => Self::is_signed_integer_type(underlying_type),
+            TypeInfo::TypedefType {
+                underlying_type, ..
+            }
+            | TypeInfo::QualifiedType {
+                underlying_type, ..
+            } => Self::is_signed_integer_type(underlying_type),
+            _ => false,
+        }
+    }
+
+    fn sign_extend_memory_read_if_needed(
+        &self,
+        value: BasicValueEnum<'ctx>,
+        dwarf_type: &TypeInfo,
+        access_size: MemoryAccessSize,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        if !Self::is_signed_integer_type(dwarf_type) || matches!(access_size, MemoryAccessSize::U64)
+        {
+            return Ok(value);
+        }
+
+        let int_value = value.into_int_value();
+        let narrow_type = match access_size {
+            MemoryAccessSize::U8 => self.context.i8_type(),
+            MemoryAccessSize::U16 => self.context.i16_type(),
+            MemoryAccessSize::U32 => self.context.i32_type(),
+            MemoryAccessSize::U64 => unreachable!("U64 values do not need sign extension"),
+        };
+        let narrowed = self
+            .builder
+            .build_int_truncate(int_value, narrow_type, "signed_mem_trunc")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let extended = self
+            .builder
+            .build_int_s_extend(narrowed, self.context.i64_type(), "signed_mem_sext")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        Ok(extended.into())
+    }
+
     pub(super) fn variable_read_plan_to_runtime_read_parts(
         &self,
         plan: VariableReadPlan,
@@ -456,11 +505,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         }
 
         let access_size = self.dwarf_type_to_memory_access_size(dwarf_type);
-        if self.condition_context_active {
+        let read_value = if self.condition_context_active {
             self.generate_memory_read_with_status(addr, access_size)
         } else {
             self.generate_memory_read(addr, access_size, status_ptr)
-        }
+        }?;
+
+        self.sign_extend_memory_read_if_needed(read_value, dwarf_type, access_size)
     }
 
     /// Execute a sequence of compute steps

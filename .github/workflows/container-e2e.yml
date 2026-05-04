@@ -98,6 +98,7 @@ jobs:
             e2e-tests/tests/fixtures/globals_program/globals_program
             e2e-tests/tests/fixtures/globals_program/libgvars.so
             e2e-tests/tests/fixtures/late_globals_program/late_globals_program
+            e2e-tests/tests/fixtures/scalar_types_program/scalar_types_program
             e2e-tests/tests/fixtures/rust_global_program/target/debug/rust_global_program
             e2e-tests/tests/fixtures/inline_callsite_program/inline_callsite_program
             e2e-tests/tests/fixtures/inline_callsite_program/inline_callsite_program_clang_dwarf5
@@ -233,6 +234,7 @@ jobs:
             e2e-tests/tests/fixtures/globals_program/globals_program
             e2e-tests/tests/fixtures/globals_program/libgvars.so
             e2e-tests/tests/fixtures/late_globals_program/late_globals_program
+            e2e-tests/tests/fixtures/scalar_types_program/scalar_types_program
             e2e-tests/tests/fixtures/rust_global_program/target/debug/rust_global_program
             e2e-tests/tests/fixtures/inline_callsite_program/inline_callsite_program
             e2e-tests/tests/fixtures/inline_callsite_program/inline_callsite_program_clang_dwarf5

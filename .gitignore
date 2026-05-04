@@ -67,6 +67,7 @@ e2e-tests/tests/fixtures/member_pointer_program/member_pointer_program
 e2e-tests/tests/fixtures/member_pointer_program/member_pointer_program_o*
 e2e-tests/tests/fixtures/partitioned_ranges_program/partitioned_ranges_program
 e2e-tests/tests/fixtures/rust_global_program/target/
+e2e-tests/tests/fixtures/scalar_types_program/scalar_types_program
 e2e-tests/tests/fixtures/sample_program/sample_lib.o
 e2e-tests/tests/fixtures/sample_program/sample_program
 e2e-tests/tests/fixtures/sample_program/sample_program.o

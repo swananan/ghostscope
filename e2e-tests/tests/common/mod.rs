@@ -28,6 +28,7 @@ lazy_static! {
         Mutex::new(None);
     static ref COMPILE_GLOBALS_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
     static ref COMPILE_LATE_GLOBALS_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
+    static ref COMPILE_SCALAR_TYPES_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
     static ref COMPILE_RUST_GLOBAL_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
     static ref COMPILE_INLINE_CALLSITE_DEFAULT_RESULT: Mutex<Option<anyhow::Result<()>>> =
         Mutex::new(None);
@@ -65,6 +66,7 @@ enum RegisteredFixtureKind {
     MemberPointer,
     Globals,
     LateGlobals,
+    ScalarTypes,
     RustGlobal,
     InlineCallsite,
     InlineCallValue,
@@ -115,6 +117,12 @@ const REGISTERED_FIXTURES: &[RegisteredFixture] = &[
         directory: "late_globals_program",
         cleanup: CleanupCommand::Make,
         kind: RegisteredFixtureKind::LateGlobals,
+    },
+    RegisteredFixture {
+        name: "scalar_types_program",
+        directory: "scalar_types_program",
+        cleanup: CleanupCommand::Make,
+        kind: RegisteredFixtureKind::ScalarTypes,
     },
     RegisteredFixture {
         name: "rust_global_program",
@@ -383,6 +391,16 @@ impl RegisteredFixture {
             RegisteredFixtureKind::LateGlobals => {
                 ensure_late_globals_program_compiled()?;
                 Ok(dir.join("late_globals_program"))
+            }
+            RegisteredFixtureKind::ScalarTypes => {
+                if !matches!(opt_level, OptimizationLevel::Debug) {
+                    anyhow::bail!(
+                        "Optimization level {} not supported for scalar_types_program",
+                        opt_level.description()
+                    );
+                }
+                ensure_scalar_types_program_compiled()?;
+                Ok(dir.join("scalar_types_program"))
             }
             RegisteredFixtureKind::RustGlobal => {
                 ensure_rust_global_program_compiled()?;
@@ -1037,6 +1055,7 @@ pub mod termination;
 
 static COMPILE_GLOBALS: Once = Once::new();
 static COMPILE_LATE_GLOBALS: Once = Once::new();
+static COMPILE_SCALAR_TYPES: Once = Once::new();
 static COMPILE_RUST_GLOBAL: Once = Once::new();
 static COMPILE_INLINE_CALLSITE_DEFAULT: Once = Once::new();
 static COMPILE_INLINE_CALLSITE_CLANG_DWARF5: Once = Once::new();
@@ -1122,6 +1141,23 @@ fn ensure_late_globals_program_compiled() -> anyhow::Result<()> {
     });
 
     match COMPILE_LATE_GLOBALS_RESULT.lock().unwrap().as_ref() {
+        Some(Ok(())) => Ok(()),
+        Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
+        None => panic!("Compilation result should be set after call_once"),
+    }
+}
+
+fn ensure_scalar_types_program_compiled() -> anyhow::Result<()> {
+    COMPILE_SCALAR_TYPES.call_once(|| {
+        let compile_result = compile_c_make_fixture(
+            "scalar_types_program",
+            FixtureCompiler::Default,
+            "-Wall -Wextra -g -O0",
+        );
+        *COMPILE_SCALAR_TYPES_RESULT.lock().unwrap() = Some(compile_result);
+    });
+
+    match COMPILE_SCALAR_TYPES_RESULT.lock().unwrap().as_ref() {
         Some(Ok(())) => Ok(()),
         Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
         None => panic!("Compilation result should be set after call_once"),
