@@ -74,20 +74,20 @@ pub struct PlannedAddress {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum PlannedValue {
+    Constant(i64),
+    RegisterValue { dwarf_reg: u16 },
+    ComputedValue { steps: Vec<ComputeStep> },
+    ImplicitBytes(Vec<u8>),
+    AddressValue { address: PlannedAddress },
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum VariableMaterialization {
-    DirectValue {
-        location: VariableLocation,
-        address_origin: Option<AddressOrigin>,
-    },
-    UserMemoryRead {
-        address: PlannedAddress,
-    },
-    Composite {
-        pieces: Vec<PieceLocation>,
-    },
-    Unavailable {
-        availability: Availability,
-    },
+    DirectValue { value: PlannedValue },
+    UserMemoryRead { address: PlannedAddress },
+    Composite { pieces: Vec<PieceLocation> },
+    Unavailable { availability: Availability },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -288,10 +288,21 @@ impl VariableReadPlan {
             }
         } else {
             match lowering.kind {
-                VariableLoweringKind::DirectValue => VariableMaterialization::DirectValue {
-                    address_origin: direct_value_address_origin(&self.location),
-                    location: self.location.clone(),
-                },
+                VariableLoweringKind::DirectValue => {
+                    match PlannedValue::from_location(self.location.clone()) {
+                        Some(value) => VariableMaterialization::DirectValue { value },
+                        None => VariableMaterialization::Unavailable {
+                            availability: Availability::Unsupported(
+                                UnsupportedReason::ExpressionShape {
+                                    detail: format!(
+                                        "location {} cannot be materialized as a direct value",
+                                        self.location
+                                    ),
+                                },
+                            ),
+                        },
+                    }
+                }
                 VariableLoweringKind::UserMemoryRead => {
                     match PlannedAddress::from_location(self.location.clone()) {
                         Some(address) => VariableMaterialization::UserMemoryRead { address },
@@ -450,6 +461,35 @@ impl VariableReadPlan {
     }
 }
 
+impl PlannedValue {
+    pub fn from_location(location: VariableLocation) -> Option<Self> {
+        match location {
+            VariableLocation::RegisterValue { dwarf_reg } => {
+                Some(Self::RegisterValue { dwarf_reg })
+            }
+            VariableLocation::ComputedValue(steps) => {
+                if let [ComputeStep::PushConstant(value)] = steps.as_slice() {
+                    Some(Self::Constant(*value))
+                } else {
+                    Some(Self::ComputedValue { steps })
+                }
+            }
+            VariableLocation::ImplicitValue(bytes) => Some(Self::ImplicitBytes(bytes)),
+            VariableLocation::AbsoluteAddressValue(expr) => {
+                PlannedAddress::from_location(VariableLocation::AbsoluteAddressValue(expr))
+                    .map(|address| Self::AddressValue { address })
+            }
+            VariableLocation::Address(_)
+            | VariableLocation::RegisterAddress { .. }
+            | VariableLocation::FrameBaseRelative { .. }
+            | VariableLocation::ComputedAddress(_)
+            | VariableLocation::Pieces(_)
+            | VariableLocation::OptimizedOut
+            | VariableLocation::Unknown => None,
+        }
+    }
+}
+
 impl PlannedAddress {
     pub fn from_location(location: VariableLocation) -> Option<Self> {
         let origin = match &location {
@@ -509,13 +549,6 @@ impl RuntimeCapabilities {
                 self.regular_uprobe || self.sleepable_uprobe || self.copy_from_user_task
             }
         }
-    }
-}
-
-fn direct_value_address_origin(location: &VariableLocation) -> Option<AddressOrigin> {
-    match location {
-        VariableLocation::AbsoluteAddressValue(expr) => Some(address_origin_for_steps(&expr.steps)),
-        _ => None,
     }
 }
 
@@ -1140,15 +1173,46 @@ mod tests {
 
         match materialized.materialization {
             VariableMaterialization::DirectValue {
-                address_origin,
-                location,
-            } => {
-                assert_eq!(address_origin, Some(AddressOrigin::LinkTime));
-                assert!(matches!(
-                    location,
-                    VariableLocation::AbsoluteAddressValue(_)
-                ));
+                value:
+                    PlannedValue::AddressValue {
+                        address:
+                            PlannedAddress {
+                                origin: AddressOrigin::LinkTime,
+                                ..
+                            },
+                    },
+            } => {}
+            VariableMaterialization::DirectValue { value } => {
+                panic!("unexpected direct value: {value:?}");
             }
+            other => panic!("unexpected materialization: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn materialization_plan_converts_constant_direct_value() {
+        let plan = read_plan(VariableLocation::ComputedValue(vec![
+            ComputeStep::PushConstant(42),
+        ]));
+        let materialized = plan.materialization_plan(&capabilities(false));
+
+        match materialized.materialization {
+            VariableMaterialization::DirectValue {
+                value: PlannedValue::Constant(42),
+            } => {}
+            other => panic!("unexpected materialization: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn materialization_plan_converts_register_direct_value() {
+        let plan = read_plan(VariableLocation::RegisterValue { dwarf_reg: 6 });
+        let materialized = plan.materialization_plan(&capabilities(false));
+
+        match materialized.materialization {
+            VariableMaterialization::DirectValue {
+                value: PlannedValue::RegisterValue { dwarf_reg: 6 },
+            } => {}
             other => panic!("unexpected materialization: {other:?}"),
         }
     }
