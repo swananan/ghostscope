@@ -77,46 +77,18 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         );
         debug!("Evaluation context PC address: 0x{:x}", pc_address);
 
-        let pt_regs_ptr = self.get_pt_regs_parameter()?;
-        let result_size = MemoryAccessSize::from_size(Self::get_dwarf_type_size(dwarf_type));
+        if let Some(value) = ghostscope_dwarf::PlannedValue::from_location(location.clone()) {
+            return self
+                .planned_value_to_llvm_value(&value, dwarf_type, var_name, pc_address, status_ptr);
+        }
 
         match location {
-            VariableLocation::RegisterValue { dwarf_reg } => {
-                debug!("Generating register value: {dwarf_reg}");
-                self.load_register_value(*dwarf_reg, pt_regs_ptr)
-            }
-            VariableLocation::ComputedValue(steps) => {
-                debug!("Generating computed value: {} steps", steps.len());
-                let runtime_status_ptr = if self.condition_context_active {
-                    Some(self.get_or_create_cond_error_global())
-                } else {
-                    status_ptr
-                };
-                self.generate_compute_steps(
-                    steps,
-                    pt_regs_ptr,
-                    Some(result_size),
-                    runtime_status_ptr,
-                    None,
-                )
-            }
-            VariableLocation::ImplicitValue(bytes) => {
-                debug!("Generating implicit value: {} bytes", bytes.len());
-                let mut value: u64 = 0;
-                for (i, &byte) in bytes.iter().enumerate().take(8) {
-                    value |= (byte as u64) << (i * 8);
-                }
-                Ok(self.context.i64_type().const_int(value, false).into())
-            }
-            VariableLocation::AbsoluteAddressValue(_) => {
-                let runtime_status_ptr = if self.condition_context_active {
-                    Some(self.get_or_create_cond_error_global())
-                } else {
-                    status_ptr
-                };
-                self.variable_location_to_address_with_hint(location, runtime_status_ptr, None)
-                    .map(Into::into)
-            }
+            VariableLocation::AbsoluteAddressValue(_)
+            | VariableLocation::RegisterValue { .. }
+            | VariableLocation::ComputedValue(_)
+            | VariableLocation::ImplicitValue(_) => Err(CodeGenError::DwarfError(format!(
+                "Direct DWARF value '{var_name}' could not be materialized as a planned value"
+            ))),
             VariableLocation::Address(_)
             | VariableLocation::RegisterAddress { .. }
             | VariableLocation::ComputedAddress(_) => {
@@ -146,6 +118,62 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             VariableLocation::Unknown => Err(CodeGenError::DwarfError(
                 "Variable read plan has unknown location".to_string(),
             )),
+        }
+    }
+
+    fn planned_value_to_llvm_value(
+        &mut self,
+        value: &ghostscope_dwarf::PlannedValue,
+        dwarf_type: &TypeInfo,
+        var_name: &str,
+        _pc_address: u64,
+        status_ptr: Option<PointerValue<'ctx>>,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        let pt_regs_ptr = self.get_pt_regs_parameter()?;
+        let result_size = MemoryAccessSize::from_size(Self::get_dwarf_type_size(dwarf_type));
+        match value {
+            ghostscope_dwarf::PlannedValue::Constant(value) => Ok(self
+                .context
+                .i64_type()
+                .const_int(*value as u64, true)
+                .into()),
+            ghostscope_dwarf::PlannedValue::RegisterValue { dwarf_reg } => {
+                debug!("Generating register value: {dwarf_reg}");
+                self.load_register_value(*dwarf_reg, pt_regs_ptr)
+            }
+            ghostscope_dwarf::PlannedValue::ComputedValue { steps } => {
+                debug!("Generating computed value: {} steps", steps.len());
+                let runtime_status_ptr = if self.condition_context_active {
+                    Some(self.get_or_create_cond_error_global())
+                } else {
+                    status_ptr
+                };
+                self.generate_compute_steps(
+                    steps,
+                    pt_regs_ptr,
+                    Some(result_size),
+                    runtime_status_ptr,
+                    None,
+                )
+            }
+            ghostscope_dwarf::PlannedValue::ImplicitBytes(bytes) => {
+                debug!("Generating implicit value: {} bytes", bytes.len());
+                let mut value: u64 = 0;
+                for (i, &byte) in bytes.iter().enumerate().take(8) {
+                    value |= (byte as u64) << (i * 8);
+                }
+                Ok(self.context.i64_type().const_int(value, false).into())
+            }
+            ghostscope_dwarf::PlannedValue::AddressValue { address } => {
+                debug!("Generating address direct value for variable: {var_name}");
+                let runtime_status_ptr = if self.condition_context_active {
+                    Some(self.get_or_create_cond_error_global())
+                } else {
+                    status_ptr
+                };
+                self.planned_address_to_llvm_address(address, runtime_status_ptr, None)
+                    .map(Into::into)
+            }
         }
     }
 
@@ -453,14 +481,14 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         status_ptr: Option<PointerValue<'ctx>>,
     ) -> Result<BasicValueEnum<'ctx>> {
         match &materialization.materialization {
-            ghostscope_dwarf::VariableMaterialization::DirectValue { location, .. } => {
+            ghostscope_dwarf::VariableMaterialization::DirectValue { value } => {
                 let dwarf_type = materialization.dwarf_type.as_ref().ok_or_else(|| {
                     CodeGenError::DwarfError(
                         "Expression has no DWARF type information".to_string(),
                     )
                 })?;
-                self.variable_location_to_llvm_value(
-                    location,
+                self.planned_value_to_llvm_value(
+                    value,
                     dwarf_type,
                     &materialization.name,
                     pc_address,
