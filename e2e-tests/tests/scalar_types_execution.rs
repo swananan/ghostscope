@@ -81,6 +81,12 @@ trace scalar_anchor {
     if *ulongp > 8000000000 { print "ULONG_BIG"; }
     if *u64p > 9223372036854775807 { print "U64_HIGH"; }
     if *u64p != 0 { print "U64_NONZERO"; }
+    if *i32p > *u32p { print "MIXED_I32_GT_U32"; }
+    if *u32p < *i32p { print "MIXED_U32_LT_I32"; }
+    if *i32p < *u32p { print "MIXED_I32_LT_U32"; }
+    if *i8p < *u8p { print "MIXED_I8_LT_U8"; }
+    if *i8p > *u8p { print "MIXED_I8_GT_U8"; }
+    if *i64p < *u64p { print "MIXED_I64_LT_U64"; }
 }
 "#;
 
@@ -101,10 +107,20 @@ trace scalar_anchor {
         "ULONG_BIG",
         "U64_HIGH",
         "U64_NONZERO",
+        "MIXED_I32_GT_U32",
+        "MIXED_U32_LT_I32",
+        "MIXED_I8_LT_U8",
+        "MIXED_I64_LT_U64",
     ] {
         assert!(
             stdout.contains(marker),
             "Expected comparison marker {marker}. STDOUT: {stdout}"
+        );
+    }
+    for marker in ["MIXED_I32_LT_U32", "MIXED_I8_GT_U8"] {
+        assert!(
+            !stdout.contains(marker),
+            "Unexpected mixed comparison marker {marker}. STDOUT: {stdout}"
         );
     }
     Ok(())
@@ -192,6 +208,86 @@ trace scalar_by_value {
         stdout.contains("BYVAL_ENUMS:scalar_signed_enum::SCALAR_ENUM_NEG(-3):scalar_big_enum::SCALAR_ENUM_BIG(4000000000)"),
         "Expected signed and large enum formatting. STDOUT: {stdout}"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_c_scalar_float_bool_by_value_parameters() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("scalar_types_program")?;
+    let target = spawn_scalar_types_binary(&binary_path).await?;
+
+    let script = r#"
+trace scalar_float_bool_by_value {
+    print "BYVAL_BOOL:{}:{}", bool_truev, bool_falsev;
+    print "BYVAL_FLOAT:{}:{}", f32v, f64v;
+    if bool_truev != bool_falsev { print "BYVAL_BOOL_DIFF"; }
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 4, &target).await?;
+    target.terminate().await?;
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+
+    assert!(
+        stdout.contains("BYVAL_BOOL:true:false"),
+        "Expected _Bool by-value parameter formatting. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("BYVAL_FLOAT:-12.5:123456.25"),
+        "Expected float and double by-value parameter formatting. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("BYVAL_BOOL_DIFF"),
+        "Expected _Bool by-value comparison marker. STDOUT: {stdout}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_c_scalar_stack_by_value_parameters_preserve_semantics() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("scalar_types_program")?;
+    let target = spawn_scalar_types_binary(&binary_path).await?;
+
+    let script = r#"
+trace scalar_stack_by_value {
+    print "STACK_REGS:{}:{}", reg1, reg6;
+    print "STACK_VALUES:{}:{}:{}:{}", stack_i8v, stack_u8v, stack_i32v, stack_u64v;
+    if stack_i8v < 0 { print "STACK_I8_NEG"; }
+    if stack_u8v > 200 { print "STACK_U8_BIG"; }
+    if stack_i32v < -10000000 { print "STACK_I32_NEG"; }
+    if stack_u64v > 9223372036854775807 { print "STACK_U64_HIGH"; }
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 4, &target).await?;
+    target.terminate().await?;
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+
+    assert!(
+        stdout.contains("STACK_REGS:11:66"),
+        "Expected register by-value parameters before stack slots. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("STACK_VALUES:-5:250:-12345678:18446744073709551610"),
+        "Expected stack-passed by-value parameters to preserve values. STDOUT: {stdout}"
+    );
+    for marker in [
+        "STACK_I8_NEG",
+        "STACK_U8_BIG",
+        "STACK_I32_NEG",
+        "STACK_U64_HIGH",
+    ] {
+        assert!(
+            stdout.contains(marker),
+            "Expected stack by-value marker {marker}. STDOUT: {stdout}"
+        );
+    }
     Ok(())
 }
 
