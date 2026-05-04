@@ -374,8 +374,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             } else {
                                 None
                             };
-                            return self.variable_location_to_address_with_hint(
-                                &var.location,
+                            let pc_address = self.get_compile_time_context()?.pc_address;
+                            return self.variable_read_plan_to_lvalue_address_with_hint(
+                                &var,
+                                pc_address,
                                 status_ptr,
                                 module_hint.as_deref(),
                             );
@@ -403,8 +405,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 } else {
                     None
                 };
-                return self.variable_location_to_address_with_hint(
-                    &var.location,
+                let pc_address = self.get_compile_time_context()?.pc_address;
+                return self.variable_read_plan_to_lvalue_address_with_hint(
+                    &var,
+                    pc_address,
                     status_ptr,
                     module_hint.as_deref(),
                 );
@@ -467,13 +471,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 }
                 match dty {
                     DwarfType::PointerType { .. } => {
-                        let val_any = self.variable_location_to_llvm_value(
-                            &var.location,
-                            dty,
-                            &var.name,
-                            self.get_compile_time_context()?.pc_address,
-                            None,
-                        )?;
+                        let pc_address = self.get_compile_time_context()?.pc_address;
+                        let val_any =
+                            self.variable_read_plan_to_llvm_value(&var, pc_address, None)?;
                         match val_any {
                             IntValue(iv) => Ok(iv),
                             PointerValue(pv) => self
@@ -493,8 +493,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         } else {
                             None
                         };
-                        self.variable_location_to_address_with_hint(
-                            &var.location,
+                        let pc_address = self.get_compile_time_context()?.pc_address;
+                        self.variable_read_plan_to_lvalue_address_with_hint(
+                            &var,
+                            pc_address,
                             status_ptr,
                             module_hint.as_deref(),
                         )
@@ -510,8 +512,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 } else {
                     None
                 };
-                self.variable_location_to_address_with_hint(
-                    &var.location,
+                let pc_address = self.get_compile_time_context()?.pc_address;
+                self.variable_read_plan_to_lvalue_address_with_hint(
+                    &var,
+                    pc_address,
                     status_ptr,
                     module_hint.as_deref(),
                 )
@@ -1103,13 +1107,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     }
                     match ty {
                         DwarfType::PointerType { .. } => {
-                            let val_any = self.variable_location_to_llvm_value(
-                                &var.location,
-                                ty,
-                                &var.name,
-                                self.get_compile_time_context()?.pc_address,
-                                None,
-                            )?;
+                            let pc_address = self.get_compile_time_context()?.pc_address;
+                            let val_any =
+                                self.variable_read_plan_to_llvm_value(&var, pc_address, None)?;
                             match val_any {
                                 BasicValueEnum::IntValue(iv) => iv,
                                 BasicValueEnum::PointerValue(pv) => self
@@ -1130,8 +1130,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             } else {
                                 None
                             };
-                            self.variable_location_to_address_with_hint(
-                                &var.location,
+                            let pc_address = self.get_compile_time_context()?.pc_address;
+                            self.variable_read_plan_to_lvalue_address_with_hint(
+                                &var,
+                                pc_address,
                                 status_ptr,
                                 module_hint.as_deref(),
                             )?
@@ -1733,8 +1735,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                     )
                                 })?;
                         let module_hint = self.current_resolved_var_module_path.clone();
-                        match self.variable_location_to_address_with_hint(
-                            &var.location,
+                        let pc_address = self.get_compile_time_context()?.pc_address;
+                        match self.variable_read_plan_to_lvalue_address_with_hint(
+                            &var,
+                            pc_address,
                             None,
                             module_hint.as_deref(),
                         ) {
@@ -1768,8 +1772,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     })?;
                 // Use current resolved hint if available (set during DWARF resolution)
                 let module_hint = self.current_resolved_var_module_path.clone();
-                match self.variable_location_to_address_with_hint(
-                    &var.location,
+                let pc_address = self.get_compile_time_context()?.pc_address;
+                match self.variable_read_plan_to_lvalue_address_with_hint(
+                    &var,
+                    pc_address,
                     None,
                     module_hint.as_deref(),
                 ) {
@@ -2417,19 +2423,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             cur
         }
 
-        // Compute runtime address of the DWARF expression
-        let module_hint = self.current_resolved_var_module_path.clone();
-        let status_ptr = if self.condition_context_active {
-            Some(self.get_or_create_cond_error_global())
-        } else {
-            None
-        };
-        let addr = self.variable_location_to_address_with_hint(
-            &var.location,
-            status_ptr,
-            module_hint.as_deref(),
-        )?;
-
         let lit_bytes = lit.as_bytes();
         let lit_len = lit_bytes.len() as u32;
         let one = self.context.bool_type().const_int(1, false);
@@ -2449,13 +2442,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 }
 
                 // Evaluate expression to pointer value and read up to L+1 bytes
-                let val_any = self.variable_location_to_llvm_value(
-                    &var.location,
-                    var.dwarf_type.as_ref().unwrap(),
-                    &var.name,
-                    self.get_compile_time_context()?.pc_address,
-                    None,
-                )?;
+                let pc_address = self.get_compile_time_context()?.pc_address;
+                let val_any = self.variable_read_plan_to_llvm_value(&var, pc_address, None)?;
                 let ptr_i64 = match val_any {
                     BasicValueEnum::IntValue(iv) => iv,
                     BasicValueEnum::PointerValue(pv) => self
@@ -2577,6 +2565,19 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     // Return const false (or true if '!=' requested)
                     return Ok((if is_equal { zero } else { one }).into());
                 }
+                let module_hint = self.current_resolved_var_module_path.clone();
+                let status_ptr = if self.condition_context_active {
+                    Some(self.get_or_create_cond_error_global())
+                } else {
+                    None
+                };
+                let pc_address = self.get_compile_time_context()?.pc_address;
+                let addr = self.variable_read_plan_to_lvalue_address_with_hint(
+                    &var,
+                    pc_address,
+                    status_ptr,
+                    module_hint.as_deref(),
+                )?;
                 // Read exactly L+1 bytes
                 let (buf_global, status, arr_ty) =
                     self.read_user_bytes_into_buffer(addr, lit_len + 1, "_gs_arrbuf")?;
@@ -2661,6 +2662,19 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     .map_err(|e| CodeGenError::Builder(e.to_string()))?
             }
             None => {
+                let module_hint = self.current_resolved_var_module_path.clone();
+                let status_ptr = if self.condition_context_active {
+                    Some(self.get_or_create_cond_error_global())
+                } else {
+                    None
+                };
+                let pc_address = self.get_compile_time_context()?.pc_address;
+                let addr = self.variable_read_plan_to_lvalue_address_with_hint(
+                    &var,
+                    pc_address,
+                    status_ptr,
+                    module_hint.as_deref(),
+                )?;
                 // Fallback using type_name string
                 match parse_type_name(&var.type_name) {
                     ParsedKind::PtrChar => {

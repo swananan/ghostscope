@@ -1867,8 +1867,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                         CodeGenError::VariableNotFound(format!("{expr:?}"))
                                     })?;
                                 let mod_hint = self.take_module_hint();
-                                self.variable_location_to_address_with_hint(
-                                    &var.location,
+                                let pc_address = self.get_compile_time_context()?.pc_address;
+                                self.variable_read_plan_to_lvalue_address_with_hint(
+                                    &var,
+                                    pc_address,
                                     None,
                                     mod_hint.as_deref(),
                                 )?
@@ -1963,8 +1965,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                     || CodeGenError::VariableNotFound(format!("{val_expr:?}")),
                                 )?;
                                 let mod_hint = self.take_module_hint();
-                                self.variable_location_to_address_with_hint(
-                                    &var.location,
+                                let pc_address = self.get_compile_time_context()?.pc_address;
+                                self.variable_read_plan_to_lvalue_address_with_hint(
+                                    &var,
+                                    pc_address,
                                     None,
                                     mod_hint.as_deref(),
                                 )?
@@ -2073,8 +2077,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                     || CodeGenError::VariableNotFound(format!("{val_expr:?}")),
                                 )?;
                                 let mod_hint = self.take_module_hint();
-                                self.variable_location_to_address_with_hint(
-                                    &var.location,
+                                let pc_address = self.get_compile_time_context()?.pc_address;
+                                self.variable_read_plan_to_lvalue_address_with_hint(
+                                    &var,
+                                    pc_address,
                                     None,
                                     mod_hint.as_deref(),
                                 )?
@@ -4263,22 +4269,20 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         match self.query_dwarf_for_variable(var_name)? {
             Some(var_info) => {
                 info!(
-                    "Found DWARF variable: {} = {:?}",
-                    var_name, var_info.location
+                    "Found DWARF variable read plan: {} availability={:?}",
+                    var_name, var_info.availability
                 );
 
                 // Require DWARF type information
-                let dwarf_type = var_info.dwarf_type.as_ref().ok_or_else(|| {
+                var_info.dwarf_type.as_ref().ok_or_else(|| {
                     CodeGenError::DwarfError(format!(
                         "Variable '{var_name}' has no type information in DWARF"
                     ))
                 })?;
 
                 let compile_context = self.get_compile_time_context()?;
-                self.variable_location_to_llvm_value(
-                    &var_info.location,
-                    dwarf_type,
-                    var_name,
+                self.variable_read_plan_to_llvm_value(
+                    &var_info,
                     compile_context.pc_address,
                     status_ptr,
                 )
