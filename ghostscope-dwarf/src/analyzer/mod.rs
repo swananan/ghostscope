@@ -1068,6 +1068,7 @@ mod tests {
         VariableReadPlan {
             name: name.to_string(),
             type_name: "int".to_string(),
+            access_path: crate::VariableAccessPath::default(),
             dwarf_type: Some(crate::TypeInfo::BaseType {
                 name: "int".to_string(),
                 size: 4,

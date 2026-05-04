@@ -28,18 +28,19 @@ pub use analyzer::{
 pub use core::{
     AddressExpr, AmbiguityReason, Availability, CallerFrameRecovery, CfaResult, ComputeStep, CuId,
     DieRef, DwarfError, EntryValueCase, FunctionId, FunctionInfo, GlobalVariableInfo, HelperMode,
-    InlineContextId, MemoryAccessSize, ModuleAddress, ModuleId, Provenance, Result,
+    InlineContextId, MemoryAccessSize, ModuleAddress, ModuleId, PieceLocation, Provenance, Result,
     RuntimeCapabilities, RuntimeRequirement, ScopeId, SectionType, SourceLocation, TargetArch,
     TypeId, UnsupportedReason, VariableId, VariableInfo, VariableLocation, VerifierRisk,
 };
 
 // Re-export semantic contract types.
 pub use semantics::{
-    AddressSpaceInfo, CfaRulePlan, CompactUnwindRow, CompactUnwindStats, CompactUnwindTable,
-    InlineFrame, PcContext, PcLineInfo, PcRange, RegisterRecoveryPlan, UnwindDiagnostic,
-    UnwindDiagnosticKind, VariableAccessPath, VariableAccessSegment, VariableLoweringKind,
-    VariableLoweringPlan, VariablePlan, VariableQueryDiagnostic, VariableReadPlan, VisibleVariable,
-    VisibleVariablesResult,
+    AddressOrigin, AddressSpaceInfo, CfaRulePlan, CompactUnwindRow, CompactUnwindStats,
+    CompactUnwindTable, InlineFrame, PcContext, PcLineInfo, PcRange, PlannedAddress,
+    RegisterRecoveryPlan, UnwindDiagnostic, UnwindDiagnosticKind, VariableAccessPath,
+    VariableAccessSegment, VariableLoweringKind, VariableLoweringPlan, VariableMaterialization,
+    VariableMaterializationPlan, VariablePlan, VariableQueryDiagnostic, VariableReadPlan,
+    VisibleVariable, VisibleVariablesResult,
 };
 
 // Re-export type definitions from protocol (avoiding circular dependencies)
