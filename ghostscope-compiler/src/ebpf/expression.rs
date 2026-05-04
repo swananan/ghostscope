@@ -244,6 +244,36 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         }
         false
     }
+
+    fn is_unsigned_integer_type(t: &DwarfType) -> bool {
+        match t {
+            DwarfType::BaseType { encoding, .. } => {
+                *encoding == ghostscope_dwarf::constants::DW_ATE_unsigned.0 as u16
+                    || *encoding == ghostscope_dwarf::constants::DW_ATE_unsigned_char.0 as u16
+            }
+            DwarfType::EnumType { base_type, .. } => Self::is_unsigned_integer_type(base_type),
+            DwarfType::BitfieldType {
+                underlying_type, ..
+            } => Self::is_unsigned_integer_type(underlying_type),
+            DwarfType::TypedefType {
+                underlying_type, ..
+            }
+            | DwarfType::QualifiedType {
+                underlying_type, ..
+            } => Self::is_unsigned_integer_type(underlying_type),
+            _ => false,
+        }
+    }
+
+    fn is_dwarf_unsigned_integer_expr(&mut self, expr: &Expr) -> bool {
+        if let Ok(Some(var)) = self.query_dwarf_for_complex_expr(expr) {
+            if let Some(ref ty) = var.dwarf_type {
+                return Self::is_unsigned_integer_type(ty);
+            }
+        }
+        false
+    }
+
     /// Ensure that when an expression refers to a DWARF-backed variable (not via address-of),
     /// the variable's DWARF type is a pointer or array (decays to pointer for memcmp/strncmp).
     fn ensure_dwarf_pointer_arg(&mut self, e: &Expr, where_ctx: &str) -> Result<()> {
@@ -1662,10 +1692,19 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     return Ok(phi.as_basic_value());
                 }
 
+                let use_unsigned_ordering = is_ordered
+                    && (self.is_dwarf_unsigned_integer_expr(left)
+                        || self.is_dwarf_unsigned_integer_expr(right));
+
                 // Default eager evaluation for other binary ops
                 let left_val = self.compile_expr(left)?;
                 let right_val = self.compile_expr(right)?;
-                self.compile_binary_op(left_val, op.clone(), right_val)
+                self.compile_binary_op_with_ordering(
+                    left_val,
+                    op.clone(),
+                    right_val,
+                    use_unsigned_ordering,
+                )
             }
             Expr::MemberAccess(_, _) => {
                 // Use unified DWARF expression compilation
@@ -1811,6 +1850,16 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         op: BinaryOp,
         right: BasicValueEnum<'ctx>,
     ) -> Result<BasicValueEnum<'ctx>> {
+        self.compile_binary_op_with_ordering(left, op, right, false)
+    }
+
+    fn compile_binary_op_with_ordering(
+        &mut self,
+        left: BasicValueEnum<'ctx>,
+        op: BinaryOp,
+        right: BasicValueEnum<'ctx>,
+        use_unsigned_ordering: bool,
+    ) -> Result<BasicValueEnum<'ctx>> {
         use inkwell::values::BasicValueEnum::*;
 
         // Debug logging to understand the actual types
@@ -1871,50 +1920,50 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         return Ok(result.into());
                     }
                     BinaryOp::LessThan => {
+                        let predicate = if use_unsigned_ordering {
+                            inkwell::IntPredicate::ULT
+                        } else {
+                            inkwell::IntPredicate::SLT
+                        };
                         let result = self
                             .builder
-                            .build_int_compare(
-                                inkwell::IntPredicate::SLT,
-                                left_int,
-                                right_int,
-                                "lt",
-                            )
+                            .build_int_compare(predicate, left_int, right_int, "lt")
                             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
                         return Ok(result.into());
                     }
                     BinaryOp::LessEqual => {
+                        let predicate = if use_unsigned_ordering {
+                            inkwell::IntPredicate::ULE
+                        } else {
+                            inkwell::IntPredicate::SLE
+                        };
                         let result = self
                             .builder
-                            .build_int_compare(
-                                inkwell::IntPredicate::SLE,
-                                left_int,
-                                right_int,
-                                "le",
-                            )
+                            .build_int_compare(predicate, left_int, right_int, "le")
                             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
                         return Ok(result.into());
                     }
                     BinaryOp::GreaterThan => {
+                        let predicate = if use_unsigned_ordering {
+                            inkwell::IntPredicate::UGT
+                        } else {
+                            inkwell::IntPredicate::SGT
+                        };
                         let result = self
                             .builder
-                            .build_int_compare(
-                                inkwell::IntPredicate::SGT,
-                                left_int,
-                                right_int,
-                                "gt",
-                            )
+                            .build_int_compare(predicate, left_int, right_int, "gt")
                             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
                         return Ok(result.into());
                     }
                     BinaryOp::GreaterEqual => {
+                        let predicate = if use_unsigned_ordering {
+                            inkwell::IntPredicate::UGE
+                        } else {
+                            inkwell::IntPredicate::SGE
+                        };
                         let result = self
                             .builder
-                            .build_int_compare(
-                                inkwell::IntPredicate::SGE,
-                                left_int,
-                                right_int,
-                                "ge",
-                            )
+                            .build_int_compare(predicate, left_int, right_int, "ge")
                             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
                         return Ok(result.into());
                     }
