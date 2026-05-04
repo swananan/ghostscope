@@ -5,8 +5,9 @@
 
 use super::context::{CodeGenError, EbpfContext, Result};
 use ghostscope_dwarf::{
-    AddressExpr, Availability, ComputeStep, EntryValueCase, MemoryAccessSize, SectionType,
-    TypeInfo, VariableAccessPath, VariableAccessSegment, VariableLocation, VariableReadPlan,
+    AddressExpr, AddressOrigin, Availability, ComputeStep, EntryValueCase, MemoryAccessSize,
+    PlannedAddress, SectionType, TypeInfo, VariableAccessPath, VariableAccessSegment,
+    VariableLocation, VariableMaterializationPlan, VariableReadPlan,
 };
 use ghostscope_process::module_probe;
 use inkwell::values::{BasicValueEnum, IntValue, PointerValue};
@@ -135,17 +136,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     var_name,
                     pieces.len()
                 );
-                if let Some(first_piece) = pieces.first() {
-                    self.variable_location_to_llvm_value(
-                        &first_piece.location,
-                        dwarf_type,
-                        var_name,
-                        pc_address,
-                        status_ptr,
-                    )
-                } else {
-                    Ok(self.context.i64_type().const_zero().into())
-                }
+                Err(CodeGenError::DwarfError(format!(
+                    "DWARF variable '{var_name}' is split across pieces; piece reconstruction is not implemented"
+                )))
             }
             VariableLocation::FrameBaseRelative { .. } => Err(CodeGenError::DwarfError(
                 "Frame-base-relative variable plan requires resolved frame base".to_string(),
@@ -163,51 +156,99 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         status_ptr: Option<PointerValue<'ctx>>,
         module_hint: Option<&str>,
     ) -> Result<IntValue<'ctx>> {
-        // Policy note:
-        // - Link-time addresses (DW_OP_addr or constant-foldable address expressions) are
-        //   always rebased using per-module section offsets (ASLR) to get a runtime address.
-        // - Runtime-derived addresses (register/stack-relative or computed via dereference)
-        //   are used as-is and are NOT rebased.
-        // The caller signals which path we are on by providing the semantic location shape.
+        let Some(address) = PlannedAddress::from_location(location.clone()) else {
+            return match location {
+                VariableLocation::OptimizedOut => {
+                    let pc_address = self
+                        .current_compile_time_context
+                        .as_ref()
+                        .map(|ctx| ctx.pc_address)
+                        .unwrap_or(0);
+                    Err(Self::dwarf_expression_unavailable_error(
+                        "DWARF address expression",
+                        &Availability::OptimizedOut,
+                        pc_address,
+                    ))
+                }
+                _ => Err(CodeGenError::NotImplemented(
+                    "Unable to compute address from variable location".to_string(),
+                )),
+            };
+        };
+
+        self.planned_address_to_llvm_address(&address, status_ptr, module_hint)
+    }
+
+    pub fn planned_address_to_llvm_address(
+        &mut self,
+        address: &PlannedAddress,
+        status_ptr: Option<PointerValue<'ctx>>,
+        module_hint: Option<&str>,
+    ) -> Result<IntValue<'ctx>> {
         let pt_regs_ptr = self.get_pt_regs_parameter()?;
         self.store_offsets_found_const(true)?;
 
-        match location {
-            VariableLocation::OptimizedOut => {
-                let pc_address = self
-                    .current_compile_time_context
-                    .as_ref()
-                    .map(|ctx| ctx.pc_address)
-                    .unwrap_or(0);
-                Err(Self::dwarf_expression_unavailable_error(
-                    "DWARF address expression",
-                    &Availability::OptimizedOut,
-                    pc_address,
-                ))
+        match address.origin {
+            AddressOrigin::LinkTime => {
+                let link_addr = address.constant_link_time_address().ok_or_else(|| {
+                    CodeGenError::DwarfError(
+                        "read plan marked address as link-time without a constant address"
+                            .to_string(),
+                    )
+                })?;
+                self.runtime_address_from_link_time_address(link_addr, status_ptr, module_hint)
             }
-            VariableLocation::Address(expr) => self.address_steps_to_address_with_hint(
-                &expr.steps,
-                pt_regs_ptr,
-                status_ptr,
-                module_hint,
-            ),
-            VariableLocation::AbsoluteAddressValue(expr) => self
-                .address_steps_to_address_with_hint(
-                    &expr.steps,
-                    pt_regs_ptr,
+            AddressOrigin::LinkTimeBase => {
+                let (link_addr, tail_steps) =
+                    address.link_time_base_and_runtime_tail().ok_or_else(|| {
+                        CodeGenError::DwarfError(
+                            "read plan marked address as link-time-base without a base address"
+                                .to_string(),
+                        )
+                    })?;
+                let runtime_base = self.runtime_address_from_link_time_address(
+                    link_addr,
                     status_ptr,
                     module_hint,
-                ),
+                )?;
+                let value = self.generate_compute_steps(
+                    tail_steps,
+                    pt_regs_ptr,
+                    None,
+                    status_ptr,
+                    Some(runtime_base),
+                )?;
+                match value {
+                    BasicValueEnum::IntValue(value) => Ok(value),
+                    _ => Err(CodeGenError::LLVMError(
+                        "Computed address did not produce integer".to_string(),
+                    )),
+                }
+            }
+            AddressOrigin::RuntimeDerived | AddressOrigin::Unknown => {
+                self.planned_address_without_rebase(address, pt_regs_ptr, status_ptr)
+            }
+        }
+    }
+
+    fn planned_address_without_rebase(
+        &mut self,
+        address: &PlannedAddress,
+        pt_regs_ptr: PointerValue<'ctx>,
+        status_ptr: Option<PointerValue<'ctx>>,
+    ) -> Result<IntValue<'ctx>> {
+        match &address.location {
+            VariableLocation::Address(expr) | VariableLocation::AbsoluteAddressValue(expr) => {
+                self.address_steps_to_unrebased_address(&expr.steps, pt_regs_ptr, status_ptr)
+            }
             VariableLocation::RegisterAddress { dwarf_reg, offset } => {
                 let reg_val = self.load_register_value(*dwarf_reg, pt_regs_ptr)?;
                 if let BasicValueEnum::IntValue(reg_i) = reg_val {
                     if *offset != 0 {
                         let ofs_val = self.context.i64_type().const_int(*offset as u64, true);
-                        let sum = self
-                            .builder
+                        self.builder
                             .build_int_add(reg_i, ofs_val, "addr_with_offset")
-                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                        Ok(sum)
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))
                     } else {
                         Ok(reg_i)
                     }
@@ -218,93 +259,26 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 }
             }
             VariableLocation::ComputedAddress(steps) => {
-                self.address_steps_to_address_with_hint(steps, pt_regs_ptr, status_ptr, module_hint)
+                self.address_steps_to_unrebased_address(steps, pt_regs_ptr, status_ptr)
             }
             _ => Err(CodeGenError::NotImplemented(
-                "Unable to compute address from variable location".to_string(),
+                "Unable to compute address from planned address".to_string(),
             )),
         }
     }
 
-    fn address_steps_to_address_with_hint(
+    fn address_steps_to_unrebased_address(
         &mut self,
         steps: &[ComputeStep],
         pt_regs_ptr: PointerValue<'ctx>,
         status_ptr: Option<PointerValue<'ctx>>,
-        module_hint: Option<&str>,
     ) -> Result<IntValue<'ctx>> {
-        if let Some(link_addr) = Self::fold_constant_address_steps(steps) {
-            return self.runtime_address_from_link_time_address(link_addr, status_ptr, module_hint);
-        }
-
-        // If a static base is dereferenced before any register dependency, rebase
-        // the base first and then execute the remaining runtime expression.
-        if let Some(ComputeStep::PushConstant(base_const)) = steps.first() {
-            let mut saw_reg = false;
-            let mut saw_deref = false;
-            for step in &steps[1..] {
-                match step {
-                    ComputeStep::LoadRegister(_) => {
-                        saw_reg = true;
-                        break;
-                    }
-                    ComputeStep::Dereference { .. } => {
-                        saw_deref = true;
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-
-            if saw_deref && !saw_reg {
-                let rt = self.runtime_address_from_link_time_address(
-                    *base_const as u64,
-                    status_ptr,
-                    module_hint,
-                )?;
-                let val = self.generate_compute_steps(
-                    &steps[1..],
-                    pt_regs_ptr,
-                    None,
-                    status_ptr,
-                    Some(rt),
-                )?;
-                return match val {
-                    BasicValueEnum::IntValue(value) => Ok(value),
-                    _ => Err(CodeGenError::LLVMError(
-                        "Computed location did not produce integer".to_string(),
-                    )),
-                };
-            }
-        }
-
         let val = self.generate_compute_steps(steps, pt_regs_ptr, None, status_ptr, None)?;
         match val {
             BasicValueEnum::IntValue(value) => Ok(value),
             _ => Err(CodeGenError::LLVMError(
-                "Computed location did not produce integer".to_string(),
+                "Computed address did not produce integer".to_string(),
             )),
-        }
-    }
-
-    fn fold_constant_address_steps(steps: &[ComputeStep]) -> Option<u64> {
-        let mut const_stack: Vec<i64> = Vec::new();
-        for step in steps {
-            match step {
-                ComputeStep::PushConstant(value) => const_stack.push(*value),
-                ComputeStep::Add => {
-                    let b = const_stack.pop()?;
-                    let a = const_stack.pop()?;
-                    const_stack.push(a.saturating_add(b));
-                }
-                _ => return None,
-            }
-        }
-
-        if const_stack.len() == 1 && const_stack[0] >= 0 {
-            Some(const_stack[0] as u64)
-        } else {
-            None
         }
     }
 
@@ -447,33 +421,74 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         Ok(extended.into())
     }
 
-    pub(super) fn variable_read_plan_to_runtime_read_parts(
+    pub(super) fn variable_read_plan_to_materialization(
         &self,
         plan: VariableReadPlan,
         pc_address: u64,
-    ) -> Result<(String, TypeInfo, VariableLocation)> {
-        let lowering = plan.bpf_lowering_plan(&self.compile_options.runtime_capabilities);
-        if !lowering.availability.is_available()
-            && lowering.availability != Availability::OptimizedOut
+    ) -> Result<VariableMaterializationPlan> {
+        let materialization = plan.materialization_plan(&self.compile_options.runtime_capabilities);
+        if !materialization.availability.is_available()
+            && materialization.availability != Availability::OptimizedOut
         {
             return Err(Self::dwarf_expression_unavailable_error(
-                &plan.name,
-                &lowering.availability,
+                &materialization.name,
+                &materialization.availability,
                 pc_address,
             ));
         }
 
-        let dwarf_type = if lowering.availability == Availability::OptimizedOut {
-            TypeInfo::OptimizedOut {
-                name: plan.name.clone(),
-            }
-        } else {
-            plan.dwarf_type.clone().ok_or_else(|| {
+        if materialization.availability != Availability::OptimizedOut {
+            materialization.dwarf_type.as_ref().ok_or_else(|| {
                 CodeGenError::DwarfError("Expression has no DWARF type information".to_string())
-            })?
-        };
+            })?;
+        }
 
-        Ok((plan.name, dwarf_type, plan.location))
+        Ok(materialization)
+    }
+
+    pub fn variable_materialization_to_llvm_value(
+        &mut self,
+        materialization: &VariableMaterializationPlan,
+        pc_address: u64,
+        status_ptr: Option<PointerValue<'ctx>>,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        match &materialization.materialization {
+            ghostscope_dwarf::VariableMaterialization::DirectValue { location, .. } => {
+                let dwarf_type = materialization.dwarf_type.as_ref().ok_or_else(|| {
+                    CodeGenError::DwarfError(
+                        "Expression has no DWARF type information".to_string(),
+                    )
+                })?;
+                self.variable_location_to_llvm_value(
+                    location,
+                    dwarf_type,
+                    &materialization.name,
+                    pc_address,
+                    status_ptr,
+                )
+            }
+            ghostscope_dwarf::VariableMaterialization::UserMemoryRead { address } => {
+                let dwarf_type = materialization.dwarf_type.as_ref().ok_or_else(|| {
+                    CodeGenError::DwarfError(
+                        "Expression has no DWARF type information".to_string(),
+                    )
+                })?;
+                self.generate_memory_location_from_planned_address(address, dwarf_type, status_ptr)
+            }
+            ghostscope_dwarf::VariableMaterialization::Unavailable { availability } => {
+                Err(Self::dwarf_expression_unavailable_error(
+                    &materialization.name,
+                    availability,
+                    pc_address,
+                ))
+            }
+            ghostscope_dwarf::VariableMaterialization::Composite { .. } => {
+                Err(CodeGenError::DwarfError(format!(
+                    "DWARF variable '{}' is split across pieces; piece reconstruction is not implemented",
+                    materialization.name
+                )))
+            }
+        }
     }
 
     /// Generate LLVM IR for memory-backed variable locations.
@@ -483,14 +498,28 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         dwarf_type: &TypeInfo,
         status_ptr: Option<PointerValue<'ctx>>,
     ) -> Result<BasicValueEnum<'ctx>> {
+        let address = PlannedAddress::from_location(location.clone()).ok_or_else(|| {
+            CodeGenError::DwarfError(
+                "Variable location cannot be materialized as an address".into(),
+            )
+        })?;
+        self.generate_memory_location_from_planned_address(&address, dwarf_type, status_ptr)
+    }
+
+    fn generate_memory_location_from_planned_address(
+        &mut self,
+        address: &PlannedAddress,
+        dwarf_type: &TypeInfo,
+        status_ptr: Option<PointerValue<'ctx>>,
+    ) -> Result<BasicValueEnum<'ctx>> {
         let module_hint = self.current_resolved_var_module_path.clone();
         let runtime_status_ptr = if self.condition_context_active {
             Some(self.get_or_create_cond_error_global())
         } else {
             status_ptr
         };
-        let addr = self.variable_location_to_address_with_hint(
-            location,
+        let addr = self.planned_address_to_llvm_address(
+            address,
             runtime_status_ptr,
             module_hint.as_deref(),
         )?;
@@ -1815,6 +1844,32 @@ mod tests {
     }
 
     #[test]
+    fn piece_locations_are_rejected_instead_of_using_first_piece() {
+        let llctx = LlvmContext::create();
+        let opts = crate::CompileOptions::default();
+        let mut ctx = EbpfContext::new(&llctx, "piece_value", Some(0), &opts).expect("ctx");
+        ctx.create_basic_ebpf_function("f").expect("fn");
+
+        let ty = ghostscope_protocol::TypeInfo::BaseType {
+            name: "int".to_string(),
+            size: 4,
+            encoding: ghostscope_dwarf::constants::DW_ATE_signed.0 as u16,
+        };
+        let location = VariableLocation::Pieces(vec![ghostscope_dwarf::PieceLocation {
+            bit_offset: 0,
+            bit_size: 32,
+            location: Box::new(VariableLocation::RegisterValue { dwarf_reg: 0 }),
+        }]);
+
+        let err = ctx
+            .variable_location_to_llvm_value(&location, &ty, "split", 0x1234, None)
+            .expect_err("split pieces should not silently use the first piece");
+
+        assert!(matches!(err, CodeGenError::DwarfError(_)));
+        assert!(err.to_string().contains("split across pieces"));
+    }
+
+    #[test]
     fn unavailable_error_formats_structured_dwarf_reason() {
         let err = EbpfContext::dwarf_expression_unavailable_error(
             "x",
@@ -1859,6 +1914,7 @@ mod tests {
         let plan = VariableReadPlan {
             name: "x".to_string(),
             type_name: "int".to_string(),
+            access_path: VariableAccessPath::default(),
             dwarf_type: Some(dwarf_type),
             declaration: None,
             type_id: None,
@@ -1873,7 +1929,7 @@ mod tests {
         };
 
         let err = ctx
-            .variable_read_plan_to_runtime_read_parts(plan, 0x1234)
+            .variable_read_plan_to_materialization(plan, 0x1234)
             .expect_err("zero stack capability should reject the read plan");
 
         assert!(matches!(err, CodeGenError::VariableUnavailable(_)));
@@ -1893,6 +1949,7 @@ mod tests {
         let plan = VariableReadPlan {
             name: "x".to_string(),
             type_name: "int".to_string(),
+            access_path: VariableAccessPath::default(),
             dwarf_type: Some(dwarf_type),
             declaration: None,
             type_id: None,
@@ -1906,16 +1963,16 @@ mod tests {
             provenance: Provenance::DirectDie,
         };
 
-        let (_, marker_type, location) = ctx
-            .variable_read_plan_to_runtime_read_parts(plan, 0x1234)
+        let materialized = ctx
+            .variable_read_plan_to_materialization(plan, 0x1234)
             .expect("optimized-out runtime metadata should remain printable");
-        assert_eq!(location, VariableLocation::OptimizedOut);
-        assert_eq!(
-            marker_type,
-            TypeInfo::OptimizedOut {
-                name: "x".to_string()
+        assert_eq!(materialized.availability, Availability::OptimizedOut);
+        assert!(matches!(
+            materialized.materialization,
+            ghostscope_dwarf::VariableMaterialization::Unavailable {
+                availability: Availability::OptimizedOut
             }
-        );
+        ));
     }
 
     #[test]

@@ -29,7 +29,7 @@ struct PrintVarRuntimeMeta {
 #[derive(Debug, Clone)]
 enum ComplexArgSource<'ctx> {
     RuntimeRead {
-        location: ghostscope_dwarf::VariableLocation,
+        address: ghostscope_dwarf::PlannedAddress,
         dwarf_type: ghostscope_dwarf::TypeInfo,
         module_for_offsets: Option<String>,
     },
@@ -48,7 +48,7 @@ enum ComplexArgSource<'ctx> {
         bytes: Vec<u8>,
     },
     AddressValue {
-        location: ghostscope_dwarf::VariableLocation,
+        address: ghostscope_dwarf::PlannedAddress,
         module_for_offsets: Option<String>,
     },
     // Newly added: a value computed in LLVM at runtime (e.g., expression result)
@@ -169,6 +169,99 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 .build_int_s_extend(ret, i32_ty, name)
                 .map_err(|e| CodeGenError::LLVMError(e.to_string())),
             std::cmp::Ordering::Equal => Ok(ret),
+        }
+    }
+
+    fn complex_arg_from_dwarf_read_plan(
+        &mut self,
+        plan: ghostscope_dwarf::VariableReadPlan,
+        display_name: Option<String>,
+    ) -> Result<ComplexArg<'ctx>> {
+        let pc_address = self.get_compile_time_context()?.pc_address;
+        let materialized = self.variable_read_plan_to_materialization(plan, pc_address)?;
+        let display_name = display_name.unwrap_or_else(|| materialized.name.clone());
+
+        match &materialized.materialization {
+            ghostscope_dwarf::VariableMaterialization::Unavailable {
+                availability: ghostscope_dwarf::Availability::OptimizedOut,
+            } => {
+                let optimized_type = ghostscope_dwarf::TypeInfo::OptimizedOut {
+                    name: materialized.name.clone(),
+                };
+                Ok(ComplexArg {
+                    var_name_index: self.trace_context.add_variable_name(display_name),
+                    type_index: self.trace_context.add_type(optimized_type),
+                    access_path: Vec::new(),
+                    data_len: 0,
+                    source: ComplexArgSource::ImmediateBytes { bytes: Vec::new() },
+                })
+            }
+            ghostscope_dwarf::VariableMaterialization::Unavailable { availability } => {
+                Err(Self::dwarf_expression_unavailable_error(
+                    &materialized.name,
+                    availability,
+                    pc_address,
+                ))
+            }
+            ghostscope_dwarf::VariableMaterialization::UserMemoryRead { address } => {
+                let dwarf_type = materialized.dwarf_type.clone().ok_or_else(|| {
+                    CodeGenError::DwarfError(
+                        "Expression has no DWARF type information".to_string(),
+                    )
+                })?;
+                let data_len = Self::compute_read_size_for_type(&dwarf_type);
+                if data_len == 0 {
+                    return Err(CodeGenError::TypeSizeNotAvailable(display_name));
+                }
+                let module_hint = self.take_module_hint();
+                Ok(ComplexArg {
+                    var_name_index: self.trace_context.add_variable_name(display_name),
+                    type_index: self.trace_context.add_type(dwarf_type.clone()),
+                    access_path: Vec::new(),
+                    data_len,
+                    source: ComplexArgSource::RuntimeRead {
+                        address: address.clone(),
+                        dwarf_type,
+                        module_for_offsets: module_hint,
+                    },
+                })
+            }
+            ghostscope_dwarf::VariableMaterialization::DirectValue { .. } => {
+                let value =
+                    self.variable_materialization_to_llvm_value(&materialized, pc_address, None)?;
+                let dwarf_type = materialized.dwarf_type.clone().ok_or_else(|| {
+                    CodeGenError::DwarfError(
+                        "Expression has no DWARF type information".to_string(),
+                    )
+                })?;
+                let value = match value {
+                    BasicValueEnum::IntValue(value) => value,
+                    BasicValueEnum::PointerValue(value) => self
+                        .builder
+                        .build_ptr_to_int(value, self.context.i64_type(), "direct_ptr_to_i64")
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?,
+                    _ => {
+                        return Err(CodeGenError::DwarfError(format!(
+                            "direct DWARF value '{}' did not lower to an integer",
+                            materialized.name
+                        )))
+                    }
+                };
+                let data_len = Self::compute_read_size_for_type(&dwarf_type).clamp(1, 8);
+                Ok(ComplexArg {
+                    var_name_index: self.trace_context.add_variable_name(display_name),
+                    type_index: self.trace_context.add_type(dwarf_type),
+                    access_path: Vec::new(),
+                    data_len,
+                    source: ComplexArgSource::ComputedInt { value, byte_len: data_len },
+                })
+            }
+            ghostscope_dwarf::VariableMaterialization::Composite { .. } => Err(
+                CodeGenError::DwarfError(format!(
+                    "DWARF variable '{}' is split across pieces; piece reconstruction is not implemented",
+                    materialized.name
+                )),
+            ),
         }
     }
 
@@ -324,12 +417,32 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 let var = self
                     .query_dwarf_for_complex_expr(inner)?
                     .ok_or_else(|| CodeGenError::VariableNotFound(format!("{inner:?}")))?;
-                let inner_ty = var.dwarf_type.as_ref().ok_or_else(|| {
+                let pc_address = self.get_compile_time_context()?.pc_address;
+                let materialized = self.variable_read_plan_to_materialization(var, pc_address)?;
+                let inner_ty = materialized.dwarf_type.as_ref().ok_or_else(|| {
                     CodeGenError::DwarfError("Expression has no DWARF type information".to_string())
                 })?;
                 let ptr_ty = ghostscope_dwarf::TypeInfo::PointerType {
                     target_type: Box::new(inner_ty.clone()),
                     size: 8,
+                };
+                let address = match materialized.materialization {
+                    ghostscope_dwarf::VariableMaterialization::UserMemoryRead { address } => {
+                        address
+                    }
+                    ghostscope_dwarf::VariableMaterialization::Unavailable { availability } => {
+                        return Err(Self::dwarf_expression_unavailable_error(
+                            &materialized.name,
+                            &availability,
+                            pc_address,
+                        ))
+                    }
+                    _ => {
+                        return Err(CodeGenError::DwarfError(format!(
+                            "cannot take address of value-backed DWARF expression '{}'",
+                            materialized.name
+                        )))
+                    }
                 };
                 let module_hint = self.take_module_hint();
                 Ok(ComplexArg {
@@ -340,7 +453,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     access_path: Vec::new(),
                     data_len: 8,
                     source: ComplexArgSource::AddressValue {
-                        location: var.location.clone(),
+                        address,
                         module_for_offsets: module_hint,
                     },
                 })
@@ -351,208 +464,21 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             | E::ArrayAccess(_, _)
             | E::PointerDeref(_)
             | E::ChainAccess(_)) => {
-                if let Some(plan) = self.query_dwarf_for_complex_expr_plan(expr)? {
-                    let pc_address = self.get_compile_time_context()?.pc_address;
-                    let (var_name, dwarf_type, location) =
-                        self.variable_read_plan_to_runtime_read_parts(plan, pc_address)?;
-                    let display_name = if matches!(expr, E::PointerDeref(_)) {
-                        self.expr_to_name(expr)
-                    } else {
-                        var_name
-                    };
-                    if matches!(location, ghostscope_dwarf::VariableLocation::OptimizedOut) {
-                        return Ok(ComplexArg {
-                            var_name_index: self.trace_context.add_variable_name(display_name),
-                            type_index: self.trace_context.add_type(dwarf_type),
-                            access_path: Vec::new(),
-                            data_len: 0,
-                            source: ComplexArgSource::ImmediateBytes { bytes: Vec::new() },
-                        });
-                    }
-                    let data_len = Self::compute_read_size_for_type(&dwarf_type);
-                    if data_len == 0 {
-                        return Err(CodeGenError::TypeSizeNotAvailable(display_name));
-                    }
-                    let module_hint = self.take_module_hint();
-                    return Ok(ComplexArg {
-                        var_name_index: self.trace_context.add_variable_name(display_name),
-                        type_index: self.trace_context.add_type(dwarf_type.clone()),
-                        access_path: Vec::new(),
-                        data_len,
-                        source: ComplexArgSource::RuntimeRead {
-                            location,
-                            dwarf_type,
-                            module_for_offsets: module_hint,
-                        },
-                    });
-                }
-
-                let var = self
-                    .query_dwarf_for_complex_expr(expr)?
+                let plan = self
+                    .query_dwarf_for_complex_expr_plan(expr)?
                     .ok_or_else(|| CodeGenError::VariableNotFound(format!("{expr:?}")))?;
-                if var.availability == ghostscope_dwarf::Availability::OptimizedOut {
-                    let ti = ghostscope_protocol::type_info::TypeInfo::OptimizedOut {
-                        name: var.name.clone(),
-                    };
-                    return Ok(ComplexArg {
-                        var_name_index: self.trace_context.add_variable_name(var.name.clone()),
-                        type_index: self.trace_context.add_type(ti),
-                        access_path: Vec::new(),
-                        data_len: 0,
-                        source: ComplexArgSource::ImmediateBytes { bytes: Vec::new() },
-                    });
-                }
-                let dwarf_type = var.dwarf_type.as_ref().ok_or_else(|| {
-                    CodeGenError::DwarfError("Expression has no DWARF type information".to_string())
-                })?;
-                let data_len = Self::compute_read_size_for_type(dwarf_type);
-                if data_len == 0 {
-                    return Err(CodeGenError::TypeSizeNotAvailable(var.name));
-                }
-                // Previously clamped to 1993 bytes; now use full DWARF size (transport clamps per event size)
-                // data_len unchanged
-                let module_hint = self.take_module_hint();
-                Ok(ComplexArg {
-                    var_name_index: self.trace_context.add_variable_name(var.name.clone()),
-                    type_index: self.trace_context.add_type(dwarf_type.clone()),
-                    access_path: Vec::new(),
-                    data_len,
-                    source: ComplexArgSource::RuntimeRead {
-                        location: var.location.clone(),
-                        dwarf_type: dwarf_type.clone(),
-                        module_for_offsets: module_hint,
-                    },
-                })
+                let display_name = if matches!(expr, E::PointerDeref(_)) {
+                    Some(self.expr_to_name(expr))
+                } else {
+                    None
+                };
+                self.complex_arg_from_dwarf_read_plan(plan, display_name)
             }
 
             // 6) Variable not in script scope → DWARF variable or computed fast-path for simple scalars
             E::Variable(name) => {
                 if let Some(v) = self.query_dwarf_for_variable(name)? {
-                    if let Some(ref t) = v.dwarf_type {
-                        // If DWARF reports optimized-out at this PC, emit OptimizedOut type with no data
-                        if v.availability == ghostscope_dwarf::Availability::OptimizedOut {
-                            let ti = ghostscope_protocol::type_info::TypeInfo::OptimizedOut {
-                                name: v.name.clone(),
-                            };
-                            return Ok(ComplexArg {
-                                var_name_index: self
-                                    .trace_context
-                                    .add_variable_name(v.name.clone()),
-                                type_index: self.trace_context.add_type(ti),
-                                access_path: Vec::new(),
-                                data_len: 0,
-                                source: ComplexArgSource::ImmediateBytes { bytes: Vec::new() },
-                            });
-                        }
-                        let is_link_addr =
-                            matches!(v.location, ghostscope_dwarf::VariableLocation::Address(_));
-                        if Self::is_simple_typeinfo(t) && !is_link_addr {
-                            // Prefer computed value to avoid runtime reads
-                            let compiled = self.compile_expr(expr)?;
-                            match compiled {
-                                BasicValueEnum::IntValue(iv) => {
-                                    // Respect DWARF pointer types to keep pointer formatting
-                                    let (kind, byte_len) = if matches!(
-                                        t,
-                                        ghostscope_dwarf::TypeInfo::PointerType { .. }
-                                    ) {
-                                        (TypeKind::Pointer, 8)
-                                    } else {
-                                        let bitw = iv.get_type().get_bit_width();
-                                        if bitw == 1 {
-                                            (TypeKind::Bool, 1)
-                                        } else if bitw <= 8 {
-                                            (TypeKind::I8, 1)
-                                        } else if bitw <= 16 {
-                                            (TypeKind::I16, 2)
-                                        } else if bitw <= 32 {
-                                            (TypeKind::I32, 4)
-                                        } else {
-                                            (TypeKind::I64, 8)
-                                        }
-                                    };
-                                    Ok(ComplexArg {
-                                        var_name_index: self
-                                            .trace_context
-                                            .add_variable_name(self.expr_to_name(expr)),
-                                        type_index: self.add_synthesized_type_index_for_kind(kind),
-                                        access_path: Vec::new(),
-                                        data_len: byte_len,
-                                        source: ComplexArgSource::ComputedInt {
-                                            value: iv,
-                                            byte_len,
-                                        },
-                                    })
-                                }
-                                BasicValueEnum::PointerValue(pv) => {
-                                    // Pointer register-backed → cast to i64 with pointer typeindex
-                                    let iv = self
-                                        .builder
-                                        .build_ptr_to_int(pv, self.context.i64_type(), "ptr_to_i64")
-                                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-                                    Ok(ComplexArg {
-                                        var_name_index: self
-                                            .trace_context
-                                            .add_variable_name(self.expr_to_name(expr)),
-                                        type_index: self
-                                            .add_synthesized_type_index_for_kind(TypeKind::Pointer),
-                                        access_path: Vec::new(),
-                                        data_len: 8,
-                                        source: ComplexArgSource::ComputedInt {
-                                            value: iv,
-                                            byte_len: 8,
-                                        },
-                                    })
-                                }
-                                _ => {
-                                    // Fall back to runtime read path
-                                    let data_len = Self::compute_read_size_for_type(t);
-                                    if data_len == 0 {
-                                        return Err(CodeGenError::TypeSizeNotAvailable(v.name));
-                                    }
-                                    let module_hint = self.take_module_hint();
-                                    Ok(ComplexArg {
-                                        var_name_index: self
-                                            .trace_context
-                                            .add_variable_name(v.name.clone()),
-                                        type_index: self.trace_context.add_type(t.clone()),
-                                        access_path: Vec::new(),
-                                        data_len,
-                                        source: ComplexArgSource::RuntimeRead {
-                                            location: v.location.clone(),
-                                            dwarf_type: t.clone(),
-                                            module_for_offsets: module_hint,
-                                        },
-                                    })
-                                }
-                            }
-                        } else {
-                            // Complex types or link-time addresses: use RuntimeRead
-                            // (globals/statics need memory read; not an address print unless AddressOf)
-                            let data_len = Self::compute_read_size_for_type(t);
-                            if data_len == 0 {
-                                return Err(CodeGenError::TypeSizeNotAvailable(v.name));
-                            }
-                            let module_hint = self.take_module_hint();
-                            Ok(ComplexArg {
-                                var_name_index: self
-                                    .trace_context
-                                    .add_variable_name(v.name.clone()),
-                                type_index: self.trace_context.add_type(t.clone()),
-                                access_path: Vec::new(),
-                                data_len,
-                                source: ComplexArgSource::RuntimeRead {
-                                    location: v.location.clone(),
-                                    dwarf_type: t.clone(),
-                                    module_for_offsets: module_hint,
-                                },
-                            })
-                        }
-                    } else {
-                        Err(CodeGenError::DwarfError(
-                            "Variable has no DWARF type information".to_string(),
-                        ))
-                    }
+                    self.complex_arg_from_dwarf_read_plan(v, None)
                 } else {
                     Err(CodeGenError::VariableNotInScope(name.clone()))
                 }
@@ -611,6 +537,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         let index = sign * int_side;
                         let (location, elem_ty) =
                             self.compute_pointed_location_with_index(ptr_side, index)?;
+                        let address = ghostscope_dwarf::PlannedAddress::from_location(location)
+                            .ok_or_else(|| {
+                                CodeGenError::DwarfError(
+                                    "pointer arithmetic did not produce an address-backed plan"
+                                        .to_string(),
+                                )
+                            })?;
                         let data_len = Self::compute_read_size_for_type(&elem_ty);
                         let module_hint = self.take_module_hint();
                         if data_len == 0 {
@@ -627,7 +560,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                 access_path: Vec::new(),
                                 data_len: 8,
                                 source: ComplexArgSource::AddressValue {
-                                    location,
+                                    address,
                                     module_for_offsets: module_hint,
                                 },
                             });
@@ -640,7 +573,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             access_path: Vec::new(),
                             data_len,
                             source: ComplexArgSource::RuntimeRead {
-                                location,
+                                address,
                                 dwarf_type: elem_ty,
                                 module_for_offsets: module_hint,
                             },
@@ -732,7 +665,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 Ok(1)
             }
             ComplexArgSource::RuntimeRead {
-                location,
+                address,
                 ref dwarf_type,
                 module_for_offsets,
             } => {
@@ -744,7 +677,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 };
                 self.generate_print_complex_variable_runtime(
                     meta,
-                    &location,
+                    &address,
                     dwarf_type,
                     module_for_offsets.as_deref(),
                 )?;
@@ -1104,28 +1037,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         // Already accumulated; EndInstruction will send the whole event
         Ok(())
     }
-    /// Determine if a TypeInfo qualifies as a "simple variable" for PrintVariableIndex
-    /// Simple: base types (bool/int/float/char), enums (with base type 1/2/4/8), pointers;
-    /// Complex: arrays, structs, unions, functions
-    fn is_simple_typeinfo(t: &ghostscope_dwarf::TypeInfo) -> bool {
-        use ghostscope_dwarf::TypeInfo as TI;
-        match t {
-            TI::BaseType { size, .. } => matches!(*size, 1 | 2 | 4 | 8),
-            TI::EnumType { base_type, .. } => {
-                let sz = base_type.size();
-                matches!(sz, 1 | 2 | 4 | 8)
-            }
-            TI::PointerType { .. } => true,
-            TI::TypedefType {
-                underlying_type, ..
-            }
-            | TI::QualifiedType {
-                underlying_type, ..
-            } => Self::is_simple_typeinfo(underlying_type),
-            _ => false,
-        }
-    }
-
     fn is_char_byte_typeinfo(t: &ghostscope_dwarf::TypeInfo) -> bool {
         use ghostscope_dwarf::TypeInfo as TI;
         match t {
@@ -3302,7 +3213,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     }
                 }
                 ComplexArgSource::RuntimeRead {
-                    location,
+                    address,
                     dwarf_type,
                     module_for_offsets,
                 } => {
@@ -3315,9 +3226,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         .build_bit_cast(var_data_ptr, ptr_type, "dst_ptr")
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
                     let size_val = i32_type.const_int(a.data_len as u64, false);
-                    // Compute source address; if link-time address, apply ASLR offsets via map
-                    let src_addr = self.variable_location_to_address_with_hint(
-                        location,
+                    let src_addr = self.planned_address_to_llvm_address(
+                        address,
                         Some(apl_ptr),
                         module_for_offsets.as_deref(),
                     )?;
@@ -3479,12 +3389,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     self.builder.position_at_end(cont2_block);
                 }
                 ComplexArgSource::AddressValue {
-                    location,
+                    address,
                     module_for_offsets,
                 } => {
-                    // Compute address (apply ASLR if link-time address) and store as 8 bytes
-                    let addr = self.variable_location_to_address_with_hint(
-                        location,
+                    let addr = self.planned_address_to_llvm_address(
+                        address,
                         Some(apl_ptr),
                         module_for_offsets.as_deref(),
                     )?;
@@ -4389,7 +4298,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     fn generate_print_complex_variable_runtime(
         &mut self,
         meta: PrintVarRuntimeMeta,
-        location: &ghostscope_dwarf::VariableLocation,
+        address: &ghostscope_dwarf::PlannedAddress,
         dwarf_type: &ghostscope_dwarf::TypeInfo,
         module_hint: Option<&str>,
     ) -> Result<()> {
@@ -4399,7 +4308,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             access_path = %meta.access_path,
             type_size = dwarf_type.size(),
             data_len_limit = meta.data_len_limit,
-            location = ?location,
+            address = ?address,
             "generate_print_complex_variable_runtime: begin"
         );
         // Compute sizes first, then reserve instruction region directly in accumulation buffer
@@ -4716,7 +4625,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         // Compute source address with ASLR-aware helper, honoring module hint
         // Prefer a previously recorded module path for offsets; fall back handled in helper
         let src_addr =
-            self.variable_location_to_address_with_hint(location, Some(status_ptr), module_hint)?;
+            self.planned_address_to_llvm_address(address, Some(status_ptr), module_hint)?;
         tracing::trace!(src_addr = %{src_addr}, "generate_print_complex_variable_runtime: computed src_addr");
 
         // Setup common types and casts

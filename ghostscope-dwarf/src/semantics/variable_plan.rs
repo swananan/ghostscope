@@ -2,8 +2,8 @@
 
 use crate::core::{
     AddressExpr, Availability, ComputeStep, DieRef, HelperMode, InlineContextId, MemoryAccessSize,
-    Provenance, Result, RuntimeCapabilities, RuntimeRequirement, TypeId, UnsupportedReason,
-    VariableId, VariableLocation, VerifierRisk,
+    PieceLocation, Provenance, Result, RuntimeCapabilities, RuntimeRequirement, TypeId,
+    UnsupportedReason, VariableId, VariableLocation, VerifierRisk,
 };
 use crate::semantics::PcRange;
 use crate::TypeInfo;
@@ -59,11 +59,54 @@ pub struct VariableLoweringPlan {
     pub verifier_risk: VerifierRisk,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressOrigin {
+    LinkTime,
+    LinkTimeBase,
+    RuntimeDerived,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlannedAddress {
+    pub location: VariableLocation,
+    pub origin: AddressOrigin,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum VariableMaterialization {
+    DirectValue {
+        location: VariableLocation,
+        address_origin: Option<AddressOrigin>,
+    },
+    UserMemoryRead {
+        address: PlannedAddress,
+    },
+    Composite {
+        pieces: Vec<PieceLocation>,
+    },
+    Unavailable {
+        availability: Availability,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VariableMaterializationPlan {
+    pub name: String,
+    pub type_name: String,
+    pub access_path: VariableAccessPath,
+    pub dwarf_type: Option<TypeInfo>,
+    pub availability: Availability,
+    pub lowering: VariableLoweringPlan,
+    pub materialization: VariableMaterialization,
+}
+
 /// Owned, PC-sensitive variable read plan before runtime-specific lowering.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VariableReadPlan {
     pub name: String,
     pub type_name: String,
+    pub access_path: VariableAccessPath,
     pub dwarf_type: Option<TypeInfo>,
     pub declaration: Option<DieRef>,
     pub type_id: Option<TypeId>,
@@ -77,7 +120,7 @@ pub struct VariableReadPlan {
     pub provenance: Provenance,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VariableAccessPath {
     pub segments: Vec<VariableAccessSegment>,
 }
@@ -165,6 +208,7 @@ impl VariableReadPlan {
         Self {
             name: variable.name,
             type_name: variable.type_name,
+            access_path: VariableAccessPath::default(),
             dwarf_type: variable.dwarf_type,
             declaration: variable.declaration,
             type_id: variable.type_id,
@@ -233,12 +277,72 @@ impl VariableReadPlan {
         }
     }
 
+    pub fn materialization_plan(
+        &self,
+        capabilities: &RuntimeCapabilities,
+    ) -> VariableMaterializationPlan {
+        let lowering = self.bpf_lowering_plan(capabilities);
+        let materialization = if !lowering.availability.is_available() {
+            VariableMaterialization::Unavailable {
+                availability: lowering.availability.clone(),
+            }
+        } else {
+            match lowering.kind {
+                VariableLoweringKind::DirectValue => VariableMaterialization::DirectValue {
+                    address_origin: direct_value_address_origin(&self.location),
+                    location: self.location.clone(),
+                },
+                VariableLoweringKind::UserMemoryRead => {
+                    match PlannedAddress::from_location(self.location.clone()) {
+                        Some(address) => VariableMaterialization::UserMemoryRead { address },
+                        None => VariableMaterialization::Unavailable {
+                            availability: Availability::Unsupported(
+                                UnsupportedReason::AddressClass {
+                                    detail: format!(
+                                        "location {} cannot be materialized as an address",
+                                        self.location
+                                    ),
+                                },
+                            ),
+                        },
+                    }
+                }
+                VariableLoweringKind::Composite => match &self.location {
+                    VariableLocation::Pieces(pieces) => VariableMaterialization::Composite {
+                        pieces: pieces.clone(),
+                    },
+                    _ => VariableMaterialization::Unavailable {
+                        availability: Availability::Unsupported(
+                            UnsupportedReason::ExpressionShape {
+                                detail: "composite lowering without piece locations".to_string(),
+                            },
+                        ),
+                    },
+                },
+                VariableLoweringKind::Unavailable => VariableMaterialization::Unavailable {
+                    availability: lowering.availability.clone(),
+                },
+            }
+        };
+
+        VariableMaterializationPlan {
+            name: self.name.clone(),
+            type_name: self.type_name.clone(),
+            access_path: self.access_path.clone(),
+            dwarf_type: self.dwarf_type.clone(),
+            availability: lowering.availability.clone(),
+            lowering,
+            materialization,
+        }
+    }
+
     pub fn plan_access_path(&self, path: &VariableAccessPath) -> Result<Self> {
         let mut plan = self.clone();
         for segment in &path.segments {
             plan = plan.plan_access_segment(segment)?;
         }
 
+        plan.access_path.segments.extend(path.segments.clone());
         plan.name.push_str(&path.suffix());
         Ok(plan)
     }
@@ -346,6 +450,54 @@ impl VariableReadPlan {
     }
 }
 
+impl PlannedAddress {
+    pub fn from_location(location: VariableLocation) -> Option<Self> {
+        let origin = match &location {
+            VariableLocation::Address(expr) | VariableLocation::AbsoluteAddressValue(expr) => {
+                address_origin_for_steps(&expr.steps)
+            }
+            VariableLocation::RegisterAddress { .. }
+            | VariableLocation::FrameBaseRelative { .. } => AddressOrigin::RuntimeDerived,
+            VariableLocation::ComputedAddress(steps) => address_origin_for_steps(steps),
+            VariableLocation::RegisterValue { .. }
+            | VariableLocation::ComputedValue(_)
+            | VariableLocation::ImplicitValue(_)
+            | VariableLocation::Pieces(_)
+            | VariableLocation::OptimizedOut
+            | VariableLocation::Unknown => return None,
+        };
+
+        Some(Self { location, origin })
+    }
+
+    pub fn constant_link_time_address(&self) -> Option<u64> {
+        match (&self.origin, &self.location) {
+            (AddressOrigin::LinkTime, VariableLocation::Address(expr))
+            | (AddressOrigin::LinkTime, VariableLocation::AbsoluteAddressValue(expr)) => {
+                fold_constant_steps(&expr.steps)
+            }
+            (AddressOrigin::LinkTime, VariableLocation::ComputedAddress(steps)) => {
+                fold_constant_steps(steps)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn link_time_base_and_runtime_tail(&self) -> Option<(u64, &[ComputeStep])> {
+        if self.origin != AddressOrigin::LinkTimeBase {
+            return None;
+        }
+
+        match &self.location {
+            VariableLocation::Address(expr) | VariableLocation::AbsoluteAddressValue(expr) => {
+                link_time_base_and_runtime_tail(&expr.steps)
+            }
+            VariableLocation::ComputedAddress(steps) => link_time_base_and_runtime_tail(steps),
+            _ => None,
+        }
+    }
+}
+
 impl RuntimeCapabilities {
     pub fn supports_requirement(&self, requirement: &RuntimeRequirement) -> bool {
         match requirement {
@@ -358,6 +510,89 @@ impl RuntimeCapabilities {
             }
         }
     }
+}
+
+fn direct_value_address_origin(location: &VariableLocation) -> Option<AddressOrigin> {
+    match location {
+        VariableLocation::AbsoluteAddressValue(expr) => Some(address_origin_for_steps(&expr.steps)),
+        _ => None,
+    }
+}
+
+fn address_origin_for_steps(steps: &[ComputeStep]) -> AddressOrigin {
+    if fold_constant_steps(steps).is_some() {
+        return AddressOrigin::LinkTime;
+    }
+
+    if link_time_base_and_runtime_tail(steps).is_some() {
+        return AddressOrigin::LinkTimeBase;
+    }
+
+    if steps_reference_runtime_state(steps) {
+        AddressOrigin::RuntimeDerived
+    } else {
+        AddressOrigin::Unknown
+    }
+}
+
+fn fold_constant_steps(steps: &[ComputeStep]) -> Option<u64> {
+    let mut const_stack: Vec<i64> = Vec::new();
+    for step in steps {
+        match step {
+            ComputeStep::PushConstant(value) => const_stack.push(*value),
+            ComputeStep::Add => {
+                let rhs = const_stack.pop()?;
+                let lhs = const_stack.pop()?;
+                const_stack.push(lhs.saturating_add(rhs));
+            }
+            _ => return None,
+        }
+    }
+
+    if const_stack.len() == 1 && const_stack[0] >= 0 {
+        Some(const_stack[0] as u64)
+    } else {
+        None
+    }
+}
+
+fn link_time_base_and_runtime_tail(steps: &[ComputeStep]) -> Option<(u64, &[ComputeStep])> {
+    let Some(ComputeStep::PushConstant(base)) = steps.first() else {
+        return None;
+    };
+
+    if *base < 0 {
+        return None;
+    }
+
+    for step in steps.iter().skip(1) {
+        match step {
+            ComputeStep::LoadRegister(_) => {
+                break;
+            }
+            ComputeStep::Dereference { .. } => {
+                return Some((*base as u64, &steps[1..]));
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn steps_reference_runtime_state(steps: &[ComputeStep]) -> bool {
+    steps.iter().any(|step| match step {
+        ComputeStep::LoadRegister(_)
+        | ComputeStep::Dereference { .. }
+        | ComputeStep::EntryValueLookup { .. } => true,
+        ComputeStep::If {
+            then_branch,
+            else_branch,
+        } => {
+            steps_reference_runtime_state(then_branch) || steps_reference_runtime_state(else_branch)
+        }
+        _ => false,
+    })
 }
 
 trait VariableLocationLoweringExt {
@@ -762,6 +997,7 @@ mod tests {
         VariableReadPlan {
             name: "value".to_string(),
             type_name: "int".to_string(),
+            access_path: VariableAccessPath::default(),
             dwarf_type: None,
             declaration: None,
             type_id: None,
@@ -820,6 +1056,118 @@ mod tests {
         assert_eq!(lowering.helper_mode, HelperMode::ProbeReadUser);
         assert_eq!(lowering.verifier_risk, VerifierRisk::Low);
         assert!(lowering.required_registers.is_empty());
+    }
+
+    #[test]
+    fn materialization_plan_preserves_link_time_address_origin() {
+        let plan = read_plan(VariableLocation::Address(AddressExpr::constant(0x1000)));
+        let materialized = plan.materialization_plan(&capabilities(true));
+
+        match materialized.materialization {
+            VariableMaterialization::UserMemoryRead { address } => {
+                assert_eq!(address.origin, AddressOrigin::LinkTime);
+                assert_eq!(address.constant_link_time_address(), Some(0x1000));
+            }
+            other => panic!("unexpected materialization: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn materialization_plan_marks_static_base_before_deref() {
+        let plan = read_plan(VariableLocation::ComputedAddress(vec![
+            ComputeStep::PushConstant(0x3000),
+            ComputeStep::Dereference {
+                size: MemoryAccessSize::U64,
+            },
+            ComputeStep::PushConstant(16),
+            ComputeStep::Add,
+        ]));
+        let materialized = plan.materialization_plan(&capabilities(true));
+
+        match materialized.materialization {
+            VariableMaterialization::UserMemoryRead { address } => {
+                assert_eq!(address.origin, AddressOrigin::LinkTimeBase);
+                let (base, tail) = address
+                    .link_time_base_and_runtime_tail()
+                    .expect("link-time base");
+                assert_eq!(base, 0x3000);
+                assert_eq!(tail.len(), 3);
+            }
+            other => panic!("unexpected materialization: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn materialization_plan_preserves_arithmetic_before_first_deref() {
+        let plan = read_plan(VariableLocation::ComputedAddress(vec![
+            ComputeStep::PushConstant(0x3000),
+            ComputeStep::PushConstant(8),
+            ComputeStep::Add,
+            ComputeStep::Dereference {
+                size: MemoryAccessSize::U64,
+            },
+        ]));
+        let materialized = plan.materialization_plan(&capabilities(true));
+
+        match materialized.materialization {
+            VariableMaterialization::UserMemoryRead { address } => {
+                assert_eq!(address.origin, AddressOrigin::LinkTimeBase);
+                let (base, tail) = address
+                    .link_time_base_and_runtime_tail()
+                    .expect("link-time base");
+                assert_eq!(base, 0x3000);
+                assert_eq!(
+                    tail,
+                    &[
+                        ComputeStep::PushConstant(8),
+                        ComputeStep::Add,
+                        ComputeStep::Dereference {
+                            size: MemoryAccessSize::U64,
+                        },
+                    ]
+                );
+            }
+            other => panic!("unexpected materialization: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn materialization_plan_keeps_absolute_address_value_direct() {
+        let plan = read_plan(VariableLocation::AbsoluteAddressValue(
+            AddressExpr::constant(0x2000),
+        ));
+        let materialized = plan.materialization_plan(&capabilities(false));
+
+        match materialized.materialization {
+            VariableMaterialization::DirectValue {
+                address_origin,
+                location,
+            } => {
+                assert_eq!(address_origin, Some(AddressOrigin::LinkTime));
+                assert!(matches!(
+                    location,
+                    VariableLocation::AbsoluteAddressValue(_)
+                ));
+            }
+            other => panic!("unexpected materialization: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn materialization_plan_surfaces_piece_locations_without_first_piece_fallback() {
+        let plan = read_plan(VariableLocation::Pieces(vec![PieceLocation {
+            bit_offset: 0,
+            bit_size: 32,
+            location: Box::new(VariableLocation::RegisterValue { dwarf_reg: 0 }),
+        }]));
+        let materialized = plan.materialization_plan(&capabilities(true));
+
+        match materialized.materialization {
+            VariableMaterialization::Composite { pieces } => {
+                assert_eq!(pieces.len(), 1);
+            }
+            other => panic!("unexpected materialization: {other:?}"),
+        }
     }
 
     #[test]
@@ -940,6 +1288,7 @@ mod tests {
         let planned = plan.plan_access_path(&access).expect("field access");
 
         assert_eq!(planned.name, "value.fd");
+        assert_eq!(planned.access_path, access);
         assert_eq!(planned.dwarf_type, Some(int_type));
         assert_eq!(
             planned.location,
@@ -947,6 +1296,13 @@ mod tests {
                 dwarf_reg: 6,
                 offset: -20,
             }
+        );
+        assert_eq!(
+            planned
+                .materialization_plan(&capabilities(true))
+                .access_path
+                .segments,
+            vec![VariableAccessSegment::Field("fd".to_string())]
         );
     }
 

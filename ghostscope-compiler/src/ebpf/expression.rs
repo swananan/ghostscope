@@ -7,7 +7,6 @@ use crate::script::{BinaryOp, Expr};
 use aya_ebpf_bindings::bindings::bpf_func_id::BPF_FUNC_probe_read_user;
 use ghostscope_dwarf::{
     AmbiguityReason, Availability, RuntimeRequirement, TypeInfo as DwarfType, UnsupportedReason,
-    VariableReadPlan,
 };
 use inkwell::values::{BasicValueEnum, IntValue};
 use inkwell::AddressSpace;
@@ -2189,24 +2188,18 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             }
         };
 
-        let dwarf_type = variable_plan.dwarf_type.as_ref().ok_or_else(|| {
+        let materialized =
+            self.variable_read_plan_to_materialization(variable_plan, compile_context.pc_address)?;
+        let dwarf_type = materialized.dwarf_type.as_ref().ok_or_else(|| {
             CodeGenError::DwarfError("Expression has no DWARF type information".to_string())
         })?;
-        Self::ensure_dwarf_value_available(&variable_plan, compile_context.pc_address)?;
 
         debug!(
             "compile_dwarf_expression: Found DWARF info for expression '{}' with type: {:?}",
-            variable_plan.name, dwarf_type
+            materialized.name, dwarf_type
         );
 
-        // Use the unified evaluation logic to generate LLVM IR
-        self.variable_location_to_llvm_value(
-            &variable_plan.location,
-            dwarf_type,
-            &variable_plan.name,
-            compile_context.pc_address,
-            None,
-        )
+        self.variable_materialization_to_llvm_value(&materialized, compile_context.pc_address, None)
     }
 
     pub(crate) fn dwarf_expression_unavailable_error(
@@ -2284,22 +2277,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             AmbiguityReason::TypeResolution { detail } => {
                 format!("ambiguous type resolution: {detail}")
             }
-        }
-    }
-
-    pub(crate) fn ensure_dwarf_value_available(
-        variable: &VariableReadPlan,
-        pc_address: u64,
-    ) -> Result<()> {
-        let availability = variable.availability.clone();
-        if availability.is_available() {
-            Ok(())
-        } else {
-            Err(Self::dwarf_expression_unavailable_error(
-                &variable.name,
-                &availability,
-                pc_address,
-            ))
         }
     }
 

@@ -2,7 +2,7 @@ use super::DwarfAnalyzer;
 use crate::{
     core::{ModuleAddress, Provenance, Result},
     semantics::{
-        AddressSpaceInfo, PcContext, PcLineInfo, PlanError, VariableAccessPath,
+        AddressSpaceInfo, PcContext, PcLineInfo, PcRange, PlanError, VariableAccessPath,
         VariableAccessSegment, VariableReadPlan, VisibleVariable, VisibleVariablesResult,
     },
 };
@@ -135,6 +135,15 @@ impl DwarfAnalyzer {
         VariableReadPlan::from_visible_variable(variable.visible_variable(), provenance)
     }
 
+    fn attach_pc_context(ctx: &PcContext, mut plan: VariableReadPlan) -> VariableReadPlan {
+        plan.pc_range = Some(PcRange {
+            start: ctx.normalized_pc,
+            end: ctx.normalized_pc,
+        });
+        plan.inline_context = ctx.inline_chain.last().and_then(|frame| frame.context);
+        plan
+    }
+
     pub(super) fn plan_access_path_with_type_completion(
         &self,
         module_path: &Path,
@@ -178,7 +187,10 @@ impl DwarfAnalyzer {
         )
         .map(|variable| {
             variable.map(|variable| {
-                VariableReadPlan::from_visible_variable(variable, Provenance::DirectDie)
+                Self::attach_pc_context(
+                    ctx,
+                    VariableReadPlan::from_visible_variable(variable, Provenance::DirectDie),
+                )
             })
         })
     }
@@ -293,9 +305,9 @@ impl DwarfAnalyzer {
 
         match matches.as_slice() {
             [] => Ok(None),
-            [variable] => Ok(Some(VariableReadPlan::from_visible_variable(
-                variable.clone(),
-                Provenance::DirectDie,
+            [variable] => Ok(Some(Self::attach_pc_context(
+                ctx,
+                VariableReadPlan::from_visible_variable(variable.clone(), Provenance::DirectDie),
             ))),
             _ => Err(anyhow::anyhow!(
                 "Ambiguous VariableId {:?} at PC 0x{:x}: {} visible matches",
