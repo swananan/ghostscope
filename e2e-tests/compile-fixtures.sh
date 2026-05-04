@@ -58,6 +58,9 @@ run_make_fixture globals_program all
 run_make_fixture late_globals_program clean
 run_make_fixture late_globals_program all
 
+run_make_fixture scalar_types_program clean
+run_make_fixture scalar_types_program all
+
 run_cargo_fixture "$RUST_FIXTURE_DIR" clean
 run_cargo_fixture "$RUST_FIXTURE_DIR" build --locked
 
