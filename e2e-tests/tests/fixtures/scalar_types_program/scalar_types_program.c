@@ -100,6 +100,44 @@ __attribute__((noinline)) static void scalar_by_value(
     asm volatile("" ::: "memory");
 }
 
+__attribute__((noinline)) static void scalar_float_bool_by_value(
+    _Bool bool_truev,
+    _Bool bool_falsev,
+    float f32v,
+    double f64v)
+{
+    scalar_sink ^= (uintptr_t)bool_truev;
+    scalar_sink ^= (uintptr_t)bool_falsev;
+    scalar_sink ^= (uintptr_t)(int)f32v;
+    scalar_sink ^= (uintptr_t)(long long)f64v;
+    asm volatile("" ::: "memory");
+}
+
+__attribute__((noinline)) static void scalar_stack_by_value(
+    uint64_t reg1,
+    uint64_t reg2,
+    uint64_t reg3,
+    uint64_t reg4,
+    uint64_t reg5,
+    uint64_t reg6,
+    int8_t stack_i8v,
+    uint8_t stack_u8v,
+    int32_t stack_i32v,
+    uint64_t stack_u64v)
+{
+    scalar_sink ^= (uintptr_t)reg1;
+    scalar_sink ^= (uintptr_t)reg2;
+    scalar_sink ^= (uintptr_t)reg3;
+    scalar_sink ^= (uintptr_t)reg4;
+    scalar_sink ^= (uintptr_t)reg5;
+    scalar_sink ^= (uintptr_t)reg6;
+    scalar_sink ^= (uintptr_t)(uint8_t)stack_i8v;
+    scalar_sink ^= (uintptr_t)stack_u8v;
+    scalar_sink ^= (uintptr_t)(uint32_t)stack_i32v;
+    scalar_sink ^= (uintptr_t)stack_u64v;
+    asm volatile("" ::: "memory");
+}
+
 __attribute__((noinline)) static void scalar_probe(int iter)
 {
     volatile int8_t i8_neg = (int8_t)-5;
@@ -167,6 +205,24 @@ __attribute__((noinline)) static void scalar_probe(int iter)
         alias_i8_neg,
         enum_neg,
         enum_big);
+
+    scalar_float_bool_by_value(
+        bool_true,
+        bool_false,
+        f32_val,
+        f64_val);
+
+    scalar_stack_by_value(
+        11,
+        22,
+        33,
+        44,
+        55,
+        66,
+        i8_neg,
+        u8_big,
+        i32_neg,
+        u64_big);
 }
 
 int main(void)

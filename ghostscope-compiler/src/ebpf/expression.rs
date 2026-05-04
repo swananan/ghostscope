@@ -14,6 +14,25 @@ use tracing::debug;
 
 // compare cap is provided via compile_options.compare_cap (config: ebpf.compare_cap)
 
+#[derive(Clone, Copy, Debug)]
+struct CIntegerComparisonType {
+    size: u64,
+    is_unsigned: bool,
+}
+
+impl CIntegerComparisonType {
+    fn promoted(self) -> Self {
+        if self.size < 4 {
+            Self {
+                size: 4,
+                is_unsigned: false,
+            }
+        } else {
+            self
+        }
+    }
+}
+
 impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     pub(crate) fn get_host_pid_tid_values(&mut self) -> Result<(IntValue<'ctx>, IntValue<'ctx>)> {
         let i32_type = self.context.i32_type();
@@ -245,33 +264,82 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         false
     }
 
-    fn is_unsigned_integer_type(t: &DwarfType) -> bool {
+    fn integer_comparison_type(t: &DwarfType) -> Option<CIntegerComparisonType> {
         match t {
-            DwarfType::BaseType { encoding, .. } => {
-                *encoding == ghostscope_dwarf::constants::DW_ATE_unsigned.0 as u16
-                    || *encoding == ghostscope_dwarf::constants::DW_ATE_unsigned_char.0 as u16
+            DwarfType::BaseType { encoding, size, .. } => {
+                let is_unsigned = *encoding
+                    == ghostscope_dwarf::constants::DW_ATE_unsigned.0 as u16
+                    || *encoding == ghostscope_dwarf::constants::DW_ATE_unsigned_char.0 as u16;
+                let is_signed = *encoding == ghostscope_dwarf::constants::DW_ATE_signed.0 as u16
+                    || *encoding == ghostscope_dwarf::constants::DW_ATE_signed_char.0 as u16
+                    || *encoding == ghostscope_dwarf::constants::DW_ATE_boolean.0 as u16;
+                if is_unsigned || is_signed {
+                    Some(CIntegerComparisonType {
+                        size: *size,
+                        is_unsigned,
+                    })
+                } else {
+                    None
+                }
             }
-            DwarfType::EnumType { base_type, .. } => Self::is_unsigned_integer_type(base_type),
+            DwarfType::EnumType {
+                base_type, size, ..
+            } => Self::integer_comparison_type(base_type).map(|mut ty| {
+                if ty.size == 0 {
+                    ty.size = *size;
+                }
+                ty
+            }),
             DwarfType::BitfieldType {
-                underlying_type, ..
-            } => Self::is_unsigned_integer_type(underlying_type),
+                underlying_type,
+                bit_size,
+                ..
+            } => Self::integer_comparison_type(underlying_type).map(|mut ty| {
+                ty.size = (*bit_size as u64).max(1).div_ceil(8);
+                ty
+            }),
             DwarfType::TypedefType {
                 underlying_type, ..
             }
             | DwarfType::QualifiedType {
                 underlying_type, ..
-            } => Self::is_unsigned_integer_type(underlying_type),
-            _ => false,
+            } => Self::integer_comparison_type(underlying_type),
+            _ => None,
         }
     }
 
-    fn is_dwarf_unsigned_integer_expr(&mut self, expr: &Expr) -> bool {
+    fn dwarf_integer_comparison_expr(&mut self, expr: &Expr) -> Option<CIntegerComparisonType> {
         if let Ok(Some(var)) = self.query_dwarf_for_complex_expr(expr) {
             if let Some(ref ty) = var.dwarf_type {
-                return Self::is_unsigned_integer_type(ty);
+                return Self::integer_comparison_type(ty);
             }
         }
-        false
+        None
+    }
+
+    fn usual_arithmetic_prefers_unsigned(
+        left: CIntegerComparisonType,
+        right: CIntegerComparisonType,
+    ) -> bool {
+        let left = left.promoted();
+        let right = right.promoted();
+        if left.is_unsigned == right.is_unsigned {
+            return left.is_unsigned;
+        }
+
+        let unsigned = if left.is_unsigned { left } else { right };
+        let signed = if left.is_unsigned { right } else { left };
+        unsigned.size >= signed.size
+    }
+
+    fn use_unsigned_ordering_for_exprs(&mut self, left: &Expr, right: &Expr) -> bool {
+        let left_ty = self.dwarf_integer_comparison_expr(left);
+        let right_ty = self.dwarf_integer_comparison_expr(right);
+        match (left_ty, right_ty) {
+            (Some(left), Some(right)) => Self::usual_arithmetic_prefers_unsigned(left, right),
+            (Some(ty), None) | (None, Some(ty)) => ty.promoted().is_unsigned,
+            (None, None) => false,
+        }
     }
 
     /// Ensure that when an expression refers to a DWARF-backed variable (not via address-of),
@@ -1694,9 +1762,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     return Ok(phi.as_basic_value());
                 }
 
-                let use_unsigned_ordering = is_ordered
-                    && (self.is_dwarf_unsigned_integer_expr(left)
-                        || self.is_dwarf_unsigned_integer_expr(right));
+                let use_unsigned_ordering =
+                    is_ordered && self.use_unsigned_ordering_for_exprs(left, right);
 
                 // Default eager evaluation for other binary ops
                 let left_val = self.compile_expr(left)?;
