@@ -73,12 +73,178 @@ pub struct PlannedAddress {
     pub origin: AddressOrigin,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeComputedKind {
+    Address,
+    Value,
+}
+
+/// Runtime operation selected by the DWARF semantic planner.
+///
+/// This is the backend contract for computed variable plans. It is intentionally
+/// separate from the evaluator's `ComputeStep` so compiler lowering does not
+/// consume raw DWARF-expression internals.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RuntimeExprOp {
+    LoadRegister {
+        dwarf_reg: u16,
+    },
+    PushConstant(i64),
+    UserMemoryRead {
+        size: MemoryAccessSize,
+    },
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    And,
+    Or,
+    Xor,
+    Shl,
+    Shr,
+    Shra,
+    Not,
+    Neg,
+    Abs,
+    Dup,
+    Drop,
+    Swap,
+    Rot,
+    Pick(u8),
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    If {
+        then_ops: Vec<RuntimeExprOp>,
+        else_ops: Vec<RuntimeExprOp>,
+    },
+    EntryValueLookup {
+        caller_pc_ops: Vec<RuntimeExprOp>,
+        cases: Vec<RuntimeEntryValueCase>,
+    },
+}
+
+/// One caller-side case for runtime `DW_OP_entry_value` recovery.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuntimeEntryValueCase {
+    pub caller_return_pc: u64,
+    pub value_ops: Vec<RuntimeExprOp>,
+}
+
+/// Runtime expression selected by DWARF semantic planning.
+///
+/// This is intentionally still expressive enough to carry the DWARF evaluator's
+/// stack program, but it is no longer a bare location/value result. The planner
+/// classifies the expression as an address or a value before compiler lowering.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuntimeComputedExpr {
+    kind: RuntimeComputedKind,
+    ops: Vec<RuntimeExprOp>,
+}
+
+impl RuntimeComputedExpr {
+    pub(crate) fn address(steps: Vec<ComputeStep>) -> Self {
+        Self {
+            kind: RuntimeComputedKind::Address,
+            ops: runtime_ops_from_steps(steps),
+        }
+    }
+
+    pub(crate) fn value(steps: Vec<ComputeStep>) -> Self {
+        Self {
+            kind: RuntimeComputedKind::Value,
+            ops: runtime_ops_from_steps(steps),
+        }
+    }
+
+    pub fn ops(&self) -> &[RuntimeExprOp] {
+        &self.ops
+    }
+
+    pub fn kind(&self) -> RuntimeComputedKind {
+        self.kind
+    }
+
+    pub fn runtime_requirements(&self) -> Vec<RuntimeRequirement> {
+        requirements_for_runtime_ops(&self.ops)
+    }
+
+    pub fn required_registers(&self) -> Vec<u16> {
+        registers_for_runtime_ops(&self.ops)
+    }
+
+    pub fn estimated_stack_bytes(&self) -> usize {
+        estimate_runtime_ops_stack_bytes(&self.ops)
+    }
+}
+
+fn runtime_ops_from_steps(steps: Vec<ComputeStep>) -> Vec<RuntimeExprOp> {
+    steps.into_iter().map(runtime_op_from_step).collect()
+}
+
+fn runtime_op_from_step(step: ComputeStep) -> RuntimeExprOp {
+    match step {
+        ComputeStep::LoadRegister(dwarf_reg) => RuntimeExprOp::LoadRegister { dwarf_reg },
+        ComputeStep::PushConstant(value) => RuntimeExprOp::PushConstant(value),
+        ComputeStep::Dereference { size } => RuntimeExprOp::UserMemoryRead { size },
+        ComputeStep::Add => RuntimeExprOp::Add,
+        ComputeStep::Sub => RuntimeExprOp::Sub,
+        ComputeStep::Mul => RuntimeExprOp::Mul,
+        ComputeStep::Div => RuntimeExprOp::Div,
+        ComputeStep::Mod => RuntimeExprOp::Mod,
+        ComputeStep::And => RuntimeExprOp::And,
+        ComputeStep::Or => RuntimeExprOp::Or,
+        ComputeStep::Xor => RuntimeExprOp::Xor,
+        ComputeStep::Shl => RuntimeExprOp::Shl,
+        ComputeStep::Shr => RuntimeExprOp::Shr,
+        ComputeStep::Shra => RuntimeExprOp::Shra,
+        ComputeStep::Not => RuntimeExprOp::Not,
+        ComputeStep::Neg => RuntimeExprOp::Neg,
+        ComputeStep::Abs => RuntimeExprOp::Abs,
+        ComputeStep::Dup => RuntimeExprOp::Dup,
+        ComputeStep::Drop => RuntimeExprOp::Drop,
+        ComputeStep::Swap => RuntimeExprOp::Swap,
+        ComputeStep::Rot => RuntimeExprOp::Rot,
+        ComputeStep::Pick(index) => RuntimeExprOp::Pick(index),
+        ComputeStep::Eq => RuntimeExprOp::Eq,
+        ComputeStep::Ne => RuntimeExprOp::Ne,
+        ComputeStep::Lt => RuntimeExprOp::Lt,
+        ComputeStep::Le => RuntimeExprOp::Le,
+        ComputeStep::Gt => RuntimeExprOp::Gt,
+        ComputeStep::Ge => RuntimeExprOp::Ge,
+        ComputeStep::If {
+            then_branch,
+            else_branch,
+        } => RuntimeExprOp::If {
+            then_ops: runtime_ops_from_steps(then_branch),
+            else_ops: runtime_ops_from_steps(else_branch),
+        },
+        ComputeStep::EntryValueLookup {
+            caller_pc_steps,
+            cases,
+        } => RuntimeExprOp::EntryValueLookup {
+            caller_pc_ops: runtime_ops_from_steps(caller_pc_steps),
+            cases: cases
+                .into_iter()
+                .map(|case| RuntimeEntryValueCase {
+                    caller_return_pc: case.caller_return_pc,
+                    value_ops: runtime_ops_from_steps(case.value_steps),
+                })
+                .collect(),
+        },
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlannedAddressKind {
     Constant { address: u64 },
     RegisterOffset { dwarf_reg: u16, offset: i64 },
     FrameBaseRelative { offset: i64 },
-    Computed { steps: Vec<ComputeStep> },
+    RuntimeComputed { expr: RuntimeComputedExpr },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -91,8 +257,8 @@ pub enum PlannedValue {
         dwarf_reg: u16,
         size: MemoryAccessSize,
     },
-    ComputedValue {
-        steps: Vec<ComputeStep>,
+    RuntimeComputed {
+        expr: RuntimeComputedExpr,
         result_size: MemoryAccessSize,
     },
     ImplicitBytes(Vec<u8>),
@@ -537,8 +703,8 @@ impl PlannedValue {
                         size,
                     })
                 } else {
-                    Some(Self::ComputedValue {
-                        steps,
+                    Some(Self::RuntimeComputed {
+                        expr: RuntimeComputedExpr::value(steps),
                         result_size: size,
                     })
                 }
@@ -592,20 +758,22 @@ impl PlannedAddress {
     pub fn constant_link_time_address(&self) -> Option<u64> {
         match (&self.origin, &self.kind) {
             (AddressOrigin::LinkTime, PlannedAddressKind::Constant { address }) => Some(*address),
-            (AddressOrigin::LinkTime, PlannedAddressKind::Computed { steps }) => {
-                fold_constant_steps(steps)
+            (AddressOrigin::LinkTime, PlannedAddressKind::RuntimeComputed { expr }) => {
+                fold_constant_runtime_ops(expr.ops())
             }
             _ => None,
         }
     }
 
-    pub fn link_time_base_and_runtime_tail(&self) -> Option<(u64, &[ComputeStep])> {
+    pub fn link_time_base_and_runtime_tail(&self) -> Option<(u64, &[RuntimeExprOp])> {
         if self.origin != AddressOrigin::LinkTimeBase {
             return None;
         }
 
         match &self.kind {
-            PlannedAddressKind::Computed { steps } => link_time_base_and_runtime_tail(steps),
+            PlannedAddressKind::RuntimeComputed { expr } => {
+                link_time_base_and_runtime_tail_ops(expr.ops())
+            }
             _ => None,
         }
     }
@@ -615,7 +783,9 @@ impl PlannedAddressKind {
     fn from_steps(steps: Vec<ComputeStep>) -> Self {
         match fold_constant_steps(&steps) {
             Some(address) => Self::Constant { address },
-            None => Self::Computed { steps },
+            None => Self::RuntimeComputed {
+                expr: RuntimeComputedExpr::address(steps),
+            },
         }
     }
 }
@@ -677,6 +847,27 @@ fn fold_constant_steps(steps: &[ComputeStep]) -> Option<u64> {
     }
 }
 
+fn fold_constant_runtime_ops(ops: &[RuntimeExprOp]) -> Option<u64> {
+    let mut const_stack: Vec<i64> = Vec::new();
+    for op in ops {
+        match op {
+            RuntimeExprOp::PushConstant(value) => const_stack.push(*value),
+            RuntimeExprOp::Add => {
+                let rhs = const_stack.pop()?;
+                let lhs = const_stack.pop()?;
+                const_stack.push(lhs.saturating_add(rhs));
+            }
+            _ => return None,
+        }
+    }
+
+    if const_stack.len() == 1 && const_stack[0] >= 0 {
+        Some(const_stack[0] as u64)
+    } else {
+        None
+    }
+}
+
 fn link_time_base_and_runtime_tail(steps: &[ComputeStep]) -> Option<(u64, &[ComputeStep])> {
     let Some(ComputeStep::PushConstant(base)) = steps.first() else {
         return None;
@@ -693,6 +884,30 @@ fn link_time_base_and_runtime_tail(steps: &[ComputeStep]) -> Option<(u64, &[Comp
             }
             ComputeStep::Dereference { .. } => {
                 return Some((*base as u64, &steps[1..]));
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn link_time_base_and_runtime_tail_ops(ops: &[RuntimeExprOp]) -> Option<(u64, &[RuntimeExprOp])> {
+    let Some(RuntimeExprOp::PushConstant(base)) = ops.first() else {
+        return None;
+    };
+
+    if *base < 0 {
+        return None;
+    }
+
+    for op in ops.iter().skip(1) {
+        match op {
+            RuntimeExprOp::LoadRegister { .. } => {
+                break;
+            }
+            RuntimeExprOp::UserMemoryRead { .. } => {
+                return Some((*base as u64, &ops[1..]));
             }
             _ => {}
         }
@@ -897,6 +1112,85 @@ fn estimate_steps_stack_bytes(steps: &[ComputeStep]) -> usize {
         .max()
         .unwrap_or(0);
     steps.len().saturating_mul(8).max(nested)
+}
+
+fn requirements_for_runtime_ops(ops: &[RuntimeExprOp]) -> Vec<RuntimeRequirement> {
+    let mut requirements = Vec::new();
+    for op in ops {
+        match op {
+            RuntimeExprOp::UserMemoryRead { .. } => {
+                requirements.push(RuntimeRequirement::UserMemoryRead)
+            }
+            RuntimeExprOp::EntryValueLookup {
+                caller_pc_ops,
+                cases,
+            } => {
+                requirements.push(RuntimeRequirement::CallerFrame);
+                requirements.extend(requirements_for_runtime_ops(caller_pc_ops));
+                for case in cases {
+                    requirements.extend(requirements_for_runtime_ops(&case.value_ops));
+                }
+            }
+            RuntimeExprOp::If { then_ops, else_ops } => {
+                requirements.extend(requirements_for_runtime_ops(then_ops));
+                requirements.extend(requirements_for_runtime_ops(else_ops));
+            }
+            _ => {}
+        }
+    }
+    requirements
+}
+
+fn registers_for_runtime_ops(ops: &[RuntimeExprOp]) -> Vec<u16> {
+    let mut registers = Vec::new();
+    collect_registers_for_runtime_ops(ops, &mut registers);
+    registers
+}
+
+fn collect_registers_for_runtime_ops(ops: &[RuntimeExprOp], registers: &mut Vec<u16>) {
+    for op in ops {
+        match op {
+            RuntimeExprOp::LoadRegister { dwarf_reg } => registers.push(*dwarf_reg),
+            RuntimeExprOp::EntryValueLookup {
+                caller_pc_ops,
+                cases,
+            } => {
+                collect_registers_for_runtime_ops(caller_pc_ops, registers);
+                for case in cases {
+                    collect_registers_for_runtime_ops(&case.value_ops, registers);
+                }
+            }
+            RuntimeExprOp::If { then_ops, else_ops } => {
+                collect_registers_for_runtime_ops(then_ops, registers);
+                collect_registers_for_runtime_ops(else_ops, registers);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn estimate_runtime_ops_stack_bytes(ops: &[RuntimeExprOp]) -> usize {
+    let nested = ops
+        .iter()
+        .map(|op| match op {
+            RuntimeExprOp::EntryValueLookup {
+                caller_pc_ops,
+                cases,
+            } => cases
+                .iter()
+                .map(|case| estimate_runtime_ops_stack_bytes(&case.value_ops))
+                .chain(std::iter::once(estimate_runtime_ops_stack_bytes(
+                    caller_pc_ops,
+                )))
+                .max()
+                .unwrap_or(0),
+            RuntimeExprOp::If { then_ops, else_ops } => estimate_runtime_ops_stack_bytes(then_ops)
+                .max(estimate_runtime_ops_stack_bytes(else_ops)),
+            _ => 0,
+        })
+        .max()
+        .unwrap_or(0);
+    ops.len().saturating_mul(8).max(nested)
 }
 
 fn helper_mode_for_requirements(
@@ -1237,6 +1531,12 @@ mod tests {
         match materialized.materialization {
             VariableMaterialization::UserMemoryRead { address } => {
                 assert_eq!(address.origin, AddressOrigin::LinkTimeBase);
+                match &address.kind {
+                    PlannedAddressKind::RuntimeComputed { expr } => {
+                        assert_eq!(expr.kind(), RuntimeComputedKind::Address);
+                    }
+                    other => panic!("unexpected address kind: {other:?}"),
+                }
                 let (base, tail) = address
                     .link_time_base_and_runtime_tail()
                     .expect("link-time base");
@@ -1269,9 +1569,9 @@ mod tests {
                 assert_eq!(
                     tail,
                     &[
-                        ComputeStep::PushConstant(8),
-                        ComputeStep::Add,
-                        ComputeStep::Dereference {
+                        RuntimeExprOp::PushConstant(8),
+                        RuntimeExprOp::Add,
+                        RuntimeExprOp::UserMemoryRead {
                             size: MemoryAccessSize::U64,
                         },
                     ]
@@ -1347,11 +1647,14 @@ mod tests {
         match materialized.materialization {
             VariableMaterialization::DirectValue {
                 value:
-                    PlannedValue::ComputedValue {
+                    PlannedValue::RuntimeComputed {
+                        ref expr,
                         result_size: MemoryAccessSize::U8,
                         ..
                     },
-            } => {}
+            } => {
+                assert_eq!(expr.kind(), RuntimeComputedKind::Value);
+            }
             other => panic!("unexpected materialization: {other:?}"),
         }
     }
