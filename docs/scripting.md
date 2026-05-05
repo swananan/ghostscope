@@ -457,13 +457,14 @@ trace log_activity {
 ```
 #### Comparisons (==, !=, <, <=, >, >=)
 
-- Supported: script int/bool with DWARF integer‑like scalars; values are unified to 64‑bit before compare.
+- Supported: script int/bool with DWARF integer‑like scalars.
 - Semantics for ordered comparisons:
-  - Script values are always signed `i64`.
-  - DWARF integer‑like scalars are normalized to 64‑bit integers before arithmetic/compare (width unification).
-  - Current implementation uses signed predicates for `< <= > >=`. If a DWARF value is an unsigned type that can exceed `i64::MAX` (e.g., 64‑bit `size_t`), results can be surprising (treated as negative under signed compare).
-    - Example: `let t = 1; if len > t { ... }` where `len = 2^63` may evaluate as false.
-    - Recommendation: prefer `==/!=`, or ensure both operands are within the signed range for ordered compares; print decimal + hex to sanity‑check.
+  - Script integer values are signed `i64`. Booleans participate as `0` or `1`.
+  - GhostScope does not currently support explicit casts such as `(uint32_t)x` or `x as u32`.
+  - For DWARF-backed C integer-like scalars, ordered comparisons follow C-style integer promotions and usual arithmetic conversions before selecting a signed or unsigned comparison.
+  - Narrow integer types such as `char`, `unsigned char`, `short`, and `unsigned short` are promoted before comparison. On the current supported C target model, that means `int8_t(-5) < uint8_t(250)` compares as signed `int` and evaluates true.
+  - For mixed signed/unsigned values, GhostScope chooses the converted comparison width and signedness. For example, `int32_t(-1) > uint32_t(4000000000)` compares as `uint32_t`, while `uint32_t(4000000000) > -10000000000` compares against the script value as signed `i64`.
+  - When the converted type is unsigned, both operands are converted to that width before applying the unsigned predicate. This preserves C behavior for cases such as `INT32_MIN < uint32_t(4000000000)`.
 - Pointers: equality/inequality only (pointer==pointer, pointer==0)
 - CString equality: DWARF `char*` or `char[N]` vs script string literal via bounded read
 - Not supported: relational string comparisons; aggregates; floats
@@ -474,9 +475,12 @@ Examples (Comparisons)
 // Safe equality across signed/unsigned
 if count == size { print "EQ"; }
 
-// Ordered compare (signed semantics) — be careful with large unsigned DWARF values
+// Ordered compares follow C integer promotions/usual arithmetic conversions
 let t = 1024;
-if size > t { print ">1K"; } // if size is a size_t > i64::MAX, result can be surprising
+if size > t { print ">1K"; }
+
+// Script integers are signed i64; casts are not supported yet
+if u32_count > -10000000000 { print "script-signed-i64"; }
 
 // Pointer equality (no ordering)
 trace foo.c:50 {

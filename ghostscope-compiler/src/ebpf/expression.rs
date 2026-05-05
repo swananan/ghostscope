@@ -20,6 +20,12 @@ struct CIntegerComparisonType {
     is_unsigned: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CIntegerComparisonPlan {
+    size: u64,
+    is_unsigned: bool,
+}
+
 impl CIntegerComparisonType {
     fn promoted(self) -> Self {
         if self.size < 4 {
@@ -29,6 +35,13 @@ impl CIntegerComparisonType {
             }
         } else {
             self
+        }
+    }
+
+    fn signed_i64() -> Self {
+        Self {
+            size: 8,
+            is_unsigned: false,
         }
     }
 }
@@ -317,28 +330,57 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         None
     }
 
-    fn usual_arithmetic_prefers_unsigned(
+    fn usual_arithmetic_comparison_plan(
         left: CIntegerComparisonType,
         right: CIntegerComparisonType,
-    ) -> bool {
+    ) -> CIntegerComparisonPlan {
         let left = left.promoted();
         let right = right.promoted();
         if left.is_unsigned == right.is_unsigned {
-            return left.is_unsigned;
+            return CIntegerComparisonPlan {
+                size: left.size.max(right.size),
+                is_unsigned: left.is_unsigned,
+            };
         }
 
         let unsigned = if left.is_unsigned { left } else { right };
         let signed = if left.is_unsigned { right } else { left };
-        unsigned.size >= signed.size
+        if unsigned.size >= signed.size {
+            CIntegerComparisonPlan {
+                size: unsigned.size,
+                is_unsigned: true,
+            }
+        } else {
+            CIntegerComparisonPlan {
+                size: signed.size,
+                is_unsigned: false,
+            }
+        }
     }
 
-    fn use_unsigned_ordering_for_exprs(&mut self, left: &Expr, right: &Expr) -> bool {
+    fn integer_comparison_plan_for_exprs(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+    ) -> Option<CIntegerComparisonPlan> {
         let left_ty = self.dwarf_integer_comparison_expr(left);
         let right_ty = self.dwarf_integer_comparison_expr(right);
-        match (left_ty, right_ty) {
-            (Some(left), Some(right)) => Self::usual_arithmetic_prefers_unsigned(left, right),
-            (Some(ty), None) | (None, Some(ty)) => ty.promoted().is_unsigned,
-            (None, None) => false,
+        if left_ty.is_none() && right_ty.is_none() {
+            return None;
+        }
+
+        Some(Self::usual_arithmetic_comparison_plan(
+            left_ty.unwrap_or_else(CIntegerComparisonType::signed_i64),
+            right_ty.unwrap_or_else(CIntegerComparisonType::signed_i64),
+        ))
+    }
+
+    fn unsigned_ordering_width_for_exprs(&mut self, left: &Expr, right: &Expr) -> Option<u32> {
+        let plan = self.integer_comparison_plan_for_exprs(left, right)?;
+        if plan.is_unsigned {
+            Some((plan.size * 8) as u32)
+        } else {
+            None
         }
     }
 
@@ -1762,8 +1804,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     return Ok(phi.as_basic_value());
                 }
 
-                let use_unsigned_ordering =
-                    is_ordered && self.use_unsigned_ordering_for_exprs(left, right);
+                let unsigned_ordering_width = if is_ordered {
+                    self.unsigned_ordering_width_for_exprs(left, right)
+                } else {
+                    None
+                };
 
                 // Default eager evaluation for other binary ops
                 let left_val = self.compile_expr(left)?;
@@ -1772,7 +1817,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     left_val,
                     op.clone(),
                     right_val,
-                    use_unsigned_ordering,
+                    unsigned_ordering_width,
                 )
             }
             Expr::MemberAccess(_, _) => {
@@ -1923,7 +1968,30 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         op: BinaryOp,
         right: BasicValueEnum<'ctx>,
     ) -> Result<BasicValueEnum<'ctx>> {
-        self.compile_binary_op_with_ordering(left, op, right, false)
+        self.compile_binary_op_with_ordering(left, op, right, None)
+    }
+
+    fn normalize_int_for_unsigned_compare(
+        &mut self,
+        value: IntValue<'ctx>,
+        bit_width: u32,
+        name: &str,
+    ) -> Result<IntValue<'ctx>> {
+        let current_width = value.get_type().get_bit_width();
+        if current_width == bit_width {
+            return Ok(value);
+        }
+
+        let target_type = self.context.custom_width_int_type(bit_width);
+        if current_width > bit_width {
+            self.builder
+                .build_int_truncate(value, target_type, name)
+                .map_err(|e| CodeGenError::Builder(e.to_string()))
+        } else {
+            self.builder
+                .build_int_z_extend(value, target_type, name)
+                .map_err(|e| CodeGenError::Builder(e.to_string()))
+        }
     }
 
     fn compile_binary_op_with_ordering(
@@ -1931,7 +1999,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         left: BasicValueEnum<'ctx>,
         op: BinaryOp,
         right: BasicValueEnum<'ctx>,
-        use_unsigned_ordering: bool,
+        unsigned_ordering_width: Option<u32>,
     ) -> Result<BasicValueEnum<'ctx>> {
         use inkwell::values::BasicValueEnum::*;
 
@@ -1960,6 +2028,22 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         match (left, right) {
             (IntValue(left_int), IntValue(right_int)) => {
+                let unsigned_cmp_values = if let Some(bit_width) = unsigned_ordering_width {
+                    Some((
+                        self.normalize_int_for_unsigned_compare(
+                            left_int,
+                            bit_width,
+                            "lhs_unsigned_cmp",
+                        )?,
+                        self.normalize_int_for_unsigned_compare(
+                            right_int,
+                            bit_width,
+                            "rhs_unsigned_cmp",
+                        )?,
+                    ))
+                } else {
+                    None
+                };
                 let result = match op {
                     BinaryOp::Add => self
                         .builder
@@ -1993,50 +2077,58 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         return Ok(result.into());
                     }
                     BinaryOp::LessThan => {
-                        let predicate = if use_unsigned_ordering {
+                        let predicate = if unsigned_ordering_width.is_some() {
                             inkwell::IntPredicate::ULT
                         } else {
                             inkwell::IntPredicate::SLT
                         };
+                        let (left_cmp, right_cmp) =
+                            unsigned_cmp_values.unwrap_or((left_int, right_int));
                         let result = self
                             .builder
-                            .build_int_compare(predicate, left_int, right_int, "lt")
+                            .build_int_compare(predicate, left_cmp, right_cmp, "lt")
                             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
                         return Ok(result.into());
                     }
                     BinaryOp::LessEqual => {
-                        let predicate = if use_unsigned_ordering {
+                        let predicate = if unsigned_ordering_width.is_some() {
                             inkwell::IntPredicate::ULE
                         } else {
                             inkwell::IntPredicate::SLE
                         };
+                        let (left_cmp, right_cmp) =
+                            unsigned_cmp_values.unwrap_or((left_int, right_int));
                         let result = self
                             .builder
-                            .build_int_compare(predicate, left_int, right_int, "le")
+                            .build_int_compare(predicate, left_cmp, right_cmp, "le")
                             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
                         return Ok(result.into());
                     }
                     BinaryOp::GreaterThan => {
-                        let predicate = if use_unsigned_ordering {
+                        let predicate = if unsigned_ordering_width.is_some() {
                             inkwell::IntPredicate::UGT
                         } else {
                             inkwell::IntPredicate::SGT
                         };
+                        let (left_cmp, right_cmp) =
+                            unsigned_cmp_values.unwrap_or((left_int, right_int));
                         let result = self
                             .builder
-                            .build_int_compare(predicate, left_int, right_int, "gt")
+                            .build_int_compare(predicate, left_cmp, right_cmp, "gt")
                             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
                         return Ok(result.into());
                     }
                     BinaryOp::GreaterEqual => {
-                        let predicate = if use_unsigned_ordering {
+                        let predicate = if unsigned_ordering_width.is_some() {
                             inkwell::IntPredicate::UGE
                         } else {
                             inkwell::IntPredicate::SGE
                         };
+                        let (left_cmp, right_cmp) =
+                            unsigned_cmp_values.unwrap_or((left_int, right_int));
                         let result = self
                             .builder
-                            .build_int_compare(predicate, left_int, right_int, "ge")
+                            .build_int_compare(predicate, left_cmp, right_cmp, "ge")
                             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
                         return Ok(result.into());
                     }

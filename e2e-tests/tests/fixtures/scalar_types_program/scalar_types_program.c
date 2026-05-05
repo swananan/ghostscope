@@ -22,6 +22,7 @@ __attribute__((noinline)) static void scalar_anchor(
     volatile unsigned short *u16p,
     volatile int *i32p,
     volatile unsigned int *u32p,
+    volatile int32_t *i32minp,
     volatile long *ilongp,
     volatile unsigned long *ulongp,
     volatile long long *i64p,
@@ -38,6 +39,7 @@ __attribute__((noinline)) static void scalar_anchor(
     mix ^= (uintptr_t)u16p;
     mix ^= (uintptr_t)i32p;
     mix ^= (uintptr_t)u32p;
+    mix ^= (uintptr_t)i32minp;
     mix ^= (uintptr_t)ilongp;
     mix ^= (uintptr_t)ulongp;
     mix ^= (uintptr_t)i64p;
@@ -146,6 +148,7 @@ __attribute__((noinline)) static void scalar_probe(int iter)
     volatile unsigned short u16_big = (unsigned short)60000u;
     volatile int i32_neg = -12345678;
     volatile unsigned int u32_big = 4000000000U;
+    volatile int32_t i32_min = INT32_MIN;
     volatile long ilong_neg = -4444444444L;
     volatile unsigned long ulong_big = 9000000000UL;
     volatile long long i64_neg = -9000000000000000000LL;
@@ -173,6 +176,7 @@ __attribute__((noinline)) static void scalar_probe(int iter)
         &u16_big,
         &i32_neg,
         &u32_big,
+        &i32_min,
         &ilong_neg,
         &ulong_big,
         &i64_neg,
