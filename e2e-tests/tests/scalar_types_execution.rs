@@ -84,6 +84,10 @@ trace scalar_anchor {
     if *i32p > *u32p { print "MIXED_I32_GT_U32"; }
     if *u32p < *i32p { print "MIXED_U32_LT_I32"; }
     if *i32p < *u32p { print "MIXED_I32_LT_U32"; }
+    if *i32minp < *u32p { print "MIXED_I32_MIN_LT_U32"; }
+    if *i32minp > *u32p { print "MIXED_I32_MIN_GT_U32"; }
+    if *u32p > -10000000000 { print "U32_GT_SCRIPT_NEG"; }
+    if *u32p < -10000000000 { print "U32_LT_SCRIPT_NEG"; }
     if *i8p < *u8p { print "MIXED_I8_LT_U8"; }
     if *i8p > *u8p { print "MIXED_I8_GT_U8"; }
     if *i64p < *u64p { print "MIXED_I64_LT_U64"; }
@@ -109,6 +113,8 @@ trace scalar_anchor {
         "U64_NONZERO",
         "MIXED_I32_GT_U32",
         "MIXED_U32_LT_I32",
+        "MIXED_I32_MIN_LT_U32",
+        "U32_GT_SCRIPT_NEG",
         "MIXED_I8_LT_U8",
         "MIXED_I64_LT_U64",
     ] {
@@ -117,7 +123,12 @@ trace scalar_anchor {
             "Expected comparison marker {marker}. STDOUT: {stdout}"
         );
     }
-    for marker in ["MIXED_I32_LT_U32", "MIXED_I8_GT_U8"] {
+    for marker in [
+        "MIXED_I32_LT_U32",
+        "MIXED_I32_MIN_GT_U32",
+        "U32_LT_SCRIPT_NEG",
+        "MIXED_I8_GT_U8",
+    ] {
         assert!(
             !stdout.contains(marker),
             "Unexpected mixed comparison marker {marker}. STDOUT: {stdout}"
