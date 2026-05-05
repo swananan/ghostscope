@@ -5,9 +5,10 @@
 
 use super::context::{CodeGenError, EbpfContext, Result};
 use ghostscope_dwarf::{
-    AddressOrigin, Availability, ComputeStep, EntryValueCase, MemoryAccessSize, PlannedAddress,
-    PlannedAddressKind, SectionType, TypeInfo, VariableAccessPath, VariableAccessSegment,
-    VariableLocation, VariableMaterializationPlan, VariableReadPlan,
+    AddressOrigin, Availability, MemoryAccessSize, PlannedAddress, PlannedAddressKind,
+    RuntimeComputedExpr, RuntimeEntryValueCase, RuntimeExprOp, SectionType, TypeInfo,
+    VariableAccessPath, VariableAccessSegment, VariableLocation, VariableMaterializationPlan,
+    VariableReadPlan,
 };
 use ghostscope_process::module_probe;
 use inkwell::values::{BasicValueEnum, IntValue, PointerValue};
@@ -79,15 +80,18 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 debug!("Generating register value: {dwarf_reg}");
                 self.load_register_value(*dwarf_reg, pt_regs_ptr)
             }
-            ghostscope_dwarf::PlannedValue::ComputedValue { steps, result_size } => {
-                debug!("Generating computed value: {} steps", steps.len());
+            ghostscope_dwarf::PlannedValue::RuntimeComputed { expr, result_size } => {
+                debug!(
+                    "Generating runtime-computed value: {} steps",
+                    expr.ops().len()
+                );
                 let runtime_status_ptr = if self.condition_context_active {
                     Some(self.get_or_create_cond_error_global())
                 } else {
                     status_ptr
                 };
-                self.generate_compute_steps(
-                    steps,
+                self.generate_runtime_expr_ops(
+                    expr.ops(),
                     pt_regs_ptr,
                     Some(*result_size),
                     runtime_status_ptr,
@@ -147,7 +151,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     status_ptr,
                     module_hint,
                 )?;
-                let value = self.generate_compute_steps(
+                let value = self.generate_runtime_expr_ops(
                     tail_steps,
                     pt_regs_ptr,
                     None,
@@ -194,8 +198,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     ))
                 }
             }
-            PlannedAddressKind::Computed { steps } => {
-                self.address_steps_to_unrebased_address(steps, pt_regs_ptr, status_ptr)
+            PlannedAddressKind::RuntimeComputed { expr } => {
+                self.runtime_expr_to_unrebased_address(expr, pt_regs_ptr, status_ptr)
             }
             PlannedAddressKind::FrameBaseRelative { .. } => Err(CodeGenError::NotImplemented(
                 "Frame-base-relative planned address requires resolved frame base".to_string(),
@@ -203,13 +207,14 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         }
     }
 
-    fn address_steps_to_unrebased_address(
+    fn runtime_expr_to_unrebased_address(
         &mut self,
-        steps: &[ComputeStep],
+        expr: &RuntimeComputedExpr,
         pt_regs_ptr: PointerValue<'ctx>,
         status_ptr: Option<PointerValue<'ctx>>,
     ) -> Result<IntValue<'ctx>> {
-        let val = self.generate_compute_steps(steps, pt_regs_ptr, None, status_ptr, None)?;
+        let val =
+            self.generate_runtime_expr_ops(expr.ops(), pt_regs_ptr, None, status_ptr, None)?;
         match val {
             BasicValueEnum::IntValue(value) => Ok(value),
             _ => Err(CodeGenError::LLVMError(
@@ -521,10 +526,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.sign_extend_memory_read_if_needed(read_value, dwarf_type, access_size)
     }
 
-    /// Execute a sequence of compute steps
-    fn generate_compute_steps(
+    /// Execute a semantic runtime expression selected by DWARF read planning.
+    fn generate_runtime_expr_ops(
         &mut self,
-        steps: &[ComputeStep],
+        ops: &[RuntimeExprOp],
         pt_regs_ptr: PointerValue<'ctx>,
         _result_size: Option<MemoryAccessSize>,
         status_ptr: Option<PointerValue<'ctx>>,
@@ -539,25 +544,25 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             stack.push(top);
         }
 
-        for step in steps {
-            match step {
-                ComputeStep::LoadRegister(reg_num) => {
-                    let reg_value = self.load_register_value(*reg_num, pt_regs_ptr)?;
+        for op in ops {
+            match op {
+                RuntimeExprOp::LoadRegister { dwarf_reg } => {
+                    let reg_value = self.load_register_value(*dwarf_reg, pt_regs_ptr)?;
                     if let BasicValueEnum::IntValue(int_val) = reg_value {
                         stack.push(int_val);
                     } else {
                         return Err(CodeGenError::RegisterMappingError(format!(
-                            "Register {reg_num} did not return integer value"
+                            "Register {dwarf_reg} did not return integer value"
                         )));
                     }
                 }
 
-                ComputeStep::PushConstant(value) => {
+                RuntimeExprOp::PushConstant(value) => {
                     let const_val = self.context.i64_type().const_int(*value as u64, true);
                     stack.push(const_val);
                 }
 
-                ComputeStep::Add => {
+                RuntimeExprOp::Add => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         let sum_val = self
                             .builder
@@ -584,7 +589,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     }
                 }
 
-                ComputeStep::Sub => {
+                RuntimeExprOp::Sub => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         let result = self
                             .builder
@@ -598,7 +603,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     }
                 }
 
-                ComputeStep::Mul => {
+                RuntimeExprOp::Mul => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         let result = self
                             .builder
@@ -612,7 +617,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     }
                 }
 
-                ComputeStep::Div => {
+                RuntimeExprOp::Div => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         let result = self
                             .builder
@@ -626,7 +631,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     }
                 }
 
-                ComputeStep::And => {
+                RuntimeExprOp::And => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         let result = self
                             .builder
@@ -640,7 +645,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     }
                 }
 
-                ComputeStep::Or => {
+                RuntimeExprOp::Or => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         let result = self
                             .builder
@@ -654,7 +659,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     }
                 }
 
-                ComputeStep::Xor => {
+                RuntimeExprOp::Xor => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         let result = self
                             .builder
@@ -668,7 +673,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     }
                 }
 
-                ComputeStep::Shl => {
+                RuntimeExprOp::Shl => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         let result = self
                             .builder
@@ -682,7 +687,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     }
                 }
 
-                ComputeStep::Shr => {
+                RuntimeExprOp::Shr => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         let result = self
                             .builder
@@ -696,7 +701,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     }
                 }
 
-                ComputeStep::Dereference { size } => {
+                RuntimeExprOp::UserMemoryRead { size } => {
                     if let Some(addr) = stack.pop() {
                         // Null guard: if addr == 0, set NullDeref (if status_ptr provided and current is Ok)
                         let zero64 = self.context.i64_type().const_zero();
@@ -856,12 +861,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     }
                 }
 
-                ComputeStep::EntryValueLookup {
-                    caller_pc_steps,
+                RuntimeExprOp::EntryValueLookup {
+                    caller_pc_ops,
                     cases,
                 } => {
                     let value = self.generate_entry_value_lookup(
-                        caller_pc_steps,
+                        caller_pc_ops,
                         cases,
                         pt_regs_ptr,
                         _result_size,
@@ -872,9 +877,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
                 // Add catch-all for unimplemented operations
                 _ => {
-                    warn!("Unimplemented ComputeStep: {:?}", step);
+                    warn!("Unimplemented runtime expression op: {:?}", op);
                     return Err(CodeGenError::NotImplemented(format!(
-                        "ComputeStep {step:?} not yet implemented"
+                        "runtime expression op {op:?} not yet implemented"
                     )));
                 }
             }
@@ -892,8 +897,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
     fn generate_entry_value_lookup(
         &mut self,
-        caller_pc_steps: &[ComputeStep],
-        cases: &[EntryValueCase],
+        caller_pc_ops: &[RuntimeExprOp],
+        cases: &[RuntimeEntryValueCase],
         pt_regs_ptr: PointerValue<'ctx>,
         result_size: Option<MemoryAccessSize>,
         status_ptr: Option<PointerValue<'ctx>>,
@@ -905,8 +910,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         }
 
         let caller_pc = self
-            .generate_compute_steps(
-                caller_pc_steps,
+            .generate_runtime_expr_ops(
+                caller_pc_ops,
                 pt_regs_ptr,
                 Some(MemoryAccessSize::U64),
                 status_ptr,
@@ -985,8 +990,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
             self.builder.position_at_end(case_bb);
             let case_value = self
-                .generate_compute_steps(
-                    &case.value_steps,
+                .generate_runtime_expr_ops(
+                    &case.value_ops,
                     pt_regs_ptr,
                     result_size,
                     status_ptr,
@@ -1388,6 +1393,7 @@ mod tests {
     use super::*;
     use crate::script::Expr;
     use ghostscope_dwarf::AddressExpr;
+    use ghostscope_dwarf::ComputeStep;
     use ghostscope_dwarf::Provenance;
     use inkwell::context::Context as LlvmContext;
 

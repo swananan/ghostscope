@@ -37,10 +37,11 @@ pub use core::{
 pub use semantics::{
     AddressOrigin, AddressSpaceInfo, CfaRulePlan, CompactUnwindRow, CompactUnwindStats,
     CompactUnwindTable, InlineFrame, PcContext, PcLineInfo, PcRange, PlannedAddress,
-    PlannedAddressKind, PlannedValue, RegisterRecoveryPlan, UnwindDiagnostic, UnwindDiagnosticKind,
-    VariableAccessPath, VariableAccessSegment, VariableLoweringKind, VariableLoweringPlan,
-    VariableMaterialization, VariableMaterializationPlan, VariablePlan, VariableQueryDiagnostic,
-    VariableReadPlan, VisibleVariable, VisibleVariablesResult,
+    PlannedAddressKind, PlannedValue, RegisterRecoveryPlan, RuntimeComputedExpr,
+    RuntimeComputedKind, RuntimeEntryValueCase, RuntimeExprOp, UnwindDiagnostic,
+    UnwindDiagnosticKind, VariableAccessPath, VariableAccessSegment, VariableLoweringKind,
+    VariableLoweringPlan, VariableMaterialization, VariableMaterializationPlan, VariablePlan,
+    VariableQueryDiagnostic, VariableReadPlan, VisibleVariable, VisibleVariablesResult,
 };
 
 // Re-export type definitions from protocol (avoiding circular dependencies)
