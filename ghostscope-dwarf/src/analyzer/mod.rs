@@ -103,7 +103,7 @@ impl DwarfAnalyzer {
         let mut variables = Vec::new();
         let mut parameters = Vec::new();
 
-        for variable in self.get_all_variables_at_address(module_address)? {
+        for variable in self.visible_variables_at_address(module_address)? {
             if variable.is_parameter {
                 parameters.push(variable);
             } else {

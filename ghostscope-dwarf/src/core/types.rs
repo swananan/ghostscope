@@ -35,16 +35,6 @@ pub struct SourceLocation {
     pub address: u64,
 }
 
-/// Variable information result
-#[derive(Debug, Clone)]
-pub struct VariableInfo {
-    pub name: String,
-    pub type_name: String,
-    pub location: Option<String>,
-    pub scope_start: Option<u64>,
-    pub scope_end: Option<u64>,
-}
-
 /// Function information
 #[derive(Debug, Clone)]
 pub struct FunctionInfo {
