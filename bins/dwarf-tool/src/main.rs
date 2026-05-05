@@ -165,7 +165,7 @@ enum Commands {
 }
 
 #[derive(Debug, serde::Serialize)]
-struct VariableInfo {
+struct JsonVariableInfo {
     name: String,
     type_name: String,
     location: String,
@@ -180,7 +180,7 @@ struct AddressInfo {
     source_file: Option<String>,
     source_line: Option<u32>,
     source_column: Option<u32>,
-    variables: Vec<VariableInfo>,
+    variables: Vec<JsonVariableInfo>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -641,8 +641,8 @@ fn total_variables_in_query_results(addresses: &[AddressQueryResult]) -> usize {
     addresses.iter().map(query_address_variable_count).sum()
 }
 
-fn variable_info_from_query(variable: &ghostscope_dwarf::VisibleVariable) -> VariableInfo {
-    VariableInfo {
+fn variable_info_from_query(variable: &ghostscope_dwarf::VisibleVariable) -> JsonVariableInfo {
+    JsonVariableInfo {
         name: variable.name.clone(),
         type_name: variable.type_name.clone(),
         location: format!("{}", variable.location),
@@ -1090,7 +1090,8 @@ async fn run_source_line_benchmark(
         let mut run_total_variables = 0usize;
 
         for module_address in &addresses {
-            run_total_variables += analyzer.get_all_variables_at_address(module_address)?.len();
+            let pc_context = analyzer.resolve_pc(module_address)?;
+            run_total_variables += analyzer.visible_variables(&pc_context)?.len();
         }
 
         query_times.push(start.elapsed());

@@ -202,6 +202,9 @@ pub enum PlanError {
     #[error("array access requires array or pointer type, got '{type_name}'")]
     InvalidArrayAccess { type_name: String },
 
+    #[error("Pointer arithmetic requires a pointer or array expression, got '{type_name}'")]
+    InvalidPointerArithmetic { type_name: String },
+
     #[error("pointer dereference requires pointer type, got '{type_name}'")]
     InvalidPointerDereference { type_name: String },
 
@@ -221,6 +224,12 @@ impl PlanError {
     pub fn is_value_backed_aggregate_access(&self) -> bool {
         matches!(self, PlanError::ValueBackedAggregateOffset { .. })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ElementIndexContext {
+    AccessPath,
+    PointerArithmetic,
 }
 
 impl VariableReadPlan {
@@ -379,6 +388,26 @@ impl VariableReadPlan {
         Ok(plan)
     }
 
+    /// Plan pointer-style element access for expressions like `ptr +/- K`.
+    ///
+    /// This keeps pointer dereference and element-size scaling in the DWARF
+    /// semantic layer instead of making compiler lowering rewrite locations.
+    pub fn plan_pointer_element_index(&self, index: i64) -> Result<Self> {
+        let dwarf_type = self
+            .dwarf_type
+            .clone()
+            .ok_or_else(|| PlanError::MissingTypeInfo {
+                name: self.name.clone(),
+            })?;
+        let mut plan =
+            self.plan_element_index(&dwarf_type, index, ElementIndexContext::PointerArithmetic)?;
+        let segment = VariableAccessSegment::ArrayIndex(index);
+        plan.access_path.segments.push(segment.clone());
+        plan.name
+            .push_str(&VariableAccessPath::new(vec![segment]).suffix());
+        Ok(plan)
+    }
+
     fn plan_access_segment(&self, segment: &VariableAccessSegment) -> Result<Self> {
         let dwarf_type = self
             .dwarf_type
@@ -432,6 +461,15 @@ impl VariableReadPlan {
     }
 
     fn plan_array_index(&self, dwarf_type: &TypeInfo, index: i64) -> Result<Self> {
+        self.plan_element_index(dwarf_type, index, ElementIndexContext::AccessPath)
+    }
+
+    fn plan_element_index(
+        &self,
+        dwarf_type: &TypeInfo,
+        index: i64,
+        context: ElementIndexContext,
+    ) -> Result<Self> {
         let (base_location, element_type, stride) = match strip_alias_type(dwarf_type) {
             TypeInfo::ArrayType { element_type, .. } => {
                 let stride = element_type.size().max(1);
@@ -446,8 +484,12 @@ impl VariableReadPlan {
                 )
             }
             ty => {
-                return Err(PlanError::InvalidArrayAccess {
-                    type_name: ty.type_name(),
+                let type_name = ty.type_name();
+                return Err(match context {
+                    ElementIndexContext::AccessPath => PlanError::InvalidArrayAccess { type_name },
+                    ElementIndexContext::PointerArithmetic => {
+                        PlanError::InvalidPointerArithmetic { type_name }
+                    }
                 }
                 .into());
             }
@@ -1738,6 +1780,71 @@ mod tests {
                 ComputeStep::Add,
             ])
         );
+    }
+
+    #[test]
+    fn pointer_element_index_is_planned_in_dwarf_semantics() {
+        let int_type = TypeInfo::BaseType {
+            name: "int".to_string(),
+            size: 4,
+            encoding: gimli::constants::DW_ATE_signed.0 as u16,
+        };
+        let plan = typed_read_plan(
+            VariableLocation::RegisterValue { dwarf_reg: 5 },
+            TypeInfo::PointerType {
+                target_type: Box::new(int_type),
+                size: 8,
+            },
+        );
+
+        let planned = plan
+            .plan_pointer_element_index(3)
+            .expect("pointer element index");
+
+        assert_eq!(planned.name, "value[3]");
+        assert_eq!(
+            planned.location,
+            VariableLocation::ComputedAddress(vec![
+                ComputeStep::LoadRegister(5),
+                ComputeStep::PushConstant(12),
+                ComputeStep::Add,
+            ])
+        );
+    }
+
+    #[test]
+    fn pointer_element_index_rejects_aggregate_arithmetic_with_pointer_error() {
+        let int_type = TypeInfo::BaseType {
+            name: "int".to_string(),
+            size: 4,
+            encoding: gimli::constants::DW_ATE_signed.0 as u16,
+        };
+        let plan = typed_read_plan(
+            VariableLocation::Address(AddressExpr::constant(0x1000)),
+            TypeInfo::StructType {
+                name: "GlobalState".to_string(),
+                size: 16,
+                members: vec![StructMember {
+                    name: "counter".to_string(),
+                    member_type: int_type,
+                    offset: 0,
+                    bit_offset: None,
+                    bit_size: None,
+                }],
+            },
+        );
+
+        let err = plan
+            .plan_pointer_element_index(1)
+            .expect_err("struct arithmetic must be rejected");
+        let plan_error = err
+            .downcast_ref::<PlanError>()
+            .expect("structured plan error");
+        assert!(matches!(
+            plan_error,
+            PlanError::InvalidPointerArithmetic { type_name }
+                if type_name == "struct GlobalState"
+        ));
     }
 
     #[test]

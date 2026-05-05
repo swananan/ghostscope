@@ -4,6 +4,10 @@ use common::{init, OptimizationLevel, FIXTURES};
 
 const TRACE_LINE: u32 = 68;
 
+fn field_path(fields: &[&str]) -> ghostscope_dwarf::VariableAccessPath {
+    ghostscope_dwarf::VariableAccessPath::fields(fields.iter().map(|field| (*field).to_string()))
+}
+
 async fn compile_member_pointer_script(
     script: &str,
     opt_level: OptimizationLevel,
@@ -66,41 +70,34 @@ async fn test_member_pointer_planner_resolves_o2_chain_accesses() -> anyhow::Res
     );
 
     for module_address in &addrs {
+        let pc_context = analyzer.resolve_pc(module_address)?;
         let key_data = analyzer
-            .plan_chain_access_read_plan(
-                module_address,
-                "h",
-                &["key".to_string(), "data".to_string()],
-            )
+            .plan_variable_access_by_name(&pc_context, "h", &field_path(&["key", "data"]))
             .map_err(|e| {
                 anyhow::anyhow!(
-                    "plan_chain_access_read_plan failed for h.key.data at 0x{:x}: {}",
+                    "plan_variable_access_by_name failed for h.key.data at 0x{:x}: {}",
                     module_address.address,
                     e
                 )
             })?;
         anyhow::ensure!(
             key_data.is_some(),
-            "plan_chain_access_read_plan returned None for h.key.data at 0x{:x}",
+            "plan_variable_access_by_name returned None for h.key.data at 0x{:x}",
             module_address.address
         );
 
         let header_pos = analyzer
-            .plan_chain_access_read_plan(
-                module_address,
-                "r",
-                &["header_in".to_string(), "pos".to_string()],
-            )
+            .plan_variable_access_by_name(&pc_context, "r", &field_path(&["header_in", "pos"]))
             .map_err(|e| {
                 anyhow::anyhow!(
-                    "plan_chain_access_read_plan failed for r.header_in.pos at 0x{:x}: {}",
+                    "plan_variable_access_by_name failed for r.header_in.pos at 0x{:x}: {}",
                     module_address.address,
                     e
                 )
             })?;
         anyhow::ensure!(
             header_pos.is_some(),
-            "plan_chain_access_read_plan returned None for r.header_in.pos at 0x{:x}",
+            "plan_variable_access_by_name returned None for r.header_in.pos at 0x{:x}",
             module_address.address
         );
     }
@@ -531,11 +528,12 @@ async fn test_complex_bitfield_chain_planner_resolves_member_offsets() -> anyhow
     );
 
     for module_address in &addrs {
+        let pc_context = analyzer.resolve_pc(module_address)?;
         let active = analyzer
-            .plan_chain_access_read_plan(module_address, "c", &["active".to_string()])?
+            .plan_variable_access_by_name(&pc_context, "c", &field_path(&["active"]))?
             .ok_or_else(|| anyhow::anyhow!("missing plan for c.active at {:?}", module_address))?;
         let flags = analyzer
-            .plan_chain_access_read_plan(module_address, "c", &["flags".to_string()])?
+            .plan_variable_access_by_name(&pc_context, "c", &field_path(&["flags"]))?
             .ok_or_else(|| anyhow::anyhow!("missing plan for c.flags at {:?}", module_address))?;
 
         let expected_steps = vec![

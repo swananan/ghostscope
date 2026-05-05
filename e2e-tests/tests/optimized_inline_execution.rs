@@ -170,18 +170,20 @@ async fn test_optimized_inline_struct_member_access_resolves_inline_parameter_na
         "No DWARF addresses found for inline_callsite_program.c:{INLINE_STATE_TRACE_LINE}"
     );
     for module_address in &addrs {
+        let pc_context = analyzer.resolve_pc(module_address)?;
+        let access_path = ghostscope_dwarf::VariableAccessPath::fields(["total_bytes".to_string()]);
         let planned = analyzer
-            .plan_chain_access_read_plan(module_address, "state", &["total_bytes".to_string()])
+            .plan_variable_access_by_name(&pc_context, "state", &access_path)
             .map_err(|e| {
                 anyhow::anyhow!(
-                    "exec-path plan_chain_access_read_plan failed for 0x{:x}: {}",
+                    "exec-path plan_variable_access_by_name failed for 0x{:x}: {}",
                     module_address.address,
                     e
                 )
             })?;
         anyhow::ensure!(
             planned.is_some(),
-            "exec-path plan_chain_access_read_plan returned None for 0x{:x}",
+            "exec-path plan_variable_access_by_name returned None for 0x{:x}",
             module_address.address
         );
     }
@@ -198,18 +200,20 @@ async fn test_optimized_inline_struct_member_access_resolves_inline_parameter_na
         "No PID-backed DWARF addresses found for inline_callsite_program.c:{INLINE_STATE_TRACE_LINE}"
     );
     for module_address in &pid_addrs {
+        let pc_context = pid_analyzer.resolve_pc(module_address)?;
+        let access_path = ghostscope_dwarf::VariableAccessPath::fields(["total_bytes".to_string()]);
         let planned = pid_analyzer
-            .plan_chain_access_read_plan(module_address, "state", &["total_bytes".to_string()])
+            .plan_variable_access_by_name(&pc_context, "state", &access_path)
             .map_err(|e| {
                 anyhow::anyhow!(
-                    "pid-backed plan_chain_access_read_plan failed for 0x{:x}: {}",
+                    "pid-backed plan_variable_access_by_name failed for 0x{:x}: {}",
                     module_address.address,
                     e
                 )
             })?;
         anyhow::ensure!(
             planned.is_some(),
-            "pid-backed plan_chain_access_read_plan returned None for 0x{:x}",
+            "pid-backed plan_variable_access_by_name returned None for 0x{:x}",
             module_address.address
         );
     }

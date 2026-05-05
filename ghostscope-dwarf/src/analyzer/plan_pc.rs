@@ -356,11 +356,11 @@ impl DwarfAnalyzer {
             .map(Some)
     }
 
-    /// Get all variables visible at the given module address as semantic views.
+    /// Return variables visible at a module address as semantic views.
     ///
     /// # Arguments
     /// * `module_address` - Module address containing both module path and address offset
-    pub fn get_all_variables_at_address(
+    pub(super) fn visible_variables_at_address(
         &self,
         module_address: &ModuleAddress,
     ) -> Result<Vec<VisibleVariable>> {
@@ -371,17 +371,5 @@ impl DwarfAnalyzer {
         );
         let ctx = self.resolve_pc(module_address)?;
         self.visible_variables(&ctx)
-    }
-
-    /// Plan a chain access (e.g., r.headers_in) as a neutral read plan.
-    pub fn plan_chain_access_read_plan(
-        &self,
-        module_address: &ModuleAddress,
-        base_var: &str,
-        chain: &[String],
-    ) -> Result<Option<VariableReadPlan>> {
-        let ctx = self.resolve_pc(module_address)?;
-        let path = VariableAccessPath::fields(chain.iter().cloned());
-        self.plan_variable_access_by_name(&ctx, base_var, &path)
     }
 }

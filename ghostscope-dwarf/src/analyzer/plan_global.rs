@@ -74,20 +74,6 @@ impl DwarfAnalyzer {
         results
     }
 
-    /// Plan a global/static member chain as a neutral read plan.
-    pub fn plan_global_chain_access_read_plan(
-        &self,
-        prefer_module: &PathBuf,
-        base: &str,
-        fields: &[String],
-    ) -> Result<Option<(PathBuf, VariableReadPlan)>> {
-        self.plan_global_access_read_plan(
-            prefer_module,
-            base,
-            &VariableAccessPath::fields(fields.iter().cloned()),
-        )
-    }
-
     /// Plan a global/static source-level access path as a neutral read plan.
     pub fn plan_global_access_read_plan(
         &self,
@@ -162,16 +148,6 @@ impl DwarfAnalyzer {
         die_off: gimli::UnitOffset,
         provenance: Provenance,
     ) -> Result<VariableReadPlan> {
-        let variable = self.resolve_variable_by_offsets_in_module(module_path, cu_off, die_off)?;
-        Ok(Self::read_plan_from_variable(variable, provenance))
-    }
-
-    fn resolve_variable_by_offsets_in_module<P: AsRef<Path>>(
-        &self,
-        module_path: P,
-        cu_off: gimli::DebugInfoOffset,
-        die_off: gimli::UnitOffset,
-    ) -> Result<crate::parser::VariableWithEvaluation> {
         let path_buf = module_path.as_ref().to_path_buf();
         if let Some(module_data) = self.modules.get(&path_buf) {
             let items = vec![(cu_off, die_off)];
@@ -190,7 +166,7 @@ impl DwarfAnalyzer {
                     var.dwarf_type = Some(ti);
                 }
             }
-            Ok(var)
+            Ok(Self::read_plan_from_variable(var, provenance))
         } else {
             Err(anyhow::anyhow!(
                 "Module {} not loaded",

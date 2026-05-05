@@ -533,17 +533,38 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 // Try DWARF resolution for the pointer side
                 if let Some(var) = self.query_dwarf_for_complex_expr(ptr_side)? {
                     if var.dwarf_type.is_some() {
-                        // Determine pointed-to/element type and compute location with scaled offset
                         let index = sign * int_side;
-                        let (location, elem_ty) =
-                            self.compute_pointed_location_with_index(ptr_side, index)?;
-                        let address = ghostscope_dwarf::PlannedAddress::from_location(location)
-                            .ok_or_else(|| {
-                                CodeGenError::DwarfError(
+                        let pointed_plan = var
+                            .plan_pointer_element_index(index)
+                            .map_err(|err| CodeGenError::DwarfError(err.to_string()))?;
+                        let pc_address = self.get_compile_time_context()?.pc_address;
+                        let materialized =
+                            self.variable_read_plan_to_materialization(pointed_plan, pc_address)?;
+                        let elem_ty = materialized.dwarf_type.clone().ok_or_else(|| {
+                            CodeGenError::DwarfError(
+                                "Expression has no DWARF type information".to_string(),
+                            )
+                        })?;
+                        let address = match materialized.materialization {
+                            ghostscope_dwarf::VariableMaterialization::UserMemoryRead {
+                                address,
+                            } => address,
+                            ghostscope_dwarf::VariableMaterialization::Unavailable {
+                                availability,
+                            } => {
+                                return Err(Self::dwarf_expression_unavailable_error(
+                                    &materialized.name,
+                                    &availability,
+                                    pc_address,
+                                ))
+                            }
+                            _ => {
+                                return Err(CodeGenError::DwarfError(
                                     "pointer arithmetic did not produce an address-backed plan"
                                         .to_string(),
-                                )
-                            })?;
+                                ))
+                            }
+                        };
                         let data_len = Self::compute_read_size_for_type(&elem_ty);
                         let module_hint = self.take_module_hint();
                         if data_len == 0 {

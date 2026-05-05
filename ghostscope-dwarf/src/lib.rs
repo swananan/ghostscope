@@ -30,7 +30,7 @@ pub use core::{
     DieRef, DwarfError, EntryValueCase, FunctionId, FunctionInfo, GlobalVariableInfo, HelperMode,
     InlineContextId, MemoryAccessSize, ModuleAddress, ModuleId, PieceLocation, Provenance, Result,
     RuntimeCapabilities, RuntimeRequirement, ScopeId, SectionType, SourceLocation, TargetArch,
-    TypeId, UnsupportedReason, VariableId, VariableInfo, VariableLocation, VerifierRisk,
+    TypeId, UnsupportedReason, VariableId, VariableLocation, VerifierRisk,
 };
 
 // Re-export semantic contract types.

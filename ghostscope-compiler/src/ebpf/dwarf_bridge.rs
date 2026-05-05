@@ -5,7 +5,6 @@
 
 use super::context::{CodeGenError, EbpfContext, Result};
 use ghostscope_dwarf::{
-    semantics::{add_location_offset, dereference_location},
     AddressOrigin, Availability, ComputeStep, EntryValueCase, MemoryAccessSize, PlannedAddress,
     PlannedAddressKind, SectionType, TypeInfo, VariableAccessPath, VariableAccessSegment,
     VariableLocation, VariableMaterializationPlan, VariableReadPlan,
@@ -1227,7 +1226,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         }
 
         if let Some((global_module, plan)) = analyzer
-            .plan_global_chain_access_read_plan(&prefer_module, var_name, &[])
+            .plan_global_access_read_plan(&prefer_module, var_name, &VariableAccessPath::default())
             .map_err(|err| CodeGenError::DwarfError(err.to_string()))?
         {
             debug!("Found DWARF global '{}' via variable read plan", var_name);
@@ -1381,74 +1380,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             return Ok(None);
         };
         Ok(Some((base, VariableAccessPath::new(segments))))
-    }
-
-    /// Compute a typed pointed-to location for expressions like `ptr +/- K` where K is an element index.
-    /// Returns a computed location along with the pointed-to DWARF type.
-    /// The offset is scaled by the element size of the pointer/array target type.
-    pub fn compute_pointed_location_with_index(
-        &mut self,
-        ptr_expr: &crate::script::Expr,
-        index: i64,
-    ) -> Result<(VariableLocation, TypeInfo)> {
-        use ghostscope_dwarf::TypeInfo;
-
-        // Resolve the pointer expression via DWARF
-        let ptr_var = self
-            .query_dwarf_for_complex_expr(ptr_expr)?
-            .ok_or_else(|| CodeGenError::VariableNotFound(format!("{ptr_expr:?}")))?;
-
-        let ptr_ty = ptr_var.dwarf_type.as_ref().ok_or_else(|| {
-            CodeGenError::DwarfError("Expression has no DWARF type information".to_string())
-        })?;
-
-        // Unwrap typedef/qualified wrappers
-        let mut ty = ptr_ty;
-        loop {
-            match ty {
-                TypeInfo::TypedefType {
-                    underlying_type, ..
-                } => ty = underlying_type.as_ref(),
-                TypeInfo::QualifiedType {
-                    underlying_type, ..
-                } => ty = underlying_type.as_ref(),
-                _ => break,
-            }
-        }
-
-        // Extract pointed-to (element) type and element size
-        let (elem_ty, elem_size) = match ty {
-            TypeInfo::PointerType { target_type, .. } => {
-                let et = target_type.as_ref().clone();
-                let es = et.size();
-                let es = if es == 0 { 1 } else { es };
-                (et, es)
-            }
-            TypeInfo::ArrayType { element_type, .. } => {
-                let et = element_type.as_ref().clone();
-                let es = et.size();
-                let es = if es == 0 { 1 } else { es };
-                (et, es)
-            }
-            TypeInfo::FunctionType { .. } => {
-                return Err(CodeGenError::TypeError(
-                    "Pointer arithmetic is not supported on function pointers".to_string(),
-                ))
-            }
-            _ => {
-                return Err(CodeGenError::TypeError(
-                    "Pointer arithmetic requires a pointer or array expression".to_string(),
-                ))
-            }
-        };
-
-        let base_location = dereference_location(&ptr_var.location)
-            .map_err(|err| CodeGenError::DwarfError(err.to_string()))?;
-        let byte_offset = index.saturating_mul(elem_size as i64);
-        let location = add_location_offset(base_location, byte_offset)
-            .map_err(|err| CodeGenError::DwarfError(err.to_string()))?;
-
-        Ok((location, elem_ty))
     }
 }
 
@@ -1673,7 +1604,7 @@ mod tests {
             "ptr",
             "int*",
             Some(ptr_ty),
-            location.clone(),
+            location,
             Availability::Available,
         );
 
@@ -1681,13 +1612,6 @@ mod tests {
             .variable_read_plan_to_llvm_value(&plan, 0, None)
             .expect("absolute address value should lower");
         assert!(matches!(value, BasicValueEnum::IntValue(_)));
-
-        let pointee = dereference_location(&location)
-            .expect("absolute address value should dereference to memory");
-        assert_eq!(
-            pointee,
-            VariableLocation::Address(AddressExpr::constant(0x2000))
-        );
     }
 
     #[test]
