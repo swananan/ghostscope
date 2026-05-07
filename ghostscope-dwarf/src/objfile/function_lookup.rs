@@ -20,6 +20,17 @@ impl LoadedObjfile {
             addresses.extend(self.compute_addresses_for_entry(entry));
         }
 
+        if addresses.is_empty() {
+            if let Some(symbol_starts) = self.text_symbol_starts_by_name.get(name) {
+                tracing::debug!(
+                    "LoadedObjfile: function '{}' has no concrete DWARF ranges; falling back to {} text symbol address(es)",
+                    name,
+                    symbol_starts.len()
+                );
+                addresses.extend(symbol_starts.iter().copied());
+            }
+        }
+
         tracing::debug!(
             "LoadedObjfile: function '{}' resolved to {} addresses: {:?}",
             name,

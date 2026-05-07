@@ -462,18 +462,26 @@ impl LoadedObjfile {
         };
 
         let mut by_name: HashMap<String, Vec<u64>> = HashMap::new();
-        for symbol in object.symbols() {
+        let mut collect_symbol = |symbol: object::Symbol<'_, '_, &[u8]>| {
             if symbol.kind() != SymbolKind::Text {
-                continue;
+                return;
             }
 
             let Ok(name) = symbol.name() else {
-                continue;
+                return;
             };
             by_name
                 .entry(name.to_string())
                 .or_default()
                 .push(symbol.address());
+        };
+
+        for symbol in object.symbols() {
+            collect_symbol(symbol);
+        }
+
+        for symbol in object.dynamic_symbols() {
+            collect_symbol(symbol);
         }
 
         for starts in by_name.values_mut() {
