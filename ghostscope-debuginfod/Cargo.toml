@@ -1,0 +1,25 @@
+[package]
+name = "ghostscope-debuginfod"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+keywords.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+categories.workspace = true
+description = "Async debuginfod client used by GhostScope to fetch debug information and source files by build-id."
+
+[dependencies]
+futures-util.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url = "2.5"
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["full"] }

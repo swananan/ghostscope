@@ -8,6 +8,7 @@ members = [
     "ghostscope-platform",
     "ghostscope",
     "ghostscope-dwarf",
+    "ghostscope-debuginfod",
     "ghostscope-process",
     "bins/dwarf-tool",
     "e2e-tests",
@@ -20,6 +21,7 @@ default-members = [
     "ghostscope-platform",
     "ghostscope",
     "ghostscope-dwarf",
+    "ghostscope-debuginfod",
     "ghostscope-process",
     "bins/dwarf-tool",
 ]
