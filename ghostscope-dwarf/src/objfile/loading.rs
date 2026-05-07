@@ -8,8 +8,9 @@ use crate::{
     index::{BlockIndex, CfiIndex, TypeNameIndex},
     parser::DetailedParser,
 };
+use ghostscope_debuginfod::{build_id_to_hex, DebuginfodClient};
 use object::{Object, ObjectSection, ObjectSymbol, SymbolKind};
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{collections::HashMap, path::Path, sync::Arc, time::Instant};
 
 impl LoadedObjfile {
     /// Parallel loading: debug_info || debug_line || CFI simultaneously
@@ -17,10 +18,16 @@ impl LoadedObjfile {
         module_mapping: ModuleMapping,
         debug_search_paths: &[String],
         allow_loose_debug_match: bool,
+        debuginfod_client: Option<Arc<DebuginfodClient>>,
     ) -> Result<Self> {
         tracing::info!("Parallel loading for: {}", module_mapping.path.display());
-        Self::load_internal_parallel(module_mapping, debug_search_paths, allow_loose_debug_match)
-            .await
+        Self::load_internal_parallel(
+            module_mapping,
+            debug_search_paths,
+            allow_loose_debug_match,
+            debuginfod_client,
+        )
+        .await
     }
 
     /// Parallel internal load implementation - true parallelism for debug_info || debug_line || CFI
@@ -28,6 +35,7 @@ impl LoadedObjfile {
         module_mapping: ModuleMapping,
         debug_search_paths: &[String],
         allow_loose_debug_match: bool,
+        debuginfod_client: Option<Arc<DebuginfodClient>>,
     ) -> Result<Self> {
         let load_started_at = Instant::now();
         tracing::debug!(
@@ -66,11 +74,24 @@ impl LoadedObjfile {
                             (Arc::new(debug_dwarf), debug_mapped)
                         }
                         None => {
-                            tracing::warn!(
-                                "No separate debug file found for: {}",
-                                module_mapping.path.display()
-                            );
-                            (Arc::new(dwarf_data), Arc::clone(&binary_mapped))
+                            match Self::try_load_debuginfod_debug_file(
+                                debuginfod_client.as_ref(),
+                                &binary_mapped,
+                                &module_mapping.path,
+                            )
+                            .await
+                            {
+                                Some((debug_dwarf, debug_mapped)) => {
+                                    (Arc::new(debug_dwarf), debug_mapped)
+                                }
+                                None => {
+                                    tracing::warn!(
+                                        "No separate debug file found for: {}",
+                                        module_mapping.path.display()
+                                    );
+                                    (Arc::new(dwarf_data), Arc::clone(&binary_mapped))
+                                }
+                            }
                         }
                     }
                 }
@@ -240,6 +261,191 @@ impl LoadedObjfile {
 
     fn has_debug_info(dwarf: &DwarfData) -> bool {
         matches!(dwarf.units().next(), Ok(Some(_)))
+    }
+
+    async fn try_load_debuginfod_debug_file(
+        debuginfod_client: Option<&Arc<DebuginfodClient>>,
+        binary_mapped: &Arc<MappedFile>,
+        module_path: &Path,
+    ) -> Option<(DwarfData, Arc<MappedFile>)> {
+        let client = debuginfod_client?;
+        let build_id = match Self::build_id_for_debuginfod(binary_mapped, module_path) {
+            Some(build_id) => build_id,
+            None => return None,
+        };
+        let build_id_hex = build_id_to_hex(&build_id);
+
+        tracing::info!(
+            "Trying debuginfod debug info for {} (build-id={})",
+            module_path.display(),
+            build_id_hex
+        );
+
+        let fetched = match client.fetch_debuginfo(&build_id).await {
+            Ok(Some(fetched)) => fetched,
+            Ok(None) => {
+                tracing::debug!(
+                    "debuginfod had no debug info for {} (build-id={})",
+                    module_path.display(),
+                    build_id_hex
+                );
+                return None;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "debuginfod lookup failed for {} (build-id={}): {}",
+                    module_path.display(),
+                    build_id_hex,
+                    err
+                );
+                return None;
+            }
+        };
+
+        tracing::info!(
+            "debuginfod returned debug info for {} from {} (path={}, from_cache={})",
+            module_path.display(),
+            fetched.url.as_deref().unwrap_or("<cache>"),
+            fetched.path.display(),
+            fetched.from_cache
+        );
+
+        let debug_mapped = match MappedFile::open(&fetched.path) {
+            Ok(mapped) => Arc::new(mapped),
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to open debuginfod debug file {} for {}: {}",
+                    fetched.path.display(),
+                    module_path.display(),
+                    err
+                );
+                return None;
+            }
+        };
+
+        if !Self::debuginfod_debug_file_matches_build_id(&debug_mapped, &build_id, module_path) {
+            return None;
+        }
+
+        let debug_dwarf = match Self::load_dwarf_sections(&debug_mapped) {
+            Ok(dwarf) => dwarf,
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to load DWARF sections from debuginfod debug file {} for {}: {}",
+                    debug_mapped.path.display(),
+                    module_path.display(),
+                    err
+                );
+                return None;
+            }
+        };
+
+        if !Self::has_debug_info(&debug_dwarf) {
+            tracing::warn!(
+                "Ignoring debuginfod debug file {} for {} because it contains no .debug_info",
+                debug_mapped.path.display(),
+                module_path.display()
+            );
+            return None;
+        }
+
+        tracing::info!(
+            "Loading DWARF from debuginfod debug file: {}",
+            debug_mapped.path.display()
+        );
+        Some((debug_dwarf, debug_mapped))
+    }
+
+    fn build_id_for_debuginfod(binary_mapped: &MappedFile, module_path: &Path) -> Option<Vec<u8>> {
+        let object = match binary_mapped.parse_object() {
+            Ok(object) => object,
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to parse object while reading build-id for {}: {}",
+                    module_path.display(),
+                    err
+                );
+                return None;
+            }
+        };
+
+        match object.build_id() {
+            Ok(Some(build_id)) => Some(build_id.to_vec()),
+            Ok(None) => {
+                tracing::debug!(
+                    "No build-id in {}; skipping debuginfod",
+                    module_path.display()
+                );
+                None
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to read build-id from {}; skipping debuginfod: {}",
+                    module_path.display(),
+                    err
+                );
+                None
+            }
+        }
+    }
+
+    fn debuginfod_debug_file_matches_build_id(
+        debug_mapped: &MappedFile,
+        expected_build_id: &[u8],
+        module_path: &Path,
+    ) -> bool {
+        let expected = build_id_to_hex(expected_build_id);
+        let object = match debug_mapped.parse_object() {
+            Ok(object) => object,
+            Err(err) => {
+                tracing::warn!(
+                    "Ignoring debuginfod debug file {} for {}: failed to parse object: {}",
+                    debug_mapped.path.display(),
+                    module_path.display(),
+                    err
+                );
+                return false;
+            }
+        };
+
+        match object.build_id() {
+            Ok(Some(actual_build_id)) if actual_build_id == expected_build_id => {
+                tracing::info!(
+                    "debuginfod build-id verification passed for {}: {}",
+                    debug_mapped.path.display(),
+                    expected
+                );
+                true
+            }
+            Ok(Some(actual_build_id)) => {
+                tracing::warn!(
+                    "Ignoring debuginfod debug file {} for {}: build-id mismatch expected={}, actual={}",
+                    debug_mapped.path.display(),
+                    module_path.display(),
+                    expected,
+                    build_id_to_hex(actual_build_id)
+                );
+                false
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    "Ignoring debuginfod debug file {} for {}: missing build-id, expected={}",
+                    debug_mapped.path.display(),
+                    module_path.display(),
+                    expected
+                );
+                false
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "Ignoring debuginfod debug file {} for {}: failed to read build-id: {}",
+                    debug_mapped.path.display(),
+                    module_path.display(),
+                    err
+                );
+                false
+            }
+        }
     }
 
     fn collect_text_symbol_starts(binary_mapped: &MappedFile) -> HashMap<String, Vec<u64>> {

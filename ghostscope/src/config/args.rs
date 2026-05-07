@@ -3,6 +3,8 @@ use clap::{Args as ClapArgs, CommandFactory, FromArgMatches, Parser, Subcommand,
 use std::path::PathBuf;
 use tracing::warn;
 
+use crate::config::settings::DebuginfodMode;
+
 #[derive(Debug, Clone, Copy, PartialEq, ValueEnum, serde::Serialize, serde::Deserialize)]
 pub enum LayoutMode {
     /// Horizontal layout: panels arranged side by side (4:3:3 ratio)
@@ -188,6 +190,26 @@ pub struct Args {
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub allow_loose_debug_match: bool,
 
+    /// debuginfod mode: off, on, or ask. ask is reserved for future TUI support.
+    #[arg(long, value_name = "MODE", value_enum)]
+    pub debuginfod: Option<DebuginfodMode>,
+
+    /// debuginfod server URL. May be passed more than once.
+    #[arg(long = "debuginfod-url", value_name = "URL")]
+    pub debuginfod_urls: Vec<String>,
+
+    /// debuginfod cache directory.
+    #[arg(long = "debuginfod-cache-dir", value_name = "DIR")]
+    pub debuginfod_cache_dir: Option<PathBuf>,
+
+    /// debuginfod request timeout in seconds. Use 0 for no request timeout.
+    #[arg(long = "debuginfod-timeout-secs", value_name = "SECONDS")]
+    pub debuginfod_timeout_secs: Option<u64>,
+
+    /// debuginfod maximum response size in bytes. Use 0 for no explicit cap.
+    #[arg(long = "debuginfod-max-size", value_name = "BYTES")]
+    pub debuginfod_max_size: Option<u64>,
+
     /// Script to execute (inline script - optional for TUI mode)
     #[arg(long, short = 's', value_name = "SCRIPT")]
     pub script: Option<String>,
@@ -308,6 +330,11 @@ pub struct ParsedArgs {
     pub force_perf_event_array: bool,
     pub enable_sysmon_for_shared_lib: bool,
     pub allow_loose_debug_match: bool,
+    pub debuginfod: Option<DebuginfodMode>,
+    pub debuginfod_urls: Vec<String>,
+    pub debuginfod_cache_dir: Option<PathBuf>,
+    pub debuginfod_timeout_secs: Option<u64>,
+    pub debuginfod_max_size: Option<u64>,
     pub source_panel: bool,
     pub no_source_panel: bool,
 }
@@ -479,6 +506,11 @@ impl Args {
             force_perf_event_array: parsed.force_perf_event_array,
             enable_sysmon_for_shared_lib: parsed.enable_sysmon_shared_lib,
             allow_loose_debug_match: parsed.allow_loose_debug_match,
+            debuginfod: parsed.debuginfod,
+            debuginfod_urls: parsed.debuginfod_urls,
+            debuginfod_cache_dir: parsed.debuginfod_cache_dir,
+            debuginfod_timeout_secs: parsed.debuginfod_timeout_secs,
+            debuginfod_max_size: parsed.debuginfod_max_size,
             source_panel: parsed.source_panel,
             no_source_panel: parsed.no_source_panel,
         }
@@ -652,6 +684,7 @@ mod tests {
     use super::{
         Args, BpffsCommand, BpffsPruneArgs, ParsedCommand, ScriptOutputMode, ScriptTimestampFormat,
     };
+    use crate::config::settings::DebuginfodMode;
 
     #[test]
     fn parses_bpffs_prune_subcommand() {
@@ -812,6 +845,47 @@ mod tests {
             ParsedCommand::Trace(args) => {
                 assert_eq!(args.script_output, Some(ScriptOutputMode::Plain));
                 assert_eq!(args.script_timestamp, Some(ScriptTimestampFormat::Boot));
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_debuginfod_flags() {
+        let parsed = Args::parse_args_from(vec![
+            "ghostscope".to_string(),
+            "--pid".to_string(),
+            "1234".to_string(),
+            "--debuginfod".to_string(),
+            "on".to_string(),
+            "--debuginfod-url".to_string(),
+            "https://debuginfod.ubuntu.com".to_string(),
+            "--debuginfod-url".to_string(),
+            "https://debuginfod.archlinux.org".to_string(),
+            "--debuginfod-cache-dir".to_string(),
+            "/tmp/gs-debug-cache".to_string(),
+            "--debuginfod-timeout-secs".to_string(),
+            "5".to_string(),
+            "--debuginfod-max-size".to_string(),
+            "1048576".to_string(),
+        ]);
+
+        match parsed {
+            ParsedCommand::Trace(args) => {
+                assert_eq!(args.debuginfod, Some(DebuginfodMode::On));
+                assert_eq!(
+                    args.debuginfod_urls,
+                    vec![
+                        "https://debuginfod.ubuntu.com".to_string(),
+                        "https://debuginfod.archlinux.org".to_string()
+                    ]
+                );
+                assert_eq!(
+                    args.debuginfod_cache_dir,
+                    Some(PathBuf::from("/tmp/gs-debug-cache"))
+                );
+                assert_eq!(args.debuginfod_timeout_secs, Some(5));
+                assert_eq!(args.debuginfod_max_size, Some(1048576));
             }
             other => panic!("unexpected parse result: {other:?}"),
         }

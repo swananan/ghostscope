@@ -1,10 +1,11 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::{
-    CliColorMode, Config, LayoutMode, ParsedArgs, ScriptOutputMode, ScriptTimestampFormat,
+    settings::DebuginfodMode, CliColorMode, Config, LayoutMode, ParsedArgs, ScriptOutputMode,
+    ScriptTimestampFormat,
 };
 
 /// Immutable user-provided configuration merged from CLI arguments and config file.
@@ -48,6 +49,7 @@ pub struct UserConfig {
     // DWARF configuration
     pub dwarf_search_paths: Vec<String>,
     pub dwarf_allow_loose_debug_match: bool,
+    pub dwarf_debuginfod: ResolvedDebuginfodConfig,
 
     // eBPF configuration
     pub ebpf_config: crate::config::settings::EbpfConfig,
@@ -62,6 +64,7 @@ pub struct UserConfig {
 impl UserConfig {
     /// Create merged user configuration from parsed arguments and config file.
     pub fn new(args: ParsedArgs, config: Config) -> Self {
+        let dwarf_debuginfod = ResolvedDebuginfodConfig::resolve(&args, &config);
         let log_file = args
             .log_file
             .unwrap_or_else(|| PathBuf::from(&config.general.log_file));
@@ -180,6 +183,7 @@ impl UserConfig {
             } else {
                 config.dwarf.allow_loose_debug_match
             },
+            dwarf_debuginfod,
             ebpf_config: {
                 let mut ebpf_config = config.ebpf;
                 if args.force_perf_event_array {
@@ -282,6 +286,170 @@ impl UserConfig {
         info!("✓ Command line arguments validated successfully");
         Ok(())
     }
+}
+
+/// Fully resolved debuginfod configuration.
+///
+/// The debuginfod client crate is deliberately policy-free. GhostScope resolves
+/// CLI/config/env/default precedence here, then later passes explicit values to
+/// `ghostscope-debuginfod`.
+#[derive(Debug, Clone)]
+pub struct ResolvedDebuginfodConfig {
+    pub mode: DebuginfodMode,
+    pub urls: Vec<String>,
+    pub cache_dir: Option<PathBuf>,
+    /// None means no request timeout.
+    pub timeout_secs: Option<u64>,
+    /// None means no explicit client-side response size cap.
+    pub max_size_bytes: Option<u64>,
+}
+
+impl ResolvedDebuginfodConfig {
+    pub fn is_effectively_enabled(&self) -> bool {
+        self.mode == DebuginfodMode::On && !self.urls.is_empty()
+    }
+
+    fn resolve(args: &ParsedArgs, config: &Config) -> Self {
+        let mode = args.debuginfod.unwrap_or(config.dwarf.debuginfod.enabled);
+
+        if mode == DebuginfodMode::Off {
+            return Self {
+                mode,
+                urls: Vec::new(),
+                cache_dir: None,
+                timeout_secs: None,
+                max_size_bytes: None,
+            };
+        }
+
+        let urls = if !args.debuginfod_urls.is_empty() {
+            args.debuginfod_urls.clone()
+        } else if !config.dwarf.debuginfod.urls.is_empty() {
+            config.dwarf.debuginfod.urls.clone()
+        } else {
+            env_list("DEBUGINFOD_URLS")
+        };
+
+        let cache_dir = args
+            .debuginfod_cache_dir
+            .clone()
+            .filter(|path| !path.as_os_str().is_empty())
+            .or_else(|| {
+                config
+                    .dwarf
+                    .debuginfod
+                    .cache_dir
+                    .clone()
+                    .filter(|path| !path.as_os_str().is_empty())
+            })
+            .or_else(|| env_path("DEBUGINFOD_CACHE_PATH"))
+            .or_else(default_debuginfod_cache_dir);
+
+        let timeout_secs = first_u64(
+            args.debuginfod_timeout_secs,
+            config.dwarf.debuginfod.timeout_secs,
+            env_u64("DEBUGINFOD_TIMEOUT"),
+        )
+        .or(Some(5))
+        .and_then(nonzero_u64);
+
+        let max_size_bytes = first_u64(
+            args.debuginfod_max_size,
+            config.dwarf.debuginfod.max_size_bytes,
+            env_u64("DEBUGINFOD_MAXSIZE"),
+        )
+        .and_then(nonzero_u64);
+
+        if mode == DebuginfodMode::Ask {
+            warn!(
+                "debuginfod mode 'ask' is reserved for future TUI confirmation support; \
+                 debuginfod will not be used until ask-mode is implemented"
+            );
+        } else if urls.is_empty() {
+            info!(
+                "debuginfod is enabled but no URLs were configured; skipping debuginfod fallback"
+            );
+        }
+
+        Self {
+            mode,
+            urls,
+            cache_dir,
+            timeout_secs,
+            max_size_bytes,
+        }
+    }
+}
+
+impl Default for ResolvedDebuginfodConfig {
+    fn default() -> Self {
+        Self {
+            mode: DebuginfodMode::Off,
+            urls: Vec::new(),
+            cache_dir: None,
+            timeout_secs: None,
+            max_size_bytes: None,
+        }
+    }
+}
+
+fn env_list(name: &str) -> Vec<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            value
+                .split_whitespace()
+                .filter(|part| !part.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+}
+
+fn env_u64(name: &str) -> Option<u64> {
+    match std::env::var(name) {
+        Ok(value) if !value.trim().is_empty() => match value.parse::<u64>() {
+            Ok(parsed) => Some(parsed),
+            Err(error) => {
+                warn!("Ignoring invalid {name} value '{value}': {error}");
+                None
+            }
+        },
+        _ => None,
+    }
+}
+
+fn first_u64(cli: Option<u64>, config: Option<u64>, env: Option<u64>) -> Option<u64> {
+    cli.or(config).or(env)
+}
+
+fn nonzero_u64(value: u64) -> Option<u64> {
+    (value != 0).then_some(value)
+}
+
+fn default_debuginfod_cache_dir() -> Option<PathBuf> {
+    std::env::var("XDG_CACHE_HOME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| PathBuf::from(value).join("debuginfod_client"))
+        .or_else(|| {
+            dirs::home_dir().map(|home| {
+                let deprecated = home.join(".debuginfod_client_cache");
+                if deprecated.exists() {
+                    deprecated
+                } else {
+                    home.join(".cache").join("debuginfod_client")
+                }
+            })
+        })
+        .or_else(|| Some(std::env::temp_dir().join("debuginfod_client")))
 }
 
 fn default_enable_logging_for_mode(is_script_mode: bool) -> bool {

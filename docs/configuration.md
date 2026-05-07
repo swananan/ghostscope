@@ -226,6 +226,11 @@ Behavior:
 | `--no-status` | | Disable interactive DWARF/script/attach stderr status prompts | Off override |
 | `--script-timestamp <FORMAT>` | | Pretty output timestamp: local, boot, none | local |
 | `--debug-file <PATH>` | `-d` | Debug info file path | Auto-detect |
+| `--debuginfod <MODE>` | | debuginfod mode: off, on, ask | off |
+| `--debuginfod-url <URL>` | | debuginfod server URL; may be repeated | None |
+| `--debuginfod-cache-dir <DIR>` | | debuginfod cache directory | debuginfod-compatible default |
+| `--debuginfod-timeout-secs <SECONDS>` | | debuginfod request timeout; 0 disables timeout | 5 |
+| `--debuginfod-max-size <BYTES>` | | debuginfod maximum response size; 0 disables cap | 0 |
 | `--tui` | | Start in TUI mode | Auto |
 | `--log` | | Enable file logging | Script: off, TUI: on |
 | `--no-log` | | Disable all logging | - |
@@ -339,6 +344,40 @@ search_paths = [
 # ad-hoc environments or partially repackaged symbols, but may cause inaccurate
 # symbol/line information. Prefer leaving this off unless you know what you are doing.
 allow_loose_debug_match = false
+
+[dwarf.debuginfod]
+# Optional debuginfod fallback for separate debug information.
+# Modes follow GDB's model:
+#   - "off": never use debuginfod and do not read debuginfod environment variables
+#   - "on": allow debuginfod after embedded DWARF and local debug files fail
+#   - "ask": reserved for future TUI confirmation support (currently not used)
+#
+# Default: "off" (no network access unless explicitly enabled)
+enabled = "off"
+
+# Server URLs. When enabled and this list is empty, GhostScope falls back to
+# DEBUGINFOD_URLS. Values are whitespace-separated in the environment but are
+# configured as a TOML array here.
+urls = [
+    # "https://debuginfod.ubuntu.com",
+    # "https://debuginfod.archlinux.org",
+]
+
+# Cache directory for downloaded debuginfo/source artifacts.
+# Leave unset to use:
+#   1. DEBUGINFOD_CACHE_PATH
+#   2. $XDG_CACHE_HOME/debuginfod_client
+#   3. ~/.cache/debuginfod_client
+# cache_dir = "~/.cache/debuginfod_client"
+
+# Request timeout in seconds. Priority:
+# CLI > config file > DEBUGINFOD_TIMEOUT > built-in default (5).
+# Use 0 for no request timeout.
+timeout_secs = 5
+
+# Maximum response size in bytes. Priority:
+# CLI > config file > DEBUGINFOD_MAXSIZE. Use 0 for no explicit cap.
+max_size_bytes = 0
 
 [files]
 # Save LLVM IR files
