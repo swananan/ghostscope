@@ -1,8 +1,8 @@
 use super::LoadedObjfile;
 use crate::{
     binary::{
-        dwarf_endian_from_object, empty_dwarf_reader_with_endian, try_load_debug_file, DwarfData,
-        MappedFile,
+        dwarf_endian_from_object, dwarf_reader_from_arc_with_endian,
+        empty_dwarf_reader_with_endian, try_load_debug_file, DwarfData, MappedFile,
     },
     core::{mapping::ModuleMapping, Result},
     index::{BlockIndex, CfiIndex, TypeNameIndex},
@@ -10,7 +10,7 @@ use crate::{
 };
 use ghostscope_debuginfod::{build_id_to_hex, DebuginfodClient};
 use object::{Object, ObjectSection, ObjectSymbol, SymbolKind};
-use std::{collections::HashMap, path::Path, sync::Arc, time::Instant};
+use std::{borrow::Cow, collections::HashMap, path::Path, sync::Arc, time::Instant};
 
 impl LoadedObjfile {
     /// Parallel loading: debug_info || debug_line || CFI simultaneously
@@ -490,7 +490,22 @@ impl LoadedObjfile {
 
         let load_section = |id: gimli::SectionId| -> Result<_> {
             if let Some(section) = object.section_by_name(id.name()) {
-                if let Some((start, size)) = section.file_range() {
+                let compressed_range = section.compressed_file_range()?;
+                if compressed_range.format != object::read::CompressionFormat::None {
+                    let data = section.uncompressed_data().map_err(|err| {
+                        anyhow::anyhow!(
+                            "Failed to decompress DWARF section {} in {}: {}",
+                            id.name(),
+                            file_data.path.display(),
+                            err
+                        )
+                    })?;
+                    let bytes: Arc<[u8]> = match data {
+                        Cow::Borrowed(bytes) => Arc::from(bytes),
+                        Cow::Owned(bytes) => Arc::from(bytes),
+                    };
+                    Ok(dwarf_reader_from_arc_with_endian(bytes, endian))
+                } else if let Some((start, size)) = section.file_range() {
                     MappedFile::dwarf_reader_range(Arc::clone(file_data), start, size, endian)
                         .ok_or_else(|| {
                             anyhow::anyhow!("Invalid DWARF section range for {}", id.name())

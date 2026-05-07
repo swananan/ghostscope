@@ -82,7 +82,6 @@ pub(crate) fn dwarf_reader_from_arc(bytes: Arc<[u8]>) -> DwarfReader {
     dwarf_reader_from_arc_with_endian(bytes, gimli::RunTimeEndian::Little)
 }
 
-#[cfg(test)]
 pub(crate) fn dwarf_reader_from_arc_with_endian(
     bytes: Arc<[u8]>,
     endian: DwarfEndian,
