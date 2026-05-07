@@ -5,6 +5,7 @@ use crate::{
     core::{mapping::ModuleMapping, Result},
     objfile::LoadedObjfile,
 };
+use ghostscope_debuginfod::DebuginfodClient;
 use std::sync::Arc;
 use tokio::task;
 
@@ -17,6 +18,8 @@ pub struct LoadConfig {
     pub debug_search_paths: Vec<String>,
     /// Allow non-strict debug file matching (CRC/Build-ID)
     pub allow_loose_debug_match: bool,
+    /// Optional debuginfod client for build-id based debug file lookup.
+    pub debuginfod_client: Option<Arc<DebuginfodClient>>,
 }
 
 impl Default for LoadConfig {
@@ -25,6 +28,7 @@ impl Default for LoadConfig {
             max_module_concurrency: num_cpus::get(),
             debug_search_paths: Vec::new(),
             allow_loose_debug_match: false,
+            debuginfod_client: None,
         }
     }
 }
@@ -36,6 +40,7 @@ impl LoadConfig {
             max_module_concurrency: num_cpus::get(),
             debug_search_paths: Vec::new(),
             allow_loose_debug_match: false,
+            debuginfod_client: None,
         }
     }
 }
@@ -70,6 +75,12 @@ impl ModuleLoader {
     /// Set loose debug match policy (CRC/Build-ID mismatches allowed)
     pub fn with_loose_debug_match(mut self, allow: bool) -> Self {
         self.config.allow_loose_debug_match = allow;
+        self
+    }
+
+    /// Set optional debuginfod client for build-id based debug file fallback.
+    pub fn with_debuginfod_client(mut self, client: Option<Arc<DebuginfodClient>>) -> Self {
+        self.config.debuginfod_client = client;
         self
     }
 
@@ -110,6 +121,7 @@ impl ModuleLoader {
         let progress_callback = Arc::new(progress_callback);
         let debug_search_paths = Arc::new(self.config.debug_search_paths.clone());
         let allow_loose = self.config.allow_loose_debug_match;
+        let debuginfod_client = self.config.debuginfod_client.clone();
 
         let tasks: Vec<_> = self
             .mappings
@@ -119,6 +131,7 @@ impl ModuleLoader {
                 let semaphore = semaphore.clone();
                 let progress_callback = progress_callback.clone();
                 let debug_search_paths = debug_search_paths.clone();
+                let debuginfod_client = debuginfod_client.clone();
 
                 task::spawn(async move {
                     let _permit = semaphore.acquire().await.unwrap();
@@ -134,9 +147,13 @@ impl ModuleLoader {
 
                     let start_time = std::time::Instant::now();
 
-                    let result =
-                        LoadedObjfile::load_parallel(mapping, &debug_search_paths, allow_loose)
-                            .await;
+                    let result = LoadedObjfile::load_parallel(
+                        mapping,
+                        &debug_search_paths,
+                        allow_loose,
+                        debuginfod_client,
+                    )
+                    .await;
 
                     let load_time_ms = start_time.elapsed().as_millis() as u64;
 

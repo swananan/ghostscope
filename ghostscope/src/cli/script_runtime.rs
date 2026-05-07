@@ -408,6 +408,7 @@ mod tests {
                 ebpf_max_messages: 1000,
                 dwarf_search_paths: Vec::new(),
                 dwarf_allow_loose_debug_match: false,
+                dwarf_debuginfod: Default::default(),
                 ebpf_config: EbpfConfig::default(),
                 source: Default::default(),
                 config_file_path: None,

@@ -144,6 +144,42 @@ pub struct DwarfConfig {
     /// Default: false (strict). When true, CRC/Build-ID mismatches are allowed with WARN logs.
     #[serde(default)]
     pub allow_loose_debug_match: bool,
+    /// debuginfod client configuration.
+    #[serde(default)]
+    pub debuginfod: DwarfDebuginfodConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, clap::ValueEnum, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DebuginfodMode {
+    /// Never use debuginfod.
+    #[default]
+    Off,
+    /// Use debuginfod when URLs are available.
+    On,
+    /// Reserved for future TUI confirmation support.
+    Ask,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct DwarfDebuginfodConfig {
+    /// Whether debuginfod is allowed.
+    #[serde(default)]
+    pub enabled: DebuginfodMode,
+    /// debuginfod server URLs. Empty means use DEBUGINFOD_URLS when enabled.
+    #[serde(default)]
+    pub urls: Vec<String>,
+    /// debuginfod cache directory. Empty/absent means use debuginfod-compatible defaults.
+    #[serde(default)]
+    pub cache_dir: Option<PathBuf>,
+    /// Request timeout in seconds. Absent means DEBUGINFOD_TIMEOUT or built-in default.
+    /// Zero means no request timeout.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    /// Maximum response size in bytes. Absent means DEBUGINFOD_MAXSIZE or no cap.
+    /// Zero means no explicit cap.
+    #[serde(default)]
+    pub max_size_bytes: Option<u64>,
 }
 
 /// Source code path configuration
@@ -404,6 +440,7 @@ impl Default for DwarfConfig {
         Self {
             search_paths: default_debug_search_paths(),
             allow_loose_debug_match: false,
+            debuginfod: DwarfDebuginfodConfig::default(),
         }
     }
 }

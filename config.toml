@@ -104,6 +104,43 @@ search_paths = [
 # ad-hoc environments; may cause inaccurate symbol/line info.
 allow_loose_debug_match = false
 
+[dwarf.debuginfod]
+# debuginfod fallback for separate debug information.
+# This follows GDB-style modes:
+#   - "off": never use debuginfod and do not read debuginfod environment variables
+#   - "on": allow debuginfod after embedded DWARF and local debug files fail
+#   - "ask": reserved for future TUI confirmation support (currently not used)
+#
+# Default: "off" (no network access unless explicitly enabled)
+enabled = "off"
+
+# Server URLs. When enabled and this list is empty, GhostScope falls back to
+# DEBUGINFOD_URLS. Values are whitespace-separated in the environment but are
+# configured as a TOML array here.
+#
+# Examples:
+#   - "https://debuginfod.ubuntu.com"
+#   - "https://debuginfod.archlinux.org"
+urls = [
+    # "https://debuginfod.ubuntu.com",
+]
+
+# Cache directory for downloaded debuginfo/source artifacts.
+# Leave unset or empty to use:
+#   1. DEBUGINFOD_CACHE_PATH
+#   2. $XDG_CACHE_HOME/debuginfod_client
+#   3. ~/.cache/debuginfod_client
+# cache_dir = "~/.cache/debuginfod_client"
+
+# Request timeout in seconds. CLI overrides this, then config, then
+# DEBUGINFOD_TIMEOUT, then the built-in default of 5 seconds. Use 0 for no
+# request timeout.
+timeout_secs = 5
+
+# Maximum response size in bytes. CLI overrides this, then config, then
+# DEBUGINFOD_MAXSIZE. Use 0 for no explicit client-side cap.
+max_size_bytes = 0
+
 [files]
 # File saving options (overridden by --save-*/--no-save-* flags)
 # Format: { debug = bool, release = bool }

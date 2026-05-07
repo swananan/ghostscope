@@ -8,9 +8,11 @@ use crate::{
     objfile::LoadedObjfile,
     semantics::{CompactUnwindRow, CompactUnwindTable, PcContext, VisibleVariable},
 };
+use ghostscope_debuginfod::DebuginfodClient;
 use object::{Object, ObjectSection};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 mod plan_global;
 mod plan_pc;
@@ -253,6 +255,27 @@ impl DwarfAnalyzer {
     where
         F: Fn(ModuleLoadingEvent) + Send + Sync + 'static,
     {
+        Self::from_pid_parallel_with_config_and_debuginfod(
+            pid,
+            debug_search_paths,
+            allow_loose_debug_match,
+            None,
+            progress_callback,
+        )
+        .await
+    }
+
+    /// Create DWARF analyzer from PID with debug search paths, debuginfod, and progress callback.
+    pub async fn from_pid_parallel_with_config_and_debuginfod<F>(
+        pid: u32,
+        debug_search_paths: &[String],
+        allow_loose_debug_match: bool,
+        debuginfod_client: Option<Arc<DebuginfodClient>>,
+        progress_callback: F,
+    ) -> Result<Self>
+    where
+        F: Fn(ModuleLoadingEvent) + Send + Sync + 'static,
+    {
         tracing::info!("Creating DWARF analyzer for PID {} (parallel)", pid);
 
         // Discover all modules for this process using coordinator
@@ -297,6 +320,7 @@ impl DwarfAnalyzer {
             loader = loader.with_debug_search_paths(debug_search_paths.to_vec());
         }
         loader = loader.with_loose_debug_match(allow_loose_debug_match);
+        loader = loader.with_debuginfod_client(debuginfod_client);
 
         let modules = loader
             .with_progress_callback(progress_callback)
@@ -323,10 +347,27 @@ impl DwarfAnalyzer {
         debug_search_paths: &[String],
         allow_loose_debug_match: bool,
     ) -> Result<Self> {
-        Self::from_exec_path_with_config_and_progress(
+        Self::from_exec_path_with_config_and_debuginfod(
             exec_path,
             debug_search_paths,
             allow_loose_debug_match,
+            None,
+        )
+        .await
+    }
+
+    /// Create DWARF analyzer from executable path with debug search paths and debuginfod.
+    pub async fn from_exec_path_with_config_and_debuginfod<P: AsRef<std::path::Path>>(
+        exec_path: P,
+        debug_search_paths: &[String],
+        allow_loose_debug_match: bool,
+        debuginfod_client: Option<Arc<DebuginfodClient>>,
+    ) -> Result<Self> {
+        Self::from_exec_path_with_config_and_debuginfod_and_progress(
+            exec_path,
+            debug_search_paths,
+            allow_loose_debug_match,
+            debuginfod_client,
             |_event| {},
         )
         .await
@@ -337,6 +378,28 @@ impl DwarfAnalyzer {
         exec_path: P,
         debug_search_paths: &[String],
         allow_loose_debug_match: bool,
+        progress_callback: F,
+    ) -> Result<Self>
+    where
+        P: AsRef<std::path::Path>,
+        F: Fn(ModuleLoadingEvent) + Send + Sync + 'static,
+    {
+        Self::from_exec_path_with_config_and_debuginfod_and_progress(
+            exec_path,
+            debug_search_paths,
+            allow_loose_debug_match,
+            None,
+            progress_callback,
+        )
+        .await
+    }
+
+    /// Create DWARF analyzer from executable path with debug search paths, debuginfod, and progress callback.
+    pub async fn from_exec_path_with_config_and_debuginfod_and_progress<P, F>(
+        exec_path: P,
+        debug_search_paths: &[String],
+        allow_loose_debug_match: bool,
+        debuginfod_client: Option<Arc<DebuginfodClient>>,
         progress_callback: F,
     ) -> Result<Self>
     where
@@ -380,6 +443,7 @@ impl DwarfAnalyzer {
             module_mapping,
             debug_search_paths,
             allow_loose_debug_match,
+            debuginfod_client,
         )
         .await
         {

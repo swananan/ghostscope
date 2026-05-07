@@ -53,6 +53,7 @@ pub struct GhostscopeRunner {
     enable_file_logging: bool,
     enable_console_logging: bool,
     sandbox: Option<SandboxHandle>,
+    extra_args: Vec<OsString>,
 }
 
 impl Default for GhostscopeRunner {
@@ -69,6 +70,7 @@ impl Default for GhostscopeRunner {
             enable_file_logging: false,
             enable_console_logging: false,
             sandbox: None,
+            extra_args: Vec::new(),
         }
     }
 }
@@ -136,6 +138,15 @@ impl GhostscopeRunner {
     #[allow(dead_code)]
     pub fn with_log_level<S: Into<String>>(mut self, level: S) -> Self {
         self.log_level = Some(level.into());
+        self
+    }
+
+    pub fn with_cli_args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString>,
+    {
+        self.extra_args.extend(args.into_iter().map(Into::into));
         self
     }
 
@@ -249,6 +260,7 @@ impl GhostscopeRunner {
         if logging.enable_console_logging {
             args.push(OsString::from("--log-console"));
         }
+        args.extend(self.extra_args);
 
         let launch = sandbox.ghostscope_runner_command(&args)?;
         let mut cmd = Command::new(&launch.program);

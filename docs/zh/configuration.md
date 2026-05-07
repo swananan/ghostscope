@@ -227,6 +227,11 @@ ghostscope bpffs prune --dry-run --json
 | `--no-status` | | 禁用交互式 DWARF/脚本/attach stderr 状态提示 | 关闭覆盖 |
 | `--script-timestamp <FORMAT>` | | pretty 输出时间戳：local, boot, none | local |
 | `--debug-file <PATH>` | `-d` | 调试信息文件路径 | 自动检测 |
+| `--debuginfod <MODE>` | | debuginfod 模式：off, on, ask | off |
+| `--debuginfod-url <URL>` | | debuginfod 服务 URL，可重复传递 | 无 |
+| `--debuginfod-cache-dir <DIR>` | | debuginfod 缓存目录 | debuginfod 兼容默认值 |
+| `--debuginfod-timeout-secs <SECONDS>` | | debuginfod 请求超时；0 表示不设置超时 | 5 |
+| `--debuginfod-max-size <BYTES>` | | debuginfod 最大响应大小；0 表示不设置上限 | 0 |
 | `--tui` | | 以 TUI 模式启动 | 自动 |
 | `--log` | | 启用文件日志 | Script: 关, TUI: 开 |
 | `--no-log` | | 禁用所有日志 | - |
@@ -337,6 +342,39 @@ search_paths = [
 # 默认：false（严格）。当设置为 true 时，即使 CRC 或 Build‑ID 不完全匹配，
 # 也会继续使用该独立调试文件（会记录警告日志）。仅建议在排障或环境不规范时短期启用。
 allow_loose_debug_match = false
+
+[dwarf.debuginfod]
+# 可选的 debuginfod 调试信息回退。
+# 模式参考 GDB：
+#   - "off"：完全不使用 debuginfod，也不读取 debuginfod 相关环境变量
+#   - "on"：嵌入式 DWARF 和本地独立调试文件都失败后，允许使用 debuginfod
+#   - "ask"：预留给未来 TUI 交互确认（当前不会使用）
+#
+# 默认："off"（除非显式开启，否则不会联网）
+enabled = "off"
+
+# 服务器 URL。开启后如果此列表为空，GhostScope 会回退读取 DEBUGINFOD_URLS。
+# 环境变量中是空白分隔；配置文件中使用 TOML 数组。
+urls = [
+    # "https://debuginfod.ubuntu.com",
+    # "https://debuginfod.archlinux.org",
+]
+
+# 下载的 debuginfo/source 本地缓存目录。
+# 未设置时使用：
+#   1. DEBUGINFOD_CACHE_PATH
+#   2. $XDG_CACHE_HOME/debuginfod_client
+#   3. ~/.cache/debuginfod_client
+# cache_dir = "~/.cache/debuginfod_client"
+
+# 请求超时时间（秒）。优先级：
+# 命令行 > 配置文件 > DEBUGINFOD_TIMEOUT > 内置默认 5 秒。
+# 设置为 0 表示不设置请求超时。
+timeout_secs = 5
+
+# 最大响应大小（字节）。优先级：
+# 命令行 > 配置文件 > DEBUGINFOD_MAXSIZE。设置为 0 表示不设置客户端大小上限。
+max_size_bytes = 0
 
 [files]
 # 保存 LLVM IR 文件

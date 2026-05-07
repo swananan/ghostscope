@@ -2,10 +2,12 @@ use crate::config::{ParsedArgs, PidViews, ResolvedConfig};
 use crate::source_path::SourcePathResolver;
 use crate::trace::TraceManager;
 use anyhow::Result;
+use ghostscope_debuginfod::{DebuginfodClient, DebuginfodConfig};
 use ghostscope_dwarf::{DwarfAnalyzer, ModuleStats};
 use ghostscope_process::{ProcessManager, ProcessSysmon, SysmonConfig};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tracing::{info, warn};
 
 #[derive(Debug, Clone)]
@@ -84,6 +86,26 @@ impl GhostSession {
             info!(
                 "Session runtime environment: {}",
                 cfg.runtime.runtime_env.compact_display()
+            );
+            let debuginfod = &cfg.dwarf_debuginfod;
+            info!(
+                "Session debuginfod config: mode={:?}, effective={}, urls={}, cache_dir={}, timeout_secs={}, max_size_bytes={}",
+                debuginfod.mode,
+                debuginfod.is_effectively_enabled(),
+                debuginfod.urls.len(),
+                debuginfod
+                    .cache_dir
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "<unset>".to_string()),
+                debuginfod
+                    .timeout_secs
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                debuginfod
+                    .max_size_bytes
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string())
             );
             if let Some(filter) = cfg.runtime.pid_filter_spec {
                 info!("Session PID filter spec: {:?}", filter);
@@ -186,20 +208,61 @@ impl GhostSession {
             .unwrap_or(false)
     }
 
+    fn build_debuginfod_client(&self) -> Result<Option<Arc<DebuginfodClient>>> {
+        let Some(config) = self.config.as_ref() else {
+            return Ok(None);
+        };
+        let debuginfod = &config.dwarf_debuginfod;
+        if !debuginfod.is_effectively_enabled() {
+            return Ok(None);
+        }
+
+        let Some(cache_dir) = debuginfod.cache_dir.as_ref() else {
+            warn!("debuginfod is enabled but no cache directory was resolved; skipping");
+            return Ok(None);
+        };
+
+        let mut client_config =
+            DebuginfodConfig::new(debuginfod.urls.iter().map(String::as_str), cache_dir)?;
+        client_config = match debuginfod.timeout_secs {
+            Some(timeout_secs) => client_config.with_timeout(Duration::from_secs(timeout_secs)),
+            None => client_config.without_timeout(),
+        };
+        client_config = client_config.with_max_size(debuginfod.max_size_bytes);
+
+        info!(
+            "debuginfod fallback enabled: urls={}, cache_dir={}, timeout_secs={}, max_size_bytes={}",
+            debuginfod.urls.len(),
+            cache_dir.display(),
+            debuginfod
+                .timeout_secs
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            debuginfod
+                .max_size_bytes
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        );
+
+        Ok(Some(Arc::new(DebuginfodClient::new(client_config)?)))
+    }
+
     /// Load binary and perform DWARF analysis using parallel loading (TUI mode)
     pub async fn load_binary_parallel(&mut self) -> Result<()> {
         info!("Loading binary and performing DWARF analysis (parallel mode)");
 
         let debug_search_paths = self.get_debug_search_paths();
         let allow_loose = self.get_allow_loose_debug_match();
+        let debuginfod_client = self.build_debuginfod_client()?;
 
         let process_analyzer = if let Some(proc_pid) = self.proc_pid() {
             info!("Loading binary from PID: {} (parallel)", proc_pid);
             Some(
-                DwarfAnalyzer::from_pid_parallel_with_config(
+                DwarfAnalyzer::from_pid_parallel_with_config_and_debuginfod(
                     proc_pid,
                     &debug_search_paths,
                     allow_loose,
+                    debuginfod_client.clone(),
                     |_| {},
                 )
                 .await?,
@@ -207,10 +270,11 @@ impl GhostSession {
         } else if let Some(ref binary_path) = self.target_binary {
             info!("Loading binary from executable path: {}", binary_path);
             Some(
-                DwarfAnalyzer::from_exec_path_with_config(
+                DwarfAnalyzer::from_exec_path_with_config_and_debuginfod(
                     binary_path,
                     &debug_search_paths,
                     allow_loose,
+                    debuginfod_client.clone(),
                 )
                 .await?,
             )
@@ -235,6 +299,7 @@ impl GhostSession {
 
         let debug_search_paths = self.get_debug_search_paths();
         let allow_loose = self.get_allow_loose_debug_match();
+        let debuginfod_client = self.build_debuginfod_client()?;
 
         let process_analyzer = if let Some(proc_pid) = self.proc_pid() {
             info!(
@@ -242,10 +307,11 @@ impl GhostSession {
                 proc_pid
             );
             Some(
-                DwarfAnalyzer::from_pid_parallel_with_config(
+                DwarfAnalyzer::from_pid_parallel_with_config_and_debuginfod(
                     proc_pid,
                     &debug_search_paths,
                     allow_loose,
+                    debuginfod_client.clone(),
                     progress_callback,
                 )
                 .await?,
@@ -253,10 +319,11 @@ impl GhostSession {
         } else if let Some(ref binary_path) = self.target_binary {
             info!("Loading binary from executable path: {}", binary_path);
             Some(
-                DwarfAnalyzer::from_exec_path_with_config_and_progress(
+                DwarfAnalyzer::from_exec_path_with_config_and_debuginfod_and_progress(
                     binary_path,
                     &debug_search_paths,
                     allow_loose,
+                    debuginfod_client.clone(),
                     progress_callback,
                 )
                 .await?,
@@ -391,6 +458,11 @@ mod tests {
             force_perf_event_array: false,
             enable_sysmon_for_shared_lib: false,
             allow_loose_debug_match: false,
+            debuginfod: None,
+            debuginfod_urls: Vec::new(),
+            debuginfod_cache_dir: None,
+            debuginfod_timeout_secs: None,
+            debuginfod_max_size: None,
             source_panel: false,
             no_source_panel: false,
         };

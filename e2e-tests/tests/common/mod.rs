@@ -229,6 +229,7 @@ pub fn init() {
         // Exercise runner builder methods so they are referenced in all bins.
         let _ = runner::GhostscopeRunner::new()
             .with_target("/")
+            .with_cli_args([std::ffi::OsString::from("--help")])
             .force_perf_event_array(false)
             .enable_sysmon_shared_lib(false);
 
