@@ -5,7 +5,7 @@
 
 use crate::{
     binary::{dwarf_endian_from_object, DwarfReader, MappedFile},
-    core::{CallerFrameRecovery, CfaResult, ComputeStep, ModuleId, Result},
+    core::{CallerFrameRecovery, CfaResult, ModuleId, PlanExprOp, Result},
     semantics::{
         CfaRulePlan, CompactUnwindRow, CompactUnwindTable, RegisterRecoveryPlan, UnwindDiagnostic,
         UnwindDiagnosticKind,
@@ -169,18 +169,18 @@ impl CfiIndex {
         Ok(cfa)
     }
 
-    /// Recover a caller-frame register value as ComputeStep[] that can be
+    /// Recover a caller-frame register value as PlanExprOp[] that can be
     /// evaluated from the current frame state.
     pub fn recover_caller_register_steps(
         &self,
         pc: u64,
         register: u16,
-    ) -> Result<Option<Vec<ComputeStep>>> {
+    ) -> Result<Option<Vec<PlanExprOp>>> {
         let recovery = self.recover_caller_frame(pc, &[register])?;
         Ok(recovery.register_recovery_steps.get(&register).cloned())
     }
 
-    /// Recover the direct caller frame at `pc` as ComputeStep[].
+    /// Recover the direct caller frame at `pc` as PlanExprOp[].
     pub fn recover_caller_frame(&self, pc: u64, registers: &[u16]) -> Result<CallerFrameRecovery> {
         let fde = self.find_fde_for_address(pc)?;
         let mut ctx = UnwindContext::new();
@@ -542,13 +542,13 @@ impl CfiIndex {
         });
     }
 
-    fn cfa_steps(&self, rule: &CfaRule<usize>) -> Result<Vec<ComputeStep>> {
+    fn cfa_steps(&self, rule: &CfaRule<usize>) -> Result<Vec<PlanExprOp>> {
         match rule {
             CfaRule::RegisterAndOffset { register, offset } => {
-                let mut steps = vec![ComputeStep::LoadRegister(register.0)];
+                let mut steps = vec![PlanExprOp::LoadRegister(register.0)];
                 if *offset != 0 {
-                    steps.push(ComputeStep::PushConstant(*offset));
-                    steps.push(ComputeStep::Add);
+                    steps.push(PlanExprOp::PushConstant(*offset));
+                    steps.push(PlanExprOp::Add);
                 }
                 Ok(steps)
             }
@@ -560,7 +560,7 @@ impl CfiIndex {
         &self,
         unwind_row: &gimli::UnwindTableRow<usize>,
         register: u16,
-    ) -> Result<Option<Vec<ComputeStep>>> {
+    ) -> Result<Option<Vec<PlanExprOp>>> {
         let cfa_steps = self.cfa_steps(unwind_row.cfa())?;
         let rule = unwind_row
             .register(Register(register))
@@ -568,17 +568,17 @@ impl CfiIndex {
 
         match rule {
             Some(RegisterRule::Undefined) => Ok(None),
-            Some(RegisterRule::SameValue) => Ok(Some(vec![ComputeStep::LoadRegister(register)])),
+            Some(RegisterRule::SameValue) => Ok(Some(vec![PlanExprOp::LoadRegister(register)])),
             Some(RegisterRule::Register(other)) => {
-                Ok(Some(vec![ComputeStep::LoadRegister(other.0)]))
+                Ok(Some(vec![PlanExprOp::LoadRegister(other.0)]))
             }
             Some(RegisterRule::Offset(offset)) => {
                 let mut steps = cfa_steps;
                 if offset != 0 {
-                    steps.push(ComputeStep::PushConstant(offset));
-                    steps.push(ComputeStep::Add);
+                    steps.push(PlanExprOp::PushConstant(offset));
+                    steps.push(PlanExprOp::Add);
                 }
-                steps.push(ComputeStep::Dereference {
+                steps.push(PlanExprOp::Dereference {
                     size: crate::core::MemoryAccessSize::U64,
                 });
                 Ok(Some(steps))
@@ -586,14 +586,14 @@ impl CfiIndex {
             Some(RegisterRule::ValOffset(offset)) => {
                 let mut steps = cfa_steps;
                 if offset != 0 {
-                    steps.push(ComputeStep::PushConstant(offset));
-                    steps.push(ComputeStep::Add);
+                    steps.push(PlanExprOp::PushConstant(offset));
+                    steps.push(PlanExprOp::Add);
                 }
                 Ok(Some(steps))
             }
             Some(RegisterRule::Expression(expr)) => {
                 let mut steps = self.parse_unwind_expression(expr)?;
-                steps.push(ComputeStep::Dereference {
+                steps.push(PlanExprOp::Dereference {
                     size: crate::core::MemoryAccessSize::U64,
                 });
                 Ok(Some(steps))
@@ -602,7 +602,7 @@ impl CfiIndex {
                 Ok(Some(self.parse_unwind_expression(expr)?))
             }
             Some(RegisterRule::Constant(value)) => {
-                Ok(Some(vec![ComputeStep::PushConstant(value as i64)]))
+                Ok(Some(vec![PlanExprOp::PushConstant(value as i64)]))
             }
             Some(RegisterRule::Architectural) | None => Ok(None),
         }
@@ -611,7 +611,7 @@ impl CfiIndex {
     fn parse_unwind_expression(
         &self,
         expr: gimli::UnwindExpression<usize>,
-    ) -> Result<Vec<ComputeStep>> {
+    ) -> Result<Vec<PlanExprOp>> {
         let expression = expr.get(&self.eh_frame)?;
         crate::dwarf_expr::cfa::parse_expression(expression.0, self.encoding)
     }

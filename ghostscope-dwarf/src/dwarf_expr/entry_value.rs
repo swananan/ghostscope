@@ -2,7 +2,7 @@
 
 use crate::{
     binary::DwarfReader,
-    core::{ComputeStep, EntryValueCase, Result},
+    core::{EntryValueCase, PlanExprOp, Result},
     dwarf_expr::{errors as expr_errors, modes::DwarfExprMode},
     index::{BlockIndexBuilder, CfiIndex, FunctionBlocks},
 };
@@ -22,7 +22,7 @@ pub(crate) struct LocationContext<'a> {
 
 pub(crate) enum LoweredEntryValue {
     Steps {
-        steps: Vec<ComputeStep>,
+        steps: Vec<PlanExprOp>,
         forces_stack_value: bool,
     },
     Optimized,
@@ -107,7 +107,7 @@ pub(crate) fn resolve_register(
     dwarf: Option<&gimli::Dwarf<DwarfReader>>,
     function_context: Option<&FunctionBlocks>,
     cfi_index: Option<&CfiIndex>,
-) -> Result<Vec<ComputeStep>> {
+) -> Result<Vec<PlanExprOp>> {
     let function_context = function_context
         .ok_or_else(|| anyhow::anyhow!("DW_OP_entry_value requires function call-site context"))?;
     build_incoming_lookup(current_pc, register, dwarf, function_context, cfi_index).or_else(
@@ -131,7 +131,7 @@ fn build_incoming_lookup(
     dwarf: Option<&gimli::Dwarf<DwarfReader>>,
     function_context: &FunctionBlocks,
     cfi_index: Option<&CfiIndex>,
-) -> Result<Vec<ComputeStep>> {
+) -> Result<Vec<PlanExprOp>> {
     let cfi_index = cfi_index.ok_or_else(|| {
         anyhow::anyhow!(
             "DW_OP_entry_value register recovery needs CFI at 0x{:x}",
@@ -140,7 +140,7 @@ fn build_incoming_lookup(
     })?;
     let recovery = cfi_index.recover_caller_frame(current_pc, &[])?;
 
-    let mut cases_by_return_pc = BTreeMap::<u64, Vec<ComputeStep>>::new();
+    let mut cases_by_return_pc = BTreeMap::<u64, Vec<PlanExprOp>>::new();
     let parameters = collect_parameter_steps(register, dwarf, function_context);
     for (caller_return_pc, caller_value_steps) in parameters {
         let value_steps =
@@ -189,7 +189,7 @@ pub(crate) fn collect_parameter_steps(
     register: u16,
     dwarf: Option<&gimli::Dwarf<DwarfReader>>,
     function_context: &FunctionBlocks,
-) -> Vec<(u64, Vec<ComputeStep>)> {
+) -> Vec<(u64, Vec<PlanExprOp>)> {
     let indexed_parameters: Vec<_> = function_context
         .incoming_entry_value_parameters(register)
         .into_iter()
@@ -222,7 +222,7 @@ pub(crate) fn resolve_register_offset(
     dwarf: Option<&gimli::Dwarf<DwarfReader>>,
     function_context: Option<&FunctionBlocks>,
     cfi_index: Option<&CfiIndex>,
-) -> Result<Vec<ComputeStep>> {
+) -> Result<Vec<PlanExprOp>> {
     if is_stack_pointer_register(register) {
         return recover_stack_pointer_steps(current_pc, offset, address_size, cfi_index);
     }
@@ -254,7 +254,7 @@ fn recover_register_from_cfi(
     current_pc: u64,
     register: u16,
     cfi_index: Option<&CfiIndex>,
-) -> Result<Vec<ComputeStep>> {
+) -> Result<Vec<PlanExprOp>> {
     let cfi_index = cfi_index.ok_or_else(|| {
         anyhow::anyhow!(
             "DW_OP_entry_value register recovery needs CFI at 0x{:x}",
@@ -277,7 +277,7 @@ fn recover_stack_pointer_steps(
     offset: i64,
     address_size: u8,
     cfi_index: Option<&CfiIndex>,
-) -> Result<Vec<ComputeStep>> {
+) -> Result<Vec<PlanExprOp>> {
     let cfi_index = cfi_index.ok_or_else(|| {
         anyhow::anyhow!(
             "DW_OP_entry_value stack-pointer recovery needs CFI at 0x{:x}",
@@ -295,10 +295,10 @@ fn recover_stack_pointer_steps(
     Ok(steps)
 }
 
-pub(crate) fn cfa_to_steps(cfa: crate::core::CfaResult) -> Vec<ComputeStep> {
+pub(crate) fn cfa_to_steps(cfa: crate::core::CfaResult) -> Vec<PlanExprOp> {
     match cfa {
         crate::core::CfaResult::RegisterPlusOffset { register, offset } => {
-            let mut steps = vec![ComputeStep::LoadRegister(register)];
+            let mut steps = vec![PlanExprOp::LoadRegister(register)];
             append_constant_offset(&mut steps, offset);
             steps
         }
@@ -306,10 +306,10 @@ pub(crate) fn cfa_to_steps(cfa: crate::core::CfaResult) -> Vec<ComputeStep> {
     }
 }
 
-pub(crate) fn append_constant_offset(steps: &mut Vec<ComputeStep>, offset: i64) {
+pub(crate) fn append_constant_offset(steps: &mut Vec<PlanExprOp>, offset: i64) {
     if offset != 0 {
-        steps.push(ComputeStep::PushConstant(offset));
-        steps.push(ComputeStep::Add);
+        steps.push(PlanExprOp::PushConstant(offset));
+        steps.push(PlanExprOp::Add);
     }
 }
 
@@ -321,9 +321,9 @@ fn is_stack_pointer_register(register: u16) -> bool {
 }
 
 pub(crate) fn build_lookup_steps(
-    caller_pc_steps: Vec<ComputeStep>,
-    cases_by_return_pc: BTreeMap<u64, Vec<ComputeStep>>,
-) -> Vec<ComputeStep> {
+    caller_pc_steps: Vec<PlanExprOp>,
+    cases_by_return_pc: BTreeMap<u64, Vec<PlanExprOp>>,
+) -> Vec<PlanExprOp> {
     let cases: Vec<_> = cases_by_return_pc
         .into_iter()
         .map(|(caller_return_pc, value_steps)| EntryValueCase {
@@ -337,21 +337,21 @@ pub(crate) fn build_lookup_steps(
             cases.len()
         );
     }
-    vec![ComputeStep::EntryValueLookup {
+    vec![PlanExprOp::EntryValueLookup {
         caller_pc_steps,
         cases,
     }]
 }
 
 fn materialize_caller_value_steps(
-    steps: &[ComputeStep],
+    steps: &[PlanExprOp],
     current_pc: u64,
     cfi_index: Option<&CfiIndex>,
-) -> Result<Vec<ComputeStep>> {
+) -> Result<Vec<PlanExprOp>> {
     let mut materialized = Vec::new();
     for step in steps {
         match step {
-            ComputeStep::LoadRegister(register) => {
+            PlanExprOp::LoadRegister(register) => {
                 let cfi_index = cfi_index.ok_or_else(|| {
                     anyhow::anyhow!(
                         "DW_OP_entry_value register recovery needs CFI at 0x{:x}",
@@ -382,7 +382,7 @@ mod tests {
         resolve_register,
     };
     use crate::binary::{dwarf_reader_from_arc, DwarfReader};
-    use crate::core::{ComputeStep, EntryValueCase};
+    use crate::core::{EntryValueCase, PlanExprOp};
     use crate::index::{BlockNode, CallSiteParameter, CallSiteRecord, FunctionBlocks};
     use gimli::constants;
     use gimli::write::{
@@ -502,7 +502,7 @@ mod tests {
                 call_target: None,
                 parameters: vec![CallSiteParameter {
                     callee_register: 5,
-                    caller_value_steps: vec![ComputeStep::PushConstant(11)],
+                    caller_value_steps: vec![PlanExprOp::PushConstant(11)],
                 }],
             }],
         );
@@ -516,7 +516,7 @@ mod tests {
                 call_target: None,
                 parameters: vec![CallSiteParameter {
                     callee_register: 5,
-                    caller_value_steps: vec![ComputeStep::PushConstant(22)],
+                    caller_value_steps: vec![PlanExprOp::PushConstant(22)],
                 }],
             }],
         );
@@ -559,7 +559,7 @@ mod tests {
                 call_target: None,
                 parameters: vec![CallSiteParameter {
                     callee_register: 5,
-                    caller_value_steps: vec![ComputeStep::PushConstant(22)],
+                    caller_value_steps: vec![PlanExprOp::PushConstant(22)],
                 }],
             }],
         );
@@ -602,7 +602,7 @@ mod tests {
                 call_target: Some(0x1200),
                 parameters: vec![CallSiteParameter {
                     callee_register: 5,
-                    caller_value_steps: vec![ComputeStep::PushConstant(33)],
+                    caller_value_steps: vec![PlanExprOp::PushConstant(33)],
                 }],
             }],
         );
@@ -616,7 +616,7 @@ mod tests {
                 call_target: Some(0x1200),
                 parameters: vec![CallSiteParameter {
                     callee_register: 5,
-                    caller_value_steps: vec![ComputeStep::PushConstant(44)],
+                    caller_value_steps: vec![PlanExprOp::PushConstant(44)],
                 }],
             }],
         );
@@ -626,21 +626,21 @@ mod tests {
             cases_by_return_pc.insert(caller_return_pc, parameter.caller_value_steps.clone());
         }
         let steps = build_lookup_steps(
-            vec![ComputeStep::PushConstant(0xdeadbeef)],
+            vec![PlanExprOp::PushConstant(0xdeadbeef)],
             cases_by_return_pc,
         );
         assert_eq!(
             steps,
-            vec![ComputeStep::EntryValueLookup {
-                caller_pc_steps: vec![ComputeStep::PushConstant(0xdeadbeef)],
+            vec![PlanExprOp::EntryValueLookup {
+                caller_pc_steps: vec![PlanExprOp::PushConstant(0xdeadbeef)],
                 cases: vec![
                     EntryValueCase {
                         caller_return_pc: 0x2018,
-                        value_steps: vec![ComputeStep::PushConstant(33)],
+                        value_steps: vec![PlanExprOp::PushConstant(33)],
                     },
                     EntryValueCase {
                         caller_return_pc: 0x2030,
-                        value_steps: vec![ComputeStep::PushConstant(44)],
+                        value_steps: vec![PlanExprOp::PushConstant(44)],
                     },
                 ],
             }]
@@ -675,7 +675,7 @@ mod tests {
                 call_target: Some(0x1200),
                 parameters: vec![CallSiteParameter {
                     callee_register: 5,
-                    caller_value_steps: vec![ComputeStep::PushConstant(33)],
+                    caller_value_steps: vec![PlanExprOp::PushConstant(33)],
                 }],
             }],
         );
@@ -685,7 +685,7 @@ mod tests {
 
         assert_eq!(
             parameters,
-            vec![(0x2018, vec![ComputeStep::PushConstant(33)])]
+            vec![(0x2018, vec![PlanExprOp::PushConstant(33)])]
         );
     }
 
@@ -700,9 +700,9 @@ mod tests {
         assert_eq!(
             entry_sp_steps,
             vec![
-                ComputeStep::LoadRegister(7),
-                ComputeStep::PushConstant(32),
-                ComputeStep::Add,
+                PlanExprOp::LoadRegister(7),
+                PlanExprOp::PushConstant(32),
+                PlanExprOp::Add,
             ]
         );
     }

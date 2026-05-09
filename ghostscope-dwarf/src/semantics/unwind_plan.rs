@@ -1,4 +1,4 @@
-use crate::core::{ComputeStep, ModuleId};
+use crate::core::{ModuleId, PlanExprOp};
 
 /// A compact, row-oriented unwind table derived from DWARF CFI.
 #[derive(Debug, Clone, PartialEq)]
@@ -50,7 +50,7 @@ pub struct CompactUnwindRow {
 #[derive(Debug, Clone, PartialEq)]
 pub enum CfaRulePlan {
     RegPlusOffset { register: u16, offset: i64 },
-    Expression { steps: Vec<ComputeStep> },
+    Expression { steps: Vec<PlanExprOp> },
     Unsupported { reason: String },
 }
 
@@ -85,7 +85,7 @@ pub enum RegisterRecoveryPlan {
         value: u64,
     },
     Expression {
-        steps: Vec<ComputeStep>,
+        steps: Vec<PlanExprOp>,
         dereference: bool,
     },
     Unsupported {

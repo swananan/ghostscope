@@ -1,14 +1,14 @@
 //! CFA DWARF expression lowering.
 
 use crate::{
-    core::{ComputeStep, MemoryAccessSize, Result},
+    core::{MemoryAccessSize, PlanExprOp, Result},
     dwarf_expr::{errors as expr_errors, modes::DwarfExprMode},
 };
 use anyhow::anyhow;
 use gimli::Reader;
 
-/// Parse CFA DWARF expression operations into a `ComputeStep` sequence.
-pub(crate) fn parse_expression<R>(reader: R, encoding: gimli::Encoding) -> Result<Vec<ComputeStep>>
+/// Parse CFA DWARF expression operations into a `PlanExprOp` sequence.
+pub(crate) fn parse_expression<R>(reader: R, encoding: gimli::Encoding) -> Result<Vec<PlanExprOp>>
 where
     R: Reader<Offset = usize>,
 {
@@ -20,26 +20,26 @@ where
     )? {
         match op {
             gimli::Operation::Register { register } => {
-                steps.push(ComputeStep::LoadRegister(register.0));
+                steps.push(PlanExprOp::LoadRegister(register.0));
             }
             gimli::Operation::RegisterOffset {
                 register, offset, ..
             } => {
-                steps.push(ComputeStep::LoadRegister(register.0));
+                steps.push(PlanExprOp::LoadRegister(register.0));
                 if offset != 0 {
-                    steps.push(ComputeStep::PushConstant(offset));
-                    steps.push(ComputeStep::Add);
+                    steps.push(PlanExprOp::PushConstant(offset));
+                    steps.push(PlanExprOp::Add);
                 }
             }
             gimli::Operation::PlusConstant { value } => {
-                steps.push(ComputeStep::PushConstant(value as i64));
-                steps.push(ComputeStep::Add);
+                steps.push(PlanExprOp::PushConstant(value as i64));
+                steps.push(PlanExprOp::Add);
             }
             gimli::Operation::UnsignedConstant { value } => {
-                steps.push(ComputeStep::PushConstant(value as i64));
+                steps.push(PlanExprOp::PushConstant(value as i64));
             }
             gimli::Operation::SignedConstant { value } => {
-                steps.push(ComputeStep::PushConstant(value));
+                steps.push(PlanExprOp::PushConstant(value));
             }
             gimli::Operation::Deref { size, space, .. } => {
                 if space {
@@ -58,14 +58,14 @@ where
                         ))
                     }
                 };
-                steps.push(ComputeStep::Dereference { size });
+                steps.push(PlanExprOp::Dereference { size });
             }
-            gimli::Operation::Plus => steps.push(ComputeStep::Add),
-            gimli::Operation::Minus => steps.push(ComputeStep::Sub),
-            gimli::Operation::Mul => steps.push(ComputeStep::Mul),
-            gimli::Operation::And => steps.push(ComputeStep::And),
-            gimli::Operation::Or => steps.push(ComputeStep::Or),
-            gimli::Operation::Xor => steps.push(ComputeStep::Xor),
+            gimli::Operation::Plus => steps.push(PlanExprOp::Add),
+            gimli::Operation::Minus => steps.push(PlanExprOp::Sub),
+            gimli::Operation::Mul => steps.push(PlanExprOp::Mul),
+            gimli::Operation::And => steps.push(PlanExprOp::And),
+            gimli::Operation::Or => steps.push(PlanExprOp::Or),
+            gimli::Operation::Xor => steps.push(PlanExprOp::Xor),
             gimli::Operation::Nop => {}
             _ => {
                 return Err(anyhow!("unsupported CFA expression operation: {:?}", op));
@@ -79,7 +79,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::parse_expression;
-    use crate::core::{ComputeStep, MemoryAccessSize};
+    use crate::core::{MemoryAccessSize, PlanExprOp};
     use gimli::{EndianSlice, RunTimeEndian};
 
     fn test_encoding() -> gimli::Encoding {
@@ -90,7 +90,7 @@ mod tests {
         }
     }
 
-    fn parse_test_expr(bytes: &[u8]) -> crate::core::Result<Vec<ComputeStep>> {
+    fn parse_test_expr(bytes: &[u8]) -> crate::core::Result<Vec<PlanExprOp>> {
         parse_expression(
             EndianSlice::new(bytes, RunTimeEndian::Little),
             test_encoding(),
@@ -100,13 +100,13 @@ mod tests {
     #[test]
     fn cfa_expression_parses_unsigned_constant() {
         let steps = parse_test_expr(&[0x10, 0x2a]).expect("DW_OP_constu should parse");
-        assert_eq!(steps, vec![ComputeStep::PushConstant(42)]);
+        assert_eq!(steps, vec![PlanExprOp::PushConstant(42)]);
     }
 
     #[test]
     fn cfa_expression_parses_signed_constant() {
         let steps = parse_test_expr(&[0x11, 0x7f]).expect("DW_OP_consts should parse");
-        assert_eq!(steps, vec![ComputeStep::PushConstant(-1)]);
+        assert_eq!(steps, vec![PlanExprOp::PushConstant(-1)]);
     }
 
     #[test]
@@ -115,8 +115,8 @@ mod tests {
         assert_eq!(
             steps,
             vec![
-                ComputeStep::LoadRegister(0),
-                ComputeStep::Dereference {
+                PlanExprOp::LoadRegister(0),
+                PlanExprOp::Dereference {
                     size: MemoryAccessSize::U64,
                 },
             ]

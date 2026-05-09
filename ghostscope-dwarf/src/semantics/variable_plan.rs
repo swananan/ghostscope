@@ -1,8 +1,8 @@
 //! Variable semantic plans before runtime-specific lowering.
 
 use crate::core::{
-    AddressExpr, Availability, ComputeStep, DieRef, HelperMode, InlineContextId, MemoryAccessSize,
-    PieceLocation, Provenance, Result, RuntimeCapabilities, RuntimeRequirement, TypeId,
+    AddressExpr, Availability, DieRef, HelperMode, InlineContextId, MemoryAccessSize,
+    PieceLocation, PlanExprOp, Provenance, Result, RuntimeCapabilities, RuntimeRequirement, TypeId,
     UnsupportedReason, VariableId, VariableLocation, VerifierRisk,
 };
 use crate::semantics::PcRange;
@@ -79,62 +79,6 @@ pub enum RuntimeComputedKind {
     Value,
 }
 
-/// Runtime operation selected by the DWARF semantic planner.
-///
-/// This is the backend contract for computed variable plans. It is intentionally
-/// separate from the evaluator's `ComputeStep` so compiler lowering does not
-/// consume raw DWARF-expression internals.
-#[derive(Debug, Clone, PartialEq)]
-pub enum RuntimeExprOp {
-    LoadRegister {
-        dwarf_reg: u16,
-    },
-    PushConstant(i64),
-    UserMemoryRead {
-        size: MemoryAccessSize,
-    },
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Mod,
-    And,
-    Or,
-    Xor,
-    Shl,
-    Shr,
-    Shra,
-    Not,
-    Neg,
-    Abs,
-    Dup,
-    Drop,
-    Swap,
-    Rot,
-    Pick(u8),
-    Eq,
-    Ne,
-    Lt,
-    Le,
-    Gt,
-    Ge,
-    If {
-        then_ops: Vec<RuntimeExprOp>,
-        else_ops: Vec<RuntimeExprOp>,
-    },
-    EntryValueLookup {
-        caller_pc_ops: Vec<RuntimeExprOp>,
-        cases: Vec<RuntimeEntryValueCase>,
-    },
-}
-
-/// One caller-side case for runtime `DW_OP_entry_value` recovery.
-#[derive(Debug, Clone, PartialEq)]
-pub struct RuntimeEntryValueCase {
-    pub caller_return_pc: u64,
-    pub value_ops: Vec<RuntimeExprOp>,
-}
-
 /// Runtime expression selected by DWARF semantic planning.
 ///
 /// This is intentionally still expressive enough to carry the DWARF evaluator's
@@ -143,25 +87,25 @@ pub struct RuntimeEntryValueCase {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeComputedExpr {
     kind: RuntimeComputedKind,
-    ops: Vec<RuntimeExprOp>,
+    ops: Vec<PlanExprOp>,
 }
 
 impl RuntimeComputedExpr {
-    pub(crate) fn address(steps: Vec<ComputeStep>) -> Self {
+    pub(crate) fn address(ops: Vec<PlanExprOp>) -> Self {
         Self {
             kind: RuntimeComputedKind::Address,
-            ops: runtime_ops_from_steps(steps),
+            ops,
         }
     }
 
-    pub(crate) fn value(steps: Vec<ComputeStep>) -> Self {
+    pub(crate) fn value(ops: Vec<PlanExprOp>) -> Self {
         Self {
             kind: RuntimeComputedKind::Value,
-            ops: runtime_ops_from_steps(steps),
+            ops,
         }
     }
 
-    pub fn ops(&self) -> &[RuntimeExprOp] {
+    pub fn ops(&self) -> &[PlanExprOp] {
         &self.ops
     }
 
@@ -170,72 +114,15 @@ impl RuntimeComputedExpr {
     }
 
     pub fn runtime_requirements(&self) -> Vec<RuntimeRequirement> {
-        requirements_for_runtime_ops(&self.ops)
+        requirements_for_steps(&self.ops)
     }
 
     pub fn required_registers(&self) -> Vec<u16> {
-        registers_for_runtime_ops(&self.ops)
+        registers_for_steps(&self.ops)
     }
 
     pub fn estimated_stack_bytes(&self) -> usize {
-        estimate_runtime_ops_stack_bytes(&self.ops)
-    }
-}
-
-fn runtime_ops_from_steps(steps: Vec<ComputeStep>) -> Vec<RuntimeExprOp> {
-    steps.into_iter().map(runtime_op_from_step).collect()
-}
-
-fn runtime_op_from_step(step: ComputeStep) -> RuntimeExprOp {
-    match step {
-        ComputeStep::LoadRegister(dwarf_reg) => RuntimeExprOp::LoadRegister { dwarf_reg },
-        ComputeStep::PushConstant(value) => RuntimeExprOp::PushConstant(value),
-        ComputeStep::Dereference { size } => RuntimeExprOp::UserMemoryRead { size },
-        ComputeStep::Add => RuntimeExprOp::Add,
-        ComputeStep::Sub => RuntimeExprOp::Sub,
-        ComputeStep::Mul => RuntimeExprOp::Mul,
-        ComputeStep::Div => RuntimeExprOp::Div,
-        ComputeStep::Mod => RuntimeExprOp::Mod,
-        ComputeStep::And => RuntimeExprOp::And,
-        ComputeStep::Or => RuntimeExprOp::Or,
-        ComputeStep::Xor => RuntimeExprOp::Xor,
-        ComputeStep::Shl => RuntimeExprOp::Shl,
-        ComputeStep::Shr => RuntimeExprOp::Shr,
-        ComputeStep::Shra => RuntimeExprOp::Shra,
-        ComputeStep::Not => RuntimeExprOp::Not,
-        ComputeStep::Neg => RuntimeExprOp::Neg,
-        ComputeStep::Abs => RuntimeExprOp::Abs,
-        ComputeStep::Dup => RuntimeExprOp::Dup,
-        ComputeStep::Drop => RuntimeExprOp::Drop,
-        ComputeStep::Swap => RuntimeExprOp::Swap,
-        ComputeStep::Rot => RuntimeExprOp::Rot,
-        ComputeStep::Pick(index) => RuntimeExprOp::Pick(index),
-        ComputeStep::Eq => RuntimeExprOp::Eq,
-        ComputeStep::Ne => RuntimeExprOp::Ne,
-        ComputeStep::Lt => RuntimeExprOp::Lt,
-        ComputeStep::Le => RuntimeExprOp::Le,
-        ComputeStep::Gt => RuntimeExprOp::Gt,
-        ComputeStep::Ge => RuntimeExprOp::Ge,
-        ComputeStep::If {
-            then_branch,
-            else_branch,
-        } => RuntimeExprOp::If {
-            then_ops: runtime_ops_from_steps(then_branch),
-            else_ops: runtime_ops_from_steps(else_branch),
-        },
-        ComputeStep::EntryValueLookup {
-            caller_pc_steps,
-            cases,
-        } => RuntimeExprOp::EntryValueLookup {
-            caller_pc_ops: runtime_ops_from_steps(caller_pc_steps),
-            cases: cases
-                .into_iter()
-                .map(|case| RuntimeEntryValueCase {
-                    caller_return_pc: case.caller_return_pc,
-                    value_ops: runtime_ops_from_steps(case.value_steps),
-                })
-                .collect(),
-        },
+        estimate_steps_stack_bytes(&self.ops)
     }
 }
 
@@ -697,7 +584,7 @@ impl PlannedValue {
                 Some(Self::RegisterValue { dwarf_reg, size })
             }
             VariableLocation::ComputedValue(steps) => {
-                if let [ComputeStep::PushConstant(value)] = steps.as_slice() {
+                if let [PlanExprOp::PushConstant(value)] = steps.as_slice() {
                     Some(Self::Constant {
                         value: *value,
                         size,
@@ -759,20 +646,20 @@ impl PlannedAddress {
         match (&self.origin, &self.kind) {
             (AddressOrigin::LinkTime, PlannedAddressKind::Constant { address }) => Some(*address),
             (AddressOrigin::LinkTime, PlannedAddressKind::RuntimeComputed { expr }) => {
-                fold_constant_runtime_ops(expr.ops())
+                fold_constant_steps(expr.ops())
             }
             _ => None,
         }
     }
 
-    pub fn link_time_base_and_runtime_tail(&self) -> Option<(u64, &[RuntimeExprOp])> {
+    pub fn link_time_base_and_runtime_tail(&self) -> Option<(u64, &[PlanExprOp])> {
         if self.origin != AddressOrigin::LinkTimeBase {
             return None;
         }
 
         match &self.kind {
             PlannedAddressKind::RuntimeComputed { expr } => {
-                link_time_base_and_runtime_tail_ops(expr.ops())
+                link_time_base_and_runtime_tail(expr.ops())
             }
             _ => None,
         }
@@ -780,7 +667,7 @@ impl PlannedAddress {
 }
 
 impl PlannedAddressKind {
-    fn from_steps(steps: Vec<ComputeStep>) -> Self {
+    fn from_steps(steps: Vec<PlanExprOp>) -> Self {
         match fold_constant_steps(&steps) {
             Some(address) => Self::Constant { address },
             None => Self::RuntimeComputed {
@@ -810,7 +697,7 @@ fn planned_value_size(dwarf_type: Option<&TypeInfo>) -> MemoryAccessSize {
         .unwrap_or(MemoryAccessSize::U64)
 }
 
-fn address_origin_for_steps(steps: &[ComputeStep]) -> AddressOrigin {
+fn address_origin_for_steps(steps: &[PlanExprOp]) -> AddressOrigin {
     if fold_constant_steps(steps).is_some() {
         return AddressOrigin::LinkTime;
     }
@@ -826,12 +713,12 @@ fn address_origin_for_steps(steps: &[ComputeStep]) -> AddressOrigin {
     }
 }
 
-fn fold_constant_steps(steps: &[ComputeStep]) -> Option<u64> {
+fn fold_constant_steps(steps: &[PlanExprOp]) -> Option<u64> {
     let mut const_stack: Vec<i64> = Vec::new();
     for step in steps {
         match step {
-            ComputeStep::PushConstant(value) => const_stack.push(*value),
-            ComputeStep::Add => {
+            PlanExprOp::PushConstant(value) => const_stack.push(*value),
+            PlanExprOp::Add => {
                 let rhs = const_stack.pop()?;
                 let lhs = const_stack.pop()?;
                 const_stack.push(lhs.saturating_add(rhs));
@@ -847,29 +734,8 @@ fn fold_constant_steps(steps: &[ComputeStep]) -> Option<u64> {
     }
 }
 
-fn fold_constant_runtime_ops(ops: &[RuntimeExprOp]) -> Option<u64> {
-    let mut const_stack: Vec<i64> = Vec::new();
-    for op in ops {
-        match op {
-            RuntimeExprOp::PushConstant(value) => const_stack.push(*value),
-            RuntimeExprOp::Add => {
-                let rhs = const_stack.pop()?;
-                let lhs = const_stack.pop()?;
-                const_stack.push(lhs.saturating_add(rhs));
-            }
-            _ => return None,
-        }
-    }
-
-    if const_stack.len() == 1 && const_stack[0] >= 0 {
-        Some(const_stack[0] as u64)
-    } else {
-        None
-    }
-}
-
-fn link_time_base_and_runtime_tail(steps: &[ComputeStep]) -> Option<(u64, &[ComputeStep])> {
-    let Some(ComputeStep::PushConstant(base)) = steps.first() else {
+fn link_time_base_and_runtime_tail(steps: &[PlanExprOp]) -> Option<(u64, &[PlanExprOp])> {
+    let Some(PlanExprOp::PushConstant(base)) = steps.first() else {
         return None;
     };
 
@@ -879,10 +745,10 @@ fn link_time_base_and_runtime_tail(steps: &[ComputeStep]) -> Option<(u64, &[Comp
 
     for step in steps.iter().skip(1) {
         match step {
-            ComputeStep::LoadRegister(_) => {
+            PlanExprOp::LoadRegister(_) => {
                 break;
             }
-            ComputeStep::Dereference { .. } => {
+            PlanExprOp::Dereference { .. } => {
                 return Some((*base as u64, &steps[1..]));
             }
             _ => {}
@@ -892,36 +758,12 @@ fn link_time_base_and_runtime_tail(steps: &[ComputeStep]) -> Option<(u64, &[Comp
     None
 }
 
-fn link_time_base_and_runtime_tail_ops(ops: &[RuntimeExprOp]) -> Option<(u64, &[RuntimeExprOp])> {
-    let Some(RuntimeExprOp::PushConstant(base)) = ops.first() else {
-        return None;
-    };
-
-    if *base < 0 {
-        return None;
-    }
-
-    for op in ops.iter().skip(1) {
-        match op {
-            RuntimeExprOp::LoadRegister { .. } => {
-                break;
-            }
-            RuntimeExprOp::UserMemoryRead { .. } => {
-                return Some((*base as u64, &ops[1..]));
-            }
-            _ => {}
-        }
-    }
-
-    None
-}
-
-fn steps_reference_runtime_state(steps: &[ComputeStep]) -> bool {
+fn steps_reference_runtime_state(steps: &[PlanExprOp]) -> bool {
     steps.iter().any(|step| match step {
-        ComputeStep::LoadRegister(_)
-        | ComputeStep::Dereference { .. }
-        | ComputeStep::EntryValueLookup { .. } => true,
-        ComputeStep::If {
+        PlanExprOp::LoadRegister(_)
+        | PlanExprOp::Dereference { .. }
+        | PlanExprOp::EntryValueLookup { .. } => true,
+        PlanExprOp::If {
             then_branch,
             else_branch,
         } => {
@@ -1027,14 +869,12 @@ impl VariableLocationLoweringExt for VariableLocation {
     }
 }
 
-fn requirements_for_steps(steps: &[ComputeStep]) -> Vec<RuntimeRequirement> {
+fn requirements_for_steps(steps: &[PlanExprOp]) -> Vec<RuntimeRequirement> {
     let mut requirements = Vec::new();
     for step in steps {
         match step {
-            ComputeStep::Dereference { .. } => {
-                requirements.push(RuntimeRequirement::UserMemoryRead)
-            }
-            ComputeStep::EntryValueLookup {
+            PlanExprOp::Dereference { .. } => requirements.push(RuntimeRequirement::UserMemoryRead),
+            PlanExprOp::EntryValueLookup {
                 caller_pc_steps,
                 cases,
             } => {
@@ -1044,7 +884,7 @@ fn requirements_for_steps(steps: &[ComputeStep]) -> Vec<RuntimeRequirement> {
                     requirements.extend(requirements_for_steps(&case.value_steps));
                 }
             }
-            ComputeStep::If {
+            PlanExprOp::If {
                 then_branch,
                 else_branch,
             } => {
@@ -1057,17 +897,17 @@ fn requirements_for_steps(steps: &[ComputeStep]) -> Vec<RuntimeRequirement> {
     requirements
 }
 
-fn registers_for_steps(steps: &[ComputeStep]) -> Vec<u16> {
+fn registers_for_steps(steps: &[PlanExprOp]) -> Vec<u16> {
     let mut registers = Vec::new();
     collect_registers_for_steps(steps, &mut registers);
     registers
 }
 
-fn collect_registers_for_steps(steps: &[ComputeStep], registers: &mut Vec<u16>) {
+fn collect_registers_for_steps(steps: &[PlanExprOp], registers: &mut Vec<u16>) {
     for step in steps {
         match step {
-            ComputeStep::LoadRegister(register) => registers.push(*register),
-            ComputeStep::EntryValueLookup {
+            PlanExprOp::LoadRegister(register) => registers.push(*register),
+            PlanExprOp::EntryValueLookup {
                 caller_pc_steps,
                 cases,
             } => {
@@ -1076,7 +916,7 @@ fn collect_registers_for_steps(steps: &[ComputeStep], registers: &mut Vec<u16>) 
                     collect_registers_for_steps(&case.value_steps, registers);
                 }
             }
-            ComputeStep::If {
+            PlanExprOp::If {
                 then_branch,
                 else_branch,
             } => {
@@ -1088,11 +928,11 @@ fn collect_registers_for_steps(steps: &[ComputeStep], registers: &mut Vec<u16>) 
     }
 }
 
-fn estimate_steps_stack_bytes(steps: &[ComputeStep]) -> usize {
+fn estimate_steps_stack_bytes(steps: &[PlanExprOp]) -> usize {
     let nested = steps
         .iter()
         .map(|step| match step {
-            ComputeStep::EntryValueLookup {
+            PlanExprOp::EntryValueLookup {
                 caller_pc_steps,
                 cases,
             } => cases
@@ -1101,7 +941,7 @@ fn estimate_steps_stack_bytes(steps: &[ComputeStep]) -> usize {
                 .chain(std::iter::once(estimate_steps_stack_bytes(caller_pc_steps)))
                 .max()
                 .unwrap_or(0),
-            ComputeStep::If {
+            PlanExprOp::If {
                 then_branch,
                 else_branch,
             } => {
@@ -1112,85 +952,6 @@ fn estimate_steps_stack_bytes(steps: &[ComputeStep]) -> usize {
         .max()
         .unwrap_or(0);
     steps.len().saturating_mul(8).max(nested)
-}
-
-fn requirements_for_runtime_ops(ops: &[RuntimeExprOp]) -> Vec<RuntimeRequirement> {
-    let mut requirements = Vec::new();
-    for op in ops {
-        match op {
-            RuntimeExprOp::UserMemoryRead { .. } => {
-                requirements.push(RuntimeRequirement::UserMemoryRead)
-            }
-            RuntimeExprOp::EntryValueLookup {
-                caller_pc_ops,
-                cases,
-            } => {
-                requirements.push(RuntimeRequirement::CallerFrame);
-                requirements.extend(requirements_for_runtime_ops(caller_pc_ops));
-                for case in cases {
-                    requirements.extend(requirements_for_runtime_ops(&case.value_ops));
-                }
-            }
-            RuntimeExprOp::If { then_ops, else_ops } => {
-                requirements.extend(requirements_for_runtime_ops(then_ops));
-                requirements.extend(requirements_for_runtime_ops(else_ops));
-            }
-            _ => {}
-        }
-    }
-    requirements
-}
-
-fn registers_for_runtime_ops(ops: &[RuntimeExprOp]) -> Vec<u16> {
-    let mut registers = Vec::new();
-    collect_registers_for_runtime_ops(ops, &mut registers);
-    registers
-}
-
-fn collect_registers_for_runtime_ops(ops: &[RuntimeExprOp], registers: &mut Vec<u16>) {
-    for op in ops {
-        match op {
-            RuntimeExprOp::LoadRegister { dwarf_reg } => registers.push(*dwarf_reg),
-            RuntimeExprOp::EntryValueLookup {
-                caller_pc_ops,
-                cases,
-            } => {
-                collect_registers_for_runtime_ops(caller_pc_ops, registers);
-                for case in cases {
-                    collect_registers_for_runtime_ops(&case.value_ops, registers);
-                }
-            }
-            RuntimeExprOp::If { then_ops, else_ops } => {
-                collect_registers_for_runtime_ops(then_ops, registers);
-                collect_registers_for_runtime_ops(else_ops, registers);
-            }
-            _ => {}
-        }
-    }
-}
-
-fn estimate_runtime_ops_stack_bytes(ops: &[RuntimeExprOp]) -> usize {
-    let nested = ops
-        .iter()
-        .map(|op| match op {
-            RuntimeExprOp::EntryValueLookup {
-                caller_pc_ops,
-                cases,
-            } => cases
-                .iter()
-                .map(|case| estimate_runtime_ops_stack_bytes(&case.value_ops))
-                .chain(std::iter::once(estimate_runtime_ops_stack_bytes(
-                    caller_pc_ops,
-                )))
-                .max()
-                .unwrap_or(0),
-            RuntimeExprOp::If { then_ops, else_ops } => estimate_runtime_ops_stack_bytes(then_ops)
-                .max(estimate_runtime_ops_stack_bytes(else_ops)),
-            _ => 0,
-        })
-        .max()
-        .unwrap_or(0);
-    ops.len().saturating_mul(8).max(nested)
 }
 
 fn helper_mode_for_requirements(
@@ -1312,7 +1073,7 @@ pub fn add_location_offset(location: VariableLocation, offset: i64) -> Result<Va
 }
 
 fn offset_address_expr(mut expr: AddressExpr, offset: i64) -> AddressExpr {
-    if let [ComputeStep::PushConstant(base)] = expr.steps.as_mut_slice() {
+    if let [PlanExprOp::PushConstant(base)] = expr.steps.as_mut_slice() {
         *base = base.saturating_add(offset);
         return expr;
     }
@@ -1320,10 +1081,10 @@ fn offset_address_expr(mut expr: AddressExpr, offset: i64) -> AddressExpr {
     expr
 }
 
-fn push_add_offset(steps: &mut Vec<ComputeStep>, offset: i64) {
+fn push_add_offset(steps: &mut Vec<PlanExprOp>, offset: i64) {
     if offset != 0 {
-        steps.push(ComputeStep::PushConstant(offset));
-        steps.push(ComputeStep::Add);
+        steps.push(PlanExprOp::PushConstant(offset));
+        steps.push(PlanExprOp::Add);
     }
 }
 
@@ -1333,7 +1094,7 @@ pub fn dereference_location(location: &VariableLocation) -> Result<VariableLocat
         VariableLocation::AbsoluteAddressValue(expr) => Ok(VariableLocation::Address(expr.clone())),
         VariableLocation::RegisterValue { dwarf_reg } => {
             Ok(VariableLocation::ComputedAddress(vec![
-                ComputeStep::LoadRegister(*dwarf_reg),
+                PlanExprOp::LoadRegister(*dwarf_reg),
             ]))
         }
         VariableLocation::ComputedValue(steps) => {
@@ -1348,22 +1109,22 @@ pub fn dereference_location(location: &VariableLocation) -> Result<VariableLocat
         }
         VariableLocation::Address(expr) => {
             let mut steps = expr.steps.clone();
-            steps.push(ComputeStep::Dereference {
+            steps.push(PlanExprOp::Dereference {
                 size: MemoryAccessSize::U64,
             });
             Ok(VariableLocation::ComputedAddress(steps))
         }
         VariableLocation::RegisterAddress { dwarf_reg, offset } => {
-            let mut steps = vec![ComputeStep::LoadRegister(*dwarf_reg)];
+            let mut steps = vec![PlanExprOp::LoadRegister(*dwarf_reg)];
             push_add_offset(&mut steps, *offset);
-            steps.push(ComputeStep::Dereference {
+            steps.push(PlanExprOp::Dereference {
                 size: MemoryAccessSize::U64,
             });
             Ok(VariableLocation::ComputedAddress(steps))
         }
         VariableLocation::ComputedAddress(steps) => {
             let mut steps = steps.clone();
-            steps.push(ComputeStep::Dereference {
+            steps.push(PlanExprOp::Dereference {
                 size: MemoryAccessSize::U64,
             });
             Ok(VariableLocation::ComputedAddress(steps))
@@ -1519,12 +1280,12 @@ mod tests {
     #[test]
     fn materialization_plan_marks_static_base_before_deref() {
         let plan = read_plan(VariableLocation::ComputedAddress(vec![
-            ComputeStep::PushConstant(0x3000),
-            ComputeStep::Dereference {
+            PlanExprOp::PushConstant(0x3000),
+            PlanExprOp::Dereference {
                 size: MemoryAccessSize::U64,
             },
-            ComputeStep::PushConstant(16),
-            ComputeStep::Add,
+            PlanExprOp::PushConstant(16),
+            PlanExprOp::Add,
         ]));
         let materialized = plan.materialization_plan(&capabilities(true));
 
@@ -1550,10 +1311,10 @@ mod tests {
     #[test]
     fn materialization_plan_preserves_arithmetic_before_first_deref() {
         let plan = read_plan(VariableLocation::ComputedAddress(vec![
-            ComputeStep::PushConstant(0x3000),
-            ComputeStep::PushConstant(8),
-            ComputeStep::Add,
-            ComputeStep::Dereference {
+            PlanExprOp::PushConstant(0x3000),
+            PlanExprOp::PushConstant(8),
+            PlanExprOp::Add,
+            PlanExprOp::Dereference {
                 size: MemoryAccessSize::U64,
             },
         ]));
@@ -1569,9 +1330,9 @@ mod tests {
                 assert_eq!(
                     tail,
                     &[
-                        RuntimeExprOp::PushConstant(8),
-                        RuntimeExprOp::Add,
-                        RuntimeExprOp::UserMemoryRead {
+                        PlanExprOp::PushConstant(8),
+                        PlanExprOp::Add,
+                        PlanExprOp::Dereference {
                             size: MemoryAccessSize::U64,
                         },
                     ]
@@ -1611,7 +1372,7 @@ mod tests {
     #[test]
     fn materialization_plan_converts_constant_direct_value() {
         let plan = read_plan(VariableLocation::ComputedValue(vec![
-            ComputeStep::PushConstant(42),
+            PlanExprOp::PushConstant(42),
         ]));
         let materialized = plan.materialization_plan(&capabilities(false));
 
@@ -1636,9 +1397,9 @@ mod tests {
         };
         let plan = typed_read_plan(
             VariableLocation::ComputedValue(vec![
-                ComputeStep::LoadRegister(0),
-                ComputeStep::PushConstant(1),
-                ComputeStep::Add,
+                PlanExprOp::LoadRegister(0),
+                PlanExprOp::PushConstant(1),
+                PlanExprOp::Add,
             ]),
             byte_type,
         );
@@ -1732,16 +1493,16 @@ mod tests {
     #[test]
     fn entry_value_steps_surface_caller_frame_and_memory_requirements() {
         let plan = read_plan(VariableLocation::ComputedValue(vec![
-            ComputeStep::EntryValueLookup {
+            PlanExprOp::EntryValueLookup {
                 caller_pc_steps: vec![
-                    ComputeStep::LoadRegister(7),
-                    ComputeStep::Dereference {
+                    PlanExprOp::LoadRegister(7),
+                    PlanExprOp::Dereference {
                         size: MemoryAccessSize::U64,
                     },
                 ],
                 cases: vec![EntryValueCase {
                     caller_return_pc: 0x10,
-                    value_steps: vec![ComputeStep::LoadRegister(5)],
+                    value_steps: vec![PlanExprOp::LoadRegister(5)],
                 }],
             },
         ]));
@@ -1764,7 +1525,7 @@ mod tests {
         let mut capabilities = capabilities(true);
         capabilities.max_bpf_stack_bytes = 16;
         let plan = read_plan(VariableLocation::ComputedValue(vec![
-            ComputeStep::PushConstant(1);
+            PlanExprOp::PushConstant(1);
             8
         ]));
         let lowering = plan.bpf_lowering_plan(&capabilities);
@@ -1925,7 +1686,7 @@ mod tests {
         for location in [
             VariableLocation::AbsoluteAddressValue(AddressExpr::constant(0x1000)),
             VariableLocation::RegisterValue { dwarf_reg: 0 },
-            VariableLocation::ComputedValue(vec![ComputeStep::LoadRegister(0)]),
+            VariableLocation::ComputedValue(vec![PlanExprOp::LoadRegister(0)]),
         ] {
             let plan = typed_read_plan(location, struct_type.clone());
             let err = plan
@@ -1956,7 +1717,7 @@ mod tests {
         for location in [
             VariableLocation::AbsoluteAddressValue(AddressExpr::constant(0x1000)),
             VariableLocation::RegisterValue { dwarf_reg: 0 },
-            VariableLocation::ComputedValue(vec![ComputeStep::LoadRegister(0)]),
+            VariableLocation::ComputedValue(vec![PlanExprOp::LoadRegister(0)]),
         ] {
             let plan = typed_read_plan(location, array_type.clone());
             let err = plan
@@ -2002,9 +1763,9 @@ mod tests {
         assert_eq!(
             planned.location,
             VariableLocation::ComputedAddress(vec![
-                ComputeStep::LoadRegister(5),
-                ComputeStep::PushConstant(8),
-                ComputeStep::Add,
+                PlanExprOp::LoadRegister(5),
+                PlanExprOp::PushConstant(8),
+                PlanExprOp::Add,
             ])
         );
     }
@@ -2064,7 +1825,7 @@ mod tests {
             }],
         };
         let plan = typed_read_plan(
-            VariableLocation::ComputedValue(vec![ComputeStep::PushConstant(0x2000)]),
+            VariableLocation::ComputedValue(vec![PlanExprOp::PushConstant(0x2000)]),
             TypeInfo::PointerType {
                 target_type: Box::new(struct_type),
                 size: 8,
@@ -2078,9 +1839,9 @@ mod tests {
         assert_eq!(
             planned.location,
             VariableLocation::ComputedAddress(vec![
-                ComputeStep::PushConstant(0x2000),
-                ComputeStep::PushConstant(8),
-                ComputeStep::Add,
+                PlanExprOp::PushConstant(0x2000),
+                PlanExprOp::PushConstant(8),
+                PlanExprOp::Add,
             ])
         );
     }
@@ -2108,9 +1869,9 @@ mod tests {
         assert_eq!(
             planned.location,
             VariableLocation::ComputedAddress(vec![
-                ComputeStep::LoadRegister(5),
-                ComputeStep::PushConstant(12),
-                ComputeStep::Add,
+                PlanExprOp::LoadRegister(5),
+                PlanExprOp::PushConstant(12),
+                PlanExprOp::Add,
             ])
         );
     }

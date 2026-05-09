@@ -49,7 +49,7 @@ pub enum DirectValueResult {
     /// This is a full expression that computes the value
     ComputedValue {
         /// Expression steps (stack-based computation)
-        steps: Vec<ComputeStep>,
+        steps: Vec<PlanExprOp>,
         /// Expected result type size
         result_size: MemoryAccessSize,
     },
@@ -73,7 +73,7 @@ pub enum LocationResult {
     /// Will be evaluated step by step in eBPF
     ComputedLocation {
         /// Expression that computes the final address
-        steps: Vec<ComputeStep>,
+        steps: Vec<PlanExprOp>,
     },
 }
 
@@ -86,20 +86,20 @@ pub enum CfaResult {
         offset: i64,
     },
     /// CFA computed by DWARF expression
-    Expression { steps: Vec<ComputeStep> },
+    Expression { steps: Vec<PlanExprOp> },
 }
 
-/// Caller-frame recovery rules materialized as ComputeStep[] for compiler/eBPF use.
+/// Caller-frame recovery rules materialized as planned expression ops.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CallerFrameRecovery {
     /// Steps that compute the current frame's CFA.
-    pub cfa_steps: Vec<ComputeStep>,
+    pub cfa_steps: Vec<PlanExprOp>,
     /// DWARF register number that holds the caller's return address.
     pub return_address_register: u16,
     /// Steps that recover the caller PC from the current frame.
-    pub caller_pc_steps: Vec<ComputeStep>,
+    pub caller_pc_steps: Vec<PlanExprOp>,
     /// Per-register recovery steps keyed by DWARF register number.
-    pub register_recovery_steps: BTreeMap<u16, Vec<ComputeStep>>,
+    pub register_recovery_steps: BTreeMap<u16, Vec<PlanExprOp>>,
 }
 
 /// Piece of a composite location
@@ -118,16 +118,16 @@ pub struct PieceResult {
 pub struct EntryValueCase {
     /// Link-time caller return PC from DW_AT_call_return_pc.
     pub caller_return_pc: u64,
-    /// Materialized ComputeStep[] that recover the original caller value.
-    pub value_steps: Vec<ComputeStep>,
+    /// Materialized planned expression ops that recover the original caller value.
+    pub value_steps: Vec<PlanExprOp>,
 }
 
-/// Stack-machine computation step preserved for later runtime lowering.
+/// Stack-machine expression op selected by DWARF lowering.
 ///
-/// The compiler currently lowers these steps to LLVM IR for eBPF, but the DWARF
-/// crate treats them as target-independent semantic operations.
+/// This is the single planned expression IR shared by DWARF expression
+/// lowering, read plans, CFI recovery, and compiler/eBPF lowering.
 #[derive(Debug, Clone, PartialEq)]
-pub enum ComputeStep {
+pub enum PlanExprOp {
     /// Load register value from pt_regs
     LoadRegister(u16), // DWARF register number
 
@@ -176,14 +176,14 @@ pub enum ComputeStep {
 
     /// Control flow (simplified for eBPF)
     If {
-        then_branch: Vec<ComputeStep>,
-        else_branch: Vec<ComputeStep>,
+        then_branch: Vec<PlanExprOp>,
+        else_branch: Vec<PlanExprOp>,
     },
 
     /// Recover a DW_OP_entry_value at runtime by matching the recovered caller
     /// return PC against caller-side DW_AT_call_return_pc cases.
     EntryValueLookup {
-        caller_pc_steps: Vec<ComputeStep>,
+        caller_pc_steps: Vec<PlanExprOp>,
         cases: Vec<EntryValueCase>,
     },
 }
@@ -223,7 +223,7 @@ impl MemoryAccessSize {
 
 impl DirectValueResult {
     /// Convert compute steps to a human-readable expression
-    fn steps_to_expression(steps: &[ComputeStep]) -> String {
+    fn steps_to_expression(steps: &[PlanExprOp]) -> String {
         use ghostscope_platform::register_mapping::dwarf_reg_to_name;
 
         // Stack for expression building
@@ -231,18 +231,18 @@ impl DirectValueResult {
 
         for step in steps {
             match step {
-                ComputeStep::LoadRegister(r) => {
+                PlanExprOp::LoadRegister(r) => {
                     let reg_name = dwarf_reg_to_name(*r).unwrap_or("r?").to_string();
                     stack.push(reg_name);
                 }
-                ComputeStep::PushConstant(v) => {
+                PlanExprOp::PushConstant(v) => {
                     if *v >= 0 && *v <= 0xFF {
                         stack.push(format!("{v}"));
                     } else {
                         stack.push(format!("0x{v:x}"));
                     }
                 }
-                ComputeStep::Add => {
+                PlanExprOp::Add => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         // Special case: register + small offset
                         if a.chars()
@@ -258,126 +258,126 @@ impl DirectValueResult {
                         stack.push("?+?".to_string());
                     }
                 }
-                ComputeStep::Sub => {
+                PlanExprOp::Sub => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         stack.push(format!("({a}-{b})"));
                     } else {
                         stack.push("?-?".to_string());
                     }
                 }
-                ComputeStep::Mul => {
+                PlanExprOp::Mul => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         stack.push(format!("{a}*{b}"));
                     } else {
                         stack.push("?*?".to_string());
                     }
                 }
-                ComputeStep::Div => {
+                PlanExprOp::Div => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         stack.push(format!("({a}/{b})"));
                     } else {
                         stack.push("?/?".to_string());
                     }
                 }
-                ComputeStep::Mod => {
+                PlanExprOp::Mod => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         stack.push(format!("({a}%{b})"));
                     } else {
                         stack.push("?%?".to_string());
                     }
                 }
-                ComputeStep::And => {
+                PlanExprOp::And => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         stack.push(format!("({a}&{b})"));
                     } else {
                         stack.push("?&?".to_string());
                     }
                 }
-                ComputeStep::Or => {
+                PlanExprOp::Or => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         stack.push(format!("({a}|{b})"));
                     } else {
                         stack.push("?|?".to_string());
                     }
                 }
-                ComputeStep::Xor => {
+                PlanExprOp::Xor => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         stack.push(format!("({a}^{b})"));
                     } else {
                         stack.push("?^?".to_string());
                     }
                 }
-                ComputeStep::Shl => {
+                PlanExprOp::Shl => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         stack.push(format!("({a}<<{b})"));
                     } else {
                         stack.push("?<<?".to_string());
                     }
                 }
-                ComputeStep::Shr => {
+                PlanExprOp::Shr => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         stack.push(format!("({a}>>{b})"));
                     } else {
                         stack.push("?>>?".to_string());
                     }
                 }
-                ComputeStep::Shra => {
+                PlanExprOp::Shra => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         stack.push(format!("({a}>>>{b})"));
                     } else {
                         stack.push("?>>>?".to_string());
                     }
                 }
-                ComputeStep::Not => {
+                PlanExprOp::Not => {
                     if let Some(a) = stack.pop() {
                         stack.push(format!("~{a}"));
                     } else {
                         stack.push("~?".to_string());
                     }
                 }
-                ComputeStep::Neg => {
+                PlanExprOp::Neg => {
                     if let Some(a) = stack.pop() {
                         stack.push(format!("-{a}"));
                     } else {
                         stack.push("-?".to_string());
                     }
                 }
-                ComputeStep::Abs => {
+                PlanExprOp::Abs => {
                     if let Some(a) = stack.pop() {
                         stack.push(format!("|{a}|"));
                     } else {
                         stack.push("|?|".to_string());
                     }
                 }
-                ComputeStep::Dereference { size } => {
+                PlanExprOp::Dereference { size } => {
                     if let Some(a) = stack.pop() {
                         stack.push(format!("*({a} as {size})"));
                     } else {
                         stack.push(format!("*(? as {size})"));
                     }
                 }
-                ComputeStep::Dup => {
+                PlanExprOp::Dup => {
                     if let Some(top) = stack.last() {
                         stack.push(top.clone());
                     }
                 }
-                ComputeStep::Drop => {
+                PlanExprOp::Drop => {
                     stack.pop();
                 }
-                ComputeStep::Swap => {
+                PlanExprOp::Swap => {
                     if stack.len() >= 2 {
                         let len = stack.len();
                         stack.swap(len - 1, len - 2);
                     }
                 }
-                ComputeStep::Rot => {
+                PlanExprOp::Rot => {
                     if stack.len() >= 3 {
                         let len = stack.len();
                         let third = stack.remove(len - 3);
                         stack.push(third);
                     }
                 }
-                ComputeStep::Pick(n) => {
+                PlanExprOp::Pick(n) => {
                     if stack.len() > *n as usize {
                         let idx = stack.len() - 1 - (*n as usize);
                         let val = stack[idx].clone();
@@ -386,49 +386,49 @@ impl DirectValueResult {
                         stack.push("?".to_string());
                     }
                 }
-                ComputeStep::Eq => {
+                PlanExprOp::Eq => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         stack.push(format!("({a}=={b})"));
                     } else {
                         stack.push("?==?".to_string());
                     }
                 }
-                ComputeStep::Ne => {
+                PlanExprOp::Ne => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         stack.push(format!("({a}!={b})"));
                     } else {
                         stack.push("?!=?".to_string());
                     }
                 }
-                ComputeStep::Lt => {
+                PlanExprOp::Lt => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         stack.push(format!("({a}<{b})"));
                     } else {
                         stack.push("?<?".to_string());
                     }
                 }
-                ComputeStep::Le => {
+                PlanExprOp::Le => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         stack.push(format!("({a}<={b})"));
                     } else {
                         stack.push("?<=?".to_string());
                     }
                 }
-                ComputeStep::Gt => {
+                PlanExprOp::Gt => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         stack.push(format!("({a}>{b})"));
                     } else {
                         stack.push("?>?".to_string());
                     }
                 }
-                ComputeStep::Ge => {
+                PlanExprOp::Ge => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         stack.push(format!("({a}>={b})"));
                     } else {
                         stack.push("?>=?".to_string());
                     }
                 }
-                ComputeStep::If {
+                PlanExprOp::If {
                     then_branch,
                     else_branch,
                 } => {
@@ -441,7 +441,7 @@ impl DirectValueResult {
                     _ = then_branch;
                     _ = else_branch;
                 }
-                ComputeStep::EntryValueLookup { cases, .. } => {
+                PlanExprOp::EntryValueLookup { cases, .. } => {
                     stack.push(format!("entry_value[{} cases]", cases.len()));
                 }
             }
@@ -454,7 +454,7 @@ impl DirectValueResult {
 
 impl LocationResult {
     /// Convert compute steps to a human-readable expression (reuse from DirectValueResult)
-    fn steps_to_expression(steps: &[ComputeStep]) -> String {
+    fn steps_to_expression(steps: &[PlanExprOp]) -> String {
         DirectValueResult::steps_to_expression(steps)
     }
 }
@@ -578,46 +578,46 @@ impl fmt::Display for MemoryAccessSize {
     }
 }
 
-impl fmt::Display for ComputeStep {
+impl fmt::Display for PlanExprOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use ghostscope_platform::register_mapping::dwarf_reg_to_name;
 
         match self {
-            ComputeStep::LoadRegister(r) => {
+            PlanExprOp::LoadRegister(r) => {
                 if let Some(name) = dwarf_reg_to_name(*r) {
                     write!(f, "load {name}")
                 } else {
                     write!(f, "load r{r}")
                 }
             }
-            ComputeStep::PushConstant(v) => write!(f, "push {v}"),
-            ComputeStep::Dereference { size } => write!(f, "deref {size}"),
-            ComputeStep::Add => write!(f, "add"),
-            ComputeStep::Sub => write!(f, "sub"),
-            ComputeStep::Mul => write!(f, "mul"),
-            ComputeStep::Div => write!(f, "div"),
-            ComputeStep::Mod => write!(f, "mod"),
-            ComputeStep::And => write!(f, "and"),
-            ComputeStep::Or => write!(f, "or"),
-            ComputeStep::Xor => write!(f, "xor"),
-            ComputeStep::Shl => write!(f, "shl"),
-            ComputeStep::Shr => write!(f, "shr"),
-            ComputeStep::Shra => write!(f, "shra"),
-            ComputeStep::Not => write!(f, "not"),
-            ComputeStep::Neg => write!(f, "neg"),
-            ComputeStep::Abs => write!(f, "abs"),
-            ComputeStep::Dup => write!(f, "dup"),
-            ComputeStep::Drop => write!(f, "drop"),
-            ComputeStep::Swap => write!(f, "swap"),
-            ComputeStep::Rot => write!(f, "rot"),
-            ComputeStep::Pick(n) => write!(f, "pick {n}"),
-            ComputeStep::Eq => write!(f, "eq"),
-            ComputeStep::Ne => write!(f, "ne"),
-            ComputeStep::Lt => write!(f, "lt"),
-            ComputeStep::Le => write!(f, "le"),
-            ComputeStep::Gt => write!(f, "gt"),
-            ComputeStep::Ge => write!(f, "ge"),
-            ComputeStep::If {
+            PlanExprOp::PushConstant(v) => write!(f, "push {v}"),
+            PlanExprOp::Dereference { size } => write!(f, "deref {size}"),
+            PlanExprOp::Add => write!(f, "add"),
+            PlanExprOp::Sub => write!(f, "sub"),
+            PlanExprOp::Mul => write!(f, "mul"),
+            PlanExprOp::Div => write!(f, "div"),
+            PlanExprOp::Mod => write!(f, "mod"),
+            PlanExprOp::And => write!(f, "and"),
+            PlanExprOp::Or => write!(f, "or"),
+            PlanExprOp::Xor => write!(f, "xor"),
+            PlanExprOp::Shl => write!(f, "shl"),
+            PlanExprOp::Shr => write!(f, "shr"),
+            PlanExprOp::Shra => write!(f, "shra"),
+            PlanExprOp::Not => write!(f, "not"),
+            PlanExprOp::Neg => write!(f, "neg"),
+            PlanExprOp::Abs => write!(f, "abs"),
+            PlanExprOp::Dup => write!(f, "dup"),
+            PlanExprOp::Drop => write!(f, "drop"),
+            PlanExprOp::Swap => write!(f, "swap"),
+            PlanExprOp::Rot => write!(f, "rot"),
+            PlanExprOp::Pick(n) => write!(f, "pick {n}"),
+            PlanExprOp::Eq => write!(f, "eq"),
+            PlanExprOp::Ne => write!(f, "ne"),
+            PlanExprOp::Lt => write!(f, "lt"),
+            PlanExprOp::Le => write!(f, "le"),
+            PlanExprOp::Gt => write!(f, "gt"),
+            PlanExprOp::Ge => write!(f, "ge"),
+            PlanExprOp::If {
                 then_branch,
                 else_branch,
             } => {
@@ -628,7 +628,7 @@ impl fmt::Display for ComputeStep {
                     else_branch.len()
                 )
             }
-            ComputeStep::EntryValueLookup { cases, .. } => {
+            PlanExprOp::EntryValueLookup { cases, .. } => {
                 write!(f, "entry_value_lookup[cases:{}]", cases.len())
             }
         }

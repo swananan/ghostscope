@@ -537,14 +537,14 @@ async fn test_complex_bitfield_chain_planner_resolves_member_offsets() -> anyhow
             .ok_or_else(|| anyhow::anyhow!("missing plan for c.flags at {:?}", module_address))?;
 
         let expected_steps = vec![
-            ghostscope_dwarf::ComputeStep::LoadRegister(6),
-            ghostscope_dwarf::ComputeStep::PushConstant(-8),
-            ghostscope_dwarf::ComputeStep::Add,
-            ghostscope_dwarf::ComputeStep::Dereference {
+            ghostscope_dwarf::PlanExprOp::LoadRegister(6),
+            ghostscope_dwarf::PlanExprOp::PushConstant(-8),
+            ghostscope_dwarf::PlanExprOp::Add,
+            ghostscope_dwarf::PlanExprOp::Dereference {
                 size: ghostscope_dwarf::MemoryAccessSize::U64,
             },
-            ghostscope_dwarf::ComputeStep::PushConstant(64),
-            ghostscope_dwarf::ComputeStep::Add,
+            ghostscope_dwarf::PlanExprOp::PushConstant(64),
+            ghostscope_dwarf::PlanExprOp::Add,
         ];
         let expected_location = ghostscope_dwarf::VariableLocation::ComputedAddress(expected_steps);
 

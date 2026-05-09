@@ -26,11 +26,12 @@ pub use analyzer::{
 
 // Re-export essential core and semantic support types.
 pub use core::{
-    AddressExpr, AmbiguityReason, Availability, CallerFrameRecovery, CfaResult, ComputeStep, CuId,
-    DieRef, DwarfError, EntryValueCase, FunctionId, FunctionInfo, GlobalVariableInfo, HelperMode,
-    InlineContextId, MemoryAccessSize, ModuleAddress, ModuleId, PieceLocation, Provenance, Result,
-    RuntimeCapabilities, RuntimeRequirement, ScopeId, SectionType, SourceLocation, TargetArch,
-    TypeId, UnsupportedReason, VariableId, VariableLocation, VerifierRisk,
+    AddressExpr, AmbiguityReason, Availability, CallerFrameRecovery, CfaResult, CuId, DieRef,
+    DwarfError, EntryValueCase, FunctionId, FunctionInfo, GlobalVariableInfo, HelperMode,
+    InlineContextId, MemoryAccessSize, ModuleAddress, ModuleId, PieceLocation, PlanExprOp,
+    Provenance, Result, RuntimeCapabilities, RuntimeRequirement, ScopeId, SectionType,
+    SourceLocation, TargetArch, TypeId, UnsupportedReason, VariableId, VariableLocation,
+    VerifierRisk,
 };
 
 // Re-export semantic contract types.
@@ -38,10 +39,10 @@ pub use semantics::{
     AddressOrigin, AddressSpaceInfo, CfaRulePlan, CompactUnwindRow, CompactUnwindStats,
     CompactUnwindTable, InlineFrame, PcContext, PcLineInfo, PcRange, PlannedAddress,
     PlannedAddressKind, PlannedValue, RegisterRecoveryPlan, RuntimeComputedExpr,
-    RuntimeComputedKind, RuntimeEntryValueCase, RuntimeExprOp, UnwindDiagnostic,
-    UnwindDiagnosticKind, VariableAccessPath, VariableAccessSegment, VariableLoweringKind,
-    VariableLoweringPlan, VariableMaterialization, VariableMaterializationPlan, VariablePlan,
-    VariableQueryDiagnostic, VariableReadPlan, VisibleVariable, VisibleVariablesResult,
+    RuntimeComputedKind, UnwindDiagnostic, UnwindDiagnosticKind, VariableAccessPath,
+    VariableAccessSegment, VariableLoweringKind, VariableLoweringPlan, VariableMaterialization,
+    VariableMaterializationPlan, VariablePlan, VariableQueryDiagnostic, VariableReadPlan,
+    VisibleVariable, VisibleVariablesResult,
 };
 
 // Re-export type definitions from protocol (avoiding circular dependencies)
